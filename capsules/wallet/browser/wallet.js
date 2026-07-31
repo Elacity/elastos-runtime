@@ -74,7 +74,7 @@ let currentRequests = [];
 let selectedAccountId = "";
 let reviewWalletRequestId = readQueryParam("wallet_request");
 let refreshWalletStateInFlight = null;
-const { fetchJson, notifyHomeSummaryChanged, requestFreshPasskeyHomeToken, shellHeaders } = createWalletApi({
+const { fetchJson, notifyHomeSummaryChanged, requestPasskeyStepUp, shellHeaders } = createWalletApi({
   getHomeToken: () => activeHomeToken,
 });
 const { showStatus } = createWalletRender({ statusNode });
@@ -102,7 +102,7 @@ const {
   getHomeToken: () => activeHomeToken,
   notifyHomeSummaryChanged,
   renderAll,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   refreshWalletState,
   shellHeaders,
   showStatus,
@@ -115,7 +115,7 @@ const {
   fetchJson,
   notifyHomeSummaryChanged,
   openApprovalMethod,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   refreshWalletState,
   requestsNode,
   requestsPanelNode,
@@ -154,7 +154,7 @@ const { onCreateManagedWallet, openCreateAccountFlow, openImportRecoveryKeyFlow 
   openFlowModal,
   readText,
   refreshWalletState,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   setBusy,
   shellHeaders,
   showStatus,
@@ -178,7 +178,7 @@ const { canSendFromAccount, openSendFlow } = createWalletSendFlow({
   readText,
   refreshWalletState,
   renderActivity,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   selectedOrDefaultAccount,
   setBusy,
   setCurrentRequests: (requests) => {
@@ -208,7 +208,7 @@ const { onAccountClick, onDocumentClick } = createWalletAccountActions({
   openInfoModal,
   refreshWalletState,
   renderReceiveAddress,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   shellHeaders,
   showStatus,
 });

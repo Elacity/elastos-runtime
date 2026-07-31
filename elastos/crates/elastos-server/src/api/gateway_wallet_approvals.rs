@@ -84,14 +84,19 @@ pub(in crate::api::gateway) async fn system_wallet_approval_approve(
     Path(request_id): Path<String>,
     Json(input): Json<WalletApprovalApproveRequest>,
 ) -> Response {
-    let authority =
-        match require_runtime_wallet_authority(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
-            Ok(authority) => authority,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
+            Ok(launch) => launch,
             Err(err) => return system_error_response(err),
         };
-    let context = authority.home_launch_context();
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
+        Err(err) => return system_error_response(err),
+    };
+    let context = launch.context.clone();
     approve_wallet_managed_request(
         &state,
+        &launch,
         &context,
         &authority,
         &request_id,
@@ -103,38 +108,38 @@ pub(in crate::api::gateway) async fn system_wallet_approval_approve(
 
 pub(in crate::api::gateway) async fn approve_wallet_managed_request(
     state: &GatewayState,
+    launch: &RequiredHomeLaunchToken,
     context: &HomeLaunchTokenContext,
     authority: &RuntimeWalletAuthority,
     request_id: &str,
     input: WalletApprovalApproveRequest,
     capsule_id: &'static str,
 ) -> Response {
-    let Some(home_token) = input.home_token.as_deref() else {
+    let Some(step_up_token) = input.step_up_token.as_deref() else {
         return system_error_response(anyhow::anyhow!(
             "fresh passkey verification is required to sign with a built-in wallet"
         ));
     };
-    if let Err(err) = consume_fresh_passkey_home_token(
-        &state.data_dir,
-        home_token,
-        context,
-        capsule_id,
-        180,
-        "wallet.approve",
-        &serde_json::json!({
-            "request_id": request_id,
-            "reason": input.reason,
-        }),
-    ) {
-        return system_error_response(err);
-    }
-    let reason = input.reason.unwrap_or_else(|| {
+    let reason = input.reason.clone().unwrap_or_else(|| {
         if capsule_id == SYSTEM_CAPSULE_ID {
             "Approved in System".to_string()
         } else {
             "Approved in Wallet".to_string()
         }
     });
+    if let Err(err) = consume_passkey_step_up_token(
+        &state.data_dir,
+        step_up_token,
+        launch,
+        180,
+        "wallet.approve",
+        &serde_json::json!({
+            "request_id": request_id,
+            "reason": reason,
+        }),
+    ) {
+        return system_error_response(err);
+    }
     match approve_managed_wallet_request(
         state,
         &state.data_dir,

@@ -101,10 +101,10 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     let missing_text = String::from_utf8(missing_body.to_vec()).unwrap();
     assert!(missing_text.contains("fresh passkey verification is required"));
 
-    let approval_token = intent_token_for_authority_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         SYSTEM_CAPSULE_ID,
-        &authority,
+        &token,
         "wallet.approve",
         &json!({
             "request_id": "wallet-approval:managed",
@@ -119,7 +119,7 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
                 .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"reason":"Looks correct","home_token":"{}"}}"#,
+                    r#"{{"reason":"Looks correct","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -174,10 +174,10 @@ async fn test_system_does_not_approve_external_wallet_request() {
     };
     let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
 
-    let approval_token = intent_token_for_authority_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         SYSTEM_CAPSULE_ID,
-        &authority,
+        &token,
         "wallet.approve",
         &json!({
             "request_id": "wallet-approval:external",
@@ -192,7 +192,7 @@ async fn test_system_does_not_approve_external_wallet_request() {
                 .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"reason":"Looks correct","home_token":"{}"}}"#,
+                    r#"{{"reason":"Looks correct","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),

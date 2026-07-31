@@ -153,18 +153,22 @@ pub(super) async fn inbox_action(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let authority =
-        match require_runtime_wallet_authority(&state.data_dir, &headers, &[INBOX_CAPSULE_ID]) {
-            Ok(authority) => authority,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[INBOX_CAPSULE_ID]) {
+            Ok(launch) => launch,
             Err(err) => return inbox_error_response(err),
         };
-    let context = authority.home_launch_context();
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
+        Err(err) => return inbox_error_response(err),
+    };
+    let context = launch.context.clone();
 
     let action = match parse_inbox_action_request(&headers, &body).map_err(anyhow::Error::msg) {
         Ok(req) => req,
         Err(err) => return inbox_error_response(err),
     };
-    match dispatch_inbox_action(&state, &context, &authority, &action).await {
+    match dispatch_inbox_action(&state, &launch, &context, &authority, &action).await {
         Ok(message) => {
             let result = inspect_action_request_id_from_action(&action.action_id)
                 .map(|request_id| inspect_action_result_receipt(&state.data_dir, request_id))
@@ -201,7 +205,7 @@ fn parse_inbox_action_request(
             .ok_or_else(|| "missing action_id".to_string())?;
         Ok(InboxActionRequest {
             action_id,
-            home_token: None,
+            step_up_token: None,
         })
     } else {
         Err("unsupported inbox action content type".to_string())
@@ -210,6 +214,7 @@ fn parse_inbox_action_request(
 
 async fn dispatch_inbox_action(
     state: &GatewayState,
+    launch: &RequiredHomeLaunchToken,
     context: &HomeLaunchTokenContext,
     authority: &RuntimeWalletAuthority,
     action: &InboxActionRequest,
@@ -260,14 +265,13 @@ async fn dispatch_inbox_action(
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-approve-request:") {
-        let Some(home_token) = action.home_token.as_deref() else {
+        let Some(step_up_token) = action.step_up_token.as_deref() else {
             anyhow::bail!("fresh passkey verification is required to sign with a built-in wallet");
         };
-        consume_fresh_passkey_home_token(
+        consume_passkey_step_up_token(
             data_dir,
-            home_token,
-            context,
-            INBOX_CAPSULE_ID,
+            step_up_token,
+            launch,
             180,
             "wallet.approve",
             &serde_json::json!({
@@ -339,10 +343,11 @@ async fn dispatch_inbox_action(
         .map_err(|err| anyhow::anyhow!(err))?;
     }
     if let Some(request_id) = action_id.strip_prefix("inspect-approve-request:") {
-        let Some(home_token) = action.home_token.as_deref() else {
+        let Some(step_up_token) = action.step_up_token.as_deref() else {
             anyhow::bail!("fresh passkey verification is required to approve an Inspector action");
         };
-        return approve_inspect_action_request(state, context, request_id, home_token).await;
+        return approve_inspect_action_request(state, launch, context, request_id, step_up_token)
+            .await;
     }
     if let Some(request_id) = action_id.strip_prefix("inspect-deny-request:") {
         return deny_inspect_action_request(state, context, request_id);

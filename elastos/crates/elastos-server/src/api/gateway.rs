@@ -62,6 +62,8 @@ mod gateway_inbox;
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_passkey_step_up.rs"]
+mod gateway_passkey_step_up;
 #[path = "gateway_provider_proxy.rs"]
 mod gateway_provider_proxy;
 #[path = "gateway_room.rs"]
@@ -84,25 +86,31 @@ pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_ob
 use gateway_home_system::*;
 use gateway_home_terminal::*;
 pub(super) use gateway_home_token::{
-    consume_fresh_passkey_home_token, home_launch_auth_data_dir, home_launch_token_header,
-    home_session_clear_cookie_header, home_session_cookie_header_for_token,
-    issue_home_launch_token_for_auth_grant, issue_home_projection_launch_token_with_context,
-    issue_home_projection_launch_token_with_intent, require_home_launch_token,
+    home_launch_auth_data_dir, home_launch_token_header, home_session_clear_cookie_header,
+    home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
+    issue_home_projection_launch_token_with_context, require_carried_home_launch_token,
+    require_home_launch_token, require_home_launch_token_binding,
     require_home_launch_token_context, require_home_launch_token_for_any_app_context,
     require_home_launch_token_for_any_context, require_home_projection_launch_token_context,
     require_home_runtime_wallet_authority, require_home_token, require_home_token_context,
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
-    require_runtime_wallet_authority, HomeLaunchTokenContext, RuntimeWalletAuthority,
+    require_runtime_wallet_authority, runtime_wallet_authority, HomeLaunchContext,
+    HomeLaunchTokenContext, RequiredHomeLaunchToken, RuntimeWalletAuthority,
 };
 #[cfg(test)]
 pub(crate) use gateway_home_token::{
-    issue_home_launch_token, issue_home_launch_token_with_context,
-    issue_home_launch_token_with_intent, local_home_launch_token_context,
+    issue_home_launch_token, issue_home_launch_token_with_context, local_home_launch_token_context,
     set_test_home_launch_auth_data_dir, uuid_like_token,
 };
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
+pub(super) use gateway_passkey_step_up::consume_passkey_step_up_token;
+use gateway_passkey_step_up::*;
+#[cfg(test)]
+pub(crate) use gateway_passkey_step_up::{
+    issue_passkey_step_up_token_at_for_test, issue_passkey_step_up_token_for_test,
+};
 use gateway_provider_proxy::*;
 use gateway_room::*;
 pub(crate) use gateway_room::{
@@ -552,6 +560,18 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/auth/passkey/authenticate/complete",
             post(super::auth_gateway::passkey_authenticate_complete),
+        )
+        .route(
+            "/api/auth/passkey-step-up/begin",
+            post(passkey_step_up_begin).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/passkey-step-up/complete",
+            post(passkey_step_up_complete).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/passkey-step-up/cancel",
+            post(passkey_step_up_cancel).layer(DefaultBodyLimit::max(8 * 1024)),
         )
         .route(
             "/api/browser/session/request",
@@ -1143,7 +1163,9 @@ async fn landing_page() -> Html<String> {
 
 include!("gateway_models.rs");
 
-fn load_existing_gateway_runtime_did(data_dir: &std::path::Path) -> Option<String> {
+pub(in crate::api::gateway) fn load_existing_gateway_runtime_did(
+    data_dir: &std::path::Path,
+) -> Option<String> {
     if let Some(did) = std::env::var_os(HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV)
         .and_then(|value| value.into_string().ok())
         .map(|value| value.trim().to_string())
@@ -1223,6 +1245,7 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
     let status = if text.contains("home launch token")
         || text.contains("fresh passkey")
+        || text.contains("passkey step-up")
         || text.contains("auth session is not active")
         || text.contains("auth session not found")
         || text.contains("belongs to a different principal")
@@ -1250,6 +1273,7 @@ fn system_error_response(err: anyhow::Error) -> Response {
         || text.contains("admin passkey required")
         || text.contains("proof-bound passkey session required")
         || text.contains("fresh passkey")
+        || text.contains("passkey step-up")
     {
         StatusCode::FORBIDDEN
     } else if text.contains("nickname must")

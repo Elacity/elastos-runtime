@@ -84,7 +84,7 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let missing_text = String::from_utf8(missing_body.to_vec()).unwrap();
     assert!(missing_text.contains("fresh passkey verification is required"));
 
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         INBOX_CAPSULE_ID,
         &token,
@@ -102,7 +102,7 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
                 .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"wallet-approve-request:wallet-approval:test","home_token":"{}"}}"#,
+                    r#"{{"action_id":"wallet-approve-request:wallet-approval:test","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -288,7 +288,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
         "documents"
     );
 
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         WALLET_CAPSULE_ID,
         &wallet_token,
@@ -310,7 +310,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
                 .header("x-elastos-home-token", wallet_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"reason":"Approved in Wallet","home_token":"{}"}}"#,
+                    r#"{{"reason":"Approved in Wallet","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -519,7 +519,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
         "Bitcoin proof request"
     );
 
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         WALLET_CAPSULE_ID,
         &wallet_token,
@@ -541,7 +541,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
                 .header("x-elastos-home-token", wallet_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"reason":"Approved in Wallet","home_token":"{}"}}"#,
+                    r#"{{"reason":"Approved in Wallet","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),

@@ -27,14 +27,14 @@ export function createWalletApi({ getHomeToken }) {
     return response.json();
   }
 
-  async function requestFreshPasskeyHomeToken(operation, request) {
-    return requestHomePasskeyAuthority(getHomeToken(), homeParentOrigin, operation, request);
+  async function requestPasskeyStepUp(operation, request) {
+    return requestHomePasskeyStepUp(getHomeToken(), homeParentOrigin, operation, request);
   }
 
-  function shellHeaders(extra = {}, authorityToken = getHomeToken()) {
+  function shellHeaders(extra = {}) {
     return {
       ...extra,
-      "x-elastos-home-token": authorityToken,
+      "x-elastos-home-token": getHomeToken(),
     };
   }
 
@@ -52,12 +52,12 @@ export function createWalletApi({ getHomeToken }) {
   return {
     fetchJson,
     notifyHomeSummaryChanged,
-    requestFreshPasskeyHomeToken,
+    requestPasskeyStepUp,
     shellHeaders,
   };
 }
 
-function requestHomePasskeyAuthority(homeToken, parentOrigin, operation, request) {
+function requestHomePasskeyStepUp(homeToken, parentOrigin, operation, request) {
   if (!homeToken || window.top === window || !parentOrigin) {
     return Promise.reject(new Error("Open Wallet from Home to verify your passkey."));
   }
@@ -73,25 +73,42 @@ function requestHomePasskeyAuthority(homeToken, parentOrigin, operation, request
         return;
       }
       const result = event.data && typeof event.data === "object" ? event.data : null;
-      if (result?.type !== "home:passkey-authority-result" || result.requestId !== requestId) {
+      if (
+        result?.type !== "elastos.home.passkey-step-up.result/v1"
+        || result.requestId !== requestId
+      ) {
         return;
       }
       window.clearTimeout(timeout);
       window.removeEventListener("message", onResult);
-      const freshToken = readText(result.homeToken);
-      if (freshToken) {
-        resolve(freshToken);
+      const stepUpToken = readText(result.stepUpToken);
+      const expectedKeys = stepUpToken
+        ? ["type", "requestId", "stepUpToken"]
+        : ["type", "requestId", "error"];
+      if (!hasExactKeys(result, expectedKeys)) {
+        reject(new Error("Passkey verification returned an invalid result."));
+        return;
+      }
+      if (stepUpToken) {
+        resolve(stepUpToken);
         return;
       }
       reject(new Error(readText(result.error) || "Passkey verification failed."));
     };
     window.addEventListener("message", onResult);
     window.top.postMessage({
-      type: "home:request-passkey-authority",
+      type: "elastos.home.passkey-step-up.request/v1",
       requestId,
       homeToken,
       operation,
       request,
     }, parentOrigin);
   });
+}
+
+function hasExactKeys(value, expectedKeys) {
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
 }

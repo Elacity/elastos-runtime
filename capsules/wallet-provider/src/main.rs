@@ -12,8 +12,9 @@ use elastos_auth::{
     verify_siwe_challenge, AuthChallengeInput, AuthChallengeV1, ProofBinding,
 };
 use elastos_wallet_contract::{
-    WalletProviderOperationV2, WalletProviderRequestV2, WalletProviderResponseV2, WalletResultV2,
-    WALLET_BUS_OPERATION, WALLET_PROTOCOL_VERSION,
+    ManagedRecoveryKeyEntryV1, ManagedRecoverySetV1, WalletProviderOperationV2,
+    WalletProviderRequestV2, WalletProviderResponseV2, WalletResultV2, WALLET_BUS_OPERATION,
+    WALLET_PROTOCOL_VERSION,
 };
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
@@ -334,6 +335,12 @@ impl WalletProvider {
                 recovery_key: recovery_key.clone(),
                 label: label.clone(),
             }),
+            WalletProviderOperationV2::ExportManagedRecoverySet {} => {
+                self.export_managed_recovery_set(principal_id)
+            }
+            WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set } => {
+                self.import_managed_recovery_set(principal_id, recovery_set)
+            }
         }
     }
 

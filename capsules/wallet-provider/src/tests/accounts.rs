@@ -1,5 +1,7 @@
 use super::support::*;
 use super::*;
+use elastos_wallet_contract::MANAGED_RECOVERY_SET_SCHEMA;
+use std::collections::BTreeSet;
 
 #[test]
 fn link_account_persists_and_lists_active_accounts() {
@@ -1093,4 +1095,255 @@ fn import_managed_recovery_key_restores_exported_wallet() {
         }
         other => panic!("expected accounts, got {other:?}"),
     }
+}
+
+fn managed_recovery_set_fixture(
+    provider: &mut WalletProvider,
+    principal_id: &str,
+) -> ManagedRecoverySetV1 {
+    for (chain_namespace, label) in [
+        ("eip155:20", "Spending"),
+        (BITCOIN_MAINNET_CHAIN_NAMESPACE, "Savings"),
+    ] {
+        assert!(matches!(
+            invoke_wallet(
+                provider,
+                principal_id,
+                "wallet",
+                WalletProviderOperationV2::CreateManagedAccount {
+                    chain_namespace: chain_namespace.into(),
+                    label: Some(label.into()),
+                    create_new: true,
+                },
+            ),
+            Response::Ok { .. }
+        ));
+    }
+    let revoked_account_id = match invoke_wallet(
+        provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: Some("Revoked".into()),
+            create_new: true,
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            data["account"]["account_id"].as_str().unwrap().to_string()
+        }
+        other => panic!("expected managed account creation, got {other:?}"),
+    };
+    assert!(matches!(
+        invoke_wallet(
+            provider,
+            principal_id,
+            "wallet",
+            WalletProviderOperationV2::RevokeAccount {
+                account_id: revoked_account_id,
+            },
+        ),
+        Response::Ok { .. }
+    ));
+    assert!(matches!(
+        invoke_wallet(
+            provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:connector".into(),
+                chain_namespace: "eip155:20".into(),
+                address: "0x2222222222222222222222222222222222222222".into(),
+                proof_type: "siwe".into(),
+                label: Some("Connector".into()),
+            },
+        ),
+        Response::Ok { .. }
+    ));
+    provider
+        .store
+        .accounts
+        .iter_mut()
+        .find(|account| account.connector_id.as_deref() == Some("wallet-metamask"))
+        .unwrap()
+        .proof_type = MANAGED_EVM_PROOF_TYPE.to_string();
+    match invoke_wallet(
+        provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ExportManagedRecoverySet {},
+    ) {
+        Response::Ok { data: Some(data) } => serde_json::from_value(data).unwrap(),
+        other => panic!("expected managed recovery set export, got {other:?}"),
+    }
+}
+
+#[test]
+fn managed_recovery_set_exports_only_active_managed_accounts_and_restores_labels() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let principal_id = "person:local:alice";
+    let mut source = init_provider(source_dir.path());
+    let recovery_set = managed_recovery_set_fixture(&mut source, principal_id);
+
+    assert_eq!(recovery_set.schema, MANAGED_RECOVERY_SET_SCHEMA);
+    assert_eq!(recovery_set.keys.len(), 2);
+    assert_eq!(
+        recovery_set
+            .keys
+            .iter()
+            .filter_map(|entry| entry.label.as_deref())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["Savings", "Spending"])
+    );
+    assert!(recovery_set
+        .keys
+        .iter()
+        .all(|entry| entry.label.as_deref() != Some("Connector")));
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let mut target = init_provider(target_dir.path());
+    match invoke_wallet(
+        &mut target,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["imported"], true);
+            assert_eq!(data["account_count"], 2);
+            assert_eq!(data["accounts"].as_array().unwrap().len(), 2);
+        }
+        other => panic!("expected managed recovery set import, got {other:?}"),
+    }
+    match invoke_wallet(
+        &mut target,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["accounts"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                data["accounts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|account| account["label"].as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["Savings", "Spending"])
+            );
+        }
+        other => panic!("expected imported managed accounts, got {other:?}"),
+    }
+}
+
+#[test]
+fn managed_recovery_set_validates_every_provider_owned_key_semantic_before_commit() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let principal_id = "person:local:alice";
+    let mut source = init_provider(source_dir.path());
+    let recovery_set = managed_recovery_set_fixture(&mut source, principal_id);
+
+    for case in [
+        "schema",
+        "private_key",
+        "address",
+        "chain",
+        "account_id",
+        "label",
+    ] {
+        let mut candidate = recovery_set.clone();
+        let entry = &mut candidate.keys[1];
+        match case {
+            "schema" => entry.recovery_key["schema"] = json!("elastos.wallet.recovery-key/v0"),
+            "private_key" => entry.recovery_key["private_key_hex"] = json!("00"),
+            "address" => {
+                let address = "0x3333333333333333333333333333333333333333";
+                let account_id = account_id("eip155:20", address);
+                entry.recovery_key["chain_namespace"] = json!("eip155:20");
+                entry.recovery_key["address"] = json!(address);
+                entry.recovery_key["account_id"] = json!(account_id);
+                entry.account_id = account_id;
+            }
+            "chain" => entry.recovery_key["chain_namespace"] = json!("solana:mainnet"),
+            "account_id" => entry.account_id = "wallet:eip155:20:attacker".into(),
+            "label" => entry.label = Some("x".repeat(81)),
+            _ => unreachable!(),
+        }
+        candidate.validate().unwrap();
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut target = init_provider(target_dir.path());
+        let context = wallet_context(principal_id, "wallet");
+        let request = wallet_request(
+            &context,
+            WalletProviderOperationV2::ImportManagedRecoverySet {
+                recovery_set: candidate,
+            },
+        );
+        match invoke_wallet_request(&mut target, &request) {
+            Response::Error { code, .. } => assert_eq!(code, "invalid_request", "{case}"),
+            other => panic!("case {case} unexpectedly imported: {other:?}"),
+        }
+        assert!(target.store.accounts.is_empty(), "{case}");
+        assert!(target.store.managed_wallets.is_empty(), "{case}");
+        assert!(!target
+            .store
+            .consumed_lifecycles
+            .iter()
+            .any(|record| record.lifecycle_id == request.lifecycle_id));
+    }
+}
+
+#[test]
+fn managed_recovery_set_save_failure_rolls_back_and_leaves_lifecycle_retryable() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let principal_id = "person:local:alice";
+    let mut source = init_provider(source_dir.path());
+    let recovery_set = managed_recovery_set_fixture(&mut source, principal_id);
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let mut target = init_provider(target_dir.path());
+    let context = wallet_context(principal_id, "wallet");
+    let request = wallet_request(
+        &context,
+        WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set },
+    );
+    let staging_path = target
+        .store_path
+        .as_ref()
+        .unwrap()
+        .with_extension("json.tmp");
+    std::fs::create_dir(&staging_path).unwrap();
+
+    assert!(matches!(
+        invoke_wallet_request(&mut target, &request),
+        Response::Error { ref code, .. } if code == "storage_error"
+    ));
+    assert!(target.store.accounts.is_empty());
+    assert!(target.store.managed_wallets.is_empty());
+    assert!(!target
+        .store
+        .consumed_lifecycles
+        .iter()
+        .any(|record| record.lifecycle_id == request.lifecycle_id));
+
+    std::fs::remove_dir(&staging_path).unwrap();
+    assert!(matches!(
+        invoke_wallet_request(&mut target, &request),
+        Response::Ok { .. }
+    ));
+    assert_eq!(target.store.accounts.len(), 2);
+    assert_eq!(target.store.managed_wallets.len(), 2);
+    assert_eq!(
+        target
+            .store
+            .consumed_lifecycles
+            .iter()
+            .filter(|record| record.lifecycle_id == request.lifecycle_id)
+            .count(),
+        1
+    );
 }

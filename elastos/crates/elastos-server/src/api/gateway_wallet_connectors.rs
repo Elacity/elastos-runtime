@@ -182,13 +182,6 @@ pub(in crate::api::gateway) fn require_wallet_connector_launch_authority(
     require_runtime_wallet_authority(data_dir, headers, &[connector_id])
 }
 
-pub(in crate::api::gateway) fn require_wallet_app_launch_context(
-    data_dir: &FsPath,
-    headers: &HeaderMap,
-) -> anyhow::Result<HomeLaunchTokenContext> {
-    require_home_launch_token_context(data_dir, headers, WALLET_CAPSULE_ID)
-}
-
 pub(in crate::api::gateway) fn require_wallet_app_launch_authority(
     data_dir: &FsPath,
     headers: &HeaderMap,

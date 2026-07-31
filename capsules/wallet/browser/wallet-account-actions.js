@@ -25,7 +25,7 @@ export function createWalletAccountActions({
   openInfoModal,
   refreshWalletState,
   renderReceiveAddress,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   shellHeaders,
   showStatus,
 }) {
@@ -156,14 +156,14 @@ export function createWalletAccountActions({
     setBusy(button, true);
     try {
       for (const accountId of accountIds(account)) {
-        const homeToken = await requestFreshPasskeyHomeToken(
+        const stepUpToken = await requestPasskeyStepUp(
           "wallet.account.delete",
           { account_id: accountId },
         );
         await fetchJson(`/api/apps/wallet/wallet/accounts/${encodeURIComponent(accountId)}`, {
           method: "DELETE",
-          headers: shellHeaders({ "content-type": "application/json" }, homeToken),
-          body: JSON.stringify({ home_token: homeToken }),
+          headers: shellHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ step_up_token: stepUpToken }),
         });
       }
       closeModal();
@@ -194,7 +194,7 @@ export function createWalletAccountActions({
       ),
     ]);
     try {
-      const homeToken = await requestFreshPasskeyHomeToken(
+      const stepUpToken = await requestPasskeyStepUp(
         "wallet.recovery-key.export",
         { account_id: account.account_id },
       );
@@ -202,8 +202,8 @@ export function createWalletAccountActions({
         `/api/apps/wallet/wallet/accounts/${encodeURIComponent(account.account_id)}/recovery-key`,
         {
           method: "POST",
-          headers: shellHeaders({ "content-type": "application/json" }, homeToken),
-          body: JSON.stringify({ home_token: homeToken }),
+          headers: shellHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ step_up_token: stepUpToken }),
         },
       );
       renderRecoveryKey(account, payload);

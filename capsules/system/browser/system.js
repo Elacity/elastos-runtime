@@ -1764,7 +1764,13 @@ async function onRecoveryImport(event) {
       showRecoveryPending(plan);
       return;
     }
-    await submitRecoveryImport(plan.request);
+    pendingRecoveryImport = { imported };
+    const response = await submitRecoveryImport(plan.request);
+    if (recoveryImportIsComplete(response)) {
+      clearRecoveryPending();
+    } else {
+      showWalletRestorePending(response);
+    }
   } catch (error) {
     showRecoveryStatus("Import failed", "error");
     showRecoveryNote(String(error.message || error), "error");
@@ -1789,8 +1795,15 @@ async function onRecoveryAttach() {
       headers: shellHeaders(),
     });
     const plan = recoveryImportPlan(status, pendingRecoveryImport.imported, { allowReassign: true });
-    await submitRecoveryImport(plan.request);
-    clearRecoveryPending();
+    const response = await submitRecoveryImport(
+      plan.request,
+      pendingRecoveryImport.terminalRetryToken,
+    );
+    if (recoveryImportIsComplete(response)) {
+      clearRecoveryPending();
+    } else {
+      showWalletRestorePending(response);
+    }
   } catch (error) {
     showRecoveryStatus("Attach failed", "error");
     showRecoveryNote(String(error.message || error), "error");
@@ -1800,10 +1813,14 @@ async function onRecoveryAttach() {
   }
 }
 
-async function submitRecoveryImport(body) {
+async function submitRecoveryImport(body, terminalRetryToken = "") {
+  const headers = shellHeaders({ "content-type": "application/json" });
+  if (readText(terminalRetryToken)) {
+    headers["x-elastos-recovery-terminal"] = readText(terminalRetryToken);
+  }
   const response = await fetchJson("/api/auth/recovery/full-import", {
     method: "POST",
-    headers: shellHeaders({ "content-type": "application/json" }),
+    headers,
     body: JSON.stringify(body),
   });
   if (readText(response.system_token)) {
@@ -1811,19 +1828,25 @@ async function submitRecoveryImport(body) {
   } else if (readText(response.home_token)) {
     apiHomeToken = readText(response.home_token);
   }
-  if (recoveryPasswordInput) {
-    recoveryPasswordInput.value = "";
-  }
-  showRecoveryStatus("", "success");
-  showRecoveryNote(
-    response.status === "reassigned"
-      ? "Recovered root attached. Home may refresh to use it."
-      : recoveryImportSuccessMessage(response),
-    "success",
-  );
   await refreshRecoveryStatus();
   await refreshAccountList();
   notifyHomeSummaryChanged();
+  if (recoveryImportIsComplete(response)) {
+    if (recoveryPasswordInput) {
+      recoveryPasswordInput.value = "";
+    }
+    showRecoveryStatus("", "success");
+    showRecoveryNote(
+      response.status === "reassigned"
+        ? `Recovered root attached. ${recoveryImportSuccessMessage(response)}`
+        : recoveryImportSuccessMessage(response),
+      "success",
+    );
+  } else {
+    showRecoveryStatus("Root recovered", "muted");
+    showRecoveryNote(recoveryImportIncompleteMessage(response), "muted");
+  }
+  return response;
 }
 
 function recoveryImportPlan(status, imported, options = {}) {
@@ -1859,18 +1882,21 @@ async function exportFullRecoveryBundle(status) {
     principal_id: readText(status.principal_id),
     localhost_root: readText(status.localhost_root),
     label: "Recovery Kit",
+    download_password: downloadPassword || null,
   };
-  const homeToken = await requestFreshPasskeyHomeToken(
+  const stepUpToken = await requestPasskeyStepUp(
     "auth.full-recovery-bundle.export",
     intent,
   );
   return fetchJson("/api/auth/recovery/full-export", {
     method: "POST",
-    headers: shellHeaders({ "content-type": "application/json" }, homeToken),
+    headers: shellHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       schema: "elastos.full-recovery-bundle.export.request/v1",
-      ...intent,
-      home_token: homeToken,
+      principal_id: intent.principal_id,
+      localhost_root: intent.localhost_root,
+      label: intent.label,
+      step_up_token: stepUpToken,
       ...(downloadPassword ? { download_password: downloadPassword } : {}),
     }),
   });
@@ -1897,11 +1923,44 @@ function fullRecoveryImportRequest(principalId, localhostRoot, bundle, recoveryP
 }
 
 function recoveryImportSuccessMessage(response) {
-  const count = Number(response && response.wallet_recovery_key_count ? response.wallet_recovery_key_count : 0);
+  const count = Number(response && response.wallet_restore && response.wallet_restore.imported_count
+    ? response.wallet_restore.imported_count
+    : 0);
   if (count > 0) {
     return `Recovery Kit imported. Restored ${count} built-in Wallet ${count === 1 ? "account" : "accounts"}.`;
   }
   return "Recovery Kit imported.";
+}
+
+function recoveryImportIsComplete(response) {
+  return readText(response && response.schema) === "elastos.full-recovery-bundle.import.response/v2"
+    && readText(response && response.wallet_restore && response.wallet_restore.status) === "complete"
+    && readText(response && response.runtime_audit && response.runtime_audit.status) === "complete";
+}
+
+function recoveryImportIncompleteMessage(response) {
+  const walletComplete = readText(
+    response && response.wallet_restore && response.wallet_restore.status,
+  ) === "complete";
+  const auditComplete = readText(
+    response && response.runtime_audit && response.runtime_audit.status,
+  ) === "complete";
+  if (walletComplete && !auditComplete) {
+    return "Root recovered and Wallet restored, but required Runtime audit evidence is incomplete. Retry Recovery completion safely below.";
+  }
+  const expected = Number(response && response.wallet_restore && response.wallet_restore.expected_count
+    ? response.wallet_restore.expected_count
+    : 0);
+  const reason = readText(response && response.wallet_restore && response.wallet_restore.reason_code);
+  const reasonText = reason === "wallet_provider_unavailable"
+    ? "Wallet Provider is unavailable."
+    : reason === "wallet_provider_invalid_response"
+      ? "Wallet Provider returned an invalid response."
+      : reason === "wallet_authority_invalid"
+        ? "Replacement Wallet authority could not be validated."
+        : "Wallet Provider rejected the restore.";
+  const auditText = auditComplete ? "" : " Runtime audit evidence is also incomplete.";
+  return `Root recovered, Wallet restore incomplete (0 of ${expected}). ${reasonText}${auditText} Retry Recovery completion safely below.`;
 }
 
 function recoveryDownloadPassword() {
@@ -1937,6 +1996,24 @@ function showRecoveryPending(plan) {
   recoveryPendingNode.hidden = false;
   showRecoveryNote("", "muted");
   if (recoveryAttachButton) {
+    recoveryAttachButton.textContent = "Recover account";
+    recoveryAttachButton.disabled = !hasShellAccess();
+  }
+}
+
+function showWalletRestorePending(response) {
+  if (!recoveryPendingNode || !recoveryPendingTextNode) {
+    return;
+  }
+  recoveryPendingTextNode.textContent = recoveryImportIncompleteMessage(response);
+  recoveryPendingNode.hidden = false;
+  if (pendingRecoveryImport) {
+    pendingRecoveryImport.terminalRetryToken = readText(
+      response && response.runtime_audit && response.runtime_audit.retry_token,
+    );
+  }
+  if (recoveryAttachButton) {
+    recoveryAttachButton.textContent = "Retry Recovery completion";
     recoveryAttachButton.disabled = !hasShellAccess();
   }
 }
@@ -1950,6 +2027,7 @@ function clearRecoveryPending() {
     recoveryPendingTextNode.textContent = "";
   }
   if (recoveryAttachButton) {
+    recoveryAttachButton.textContent = "Recover account";
     recoveryAttachButton.disabled = false;
   }
 }
@@ -2453,11 +2531,11 @@ function readLaunchToken() {
   return new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
 }
 
-async function requestFreshPasskeyHomeToken(operation, request) {
-  return requestHomePasskeyAuthority(apiHomeToken, homeParentOrigin, operation, request);
+async function requestPasskeyStepUp(operation, request) {
+  return requestHomePasskeyStepUp(apiHomeToken, homeParentOrigin, operation, request);
 }
 
-function requestHomePasskeyAuthority(homeToken, parentOrigin, operation, request) {
+function requestHomePasskeyStepUp(homeToken, parentOrigin, operation, request) {
   if (!homeToken || window.top === window || !parentOrigin) {
     return Promise.reject(new Error("Open System from Home to verify your passkey."));
   }
@@ -2473,21 +2551,31 @@ function requestHomePasskeyAuthority(homeToken, parentOrigin, operation, request
         return;
       }
       const result = event.data && typeof event.data === "object" ? event.data : null;
-      if (result?.type !== "home:passkey-authority-result" || result.requestId !== requestId) {
+      if (
+        result?.type !== "elastos.home.passkey-step-up.result/v1"
+        || result.requestId !== requestId
+      ) {
         return;
       }
       window.clearTimeout(timeout);
       window.removeEventListener("message", onResult);
-      const freshToken = readText(result.homeToken);
-      if (freshToken) {
-        resolve(freshToken);
+      const stepUpToken = readText(result.stepUpToken);
+      const expectedKeys = stepUpToken
+        ? ["type", "requestId", "stepUpToken"]
+        : ["type", "requestId", "error"];
+      if (!hasExactKeys(result, expectedKeys)) {
+        reject(new Error("Passkey verification returned an invalid result."));
+        return;
+      }
+      if (stepUpToken) {
+        resolve(stepUpToken);
         return;
       }
       reject(new Error(readText(result.error) || "Passkey verification failed."));
     };
     window.addEventListener("message", onResult);
     window.top.postMessage({
-      type: "home:request-passkey-authority",
+      type: "elastos.home.passkey-step-up.request/v1",
       requestId,
       homeToken,
       operation,
@@ -2496,11 +2584,18 @@ function requestHomePasskeyAuthority(homeToken, parentOrigin, operation, request
   });
 }
 
-function shellHeaders(extra, authorityToken = apiHomeToken) {
+function shellHeaders(extra) {
   return Object.assign(
-    authorityToken.length > 0 ? { "x-elastos-home-token": authorityToken } : {},
+    apiHomeToken.length > 0 ? { "x-elastos-home-token": apiHomeToken } : {},
     extra || {},
   );
+}
+
+function hasExactKeys(value, expectedKeys) {
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
 }
 
 function readText(value) {

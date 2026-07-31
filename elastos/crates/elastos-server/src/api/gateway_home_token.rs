@@ -18,11 +18,11 @@ pub(crate) struct HomeLaunchTokenContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct HomeLaunchContext {
-    schema: String,
-    selected_resource: String,
-    executable_actor: String,
-    authority_actor: String,
+pub(in crate::api) struct HomeLaunchContext {
+    pub(in crate::api) schema: String,
+    pub(in crate::api) selected_resource: String,
+    pub(in crate::api) executable_actor: String,
+    pub(in crate::api) authority_actor: String,
 }
 
 impl HomeLaunchContext {
@@ -44,7 +44,7 @@ impl HomeLaunchContext {
         }
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(in crate::api) fn validate(&self) -> anyhow::Result<()> {
         if self.schema != HOME_LAUNCH_CONTEXT_SCHEMA
             || self.selected_resource.trim().is_empty()
             || self.executable_actor.trim().is_empty()
@@ -75,15 +75,6 @@ struct HomeLaunchTokenPayload {
     proof_binding_id: Option<String>,
     grant_id: String,
     non_delegatable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    intent: Option<HomeLaunchTokenIntent>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HomeLaunchTokenIntent {
-    operation: String,
-    request_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,11 +85,11 @@ struct HomeLaunchTokenEnvelope {
     signer_did: String,
 }
 
-#[derive(Debug)]
-struct RequiredHomeLaunchToken {
-    launch_id: String,
-    launch_context: HomeLaunchContext,
-    context: HomeLaunchTokenContext,
+#[derive(Debug, Clone)]
+pub(in crate::api) struct RequiredHomeLaunchToken {
+    pub(in crate::api) launch_id: String,
+    pub(in crate::api) launch_context: HomeLaunchContext,
+    pub(in crate::api) context: HomeLaunchTokenContext,
 }
 
 /// Runtime-owned Wallet authority produced only after launch-token validation.
@@ -234,13 +225,7 @@ pub(crate) fn issue_home_launch_token_with_context(
     app: &str,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<String> {
-    issue_home_launch_token_with_context_and_intent(
-        data_dir,
-        &HomeLaunchContext::direct(app),
-        context,
-        None,
-        now_ts(),
-    )
+    issue_home_launch_token_at(data_dir, &HomeLaunchContext::direct(app), context, now_ts())
 }
 
 pub(crate) fn issue_home_projection_launch_token_with_context(
@@ -249,76 +234,18 @@ pub(crate) fn issue_home_projection_launch_token_with_context(
     executable_actor: &str,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<String> {
-    issue_home_launch_token_with_context_and_intent(
+    issue_home_launch_token_at(
         data_dir,
         &HomeLaunchContext::projection(selected_resource, executable_actor),
         context,
-        None,
         now_ts(),
     )
 }
 
-#[cfg(test)]
-pub(crate) fn issue_home_launch_token_with_intent(
-    data_dir: &std::path::Path,
-    app: &str,
-    context: &HomeLaunchTokenContext,
-    operation: &str,
-    request: &serde_json::Value,
-) -> anyhow::Result<String> {
-    let operation = operation.trim();
-    if operation.is_empty() || operation.len() > 128 {
-        anyhow::bail!("invalid Home authority operation");
-    }
-    let request_bytes = serde_json::to_vec(request)?;
-    if request_bytes.len() > 64 * 1024 {
-        anyhow::bail!("Home authority request is too large");
-    }
-    issue_home_launch_token_with_context_and_intent(
-        data_dir,
-        &HomeLaunchContext::direct(app),
-        context,
-        Some(HomeLaunchTokenIntent {
-            operation: operation.to_string(),
-            request_sha256: hex::encode(Sha256::digest(request_bytes)),
-        }),
-        now_ts(),
-    )
-}
-
-pub(crate) fn issue_home_projection_launch_token_with_intent(
-    data_dir: &std::path::Path,
-    selected_resource: &str,
-    executable_actor: &str,
-    context: &HomeLaunchTokenContext,
-    operation: &str,
-    request: &serde_json::Value,
-) -> anyhow::Result<String> {
-    let operation = operation.trim();
-    if operation.is_empty() || operation.len() > 128 {
-        anyhow::bail!("invalid Home authority operation");
-    }
-    let request_bytes = serde_json::to_vec(request)?;
-    if request_bytes.len() > 64 * 1024 {
-        anyhow::bail!("Home authority request is too large");
-    }
-    issue_home_launch_token_with_context_and_intent(
-        data_dir,
-        &HomeLaunchContext::projection(selected_resource, executable_actor),
-        context,
-        Some(HomeLaunchTokenIntent {
-            operation: operation.to_string(),
-            request_sha256: hex::encode(Sha256::digest(request_bytes)),
-        }),
-        now_ts(),
-    )
-}
-
-fn issue_home_launch_token_with_context_and_intent(
+fn issue_home_launch_token_at(
     data_dir: &std::path::Path,
     launch_context: &HomeLaunchContext,
     context: &HomeLaunchTokenContext,
-    intent: Option<HomeLaunchTokenIntent>,
     issued_at: u64,
 ) -> anyhow::Result<String> {
     launch_context.validate()?;
@@ -341,7 +268,6 @@ fn issue_home_launch_token_with_context_and_intent(
             proof_binding_id: context.proof_binding_id.clone(),
             grant_id: context.grant_id.clone(),
             non_delegatable: true,
-            intent,
         },
         signature: String::new(),
         signer_did: String::new(),
@@ -366,11 +292,10 @@ fn issue_expired_home_launch_token_with_context(
     app: &str,
     context: &HomeLaunchTokenContext,
 ) -> anyhow::Result<String> {
-    issue_home_launch_token_with_context_and_intent(
+    issue_home_launch_token_at(
         data_dir,
         &HomeLaunchContext::direct(app),
         context,
-        None,
         now_ts().saturating_sub(HOME_LAUNCH_TOKEN_TTL_SECS + 1),
     )
 }
@@ -457,127 +382,6 @@ pub(crate) fn require_internal_shell_launch_grant_for_any_context(
     .map(|required| required.context)
 }
 
-pub(crate) fn consume_fresh_passkey_home_token(
-    data_dir: &std::path::Path,
-    token: &str,
-    expected_context: &HomeLaunchTokenContext,
-    expected_app: &str,
-    max_age_secs: u64,
-    operation: &str,
-    request: &serde_json::Value,
-) -> anyhow::Result<()> {
-    let token = token.trim();
-    if token.is_empty() {
-        anyhow::bail!("missing fresh passkey token");
-    }
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token)
-        .map_err(|_| anyhow::anyhow!("invalid fresh passkey token encoding"))?;
-    require_launch_token_schema(&bytes)
-        .map_err(|_| anyhow::anyhow!("unsupported fresh passkey token schema"))?;
-    let envelope: HomeLaunchTokenEnvelope = serde_json::from_slice(&bytes)
-        .map_err(|_| anyhow::anyhow!("invalid fresh passkey token payload"))?;
-    if envelope.payload.schema != HOME_LAUNCH_TOKEN_SCHEMA {
-        anyhow::bail!("unsupported fresh passkey token schema");
-    }
-    let local_did = load_existing_gateway_runtime_did(data_dir)
-        .ok_or_else(|| anyhow::anyhow!("gateway identity is unavailable"))?;
-    crate::crypto::verify_signed_json_envelope_against_dids(
-        &bytes,
-        HOME_LAUNCH_TOKEN_DOMAIN,
-        &[local_did],
-    )
-    .map_err(|err| anyhow::anyhow!("invalid fresh passkey token: {}", err))?;
-    let now = now_ts();
-    envelope.payload.launch_context.validate()?;
-    if !valid_home_launch_id(&envelope.payload.launch_id)
-        || !envelope.payload.non_delegatable
-        || envelope.payload.exp <= envelope.payload.iat
-        || envelope.payload.exp.saturating_sub(envelope.payload.iat) > HOME_LAUNCH_TOKEN_TTL_SECS
-    {
-        anyhow::bail!("fresh passkey token has an invalid launch contract");
-    }
-    if envelope.payload.launch_context.selected_resource != expected_app
-        || envelope.payload.launch_context.executable_actor != expected_app
-        || envelope.payload.launch_context.authority_actor != expected_app
-    {
-        anyhow::bail!("fresh passkey token is not authorized for this operation");
-    }
-    if envelope.payload.principal_id != expected_context.principal_id {
-        anyhow::bail!("fresh passkey token belongs to a different principal");
-    }
-    let Some(proof_binding_id) = envelope.payload.proof_binding_id.as_deref() else {
-        anyhow::bail!("fresh passkey token is not proof-bound");
-    };
-    if !proof_binding_id.starts_with("proof:passkey:") {
-        anyhow::bail!("fresh passkey verification is required");
-    }
-    if envelope.payload.exp <= now {
-        anyhow::bail!("fresh passkey token expired");
-    }
-    if envelope.payload.iat > now.saturating_add(60)
-        || now.saturating_sub(envelope.payload.iat) > max_age_secs
-    {
-        anyhow::bail!("fresh passkey token is too old");
-    }
-    let grant =
-        crate::auth::load_active_session_grant(data_dir, &envelope.payload.session_id, now)?;
-    if grant.principal_id != envelope.payload.principal_id
-        || grant.proof_binding_id != proof_binding_id
-        || grant.grant_id != envelope.payload.grant_id
-        || envelope.payload.session_id != expected_context.session_id
-        || envelope.payload.grant_id != expected_context.grant_id
-        || expected_context.proof_binding_id.as_deref() != Some(proof_binding_id)
-        || !grant.apps.iter().any(|app| app == expected_app)
-    {
-        anyhow::bail!("fresh passkey token authority context mismatch");
-    }
-    let operation = operation.trim();
-    if operation.is_empty() {
-        anyhow::bail!("fresh passkey operation is required");
-    }
-    let request_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(request)?));
-    let Some(intent) = envelope.payload.intent.as_ref() else {
-        anyhow::bail!("fresh passkey token is not bound to an operation");
-    };
-    if intent.operation != operation || intent.request_sha256 != request_sha256 {
-        anyhow::bail!("fresh passkey token intent mismatch");
-    }
-    let auth_state_path = crate::auth::auth_state_path(data_dir)?;
-    let root = auth_state_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("authentication state root is unavailable"))?
-        .join("consumed-passkey-proofs");
-    std::fs::create_dir_all(&root)?;
-    let token_sha256 = hex::encode(Sha256::digest(token.as_bytes()));
-    let path = root.join(format!("{token_sha256}.json"));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                anyhow::anyhow!("fresh passkey token has already been used")
-            } else {
-                anyhow::Error::from(err)
-            }
-        })?;
-    let marker = serde_json::json!({
-        "schema": "elastos.auth.consumed-passkey-proof/v1",
-        "token_sha256": token_sha256,
-        "principal_id": envelope.payload.principal_id,
-        "session_id": envelope.payload.session_id,
-        "selected_resource": envelope.payload.launch_context.selected_resource,
-        "executable_actor": envelope.payload.launch_context.executable_actor,
-        "operation": operation,
-        "request_sha256": request_sha256,
-        "consumed_at": now,
-    });
-    std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(&marker)?)?;
-    file.sync_all()?;
-    Ok(())
-}
-
 pub(crate) fn require_home_token(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
@@ -615,7 +419,7 @@ pub(in crate::api) fn require_runtime_wallet_authority(
     allowed_apps: &[&str],
 ) -> anyhow::Result<RuntimeWalletAuthority> {
     let required = require_home_launch_token_for_any_from(data_dir, headers, allowed_apps, None)?;
-    runtime_wallet_authority(required)
+    runtime_wallet_authority(&required)
 }
 
 pub(in crate::api) fn require_home_runtime_wallet_authority(
@@ -629,22 +433,30 @@ pub(in crate::api) fn require_home_runtime_wallet_authority(
         Some(HOME_SESSION_COOKIE),
         HomeLaunchOriginPolicy::Browser,
     )?;
-    runtime_wallet_authority(required)
+    runtime_wallet_authority(&required)
 }
 
-fn runtime_wallet_authority(
-    required: RequiredHomeLaunchToken,
+pub(in crate::api) fn runtime_wallet_authority(
+    required: &RequiredHomeLaunchToken,
 ) -> anyhow::Result<RuntimeWalletAuthority> {
     let context = VerifiedWalletInvocationContext::new(
-        required.context.principal_id,
-        required.context.session_id,
-        required.context.proof_binding_id,
-        required.context.grant_id,
-        required.launch_context.executable_actor,
-        required.launch_id,
+        required.context.principal_id.clone(),
+        required.context.session_id.clone(),
+        required.context.proof_binding_id.clone(),
+        required.context.grant_id.clone(),
+        required.launch_context.executable_actor.clone(),
+        required.launch_id.clone(),
     )
     .map_err(|err| anyhow::anyhow!("invalid verified Wallet authority: {err}"))?;
     Ok(RuntimeWalletAuthority { context })
+}
+
+pub(in crate::api) fn require_home_launch_token_binding(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+) -> anyhow::Result<RequiredHomeLaunchToken> {
+    require_home_launch_token_for_any_from(data_dir, headers, allowed_apps, None)
 }
 
 fn require_home_launch_token_for_any_from(
@@ -697,8 +509,52 @@ fn require_home_launch_token_for_any_from_expected_did(
 ) -> anyhow::Result<RequiredHomeLaunchToken> {
     let token = home_launch_token_credential(headers, cookie_name)?
         .ok_or_else(|| anyhow::anyhow!("missing home launch token"))?;
+    let required = require_home_launch_token_value_from_expected_did(
+        token.as_str(),
+        allowed_apps,
+        expected_did,
+        auth_data_dir,
+    )?;
+    match origin_policy {
+        HomeLaunchOriginPolicy::Browser
+            if required.launch_context.executable_actor == HOME_CAPSULE_ID =>
+        {
+            require_exact_home_browser_origin(headers)?
+        }
+        HomeLaunchOriginPolicy::Browser => require_capsule_browser_origin(headers)?,
+        HomeLaunchOriginPolicy::InternalShell => require_internal_shell_origin(headers)?,
+    }
+    Ok(required)
+}
+
+pub(in crate::api) fn require_carried_home_launch_token(
+    data_dir: &std::path::Path,
+    token: &str,
+    allowed_apps: &[&str],
+) -> anyhow::Result<RequiredHomeLaunchToken> {
+    let expected_did = load_existing_gateway_runtime_did(data_dir)
+        .ok_or_else(|| anyhow::anyhow!("gateway identity is unavailable"))?;
+    let auth_data_dir = home_launch_auth_data_dir(data_dir);
+    require_home_launch_token_value_from_expected_did(
+        token,
+        allowed_apps,
+        expected_did,
+        &auth_data_dir,
+    )
+}
+
+fn require_home_launch_token_value_from_expected_did(
+    token: &str,
+    allowed_apps: &[&str],
+    expected_did: String,
+    auth_data_dir: &std::path::Path,
+) -> anyhow::Result<RequiredHomeLaunchToken> {
+    let token = token.trim();
+    if token.is_empty() || token.len() > 16 * 1024 {
+        anyhow::bail!("invalid home launch token encoding");
+    }
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token.as_str())
+        .decode(token)
         .map_err(|_| anyhow::anyhow!("invalid home launch token encoding"))?;
     require_launch_token_schema(&bytes)?;
     let envelope: HomeLaunchTokenEnvelope = serde_json::from_slice(&bytes)
@@ -719,15 +575,6 @@ fn require_home_launch_token_for_any_from_expected_did(
         .any(|app| envelope.payload.launch_context.executable_actor == *app)
     {
         anyhow::bail!("home launch token is not authorized for this provider");
-    }
-    match origin_policy {
-        HomeLaunchOriginPolicy::Browser
-            if envelope.payload.launch_context.executable_actor == HOME_CAPSULE_ID =>
-        {
-            require_exact_home_browser_origin(headers)?
-        }
-        HomeLaunchOriginPolicy::Browser => require_capsule_browser_origin(headers)?,
-        HomeLaunchOriginPolicy::InternalShell => require_internal_shell_origin(headers)?,
     }
     let now = now_ts();
     if envelope.payload.exp <= now {
@@ -1550,155 +1397,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing same-origin provenance"));
-    }
-
-    #[test]
-    fn fresh_passkey_proof_is_app_scoped_and_single_use() {
-        let data_dir = tempfile::tempdir().unwrap();
-        elastos_identity::load_or_create_did(data_dir.path()).unwrap();
-        let now = now_ts();
-        let context = HomeLaunchTokenContext {
-            principal_id: "person:local:alice".to_string(),
-            session_id: "auth:alice".to_string(),
-            proof_binding_id: Some("proof:passkey:alice".to_string()),
-            grant_id: "grant:alice".to_string(),
-        };
-        crate::auth::store_session_grant(
-            data_dir.path(),
-            elastos_runtime::auth::AuthSessionGrantV1 {
-                schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.to_string(),
-                grant_id: context.grant_id.clone(),
-                session_id: context.session_id.clone(),
-                principal_id: context.principal_id.clone(),
-                proof_binding_id: context.proof_binding_id.clone().unwrap(),
-                issued_at: now,
-                expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
-                apps: vec![INBOX_CAPSULE_ID.to_string()],
-            },
-        )
-        .unwrap();
-        let request = serde_json::json!({ "request_id": "inspect-action-1" });
-        let token = issue_home_launch_token_with_intent(
-            data_dir.path(),
-            INBOX_CAPSULE_ID,
-            &context,
-            "inspect.approve",
-            &request,
-        )
-        .unwrap();
-
-        let home_projection = issue_home_projection_launch_token_with_intent(
-            data_dir.path(),
-            INBOX_CAPSULE_ID,
-            INBOX_CAPSULE_ID,
-            &context,
-            "inspect.approve",
-            &request,
-        )
-        .unwrap();
-        let delegated = consume_fresh_passkey_home_token(
-            data_dir.path(),
-            &home_projection,
-            &context,
-            INBOX_CAPSULE_ID,
-            180,
-            "inspect.approve",
-            &request,
-        )
-        .unwrap_err();
-        assert!(delegated.to_string().contains("not authorized"));
-
-        let wrong_app = consume_fresh_passkey_home_token(
-            data_dir.path(),
-            &token,
-            &context,
-            SYSTEM_CAPSULE_ID,
-            180,
-            "inspect.approve",
-            &request,
-        )
-        .unwrap_err();
-        assert!(wrong_app.to_string().contains("not authorized"));
-        consume_fresh_passkey_home_token(
-            data_dir.path(),
-            &token,
-            &context,
-            INBOX_CAPSULE_ID,
-            180,
-            "inspect.approve",
-            &request,
-        )
-        .unwrap();
-        let replay = consume_fresh_passkey_home_token(
-            data_dir.path(),
-            &token,
-            &context,
-            INBOX_CAPSULE_ID,
-            180,
-            "inspect.approve",
-            &request,
-        )
-        .unwrap_err();
-        assert!(replay.to_string().contains("already been used"));
-    }
-
-    #[test]
-    fn fresh_passkey_proof_rejects_substituted_intent() {
-        let data_dir = tempfile::tempdir().unwrap();
-        elastos_identity::load_or_create_did(data_dir.path()).unwrap();
-        let now = now_ts();
-        let context = HomeLaunchTokenContext {
-            principal_id: "person:local:alice".to_string(),
-            session_id: "auth:alice".to_string(),
-            proof_binding_id: Some("proof:passkey:alice".to_string()),
-            grant_id: "grant:alice".to_string(),
-        };
-        crate::auth::store_session_grant(
-            data_dir.path(),
-            elastos_runtime::auth::AuthSessionGrantV1 {
-                schema: elastos_runtime::auth::AuthSessionGrantV1::SCHEMA.to_string(),
-                grant_id: context.grant_id.clone(),
-                session_id: context.session_id.clone(),
-                principal_id: context.principal_id.clone(),
-                proof_binding_id: context.proof_binding_id.clone().unwrap(),
-                issued_at: now,
-                expires_at: now + HOME_LAUNCH_TOKEN_TTL_SECS,
-                apps: vec![INBOX_CAPSULE_ID.to_string()],
-            },
-        )
-        .unwrap();
-        let approved = serde_json::json!({ "request_id": "inspect-action-1" });
-        let token = issue_home_launch_token_with_intent(
-            data_dir.path(),
-            INBOX_CAPSULE_ID,
-            &context,
-            "inspect.approve",
-            &approved,
-        )
-        .unwrap();
-
-        let wrong_operation = consume_fresh_passkey_home_token(
-            data_dir.path(),
-            &token,
-            &context,
-            INBOX_CAPSULE_ID,
-            180,
-            "wallet.approve",
-            &approved,
-        )
-        .unwrap_err();
-        assert!(wrong_operation.to_string().contains("intent mismatch"));
-        let wrong_request = consume_fresh_passkey_home_token(
-            data_dir.path(),
-            &token,
-            &context,
-            INBOX_CAPSULE_ID,
-            180,
-            "inspect.approve",
-            &serde_json::json!({ "request_id": "inspect-action-2" }),
-        )
-        .unwrap_err();
-        assert!(wrong_request.to_string().contains("intent mismatch"));
     }
 
     #[test]

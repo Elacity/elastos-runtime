@@ -51,26 +51,14 @@ pub(super) async fn home_launch(
         .viewer
         .as_deref()
         .unwrap_or(target_summary.target.as_str());
-    let route = match req.authority.as_ref() {
-        Some(authority) => append_home_launch_token_with_intent(
-            &state.data_dir,
-            &target_summary.route,
-            &target_summary.target,
-            executable_actor,
-            &req.query,
-            &context,
-            &authority.operation,
-            &authority.request,
-        ),
-        None => append_home_launch_token(
-            &state.data_dir,
-            &target_summary.route,
-            &target_summary.target,
-            executable_actor,
-            &req.query,
-            &context,
-        ),
-    }
+    let route = append_home_launch_token(
+        &state.data_dir,
+        &target_summary.route,
+        &target_summary.target,
+        executable_actor,
+        &req.query,
+        &context,
+    )
     .map_err(gateway_internal_error)?;
     let route =
         crate::api::browser_capsules::canonical_browser_capsule_route(&route).map_err(|error| {
@@ -93,27 +81,6 @@ pub(super) async fn home_launch(
         launch_detail: launch.as_ref().and_then(|summary| summary.detail.clone()),
         capsule_id: launch.and_then(|summary| summary.capsule_id),
     }))
-}
-
-fn append_home_launch_token_with_intent(
-    data_dir: &std::path::Path,
-    route: &str,
-    selected_resource: &str,
-    executable_actor: &str,
-    query: &BTreeMap<String, String>,
-    context: &HomeLaunchTokenContext,
-    operation: &str,
-    request: &serde_json::Value,
-) -> anyhow::Result<String> {
-    let token = issue_home_projection_launch_token_with_intent(
-        data_dir,
-        selected_resource,
-        executable_actor,
-        context,
-        operation,
-        request,
-    )?;
-    append_home_launch_token_to_route(route, query, &token)
 }
 
 pub(super) fn append_home_launch_token(

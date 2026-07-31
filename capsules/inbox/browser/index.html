@@ -528,10 +528,10 @@
       }
     }
 
-    async function api(path, options, authorityToken = state.homeToken) {
+    async function api(path, options) {
       const request = Object.assign({ method: "GET" }, options || {});
       request.headers = Object.assign({}, request.headers || {}, {
-        "x-elastos-home-token": authorityToken,
+        "x-elastos-home-token": state.homeToken,
       });
       if (request.body && !request.headers["content-type"]) {
         request.headers["content-type"] = "application/json";
@@ -544,7 +544,7 @@
       return response.json();
     }
 
-    async function requestFreshPasskeyHomeToken(operation, request) {
+    async function requestPasskeyStepUp(operation, request) {
       if (!state.homeToken || window.top === window || !homeParentOrigin) {
         throw new Error("Open Inbox from Home to verify your passkey.");
       }
@@ -560,14 +560,26 @@
             return;
           }
           const result = event.data && typeof event.data === "object" ? event.data : null;
-          if (result?.type !== "home:passkey-authority-result" || result.requestId !== requestId) {
+          if (
+            result?.type !== "elastos.home.passkey-step-up.result/v1"
+            || result.requestId !== requestId
+          ) {
             return;
           }
           window.clearTimeout(timeout);
           window.removeEventListener("message", onResult);
-          const freshToken = typeof result.homeToken === "string" ? result.homeToken.trim() : "";
-          if (freshToken) {
-            resolve(freshToken);
+          const stepUpToken = typeof result.stepUpToken === "string"
+            ? result.stepUpToken.trim()
+            : "";
+          const expectedKeys = stepUpToken
+            ? ["type", "requestId", "stepUpToken"]
+            : ["type", "requestId", "error"];
+          if (!hasExactKeys(result, expectedKeys)) {
+            reject(new Error("Passkey verification returned an invalid result."));
+            return;
+          }
+          if (stepUpToken) {
+            resolve(stepUpToken);
             return;
           }
           reject(new Error(typeof result.error === "string" && result.error.trim()
@@ -576,7 +588,7 @@
         };
         window.addEventListener("message", onResult);
         window.top.postMessage({
-          type: "home:request-passkey-authority",
+          type: "elastos.home.passkey-step-up.request/v1",
           requestId,
           homeToken: state.homeToken,
           operation,
@@ -585,11 +597,18 @@
       });
     }
 
-    async function inboxAction(actionId, fields = {}, authorityToken = state.homeToken) {
+    function hasExactKeys(value, expectedKeys) {
+      const actual = Object.keys(value).sort();
+      const expected = expectedKeys.slice().sort();
+      return actual.length === expected.length
+        && actual.every((key, index) => key === expected[index]);
+    }
+
+    async function inboxAction(actionId, fields = {}) {
       return api("/api/apps/inbox/actions", {
         method: "POST",
         body: JSON.stringify(Object.assign({ action_id: actionId }, fields)),
-      }, authorityToken);
+      });
     }
 
     async function loadInbox() {
@@ -743,13 +762,13 @@
       button.disabled = true;
       setStatus("Confirm with your passkey to sign.");
       try {
-        const homeToken = await requestFreshPasskeyHomeToken("wallet.approve", {
+        const stepUpToken = await requestPasskeyStepUp("wallet.approve", {
           request_id: requestId,
           reason: "Approved in Inbox",
         });
         await inboxAction("wallet-approve-request:" + requestId, {
-          home_token: homeToken,
-        }, homeToken);
+          step_up_token: stepUpToken,
+        });
         setStatus("Request signed.");
         await loadInbox();
         notifyHome();
@@ -766,12 +785,12 @@
       button.disabled = true;
       setStatus("Confirm with your passkey to approve this System action.");
       try {
-        const homeToken = await requestFreshPasskeyHomeToken("inspect.approve", {
+        const stepUpToken = await requestPasskeyStepUp("inspect.approve", {
           request_id: requestId,
         });
         const outcome = await inboxAction("inspect-approve-request:" + requestId, {
-          home_token: homeToken,
-        }, homeToken);
+          step_up_token: stepUpToken,
+        });
         requireInspectActionResult(outcome, requestId, "completed");
         setStatus("System action approved.");
         await loadInbox();

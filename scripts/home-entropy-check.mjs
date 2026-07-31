@@ -1103,6 +1103,7 @@ const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_home_system.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_terminal.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_token.rs",
+  "elastos/crates/elastos-server/src/api/gateway_passkey_step_up.rs",
   "elastos/crates/elastos-server/src/api/gateway_inbox.rs",
   "elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs",
   "elastos/crates/elastos-server/src/api/gateway_models.rs",
@@ -1828,17 +1829,20 @@ assert(
   "Home must grant clipboard-read/write explicitly and only to the Browser iframe",
 );
 assert(
-    shellJs.includes('const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
-    shellJs.includes('data.type === "home:request-passkey-authority"') &&
-    shellJs.includes("const launched = await launchHomeTarget(context.targetId, {}, { operation, request })") &&
-    shellJs.includes("const scopedToken = homeLaunchTokenFromRoute") &&
-    !shellJs.includes(".then((homeToken) => reply({ homeToken }))") &&
-    shellAuthJs.includes("export function requestPasskeyHomeAuthority()") &&
-    inboxStyle.includes('type: "home:request-passkey-authority"') &&
-    systemJs.includes('type: "home:request-passkey-authority"') &&
-    walletApiSource.includes('type: "home:request-passkey-authority"') &&
+    shellJs.includes('const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
+    shellJs.includes('data.type === "elastos.home.passkey-step-up.request/v1"') &&
+    shellJs.includes("requestPasskeyStepUp(context.homeToken, operation, request)") &&
+    shellJs.includes(".then((stepUpToken) => reply({ stepUpToken }))") &&
+    !shellJs.includes("launchHomeTarget(context.targetId, {}, { operation, request })") &&
+    shellAuthJs.includes("export async function requestPasskeyStepUp(appToken, operation, request)") &&
+    shellAuthJs.includes("/api/auth/passkey-step-up/begin") &&
+    shellAuthJs.includes("/api/auth/passkey-step-up/complete") &&
+    shellAuthJs.includes("/api/auth/passkey-step-up/cancel") &&
+    inboxStyle.includes('type: "elastos.home.passkey-step-up.request/v1"') &&
+    systemJs.includes('type: "elastos.home.passkey-step-up.request/v1"') &&
+    walletApiSource.includes('type: "elastos.home.passkey-step-up.request/v1"') &&
     !shellWindows.includes("publickey-credentials-get"),
-  "Fresh passkey proof must run in the trusted Home host and return only capsule-scoped authority to validated Inbox, System, or Wallet frames",
+  "Exact-intent passkey step-up must run in the trusted Home host and return only separate step-up proof to validated Inbox, System, or Wallet frames",
 );
 assert(
   shellJs.includes('scope === "wallet"') &&
@@ -4404,11 +4408,11 @@ assert(
   "Inbox source-app opens must use Home orchestration",
 );
 const inboxWalletApprovalBoundary = {
-  inboxCanApproveWithFreshPasskey: inbox.includes("requestFreshPasskeyHomeToken") &&
-    inbox.includes('type: "home:request-passkey-authority"') &&
+  inboxCanApproveWithFreshPasskey: inbox.includes("requestPasskeyStepUp") &&
+    inbox.includes('type: "elastos.home.passkey-step-up.request/v1"') &&
     !inbox.includes("/api/auth/passkey/authenticate/begin") &&
     !inbox.includes("navigator.credentials.get") &&
-    inbox.includes("home_token: homeToken") &&
+    inbox.includes("step_up_token: stepUpToken") &&
     inbox.includes('inboxAction("wallet-approve-request:" + requestId'),
   inboxKeepsWalletDeepLink: inbox.includes("Review in Wallet") &&
     inbox.includes('openSource("wallet", { wallet_request: requestId })'),
@@ -4416,7 +4420,7 @@ const inboxWalletApprovalBoundary = {
     "fresh passkey verification is required to sign with a built-in wallet",
   ) &&
     gatewayInboxApi.includes(
-      "consume_fresh_passkey_home_token(",
+      "consume_passkey_step_up_token(",
     ) &&
     gatewayInboxApi.includes('"wallet.approve"') &&
     gatewayInboxApi.includes('"reason": "Approved in Inbox"'),
@@ -4426,10 +4430,10 @@ const inboxWalletApprovalBoundary = {
     gatewayInboxApi.includes('"Approved in Inbox"') &&
     gatewayInboxApi.includes("INBOX_CAPSULE_ID"),
   gatewayReadsInboxHomeToken: gatewayInboxApi.includes(
-    "action.home_token.as_deref()",
+    "action.step_up_token.as_deref()",
   ),
   gatewayModelAllowsInboxHomeToken: gatewayApi.includes(
-    "home_token: Option<String>",
+    "step_up_token: Option<String>",
   ),
   gatewayTestCoversInboxSigning: gatewayTests.includes(
     "test_inbox_approves_wallet_requests_through_runtime_wallet_signing",
@@ -4440,7 +4444,7 @@ const inboxWalletApprovalBoundary = {
     "Open Wallet to approve wallet signing requests.",
   ),
   homeDelegatesFreshAuthOnlyToApprovalSurfaces:
-    shellJs.includes('const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
+    shellJs.includes('const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
     !shellWindows.includes("publickey-credentials-get"),
   wciRequiresHostOwnedFreshAuth: wciAlignmentScript.includes(
     "Inbox passkey ceremonies must remain in the trusted Home host",
@@ -4448,7 +4452,7 @@ const inboxWalletApprovalBoundary = {
     wciAlignmentScript.includes(
       "Wallet passkey ceremonies must remain in the trusted Home host",
     ),
-  walletOwnsFreshPasskeyToken: walletJs.includes("requestFreshPasskeyHomeToken"),
+  walletOwnsFreshPasskeyToken: walletJs.includes("requestPasskeyStepUp"),
   walletReadsFocusedRequest: walletJs.includes('readQueryParam("wallet_request")'),
   walletMarksFocusedRequest: walletJs.includes("wallet-request-focused"),
 };
@@ -4460,15 +4464,15 @@ assert(
 const inboxInspectorApprovalBoundary = {
   inboxCanApproveWithFreshPasskey: inbox.includes("approveInspectRequest") &&
     inbox.includes('inboxAction("inspect-approve-request:" + requestId') &&
-    inbox.includes("requestFreshPasskeyHomeToken") &&
-    inbox.includes("home_token: homeToken") &&
+    inbox.includes("requestPasskeyStepUp") &&
+    inbox.includes("step_up_token: stepUpToken") &&
     inbox.includes("Confirm with your passkey to approve this System action."),
   gatewayRequiresFreshPasskeyForInspectApproval: gatewayInboxApi.includes(
     "fresh passkey verification is required to approve an Inspector action",
   ) &&
-    gatewayInboxApi.includes("approve_inspect_action_request(state, context, request_id, home_token)") &&
+    gatewayInboxApi.includes("approve_inspect_action_request(") &&
     gatewayInspectActions.includes("claim_bound_pending_inspect_action(") &&
-    gatewayInspectActions.includes("consume_fresh_passkey_home_token(") &&
+    gatewayInspectActions.includes("consume_passkey_step_up_token(") &&
     gatewayInspectActions.includes('"inspect.approve"') &&
     gatewayInspectActions.includes('json!({ "request_id": record.request_id })'),
   inboxRequiresExactInspectorReceipt: inbox.includes("requireInspectActionResult") &&
@@ -4481,11 +4485,11 @@ const inboxInspectorApprovalBoundary = {
     "inspect_action_requires_inbox_approval_before_dispatch",
   ) &&
     gatewayTests.includes("missing_fresh_proof") &&
-    gatewayTests.includes("inspect_action_rejects_stale_fresh_passkey_before_dispatch") &&
+    gatewayTests.includes("inspect_action_rejects_stale_step_up_before_dispatch") &&
     gatewayTests.includes('message.contains("auth session")') &&
     gatewayTests.includes("other_inbox_token.as_str()") &&
-    gatewayApi.includes("fresh_passkey_proof_is_app_scoped_and_single_use") &&
-    gatewayApi.includes("fresh_passkey_proof_rejects_substituted_intent"),
+    gatewayApi.includes("signed_step_up_is_exact_intent_and_single_use") &&
+    gatewayApi.includes("token_rejects_expiry_mixed_schema_and_extra_envelope_fields"),
   docsDeclareFreshInspectorProof: capsuleInspectorDocs.includes(
     "fresh same-principal passkey Home token",
   ) &&
@@ -6089,7 +6093,7 @@ assert(
     gbaLiveSmoke.includes("/storage/gba-emulator/save/") &&
     gatewayApi.includes("let executable_actor = target_summary") &&
     gatewayApi.includes("issue_home_projection_launch_token_with_context") &&
-    gatewayApi.includes("issue_home_projection_launch_token_with_intent") &&
+    !gatewayApi.includes("issue_home_projection_launch_token_with_intent") &&
     gatewayTests.includes("home_content_launch_uses_the_bound_gba_viewer_without_compute") &&
     gatewayTests.includes("selected_gba_content_token_rejects_resource_substitution") &&
     libraryMenuSmoke.includes('message?.target === "gba-emulator"') &&
@@ -6300,7 +6304,7 @@ assert(
 );
 assert(
   !systemJs.includes("navigator.credentials.get") ||
-    (systemJs.includes("requestFreshPasskeyHomeToken") &&
+    (systemJs.includes("requestPasskeyStepUp") &&
       systemJs.includes("/api/auth/recovery/full-export") &&
       systemJs.includes("elastos.full-recovery-bundle.export.request/v1")),
   "System must not duplicate general Home sign-in; fresh passkey verification is allowed only for Full Recovery Bundle export",
@@ -6546,8 +6550,20 @@ assert(
     systemJs.includes("recoveryDownloadPassword") &&
     systemJs.includes("elastos.full-recovery-bundle.export.request/v1") &&
     systemJs.includes("/api/auth/recovery/full-export") &&
+    systemJs.includes("elastos.full-recovery-bundle.import.response/v2") &&
+    systemJs.includes("Root recovered, Wallet restore incomplete") &&
+    systemJs.includes("required Runtime audit evidence is incomplete") &&
+    systemJs.includes("x-elastos-recovery-terminal") &&
+    systemJs.includes("Retry Recovery completion") &&
     authGatewayApi.includes("elastos.full-recovery-bundle/v1") &&
-    authGatewayApi.includes("wallet_recovery_keys_for_principal"),
+    authGatewayApi.includes("ExportManagedRecoverySet") &&
+    authGatewayApi.includes("ImportManagedRecoverySet") &&
+    !authGatewayApi.includes('"op": "accounts"') &&
+    !authGatewayApi.includes('"op": "export_managed_secret"') &&
+    !authGatewayApi.includes('"op": "import_managed_secret"') &&
+    recoveryKitLiveSmoke.includes(
+      "elastos.full-recovery-bundle.import.response/v2",
+    ),
   "System Recovery Kit download must be the full recover-everything path: data root plus built-in Wallet keys with optional password wrapping",
 );
 assert(
@@ -6555,7 +6571,11 @@ assert(
     system.includes('id="recovery-pending"') &&
     system.includes("Recover account") &&
     systemJs.includes("pendingRecoveryImport") &&
-    systemJs.includes("onRecoveryAttach"),
+    systemJs.includes("onRecoveryAttach") &&
+    systemJs.includes("showWalletRestorePending") &&
+    systemJs.includes("Retry Recovery completion") &&
+    systemJs.includes("wallet_restore") &&
+    systemJs.includes("runtime_audit"),
   "System Recovery Kit import must expose an explicit in-surface reassignment review before recovering an existing account",
 );
 assert(
@@ -9769,8 +9789,8 @@ assert(
   "Wallet account creation must be available from the main Wallet surface while rename and card action menus stay provider-backed",
 );
 assert(
-    walletJs.includes("requestFreshPasskeyHomeToken") &&
-    walletJs.includes('type: "home:request-passkey-authority"') &&
+    walletJs.includes("requestPasskeyStepUp") &&
+    walletJs.includes('type: "elastos.home.passkey-step-up.request/v1"') &&
     !walletJs.includes("/api/auth/passkey/authenticate/begin") &&
     !walletJs.includes("navigator.credentials.get") &&
     walletJs.includes("/recovery-key") &&
@@ -9787,10 +9807,10 @@ assert(
     gatewayApi.includes(
       "/api/apps/wallet/wallet/accounts/:account_id/recovery-key",
     ) &&
-    gatewayApi.includes("consume_fresh_passkey_home_token") &&
+    gatewayApi.includes("consume_passkey_step_up_token") &&
     gatewayApi.includes('"wallet.recovery-key.export"') &&
     gatewayTests.includes(
-      "test_wallet_recovery_key_requires_fresh_passkey_home_token",
+      "test_wallet_recovery_key_requires_passkey_step_up",
     ) &&
     gatewayTests.includes("test_wallet_app_can_delete_managed_account"),
   "Wallet recovery/delete routes must be provider-backed, passkey-gated, and covered by gateway tests",

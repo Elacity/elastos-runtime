@@ -383,7 +383,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     assert!(message.contains("fresh passkey verification is required"));
     assert!(calls.lock().await.is_empty());
 
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         INBOX_CAPSULE_ID,
         &inbox_token,
@@ -399,7 +399,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
                 .header("x-elastos-home-token", inbox_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -546,7 +546,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
                 .header("x-elastos-home-token", inbox_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","step_up_token":"{}"}}"#,
                     inbox_token.as_str()
                 )))
                 .unwrap(),
@@ -558,7 +558,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
 }
 
 #[tokio::test]
-async fn inspect_action_rejects_stale_fresh_passkey_before_dispatch() {
+async fn inspect_action_rejects_stale_step_up_before_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let (state, calls) = inspect_act_test_state(dir.path()).await;
     let app = gateway_router(state);
@@ -597,7 +597,7 @@ async fn inspect_action_rejects_stale_fresh_passkey_before_dispatch() {
                 .header("x-elastos-home-token", inbox_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","step_up_token":"{}"}}"#,
                     inbox_token.as_str()
                 )))
                 .unwrap(),
@@ -645,7 +645,7 @@ async fn inspect_action_audits_approved_dispatch_failure() {
     let request_id = request_payload["request_id"].as_str().unwrap();
 
     let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         INBOX_CAPSULE_ID,
         &inbox_token,
@@ -660,7 +660,7 @@ async fn inspect_action_audits_approved_dispatch_failure() {
                 .header("x-elastos-home-token", inbox_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -895,7 +895,7 @@ async fn inspect_action_rejects_stale_authority_plan_before_dispatch() {
                 .header("x-elastos-home-token", inbox_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","step_up_token":"{}"}}"#,
                     inbox_token.as_str()
                 )))
                 .unwrap(),
@@ -987,7 +987,7 @@ async fn inspect_action_rejects_changed_request_binding_before_dispatch() {
                 .header("x-elastos-home-token", inbox_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","step_up_token":"{}"}}"#,
                     inbox_token.as_str()
                 )))
                 .unwrap(),
@@ -1084,7 +1084,7 @@ async fn esp_inspect_action_rejects_every_mutated_binding_field_before_dispatch(
 
             let action_body = if action == "approve" {
                 format!(
-                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","step_up_token":"{}"}}"#,
                     inbox_token
                 )
             } else {
@@ -1243,7 +1243,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
     for action_prefix in ["inspect-approve-request", "inspect-deny-request"] {
         let body = if action_prefix == "inspect-approve-request" {
             format!(
-                r#"{{"action_id":"{action_prefix}:{request_id}","home_token":"{}"}}"#,
+                r#"{{"action_id":"{action_prefix}:{request_id}","step_up_token":"{}"}}"#,
                 other_inbox_token.as_str()
             )
         } else {
@@ -1300,7 +1300,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
         });
     assert!(requester_sees_request);
 
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         INBOX_CAPSULE_ID,
         &requester_inbox_token,
@@ -1315,7 +1315,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
                 .header("x-elastos-home-token", requester_inbox_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"inspect-approve-request:{request_id}","home_token":"{}"}}"#,
+                    r#"{{"action_id":"inspect-approve-request:{request_id}","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),

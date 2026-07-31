@@ -18,7 +18,6 @@ let unlockPresentation = "modal";
 let unlockCallback = null;
 let busy = false;
 let sessionRefreshInFlight = null;
-let passkeyAuthorityRequestInFlight = null;
 let autoSignInAttempted = false;
 
 export function isHomeAuthError(error) {
@@ -140,37 +139,62 @@ export async function signOutHome() {
   }
 }
 
-export function requestPasskeyHomeAuthority() {
+export async function requestPasskeyStepUp(appToken, operation, request) {
   if (!window.PublicKeyCredential) {
-    return Promise.reject(new Error("Passkey verification is unavailable in this browser."));
+    throw new Error("Passkey verification is unavailable in this browser.");
   }
-  if (!passkeyAuthorityRequestInFlight) {
-    passkeyAuthorityRequestInFlight = (async () => {
-      const begin = await fetchJson("/api/auth/passkey/authenticate/begin", { method: "POST" });
-      const credential = await navigator.credentials.get(toRequestOptions(begin.options));
-      if (!credential) {
-        throw new Error("Passkey verification was cancelled.");
-      }
-      const response = await fetchJson("/api/auth/passkey/authenticate/complete", {
+  let ceremonyId = "";
+  try {
+    const begin = await fetchJson("/api/auth/passkey-step-up/begin", {
+      method: "POST",
+      body: JSON.stringify({
+        schema: "elastos.auth.passkey-step-up.begin.request/v1",
+        app_token: appToken,
+        operation,
+        request,
+      }),
+    });
+    ceremonyId = readText(begin?.ceremony_id);
+    if (
+      begin?.schema !== "elastos.auth.passkey-step-up.begin.result/v1"
+      || !ceremonyId
+      || !begin?.options
+    ) {
+      throw new Error("Passkey verification returned an invalid challenge.");
+    }
+    const credential = await navigator.credentials.get(toRequestOptions(begin.options));
+    if (!credential) {
+      throw new Error("Passkey verification was cancelled.");
+    }
+    const response = await fetchJson("/api/auth/passkey-step-up/complete", {
+      method: "POST",
+      body: JSON.stringify({
+        schema: "elastos.auth.passkey-step-up.complete.request/v1",
+        ceremony_id: ceremonyId,
+        response: serializeAssertionCredential(credential),
+      }),
+    });
+    const stepUpToken = readText(response?.step_up_token);
+    if (
+      response?.schema !== "elastos.auth.passkey-step-up.complete.result/v1"
+      || !stepUpToken
+    ) {
+      throw new Error("Passkey verification did not return step-up proof.");
+    }
+    ceremonyId = "";
+    return stepUpToken;
+  } catch (error) {
+    if (ceremonyId) {
+      await fetchJson("/api/auth/passkey-step-up/cancel", {
         method: "POST",
         body: JSON.stringify({
-          ceremony_id: begin.ceremony_id,
-          response: serializeAssertionCredential(credential),
+          schema: "elastos.auth.passkey-step-up.cancel.request/v1",
+          ceremony_id: ceremonyId,
         }),
-      });
-      const homeToken = typeof response?.home_token === "string"
-        ? response.home_token.trim()
-        : "";
-      if (!homeToken) {
-        throw new Error("Passkey verification did not return authority.");
-      }
-      setHomeAuthorityToken(homeToken);
-      return homeToken;
-    })().finally(() => {
-      passkeyAuthorityRequestInFlight = null;
-    });
+      }).catch(() => {});
+    }
+    throw error;
   }
-  return passkeyAuthorityRequestInFlight;
 }
 
 function renderUnlockChecking() {

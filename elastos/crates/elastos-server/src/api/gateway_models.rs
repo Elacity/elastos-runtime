@@ -355,7 +355,7 @@ struct WalletApprovalApproveRequest {
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
-    home_token: Option<String>,
+    step_up_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -401,19 +401,19 @@ struct WalletAccountRenameRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WalletAccountDeleteRequest {
-    home_token: String,
+    step_up_token: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WalletAccountRecoveryKeyRequest {
-    home_token: String,
+    step_up_token: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WalletAccountImportRecoveryKeyRequest {
-    home_token: String,
+    step_up_token: String,
     recovery_key: serde_json::Value,
     #[serde(default)]
     label: Option<String>,
@@ -426,7 +426,7 @@ struct WalletSendTransactionRequest {
     chain_namespace: String,
     to: String,
     amount: String,
-    home_token: String,
+    step_up_token: String,
 }
 
 #[derive(Deserialize)]
@@ -825,15 +825,6 @@ struct HomeLaunchRequest {
     target: String,
     #[serde(default)]
     query: BTreeMap<String, String>,
-    #[serde(default)]
-    authority: Option<HomeLaunchAuthorityRequest>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HomeLaunchAuthorityRequest {
-    operation: String,
-    request: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -841,7 +832,7 @@ struct HomeLaunchAuthorityRequest {
 struct InboxActionRequest {
     action_id: String,
     #[serde(default)]
-    home_token: Option<String>,
+    step_up_token: Option<String>,
 }
 
 #[derive(Serialize)]

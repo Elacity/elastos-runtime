@@ -22,7 +22,7 @@ import {
   hideHomeUnlock,
   isHomeAuthError,
   refreshHomeSession,
-  requestPasskeyHomeAuthority,
+  requestPasskeyStepUp,
   showHomeUnlock,
   signOutHome,
 } from "./shell-auth.js?v=home-20260715a";
@@ -60,7 +60,7 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   documents: new Set(["chat-room"]),
   library: new Set(["archive-manager", "browser", "chat-room"]),
 });
-const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
+const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
 
 function hideHostBootMask() {
@@ -116,7 +116,7 @@ async function showHostAuthGate(options = {}) {
   await unlockReady;
 }
 
-async function launchHomeTarget(target, query = {}, authority = null) {
+async function launchHomeTarget(target, query = {}) {
   const body = {
     target,
     query: {
@@ -124,9 +124,6 @@ async function launchHomeTarget(target, query = {}, authority = null) {
       home_origin: window.location.origin,
     },
   };
-  if (authority) {
-    body.authority = authority;
-  }
   const launched = await fetchJson("/api/apps/home/launch", {
     method: "POST",
     body: JSON.stringify(body),
@@ -748,19 +745,24 @@ window.addEventListener("message", (event) => {
     preclaimActiveShellSwitch(data.activeShell);
     return;
   }
-  if (data.type === "home:request-passkey-authority") {
+  if (data.type === "elastos.home.passkey-step-up.request/v1") {
     const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
     const operation = typeof data.operation === "string" ? data.operation.trim() : "";
-    const request = data.request && typeof data.request === "object" ? data.request : null;
+    const request = data.request
+      && typeof data.request === "object"
+      && !Array.isArray(data.request)
+      ? data.request
+      : null;
     if (
       context.kind !== "app-frame"
-      || !PASSKEY_AUTHORITY_TARGETS.has(context.targetId)
+      || !PASSKEY_STEP_UP_TARGETS.has(context.targetId)
+      || !hasExactMessageKeys(data, ["type", "requestId", "homeToken", "operation", "request"])
       || !requestId
       || requestId.length > 128
       || !operation
       || operation.length > 128
       || !request
-      || JSON.stringify(request).length > 65_536
+      || !isBoundedStepUpRequest(request)
     ) {
       console.warn("home ignored unauthorized passkey request", context.targetId);
       return;
@@ -768,7 +770,7 @@ window.addEventListener("message", (event) => {
     const reply = (payload) => {
       try {
         event.source?.postMessage({
-          type: "home:passkey-authority-result",
+          type: "elastos.home.passkey-step-up.result/v1",
           requestId,
           ...payload,
         }, OPAQUE_FRAME_TARGET);
@@ -776,15 +778,8 @@ window.addEventListener("message", (event) => {
         console.error("home could not return passkey result", error);
       }
     };
-    requestPasskeyHomeAuthority()
-      .then(async () => {
-        const launched = await launchHomeTarget(context.targetId, {}, { operation, request });
-        const scopedToken = homeLaunchTokenFromRoute(launched?.route || "");
-        if (!scopedToken) {
-          throw new Error("Passkey verification did not return capsule authority.");
-        }
-        reply({ homeToken: scopedToken });
-      })
+    requestPasskeyStepUp(context.homeToken, operation, request)
+      .then((stepUpToken) => reply({ stepUpToken }))
       .catch((error) => reply({
         error: error instanceof Error ? error.message : "Passkey verification failed.",
       }));
@@ -998,6 +993,23 @@ function homeLaunchTokenFromRoute(route) {
     return new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
   } catch (_error) {
     return "";
+  }
+}
+
+function hasExactMessageKeys(message, expectedKeys) {
+  const actual = Object.keys(message).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+function isBoundedStepUpRequest(request) {
+  try {
+    const serialized = JSON.stringify(request);
+    return typeof serialized === "string"
+      && new TextEncoder().encode(serialized).byteLength <= 65_536;
+  } catch (_error) {
+    return false;
   }
 }
 

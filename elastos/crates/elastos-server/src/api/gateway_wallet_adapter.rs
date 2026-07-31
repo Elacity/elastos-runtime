@@ -206,7 +206,7 @@ mod tests {
                     return Ok(serde_json::json!({"status": "ok", "data": {}}));
                 }
                 ResponseMutation::StaleProtocol => {
-                    response["protocol_version"] = serde_json::json!("1.0");
+                    response["protocol_version"] = serde_json::json!("2.0");
                 }
                 ResponseMutation::MixedSchema => {
                     response["schema"] = serde_json::json!(WALLET_REQUEST_SCHEMA);

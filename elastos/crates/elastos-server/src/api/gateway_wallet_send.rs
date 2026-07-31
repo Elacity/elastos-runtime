@@ -7,16 +7,20 @@ pub(in crate::api::gateway) async fn wallet_app_send_transaction(
     headers: HeaderMap,
     Json(input): Json<WalletSendTransactionRequest>,
 ) -> Response {
-    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
         Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    let context = authority.home_launch_context();
-    if let Err(err) = consume_fresh_passkey_home_token(
+    let context = launch.context.clone();
+    if let Err(err) = consume_passkey_step_up_token(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        WALLET_CAPSULE_ID,
+        &input.step_up_token,
+        &launch,
         180,
         "wallet.send",
         &serde_json::json!({

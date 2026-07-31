@@ -159,9 +159,10 @@ pub(super) fn pending_inspect_action_requests(
 
 pub(super) async fn approve_inspect_action_request(
     state: &GatewayState,
+    launch: &RequiredHomeLaunchToken,
     context: &HomeLaunchTokenContext,
     request_id: &str,
-    home_token: &str,
+    step_up_token: &str,
 ) -> anyhow::Result<String> {
     let (mut record, request_binding) =
         claim_bound_pending_inspect_action(state, context, request_id, "approving")?;
@@ -206,11 +207,10 @@ pub(super) async fn approve_inspect_action_request(
         )?;
         anyhow::bail!(message);
     }
-    if let Err(err) = consume_fresh_passkey_home_token(
+    if let Err(err) = consume_passkey_step_up_token(
         &state.data_dir,
-        home_token,
-        context,
-        INBOX_CAPSULE_ID,
+        step_up_token,
+        launch,
         180,
         "inspect.approve",
         &serde_json::json!({ "request_id": record.request_id }),

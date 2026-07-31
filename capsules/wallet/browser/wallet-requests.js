@@ -13,7 +13,7 @@ export function createWalletRequests({
   fetchJson,
   notifyHomeSummaryChanged,
   openApprovalMethod,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   refreshWalletState,
   requestsNode,
   requestsPanelNode,
@@ -98,11 +98,11 @@ export function createWalletRequests({
     showStatus("Confirm with your passkey to sign.", "muted");
     try {
       const intent = { request_id: requestId, reason: "Approved in Wallet" };
-      const homeToken = await requestFreshPasskeyHomeToken("wallet.approve", intent);
+      const stepUpToken = await requestPasskeyStepUp("wallet.approve", intent);
       await fetchJson(`/api/apps/wallet/wallet/managed-approvals/${encodeURIComponent(requestId)}/approve`, {
         method: "POST",
-        headers: shellHeaders({ "content-type": "application/json" }, homeToken),
-        body: JSON.stringify({ reason: intent.reason, home_token: homeToken }),
+        headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ reason: intent.reason, step_up_token: stepUpToken }),
       });
       showStatus("Request signed.", "success");
       notifyHomeSummaryChanged();

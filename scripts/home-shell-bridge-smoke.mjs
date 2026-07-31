@@ -318,15 +318,26 @@ globalThis.fetch = async (url, init = {}) => {
   if (url === "/api/auth/sessions/refresh") {
     return jsonResponse({ home_token: "host-token" });
   }
-  if (url === "/api/auth/passkey/authenticate/begin") {
+  if (url === "/api/auth/passkey-step-up/begin") {
     return jsonResponse({
+      schema: "elastos.auth.passkey-step-up.begin.result/v1",
       ceremony_id: "ceremony-id",
       options: { publicKey: { challenge: "AQ", allowCredentials: [] } },
     });
   }
-  if (url === "/api/auth/passkey/authenticate/complete") {
+  if (url === "/api/auth/passkey-step-up/complete") {
     passkeyCompleted = true;
-    return jsonResponse({ home_token: "fresh-passkey-token" });
+    return jsonResponse({
+      schema: "elastos.auth.passkey-step-up.complete.result/v1",
+      step_up_token: "system-step-up-token",
+    });
+  }
+  if (url === "/api/auth/passkey-step-up/cancel") {
+    return jsonResponse({
+      schema: "elastos.auth.passkey-step-up.cancel.result/v1",
+      ceremony_id: body?.ceremony_id,
+      status: "cancelled",
+    });
   }
   if (url === "/api/apps/home/active-shell") {
     assert(body?.active === "home-gui", "root shell app-open must switch back to home-gui", body);
@@ -339,12 +350,12 @@ globalThis.fetch = async (url, init = {}) => {
     return jsonResponse({ active: "home-gui" });
   }
   if (url === "/api/apps/home/launch") {
-    const expectedToken = body?.authority ? "fresh-passkey-token" : "host-token";
     assert(
-      init.headers?.["x-elastos-home-token"] === expectedToken,
+      init.headers?.["x-elastos-home-token"] === "host-token",
       "Home launch did not use explicit host-held authority",
       init.headers,
     );
+    assert(!Object.hasOwn(body || {}, "authority"), "Home launch carried removed intent authority", body);
     if (body?.target === "home-cli") {
       assert(body?.query?.shell_mode === "root", "alternate shell must launch in root mode", body);
       return jsonResponse({
@@ -370,10 +381,9 @@ globalThis.fetch = async (url, init = {}) => {
       });
     }
     if (body?.target === "system") {
-      const token = body?.authority ? "system-fresh-token" : "system-token";
       return jsonResponse({
         attach_kind: "iframe",
-        route: `/apps/system/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=${token}`,
+        route: "/apps/system/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=system-token",
         target: "system",
         title: "System",
       });
@@ -611,10 +621,10 @@ sendChildMessage("null", browserFrameWindow, {
   homeToken: "browser-token",
 });
 const passkeyRequestsBeforeBrowser = requests.filter(
-  (request) => request.url === "/api/auth/passkey/authenticate/begin",
+  (request) => request.url === "/api/auth/passkey-step-up/begin",
 ).length;
 sendChildMessage("null", browserFrameWindow, {
-  type: "home:request-passkey-authority",
+  type: "elastos.home.passkey-step-up.request/v1",
   requestId: "browser-request",
   homeToken: "browser-token",
   operation: "browser.profile.delete",
@@ -622,7 +632,7 @@ sendChildMessage("null", browserFrameWindow, {
 });
 await new Promise((resolve) => setTimeout(resolve, 0));
 assert(
-  requests.filter((request) => request.url === "/api/auth/passkey/authenticate/begin").length ===
+  requests.filter((request) => request.url === "/api/auth/passkey-step-up/begin").length ===
     passkeyRequestsBeforeBrowser,
   "Browser frame obtained host passkey authority",
   requests,
@@ -657,8 +667,26 @@ sendChildMessage("null", systemFrameWindow, {
   type: "home:app-ready",
   homeToken: "system-token",
 });
+const stepUpBeginsBeforeClosedMessage = requests.filter(
+  (request) => request.url === "/api/auth/passkey-step-up/begin",
+).length;
 sendChildMessage("null", systemFrameWindow, {
-  type: "home:request-passkey-authority",
+  type: "elastos.home.passkey-step-up.request/v1",
+  requestId: "system-request-with-extra-field",
+  homeToken: "system-token",
+  operation: "auth.full-recovery-bundle.export",
+  request: { label: "Recovery Kit" },
+  authority: "legacy",
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(
+  requests.filter((request) => request.url === "/api/auth/passkey-step-up/begin").length ===
+    stepUpBeginsBeforeClosedMessage && !passkeyReply,
+  "Home accepted a passkey step-up message with an extra field",
+  requests,
+);
+sendChildMessage("null", systemFrameWindow, {
+  type: "elastos.home.passkey-step-up.request/v1",
   requestId: "system-request",
   homeToken: "system-token",
   operation: "auth.full-recovery-bundle.export",
@@ -668,11 +696,23 @@ for (let attempt = 0; attempt < 20 && !passkeyReply; attempt += 1) {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 assert(
-  passkeyReply?.payload?.homeToken === "system-fresh-token" &&
+  passkeyReply?.payload?.stepUpToken === "system-step-up-token" &&
+    passkeyReply?.payload?.type === "elastos.home.passkey-step-up.result/v1" &&
     passkeyReply?.payload?.requestId === "system-request" &&
     passkeyReply?.origin === "*",
   "validated System frame did not receive capsule-scoped passkey proof",
   passkeyReply,
+);
+const systemStepUpBegin = requests.find(
+  (request) => request.url === "/api/auth/passkey-step-up/begin",
+);
+assert(
+  systemStepUpBegin?.body?.schema === "elastos.auth.passkey-step-up.begin.request/v1" &&
+    systemStepUpBegin?.body?.app_token === "system-token" &&
+    systemStepUpBegin?.body?.operation === "auth.full-recovery-bundle.export" &&
+    systemStepUpBegin?.body?.request?.label === "Recovery Kit",
+  "Home did not bind the System step-up ceremony to the original launch and exact request",
+  systemStepUpBegin,
 );
 
 console.log("[home-shell-bridge] PASS");

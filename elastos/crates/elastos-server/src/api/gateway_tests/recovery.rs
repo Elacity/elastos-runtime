@@ -1,5 +1,177 @@
 use super::*;
 
+fn decode_recorded_wallet_requests(requests: &[serde_json::Value]) -> Vec<WalletProviderRequestV2> {
+    requests
+        .iter()
+        .filter(|request| request.get("op").and_then(Value::as_str) == Some(WALLET_BUS_OPERATION))
+        .map(|request| {
+            WalletProviderRequestV2::decode_at(
+                &serde_json::to_vec(
+                    request
+                        .get("request")
+                        .expect("recorded Wallet Bus request envelope"),
+                )
+                .unwrap(),
+                crate::auth::now_ts(),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+fn assert_wallet_authority(request: &WalletProviderRequestV2, expected: &RuntimeWalletAuthority) {
+    let expected = expected.verified_context();
+    assert_eq!(request.authority.principal_id, expected.principal_id());
+    assert_eq!(request.authority.session_id, expected.session_id());
+    assert_eq!(
+        request.authority.proof_binding_id.as_deref(),
+        expected.proof_binding_id()
+    );
+    assert_eq!(request.authority.grant_id, expected.grant_id());
+    assert_eq!(request.authority.actor, expected.actor());
+    assert_eq!(request.authority.launch_id, expected.launch_id());
+}
+
+async fn create_and_export_raw_full_recovery_bundle(
+    app: &axum::Router,
+    data_dir: &std::path::Path,
+    authority: &TestPasskeyAuthority,
+    principal: &crate::auth::PrincipalRecord,
+) -> Value {
+    let wallet_token = app_token_for_authority(data_dir, WALLET_CAPSULE_ID, authority);
+    let create = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/wallet/wallet/managed")
+                .header("x-elastos-home-token", wallet_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "chain_namespace": "eip155:20",
+                        "label": "Recovery test",
+                        "create_new": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let intent = json!({
+        "principal_id": authority.principal_id,
+        "localhost_root": principal.localhost_root,
+        "label": "Recovery test",
+        "download_password": null,
+    });
+    let step_up = step_up_token_for_app_context(
+        data_dir,
+        SYSTEM_CAPSULE_ID,
+        &authority.system_token,
+        "auth.full-recovery-bundle.export",
+        &intent,
+    );
+    let export = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/auth/recovery/full-export")
+                .header("x-elastos-home-token", authority.system_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.full-recovery-bundle.export.request/v1",
+                        "principal_id": intent["principal_id"],
+                        "localhost_root": intent["localhost_root"],
+                        "label": intent["label"],
+                        "step_up_token": step_up,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(export.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn import_raw_full_recovery_bundle(
+    app: &axum::Router,
+    token: &str,
+    principal_id: &str,
+    localhost_root: &str,
+    bundle: &Value,
+    reassign: bool,
+) -> (StatusCode, Value) {
+    import_raw_full_recovery_bundle_with_terminal_retry(
+        app,
+        token,
+        principal_id,
+        localhost_root,
+        bundle,
+        reassign,
+        None,
+    )
+    .await
+}
+
+async fn import_raw_full_recovery_bundle_with_terminal_retry(
+    app: &axum::Router,
+    token: &str,
+    principal_id: &str,
+    localhost_root: &str,
+    bundle: &Value,
+    reassign: bool,
+    terminal_retry_token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = test_browser_request("localhost:61180", "null")
+        .method("POST")
+        .uri("/api/auth/recovery/full-import")
+        .header("x-elastos-home-token", token)
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(terminal_retry_token) = terminal_retry_token {
+        request = request.header("x-elastos-recovery-terminal", terminal_retry_token);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.full-recovery-bundle.import.request/v1",
+                        "principal_id": principal_id,
+                        "localhost_root": localhost_root,
+                        "bundle": bundle,
+                        "reassign_to_current_principal": reassign,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or_else(|_| {
+            json!({
+                "error": String::from_utf8_lossy(&body),
+            })
+        }),
+    )
+}
+
 #[tokio::test]
 async fn test_legacy_recovery_kit_routes_are_absent() {
     let dir = tempfile::tempdir().unwrap();
@@ -49,11 +221,12 @@ async fn test_full_recovery_bundle_prevents_admin_exporting_guest_root() {
         "principal_id": guest.principal_id,
         "localhost_root": guest_principal.localhost_root,
         "label": "Guest root",
+        "download_password": null,
     });
-    let fresh_token = intent_token_for_authority_context(
+    let fresh_token = step_up_token_for_app_context(
         dir.path(),
         SYSTEM_CAPSULE_ID,
-        &admin,
+        &admin.system_token,
         "auth.full-recovery-bundle.export",
         &intent,
     );
@@ -71,7 +244,7 @@ async fn test_full_recovery_bundle_prevents_admin_exporting_guest_root() {
                         "principal_id": intent["principal_id"],
                         "localhost_root": intent["localhost_root"],
                         "label": intent["label"],
-                        "home_token": fresh_token,
+                        "step_up_token": fresh_token,
                     })
                     .to_string(),
                 ))
@@ -90,7 +263,8 @@ async fn test_full_recovery_bundle_prevents_admin_exporting_guest_root() {
 #[tokio::test]
 async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(wallet_chain_test_state(dir.path()).await);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let authority = passkey_authority_with_name(dir.path(), Some("alex"));
     let principal =
         crate::auth::load_principal_for_proof_binding(dir.path(), &authority.proof_binding_id)
@@ -131,11 +305,12 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
         "principal_id": authority.principal_id,
         "localhost_root": principal.localhost_root,
         "label": "Everything",
+        "download_password": "test password",
     });
-    let fresh_token = intent_token_for_authority_context(
+    let fresh_token = step_up_token_for_app_context(
         dir.path(),
         SYSTEM_CAPSULE_ID,
-        &authority,
+        &authority.system_token,
         "auth.full-recovery-bundle.export",
         &export_intent,
     );
@@ -153,7 +328,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
                         "principal_id": export_intent["principal_id"],
                         "localhost_root": export_intent["localhost_root"],
                         "label": export_intent["label"],
-                        "home_token": fresh_token,
+                        "step_up_token": fresh_token,
                         "download_password": "test password"
                     })
                     .to_string(),
@@ -180,7 +355,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     );
     assert!(!export_json.to_string().contains("private_key_hex"));
 
-    let delete_token = intent_token_for_app_context(
+    let delete_token = step_up_token_for_app_context(
         dir.path(),
         WALLET_CAPSULE_ID,
         &wallet_token,
@@ -196,7 +371,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
                 .header("x-elastos-home-token", wallet_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({ "home_token": delete_token }).to_string(),
+                    json!({ "step_up_token": delete_token }).to_string(),
                 ))
                 .unwrap(),
         )
@@ -233,9 +408,14 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     let import_json: serde_json::Value = serde_json::from_slice(&import_body).unwrap();
     assert_eq!(
         import_json["schema"],
-        "elastos.full-recovery-bundle.import.response/v1"
+        "elastos.full-recovery-bundle.import.response/v2"
     );
-    assert_eq!(import_json["wallet_recovery_key_count"], 1);
+    assert_eq!(import_json["wallet_restore"]["status"], "complete");
+    assert_eq!(import_json["wallet_restore"]["expected_count"], 1);
+    assert_eq!(import_json["wallet_restore"]["imported_count"], 1);
+    assert_eq!(import_json["wallet_restore"]["reason_code"], "none");
+    assert_eq!(import_json["runtime_audit"]["status"], "complete");
+    assert_eq!(import_json["runtime_audit"]["reason_code"], "none");
 
     let summary = app
         .oneshot(
@@ -260,12 +440,36 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
         .expect("restored wallet account");
     assert_eq!(restored_account["signing_available"], true);
     assert_eq!(restored_account["signing_status"], "managed_key_available");
+    assert_eq!(restored_account["label"], "Spending");
+
+    let expected_system_authority = runtime_wallet_authority_for_app_token(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        &authority.system_token,
+    );
+    let requests = wallet_provider.requests.lock().await;
+    let requests = decode_recorded_wallet_requests(&requests);
+    let export_request = requests
+        .iter()
+        .find(|request| request.operation.kind() == WalletOperationKind::ExportManagedRecoverySet)
+        .expect("typed managed recovery-set export");
+    let import_request = requests
+        .iter()
+        .find(|request| request.operation.kind() == WalletOperationKind::ImportManagedRecoverySet)
+        .expect("typed managed recovery-set import");
+    assert_wallet_authority(export_request, &expected_system_authority);
+    assert_wallet_authority(import_request, &expected_system_authority);
+    assert_eq!(
+        import_request.operation.kind(),
+        WalletOperationKind::ImportManagedRecoverySet
+    );
 }
 
 #[tokio::test]
 async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(wallet_chain_test_state(dir.path()).await);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let original = passkey_authority_with_name(dir.path(), Some("original"));
     let original_principal =
         crate::auth::load_principal_for_proof_binding(dir.path(), &original.proof_binding_id)
@@ -298,11 +502,12 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
         "principal_id": original.principal_id,
         "localhost_root": original_principal.localhost_root,
         "label": "Everything",
+        "download_password": "test password",
     });
-    let fresh_token = intent_token_for_authority_context(
+    let fresh_token = step_up_token_for_app_context(
         dir.path(),
         SYSTEM_CAPSULE_ID,
-        &original,
+        &original.system_token,
         "auth.full-recovery-bundle.export",
         &export_intent,
     );
@@ -320,7 +525,7 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
                         "principal_id": export_intent["principal_id"],
                         "localhost_root": export_intent["localhost_root"],
                         "label": export_intent["label"],
-                        "home_token": fresh_token,
+                        "step_up_token": fresh_token,
                         "download_password": "test password"
                     })
                     .to_string(),
@@ -343,6 +548,7 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
     let replacement_principal =
         crate::auth::load_principal_for_proof_binding(dir.path(), &replacement.proof_binding_id)
             .unwrap();
+    let replacement_session_id = replacement.session_id.clone();
 
     let import = app
         .clone()
@@ -367,11 +573,17 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
         )
         .await
         .unwrap();
-    assert_eq!(import.status(), StatusCode::OK);
+    let import_status = import.status();
     let import_body = axum::body::to_bytes(import.into_body(), usize::MAX)
         .await
         .unwrap();
-    let import_json: serde_json::Value = serde_json::from_slice(&import_body).unwrap();
+    let import_text = String::from_utf8(import_body.to_vec()).unwrap();
+    assert_eq!(
+        import_status,
+        StatusCode::OK,
+        "unexpected recovery response: {import_text}"
+    );
+    let import_json: serde_json::Value = serde_json::from_str(&import_text).unwrap();
     assert_eq!(import_json["status"], "reassigned");
     assert_eq!(import_json["principal_id"], original_principal.principal_id);
     assert_eq!(
@@ -382,7 +594,10 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
         import_json["previous_principal_id"],
         replacement_principal.principal_id
     );
-    assert_eq!(import_json["wallet_recovery_key_count"], 1);
+    assert_eq!(import_json["wallet_restore"]["status"], "complete");
+    assert_eq!(import_json["wallet_restore"]["expected_count"], 1);
+    assert_eq!(import_json["wallet_restore"]["imported_count"], 1);
+    assert_eq!(import_json["runtime_audit"]["status"], "complete");
     assert!(import_json["home_token"]
         .as_str()
         .is_some_and(|value| !value.is_empty()));
@@ -401,4 +616,491 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
         crate::auth::now_ts()
     )
     .unwrap());
+
+    let replacement_system_token = import_json["system_token"].as_str().unwrap();
+    let post_recovery_authority = runtime_wallet_authority_for_app_token(
+        dir.path(),
+        SYSTEM_CAPSULE_ID,
+        replacement_system_token,
+    );
+    assert_eq!(
+        post_recovery_authority.verified_context().principal_id(),
+        original_principal.principal_id
+    );
+    assert_eq!(
+        post_recovery_authority
+            .verified_context()
+            .proof_binding_id(),
+        Some(replacement.proof_binding_id.as_str())
+    );
+    assert_ne!(
+        post_recovery_authority.verified_context().session_id(),
+        replacement_session_id
+    );
+    let requests = wallet_provider.requests.lock().await;
+    let requests = decode_recorded_wallet_requests(&requests);
+    let import_request = requests
+        .iter()
+        .find(|request| request.operation.kind() == WalletOperationKind::ImportManagedRecoverySet)
+        .expect("post-reassignment typed managed recovery-set import");
+    assert_wallet_authority(import_request, &post_recovery_authority);
+}
+
+struct MalformedFullRecoveryWalletProvider;
+
+#[async_trait::async_trait]
+impl Provider for MalformedFullRecoveryWalletProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "malformed recovery test provider supports only raw requests".into(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["wallet"]
+    }
+
+    fn name(&self) -> &'static str {
+        "malformed-full-recovery-wallet-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        assert_eq!(
+            request.get("op").and_then(Value::as_str),
+            Some(WALLET_BUS_OPERATION)
+        );
+        let wallet_request = WalletProviderRequestV2::decode_at(
+            &serde_json::to_vec(request.get("request").unwrap()).unwrap(),
+            crate::auth::now_ts(),
+        )
+        .unwrap();
+        Ok(json!({
+            "status": "ok",
+            "data": WalletProviderResponseV2::for_request(
+                &wallet_request,
+                WalletResultV2::Ok {
+                    data: json!({
+                        "imported": true,
+                        "account_count": 1,
+                        "accounts": [],
+                    }),
+                },
+            ),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn test_full_recovery_bundle_returns_committed_root_and_retries_wallet_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let export_app = gateway_router(wallet_chain_test_state(dir.path()).await);
+    let original = passkey_authority_with_name(dir.path(), Some("original"));
+    let original_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &original.proof_binding_id)
+            .unwrap();
+    let bundle = create_and_export_raw_full_recovery_bundle(
+        &export_app,
+        dir.path(),
+        &original,
+        &original_principal,
+    )
+    .await;
+    assert_eq!(bundle["schema"], "elastos.full-recovery-bundle/v1");
+    assert_eq!(bundle["wallet_recovery_keys"].as_array().unwrap().len(), 1);
+
+    let replacement = passkey_authority_with_name_role(
+        dir.path(),
+        Some("replacement"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let replacement_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &replacement.proof_binding_id)
+            .unwrap();
+    let unavailable_app = gateway_router(test_state(dir.path()));
+    let (status, incomplete) = import_raw_full_recovery_bundle(
+        &unavailable_app,
+        &replacement.system_token,
+        &replacement_principal.principal_id,
+        &replacement_principal.localhost_root,
+        &bundle,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{incomplete}");
+    assert_eq!(
+        incomplete["schema"],
+        "elastos.full-recovery-bundle.import.response/v2"
+    );
+    assert_eq!(incomplete["status"], "reassigned");
+    assert_eq!(incomplete["wallet_restore"]["status"], "incomplete");
+    assert_eq!(incomplete["wallet_restore"]["expected_count"], 1);
+    assert_eq!(incomplete["wallet_restore"]["imported_count"], 0);
+    assert_eq!(
+        incomplete["wallet_restore"]["reason_code"],
+        "wallet_provider_unavailable"
+    );
+    assert_eq!(incomplete["runtime_audit"]["status"], "complete");
+    assert!(!incomplete.to_string().contains("private_key_hex"));
+    let home_token = incomplete["home_token"].as_str().unwrap().to_string();
+    let system_token = incomplete["system_token"].as_str().unwrap().to_string();
+
+    let retry_app = gateway_router(wallet_chain_test_state(dir.path()).await);
+    for (token, origin) in [
+        (&home_token, "http://localhost:61180"),
+        (&system_token, "null"),
+    ] {
+        let usable = retry_app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", origin)
+                    .uri("/api/auth/recovery/status")
+                    .header("x-elastos-home-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usable.status(), StatusCode::OK);
+    }
+    let old_token = retry_app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/auth/recovery/status")
+                .header("x-elastos-home-token", replacement.system_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            old_token.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "old pre-reassignment token remained usable: {}",
+        old_token.status()
+    );
+
+    let (retry_status, complete) = import_raw_full_recovery_bundle(
+        &retry_app,
+        &system_token,
+        incomplete["principal_id"].as_str().unwrap(),
+        incomplete["localhost_root"].as_str().unwrap(),
+        &bundle,
+        false,
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::OK, "{complete}");
+    assert_eq!(complete["status"], "imported");
+    assert_eq!(complete["wallet_restore"]["status"], "complete");
+    assert_eq!(complete["wallet_restore"]["expected_count"], 1);
+    assert_eq!(complete["wallet_restore"]["imported_count"], 1);
+    assert_eq!(complete["wallet_restore"]["reason_code"], "none");
+    assert_eq!(complete["runtime_audit"]["status"], "complete");
+
+    let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    let incomplete_audit = auth_state
+        .audit
+        .iter()
+        .find(|event| event.event_type == "auth.full_recovery_bundle.import_incomplete")
+        .expect("incomplete Wallet restore audit");
+    assert_eq!(incomplete_audit.result, "incomplete");
+    assert!(incomplete_audit
+        .reason
+        .contains("reason_code=wallet_provider_unavailable"));
+    assert!(incomplete_audit.reason.contains("expected_count=1"));
+    assert!(incomplete_audit.reason.contains("imported_count=0"));
+    let complete_audit = auth_state
+        .audit
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "auth.full_recovery_bundle.imported")
+        .expect("complete Wallet restore audit");
+    assert_eq!(complete_audit.result, "ok");
+    assert!(complete_audit.reason.contains("expected_count=1"));
+    assert!(complete_audit.reason.contains("imported_count=1"));
+    let audit_json = serde_json::to_string(&auth_state.audit).unwrap();
+    assert!(!audit_json.contains("private_key_hex"));
+    assert!(
+        !audit_json.contains("1111111111111111111111111111111111111111111111111111111111111111")
+    );
+}
+
+#[tokio::test]
+async fn test_full_recovery_bundle_returns_tokens_when_outcome_audit_needs_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let export_app = gateway_router(wallet_chain_test_state(dir.path()).await);
+    let original = passkey_authority_with_name(dir.path(), Some("original"));
+    let original_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &original.proof_binding_id)
+            .unwrap();
+    let bundle = create_and_export_raw_full_recovery_bundle(
+        &export_app,
+        dir.path(),
+        &original,
+        &original_principal,
+    )
+    .await;
+    let replacement = passkey_authority_with_name_role(
+        dir.path(),
+        Some("replacement"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let replacement_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &replacement.proof_binding_id)
+            .unwrap();
+    let (import_state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let import_app = gateway_router(import_state);
+    crate::auth::inject_recovery_reassignment_test_fault(
+        dir.path(),
+        crate::auth::RecoveryReassignmentTestFault::PostCommitOutcomeAudit,
+    );
+
+    let (status, incomplete) = import_raw_full_recovery_bundle(
+        &import_app,
+        &replacement.system_token,
+        &replacement_principal.principal_id,
+        &replacement_principal.localhost_root,
+        &bundle,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{incomplete}");
+    assert_eq!(incomplete["status"], "reassigned");
+    assert_eq!(incomplete["wallet_restore"]["status"], "complete");
+    assert_eq!(incomplete["runtime_audit"]["status"], "incomplete");
+    assert_eq!(
+        incomplete["runtime_audit"]["reason_code"],
+        "runtime_audit_unavailable"
+    );
+    let terminal_retry_token = incomplete["runtime_audit"]["retry_token"]
+        .as_str()
+        .expect("signed non-secret terminal retry token")
+        .to_string();
+    assert!(!incomplete.to_string().contains("private_key_hex"));
+    let home_token = incomplete["home_token"].as_str().unwrap();
+    let system_token = incomplete["system_token"].as_str().unwrap();
+    for (token, origin) in [
+        (home_token, "http://localhost:61180"),
+        (system_token, "null"),
+    ] {
+        let usable = import_app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", origin)
+                    .uri("/api/auth/recovery/status")
+                    .header("x-elastos-home-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usable.status(), StatusCode::OK);
+    }
+    let old_session = import_app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/auth/recovery/status")
+                .header("x-elastos-home-token", replacement.system_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            old_session.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "old pre-reassignment token remained usable: {}",
+        old_session.status()
+    );
+
+    let mut same_id_same_count_substitution = bundle.clone();
+    same_id_same_count_substitution["created_at"] =
+        json!(bundle["created_at"].as_u64().unwrap() + 1);
+    let mut kit_substitution = bundle.clone();
+    kit_substitution["data_kit"]["instructions"][0] =
+        json!("Substituted Recovery Kit instructions.");
+    let mut wallet_key_substitution = bundle.clone();
+    wallet_key_substitution["wallet_recovery_keys"][0]["private_key_hex"] =
+        json!("2222222222222222222222222222222222222222222222222222222222222222");
+    for (case, substituted) in [
+        ("same-id same-count bundle", same_id_same_count_substitution),
+        ("Recovery Kit", kit_substitution),
+        ("Wallet key", wallet_key_substitution),
+    ] {
+        let (substitution_status, substitution_response) =
+            import_raw_full_recovery_bundle_with_terminal_retry(
+                &import_app,
+                system_token,
+                incomplete["principal_id"].as_str().unwrap(),
+                incomplete["localhost_root"].as_str().unwrap(),
+                &substituted,
+                false,
+                Some(&terminal_retry_token),
+            )
+            .await;
+        assert_eq!(
+            substitution_status,
+            StatusCode::FORBIDDEN,
+            "{case} substitution reused terminal evidence: {substitution_response}"
+        );
+    }
+
+    let now = crate::auth::now_ts();
+    let cross_session_grant = AuthSessionGrantV1 {
+        schema: AuthSessionGrantV1::SCHEMA.to_string(),
+        grant_id: format!("grant:{}", uuid_like_token()),
+        session_id: format!("auth:{}", uuid_like_token()),
+        principal_id: incomplete["principal_id"].as_str().unwrap().to_string(),
+        proof_binding_id: replacement.proof_binding_id.clone(),
+        issued_at: now,
+        expires_at: now + 12 * 60 * 60,
+        apps: vec![SYSTEM_CAPSULE_ID.to_string()],
+    };
+    crate::auth::store_session_grant(dir.path(), cross_session_grant.clone()).unwrap();
+    let cross_session_token =
+        issue_home_launch_token_for_auth_grant(dir.path(), SYSTEM_CAPSULE_ID, &cross_session_grant)
+            .unwrap();
+    let (cross_session_status, cross_session_response) =
+        import_raw_full_recovery_bundle_with_terminal_retry(
+            &import_app,
+            &cross_session_token,
+            incomplete["principal_id"].as_str().unwrap(),
+            incomplete["localhost_root"].as_str().unwrap(),
+            &bundle,
+            false,
+            Some(&terminal_retry_token),
+        )
+        .await;
+    assert_eq!(
+        cross_session_status,
+        StatusCode::FORBIDDEN,
+        "cross-session terminal replay succeeded: {cross_session_response}"
+    );
+
+    let (retry_status, complete) = import_raw_full_recovery_bundle_with_terminal_retry(
+        &import_app,
+        system_token,
+        incomplete["principal_id"].as_str().unwrap(),
+        incomplete["localhost_root"].as_str().unwrap(),
+        &bundle,
+        false,
+        Some(&terminal_retry_token),
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::OK, "{complete}");
+    assert_eq!(complete["wallet_restore"]["status"], "complete");
+    assert_eq!(complete["runtime_audit"]["status"], "complete");
+    assert_eq!(complete["runtime_audit"]["reason_code"], "none");
+
+    let (repeat_status, repeated) = import_raw_full_recovery_bundle(
+        &import_app,
+        system_token,
+        incomplete["principal_id"].as_str().unwrap(),
+        incomplete["localhost_root"].as_str().unwrap(),
+        &bundle,
+        false,
+    )
+    .await;
+    assert_eq!(repeat_status, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated["wallet_restore"]["status"], "complete");
+    assert_eq!(repeated["runtime_audit"]["status"], "complete");
+
+    let requests = wallet_provider.requests.lock().await;
+    let import_count = decode_recorded_wallet_requests(&requests)
+        .iter()
+        .filter(|request| request.operation.kind() == WalletOperationKind::ImportManagedRecoverySet)
+        .count();
+    assert_eq!(
+        import_count, 1,
+        "terminal retry repeated a completed Wallet import"
+    );
+    let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    assert_eq!(
+        auth_state
+            .audit
+            .iter()
+            .filter(|event| event.event_type == "auth.recovery_kit.reassigned")
+            .count(),
+        1
+    );
+    assert_eq!(
+        auth_state
+            .audit
+            .iter()
+            .filter(|event| event.event_type == "auth.full_recovery_bundle.imported")
+            .count(),
+        1
+    );
+    assert!(!serde_json::to_string(&auth_state.audit)
+        .unwrap()
+        .contains("private_key_hex"));
+}
+
+#[tokio::test]
+async fn test_full_recovery_bundle_sanitizes_malformed_wallet_restore_after_reassignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let export_app = gateway_router(wallet_chain_test_state(dir.path()).await);
+    let original = passkey_authority_with_name(dir.path(), Some("original"));
+    let original_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &original.proof_binding_id)
+            .unwrap();
+    let bundle = create_and_export_raw_full_recovery_bundle(
+        &export_app,
+        dir.path(),
+        &original,
+        &original_principal,
+    )
+    .await;
+    let replacement = passkey_authority_with_name_role(
+        dir.path(),
+        Some("replacement"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let replacement_principal =
+        crate::auth::load_principal_for_proof_binding(dir.path(), &replacement.proof_binding_id)
+            .unwrap();
+    let malformed_state = wallet_chain_test_state_with_shared_wallet_provider(
+        dir.path(),
+        Arc::new(MalformedFullRecoveryWalletProvider),
+    )
+    .await;
+    let malformed_app = gateway_router(malformed_state);
+    let (status, response) = import_raw_full_recovery_bundle(
+        &malformed_app,
+        &replacement.system_token,
+        &replacement_principal.principal_id,
+        &replacement_principal.localhost_root,
+        &bundle,
+        true,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["status"], "reassigned");
+    assert_eq!(response["wallet_restore"]["status"], "incomplete");
+    assert_eq!(response["wallet_restore"]["expected_count"], 1);
+    assert_eq!(response["wallet_restore"]["imported_count"], 0);
+    assert_eq!(
+        response["wallet_restore"]["reason_code"],
+        "wallet_provider_invalid_response"
+    );
+    assert_eq!(response["runtime_audit"]["status"], "complete");
+    assert!(response["home_token"]
+        .as_str()
+        .is_some_and(|token| !token.is_empty()));
+    assert!(response["system_token"]
+        .as_str()
+        .is_some_and(|token| !token.is_empty()));
+    let serialized = response.to_string();
+    assert!(!serialized.contains("missing status"));
+    assert!(!serialized.contains("invalid Wallet provider"));
+    assert!(!serialized.contains("private_key_hex"));
 }

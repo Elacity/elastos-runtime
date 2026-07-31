@@ -2799,6 +2799,29 @@ impl Provider for MockWalletProvider {
                     "intent": intent,
                     "account_id": account_id,
                 }),
+                WalletProviderOperationV2::ExportManagedRecoveryKey { account_id } => json!({
+                    "op": "export_managed_secret",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "account_id": account_id,
+                }),
+                WalletProviderOperationV2::ImportManagedRecoveryKey {
+                    recovery_key,
+                    label,
+                } => json!({
+                    "op": "import_managed_secret",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "recovery_key": recovery_key,
+                    "label": label,
+                }),
+                WalletProviderOperationV2::ExportManagedRecoverySet {} => json!({
+                    "op": "export_managed_recovery_set",
+                    "principal_id": wallet_request.authority.principal_id,
+                }),
+                WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set } => json!({
+                    "op": "import_managed_recovery_set",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "recovery_set": recovery_set,
+                }),
                 WalletProviderOperationV2::Challenge {
                     domain,
                     uri,
@@ -2939,7 +2962,8 @@ impl Provider for MockWalletProvider {
                         &wallet_request,
                         WalletResultV2::Error {
                             code: "unsupported_operation".to_string(),
-                            message: "mock Wallet Bus v2 supports migrated account operations and wallet-link ceremonies".to_string(),
+                            message: "mock Wallet Bus v2 does not support this operation"
+                                .to_string(),
                         },
                     );
                     return Ok(json!({"status": "ok", "data": response}));
@@ -3091,6 +3115,8 @@ impl RecordingWalletProvider {
                             | "revoke_account"
                             | "rename_account"
                             | "set_default_account"
+                            | "export_managed_secret"
+                            | "import_managed_secret"
                     )
                 ),
                 "account operation emitted a retired raw Wallet request: {request}"
@@ -3121,6 +3147,18 @@ impl RecordingWalletProvider {
             let wallet_request =
                 WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts()).unwrap();
             let kind = wallet_request.operation.kind();
+            if matches!(
+                kind,
+                WalletOperationKind::ExportManagedRecoveryKey
+                    | WalletOperationKind::ImportManagedRecoveryKey
+            ) {
+                assert!(
+                    request["request"]["operation"]["params"]
+                        .get("principal_id")
+                        .is_none(),
+                    "managed Recovery Key operation supplied principal_id outside Runtime authority"
+                );
+            }
             if !matches!(
                 kind,
                 WalletOperationKind::ListAccounts
@@ -3128,6 +3166,8 @@ impl RecordingWalletProvider {
                     | WalletOperationKind::RevokeAccount
                     | WalletOperationKind::RenameAccount
                     | WalletOperationKind::SetDefaultAccount
+                    | WalletOperationKind::ExportManagedRecoveryKey
+                    | WalletOperationKind::ImportManagedRecoveryKey
             ) {
                 continue;
             }
@@ -3722,6 +3762,109 @@ impl MockWalletProvider {
                 Ok(json!({
                     "status": "ok",
                     "data": { "account": account.clone() }
+                }))
+            }
+            Some("export_managed_recovery_set") => {
+                let principal_id = required_test_str(request, "principal_id")?;
+                let accounts = self.accounts.lock().await;
+                let keys = accounts
+                    .iter()
+                    .filter(|account| {
+                        account.get("principal_id").and_then(Value::as_str) == Some(principal_id)
+                            && account.get("revoked_at").is_none()
+                            && account.get("connector_id").and_then(Value::as_str).is_none()
+                            && account
+                                .get("proof_type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|proof| {
+                                    proof == "managed_evm" || proof == "managed_btc_p2wpkh"
+                                })
+                    })
+                    .map(|account| {
+                        json!({
+                            "account_id": account["account_id"],
+                            "recovery_key": {
+                                "schema": "elastos.wallet.recovery-key/v1",
+                                "account_id": account["account_id"],
+                                "chain_namespace": account["chain_namespace"],
+                                "address": account["address"],
+                                "secret_type": "secp256k1_private_key_hex",
+                                "private_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+                                "note": "This account was created as an encrypted signing key, not a BIP39 seed phrase."
+                            },
+                            "label": account.get("label").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.wallet.managed-recovery-set/v1",
+                        "keys": keys,
+                    }
+                }))
+            }
+            Some("import_managed_recovery_set") => {
+                let principal_id = required_test_str(request, "principal_id")?;
+                let recovery_set = request
+                    .get("recovery_set")
+                    .ok_or_else(|| ProviderError::Provider("missing recovery_set".into()))?;
+                let entries = recovery_set
+                    .get("keys")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| ProviderError::Provider("missing recovery set keys".into()))?;
+                let mut imported_accounts = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let account_id = required_test_str(entry, "account_id")?;
+                    let recovery_key = entry
+                        .get("recovery_key")
+                        .ok_or_else(|| ProviderError::Provider("missing recovery_key".into()))?;
+                    if required_test_str(recovery_key, "account_id")? != account_id {
+                        return Ok(json!({
+                            "status": "error",
+                            "code": "invalid_request",
+                            "message": "managed recovery set account_id mismatch"
+                        }));
+                    }
+                    let chain_namespace = required_test_str(recovery_key, "chain_namespace")?;
+                    let address = required_test_str(recovery_key, "address")?;
+                    let proof_type =
+                        if chain_namespace == "bip122:000000000019d6689c085ae165831e93" {
+                            "managed_btc_p2wpkh"
+                        } else {
+                            "managed_evm"
+                        };
+                    imported_accounts.push(json!({
+                        "account_id": account_id,
+                        "principal_id": principal_id,
+                        "proof_binding_id": format!("proof:wallet:managed:{chain_namespace}:{address}"),
+                        "chain_namespace": chain_namespace,
+                        "address": address,
+                        "proof_type": proof_type,
+                        "signing_available": true,
+                        "signing_status": "managed_key_available",
+                        "label": entry.get("label").cloned().unwrap_or_else(|| json!("Imported")),
+                        "linked_at": crate::auth::now_ts()
+                    }));
+                }
+                let mut accounts = self.accounts.lock().await;
+                for imported in &imported_accounts {
+                    if let Some(existing) = accounts.iter_mut().find(|account| {
+                        account.get("principal_id") == imported.get("principal_id")
+                            && account.get("account_id") == imported.get("account_id")
+                    }) {
+                        *existing = imported.clone();
+                    } else {
+                        accounts.push(imported.clone());
+                    }
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "imported": true,
+                        "account_count": imported_accounts.len(),
+                        "accounts": imported_accounts,
+                    }
                 }))
             }
             Some("export_managed_secret") => {

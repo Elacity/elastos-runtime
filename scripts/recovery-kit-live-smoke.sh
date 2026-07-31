@@ -168,10 +168,16 @@ if [[ "$ALLOW_IMPORT" == "1" ]]; then
     printf '%s\n' "$imported" | jq -e \
         --arg principal_id "$principal" \
         --arg localhost_root "$localhost_root" \
-        '.schema == "elastos.full-recovery-bundle.import.response/v1"
+        '.schema == "elastos.full-recovery-bundle.import.response/v2"
          and .status == "imported"
          and .principal_id == $principal_id
-         and .localhost_root == $localhost_root' >/dev/null
+         and .localhost_root == $localhost_root
+         and .wallet_restore.status == "complete"
+         and (.wallet_restore.expected_count | type == "number")
+         and .wallet_restore.imported_count == .wallet_restore.expected_count
+         and .wallet_restore.reason_code == "none"
+         and .runtime_audit.status == "complete"
+         and .runtime_audit.reason_code == "none"' >/dev/null
 fi
 
 echo "[recovery-kit-live-smoke] OK"

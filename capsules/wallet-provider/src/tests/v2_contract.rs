@@ -147,11 +147,13 @@ fn wallet_contract_rejects_missing_and_mixed_protocol_versions() {
     let context = wallet_context("person:local:alice", "wallet");
     let request = wallet_request(
         &context,
-        WalletProviderOperationV2::ListAccounts {
-            include_revoked: false,
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: Some("must not dispatch".into()),
+            create_new: true,
         },
     );
-    for version in [Some("1.0"), Some("2.1"), None] {
+    for version in [Some("1.0"), Some("2.0"), Some("2.2"), None] {
         let mut value = serde_json::to_value(&request).unwrap();
         match version {
             Some(version) => value["protocol_version"] = json!(version),
@@ -171,6 +173,9 @@ fn wallet_contract_rejects_missing_and_mixed_protocol_versions() {
             matches!(response, Response::Error { ref code, .. } if code == "invalid_wallet_contract"),
             "mixed version unexpectedly reached Wallet: {response:?}"
         );
+        assert!(provider.store.accounts.is_empty());
+        assert!(provider.store.managed_wallets.is_empty());
+        assert!(provider.store.consumed_lifecycles.is_empty());
     }
 }
 

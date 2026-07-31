@@ -34,8 +34,8 @@ fn approval_callers_use_wallet_bus_v2_while_deferred_paths_remain_explicit() {
     let wallet_app_source = include_str!("../../gateway_wallet_app.rs");
     assert!(browser_source.contains(r#""op": "record_transaction_hash""#));
     assert!(send_source.contains(r#""op": "record_transaction_hash""#));
-    assert!(wallet_app_source.contains(r#""op": "export_managed_secret""#));
-    assert!(wallet_app_source.contains(r#""op": "import_managed_secret""#));
+    assert!(!wallet_app_source.contains(r#""op": "export_managed_secret""#));
+    assert!(!wallet_app_source.contains(r#""op": "import_managed_secret""#));
 }
 
 #[tokio::test]

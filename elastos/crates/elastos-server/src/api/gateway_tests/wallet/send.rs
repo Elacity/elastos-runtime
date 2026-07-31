@@ -50,7 +50,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
         "to": "0x2222222222222222222222222222222222222222",
         "amount": "0.000000000000000001",
     });
-    let send_token = intent_token_for_app_context(
+    let send_token = step_up_token_for_app_context(
         dir.path(),
         WALLET_CAPSULE_ID,
         &token,
@@ -67,7 +67,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
                 .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"account_id":"{account_id}","chain_namespace":"eip155:20","to":"0x2222222222222222222222222222222222222222","amount":"0.000000000000000001","home_token":"{}"}}"#,
+                    r#"{{"account_id":"{account_id}","chain_namespace":"eip155:20","to":"0x2222222222222222222222222222222222222222","amount":"0.000000000000000001","step_up_token":"{}"}}"#,
                     send_token
                 )))
                 .unwrap(),

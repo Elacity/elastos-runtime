@@ -14,18 +14,22 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 
-pub const WALLET_PROTOCOL_VERSION: &str = "2.0";
+pub const WALLET_PROTOCOL_VERSION: &str = "2.1";
 pub const WALLET_BUS_OPERATION: &str = "wallet_contract";
 pub const WALLET_REQUEST_SCHEMA: &str = "elastos.wallet.provider-request/v2";
 pub const WALLET_RESPONSE_SCHEMA: &str = "elastos.wallet.provider-response/v2";
 pub const ERC1271_EVIDENCE_SCHEMA: &str = "elastos.chain.erc1271_proof/v1";
+pub const MANAGED_RECOVERY_SET_SCHEMA: &str = "elastos.wallet.managed-recovery-set/v1";
 pub const DEFAULT_BITCOIN_NETWORK: &str = "bitcoin";
 pub const MAX_INVOCATION_TTL_SECS: u64 = 300;
 pub const MAX_CLOCK_SKEW_SECS: u64 = 60;
 pub const MAX_APPROVAL_PAYLOAD_BYTES: usize = 32 * 1024;
 pub const MAX_RECOVERY_KEY_BYTES: usize = 64 * 1024;
+pub const MAX_MANAGED_RECOVERY_SET_KEYS: usize = 64;
+pub const MAX_MANAGED_RECOVERY_SET_BYTES: usize = 256 * 1024;
 
 const REQUEST_ID_PREFIX: &str = "wallet-request:";
 const ERC1271_MAGIC_VALUE: &str = "0x1626ba7e";
@@ -235,6 +239,8 @@ pub enum WalletOperationKind {
     CompleteConnectorHandoff,
     ExportManagedRecoveryKey,
     ImportManagedRecoveryKey,
+    ExportManagedRecoverySet,
+    ImportManagedRecoverySet,
 }
 
 impl WalletOperationKind {
@@ -260,6 +266,8 @@ impl WalletOperationKind {
             Self::CompleteConnectorHandoff => "complete_connector_handoff",
             Self::ExportManagedRecoveryKey => "export_managed_recovery_key",
             Self::ImportManagedRecoveryKey => "import_managed_recovery_key",
+            Self::ExportManagedRecoverySet => "export_managed_recovery_set",
+            Self::ImportManagedRecoverySet => "import_managed_recovery_set",
         }
     }
 }
@@ -307,6 +315,79 @@ impl Erc1271ProofEvidenceV1 {
             return Err(ContractError::new(
                 "ERC-1271 evidence checked_at is required",
             ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRecoveryKeyEntryV1 {
+    pub account_id: String,
+    pub recovery_key: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl ManagedRecoveryKeyEntryV1 {
+    pub fn validate(&self) -> ContractResult<()> {
+        validate_required("managed recovery account_id", &self.account_id, 256)?;
+        if !self.recovery_key.is_object() {
+            return Err(ContractError::new(
+                "managed recovery key must be a non-null JSON object",
+            ));
+        }
+        validate_json_size(
+            "managed recovery key",
+            &self.recovery_key,
+            MAX_RECOVERY_KEY_BYTES,
+        )?;
+        validate_optional("managed recovery label", self.label.as_deref(), 256)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRecoverySetV1 {
+    pub schema: String,
+    pub keys: Vec<ManagedRecoveryKeyEntryV1>,
+}
+
+impl ManagedRecoverySetV1 {
+    pub fn new(keys: Vec<ManagedRecoveryKeyEntryV1>) -> ContractResult<Self> {
+        let recovery_set = Self {
+            schema: MANAGED_RECOVERY_SET_SCHEMA.to_string(),
+            keys,
+        };
+        recovery_set.validate()?;
+        Ok(recovery_set)
+    }
+
+    pub fn validate(&self) -> ContractResult<()> {
+        if self.schema != MANAGED_RECOVERY_SET_SCHEMA {
+            return Err(ContractError::new(
+                "unsupported managed recovery set schema",
+            ));
+        }
+        if self.keys.len() > MAX_MANAGED_RECOVERY_SET_KEYS {
+            return Err(ContractError::new(format!(
+                "managed recovery set exceeds {MAX_MANAGED_RECOVERY_SET_KEYS} keys"
+            )));
+        }
+        let mut account_ids = BTreeSet::new();
+        for key in &self.keys {
+            key.validate()?;
+            if !account_ids.insert(key.account_id.as_str()) {
+                return Err(ContractError::new(
+                    "managed recovery set contains duplicate account entries",
+                ));
+            }
+        }
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > MAX_MANAGED_RECOVERY_SET_BYTES {
+            return Err(ContractError::new(format!(
+                "managed recovery set exceeds {MAX_MANAGED_RECOVERY_SET_BYTES} bytes"
+            )));
         }
         Ok(())
     }
@@ -424,6 +505,10 @@ pub enum WalletProviderOperationV2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    ExportManagedRecoverySet {},
+    ImportManagedRecoverySet {
+        recovery_set: ManagedRecoverySetV1,
+    },
 }
 
 impl WalletProviderOperationV2 {
@@ -449,6 +534,8 @@ impl WalletProviderOperationV2 {
             Self::CompleteConnectorHandoff { .. } => WalletOperationKind::CompleteConnectorHandoff,
             Self::ExportManagedRecoveryKey { .. } => WalletOperationKind::ExportManagedRecoveryKey,
             Self::ImportManagedRecoveryKey { .. } => WalletOperationKind::ImportManagedRecoveryKey,
+            Self::ExportManagedRecoverySet { .. } => WalletOperationKind::ExportManagedRecoverySet,
+            Self::ImportManagedRecoverySet { .. } => WalletOperationKind::ImportManagedRecoverySet,
         }
     }
 
@@ -485,6 +572,8 @@ impl WalletProviderOperationV2 {
             Self::CompleteConnectorHandoff { .. } => "wallet:approval:connector-complete",
             Self::ExportManagedRecoveryKey { .. } => "wallet:recovery:export-managed",
             Self::ImportManagedRecoveryKey { .. } => "wallet:recovery:import-managed",
+            Self::ExportManagedRecoverySet { .. } => "wallet:recovery:export-managed-set",
+            Self::ImportManagedRecoverySet { .. } => "wallet:recovery:import-managed-set",
         }
     }
 
@@ -510,6 +599,8 @@ impl WalletProviderOperationV2 {
             Self::CompleteConnectorHandoff { .. } => "wallet.approval.connector.complete",
             Self::ExportManagedRecoveryKey { .. } => "wallet.recovery.managed.export",
             Self::ImportManagedRecoveryKey { .. } => "wallet.recovery.managed.import",
+            Self::ExportManagedRecoverySet { .. } => "wallet.recovery.managed-set.export",
+            Self::ImportManagedRecoverySet { .. } => "wallet.recovery.managed-set.import",
         }
     }
 
@@ -724,6 +815,8 @@ impl WalletProviderOperationV2 {
                 validate_json_size("recovery_key", recovery_key, MAX_RECOVERY_KEY_BYTES)?;
                 validate_optional("label", label.as_deref(), 256)
             }
+            Self::ExportManagedRecoverySet {} => Ok(()),
+            Self::ImportManagedRecoverySet { recovery_set } => recovery_set.validate(),
         }
     }
 }
@@ -1285,6 +1378,15 @@ mod tests {
         })
     }
 
+    fn recovery_set() -> ManagedRecoverySetV1 {
+        ManagedRecoverySetV1::new(vec![ManagedRecoveryKeyEntryV1 {
+            account_id: ACCOUNT_ID.to_string(),
+            recovery_key: recovery_key(),
+            label: Some("Recovered".to_string()),
+        }])
+        .unwrap()
+    }
+
     fn operations() -> Vec<(WalletOperationKind, WalletProviderOperationV2)> {
         vec![
             (
@@ -1447,6 +1549,16 @@ mod tests {
                     label: Some("Recovered".to_string()),
                 },
             ),
+            (
+                WalletOperationKind::ExportManagedRecoverySet,
+                WalletProviderOperationV2::ExportManagedRecoverySet {},
+            ),
+            (
+                WalletOperationKind::ImportManagedRecoverySet,
+                WalletProviderOperationV2::ImportManagedRecoverySet {
+                    recovery_set: recovery_set(),
+                },
+            ),
         ]
     }
 
@@ -1477,13 +1589,17 @@ mod tests {
     #[test]
     fn wire_contract_constants_are_exact() {
         assert_eq!(WALLET_BUS_OPERATION, "wallet_contract");
-        assert_eq!(WALLET_PROTOCOL_VERSION, "2.0");
+        assert_eq!(WALLET_PROTOCOL_VERSION, "2.1");
         assert_eq!(WALLET_REQUEST_SCHEMA, "elastos.wallet.provider-request/v2");
         assert_eq!(
             WALLET_RESPONSE_SCHEMA,
             "elastos.wallet.provider-response/v2"
         );
         assert_eq!(ERC1271_EVIDENCE_SCHEMA, "elastos.chain.erc1271_proof/v1");
+        assert_eq!(
+            MANAGED_RECOVERY_SET_SCHEMA,
+            "elastos.wallet.managed-recovery-set/v1"
+        );
     }
 
     #[test]
@@ -1605,6 +1721,105 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("exceeds 65536 serialized bytes"));
+    }
+
+    #[test]
+    fn managed_recovery_sets_are_closed_bounded_and_unambiguous() {
+        let recovery_set = recovery_set();
+        recovery_set.validate().unwrap();
+        request(WalletProviderOperationV2::ImportManagedRecoverySet {
+            recovery_set: recovery_set.clone(),
+        });
+
+        let duplicate = ManagedRecoverySetV1::new(vec![
+            recovery_set.keys[0].clone(),
+            recovery_set.keys[0].clone(),
+        ])
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("duplicate account"));
+
+        let too_many = (0..=MAX_MANAGED_RECOVERY_SET_KEYS)
+            .map(|index| ManagedRecoveryKeyEntryV1 {
+                account_id: format!("wallet:eip155:20:0x{index:040x}"),
+                recovery_key: json!({"opaque": index}),
+                label: None,
+            })
+            .collect();
+        assert!(ManagedRecoverySetV1::new(too_many)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds 64 keys"));
+
+        let oversized_key = ManagedRecoverySetV1::new(vec![ManagedRecoveryKeyEntryV1 {
+            account_id: ACCOUNT_ID.to_string(),
+            recovery_key: json!({"opaque": "x".repeat(MAX_RECOVERY_KEY_BYTES)}),
+            label: None,
+        }])
+        .unwrap_err();
+        assert!(oversized_key
+            .to_string()
+            .contains("exceeds 65536 serialized bytes"));
+
+        let aggregate = (0..5)
+            .map(|index| ManagedRecoveryKeyEntryV1 {
+                account_id: format!("wallet:eip155:20:0x{index:040x}"),
+                recovery_key: json!({"opaque": "x".repeat(60 * 1024)}),
+                label: None,
+            })
+            .collect();
+        assert!(ManagedRecoverySetV1::new(aggregate)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds 262144 bytes"));
+
+        for recovery_key in [Value::Null, json!("opaque-secret"), json!(["secret"])] {
+            assert!(ManagedRecoverySetV1::new(vec![ManagedRecoveryKeyEntryV1 {
+                account_id: ACCOUNT_ID.to_string(),
+                recovery_key,
+                label: None,
+            }])
+            .is_err());
+        }
+
+        let request = request(WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set });
+        let base = serde_json::to_value(&request).unwrap();
+        for path in ["set", "entry"] {
+            let mut candidate = base.clone();
+            match path {
+                "set" => candidate["operation"]["params"]["recovery_set"]["unknown"] = json!(true),
+                "entry" => {
+                    candidate["operation"]["params"]["recovery_set"]["keys"][0]["unknown"] =
+                        json!(true)
+                }
+                _ => unreachable!(),
+            }
+            assert!(WalletProviderRequestV2::decode_at(
+                &serde_json::to_vec(&candidate).unwrap(),
+                NOW + 1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+        }
+        for forbidden in [
+            "principal_id",
+            "actor",
+            "session_id",
+            "proof",
+            "grant",
+            "launch_id",
+            "lifecycle_id",
+        ] {
+            let mut candidate = base.clone();
+            candidate["operation"]["params"][forbidden] = json!("caller-controlled");
+            assert!(WalletProviderRequestV2::decode_at(
+                &serde_json::to_vec(&candidate).unwrap(),
+                NOW + 1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+        }
     }
 
     #[test]
@@ -1821,11 +2036,12 @@ mod tests {
         });
         let value = serde_json::to_value(request).unwrap();
         for (schema, version) in [
-            (None, Some("2.0")),
+            (None, Some("2.1")),
             (Some(WALLET_REQUEST_SCHEMA), None),
-            (Some("elastos.wallet.provider-request/v1"), Some("2.0")),
+            (Some("elastos.wallet.provider-request/v1"), Some("2.1")),
             (Some(WALLET_REQUEST_SCHEMA), Some("1.0")),
-            (Some(WALLET_REQUEST_SCHEMA), Some("2.1")),
+            (Some(WALLET_REQUEST_SCHEMA), Some("2.0")),
+            (Some(WALLET_REQUEST_SCHEMA), Some("2.2")),
         ] {
             let mut candidate = value.clone();
             match schema {
@@ -2065,11 +2281,12 @@ mod tests {
         }
 
         for (schema, version) in [
-            (None, Some("2.0")),
+            (None, Some("2.1")),
             (Some(WALLET_RESPONSE_SCHEMA), None),
-            (Some("elastos.wallet.provider-response/v1"), Some("2.0")),
+            (Some("elastos.wallet.provider-response/v1"), Some("2.1")),
             (Some(WALLET_RESPONSE_SCHEMA), Some("1.0")),
-            (Some(WALLET_RESPONSE_SCHEMA), Some("2.1")),
+            (Some(WALLET_RESPONSE_SCHEMA), Some("2.0")),
+            (Some(WALLET_RESPONSE_SCHEMA), Some("2.2")),
         ] {
             let mut candidate = serde_json::to_value(&response).unwrap();
             match schema {
@@ -2121,6 +2338,8 @@ mod tests {
             WalletOperationKind::CompleteConnectorHandoff,
             WalletOperationKind::ExportManagedRecoveryKey,
             WalletOperationKind::ImportManagedRecoveryKey,
+            WalletOperationKind::ExportManagedRecoverySet,
+            WalletOperationKind::ImportManagedRecoverySet,
         ] {
             assert!(kinds.contains(&required));
         }

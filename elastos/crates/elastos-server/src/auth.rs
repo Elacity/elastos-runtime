@@ -7,6 +7,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+#[cfg(test)]
+use std::collections::HashMap;
+
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 
@@ -52,6 +55,48 @@ const PRINCIPAL_ROOT_OBJECT_AAD_DOMAIN: &str = "elastos.principal-root.object.v1
 
 static AUTH_STATE_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static AUDIT_CHAIN_ACTIVATION_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryReassignmentTestFault {
+    TokenPreparation,
+    AuditChainRejection,
+    AuthStateSave,
+    PostCommitOutcomeAudit,
+}
+
+#[cfg(test)]
+static RECOVERY_REASSIGNMENT_TEST_FAULTS: OnceLock<
+    Mutex<HashMap<PathBuf, RecoveryReassignmentTestFault>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn inject_recovery_reassignment_test_fault(
+    data_dir: &Path,
+    fault: RecoveryReassignmentTestFault,
+) {
+    RECOVERY_REASSIGNMENT_TEST_FAULTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("recovery reassignment test fault lock")
+        .insert(data_dir.to_path_buf(), fault);
+}
+
+#[cfg(test)]
+pub(crate) fn consume_recovery_reassignment_test_fault(
+    data_dir: &Path,
+    fault: RecoveryReassignmentTestFault,
+) -> anyhow::Result<()> {
+    let faults = RECOVERY_REASSIGNMENT_TEST_FAULTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut faults = faults
+        .lock()
+        .map_err(|_| anyhow!("recovery reassignment test fault lock poisoned"))?;
+    if faults.get(data_dir) == Some(&fault) {
+        faults.remove(data_dir);
+        anyhow::bail!("injected recovery reassignment {fault:?} failure");
+    }
+    Ok(())
+}
 
 fn auth_state_mutation_lock() -> &'static Mutex<()> {
     AUTH_STATE_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
@@ -654,6 +699,11 @@ pub fn verify_auth_audit_chain_ready(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
+    #[cfg(test)]
+    consume_recovery_reassignment_test_fault(
+        data_dir,
+        RecoveryReassignmentTestFault::AuthStateSave,
+    )?;
     with_audit_chain_activation_lock(data_dir, || {
         verify_audit_chain(data_dir, state)?;
         let path = auth_state_path(data_dir)?;
@@ -1430,21 +1480,65 @@ pub fn ensure_recovered_root_reassignable(
     Ok(())
 }
 
-pub fn reassign_passkey_binding_to_recovered_root(
+pub struct RecoveredRootReassignment {
+    pub proof_binding_id: String,
+    pub recovered_principal_id: String,
+    pub recovered_localhost_root: String,
+    pub protection: PrincipalRootProtectionV1,
+    pub replacement_grant: AuthSessionGrantV1,
+    pub signed_audit_event: RuntimeAuditEventV1,
+    pub updated_at: u64,
+}
+
+pub fn commit_recovered_root_reassignment(
     data_dir: &Path,
-    proof_binding_id: &str,
-    recovered_principal_id: &str,
-    recovered_localhost_root: &str,
-    updated_at: u64,
+    reassignment: RecoveredRootReassignment,
 ) -> anyhow::Result<PrincipalRecord> {
+    let RecoveredRootReassignment {
+        proof_binding_id,
+        recovered_principal_id,
+        recovered_localhost_root,
+        protection,
+        replacement_grant,
+        signed_audit_event,
+        updated_at,
+    } = reassignment;
+    validate_principal_root_protection(&protection).map_err(anyhow::Error::msg)?;
+    if protection.principal_id != recovered_principal_id
+        || protection.localhost_root != recovered_localhost_root
+    {
+        anyhow::bail!("recovery protection does not match the recovered root");
+    }
+    validate_recovery_replacement_grant(
+        &replacement_grant,
+        &proof_binding_id,
+        &recovered_principal_id,
+        updated_at,
+    )?;
+    validate_recovery_reassignment_audit(
+        &signed_audit_event,
+        &proof_binding_id,
+        &recovered_principal_id,
+        &replacement_grant.session_id,
+        updated_at,
+    )?;
+    let (_, runtime_did) = elastos_identity::load_or_create_did(data_dir)?;
+    verify_audit_event_signature(&signed_audit_event, &runtime_did)?;
+
     mutate_auth_state(data_dir, |state| {
         normalize_principal_records(state);
         ensure_recovered_root_reassignable_in_state(
             state,
-            proof_binding_id,
-            recovered_principal_id,
-            recovered_localhost_root,
+            &proof_binding_id,
+            &recovered_principal_id,
+            &recovered_localhost_root,
         )?;
+        if state.sessions.iter().any(|stored| {
+            stored.grant.session_id == replacement_grant.session_id
+                || stored.grant.grant_id == replacement_grant.grant_id
+        }) {
+            anyhow::bail!("replacement recovery session collides with existing auth state");
+        }
 
         let removed_proof_binding_ids = state
             .principals
@@ -1466,8 +1560,8 @@ pub fn reassign_passkey_binding_to_recovered_root(
             .iter_mut()
             .find(|principal| principal.proof_binding_id == proof_binding_id)
             .ok_or_else(|| anyhow!("passkey proof binding not found after reassignment cleanup"))?;
-        principal.principal_id = recovered_principal_id.to_string();
-        principal.localhost_root = recovered_localhost_root.to_string();
+        principal.principal_id = recovered_principal_id;
+        principal.localhost_root = recovered_localhost_root;
         principal.updated_at = updated_at;
         let record = principal.clone();
         for stored in &mut state.sessions {
@@ -1479,8 +1573,91 @@ pub fn reassign_passkey_binding_to_recovered_root(
                 stored.revoked_at = Some(updated_at);
             }
         }
+        state.principal_root_protections.retain(|stored| {
+            stored.principal_id != protection.principal_id
+                || stored.localhost_root != protection.localhost_root
+        });
+        state.principal_root_protections.push(protection);
+        state.sessions.push(StoredAuthSession {
+            grant: replacement_grant,
+            revoked_at: None,
+        });
+        #[cfg(test)]
+        consume_recovery_reassignment_test_fault(
+            data_dir,
+            RecoveryReassignmentTestFault::AuditChainRejection,
+        )?;
+        push_audit_event(data_dir, state, signed_audit_event)?;
         Ok(record)
     })
+}
+
+fn validate_recovery_replacement_grant(
+    grant: &AuthSessionGrantV1,
+    proof_binding_id: &str,
+    recovered_principal_id: &str,
+    updated_at: u64,
+) -> anyhow::Result<()> {
+    if grant.schema != AuthSessionGrantV1::SCHEMA
+        || grant.principal_id != recovered_principal_id
+        || grant.proof_binding_id != proof_binding_id
+        || grant.issued_at != updated_at
+        || grant.expires_at <= grant.issued_at
+    {
+        anyhow::bail!("invalid replacement recovery session grant");
+    }
+    for (label, value) in [
+        ("grant_id", grant.grant_id.as_str()),
+        ("session_id", grant.session_id.as_str()),
+        ("principal_id", grant.principal_id.as_str()),
+        ("proof_binding_id", grant.proof_binding_id.as_str()),
+    ] {
+        if value.is_empty()
+            || value.len() > 256
+            || value
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            anyhow::bail!("invalid replacement recovery {label}");
+        }
+    }
+    if grant.apps.is_empty()
+        || grant.apps.len() > 8
+        || grant.apps.iter().any(|app| {
+            app.is_empty()
+                || app.len() > 128
+                || app.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        })
+    {
+        anyhow::bail!("invalid replacement recovery session app scope");
+    }
+    let apps = grant.apps.iter().collect::<std::collections::BTreeSet<_>>();
+    if apps.len() != grant.apps.len() {
+        anyhow::bail!("replacement recovery session app scope contains duplicates");
+    }
+    Ok(())
+}
+
+fn validate_recovery_reassignment_audit(
+    event: &RuntimeAuditEventV1,
+    proof_binding_id: &str,
+    recovered_principal_id: &str,
+    replacement_session_id: &str,
+    updated_at: u64,
+) -> anyhow::Result<()> {
+    if event.schema != RuntimeAuditEventV1::SCHEMA
+        || event.event_type != "auth.recovery_kit.reassigned"
+        || event.principal_id.as_deref() != Some(recovered_principal_id)
+        || event.proof_binding_id.as_deref() != Some(proof_binding_id)
+        || event.session_id.as_deref() != Some(replacement_session_id)
+        || event.result != "ok"
+        || event.occurred_at != updated_at
+        || event.signer_did.as_deref().is_none_or(str::is_empty)
+        || event.signature.as_deref().is_none_or(str::is_empty)
+    {
+        anyhow::bail!("invalid signed recovery reassignment audit event");
+    }
+    Ok(())
 }
 
 fn ensure_recovered_root_reassignable_in_state(
@@ -1507,6 +1684,60 @@ pub fn append_audit_event(data_dir: &Path, event: RuntimeAuditEventV1) -> anyhow
         push_audit_event(data_dir, state, event)?;
         Ok(())
     })
+}
+
+pub fn append_signed_full_recovery_outcome_audit_event(
+    data_dir: &Path,
+    event: RuntimeAuditEventV1,
+) -> anyhow::Result<()> {
+    verify_signed_full_recovery_outcome_audit_event(data_dir, &event)?;
+    mutate_auth_state(data_dir, |state| {
+        if let Some(existing) = state
+            .audit
+            .iter()
+            .find(|existing| existing.event_id == event.event_id)
+        {
+            let same_outcome = existing.schema == event.schema
+                && existing.event_type == event.event_type
+                && existing.principal_id == event.principal_id
+                && existing.proof_binding_id == event.proof_binding_id
+                && existing.session_id == event.session_id
+                && existing.challenge_id == event.challenge_id
+                && existing.capsule_id == event.capsule_id
+                && existing.result == event.result
+                && existing.reason == event.reason
+                && existing.signer_did == event.signer_did;
+            if same_outcome {
+                return Ok(());
+            }
+            anyhow::bail!("full recovery outcome audit id collision");
+        }
+        push_audit_event(data_dir, state, event)?;
+        Ok(())
+    })
+}
+
+pub fn verify_signed_full_recovery_outcome_audit_event(
+    data_dir: &Path,
+    event: &RuntimeAuditEventV1,
+) -> anyhow::Result<()> {
+    let (_, runtime_did) = elastos_identity::load_or_create_did(data_dir)?;
+    verify_audit_event_signature(event, &runtime_did)
+}
+
+pub fn load_signed_full_recovery_outcome_audit_event(
+    data_dir: &Path,
+    event_id: &str,
+) -> anyhow::Result<Option<RuntimeAuditEventV1>> {
+    let event = load_auth_state(data_dir)?
+        .audit
+        .iter()
+        .find(|event| event.event_id == event_id)
+        .cloned();
+    if let Some(event) = event.as_ref() {
+        verify_signed_full_recovery_outcome_audit_event(data_dir, event)?;
+    }
+    Ok(event)
 }
 
 pub fn sign_audit_event(
@@ -2219,6 +2450,132 @@ mod tests {
             last_used_at,
             revoked_at: None,
         })
+    }
+
+    fn recovered_root_reassignment_fixture(
+        data_dir: &Path,
+    ) -> (
+        RecoveredRootReassignment,
+        PrincipalRecord,
+        AuthSessionGrantV1,
+    ) {
+        let updated_at = now_ts();
+        let current = upsert_principal_for_binding_as_role(
+            data_dir,
+            passkey_binding(1, updated_at, updated_at),
+            "person:local:current-passkey".to_string(),
+            RuntimePrincipalRole::Guest,
+            updated_at,
+        )
+        .unwrap();
+        let current_grant = AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: "grant:current-passkey".to_string(),
+            session_id: "auth:current-passkey".to_string(),
+            principal_id: current.principal_id.clone(),
+            proof_binding_id: current.proof_binding_id.clone(),
+            issued_at: updated_at,
+            expires_at: updated_at + 3_600,
+            apps: vec!["home".to_string(), "system".to_string()],
+        };
+        store_session_grant(data_dir, current_grant.clone()).unwrap();
+
+        let recovered_principal_id = "person:local:recovered-signature-test".to_string();
+        let protection = store_test_principal_root_protection(data_dir, &recovered_principal_id);
+        let replacement_grant = AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: "grant:recovered-signature-test".to_string(),
+            session_id: "auth:recovered-signature-test".to_string(),
+            principal_id: recovered_principal_id.clone(),
+            proof_binding_id: current.proof_binding_id.clone(),
+            issued_at: updated_at,
+            expires_at: updated_at + 3_600,
+            apps: vec!["home".to_string(), "system".to_string()],
+        };
+        let signed_audit_event = sign_audit_event(
+            data_dir,
+            RuntimeAuditEventV1 {
+                schema: RuntimeAuditEventV1::SCHEMA.to_string(),
+                event_id: "audit:recovered-signature-test".to_string(),
+                event_type: "auth.recovery_kit.reassigned".to_string(),
+                principal_id: Some(recovered_principal_id.clone()),
+                proof_binding_id: Some(current.proof_binding_id.clone()),
+                session_id: Some(replacement_grant.session_id.clone()),
+                challenge_id: None,
+                capsule_id: None,
+                result: "ok".to_string(),
+                reason: "principal root reassigned from verified Recovery Kit and session reissued"
+                    .to_string(),
+                occurred_at: updated_at,
+                signer_did: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        (
+            RecoveredRootReassignment {
+                proof_binding_id: current.proof_binding_id.clone(),
+                recovered_principal_id,
+                recovered_localhost_root: protection.localhost_root.clone(),
+                protection,
+                replacement_grant,
+                signed_audit_event,
+                updated_at,
+            },
+            current,
+            current_grant,
+        )
+    }
+
+    #[test]
+    fn recovered_root_reassignment_rejects_invalid_audit_signatures_before_mutation() {
+        for case in ["malformed", "substituted", "wrong-runtime-signer"] {
+            let data_dir = tempfile::tempdir().unwrap();
+            let (mut reassignment, current, current_grant) =
+                recovered_root_reassignment_fixture(data_dir.path());
+            match case {
+                "malformed" => {
+                    reassignment.signed_audit_event.signature =
+                        Some("not-a-valid-signature".to_string());
+                }
+                "substituted" => {
+                    reassignment.signed_audit_event.reason =
+                        "substituted after Runtime signing".to_string();
+                }
+                "wrong-runtime-signer" => {
+                    let foreign_dir = tempfile::tempdir().unwrap();
+                    reassignment.signed_audit_event =
+                        sign_audit_event(foreign_dir.path(), reassignment.signed_audit_event)
+                            .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let replacement_session_id = reassignment.replacement_grant.session_id.clone();
+            let before = serde_json::to_value(load_auth_state(data_dir.path()).unwrap()).unwrap();
+
+            let error = commit_recovered_root_reassignment(data_dir.path(), reassignment)
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("signature") || error.contains("signer"),
+                "{case} failed for an unexpected reason: {error}"
+            );
+            let after = serde_json::to_value(load_auth_state(data_dir.path()).unwrap()).unwrap();
+            assert_eq!(after, before, "{case} mutated auth state");
+            let retained =
+                load_principal_for_proof_binding(data_dir.path(), &current.proof_binding_id)
+                    .unwrap();
+            assert_eq!(retained.principal_id, current.principal_id);
+            assert!(
+                is_auth_session_active(data_dir.path(), &current_grant.session_id, now_ts())
+                    .unwrap()
+            );
+            assert!(
+                !is_auth_session_active(data_dir.path(), &replacement_session_id, now_ts())
+                    .unwrap()
+            );
+        }
     }
 
     #[test]

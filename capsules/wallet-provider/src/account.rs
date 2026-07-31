@@ -318,6 +318,67 @@ impl WalletProvider {
         Response::ok(json!({ "account": account, "imported": true }))
     }
 
+    pub(super) fn import_managed_recovery_set(
+        &mut self,
+        principal_id: &str,
+        recovery_set: &ManagedRecoverySetV1,
+    ) -> Response {
+        if let Err(response) = self.ensure_initialized() {
+            return response;
+        }
+        if let Err(err) = validate_opaque_id(principal_id, "principal_id") {
+            return Response::error("invalid_request", err);
+        }
+        if let Err(err) = recovery_set.validate() {
+            return Response::error("invalid_request", err.to_string());
+        }
+        if self.storage_key.is_none() {
+            return Response::error(
+                "not_initialized",
+                "wallet-provider managed wallet storage is not initialized",
+            );
+        }
+
+        for entry in &recovery_set.keys {
+            if entry.recovery_key.get("account_id").and_then(Value::as_str)
+                != Some(entry.account_id.as_str())
+            {
+                return Response::error(
+                    "invalid_request",
+                    "managed recovery set account_id does not match its opaque recovery key",
+                );
+            }
+            if let Some(label) = entry.label.as_deref() {
+                if let Err(err) = validate_label(label) {
+                    return Response::error("invalid_request", err);
+                }
+            }
+        }
+
+        let mut accounts = Vec::with_capacity(recovery_set.keys.len());
+        for entry in &recovery_set.keys {
+            match self.import_managed_recovery_key(ImportManagedRecoveryKeyInput {
+                principal_id: principal_id.to_string(),
+                recovery_key: entry.recovery_key.clone(),
+                label: entry.label.clone(),
+            }) {
+                Response::Ok { data: Some(data) } => accounts.push(data["account"].clone()),
+                Response::Ok { data: None } => {
+                    return Response::error(
+                        "invalid_response",
+                        "managed recovery key import returned no account",
+                    )
+                }
+                Response::Error { code, message } => return Response::Error { code, message },
+            }
+        }
+        Response::ok(json!({
+            "imported": true,
+            "account_count": accounts.len(),
+            "accounts": accounts,
+        }))
+    }
+
     pub(super) fn link_account(&mut self, input: LinkAccountInput) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
@@ -471,6 +532,53 @@ impl WalletProvider {
             "private_key_hex": hex::encode(signing_key.to_bytes()),
             "note": "This account was created as an encrypted signing key, not a BIP39 seed phrase."
         }))
+    }
+
+    pub(super) fn export_managed_recovery_set(&self, principal_id: &str) -> Response {
+        if let Err(response) = self.ensure_initialized() {
+            return response;
+        }
+        if let Err(err) = validate_opaque_id(principal_id, "principal_id") {
+            return Response::error("invalid_request", err);
+        }
+        let managed_accounts = self
+            .store
+            .accounts
+            .iter()
+            .filter(|account| {
+                account.principal_id == principal_id
+                    && account.revoked_at.is_none()
+                    && account.connector_id.is_none()
+                    && is_managed_proof_type(&account.proof_type)
+            })
+            .map(|account| (account.account_id.clone(), account.label.clone()))
+            .collect::<Vec<_>>();
+        let mut keys = Vec::with_capacity(managed_accounts.len());
+        for (account_id, label) in managed_accounts {
+            let recovery_key = match self.export_managed_recovery_key(principal_id, &account_id) {
+                Response::Ok { data: Some(data) } => data,
+                Response::Ok { data: None } => {
+                    return Response::error(
+                        "invalid_response",
+                        "managed recovery key export returned no key",
+                    )
+                }
+                Response::Error { code, message } => return Response::Error { code, message },
+            };
+            keys.push(ManagedRecoveryKeyEntryV1 {
+                account_id,
+                recovery_key,
+                label,
+            });
+        }
+        let recovery_set = match ManagedRecoverySetV1::new(keys) {
+            Ok(recovery_set) => recovery_set,
+            Err(err) => return Response::error("invalid_recovery_set", err.to_string()),
+        };
+        match serde_json::to_value(recovery_set) {
+            Ok(recovery_set) => Response::ok(recovery_set),
+            Err(err) => Response::error("invalid_recovery_set", err.to_string()),
+        }
     }
 
     pub(super) fn set_default_account(&mut self, input: SetDefaultAccountInput) -> Response {

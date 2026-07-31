@@ -18,7 +18,7 @@ export function createWalletPreferences({
   getHomeToken,
   notifyHomeSummaryChanged,
   renderAll,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   refreshWalletState,
   shellHeaders,
   showStatus,
@@ -127,14 +127,14 @@ export function createWalletPreferences({
     }
     remove.disabled = true;
     try {
-      const homeToken = await requestFreshPasskeyHomeToken(
+      const stepUpToken = await requestPasskeyStepUp(
         "wallet.account.delete",
         { account_id: accountId },
       );
       await fetchJson(`/api/apps/wallet/wallet/accounts/${encodeURIComponent(accountId)}`, {
         method: "DELETE",
-        headers: shellHeaders({ "content-type": "application/json" }, homeToken),
-        body: JSON.stringify({ home_token: homeToken }),
+        headers: shellHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ step_up_token: stepUpToken }),
       });
       showStatus(`${name} removed.`, "success");
       notifyHomeSummaryChanged();

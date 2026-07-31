@@ -579,7 +579,7 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
 
     let removed_id = metamask_accounts[0]["account_id"].as_str().unwrap();
     let encoded = removed_id.replace(':', "%3A");
-    let delete_token = intent_token_for_app_context(
+    let delete_token = step_up_token_for_app_context(
         dir.path(),
         WALLET_CAPSULE_ID,
         &wallet_token,
@@ -595,7 +595,7 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
                 .header("x-elastos-home-token", wallet_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"home_token":"{}"}}"#,
+                    r#"{{"step_up_token":"{}"}}"#,
                     delete_token
                 )))
                 .unwrap(),

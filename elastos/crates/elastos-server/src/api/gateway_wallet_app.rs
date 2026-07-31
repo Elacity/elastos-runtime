@@ -32,16 +32,20 @@ pub(in crate::api::gateway) async fn wallet_app_account_delete(
     headers: HeaderMap,
     Json(input): Json<WalletAccountDeleteRequest>,
 ) -> Response {
-    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
         Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    let context = authority.home_launch_context();
-    if let Err(err) = consume_fresh_passkey_home_token(
+    let context = launch.context.clone();
+    if let Err(err) = consume_passkey_step_up_token(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        WALLET_CAPSULE_ID,
+        &input.step_up_token,
+        &launch,
         180,
         "wallet.account.delete",
         &serde_json::json!({ "account_id": account_id }),
@@ -121,28 +125,30 @@ pub(in crate::api::gateway) async fn wallet_app_account_recovery_key(
     headers: HeaderMap,
     Json(input): Json<WalletAccountRecoveryKeyRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) = consume_fresh_passkey_home_token(
+    let context = launch.context.clone();
+    if let Err(err) = consume_passkey_step_up_token(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        WALLET_CAPSULE_ID,
+        &input.step_up_token,
+        &launch,
         180,
         "wallet.recovery-key.export",
         &serde_json::json!({ "account_id": account_id }),
     ) {
         return system_error_response(err);
     }
-    match crate::api::auth_gateway::wallet_provider_data(
+    match runtime_wallet_data(
         &state,
-        serde_json::json!({
-            "op": "export_managed_secret",
-            "principal_id": context.principal_id.clone(),
-            "account_id": account_id,
-        }),
+        &authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ExportManagedRecoveryKey { account_id },
     )
     .await
     {
@@ -170,16 +176,20 @@ pub(in crate::api::gateway) async fn wallet_app_account_import_recovery_key(
     headers: HeaderMap,
     Json(input): Json<WalletAccountImportRecoveryKeyRequest>,
 ) -> Response {
-    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
         Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    let context = authority.home_launch_context();
-    if let Err(err) = consume_fresh_passkey_home_token(
+    let context = launch.context.clone();
+    if let Err(err) = consume_passkey_step_up_token(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        WALLET_CAPSULE_ID,
+        &input.step_up_token,
+        &launch,
         180,
         "wallet.recovery-key.import",
         &serde_json::json!({
@@ -189,14 +199,13 @@ pub(in crate::api::gateway) async fn wallet_app_account_import_recovery_key(
     ) {
         return system_error_response(err);
     }
-    match crate::api::auth_gateway::wallet_provider_data(
+    match runtime_wallet_data(
         &state,
-        serde_json::json!({
-            "op": "import_managed_secret",
-            "principal_id": context.principal_id.clone(),
-            "recovery_key": input.recovery_key,
-            "label": input.label,
-        }),
+        &authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ImportManagedRecoveryKey {
+            recovery_key: input.recovery_key,
+            label: input.label,
+        },
     )
     .await
     {
@@ -247,13 +256,19 @@ pub(in crate::api::gateway) async fn wallet_app_managed_approval_approve(
     Path(request_id): Path<String>,
     Json(input): Json<WalletApprovalApproveRequest>,
 ) -> Response {
-    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
         Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    let context = authority.home_launch_context();
+    let context = launch.context.clone();
     approve_wallet_managed_request(
         &state,
+        &launch,
         &context,
         &authority,
         &request_id,

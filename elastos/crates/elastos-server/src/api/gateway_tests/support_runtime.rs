@@ -496,44 +496,32 @@ fn projection_launch_token_for_authority_context(
     .unwrap()
 }
 
-fn intent_token_for_authority_context(
-    data_dir: &std::path::Path,
-    app: &str,
-    authority: &TestPasskeyAuthority,
-    operation: &str,
-    request: &serde_json::Value,
-) -> String {
-    issue_home_launch_token_with_intent(
-        data_dir,
-        app,
-        &HomeLaunchTokenContext {
-            principal_id: authority.principal_id.clone(),
-            session_id: authority.session_id.clone(),
-            proof_binding_id: Some(authority.proof_binding_id.clone()),
-            grant_id: authority.grant_id.clone(),
-        },
-        operation,
-        request,
-    )
-    .unwrap()
-}
-
-fn intent_token_for_app_context(
+fn step_up_token_for_app_context(
     data_dir: &std::path::Path,
     app: &str,
     app_token: &str,
     operation: &str,
     request: &serde_json::Value,
 ) -> String {
-    let mut headers = HeaderMap::new();
-    headers.insert(HOST, HeaderValue::from_static("localhost:61180"));
-    headers.insert("origin", HeaderValue::from_static("null"));
-    headers.insert(
-        "x-elastos-home-token",
-        HeaderValue::from_str(app_token).unwrap(),
-    );
-    let context = require_home_launch_token_context(data_dir, &headers, app).unwrap();
-    issue_home_launch_token_with_intent(data_dir, app, &context, operation, request).unwrap()
+    issue_passkey_step_up_token_for_test(data_dir, app_token, app, operation, request).unwrap()
+}
+
+fn stale_step_up_token_for_app_context(
+    data_dir: &std::path::Path,
+    app: &str,
+    app_token: &str,
+    operation: &str,
+    request: &serde_json::Value,
+) -> String {
+    issue_passkey_step_up_token_at_for_test(
+        data_dir,
+        app_token,
+        app,
+        operation,
+        request,
+        crate::auth::now_ts().saturating_sub(181),
+    )
+    .unwrap()
 }
 
 fn app_token_for_authority(
