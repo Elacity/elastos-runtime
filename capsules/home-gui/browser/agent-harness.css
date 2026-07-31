@@ -1,0 +1,4229 @@
+/* Agent harness + shelf morph styles (extracted from style.css). */
+
+/* ---- Agent Shelf morph (preview) — same Shelf glass, liquid grow in place ---- */
+/* Width/height are FLIP’d in JS (max-content/auto cannot interpolate). */
+.taskbar {
+  transition: transform 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.shelf-morph-stage {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--dock-icon-slot);
+  /* Apps face: must stay visible so dock-mag icons can lift above the pill. */
+  overflow: visible;
+  border-radius: inherit;
+}
+
+/*
+  Full-dock liquid sheen — lives on .taskbar (not the inner stage) so it
+  washes the whole pill, not a nested square.
+*/
+.taskbar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 0%,
+    transparent 38%,
+    rgba(255, 255, 255, 0.06) 46%,
+    rgba(255, 255, 255, 0.16) 50%,
+    rgba(255, 255, 255, 0.06) 54%,
+    transparent 62%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  background-position: 120% 0;
+  background-repeat: no-repeat;
+}
+
+.taskbar.is-agent-face[data-agent-morph="grow"] {
+  /* Clip sheen to the pill while stretching; mag is off in this phase. */
+  overflow: hidden;
+}
+
+.taskbar.is-agent-face[data-agent-morph="grow"]::after,
+.taskbar[data-agent-morph="shrink"]::after {
+  animation: shelf-liquid-sheen var(--shelf-morph-duration) var(--shelf-morph-ease) both;
+}
+
+.taskbar[data-agent-morph="shrink"] {
+  overflow: hidden;
+}
+
+@keyframes shelf-liquid-sheen {
+  0% {
+    opacity: 0;
+    background-position: 120% 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    background-position: -40% 0;
+  }
+}
+
+.shelf-face-apps {
+  position: relative;
+  z-index: 1;
+}
+
+.shelf-face-agent {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.shelf-morph-exit {
+  transition-property: opacity, filter;
+  transition-duration: 280ms;
+  transition-timing-function: var(--shelf-morph-ease);
+  transition-delay: 0ms;
+  will-change: opacity, filter;
+}
+
+.shelf-morph-enter {
+  opacity: 0;
+  transform: translateY(8px) scale(0.98);
+  filter: blur(3px);
+  transition-property: opacity, transform, filter;
+  transition-duration: 200ms;
+  transition-timing-function: var(--shell-motion-enter-ease);
+  transition-delay: 0ms;
+  will-change: opacity, transform, filter;
+}
+
+/*
+  Same surface as the Shelf — only geometry changes.
+  background stays var(--dock-fill); no alternate charcoal panel.
+*/
+.taskbar.is-agent-face {
+  height: auto;
+  min-height: 108px;
+  max-height: min(72vh, 520px);
+  /* Clip growing transcript — never spill text outside the glass pill. */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  /* Always viewport-centered — never nudged by sidebar/outputs.
+     Keeps the OS Shelf → Agent morph stationary (same X). */
+  left: 0;
+  right: 0;
+  width: var(--agent-column-width, min(720px, calc(100vw - 48px)));
+  max-width: calc(100vw - 48px);
+  margin-inline: auto;
+  padding: 14px 16px 12px;
+  border-radius: 28px;
+  background-color: var(--dock-fill);
+  /* No hairline/stroke — same soft glass as OS Shelf, without a border ring. */
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(14px) saturate(1.08);
+  -webkit-backdrop-filter: blur(14px) saturate(1.08);
+}
+
+/* ---- Agent Harness (preview) — full-bleed room; Shelf composer floats on top ---- */
+:root {
+  --harness-room: #0a0a0b;
+  --harness-rail: #111113;
+  --harness-sidebar-w: 248px;
+  --harness-outputs-w: 300px;
+  /* Shared by stream column + Agent-face Shelf — viewport-centered. */
+  --agent-column-width: min(720px, calc(100vw - 48px));
+  --harness-composer-clearance: calc(
+    var(--taskbar-offset, 12px) + env(safe-area-inset-bottom, 0px) + 168px
+  );
+  --harness-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --harness-breathe-ms: 780ms;
+}
+
+:root[data-el-theme="light"] {
+  --harness-room: #f3f4f6;
+  --harness-rail: #ebecef;
+}
+
+.agent-home-drop-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: 100080;
+  pointer-events: none;
+}
+
+.agent-harness {
+  position: fixed;
+  inset: 0;
+  z-index: 100085;
+  display: grid;
+  /* Two tracks only — Outputs floats so the stream scrollbar sits on the far right. */
+  grid-template-columns: var(--harness-sidebar-w) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0;
+  overflow: hidden;
+  background: var(--harness-room);
+  color: var(--text);
+  opacity: 0;
+  filter: blur(10px);
+  transform: scale(1.02);
+  transform-origin: 50% 46%;
+  pointer-events: none;
+  will-change: opacity, filter, transform;
+  transition:
+    opacity var(--harness-breathe-ms) var(--harness-ease),
+    filter calc(var(--harness-breathe-ms) + 40ms) var(--harness-ease),
+    transform var(--harness-breathe-ms) var(--harness-ease);
+}
+
+.agent-harness.is-visible {
+  opacity: 1;
+  filter: blur(0);
+  transform: scale(1);
+  pointer-events: auto;
+}
+
+/* Panels ebb in after the room — opacity/blur only, no slide from edges. */
+.agent-harness-sidebar,
+.agent-harness-outputs,
+.agent-harness-main {
+  opacity: 0;
+  filter: blur(6px);
+  transform: scale(0.992);
+  transform-origin: center center;
+  will-change: opacity, filter, transform;
+  transition:
+    opacity 560ms var(--harness-ease),
+    filter 640ms var(--harness-ease),
+    transform 640ms var(--harness-ease);
+}
+
+.agent-harness-sidebar {
+  grid-column: 1;
+  grid-row: 1;
+  transition-delay: 70ms;
+}
+
+.agent-harness-main {
+  grid-column: 2;
+  grid-row: 1;
+  transition-delay: 140ms;
+}
+
+.agent-harness-outputs {
+  transition-delay: 200ms;
+}
+
+.agent-harness.is-visible .agent-harness-sidebar,
+.agent-harness.is-visible .agent-harness-outputs,
+.agent-harness.is-visible .agent-harness-main {
+  opacity: 1;
+  filter: blur(0);
+  transform: scale(1);
+}
+
+/*
+  Home soft-exhales while harness inhales.
+  Important: .desktop-backdrop rests at scale(1.01) for wallpaper bleed.
+  Never set it to transform:none / scale(0.99) — that snaps 1.0→1.01 at the end.
+*/
+body.agent-harness-active .desktop-backdrop,
+body.agent-harness-active .desktop-workspace,
+body.agent-harness-active #wallet-rail,
+body.agent-harness-active #inbox-rail,
+body.agent-harness-active .window {
+  transition:
+    opacity 720ms var(--harness-ease),
+    filter 720ms var(--harness-ease);
+}
+
+body.agent-harness-active.agent-harness-dropping .desktop-backdrop,
+body.agent-harness-active.agent-harness-settled .desktop-backdrop {
+  /* Keep resting scale(1.01) — fade/blur only. */
+  transform: scale(1.01);
+  opacity: 0;
+  filter: blur(8px);
+  pointer-events: none;
+}
+
+body.agent-harness-active.agent-harness-dropping .desktop-workspace,
+body.agent-harness-active.agent-harness-settled .desktop-workspace,
+body.agent-harness-active.agent-harness-dropping .window,
+body.agent-harness-active.agent-harness-settled .window {
+  opacity: 0;
+  filter: blur(8px);
+  pointer-events: none;
+}
+
+/* Wallet/Inbox are intentional popovers (z above harness). Never ghost them —
+   that left slide-outs blurred and unclickable while Agent was settled. */
+body.agent-harness-active #wallet-rail,
+body.agent-harness-active #inbox-rail {
+  opacity: 1;
+  filter: none;
+}
+
+/*
+  Menubar in Agent = fullscreen Stage grammar from frame one.
+  Transform-only tuck (no opacity fade) — opacity was flashing the bar on enter.
+*/
+body.agent-harness-active:not(.expose-active) header.toolbar {
+  opacity: 1;
+  filter: none;
+  transform: translateY(-100%);
+  pointer-events: none;
+  z-index: 100130;
+  transition: transform 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+body.agent-harness-active.stage-menubar-reveal:not(.expose-active) header.toolbar {
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+/* Leave Agent — slide menubar down with Home rise (~HOME_RISE_MS), not the
+   snappy 200ms edge-reveal. Keep agent-harness-active so the transition rule
+   still applies; stripping it early pops the bar. */
+body.agent-harness-active.agent-harness-rising:not(.expose-active) header.toolbar {
+  transform: translateY(0);
+  pointer-events: none;
+  transition: transform 720ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Reveal only after settle — sensor off during drop/morph so it can't flash. */
+body.agent-harness-settled:not(.expose-active) .stage-edge-sensor-top {
+  display: block;
+  z-index: 100140;
+}
+
+body.agent-harness-active:not(.agent-harness-settled) .stage-edge-sensor-top,
+body.agent-harness-active.stage-menubar-reveal:not(.expose-active) .stage-edge-sensor-top {
+  pointer-events: none;
+}
+
+/* Mission Control above Agent Space — reveal Desktop/floor; hide harness chrome. */
+body.expose-active .agent-harness {
+  opacity: 0 !important;
+  filter: none !important;
+  pointer-events: none !important;
+  visibility: hidden;
+}
+
+body.expose-active.agent-harness-active .desktop-backdrop,
+body.expose-active.agent-harness-active .desktop-workspace,
+body.expose-active.agent-harness-active .window.expose-card,
+body.expose-active.agent-harness-active .window.mission-thumb-card {
+  opacity: 1 !important;
+  filter: none !important;
+  pointer-events: auto !important;
+}
+
+body.expose-active.agent-harness-active .desktop-backdrop {
+  transform: scale(1.01) !important;
+}
+
+body.agent-harness-rising .desktop-backdrop {
+  transform: scale(1.01);
+  opacity: 1;
+  filter: none;
+}
+
+body.agent-harness-rising .desktop-workspace,
+body.agent-harness-rising .toolbar,
+body.agent-harness-rising #wallet-rail,
+body.agent-harness-rising #inbox-rail,
+body.agent-harness-rising .window {
+  opacity: 1;
+  filter: none;
+}
+
+/* Dock sits on top of the harness — soft lift only, no border stroke. */
+body.agent-harness-active .taskbar {
+  z-index: 100110;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+}
+
+body.agent-harness-active .taskbar.is-agent-face {
+  /* Stay viewport-centered; only deepen the lift. */
+  left: 0;
+  right: 0;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+}
+
+.agent-harness-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  min-height: 0;
+  /* Tight top — Agent + icons sit with the bar, no floaty gap. */
+  padding: 10px 12px calc(var(--harness-composer-clearance) + 8px);
+  border-right: 0.5px solid color-mix(in srgb, var(--text) 8%, transparent);
+  background: var(--harness-rail);
+}
+
+/* Desktop: scrim / drawer chrome idle. Narrow media shows them. */
+.agent-harness-scrim {
+  display: none;
+}
+
+.agent-harness-sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  min-height: 36px;
+  margin: 0 0 2px;
+}
+
+.agent-harness-sidebar-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+}
+
+.agent-harness-icon-btn {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.agent-harness-icon-btn:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+/* Claude-style panel glyph — rounded rect with left rail. */
+.agent-harness-icon-panel {
+  display: block;
+  width: 16px;
+  height: 14px;
+  border: 1.5px solid currentColor;
+  border-radius: 3px;
+  background:
+    linear-gradient(currentColor, currentColor) left / 5px 100% no-repeat;
+  opacity: 0.92;
+  box-sizing: border-box;
+}
+
+.agent-harness-icon-search {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid currentColor;
+  border-radius: 999px;
+  box-sizing: border-box;
+  position: relative;
+  opacity: 0.92;
+}
+
+.agent-harness-icon-search::after {
+  content: "";
+  position: absolute;
+  right: -3px;
+  bottom: -2px;
+  width: 6px;
+  height: 1.5px;
+  background: currentColor;
+  border-radius: 1px;
+  transform: rotate(45deg);
+  transform-origin: left center;
+}
+
+/* Workbench glyph — stacked panes (artifacts panel). */
+.agent-harness-icon-workbench {
+  display: block;
+  width: 15px;
+  height: 14px;
+  border: 1.5px solid currentColor;
+  border-radius: 3px;
+  box-sizing: border-box;
+  opacity: 0.92;
+  background:
+    linear-gradient(currentColor, currentColor) center 4px / 7px 1.5px no-repeat,
+    linear-gradient(currentColor, currentColor) center 8px / 7px 1.5px no-repeat;
+}
+
+.agent-workbench-open-btn {
+  display: none;
+  flex: 0 0 auto;
+}
+
+.agent-workbench-open-btn.has-nudge,
+.agent-workbench-fab.has-nudge {
+  color: var(--accent, #f97316);
+}
+
+.agent-workbench-fab {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 4;
+  appearance: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border: 0.5px solid color-mix(in srgb, var(--text) 12%, transparent);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--harness-rail) 92%, #000);
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+}
+
+.agent-workbench-fab:hover {
+  background: color-mix(in srgb, var(--harness-rail) 96%, #000);
+  color: var(--text);
+}
+
+.agent-workbench-fab[hidden] {
+  display: none !important;
+}
+
+.agent-harness-outputs-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-workbench-close {
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.agent-workbench-close:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+/* Desktop collapse — sidebar off; main expands; reopen via mobile-bar panel. */
+body.agent-harness-sidebar-collapsed .agent-harness-sidebar {
+  display: none;
+}
+
+body.agent-harness-sidebar-collapsed .agent-harness-main {
+  grid-column: 1 / -1;
+  /* Match open sidebar top inset so panel icon doesn’t jump up. */
+  padding-top: 10px;
+}
+
+body.agent-harness-sidebar-collapsed .agent-harness-mobile-bar {
+  display: flex;
+  min-height: 36px;
+  padding: 0 12px 8px;
+}
+
+body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
+  display: grid;
+}
+
+.agent-harness-mobile-bar {
+  display: none;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 0 10px 6px;
+}
+
+.agent-harness-drawer-toggle {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.agent-harness-drawer-toggle:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+#agent-harness-search-open-main {
+  display: none;
+}
+
+.agent-harness-title {
+  margin: 0;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.agent-harness-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.agent-harness-brand-name {
+  display: block;
+}
+
+.agent-harness-brand-sub {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+}
+
+.agent-harness-sidebar-head .agent-harness-brand {
+  padding: 0 4px 0 2px;
+}
+
+/* ChatGPT-tight cluster: New chat · Home · Settings · Usage as one block. */
+.agent-harness-nav-cluster {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 2px 0 4px;
+}
+
+.agent-harness-nav-cluster .agent-harness-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+}
+
+.agent-harness-new-chat,
+.agent-harness-home {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  margin: 0;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  text-align: left;
+}
+
+.agent-harness-home {
+  margin-bottom: 0;
+}
+
+.agent-harness-new-chat:hover,
+.agent-harness-home:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-harness-home-mark {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background: currentColor;
+  opacity: 0.75;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 7.2 8 2.8l5.5 4.4V13a1 1 0 0 1-1 1H9.2v-3.2H6.8V14H3.5a1 1 0 0 1-1-1V7.2Z' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") center / 14px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 7.2 8 2.8l5.5 4.4V13a1 1 0 0 1-1 1H9.2v-3.2H6.8V14H3.5a1 1 0 0 1-1-1V7.2Z' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") center / 14px no-repeat;
+}
+
+/* Session search — Claude-style modal (desktop) / full screen (narrow). */
+.agent-session-search {
+  position: fixed;
+  inset: 0;
+  z-index: 100130;
+  display: grid;
+  place-items: start center;
+  padding: calc(12vh + env(safe-area-inset-top, 0px)) 16px 24px;
+  background: color-mix(in srgb, var(--bg, #050608) 55%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.agent-session-search[hidden] {
+  display: none;
+}
+
+.agent-session-search-panel {
+  width: min(520px, 100%);
+  max-height: min(72vh, 560px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel-strong, #16181d) 96%, transparent);
+  border: 0.5px solid color-mix(in srgb, var(--text) 12%, transparent);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+}
+
+.agent-session-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  padding: 12px 12px 10px 14px;
+  border-bottom: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-session-search-glyph {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid color-mix(in srgb, var(--text) 55%, transparent);
+  border-radius: 999px;
+  box-sizing: border-box;
+  position: relative;
+  opacity: 0.85;
+}
+
+.agent-session-search-glyph::after {
+  content: "";
+  position: absolute;
+  right: -3px;
+  bottom: -2px;
+  width: 6px;
+  height: 1.5px;
+  background: color-mix(in srgb, var(--text) 55%, transparent);
+  border-radius: 1px;
+  transform: rotate(45deg);
+  transform-origin: left center;
+}
+
+.agent-session-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  outline: none;
+}
+
+.agent-session-search-input::placeholder {
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+}
+
+.agent-session-search-close {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 65%, transparent);
+  font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.agent-session-search-close:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-session-search-results {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+  scrollbar-width: thin;
+}
+
+.agent-session-search-empty {
+  padding: 18px 12px;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 13px;
+  text-align: center;
+}
+
+.agent-session-search-row {
+  appearance: none;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-session-search-row:hover,
+.agent-session-search-row.is-active {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-session-search-row-mark {
+  width: 16px;
+  height: 14px;
+  border: 1.4px solid color-mix(in srgb, var(--text) 55%, transparent);
+  border-radius: 3px;
+  opacity: 0.75;
+}
+
+.agent-session-search-row-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-session-search-row-when {
+  color: color-mix(in srgb, var(--text) 45%, transparent);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.agent-harness-sessions {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 28%, transparent) transparent;
+}
+
+/* Sidebar nav — destinations in the tight cluster with New chat / Home. */
+.agent-harness-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+}
+
+.agent-harness-nav-cluster .agent-harness-nav-row {
+  min-height: 32px;
+}
+
+.agent-harness-nav-row {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  margin: 0;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-harness-nav-row:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-harness-nav-row.is-active {
+  background: color-mix(in srgb, var(--text) 11%, transparent);
+  color: var(--text);
+}
+
+.agent-harness-nav-mark {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  background: currentColor;
+  opacity: 0.75;
+  -webkit-mask: none center / 14px no-repeat;
+  mask: none center / 14px no-repeat;
+}
+
+.agent-harness-nav-mark[data-nav-icon="configure"] {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 5h7M12.5 5H13.5M2.5 11h3M8.5 11H13.5' stroke='black' stroke-width='1.4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='5' r='1.6' stroke='black' stroke-width='1.4'/%3E%3Ccircle cx='6.5' cy='11' r='1.6' stroke='black' stroke-width='1.4'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 5h7M12.5 5H13.5M2.5 11h3M8.5 11H13.5' stroke='black' stroke-width='1.4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='5' r='1.6' stroke='black' stroke-width='1.4'/%3E%3Ccircle cx='6.5' cy='11' r='1.6' stroke='black' stroke-width='1.4'/%3E%3C/svg%3E");
+}
+
+.agent-harness-nav-mark[data-nav-icon="usage"] {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 12.5V9.2l3-2.4 2.6 2 3.4-4.2L13.5 6.2V12.5' stroke='black' stroke-width='1.4' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 12.5V9.2l3-2.4 2.6 2 3.4-4.2L13.5 6.2V12.5' stroke='black' stroke-width='1.4' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+.agent-harness-group-label-sub {
+  padding-top: 6px;
+  opacity: 0.85;
+}
+
+/* Projects — quiet Studio-like section above Chats. */
+.agent-projects-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 10px 0 2px;
+  min-width: 0;
+}
+
+.agent-projects-create {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 6px 6px;
+  padding: 4px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.agent-projects-create[hidden] {
+  display: none !important;
+}
+
+.agent-projects-create-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+
+.agent-projects-create-submit {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.agent-projects-create-cancel {
+  flex: 0 0 auto;
+  width: 28px;
+  margin: 0;
+  padding: 5px 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.agent-projects-create-cancel:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-projects-item.is-just-created .agent-projects-toggle {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent, #f97316) 16%, transparent);
+}
+
+.agent-projects-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px 2px;
+}
+
+.agent-projects-label {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.agent-projects-add {
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.agent-projects-add:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-projects-item-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.agent-projects-toggle {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  text-align: left;
+  min-height: 34px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-projects-toggle:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.agent-projects-remove {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  margin: 0 4px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 45%, transparent);
+  font: inherit;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.agent-projects-remove:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-projects-sessions {
+  padding: 0 0 4px;
+}
+
+.agent-projects-session {
+  padding-left: 10px;
+}
+
+.agent-projects-none {
+  margin: 0;
+  padding: 4px 10px 8px 20px;
+  color: color-mix(in srgb, var(--text) 40%, transparent);
+  font-size: 12px;
+}
+
+.agent-harness-group-label {
+  padding: 12px 10px 4px;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+/* One row grammar for the whole sidebar — chat rows share the exact
+   metrics of Home and the nav rows (34px, 10px inset, 13px/520). */
+.agent-harness-session {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px;
+  border-radius: 10px;
+}
+
+.agent-harness-session:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.agent-harness-session.is-active {
+  background: color-mix(in srgb, var(--text) 11%, transparent);
+}
+
+.agent-harness-session-btn {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 34px;
+  margin: 0;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-harness-session.is-active .agent-harness-session-btn {
+  color: var(--text);
+}
+
+.agent-harness-session-menu {
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  margin: 0 4px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 45%, transparent);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.agent-harness-session:hover .agent-harness-session-menu,
+.agent-harness-session:focus-within .agent-harness-session-menu,
+.agent-harness-session-menu[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.agent-harness-session-pin {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 45%, transparent);
+}
+
+.agent-session-actions {
+  position: fixed;
+  z-index: 200090;
+  padding: 6px;
+  border: 0;
+  border-radius: var(--popover-radius, 14px);
+  background: var(--menu-fill, color-mix(in srgb, var(--surface, #1c1e24) 92%, #0b0c10));
+  box-shadow: var(--popover-shadow, var(--shadow-soft));
+  backdrop-filter: blur(20px) saturate(1.15);
+  -webkit-backdrop-filter: blur(20px) saturate(1.15);
+  outline: none;
+}
+
+.agent-session-actions[hidden] {
+  display: none !important;
+}
+
+.agent-session-actions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.agent-session-actions-label {
+  margin: 6px 8px 2px;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-session-action {
+  appearance: none;
+  width: 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-session-action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.agent-session-action.is-quiet {
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+}
+
+.agent-session-action.is-danger {
+  color: color-mix(in srgb, #f87171 85%, var(--text));
+}
+
+.agent-session-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.agent-harness-segment {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+  flex: 0 0 auto;
+  margin: 0 0 6px;
+  padding: 3px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+.agent-harness-segment-btn {
+  appearance: none;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.agent-harness-segment-btn.is-active {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
+.agent-harness-segment-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.agent-harness-main {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  /* Full height under the Shelf — dock covers the bottom; no premature gap. */
+  padding-bottom: 0;
+  box-sizing: border-box;
+  background: var(--harness-room);
+  overflow: hidden;
+}
+
+/* Center pages — sidebar destinations open in the main column (ChatGPT
+   Plugins-style), layered over the stream. UI only; no authority minted. */
+.agent-harness-page {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  overflow: auto;
+  background: var(--harness-room);
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 28%, transparent) transparent;
+}
+
+.agent-harness-page[hidden] {
+  display: none;
+}
+
+.agent-harness-page:focus {
+  outline: none;
+}
+
+/* Locked to the live composer geometry — same vars as the stream column,
+   so the page text edge lines up exactly with the chat box below. */
+.agent-harness-page-column {
+  width: var(--agent-column-width);
+  max-width: 100%;
+  margin: 0 0 0 var(--agent-column-left, 0px);
+  padding: 36px 0 calc(var(--harness-composer-clearance) + 24px);
+  box-sizing: border-box;
+}
+
+.agent-harness-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.agent-harness-page-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.agent-harness-page-sub {
+  margin: 6px 0 0;
+  color: color-mix(in srgb, var(--text) 50%, transparent);
+  font-size: 12.5px;
+  font-weight: 520;
+  line-height: 1.4;
+}
+
+.agent-harness-page-close {
+  appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  margin: 2px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+  cursor: pointer;
+}
+
+.agent-harness-page-close::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='m4 4 8 8m0-8-8 8' stroke='black' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E") center / 12px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='m4 4 8 8m0-8-8 8' stroke='black' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E") center / 12px no-repeat;
+}
+
+.agent-harness-page-close:hover {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  color: var(--text);
+}
+
+.agent-harness-page-foot {
+  margin: 20px 0 0;
+  color: color-mix(in srgb, var(--text) 40%, transparent);
+  font-size: 11.5px;
+  font-weight: 520;
+}
+
+.agent-harness-page-caption {
+  margin: 0 0 12px;
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-size: 11.5px;
+  font-weight: 520;
+  line-height: 1.4;
+}
+
+/* Page-scale variants — the rail versions are miniature; pages get
+   comfortable ChatGPT-style setting rows. */
+.agent-harness-page .agent-status-dl-page {
+  gap: 6px;
+  max-width: none;
+  font-size: 13px;
+}
+
+.agent-harness-page .agent-status-dl-page > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  padding: 0 14px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.agent-harness-page .agent-status-dl-page dt {
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  text-transform: none;
+  opacity: 1;
+  color: color-mix(in srgb, var(--text) 80%, transparent);
+}
+
+.agent-harness-page .agent-status-dl-page dd {
+  font-weight: 520;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+}
+
+.agent-harness-page .agent-tools-list {
+  gap: 6px;
+}
+
+.agent-harness-page .agent-tools-item {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 14px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+}
+
+.agent-harness-page .agent-tools-demo {
+  width: auto;
+  margin-top: 4px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 80%, transparent);
+  font-size: 12.5px;
+  font-weight: 560;
+}
+
+.agent-harness-page .agent-tools-demo:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
+/* While a page is open the Workbench steps back — one focus at a time. */
+.agent-harness[data-page] .agent-harness-outputs,
+.agent-harness[data-page] .agent-workbench-fab {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.agent-harness-outputs[hidden] {
+  display: none !important;
+}
+
+/* Settings hub — one ops door; Overview Manage rows; section chips. */
+.agent-configure-sections {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 18px;
+}
+
+.agent-configure-chip {
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+}
+
+.agent-configure-chip:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: color-mix(in srgb, var(--text) 82%, transparent);
+}
+
+.agent-configure-chip.is-active {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  color: var(--text);
+}
+
+.agent-configure-overview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-configure-manage-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 64px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-configure-manage-row:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.agent-configure-manage-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.agent-configure-manage-title {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.agent-configure-manage-detail {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.agent-configure-manage-status {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.agent-configure-manage-chevron {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid color-mix(in srgb, var(--text) 45%, transparent);
+  border-top: 1.5px solid color-mix(in srgb, var(--text) 45%, transparent);
+  transform: rotate(45deg);
+}
+
+.agent-machine-card {
+  position: relative;
+  padding: 18px 16px 16px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.agent-machine-name {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.agent-machine-meta,
+.agent-machine-specs,
+.agent-machine-source {
+  margin: 0 0 4px;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.agent-machine-source {
+  margin-top: 10px;
+  margin-bottom: 0;
+  font-size: 11.5px;
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+}
+
+.agent-machine-pill {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, #22c55e 18%, transparent);
+  color: color-mix(in srgb, #86efac 80%, var(--text));
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.agent-runtime-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 16px;
+}
+
+.agent-runtime-badge {
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.agent-runtime-note {
+  margin: 12px 0 0;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.agent-model-tier-blurb {
+  margin: 14px 0 6px;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.agent-model-download-row.is-unfit {
+  opacity: 0.45;
+}
+
+.agent-tools-list-manage {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-tools-manage-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.agent-tools-manage-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agent-tools-manage-title {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.agent-tools-manage-desc {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 12px;
+}
+
+.agent-tools-manage-state {
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.agent-tools-manage-row[data-state="pending"] .agent-tools-manage-state {
+  color: color-mix(in srgb, var(--accent, #f97316) 75%, var(--text));
+}
+
+.agent-tools-manage-row[data-state="granted"] .agent-tools-manage-state {
+  color: color-mix(in srgb, #86efac 70%, var(--text));
+}
+
+.agent-tools-manage-btn {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 560;
+  cursor: pointer;
+}
+
+.agent-tools-manage-btn:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+  color: var(--text);
+}
+
+.agent-usage-kicker {
+  margin: 0 0 4px;
+  color: color-mix(in srgb, var(--text) 50%, transparent);
+  font-size: 12.5px;
+  font-weight: 560;
+}
+
+.agent-usage-hero {
+  margin: 0 0 6px;
+  font-size: 48px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+
+.agent-usage-note {
+  margin: 0 0 22px;
+  color: color-mix(in srgb, var(--text) 45%, transparent);
+  font-size: 12.5px;
+}
+
+.agent-usage-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0 0 28px;
+}
+
+.agent-usage-strip strong {
+  display: block;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.agent-usage-strip span {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 12px;
+  font-weight: 520;
+}
+
+.agent-usage-models {
+  margin: 0 0 8px;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 13px;
+}
+
+.agent-usage-heatmap {
+  margin: 0 0 28px;
+}
+
+.agent-usage-heatmap-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.agent-usage-heatmap-head .agent-models-section-title {
+  margin: 0;
+}
+
+.agent-usage-heatmap-hint {
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-size: 11.5px;
+  font-weight: 520;
+}
+
+.agent-usage-heatmap-grid {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(7, auto);
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 3px;
+  width: 100%;
+  padding-bottom: 4px;
+}
+
+.agent-usage-heatmap-cell {
+  width: 100%;
+  aspect-ratio: 1;
+  height: auto;
+  min-width: 0;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.agent-usage-heatmap-cell[data-level="1"] {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 22%, transparent);
+}
+.agent-usage-heatmap-cell[data-level="2"] {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 40%, transparent);
+}
+.agent-usage-heatmap-cell[data-level="3"] {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 62%, transparent);
+}
+.agent-usage-heatmap-cell[data-level="4"] {
+  background: color-mix(in srgb, var(--accent, #3b82f6) 88%, transparent);
+}
+
+.agent-usage-heatmap-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-size: 11px;
+}
+
+.agent-usage-heatmap-legend {
+  display: inline-flex;
+  gap: 3px;
+  width: 55px;
+  height: 10px;
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--text) 8%, transparent) 0 22%,
+      color-mix(in srgb, var(--accent, #3b82f6) 22%, transparent) 22% 44%,
+      color-mix(in srgb, var(--accent, #3b82f6) 40%, transparent) 44% 66%,
+      color-mix(in srgb, var(--accent, #3b82f6) 62%, transparent) 66% 88%,
+      color-mix(in srgb, var(--accent, #3b82f6) 88%, transparent) 88% 100%
+    );
+  border-radius: 2px;
+}
+
+/* Tool intent lives on the composer approve popover — not the sidebar.
+   Session truth lives on Settings → Runtime. */
+
+.agent-harness[data-session-mode="build"] .agent-harness-outputs {
+  background: color-mix(in srgb, var(--accent, #f97316) 4%, transparent);
+}
+
+.agent-workbench-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 0 10px 8px;
+}
+
+.agent-workbench-tab {
+  margin: 0;
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.agent-workbench-tab.is-active {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  color: color-mix(in srgb, var(--text) 88%, transparent);
+}
+
+.agent-workbench-panels {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 10px 12px;
+}
+
+.agent-workbench-panel[hidden] {
+  display: none !important;
+}
+
+.agent-workbench-hint,
+.agent-workbench-empty {
+  margin: 10px 0 0;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 10px;
+  font-weight: 560;
+  line-height: 1.4;
+}
+
+.agent-plan-markdown {
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+  padding: 8px;
+  border: 0;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  box-sizing: border-box;
+}
+
+.agent-library-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-library-chip {
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-models-section-title {
+  margin: 22px 0 8px;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.agent-status-dl {
+  margin: 0;
+  display: grid;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.agent-status-dl > div {
+  display: grid;
+  gap: 2px;
+}
+
+.agent-status-dl dt {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.5;
+}
+
+.agent-status-dl dd {
+  margin: 0;
+  font-weight: 560;
+}
+
+.agent-tools-list {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.agent-tools-item {
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.agent-tools-item[data-state="pending"] {
+  color: color-mix(in srgb, var(--accent, #f97316) 75%, var(--text));
+}
+
+.agent-tools-demo {
+  width: 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent, #f97316) 16%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.agent-diff-card {
+  padding: 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.agent-diff-path {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.agent-diff-body {
+  margin: 0 0 10px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.4;
+  color: color-mix(in srgb, #16a34a 70%, var(--text));
+}
+
+.agent-diff-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.agent-diff-btn {
+  flex: 1 1 0;
+  margin: 0;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.agent-diff-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.agent-harness-output-chip:not(:disabled) {
+  cursor: pointer;
+}
+
+.agent-harness-session-title {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Only rendered for Build sessions — a quiet trailing tag, not a sub-line. */
+.agent-harness-session-meta {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.agent-starter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.agent-starter-chip {
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.agent-starter-chip:hover {
+  background: color-mix(in srgb, var(--accent, #f97316) 16%, transparent);
+}
+
+/* Think toggle — composer chip (same 32px row as Home / Ask / model). */
+.taskbar.is-agent-face .agent-think-btn {
+  box-sizing: border-box;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  margin: 0;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  cursor: pointer;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.taskbar.is-agent-face .agent-think-btn:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.taskbar.is-agent-face .agent-think-btn[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent, #f97316) 18%, transparent);
+  color: color-mix(in srgb, var(--text) 88%, transparent);
+}
+
+/* Follow-up queue — ChatGPT-style bumps stacked above the composer field.
+   Lives inside the Shelf agent face so dock height / stream clearance stay honest. */
+.taskbar.is-agent-face .agent-queue {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  margin: 0 0 10px;
+  padding: 0;
+  max-height: min(28vh, 220px);
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.taskbar.is-agent-face .agent-queue[hidden] {
+  display: none !important;
+}
+
+.taskbar.is-agent-face .agent-queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 8px 8px 12px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.taskbar.is-agent-face .agent-queue-item-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: color-mix(in srgb, var(--text) 82%, transparent);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.taskbar.is-agent-face .agent-queue-item-remove {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.taskbar.is-agent-face .agent-queue-item-remove:hover {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  color: color-mix(in srgb, var(--text) 88%, transparent);
+}
+
+/* Thinking — a quiet ChatGPT-style disclosure line, not a boxed card. */
+.agent-thinking {
+  margin: 2px 0 10px;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  overflow: clip;
+}
+
+.agent-thinking-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 0;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+  font-weight: 520;
+  user-select: none;
+}
+
+.agent-thinking-summary:hover {
+  color: color-mix(in srgb, var(--text) 80%, transparent);
+}
+
+.agent-thinking.is-streaming .agent-thinking-label {
+  animation: agent-thinking-shimmer 1.6s ease-in-out infinite;
+}
+
+@keyframes agent-thinking-shimmer {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-thinking.is-streaming .agent-thinking-label {
+    animation: none;
+  }
+}
+
+.agent-thinking-summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-thinking-chevron {
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  opacity: 0.55;
+  transition: transform 220ms ease;
+  flex: 0 0 auto;
+}
+
+.agent-thinking[open] .agent-thinking-chevron {
+  transform: rotate(45deg);
+}
+
+.agent-thinking-body-wrap {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 280ms ease;
+}
+
+.agent-thinking[open] .agent-thinking-body-wrap {
+  grid-template-rows: 1fr;
+}
+
+.agent-thinking-body {
+  margin: 4px 0 6px;
+  padding: 0 0 0 13px;
+  min-height: 0;
+  overflow: hidden;
+  border-left: 2px solid color-mix(in srgb, var(--text) 12%, transparent);
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+  opacity: 0.8;
+}
+
+.agent-thinking.is-streaming .agent-thinking-body::after {
+  content: "▍
+  animation: agent-caret 1s steps(1) infinite;
+}
+
+html[data-agent-reasoning="off"] .agent-thinking {
+  display: none;
+}
+
+.agent-tool-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  font-size: 12px;
+}
+
+.agent-tool-row-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--text) 18%, transparent);
+  border-top-color: var(--accent, #f97316);
+  flex: 0 0 auto;
+}
+
+.agent-tool-row.is-running .agent-tool-row-spinner {
+  animation: agent-spin 0.7s linear infinite;
+}
+
+.agent-tool-row.is-done .agent-tool-row-spinner,
+.agent-tool-row.is-denied .agent-tool-row-spinner {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--accent, #f97316) 55%, transparent);
+  animation: none;
+}
+
+.agent-tool-row.is-denied .agent-tool-row-spinner {
+  background: color-mix(in srgb, #c2410c 70%, transparent);
+}
+
+.agent-tool-row-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.agent-tool-row-name {
+  font-weight: 700;
+}
+
+.agent-tool-row-detail {
+  font-size: 11px;
+  opacity: 0.55;
+}
+
+.agent-tool-row-status {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+
+.agent-followups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 14px;
+}
+
+.agent-followup-chip {
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  animation: agent-msg-enter 280ms ease both;
+}
+
+.agent-followup-chip:hover {
+  background: color-mix(in srgb, var(--accent, #f97316) 16%, transparent);
+}
+
+.agent-msg-enter {
+  animation: agent-msg-enter 320ms ease both;
+}
+
+@keyframes agent-msg-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes agent-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-thinking.is-streaming .agent-thinking-body::after,
+  .agent-tool-row.is-running .agent-tool-row-spinner,
+  .agent-msg-enter,
+  .agent-followup-chip {
+    animation: none !important;
+  }
+
+  .agent-thinking-body-wrap,
+  .agent-thinking-chevron {
+    transition: none !important;
+  }
+}
+
+/* Scrollport fills the main column — no top chrome. Soft fade at top (Codex)
+   and under the Shelf at the bottom. */
+.agent-harness-stream-viewport {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.agent-harness-stream {
+  display: block;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* Extra inset so the last lines sit clearly above the Shelf, not in the fade. */
+  padding: 28px 0 calc(var(--harness-composer-clearance) + 36px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 28%, transparent) transparent;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 36px,
+    #000 calc(100% - var(--harness-composer-clearance) - 8px),
+    rgba(0, 0, 0, 0.55) calc(100% - var(--harness-composer-clearance) + 28px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 36px,
+    #000 calc(100% - var(--harness-composer-clearance) - 8px),
+    rgba(0, 0, 0, 0.55) calc(100% - var(--harness-composer-clearance) + 28px),
+    transparent 100%
+  );
+}
+
+/* Locked to live Shelf geometry via --agent-column-width / --agent-column-left (JS). */
+.agent-harness-stream-column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: var(--agent-column-width);
+  max-width: none;
+  margin: 0;
+  margin-left: var(--agent-column-left, 0px);
+  min-height: min-content;
+  box-sizing: border-box;
+}
+
+/* Empty hero: same horizontal band as the Shelf composer
+   (--agent-column-left / --agent-column-width from syncComposerGeometry).
+   Avoid sidebar translate hacks — those drift vs the dock. */
+.agent-harness-empty {
+  position: absolute;
+  top: 0;
+  bottom: var(--harness-composer-clearance);
+  left: var(--agent-column-left, 0px);
+  width: var(--agent-column-width);
+  right: auto;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0 32px;
+  max-width: none;
+  box-sizing: border-box;
+  text-align: center;
+  pointer-events: none;
+  transform: none;
+}
+
+.agent-harness-empty-greeting {
+  margin: 0 0 12px;
+  max-width: 22ch;
+  color: var(--text);
+  font-size: clamp(28px, 3.6vw, 40px);
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  line-height: 1.12;
+  text-wrap: balance;
+}
+
+.agent-harness-empty-sub {
+  margin: 0;
+  max-width: 42ch;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  text-wrap: balance;
+}
+
+.agent-harness-empty-teach {
+  margin: 10px 0 0;
+  max-width: 46ch;
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.4;
+  text-wrap: pretty;
+}
+
+.agent-inference-status {
+  flex: 0 0 auto;
+  margin: 0 16px 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  font-size: 12px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+}
+
+.agent-inference-status[hidden] {
+  display: none;
+}
+
+.agent-inference-status[data-state="preview"] {
+  border: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-inference-status[data-state="offline"] {
+  border: 0.5px solid color-mix(in srgb, #f59e0b 35%, transparent);
+  background: color-mix(in srgb, #f59e0b 10%, transparent);
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+}
+
+/* w1: live local model confirmed by probe — calm green, no fanfare. */
+.agent-inference-status[data-state="live"] {
+  border: 0.5px solid color-mix(in srgb, #34d399 30%, transparent);
+  background: color-mix(in srgb, #34d399 8%, transparent);
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+}
+
+.agent-preview-banner {
+  margin: 0 0 14px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+  font-size: 12.5px;
+  font-weight: 520;
+  line-height: 1.35;
+}
+
+.agent-grant-card-teach {
+  margin: 0 0 10px;
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.agent-harness-outputs {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: var(--harness-outputs-w);
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 12px 12px 14px;
+  border: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--harness-rail) 92%, #000);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+  max-height: calc(100% - var(--harness-composer-clearance) - 20px);
+  overflow: auto;
+  pointer-events: auto;
+}
+
+.agent-harness-outputs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px 4px;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.agent-harness-outputs-preview {
+  color: color-mix(in srgb, var(--text) 45%, transparent);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.agent-harness-outputs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-harness-output-chip {
+  appearance: none;
+  width: 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: not-allowed;
+}
+
+/* Inbox-grammar grant card — preview mock only (UI ≠ authority). */
+.agent-grant-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  margin: 2px 0 4px;
+  padding: 12px 14px;
+  border: 0.5px solid color-mix(in srgb, var(--text) 12%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--harness-rail) 88%, var(--harness-room));
+  box-sizing: border-box;
+}
+
+.agent-grant-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.agent-grant-card-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.agent-grant-card-preview {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.agent-grant-card-summary {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.agent-grant-card-scope {
+  margin: 0;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.agent-grant-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-grant-btn {
+  appearance: none;
+  margin: 0;
+  padding: 7px 12px;
+  border: 0.5px solid color-mix(in srgb, var(--text) 14%, transparent);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.agent-grant-btn-allow {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--harness-room, #0a0a0b);
+}
+
+.agent-grant-btn-deny {
+  color: color-mix(in srgb, #ff8f8f 80%, var(--text));
+  border-color: color-mix(in srgb, #ff8f8f 32%, transparent);
+  background: color-mix(in srgb, #ff8f8f 10%, transparent);
+}
+
+.agent-grant-card-chip {
+  margin-top: 2px;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 11px;
+  font-weight: 560;
+}
+
+.agent-grant-card.is-denied .agent-grant-card-chip {
+  color: color-mix(in srgb, #ff8f8f 70%, var(--text));
+}
+
+.agent-grant-card-result {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.agent-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.agent-msg-agent {
+  align-self: stretch;
+}
+
+.agent-msg-agent .agent-msg-body,
+.agent-msg-agent .agent-md-code {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.agent-msg-body {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.agent-msg-user {
+  align-self: flex-end;
+  width: auto;
+  max-width: min(85%, 560px);
+  text-align: right;
+}
+
+.agent-msg-user .agent-msg-body {
+  padding: 10px 12px;
+  border-radius: 16px 16px 6px 16px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  white-space: pre-wrap;
+}
+
+.agent-msg-agent.is-streaming .agent-msg-body::after {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.12em;
+  background: color-mix(in srgb, var(--text) 55%, transparent);
+  animation: agent-caret-blink 900ms steps(1, end) infinite;
+}
+
+@keyframes agent-caret-blink {
+  0%, 45% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+.agent-msg-actions {
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.agent-msg:hover .agent-msg-actions,
+.agent-msg:focus-within .agent-msg-actions {
+  opacity: 1;
+}
+
+.agent-msg-action,
+.agent-msg-retry,
+.agent-md-copy {
+  appearance: none;
+  margin: 0;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 70%, transparent);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 560;
+  cursor: pointer;
+}
+
+.agent-msg-action:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.agent-msg-stopped {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 11px;
+  font-weight: 560;
+}
+
+.agent-md-p {
+  margin: 0 0 0.7em;
+}
+
+.agent-md-p:last-child {
+  margin-bottom: 0;
+}
+
+.agent-md-inline {
+  padding: 0.1em 0.35em;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+}
+
+.agent-md-code {
+  margin: 0.6em 0;
+  border-radius: 12px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border: 0.5px solid var(--hairline);
+}
+
+.agent-md-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  border-bottom: 0.5px solid var(--hairline);
+}
+
+.agent-md-code pre {
+  margin: 0;
+  padding: 12px 14px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.agent-md-code code {
+  font: inherit;
+}
+
+@media (max-width: 1100px) {
+  :root {
+    --harness-sidebar-w: 228px;
+    --harness-outputs-w: 260px;
+  }
+}
+
+/* Part X — narrow: no Space pager; Agent = drawer + pill composer. */
+@media (max-width: 900px) {
+  :root {
+    --harness-sidebar-w: min(320px, 86vw);
+    --harness-outputs-w: 0px;
+    --agent-column-width: min(720px, calc(100vw - 24px));
+    /* Same top inset open (sidebar head) and closed (mobile bar) — no jump. */
+    --harness-chrome-top: calc(14px + env(safe-area-inset-top, 0px));
+    --harness-drawer-ms: 420ms;
+    --harness-drawer-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  #space-pager {
+    display: none !important;
+  }
+
+  .agent-workbench-fab {
+    display: none !important;
+  }
+
+  /* Narrow: workbench is a sheet when opened — not a permanent right column. */
+  .agent-harness-outputs {
+    display: none;
+  }
+
+  .agent-harness.workbench-open .agent-harness-outputs:not([hidden]) {
+    display: flex;
+    position: fixed;
+    top: calc(12px + env(safe-area-inset-top, 0px));
+    right: 12px;
+    bottom: calc(var(--harness-composer-clearance, 96px) + 12px);
+    left: auto;
+    width: min(360px, calc(100vw - 24px));
+    max-height: none;
+    z-index: 30;
+  }
+
+  .agent-harness {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Push sidebar (not dim overlay): rail slides in; main + dock nudge right. */
+  .agent-harness-scrim {
+    display: none !important;
+  }
+
+  .agent-harness {
+    overflow: hidden;
+  }
+
+  .agent-harness-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 6;
+    grid-column: auto;
+    grid-row: auto;
+    width: var(--harness-sidebar-w);
+    max-width: 86vw;
+    padding: var(--harness-chrome-top) 12px
+      calc(12px + env(safe-area-inset-bottom, 0px));
+    border-right: 0;
+    box-shadow: none;
+    opacity: 1;
+    filter: none;
+    transform: translateX(-105%);
+    transition: transform var(--harness-drawer-ms) var(--harness-drawer-ease);
+    pointer-events: auto;
+    will-change: transform;
+  }
+
+  .agent-harness.is-visible .agent-harness-sidebar {
+    opacity: 1;
+    filter: none;
+    transform: translateX(-105%);
+    pointer-events: none;
+  }
+
+  body.agent-harness-drawer-open .agent-harness-sidebar,
+  body.agent-harness-drawer-open .agent-harness.is-visible .agent-harness-sidebar {
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  body.agent-harness-active.agent-harness-drawer-open .agent-harness {
+    z-index: 100120;
+    /* Behind the curve = sidebar rail; chat sheet stays room (separate). */
+    background: var(--harness-rail) !important;
+  }
+
+  /* Mobile: close is tap-the-chat — no panel/close glyph in the rail. */
+  #agent-harness-panel-toggle {
+    display: none !important;
+  }
+
+  .agent-harness-mobile-bar {
+    display: flex;
+    align-items: center;
+    min-height: 40px;
+    /* Match sidebar head band — icon stays put open ↔ closed. */
+    padding: 2px 10px 8px;
+  }
+
+  #agent-harness-search-open-main,
+  .agent-workbench-open-btn {
+    display: grid;
+  }
+
+  body.agent-harness-drawer-open #agent-harness-drawer-open,
+  body.agent-harness-drawer-open #agent-harness-search-open-main,
+  body.agent-harness-drawer-open .agent-workbench-open-btn {
+    display: none !important;
+  }
+
+  .agent-harness-main {
+    grid-column: 1;
+    padding-top: var(--harness-chrome-top);
+    transition:
+      transform var(--harness-drawer-ms) var(--harness-drawer-ease),
+      border-radius var(--harness-drawer-ms) var(--harness-drawer-ease),
+      box-shadow var(--harness-drawer-ms) var(--harness-drawer-ease);
+    will-change: transform;
+  }
+
+  .agent-harness.is-visible .agent-harness-main {
+    transition:
+      opacity 560ms var(--harness-ease),
+      filter 640ms var(--harness-ease),
+      transform var(--harness-drawer-ms) var(--harness-drawer-ease),
+      border-radius var(--harness-drawer-ms) var(--harness-drawer-ease),
+      box-shadow var(--harness-drawer-ms) var(--harness-drawer-ease);
+  }
+
+  /* Push sheet + curve only — no border/depth experiments (settled). */
+  body.agent-harness-drawer-open .agent-harness.is-visible .agent-harness-main {
+    transform: translateX(calc(min(var(--harness-sidebar-w), 86vw) - 2px));
+    border-radius: 36px 0 0 36px;
+    border: 0;
+    box-shadow: none;
+    overflow: hidden;
+    background: var(--harness-room);
+  }
+
+  body.agent-harness-drawer-open .taskbar.is-agent-face {
+    /* Same translate as main — stream column ↔ composer stay locked. */
+    transform: translateX(calc(min(var(--harness-sidebar-w), 86vw) - 2px));
+    transition: transform var(--harness-drawer-ms) var(--harness-drawer-ease);
+    will-change: transform;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .agent-harness-sidebar,
+    .agent-harness-main,
+    .agent-harness.is-visible .agent-harness-main,
+    body.agent-harness-drawer-open .taskbar.is-agent-face {
+      transition-duration: 1ms !important;
+    }
+  }
+
+  .agent-session-search {
+    padding: 0;
+    place-items: stretch;
+    background: var(--bg, #050608);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .agent-session-search-panel {
+    width: 100%;
+    max-height: none;
+    height: 100%;
+    border-radius: 0;
+    border: 0;
+    box-shadow: none;
+  }
+
+  .agent-session-search-bar {
+    padding-top: calc(12px + env(safe-area-inset-top, 0px));
+  }
+
+  .agent-harness-empty {
+    padding-left: 20px;
+    padding-right: 20px;
+  }
+
+  .agent-harness-empty-greeting {
+    font-size: clamp(24px, 7vw, 34px);
+    max-width: 16ch;
+  }
+
+  /* Snug composer — Home + Local pill + mic/send; hide Approve/+ only. */
+  .taskbar.is-agent-face {
+    width: var(--agent-column-width, calc(100vw - 24px));
+    max-width: calc(100vw - 24px);
+    min-height: 0;
+    max-height: min(42vh, 280px);
+    padding: 12px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+    border-radius: 24px;
+  }
+
+  .taskbar.is-agent-face .shelf-morph-stage {
+    min-height: 0;
+  }
+
+  .taskbar.is-agent-face .agent-composer {
+    min-height: 0;
+    max-height: 100%;
+    gap: 8px;
+    justify-content: flex-start;
+    overflow: hidden;
+  }
+
+  .taskbar.is-agent-face .agent-composer-input {
+    font-size: 16px; /* iOS zoom guard */
+    min-height: 24px;
+    max-height: min(28vh, 180px); /* JS tightens further to pill chrome */
+    padding-top: 0;
+    overflow-y: auto;
+  }
+}
+
+/* Composer toolbar — one shared 32px control box on every viewport.
+   (Was mobile-only; desktop showed mixed 28/30px heights = "raised" chips.) */
+.taskbar.is-agent-face .agent-composer-toolbar {
+  gap: 6px;
+  min-height: 36px;
+  align-items: center;
+}
+
+.taskbar.is-agent-face .agent-composer-tools-left,
+.taskbar.is-agent-face .agent-composer-tools-right {
+  height: 32px;
+  gap: 4px;
+  align-items: center;
+}
+
+.taskbar.is-agent-face .agent-composer-tools-right {
+  margin-left: auto;
+}
+
+.taskbar.is-agent-face .agent-approve-wrap,
+.taskbar.is-agent-face .agent-model-wrap {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+}
+
+.taskbar.is-agent-face .agent-flip-back,
+.taskbar.is-agent-face .agent-tool-btn,
+.taskbar.is-agent-face .agent-approve-btn,
+.taskbar.is-agent-face .agent-model-btn,
+.taskbar.is-agent-face .agent-mic-btn,
+.taskbar.is-agent-face .agent-send-btn {
+  box-sizing: border-box;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  margin: 0;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.taskbar.is-agent-face .agent-flip-back {
+  padding: 0 8px;
+}
+
+.taskbar.is-agent-face .agent-tool-btn,
+.taskbar.is-agent-face .agent-mic-btn,
+.taskbar.is-agent-face .agent-send-btn {
+  width: 32px;
+  flex: 0 0 32px;
+  padding: 0;
+}
+
+/* Model on the right — ChatGPT "5.6 Sol Light ▾" role. */
+.taskbar.is-agent-face .agent-model-btn {
+  max-width: min(200px, 36vw);
+  padding: 0 10px;
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+  font-size: 13px;
+  font-weight: 560;
+}
+
+.taskbar.is-agent-face .agent-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transform: none;
+}
+
+.taskbar.is-agent-face .agent-model-tier {
+  display: none;
+}
+
+.taskbar.is-agent-face .agent-model-chevron,
+.taskbar.is-agent-face .agent-approve-chevron {
+  transform: none;
+}
+
+.taskbar.is-agent-face .agent-approve-btn {
+  padding: 0 10px 0 8px;
+  justify-content: flex-start;
+}
+
+.taskbar.is-agent-face #space-pager {
+  display: none !important;
+}
+
+.taskbar.is-agent-face .taskbar-inner {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  align-items: stretch;
+  overflow: hidden;
+}
+
+.taskbar.is-agent-face .shelf-morph-stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  overflow: hidden;
+}
+
+.taskbar.is-agent-face .shelf-face-apps {
+  /* Pin to the dock floor so icons don’t ride the upward height FLIP. */
+  position: absolute;
+  left: 0;
+  right: auto;
+  bottom: 0;
+  top: auto;
+  width: max-content;
+  max-width: 100%;
+  height: var(--taskbar-h);
+  display: flex;
+  align-items: center;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.taskbar.is-agent-face .shelf-face-agent {
+  position: relative;
+  inset: auto;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  overflow: hidden;
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Dock → AI: dissolve in place — opacity/blur only (no translate/scale drift).
+   Apps launcher morph keeps dock icons (data-launcher-morphing) — exclude. */
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit,
+.taskbar.is-agent-face .shelf-morph-exit {
+  opacity: 0;
+  transform: none;
+  filter: blur(5px);
+  pointer-events: none;
+}
+
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit .taskbar-icon,
+.taskbar.is-agent-face .shelf-morph-exit .taskbar-icon {
+  /* Kill dock-mag lift/scale so dissolve stays planted. */
+  transform: none !important;
+}
+
+/* Reverse of restore order: targets → divider → Apps → Agent. */
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit[data-morph-exit="3"],
+.taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="3"] {
+  transition-delay: 120ms;
+}
+
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit[data-morph-exit="2"],
+.taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="2"] {
+  transition-delay: 160ms;
+}
+
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit[data-morph-exit="1"],
+.taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="1"] {
+  transition-delay: 200ms;
+}
+
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) .shelf-morph-exit[data-morph-exit="0"],
+.taskbar.is-agent-face .shelf-morph-exit[data-morph-exit="0"] {
+  transition-delay: 240ms;
+}
+
+.taskbar[data-agent-morph="exit"]:not([data-launcher-morphing]) #space-pager {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Phase 2 — stretch only; AI chrome stays hidden until enter. */
+.taskbar.is-agent-face[data-agent-morph="grow"] .shelf-face-agent {
+  pointer-events: none;
+}
+
+.taskbar.is-agent-face[data-agent-morph="grow"] .shelf-morph-enter,
+.taskbar.is-agent-face[data-agent-morph="leave"] .shelf-morph-enter {
+  opacity: 0;
+  transform: translateY(10px) scale(0.97);
+  filter: blur(5px);
+  transition-delay: 0ms;
+}
+
+/* Phase 3 — AI controls sequence in after stretch settles.
+   Also honor settled Agent face with no morph attr (MC / Space snap). */
+.taskbar.is-agent-face[data-agent-morph="enter"] .shelf-face-agent,
+.taskbar.is-agent-face:not([data-agent-morph]) .shelf-face-agent {
+  pointer-events: auto;
+}
+
+.taskbar.is-agent-face[data-agent-morph="enter"] .shelf-morph-enter,
+.taskbar.is-agent-face:not([data-agent-morph]) .shelf-morph-enter {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+}
+
+.taskbar.is-agent-face[data-agent-morph="enter"] .shelf-morph-enter[data-morph-enter="0"] {
+  transition-delay: 0ms;
+}
+
+.taskbar.is-agent-face[data-agent-morph="enter"] .shelf-morph-enter[data-morph-enter="1"] {
+  transition-delay: 50ms;
+}
+
+/* Closing: composer out first, then shrink restores Shelf icons. */
+.taskbar[data-agent-morph="leave"] .shelf-morph-enter {
+  transition-duration: 120ms;
+  transition-timing-function: var(--shell-motion-leave-ease);
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit,
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit {
+  transition-duration: 280ms;
+  transition-timing-function: var(--shelf-morph-ease);
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="0"],
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="0"] {
+  transition-delay: 120ms;
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="1"],
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="1"] {
+  transition-delay: 160ms;
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="2"],
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="2"] {
+  transition-delay: 200ms;
+}
+
+.taskbar[data-agent-morph="shrink"] .shelf-morph-exit[data-morph-exit="3"],
+.taskbar:not(.is-agent-face):not(.is-launcher-face):not([data-agent-morph="exit"]) .shelf-morph-exit[data-morph-exit="3"] {
+  transition-delay: 240ms;
+}
+
+.taskbar-item-agent .taskbar-icon-agent {
+  width: 100%;
+  height: 100%;
+  border-radius: 12px;
+  background:
+    url("./icons/intelligence/icon-64.png?v=home-20260724z") center / contain no-repeat;
+}
+
+.agent-composer {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.agent-composer-field {
+  display: block;
+  margin: 0;
+  flex: 1 1 auto;
+  min-height: 28px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.agent-composer-input {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  /* ChatGPT-class grow — JS also caps to ~42vh / 320px. */
+  max-height: min(42vh, 320px);
+  margin: 0;
+  padding: 2px 4px 0 0;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.4;
+  caret-color: var(--text);
+  /* Firefox — thin thumb, invisible track (no white gutter). */
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 32%, transparent) transparent;
+}
+
+.agent-composer-input::placeholder {
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-weight: 400;
+}
+
+.agent-composer-input::-webkit-scrollbar {
+  width: 8px;
+}
+
+.agent-composer-input::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 4px 0;
+}
+
+.agent-composer-input::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--text) 28%, transparent);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.agent-composer-input::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--text) 42%, transparent);
+}
+
+.agent-composer-input::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.agent-composer-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+  line-height: 1;
+}
+
+.agent-composer-tools-left,
+.agent-composer-tools-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  height: 32px;
+}
+
+.agent-composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 2px 2px;
+  min-width: 0;
+}
+
+.agent-composer-attachments[hidden] {
+  display: none !important;
+}
+
+.agent-attach-chip {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin: 0;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 560;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.agent-attach-chip:hover {
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.agent-attach-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 160px;
+}
+
+.agent-attach-chip-meta {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  white-space: nowrap;
+}
+
+.agent-attach-chip-x {
+  opacity: 0.65;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.agent-tool-btn,
+.agent-approve-btn,
+.agent-model-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 72%, transparent);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 999px;
+}
+
+.agent-tool-btn {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-size: 20px;
+  font-weight: 300;
+}
+
+.agent-tool-btn:hover,
+.agent-approve-btn:hover,
+.agent-model-btn:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+.agent-approve-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.agent-approve-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 8px 0 8px;
+  white-space: nowrap;
+  max-width: min(220px, 42vw);
+}
+
+.agent-approve-btn [data-approve-label] {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-approve-btn.is-danger,
+.agent-approve-btn.is-danger:hover {
+  color: #f97316;
+}
+
+.agent-approve-chevron {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  opacity: 0.55;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.5 4.25 6 7.75l3.5-3.5' stroke='%23c9ced6' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+      center / 8px no-repeat;
+}
+
+:root[data-el-theme="light"] .agent-approve-chevron {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M2.5 4.25 6 7.75l3.5-3.5' stroke='%23485163' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* Intent mark — not a grant. Icon follows selected mode. */
+.agent-approve-mark {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 1.55 13.15 3.35v4.05c0 3.25-2.15 5.55-5.15 6.55-3-1-5.15-3.3-5.15-6.55V3.35L8 1.55Z' stroke='%23c9ced6' stroke-width='1.35'/%3E%3Ccircle cx='8' cy='6.35' r='1.55' stroke='%23c9ced6' stroke-width='1.2'/%3E%3Cpath d='M5.7 10.1c.7.85 1.55 1.25 2.3 1.25s1.6-.4 2.3-1.25' stroke='%23c9ced6' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E")
+      center / 15px no-repeat;
+}
+
+.agent-approve-mark[data-icon="ask"],
+.agent-approve-option-icon[data-icon="ask"] {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M5.2 7.2c0-1.7 1.3-3 2.8-3s2.8 1.3 2.8 3c0 1.15-.6 1.9-1.35 2.45-.55.4-.85.75-.85 1.35' stroke='%23c9ced6' stroke-width='1.3' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='12.35' r='0.85' fill='%23c9ced6'/%3E%3C/svg%3E");
+}
+
+.agent-approve-mark[data-icon="read"],
+.agent-approve-option-icon[data-icon="read"] {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.75 8c1.35-2.4 3.1-3.6 5.25-3.6S12.9 5.6 14.25 8c-1.35 2.4-3.1 3.6-5.25 3.6S4.1 10.4 2.75 8Z' stroke='%23c9ced6' stroke-width='1.25'/%3E%3Ccircle cx='8' cy='8' r='1.55' stroke='%23c9ced6' stroke-width='1.2'/%3E%3C/svg%3E");
+}
+
+.agent-approve-mark[data-icon="full"],
+.agent-approve-option-icon[data-icon="full"] {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 1.55 13.15 3.35v4.05c0 3.25-2.15 5.55-5.15 6.55-3-1-5.15-3.3-5.15-6.55V3.35L8 1.55Z' stroke='%23f97316' stroke-width='1.35'/%3E%3Cpath d='M8 5.1v3.2' stroke='%23f97316' stroke-width='1.35' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='10.55' r='0.8' fill='%23f97316'/%3E%3C/svg%3E");
+}
+
+:root[data-el-theme="light"] .agent-approve-mark {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 1.55 13.15 3.35v4.05c0 3.25-2.15 5.55-5.15 6.55-3-1-5.15-3.3-5.15-6.55V3.35L8 1.55Z' stroke='%23485163' stroke-width='1.35'/%3E%3Ccircle cx='8' cy='6.35' r='1.55' stroke='%23485163' stroke-width='1.2'/%3E%3Cpath d='M5.7 10.1c.7.85 1.55 1.25 2.3 1.25s1.6-.4 2.3-1.25' stroke='%23485163' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+:root[data-el-theme="light"] .agent-approve-mark[data-icon="ask"],
+:root[data-el-theme="light"] .agent-approve-option-icon[data-icon="ask"] {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M5.2 7.2c0-1.7 1.3-3 2.8-3s2.8 1.3 2.8 3c0 1.15-.6 1.9-1.35 2.45-.55.4-.85.75-.85 1.35' stroke='%23485163' stroke-width='1.3' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='12.35' r='0.85' fill='%23485163'/%3E%3C/svg%3E");
+}
+
+:root[data-el-theme="light"] .agent-approve-mark[data-icon="read"],
+:root[data-el-theme="light"] .agent-approve-option-icon[data-icon="read"] {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.75 8c1.35-2.4 3.1-3.6 5.25-3.6S12.9 5.6 14.25 8c-1.35 2.4-3.1 3.6-5.25 3.6S4.1 10.4 2.75 8Z' stroke='%23485163' stroke-width='1.25'/%3E%3Ccircle cx='8' cy='8' r='1.55' stroke='%23485163' stroke-width='1.2'/%3E%3C/svg%3E");
+}
+
+/* Composer menus — glass lift, no hard edge (DESIGN_SYSTEM popover geometry). */
+.agent-approve-menu,
+.agent-model-menu {
+  position: fixed;
+  /* Above harness (100085) + agent taskbar (100110) — body portal. */
+  z-index: 200090;
+  padding: 8px;
+  border: 0;
+  border-radius: var(--popover-radius, 14px);
+  background: var(--menu-fill, color-mix(in srgb, var(--surface, #1c1e24) 92%, #0b0c10));
+  box-shadow: var(--popover-shadow, var(--shadow-soft));
+  backdrop-filter: blur(20px) saturate(1.15);
+  -webkit-backdrop-filter: blur(20px) saturate(1.15);
+  outline: none;
+  transform-origin: bottom center;
+  animation: agent-menu-rise var(--shell-motion-enter, 180ms) var(--shell-motion-enter-ease, ease-out) both;
+}
+
+/* Rises from the trigger (menus sit above the composer). */
+@keyframes agent-menu-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-approve-menu,
+  .agent-model-menu {
+    animation: none;
+  }
+}
+
+.agent-approve-menu {
+  width: min(328px, calc(100vw - 24px));
+}
+
+.agent-approve-menu-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 10px 12px;
+}
+
+.agent-approve-menu-title {
+  margin: 0;
+  color: color-mix(in srgb, var(--text) 58%, transparent);
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.35;
+}
+
+.agent-approve-menu-learn {
+  margin: 0;
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-size: 11px;
+  font-weight: 520;
+  white-space: nowrap;
+}
+
+.agent-approve-menu-list,
+.agent-model-menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.agent-approve-option {
+  appearance: none;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) 16px;
+  align-items: start;
+  gap: 10px;
+  width: 100%;
+  margin: 0;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-approve-option:hover,
+.agent-approve-option.is-active {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.agent-approve-option-icon {
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 16px;
+}
+
+.agent-approve-option-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.agent-approve-option-title {
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.25;
+}
+
+.agent-approve-option-desc {
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.agent-approve-option-check {
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  opacity: 0;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M3.4 8.2 6.5 11.2 12.6 4.6' stroke='%23e8ebf0' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+      center / 14px no-repeat;
+}
+
+.agent-approve-option.is-active .agent-approve-option-check {
+  opacity: 1;
+}
+
+/* Warning lives in the title only — desc stays muted for hierarchy. */
+.agent-approve-option-danger .agent-approve-option-title {
+  color: #f97316;
+}
+
+.agent-approve-option-danger:hover,
+.agent-approve-option-danger.is-active {
+  background: color-mix(in srgb, #f97316 12%, transparent);
+}
+
+:root[data-el-theme="light"] .agent-approve-option-check {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M3.4 8.2 6.5 11.2 12.6 4.6' stroke='%2322262f' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+.agent-model-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.agent-model-menu {
+  width: min(280px, calc(100vw - 24px));
+}
+
+/* Quick switcher is one-line rows — detail lives on the Models page. */
+.agent-model-menu .agent-model-option-desc,
+.agent-model-menu .agent-model-option-meta {
+  display: none;
+}
+
+.agent-model-menu-add {
+  appearance: none;
+  display: block;
+  width: 100%;
+  margin: 6px 0 0;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 0 0 10px 10px;
+  background: transparent;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 520;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-model-menu-add:hover {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--text);
+}
+
+/* Hero — the single hardware-led pick. */
+.agent-model-hero-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin: 0 2px 8px;
+  padding: 10px;
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.agent-model-hero-kicker {
+  color: color-mix(in srgb, var(--text) 44%, transparent);
+  font-size: 10.5px;
+  font-weight: 620;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+
+.agent-model-hero-btn:disabled {
+  opacity: 0.6;
+}
+
+.agent-model-menu-empty {
+  margin: 0;
+  padding: 10px;
+  color: color-mix(in srgb, var(--text) 52%, transparent);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.agent-model-option,
+.agent-model-download-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 16px;
+  align-items: start;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+}
+
+.agent-model-option {
+  appearance: none;
+  cursor: pointer;
+}
+
+.agent-model-option:hover,
+.agent-model-option.is-active {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.agent-model-option .agent-approve-option-check {
+  opacity: 0;
+}
+
+.agent-model-option.is-active .agent-approve-option-check {
+  opacity: 1;
+}
+
+/* w1: real llama-server model — checked, quiet, not clickable theatre. */
+.agent-model-option.is-live {
+  cursor: default;
+  background: color-mix(in srgb, #34d399 6%, transparent);
+}
+
+.agent-model-option.is-live .agent-approve-option-check {
+  opacity: 1;
+}
+
+.agent-model-option-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.agent-model-option-title {
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.25;
+}
+
+.agent-model-option-desc {
+  color: color-mix(in srgb, var(--text) 55%, transparent);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.agent-model-option-meta {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-size: 11px;
+  font-weight: 560;
+  white-space: nowrap;
+  margin-top: 2px;
+}
+
+.agent-model-download-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+/* Primary actions (Get / Use) ride the user's accent; blocked rows stay quiet. */
+.agent-model-download-btn {
+  appearance: none;
+  margin: 0;
+  padding: 5px 11px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--el-accent-ink, #fff);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.agent-model-download-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 86%, #fff);
+}
+
+.agent-model-download-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: color-mix(in srgb, var(--text) 70%, transparent);
+}
+
+.agent-model-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 6px;
+  max-width: 200px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.agent-model-name,
+.agent-model-tier {
+  display: inline-block;
+  line-height: 1;
+  transform: translateY(0.5px); /* optical center vs icons */
+}
+
+.agent-model-name {
+  color: var(--text);
+  font-weight: 550;
+}
+
+.agent-model-tier {
+  color: color-mix(in srgb, var(--text) 48%, transparent);
+  font-weight: 450;
+}
+
+.agent-model-chevron {
+  width: 0;
+  height: 0;
+  margin-left: 1px;
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-top: 4.5px solid currentColor;
+  opacity: 0.55;
+  flex: 0 0 auto;
+  /* Optical: CSS triangles sit high; nudge to match cap-height. */
+  transform: translateY(1px);
+}
+
+.agent-mic-mark {
+  width: 16px;
+  height: 16px;
+  display: block;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Crect x='5.5' y='1.75' width='5' height='8.5' rx='2.5' stroke='%23c9ced6' stroke-width='1.4'/%3E%3Cpath d='M3.5 7.5a4.5 4.5 0 0 0 9 0' stroke='%23c9ced6' stroke-width='1.4' stroke-linecap='round'/%3E%3Cpath d='M8 12v2.25' stroke='%23c9ced6' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E")
+      center / 16px no-repeat;
+}
+
+:root[data-el-theme="light"] .agent-mic-mark {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Crect x='5.5' y='1.75' width='5' height='8.5' rx='2.5' stroke='%23485163' stroke-width='1.4'/%3E%3Cpath d='M3.5 7.5a4.5 4.5 0 0 0 9 0' stroke='%23485163' stroke-width='1.4' stroke-linecap='round'/%3E%3Cpath d='M8 12v2.25' stroke='%23485163' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+.agent-send-btn {
+  width: 30px;
+  height: 30px;
+  margin-left: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  transition:
+    background-color 160ms var(--shell-motion-enter-ease),
+    color 160ms var(--shell-motion-enter-ease),
+    opacity 160ms var(--shell-motion-enter-ease),
+    box-shadow 160ms var(--shell-motion-enter-ease);
+}
+
+/* Idle send — greyed until there is text. */
+.agent-send-btn[data-mode="send"]:disabled {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  color: color-mix(in srgb, var(--text) 38%, transparent);
+  cursor: default;
+  box-shadow: none;
+  opacity: 0.85;
+}
+
+/* Ready send — light / clickable once the field has content. */
+.agent-send-btn[data-mode="send"]:not(:disabled) {
+  background: #f2f3f5;
+  color: #12141a;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+  opacity: 1;
+}
+
+.agent-send-btn[data-mode="send"]:not(:disabled):hover {
+  background: #ffffff;
+}
+
+:root[data-el-theme="light"] .agent-send-btn[data-mode="send"]:not(:disabled) {
+  background: #1d2438;
+  color: #f5f7fa;
+}
+
+:root[data-el-theme="light"] .agent-send-btn[data-mode="send"]:not(:disabled):hover {
+  background: #2a3348;
+}
+
+/* Stop — only while the model is writing / processing. */
+.agent-send-btn[data-mode="stop"] {
+  background: #f2f3f5;
+  color: #12141a;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+  opacity: 1;
+}
+
+.agent-send-btn[data-mode="stop"]:hover {
+  background: #ffffff;
+}
+
+:root[data-el-theme="light"] .agent-send-btn[data-mode="stop"] {
+  background: #1d2438;
+  color: #f5f7fa;
+}
+
+:root[data-el-theme="light"] .agent-send-btn[data-mode="stop"]:hover {
+  background: #2a3348;
+}
+
+.agent-send-mark {
+  display: block;
+  background: currentColor;
+}
+
+/* ↑ arrow for send */
+.agent-send-btn[data-mode="send"] .agent-send-mark {
+  width: 14px;
+  height: 14px;
+  border-radius: 0;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 12.5V3.5M8 3.5 4.2 7.2M8 3.5l3.8 3.7' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 14px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M8 12.5V3.5M8 3.5 4.2 7.2M8 3.5l3.8 3.7' stroke='black' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 14px no-repeat;
+}
+
+/* ■ stop square while processing */
+.agent-send-btn[data-mode="stop"] .agent-send-mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 1.5px;
+  -webkit-mask: none;
+  mask: none;
+}
+
+.agent-flip-back {
+  appearance: none;
+  height: 28px;
+  padding: 0 10px;
+  margin: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 70%, transparent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.agent-flip-back:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  color: var(--text);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .taskbar,
+  .shelf-morph-stage,
+  .shelf-morph-exit,
+  .shelf-morph-enter,
+  .agent-harness,
+  .agent-harness-sidebar,
+  .agent-harness-outputs,
+  .agent-harness-main,
+  body.agent-harness-active .desktop-backdrop,
+  body.agent-harness-active .desktop-workspace,
+  body.agent-harness-active .toolbar,
+  body.agent-harness-active #wallet-rail,
+  body.agent-harness-active #inbox-rail,
+  body.agent-harness-active .window {
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+
+  .agent-msg-agent.is-streaming .agent-msg-body::after {
+    animation: none !important;
+  }
+
+  .shelf-morph-exit,
+  .shelf-morph-enter,
+  .agent-harness,
+  .agent-harness-sidebar,
+  .agent-harness-outputs,
+  .agent-harness-main {
+    filter: none !important;
+    transform: none !important;
+  }
+
+  body.agent-harness-active.agent-harness-dropping .desktop-backdrop,
+  body.agent-harness-active.agent-harness-settled .desktop-backdrop {
+    transform: scale(1.01) !important;
+    filter: none !important;
+  }
+
+  body.agent-harness-active.agent-harness-dropping .desktop-workspace,
+  body.agent-harness-active.agent-harness-settled .desktop-workspace,
+  body.agent-harness-active.agent-harness-dropping .window,
+  body.agent-harness-active.agent-harness-settled .window {
+    transform: none !important;
+    filter: none !important;
+  }
+
+  body.agent-harness-active:not(.expose-active):not(.stage-menubar-reveal) header.toolbar {
+    transform: translateY(-100%) !important;
+    filter: none !important;
+    opacity: 1 !important;
+  }
+
+  body.agent-harness-active.stage-menubar-reveal:not(.expose-active) header.toolbar,
+  body.agent-harness-active.agent-harness-rising:not(.expose-active) header.toolbar {
+    transform: none !important;
+    filter: none !important;
+    opacity: 1 !important;
+  }
+
+  .agent-home-drop-canvas {
+    display: none !important;
+  }
+
+  .taskbar.is-agent-face[data-agent-morph="grow"]::after,
+  .taskbar[data-agent-morph="shrink"]::after {
+    animation: none !important;
+    opacity: 0 !important;
+  }
+}
+
+/* Dock tooltip: shared, non-interactive, positioned above the (possibly
+   magnified) icon. Shown on hover after a delay and on keyboard focus. */

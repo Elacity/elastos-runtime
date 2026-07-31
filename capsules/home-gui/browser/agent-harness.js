@@ -4,11 +4,13 @@
    explicit, revocable tools (fail-closed). */
 
 import {
-  setAgentComposerProcessing,
   syncAgentSendButton,
   composerInput as shelfComposerInput,
   hideAgentShelfFace,
-} from "./agent-shelf.js?v=home-20260724co";
+  agentShelfFaceActive,
+  snapAgentShelfFace,
+  snapAppsShelfFace,
+} from "./agent-shelf.js?v=home-20260728ag";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -18,91 +20,126 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260724co";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724co";
+} from "./shell-stages.js?v=home-20260728ag";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260728ag";
 import {
-  MOCK_REPLY,
-  listCapabilities,
-  requestTool,
-  resolveMockApproval,
   resetMockCapabilities,
-  applyCapabilityState,
-  wantsLibraryTool,
-  wantsWalletTool,
-  getTruthSnapshot,
-  noteMockTurnTokens,
   getSelectedModel,
-  getMockTurn,
+  setSelectedModelId,
+  listInstalledModels,
+  listRecommendedModels,
+  mockInstallModel,
+  probeHardwareEstimate,
+  fitForModel,
+  recommendedModel,
   loadReasoningVisible,
   setReasoningVisible,
-  getPlanMarkdown,
   setPlanMarkdown,
   maybeUpdatePlanFromPrompt,
-} from "./mock-agent-provider.js?v=home-20260724co";
+  requestModelGet,
+  removeProject,
+} from "./mock-agent-provider.js?v=home-20260728ag";
+import {
+  bindAgentWorkspaceSnapshot,
+} from "./shell-windows.js?v=home-20260728ag";
+import { TIP } from "./agent-tip.js?v=home-20260728ag";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260728ag";
+import {
+  bindAgentWorkspaceStore,
+  getAgentWorkspaceSnapshot,
+  applyAgentWorkspaceSnapshot,
+  persistAgentWorkspaceSoon,
+} from "./agent-workspace.js?v=home-20260728ag";
+import {
+  bindAgentConfigure,
+  harnessPageOpen,
+  openHarnessPage,
+  closeHarnessPage,
+  renderHarnessPage,
+  openConfigureSection,
+  openWorkbench,
+  closeWorkbench,
+  setWorkbenchTab,
+  syncWorkbenchPanels,
+  syncWorkbenchOpenUi,
+} from "./agent-configure.js?v=home-20260728ag";
+import {
+  bindAgentGrants,
+  syncTruthStrip,
+  appendGrantCard,
+  paintGrantCardResolved,
+  resolveGrantFromCard,
+  sessionAlreadyHasGrant,
+  maybeOfferToolAfterReply,
+  hydrateCapabilitiesFromSession,
+} from "./agent-grants.js?v=home-20260728ag";
+import {
+  bindAgentStream,
+  clearStreamTimer,
+  titleFromPrompt,
+  escapeHtml,
+  renderMarkdown,
+  setTitle,
+  appendThinkingBlock,
+  finishThinkingBlock,
+  appendToolTimelineRow,
+  finishToolTimelineRow,
+  appendFollowUpChips,
+  renderFollowUpQueue,
+  enqueueFollowUp,
+  drainFollowUpQueue,
+  appendMessage,
+  showEmptyState,
+  renderActiveSession,
+  stopMockStream,
+  startTurnForPrompt,
+} from "./agent-stream.js?v=home-20260728ag";
+import {
+  getLiveInferenceState,
+  probeLiveInference,
+} from "./agent-live.js?v=home-20260728ag";
+import {
+  bindAgentSessions,
+  relativeTime,
+  touchSession,
+  exportActiveSessionMarkdown,
+  sessionSearchOpen,
+  renderSessionSearchResults,
+  openSessionSearch,
+  closeSessionSearch,
+  appendSessionRow,
+  renderProjectsNav,
+  renderSessions,
+  projectCreateEl,
+  closeProjectCreate,
+  openProjectCreate,
+  submitProjectCreate,
+  ensureSessionForPrompt,
+  selectSession,
+  newChat,
+  renameSession,
+  deleteSession,
+  assignSessionProject,
+  sessionActionsEl,
+  sessionActionsOpen,
+  closeSessionActions,
+  openSessionActions,
+  runSessionAction,
+} from "./agent-sessions.js?v=home-20260728ag";
+export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
-const TIP = "home-20260724co";
 let workbenchTab = "outputs";
+/** Right rail closed by default in Chat (ChatGPT/Claude-like); opens on substance. */
+let workbenchOpen = false;
+/** User closed it — don't auto-reopen until Build / new substance nudge. */
+let workbenchUserClosed = false;
 
-const STARTER_PROMPTS = [
-  { label: "What can you do?", text: "What can you do on this device with tools at zero?" },
-  { label: "Explain locality", text: "Explain On this device and why tools start at zero." },
-  { label: "Draft a capsule plan", text: "Help me plan a small Notes capsule with library.read only." },
-];
 
-function relativeTime(ts) {
-  if (!ts) {
-    return "";
-  }
-  const delta = Date.now() - ts;
-  if (delta < 60_000) {
-    return "now";
-  }
-  if (delta < 3_600_000) {
-    return `${Math.max(1, Math.round(delta / 60_000))}m`;
-  }
-  if (delta < 86_400_000) {
-    return `${Math.max(1, Math.round(delta / 3_600_000))}h`;
-  }
-  return `${Math.max(1, Math.round(delta / 86_400_000))}d`;
-}
 
-function touchSession(session) {
-  if (session) {
-    session.updatedAt = Date.now();
-    session.mode = sessionMode;
-  }
-}
-
-function exportActiveSessionMarkdown() {
-  const session = sessions.find((s) => s.id === activeSessionId);
-  if (!session) {
-    return;
-  }
-  const lines = [`# ${session.title}`, "", `Mode: ${session.mode || sessionMode}`, ""];
-  for (const msg of session.messages) {
-    if (msg.role === "user") {
-      lines.push(`## You`, "", msg.text, "");
-    } else if (msg.role === "agent") {
-      if (msg.thinking) {
-        lines.push(`## Thinking`, "", msg.thinking, "");
-      }
-      lines.push(`## Agent`, "", msg.text, "");
-    } else if (msg.role === "grant") {
-      lines.push(`## Grant · ${msg.label || msg.toolId}`, "", `${msg.state}: ${msg.summary || ""}`, "");
-    }
-  }
-  const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `${(session.title || "chat").replace(/[^\w\-]+/g, "_").slice(0, 48)}.md`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
 const HOME_BREATHE_MS = 780;
 const HOME_RISE_MS = 720;
 const HARNESS_CONTENT_AT_MS = 180;
-const PARTICLE_COUNT = 420;
+const PARTICLE_COUNT = 120;
 /** Part X — drawer / pill composer breakpoint (matches Outputs-hide). */
 const HARNESS_NARROW_MQ = "(max-width: 900px)";
 
@@ -175,6 +212,8 @@ let particleRaf = 0;
 let dockResizeObserver = null;
 let sessions = structuredClone(SEED_SESSIONS);
 let activeSessionId = null;
+/** True after host session.agent was applied — skip seed overwrite. */
+let workspaceHydrated = false;
 /** Follow-up prompts queued while a mock turn is streaming (fx7). */
 let followUpQueue = [];
 let reasoningVisible = loadReasoningVisible();
@@ -184,6 +223,170 @@ let turnBusy = false;
 let sessionMode = "chat";
 /** Tool intent chips: read | ask | full — not grants (fx8). */
 let toolMode = "read";
+
+
+bindAgentWorkspaceStore({
+  getSessions: () => sessions,
+  setSessions: (v) => {
+    sessions = v;
+  },
+  getActiveSessionId: () => activeSessionId,
+  setActiveSessionId: (v) => {
+    activeSessionId = v;
+  },
+  getSessionMode: () => sessionMode,
+  setSessionMode: (v) => {
+    sessionMode = v;
+  },
+  getToolMode: () => toolMode,
+  setToolMode: (v) => {
+    toolMode = v;
+  },
+  getWorkbenchOpen: () => workbenchOpen,
+  setWorkbenchOpen: (v) => {
+    workbenchOpen = v;
+  },
+  getWorkbenchTab: () => workbenchTab,
+  setWorkbenchTab: (v) => {
+    workbenchTab = v;
+  },
+  getWorkbenchUserClosed: () => workbenchUserClosed,
+  setWorkbenchUserClosed: (v) => {
+    workbenchUserClosed = v;
+  },
+  getReasoningVisible: () => reasoningVisible,
+  setReasoningVisible: (v) => {
+    reasoningVisible = v;
+  },
+  setWorkspaceHydrated: (v) => {
+    workspaceHydrated = v;
+  },
+});
+
+bindAgentConfigure(
+  {
+    get workbenchTab() {
+      return workbenchTab;
+    },
+    set workbenchTab(v) {
+      workbenchTab = v;
+    },
+    get workbenchOpen() {
+      return workbenchOpen;
+    },
+    set workbenchOpen(v) {
+      workbenchOpen = v;
+    },
+    get workbenchUserClosed() {
+      return workbenchUserClosed;
+    },
+    set workbenchUserClosed(v) {
+      workbenchUserClosed = v;
+    },
+    get sessionMode() {
+      return sessionMode;
+    },
+    set sessionMode(v) {
+      sessionMode = v;
+    },
+    get toolMode() {
+      return toolMode;
+    },
+    set toolMode(v) {
+      toolMode = v;
+    },
+  },
+  {
+    closeApproveMenu,
+    closeModelMenu,
+    isNarrowHarness,
+    closeHarnessDrawer,
+  },
+);
+
+bindAgentGrants(
+  {
+    getReasoningVisible: () => reasoningVisible,
+    getSessions: () => sessions,
+    getActiveSessionId: () => activeSessionId,
+  },
+  {
+    syncModelTrigger,
+    streamEl,
+    clearEmptyState,
+    scrollStreamToEnd,
+  },
+);
+
+bindAgentStream(
+  {
+    get streamTimer() { return streamTimer; },
+    set streamTimer(v) { streamTimer = v; },
+    get streamGeneration() { return streamGeneration; },
+    set streamGeneration(v) { streamGeneration = v; },
+    get turnBusy() { return turnBusy; },
+    set turnBusy(v) { turnBusy = v; },
+    get followUpQueue() { return followUpQueue; },
+    set followUpQueue(v) { followUpQueue = v; },
+    get reasoningVisible() { return reasoningVisible; },
+    set reasoningVisible(v) { reasoningVisible = v; },
+    get sessionMode() { return sessionMode; },
+    set sessionMode(v) { sessionMode = v; },
+    get sessions() { return sessions; },
+    set sessions(v) { sessions = v; },
+    get activeSessionId() { return activeSessionId; },
+    set activeSessionId(v) { activeSessionId = v; },
+    get active() { return active; },
+    set active(v) { active = v; },
+  },
+  {
+    streamEl,
+    streamScrollEl,
+    streamViewportEl,
+    clearEmptyState,
+    scrollStreamToEnd,
+    titleEl,
+    signedInFirstName,
+    prefersReducedMotion,
+    syncComposerGeometry,
+    ensureSessionForPrompt,
+    renderSessions,
+    syncInferenceStatus: () => syncAgentInferenceStatus(),
+  },
+);
+
+bindAgentSessions(
+  {
+    get sessions() { return sessions; },
+    set sessions(v) { sessions = v; },
+    get activeSessionId() { return activeSessionId; },
+    set activeSessionId(v) { activeSessionId = v; },
+    get sessionMode() { return sessionMode; },
+    set sessionMode(v) { sessionMode = v; },
+    get toolMode() { return toolMode; },
+    set toolMode(v) { toolMode = v; },
+    get workbenchOpen() { return workbenchOpen; },
+    set workbenchOpen(v) { workbenchOpen = v; },
+    get workbenchUserClosed() { return workbenchUserClosed; },
+    set workbenchUserClosed(v) { workbenchUserClosed = v; },
+    get followUpQueue() { return followUpQueue; },
+    set followUpQueue(v) { followUpQueue = v; },
+    get active() { return active; },
+    set active(v) { active = v; },
+  },
+  {
+    clearFloatingMenuStyle,
+    closeApproveMenu,
+    closeModelMenu,
+    positionFloatingMenu,
+    sessionListEl,
+  },
+);
+
+
+
+
+
 
 function setHarnessChromeInert(inert) {
   const nodes = [
@@ -271,87 +474,9 @@ function toggleSidebarCollapsed() {
   setSidebarCollapsed(!collapsed);
 }
 
-function sessionSearchOpen() {
-  const root = document.querySelector("#agent-session-search");
-  return Boolean(root) && !root.hidden;
-}
 
-function renderSessionSearchResults(query = "") {
-  const host = document.querySelector("#agent-session-search-results");
-  if (!host) {
-    return;
-  }
-  host.replaceChildren();
-  const q = String(query || "").trim().toLowerCase();
-  const matches = sessions.filter((session) => {
-    if (!q) {
-      return true;
-    }
-    if (session.title.toLowerCase().includes(q)) {
-      return true;
-    }
-    return (session.messages || []).some((m) =>
-      String(m.text || "").toLowerCase().includes(q),
-    );
-  });
-  if (!matches.length) {
-    const empty = document.createElement("p");
-    empty.className = "agent-session-search-empty";
-    empty.textContent = q ? "No chats match" : "No chats yet";
-    host.append(empty);
-    return;
-  }
-  for (const session of matches) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = `agent-session-search-row${
-      session.id === activeSessionId ? " is-active" : ""
-    }`;
-    row.dataset.sessionId = session.id;
-    row.setAttribute("role", "option");
-    row.innerHTML =
-      `<span class="agent-session-search-row-mark" aria-hidden="true"></span>` +
-      `<span class="agent-session-search-row-title"></span>` +
-      `<span class="agent-session-search-row-when"></span>`;
-    row.querySelector(".agent-session-search-row-title").textContent = session.title;
-    row.querySelector(".agent-session-search-row-when").textContent =
-      session.group || "";
-    host.append(row);
-  }
-}
 
-function openSessionSearch() {
-  if (!active) {
-    return;
-  }
-  const root = document.querySelector("#agent-session-search");
-  const input = document.querySelector("#agent-session-search-input");
-  if (!root) {
-    return;
-  }
-  root.hidden = false;
-  root.inert = false;
-  root.setAttribute("aria-hidden", "false");
-  renderSessionSearchResults(input?.value || "");
-  window.requestAnimationFrame(() => {
-    input?.focus({ preventScroll: true });
-    input?.select?.();
-  });
-}
 
-function closeSessionSearch() {
-  const root = document.querySelector("#agent-session-search");
-  const input = document.querySelector("#agent-session-search-input");
-  if (!root || root.hidden) {
-    return;
-  }
-  root.hidden = true;
-  root.inert = true;
-  root.setAttribute("aria-hidden", "true");
-  if (input) {
-    input.value = "";
-  }
-}
 
 function syncComposerGeometry() {
   const taskbar = document.querySelector(".taskbar");
@@ -402,20 +527,33 @@ function stopDockGeometryObserver() {
   dockResizeObserver = null;
 }
 
+/** Cached at bind — avoid querySelector spam on stream/geometry hot paths. */
+let cachedHarnessEl = null;
+let cachedStreamColumnEl = null;
+let cachedStreamScrollEl = null;
+
+function refreshHarnessDomCache() {
+  cachedHarnessEl = document.querySelector("#agent-harness");
+  cachedStreamColumnEl = document.querySelector("#agent-harness-stream-column");
+  cachedStreamScrollEl = document.querySelector("#agent-harness-stream");
+}
+
 function harnessEl() {
-  return document.querySelector("#agent-harness");
+  return cachedHarnessEl || document.querySelector("#agent-harness");
 }
 
 function streamEl() {
   /* Messages live in the dock-width column so edges match the Shelf composer. */
   return (
+    cachedStreamColumnEl ||
     document.querySelector("#agent-harness-stream-column") ||
+    cachedStreamScrollEl ||
     document.querySelector("#agent-harness-stream")
   );
 }
 
 function streamScrollEl() {
-  return document.querySelector("#agent-harness-stream");
+  return cachedStreamScrollEl || document.querySelector("#agent-harness-stream");
 }
 
 function streamViewportEl() {
@@ -470,12 +608,6 @@ export function agentHarnessActive() {
   return active;
 }
 
-function clearStreamTimer() {
-  if (streamTimer) {
-    window.clearInterval(streamTimer);
-    streamTimer = 0;
-  }
-}
 
 function stopParticles() {
   if (particleRaf) {
@@ -490,404 +622,21 @@ function stopParticles() {
   }
 }
 
-function titleFromPrompt(prompt) {
-  const cleaned = prompt.replace(/\s+/g, " ").trim();
-  if (!cleaned) {
-    return "New chat";
-  }
-  return cleaned.length > 42 ? `${cleaned.slice(0, 41)}…` : cleaned;
-}
 
-function escapeHtml(text) {
-  return String(text)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
 
-/** Tiny markdown for MOCK_REPLY only — escapeHtml on fences/inlines.
- *  SEAM (live model / Carrier-backed replies): sanitize or use a text-safe
- *  path before innerHTML. UI must never treat model HTML as authority. */
-function renderMarkdown(text) {
-  const parts = String(text).split(/```([\s\S]*?)```/g);
-  let html = "";
-  for (let i = 0; i < parts.length; i += 1) {
-    if (i % 2 === 1) {
-      const fence = parts[i];
-      const nl = fence.indexOf("\n");
-      const lang = nl === -1 ? "" : fence.slice(0, nl).trim();
-      const code = nl === -1 ? fence : fence.slice(nl + 1);
-      const safe = escapeHtml(code.replace(/\n$/, ""));
-      html +=
-        `<div class="agent-md-code">` +
-        `<div class="agent-md-code-head"><span>${escapeHtml(lang || "code")}</span>` +
-        `<button type="button" class="agent-md-copy" data-copy="1">Copy</button></div>` +
-        `<pre><code>${safe}</code></pre></div>`;
-      continue;
-    }
-    const blocks = parts[i].split(/\n{2,}/);
-    for (const block of blocks) {
-      const trimmed = block.trim();
-      if (!trimmed) {
-        continue;
-      }
-      let line = escapeHtml(trimmed)
-        .replaceAll(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-        .replaceAll(/`([^`]+)`/g, "<code class=\"agent-md-inline\">$1</code>")
-        .replaceAll(/\n/g, "<br>");
-      html += `<p class="agent-md-p">${line}</p>`;
-    }
-  }
-  return html;
-}
 
-function setTitle(title) {
-  const el = titleEl();
-  if (el) {
-    el.textContent = title;
-  }
-}
 
-function renderSessions() {
-  const list = sessionListEl();
-  if (!list) {
-    return;
-  }
-  list.replaceChildren();
-  const pinned = sessions.filter((s) => s.pinned);
-  const groups = [
-    { id: "Pinned", items: pinned },
-    { id: "Today", items: sessions.filter((s) => !s.pinned && s.group === "Today") },
-    { id: "Earlier", items: sessions.filter((s) => !s.pinned && s.group === "Earlier") },
-  ];
-  for (const group of groups) {
-    if (!group.items.length) {
-      continue;
-    }
-    const label = document.createElement("div");
-    label.className = "agent-harness-group-label";
-    label.textContent = group.id;
-    list.append(label);
-    for (const session of group.items) {
-      const row = document.createElement("div");
-      row.className = `agent-harness-session${session.id === activeSessionId ? " is-active" : ""}`;
-      row.dataset.sessionId = session.id;
 
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "agent-harness-session-btn";
-      const title = document.createElement("span");
-      title.className = "agent-harness-session-title";
-      title.textContent = session.title;
-      const meta = document.createElement("span");
-      meta.className = "agent-harness-session-meta";
-      const mode = session.mode || "chat";
-      meta.textContent = [mode, relativeTime(session.updatedAt)].filter(Boolean).join(" · ");
-      btn.append(title, meta);
-      btn.title = session.title;
 
-      const kebab = document.createElement("button");
-      kebab.type = "button";
-      kebab.className = "agent-harness-session-menu";
-      kebab.setAttribute("aria-label", `Session actions for ${session.title}`);
-      kebab.title = "Pin, export, rename, or delete";
-      kebab.textContent = "···";
 
-      row.append(btn, kebab);
-      list.append(row);
-    }
-  }
-}
 
-function syncTruthStrip() {
-  const root = document.querySelector(".agent-harness-truth");
-  if (!root) {
-    return;
-  }
-  const snap = getTruthSnapshot();
-  const local = root.querySelector("[data-truth-local]");
-  const model = root.querySelector("[data-truth-model]");
-  const tools = root.querySelector("[data-truth-tools]");
-  const context = root.querySelector("[data-truth-context]");
-  const contextFill = root.querySelector("[data-truth-context-fill]");
-  const hw = root.querySelector("[data-truth-hw]");
-  if (local) {
-    local.textContent = snap.locality;
-  }
-  if (model) {
-    model.textContent = snap.modelLabel;
-    model.title = `${snap.modelLabel} · ${snap.modelTier}`;
-  }
-  if (tools) {
-    tools.textContent = snap.toolsLabel;
-  }
-  if (context) {
-    context.textContent = snap.contextLabel;
-    context.title = "Mock context window fill — not live tokenizer";
-  }
-  if (contextFill) {
-    contextFill.style.width = `${Math.round(snap.contextRatio * 100)}%`;
-  }
-  if (hw) {
-    hw.textContent = snap.hwLabel;
-    hw.dataset.hw = snap.hwState;
-    hw.title =
-      snap.hwState === "unknown"
-        ? "Hardware not probed yet (Spark/W2)"
-        : "Stub estimate — not a live probe";
-  }
-  root.dataset.tools = snap.toolsState;
-  root.dataset.hw = snap.hwState;
-  root.dataset.modelTier = snap.modelTier;
 
-  const modelBtnName = document.querySelector(".agent-model-name");
-  const modelBtnTier = document.querySelector(".agent-model-tier");
-  const selected = getSelectedModel();
-  if (modelBtnName && selected) {
-    modelBtnName.textContent = selected.tier === "preview" ? "Local" : selected.label;
-  }
-  if (modelBtnTier && selected) {
-    modelBtnTier.textContent = selected.tier === "unsupported" ? "spark" : selected.tier;
-  }
 
-  const thinkToggle = root.querySelector("[data-truth-thinking-toggle]");
-  if (thinkToggle) {
-    thinkToggle.setAttribute("aria-pressed", reasoningVisible ? "true" : "false");
-    thinkToggle.textContent = reasoningVisible ? "Thinking on" : "Thinking off";
-    thinkToggle.title = reasoningVisible
-      ? "Hide model thinking blocks"
-      : "Show model thinking blocks";
-  }
-  document.documentElement.dataset.agentReasoning = reasoningVisible ? "on" : "off";
-}
 
-function appendTurnDivider(label) {
-  const stream = streamEl();
-  if (!stream) {
-    return null;
-  }
-  const row = document.createElement("div");
-  row.className = "agent-turn-divider";
-  row.setAttribute("role", "separator");
-  row.innerHTML = `<span class="agent-turn-divider-label"></span>`;
-  row.querySelector(".agent-turn-divider-label").textContent = label;
-  stream.append(row);
-  return row;
-}
 
-/** Live turn timeline: Thinking → Tool → Answering → Done (fx11). */
-function appendTurnTimeline() {
-  const stream = streamEl();
-  if (!stream) {
-    return null;
-  }
-  const root = document.createElement("div");
-  root.className = "agent-turn-timeline";
-  root.dataset.timeline = "1";
-  root.innerHTML =
-    `<div class="agent-timeline-step" data-step="thinking" data-state="pending">` +
-    `<span class="agent-timeline-dot" aria-hidden="true"></span>` +
-    `<span class="agent-timeline-label">Thinking</span></div>` +
-    `<div class="agent-timeline-step" data-step="tool" data-state="idle" hidden>` +
-    `<span class="agent-timeline-dot" aria-hidden="true"></span>` +
-    `<span class="agent-timeline-label">Tool</span>` +
-    `<span class="agent-timeline-detail"></span></div>` +
-    `<div class="agent-timeline-step" data-step="answer" data-state="pending">` +
-    `<span class="agent-timeline-dot" aria-hidden="true"></span>` +
-    `<span class="agent-timeline-label">Answering</span></div>` +
-    `<div class="agent-timeline-step" data-step="done" data-state="pending">` +
-    `<span class="agent-timeline-dot" aria-hidden="true"></span>` +
-    `<span class="agent-timeline-label">Done</span></div>`;
-  stream.append(root);
-  return root;
-}
 
-function setTimelineStep(timeline, stepId, state, detail = "") {
-  if (!timeline) {
-    return;
-  }
-  const step = timeline.querySelector(`[data-step="${stepId}"]`);
-  if (!step) {
-    return;
-  }
-  if (state === "idle") {
-    step.hidden = true;
-    step.dataset.state = "idle";
-    return;
-  }
-  step.hidden = false;
-  step.dataset.state = state;
-  const detailEl = step.querySelector(".agent-timeline-detail");
-  if (detailEl && detail) {
-    detailEl.textContent = detail;
-  }
-}
 
-function appendThinkingBlock(text, { streaming = false, open = true } = {}) {
-  const stream = streamEl();
-  if (!stream) {
-    return null;
-  }
-  clearEmptyState();
-  const details = document.createElement("details");
-  details.className = `agent-thinking${streaming ? " is-streaming" : ""}`;
-  details.dataset.block = "thinking";
-  details.dataset.startedAt = String(Date.now());
-  if (open && reasoningVisible) {
-    details.open = true;
-  }
-  const summary = document.createElement("summary");
-  summary.className = "agent-thinking-summary";
-  summary.innerHTML =
-    `<span class="agent-thinking-chevron" aria-hidden="true"></span>` +
-    `<span class="agent-thinking-label">Thinking</span>` +
-    `<span class="agent-thinking-duration" data-thinking-duration></span>` +
-    `<span class="agent-thinking-hint">preview · not authority</span>`;
-  const bodyWrap = document.createElement("div");
-  bodyWrap.className = "agent-thinking-body-wrap";
-  const body = document.createElement("pre");
-  body.className = "agent-thinking-body";
-  body.textContent = text;
-  bodyWrap.append(body);
-  details.append(summary, bodyWrap);
-  stream.append(details);
-  scrollStreamToEnd();
-  return details;
-}
 
-function finishThinkingBlock(details, startedAt) {
-  if (!details) {
-    return;
-  }
-  details.classList.remove("is-streaming");
-  details.classList.add("is-complete");
-  const ms = Math.max(400, Date.now() - (startedAt || Date.now()));
-  const sec = (ms / 1000).toFixed(ms >= 10000 ? 0 : 1);
-  const dur = details.querySelector("[data-thinking-duration]");
-  if (dur) {
-    dur.textContent = `Thought for ${sec}s`;
-  }
-  const label = details.querySelector(".agent-thinking-label");
-  if (label) {
-    label.textContent = "Thought";
-  }
-  /* Collapse after a beat — frontier-style; honor reduced motion by skipping delay animation only. */
-  if (details.open && reasoningVisible) {
-    const collapse = () => {
-      if (details.isConnected && reasoningVisible) {
-        details.open = false;
-      }
-    };
-    if (prefersReducedMotion()) {
-      collapse();
-    } else {
-      window.setTimeout(collapse, 900);
-    }
-  }
-}
-
-function appendToolTimelineRow(tool) {
-  const stream = streamEl();
-  if (!stream || !tool) {
-    return null;
-  }
-  const row = document.createElement("div");
-  row.className = "agent-tool-row is-running";
-  row.dataset.toolId = tool.id;
-  row.innerHTML =
-    `<span class="agent-tool-row-spinner" aria-hidden="true"></span>` +
-    `<div class="agent-tool-row-copy">` +
-    `<span class="agent-tool-row-name"></span>` +
-    `<span class="agent-tool-row-detail"></span>` +
-    `</div>` +
-    `<span class="agent-tool-row-status">Running</span>`;
-  row.querySelector(".agent-tool-row-name").textContent = tool.label;
-  row.querySelector(".agent-tool-row-detail").textContent = tool.detail || tool.kind || "";
-  stream.append(row);
-  scrollStreamToEnd();
-  return row;
-}
-
-function finishToolTimelineRow(row, { status = "done", statusLabel = "Done" } = {}) {
-  if (!row) {
-    return;
-  }
-  row.classList.remove("is-running");
-  row.classList.add(status === "error" || status === "denied" ? "is-denied" : "is-done");
-  const statusEl = row.querySelector(".agent-tool-row-status");
-  if (statusEl) {
-    statusEl.textContent = statusLabel;
-  }
-}
-
-function appendFollowUpChips(prompts) {
-  const stream = streamEl();
-  if (!stream || !prompts?.length) {
-    return null;
-  }
-  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
-  const root = document.createElement("div");
-  root.className = "agent-followups";
-  root.setAttribute("aria-label", "Suggested follow-ups");
-  for (const text of prompts) {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "agent-followup-chip";
-    chip.dataset.starter = text;
-    chip.textContent = text;
-    root.append(chip);
-  }
-  stream.append(root);
-  scrollStreamToEnd();
-  return root;
-}
-
-function renderFollowUpQueue() {
-  const root = document.querySelector("[data-agent-queue]");
-  if (!root) {
-    return;
-  }
-  root.replaceChildren();
-  root.hidden = followUpQueue.length === 0;
-  if (!followUpQueue.length) {
-    return;
-  }
-  const label = document.createElement("span");
-  label.className = "agent-queue-label";
-  label.textContent = "Queued";
-  root.append(label);
-  for (const item of followUpQueue) {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "agent-queue-chip";
-    chip.dataset.queueId = item.id;
-    chip.title = "Remove from queue";
-    chip.textContent = item.text.length > 42 ? `${item.text.slice(0, 41)}…` : item.text;
-    root.append(chip);
-  }
-}
-
-function enqueueFollowUp(text) {
-  followUpQueue.push({ id: `q-${Date.now()}-${followUpQueue.length}`, text });
-  renderFollowUpQueue();
-}
-
-function drainFollowUpQueue() {
-  if (!followUpQueue.length || !active) {
-    return;
-  }
-  const next = followUpQueue.shift();
-  renderFollowUpQueue();
-  if (!next?.text) {
-    return;
-  }
-  const session = sessions.find((s) => s.id === activeSessionId) || ensureSessionForPrompt(next.text);
-  session.messages.push({ role: "user", text: next.text });
-  renderSessions();
-  appendMessage("user", next.text);
-  startMockStreamForPrompt(next.text);
-}
 
 function toggleReasoningVisible() {
   reasoningVisible = setReasoningVisible(!reasoningVisible);
@@ -902,6 +651,397 @@ function toggleReasoningVisible() {
   }
 }
 
+const TOOL_MODE_LABELS = {
+  ask: "Ask",
+  read: "Read only",
+  full: "Full access",
+};
+
+function approveMenuEl() {
+  return document.getElementById("agent-approve-menu");
+}
+
+function approveBtnEl() {
+  return document.getElementById("agent-approve-btn");
+}
+
+function approveMenuOpen() {
+  const menu = approveMenuEl();
+  return Boolean(menu && !menu.hidden);
+}
+
+function clearFloatingMenuStyle(menu) {
+  if (!menu) {
+    return;
+  }
+  menu.style.removeProperty("left");
+  menu.style.removeProperty("top");
+  menu.style.removeProperty("right");
+  menu.style.removeProperty("bottom");
+  menu.style.removeProperty("width");
+  menu.style.removeProperty("z-index");
+  menu.setAttribute("aria-hidden", "true");
+}
+
+function positionFloatingMenu(menu, btn, { minWidth = 280, maxWidth = 360, preferRight = false } = {}) {
+  if (!menu || !btn || menu.hidden) {
+    return;
+  }
+  /* Menus are on document.body — fixed coords escape dock transform/overflow. */
+  if (menu.parentElement !== document.body) {
+    document.body.appendChild(menu);
+  }
+  const rect = btn.getBoundingClientRect();
+  const width = Math.min(maxWidth, Math.max(minWidth, window.innerWidth - 24));
+  let left = preferRight ? rect.right - width : rect.left;
+  left = Math.min(Math.max(12, left), window.innerWidth - width - 12);
+  menu.style.zIndex = "200090";
+  menu.style.width = `${width}px`;
+  menu.style.left = `${left}px`;
+  menu.style.right = "auto";
+  menu.style.bottom = "auto";
+  menu.hidden = false;
+  menu.removeAttribute("inert");
+  menu.setAttribute("aria-hidden", "false");
+  const menuH = menu.getBoundingClientRect().height || 220;
+  let top = rect.top - menuH - 10;
+  if (top < 12) {
+    top = Math.min(window.innerHeight - menuH - 12, rect.bottom + 10);
+  }
+  menu.style.top = `${Math.max(12, top)}px`;
+}
+
+function closeApproveMenu() {
+  const menu = approveMenuEl();
+  const btn = approveBtnEl();
+  if (menu) {
+    menu.hidden = true;
+    clearFloatingMenuStyle(menu);
+  }
+  if (btn) {
+    btn.setAttribute("aria-expanded", "false");
+  }
+}
+
+function openApproveMenu() {
+  const menu = approveMenuEl();
+  const btn = approveBtnEl();
+  if (!menu || !btn) {
+    return;
+  }
+  closeModelMenu();
+  btn.setAttribute("aria-expanded", "true");
+  menu.hidden = false;
+  positionFloatingMenu(menu, btn, { minWidth: 300, maxWidth: 360 });
+  menu.focus?.({ preventScroll: true });
+}
+
+function toggleApproveMenu() {
+  if (approveMenuOpen()) {
+    closeApproveMenu();
+  } else {
+    openApproveMenu();
+  }
+}
+
+function modelMenuEl() {
+  return document.getElementById("agent-model-menu");
+}
+
+function modelBtnEl() {
+  return document.getElementById("agent-model-picker");
+}
+
+function modelMenuOpen() {
+  const menu = modelMenuEl();
+  return Boolean(menu && !menu.hidden);
+}
+
+/** Menu can be summoned from the composer trigger or the sidebar Models row. */
+let modelMenuAnchor = null;
+
+function closeModelMenu() {
+  const menu = modelMenuEl();
+  const btn = modelBtnEl();
+  if (menu) {
+    menu.hidden = true;
+    clearFloatingMenuStyle(menu);
+  }
+  if (btn) {
+    btn.setAttribute("aria-expanded", "false");
+  }
+  modelMenuAnchor = null;
+}
+
+function syncModelTrigger() {
+  const btn = modelBtnEl();
+  const selected = getSelectedModel();
+  if (!btn || !selected) {
+    return;
+  }
+  const name = btn.querySelector(".agent-model-name");
+  const tier = btn.querySelector(".agent-model-tier");
+  const liveInference = getLiveInferenceState();
+  if (name) {
+    /* w1: when llama-server is live, the trigger shows the real model. */
+    name.textContent = liveInference.live && liveInference.model
+      ? liveInference.model
+      : selected.tier === "preview"
+        ? "Local preview"
+        : selected.label.replace(/\s*·\s*/g, " ");
+  }
+  if (tier) {
+    /* Keep the trigger quiet — one label, no "mock" suffix in the chrome. */
+    tier.textContent = "";
+    tier.hidden = true;
+  }
+  btn.title = liveInference.live && liveInference.model
+    ? `${liveInference.model} — live local model via llama-server on this machine`
+    : selected.tier === "preview"
+      ? `${selected.label} — preview path, not a downloaded weight file`
+      : `${selected.label} — preview stub (Get is in-session only until runtime downloads)`;
+}
+
+function renderModelHero(host) {
+  const pick = recommendedModel();
+  if (!pick) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  host.replaceChildren();
+  const selectedId = getSelectedModel()?.id;
+  const isSelected = pick.status === "installed" && pick.id === selectedId;
+  const card = document.createElement("div");
+  card.className = "agent-model-hero-card";
+  card.innerHTML =
+    `<span class="agent-model-option-copy">` +
+    `<span class="agent-model-hero-kicker">Best for this device</span>` +
+    `<span class="agent-model-option-title"></span>` +
+    `<span class="agent-model-option-desc"></span>` +
+    `</span>` +
+    `<button type="button" class="agent-model-download-btn agent-model-hero-btn"></button>`;
+  card.querySelector(".agent-model-option-title").textContent = pick.label;
+  card.querySelector(".agent-model-option-desc").textContent =
+    [pick.sizeLabel, pick.detail].filter(Boolean).join(" · ");
+  const action = card.querySelector(".agent-model-hero-btn");
+  if (isSelected) {
+    action.textContent = "In use";
+    action.disabled = true;
+  } else if (pick.status === "installed") {
+    action.textContent = "Use";
+    action.dataset.modelUse = pick.id;
+  } else {
+    action.textContent = "Get";
+    action.dataset.modelDownload = pick.id;
+    action.title = "Preview install only — no real download yet";
+  }
+  host.append(card);
+}
+
+function buildInstalledModelRows(host, emptyText) {
+  const selectedId = getSelectedModel()?.id;
+  host.replaceChildren();
+  /* w1: real llama-server models first (one configured GGUF today) — the only
+     rows that are weights on disk; preview stubs stay labeled below. */
+  const liveInference = getLiveInferenceState();
+  if (liveInference.live) {
+    for (const model of liveInference.models) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "agent-model-option is-live";
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", "true");
+      row.disabled = true;
+      row.innerHTML =
+        `<span class="agent-model-option-copy">` +
+        `<span class="agent-model-option-title"></span>` +
+        `<span class="agent-model-option-desc"></span>` +
+        `</span>` +
+        `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
+      row.querySelector(".agent-model-option-title").textContent = model.label;
+      row.querySelector(".agent-model-option-desc").textContent =
+        model.detail || "Live · llama-server on this machine";
+      host.append(row);
+    }
+  }
+  for (const model of listInstalledModels()) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "agent-model-option";
+    btn.setAttribute("role", "option");
+    btn.dataset.modelId = model.id;
+    btn.setAttribute("aria-selected", model.id === selectedId ? "true" : "false");
+    if (model.id === selectedId) {
+      btn.classList.add("is-active");
+    }
+    btn.innerHTML =
+      `<span class="agent-model-option-copy">` +
+      `<span class="agent-model-option-title"></span>` +
+      `<span class="agent-model-option-desc"></span>` +
+      `</span>` +
+      `<span class="agent-model-option-meta"></span>` +
+      `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
+    btn.querySelector(".agent-model-option-title").textContent = model.label;
+    btn.querySelector(".agent-model-option-desc").textContent =
+      model.tier === "preview"
+        ? "Preview path · not weights on disk"
+        : "Preview stub · Get was in-session only (not a real download)";
+    const meta = btn.querySelector(".agent-model-option-meta");
+    if (model.sizeLabel) {
+      meta.textContent = model.sizeLabel;
+    } else {
+      meta.remove();
+    }
+    host.append(btn);
+  }
+  if (!host.children.length) {
+    const empty = document.createElement("p");
+    empty.className = "agent-model-menu-empty";
+    empty.textContent = emptyText;
+    host.append(empty);
+  }
+}
+
+function buildDiscoverModelRows(host, emptyText) {
+  host.replaceChildren();
+  for (const model of listRecommendedModels()) {
+    const row = document.createElement("div");
+    row.className = "agent-model-download-row";
+    row.dataset.modelId = model.id;
+    const blocked = fitForModel(model) === "blocked";
+    row.innerHTML =
+      `<span class="agent-model-option-copy">` +
+      `<span class="agent-model-option-title"></span>` +
+      `<span class="agent-model-option-desc"></span>` +
+      `</span>` +
+      `<button type="button" class="agent-model-download-btn"></button>`;
+    row.querySelector(".agent-model-option-title").textContent = model.label;
+    row.querySelector(".agent-model-option-desc").textContent =
+      [model.sizeLabel, model.detail].filter(Boolean).join(" · ");
+    const action = row.querySelector(".agent-model-download-btn");
+    action.dataset.modelDownload = model.id;
+    if (blocked) {
+      action.textContent = "Needs Spark";
+      action.disabled = true;
+      action.title = "Too large for this device's estimated memory";
+    } else {
+      action.textContent = "Get";
+      action.title = "Preview install only — no real download yet";
+    }
+    host.append(row);
+  }
+  if (!host.children.length) {
+    const empty = document.createElement("p");
+    empty.className = "agent-model-menu-empty";
+    empty.textContent = emptyText;
+    host.append(empty);
+  }
+}
+
+/* Cursor-style quick switcher: just what's installed + "Add models",
+   which opens the full Models page. Browsing/downloading lives there. */
+function renderModelMenu() {
+  const listHost = document.querySelector("[data-model-menu-list]");
+  if (!listHost) {
+    return;
+  }
+  buildInstalledModelRows(listHost, "No preview models yet — see Add models.");
+}
+
+
+
+
+
+function openModelMenu(anchor = null) {
+  const menu = modelMenuEl();
+  const btn = modelBtnEl();
+  const at = anchor || btn;
+  if (!menu || !at) {
+    return;
+  }
+  closeApproveMenu();
+  renderModelMenu();
+  btn?.setAttribute("aria-expanded", "true");
+  modelMenuAnchor = at;
+  menu.hidden = false;
+  positionFloatingMenu(menu, at, { minWidth: 230, maxWidth: 280, preferRight: at === btn });
+  menu.focus?.({ preventScroll: true });
+}
+
+function toggleModelMenu() {
+  if (modelMenuOpen()) {
+    closeModelMenu();
+  } else {
+    openModelMenu();
+  }
+}
+
+function selectAgentModel(modelId) {
+  setSelectedModelId(modelId);
+  syncTruthStrip();
+  syncWorkbenchPanels();
+  closeModelMenu();
+}
+
+function repositionModelMenu() {
+  const menu = modelMenuEl();
+  const anchor = modelMenuAnchor || modelBtnEl();
+  if (menu && anchor && !menu.hidden) {
+    positionFloatingMenu(menu, anchor, {
+      minWidth: 230,
+      maxWidth: 280,
+      preferRight: anchor === modelBtnEl(),
+    });
+  }
+}
+
+function previewGetModel(modelId) {
+  const req = requestModelGet(modelId);
+  if (req.kind === "blocked") {
+    window.alert(req.reason || "This model does not fit this device estimate.");
+    return;
+  }
+  if (req.kind === "already") {
+    selectAgentModel(modelId);
+    return;
+  }
+  if (req.kind !== "preview-theatre") {
+    return;
+  }
+  /* Preview theatre — not a Carrier grant. Real Get asks Inbox later. */
+  const result = mockInstallModel(modelId);
+  if (!result.ok) {
+    return;
+  }
+  syncTruthStrip();
+  syncWorkbenchPanels();
+  renderModelMenu();
+  repositionModelMenu();
+}
+
+function syncApproveTrigger() {
+  const btn = approveBtnEl();
+  if (!btn) {
+    return;
+  }
+  const label = btn.querySelector("[data-approve-label]");
+  if (label) {
+    label.textContent = TOOL_MODE_LABELS[toolMode] || TOOL_MODE_LABELS.ask;
+  }
+  btn.dataset.toolMode = toolMode;
+  btn.classList.toggle("is-danger", toolMode === "full");
+  const mark = btn.querySelector("[data-approve-mark]");
+  if (mark) {
+    mark.dataset.icon = toolMode;
+  }
+  for (const opt of document.querySelectorAll(".agent-approve-option[data-tool-mode]")) {
+    const on = opt.dataset.toolMode === toolMode;
+    opt.classList.toggle("is-active", on);
+    opt.setAttribute("aria-selected", on ? "true" : "false");
+  }
+}
+
 function syncSessionModeUi() {
   const harness = harnessEl();
   harness?.setAttribute("data-session-mode", sessionMode);
@@ -913,28 +1053,7 @@ function syncSessionModeUi() {
     btn.classList.toggle("is-active", on);
     btn.setAttribute("aria-pressed", on ? "true" : "false");
   }
-  for (const btn of document.querySelectorAll("[data-tool-mode]")) {
-    const on = btn.dataset.toolMode === toolMode;
-    btn.classList.toggle("is-active", on);
-    btn.setAttribute("aria-pressed", on ? "true" : "false");
-  }
-  const note = document.querySelector("[data-tool-mode-note]");
-  if (note) {
-    if (sessionMode === "build") {
-      note.textContent =
-        toolMode === "full"
-          ? "Build · Full intent — still preview; ADE sandbox grant required to write"
-          : toolMode === "ask"
-            ? "Build · Ask — plan/outputs theatre; grants via Inbox cards only"
-            : "Build · Read — plan & inspect; no write authority";
-    } else if (toolMode === "full") {
-      note.textContent = "Chat · Full intent — UI ≠ authority; no ambient tools";
-    } else if (toolMode === "ask") {
-      note.textContent = "Chat · Ask — grant cards may appear; deny by default";
-    } else {
-      note.textContent = "Chat · Read — answers only · tools start at zero · preview";
-    }
-  }
+  syncApproveTrigger();
   const title = document.querySelector("[data-workbench-title]");
   if (title) {
     title.textContent = sessionMode === "build" ? "Workbench · Build" : "Workbench";
@@ -942,77 +1061,21 @@ function syncSessionModeUi() {
   for (const tab of document.querySelectorAll("[data-build-only]")) {
     tab.hidden = sessionMode !== "build";
   }
-  if (sessionMode === "build" && (workbenchTab === "outputs" || workbenchTab === "status")) {
-    setWorkbenchTab("plan");
-  } else if (sessionMode === "chat" && (workbenchTab === "diff" || workbenchTab === "plan")) {
-    setWorkbenchTab("status");
+  if (sessionMode === "build") {
+    if (workbenchTab === "outputs" || workbenchTab === "browser" || workbenchTab === "terminal") {
+      setWorkbenchTab("plan");
+    } else {
+      setWorkbenchTab(workbenchTab);
+    }
+    openWorkbench({ tab: workbenchTab, force: true });
+  } else if (sessionMode === "chat" && workbenchTab === "diff") {
+    setWorkbenchTab("outputs");
+    syncWorkbenchOpenUi();
   } else {
     setWorkbenchTab(workbenchTab);
+    syncWorkbenchOpenUi();
   }
   syncWorkbenchPanels();
-}
-
-function setWorkbenchTab(tabId) {
-  const allowed = new Set([
-    "outputs",
-    "plan",
-    "library",
-    "status",
-    "tools",
-    "diff",
-    "browser",
-    "terminal",
-  ]);
-  workbenchTab = allowed.has(tabId) ? tabId : "outputs";
-  if (workbenchTab === "diff" && sessionMode !== "build") {
-    workbenchTab = "outputs";
-  }
-  for (const tab of document.querySelectorAll("[data-workbench-tab]")) {
-    const on = tab.dataset.workbenchTab === workbenchTab;
-    tab.classList.toggle("is-active", on);
-    tab.setAttribute("aria-selected", on ? "true" : "false");
-  }
-  for (const panel of document.querySelectorAll("[data-workbench-panel]")) {
-    const on = panel.dataset.workbenchPanel === workbenchTab;
-    panel.classList.toggle("is-active", on);
-    panel.hidden = !on;
-  }
-}
-
-function syncWorkbenchPanels() {
-  const plan = document.querySelector("[data-plan-markdown]");
-  if (plan && document.activeElement !== plan) {
-    plan.value = getPlanMarkdown();
-  }
-  const status = document.querySelector("[data-status-panel]");
-  if (status) {
-    const snap = getTruthSnapshot();
-    status.innerHTML =
-      `<div><dt>Locality</dt><dd></dd></div>` +
-      `<div><dt>Model</dt><dd></dd></div>` +
-      `<div><dt>Context</dt><dd></dd></div>` +
-      `<div><dt>Tools</dt><dd></dd></div>` +
-      `<div><dt>Hardware</dt><dd></dd></div>` +
-      `<div><dt>Mode</dt><dd></dd></div>`;
-    const dds = status.querySelectorAll("dd");
-    dds[0].textContent = snap.locality;
-    dds[1].textContent = snap.modelLabel;
-    dds[2].textContent = snap.contextLabel;
-    dds[3].textContent = snap.toolsLabel;
-    dds[4].textContent = snap.hwLabel;
-    dds[5].textContent = `${sessionMode} · ${toolMode} intent`;
-  }
-  const toolsList = document.querySelector("[data-tools-list]");
-  if (toolsList) {
-    toolsList.replaceChildren();
-    for (const cap of listCapabilities()) {
-      const li = document.createElement("li");
-      li.className = "agent-tools-item";
-      li.dataset.state = cap.state;
-      li.textContent = `${cap.label} · ${cap.state}`;
-      toolsList.append(li);
-    }
-  }
 }
 
 function setSessionMode(mode) {
@@ -1036,549 +1099,14 @@ function setToolMode(mode) {
   }
   toolMode = mode;
   syncSessionModeUi();
+  closeApproveMenu();
 }
 
-function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
-  const stream = streamEl();
-  if (!stream) {
-    return null;
-  }
-  clearEmptyState();
 
-  const row = document.createElement("div");
-  row.className = `agent-msg agent-msg-${role}${streaming ? " is-streaming" : ""}`;
-  row.dataset.role = role;
 
-  const meta = document.createElement("div");
-  meta.className = "agent-msg-meta";
-  meta.textContent = role === "user" ? "You" : "Agent";
 
-  const body = document.createElement("div");
-  body.className = "agent-msg-body";
-  if (asHtml) {
-    body.innerHTML = text;
-  } else if (role === "agent" && !streaming) {
-    body.innerHTML = renderMarkdown(text);
-  } else {
-    body.textContent = text;
-  }
 
-  const actions = document.createElement("div");
-  actions.className = "agent-msg-actions";
-  const copyBtn = document.createElement("button");
-  copyBtn.type = "button";
-  copyBtn.className = "agent-msg-action";
-  copyBtn.dataset.copyMessage = "1";
-  copyBtn.textContent = "Copy";
-  copyBtn.title = "Copy message";
-  const regen = document.createElement("button");
-  regen.type = "button";
-  regen.className = "agent-msg-action";
-  regen.dataset.regenerate = "1";
-  regen.disabled = role !== "agent" || streaming;
-  regen.title = role === "agent" ? "Regenerate mock reply" : "Regenerate — agent only";
-  regen.textContent = "Regenerate";
-  actions.append(copyBtn, regen);
 
-  if (!streaming) {
-    row.classList.add("agent-msg-enter");
-  }
-  row.append(meta, body, actions);
-  stream.append(row);
-  scrollStreamToEnd();
-  return row;
-}
-
-/**
- * Inbox-grammar grant card (preview mock). Deny / Allow once update mock
- * state only — never Capsule/Carrier (Principle 16).
- */
-function appendGrantCard(spec) {
-  const stream = streamEl();
-  if (!stream || !spec?.toolId) {
-    return null;
-  }
-  clearEmptyState();
-
-  let state = spec.state || "pending";
-  let approvalId = spec.approvalId || "";
-  let label = spec.label || spec.toolId;
-  let summary = spec.summary || "";
-  let scope = spec.scope || "";
-
-  if (state === "pending" && !approvalId) {
-    const req = requestTool({
-      toolId: spec.toolId,
-      args: spec.args || { path: "Downloads" },
-    });
-    if (req.status === "denied") {
-      state = "denied";
-      label = req.label;
-      summary = req.summary;
-      scope = req.scope;
-    } else if (req.status === "needs_approval") {
-      approvalId = req.approvalId || "";
-      label = req.label;
-      summary = req.summary;
-      scope = req.scope;
-      spec.approvalId = approvalId;
-      spec.label = label;
-      spec.summary = summary;
-      spec.scope = scope;
-    } else if (req.status === "ok") {
-      state = "granted";
-      label = req.label;
-      summary = req.summary;
-      scope = req.scope;
-      spec.result = req.result;
-    }
-  }
-
-  const card = document.createElement("article");
-  card.className = `agent-grant-card is-${state}`;
-  card.dataset.role = "grant";
-  card.dataset.toolId = spec.toolId;
-  card.dataset.state = state;
-  card.dataset.preview = "1";
-  if (approvalId) {
-    card.dataset.approvalId = approvalId;
-  }
-
-  const head = document.createElement("div");
-  head.className = "agent-grant-card-head";
-  const title = document.createElement("span");
-  title.className = "agent-grant-card-title";
-  title.textContent = label;
-  const badge = document.createElement("span");
-  badge.className = "agent-grant-card-preview";
-  badge.textContent = "preview · mock";
-  head.append(title, badge);
-
-  const body = document.createElement("p");
-  body.className = "agent-grant-card-summary";
-  body.textContent = summary;
-
-  const scopeEl = document.createElement("p");
-  scopeEl.className = "agent-grant-card-scope";
-  scopeEl.textContent = `Scope: ${scope}`;
-
-  card.append(head, body, scopeEl);
-
-  if (state === "pending") {
-    const actions = document.createElement("div");
-    actions.className = "agent-grant-card-actions";
-    const deny = document.createElement("button");
-    deny.type = "button";
-    deny.className = "agent-grant-btn agent-grant-btn-deny";
-    deny.dataset.grantDecision = "deny";
-    deny.textContent = "Deny";
-    const allow = document.createElement("button");
-    allow.type = "button";
-    allow.className = "agent-grant-btn agent-grant-btn-allow";
-    allow.dataset.grantDecision = "allow_once";
-    allow.textContent = "Allow once";
-    actions.append(deny, allow);
-    card.append(actions);
-  } else {
-    const chip = document.createElement("div");
-    chip.className = "agent-grant-card-chip";
-    chip.textContent =
-      state === "granted"
-        ? "Allowed once · preview mock — no Capsule call"
-        : "Denied · fail-closed";
-    card.append(chip);
-    if (state === "granted" && spec.result) {
-      const result = document.createElement("pre");
-      result.className = "agent-grant-card-result";
-      result.textContent = spec.result;
-      card.append(result);
-    }
-  }
-
-  stream.append(card);
-  syncTruthStrip();
-  scrollStreamToEnd();
-  return card;
-}
-
-function paintGrantCardResolved(card, outcome) {
-  if (!card) {
-    return;
-  }
-  const state = outcome.status === "ok" ? "granted" : "denied";
-  card.dataset.state = state;
-  card.className = `agent-grant-card is-${state}`;
-  card.querySelector(".agent-grant-card-actions")?.remove();
-  card.querySelector(".agent-grant-card-chip")?.remove();
-  card.querySelector(".agent-grant-card-result")?.remove();
-  const chip = document.createElement("div");
-  chip.className = "agent-grant-card-chip";
-  chip.textContent =
-    state === "granted"
-      ? "Allowed once · preview mock — no Capsule call"
-      : "Denied · fail-closed";
-  card.append(chip);
-  if (state === "granted" && outcome.result) {
-    const result = document.createElement("pre");
-    result.className = "agent-grant-card-result";
-    result.textContent = outcome.result;
-    card.append(result);
-  }
-  syncTruthStrip();
-  scrollStreamToEnd();
-}
-
-function resolveGrantFromCard(card, decision) {
-  if (!card || card.dataset.state !== "pending") {
-    return;
-  }
-  const outcome = resolveMockApproval({
-    approvalId: card.dataset.approvalId,
-    toolId: card.dataset.toolId,
-    decision,
-  });
-  const session = sessions.find((s) => s.id === activeSessionId);
-  const grantMsg = session?.messages?.find(
-    (m) =>
-      m.role === "grant" &&
-      m.toolId === card.dataset.toolId &&
-      (m.state === "pending" || !m.state),
-  );
-  if (grantMsg) {
-    grantMsg.state = outcome.status === "ok" ? "granted" : "denied";
-    if (outcome.result) {
-      grantMsg.result = outcome.result;
-    }
-  }
-  paintGrantCardResolved(card, outcome);
-}
-
-function sessionAlreadyHasGrant(session, toolId) {
-  return Boolean(
-    session?.messages?.some((m) => m.role === "grant" && m.toolId === toolId),
-  );
-}
-
-function maybeOfferToolAfterReply() {
-  const session = sessions.find((s) => s.id === activeSessionId);
-  if (!session) {
-    return;
-  }
-  const lastUser = [...session.messages]
-    .reverse()
-    .find((m) => m.role === "user");
-  const text = lastUser?.text || "";
-  if (wantsWalletTool(text) && !sessionAlreadyHasGrant(session, "wallet.sign")) {
-    const req = requestTool({ toolId: "wallet.sign", args: {} });
-    const grant = {
-      role: "grant",
-      toolId: "wallet.sign",
-      state: req.status === "denied" ? "denied" : "pending",
-      approvalId: req.approvalId,
-      label: req.label,
-      summary: req.summary,
-      scope: req.scope,
-    };
-    session.messages.push(grant);
-    appendGrantCard(grant);
-    return;
-  }
-  if (wantsLibraryTool(text) && !sessionAlreadyHasGrant(session, "library.read")) {
-    const req = requestTool({
-      toolId: "library.read",
-      args: { path: "Downloads" },
-    });
-    if (req.status === "needs_approval" || req.status === "denied") {
-      const grant = {
-        role: "grant",
-        toolId: "library.read",
-        state: req.status === "denied" ? "denied" : "pending",
-        approvalId: req.approvalId,
-        label: req.label,
-        summary: req.summary,
-        scope: req.scope,
-        args: { path: "Downloads" },
-      };
-      session.messages.push(grant);
-      appendGrantCard(grant);
-    }
-  }
-}
-
-function showEmptyState() {
-  const column = streamEl();
-  const viewport = streamViewportEl();
-  if (!column || !viewport) {
-    return;
-  }
-  column.replaceChildren();
-  clearEmptyState();
-  const name = signedInFirstName();
-  const greeting = name
-    ? `What's on your mind, ${name}?`
-    : "What's on your mind?";
-  const empty = document.createElement("div");
-  empty.className = "agent-harness-empty";
-  empty.setAttribute("role", "status");
-  const sub =
-    sessionMode === "build"
-      ? "Build mode · plan & outputs theatre · no write authority yet"
-      : "Private on this machine · tools start at zero";
-  empty.innerHTML =
-    `<p class="agent-harness-empty-greeting"></p>` +
-    `<p class="agent-harness-empty-sub"></p>`;
-  empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
-  empty.querySelector(".agent-harness-empty-sub").textContent = sub;
-  const starters = document.createElement("div");
-  starters.className = "agent-starter-chips";
-  for (const item of STARTER_PROMPTS) {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "agent-starter-chip";
-    chip.dataset.starter = item.text;
-    chip.textContent = item.label;
-    starters.append(chip);
-  }
-  empty.append(starters);
-  /* Viewport — not the dock-width column — so the hero sits in true room center. */
-  viewport.append(empty);
-}
-
-function renderActiveSession() {
-  const session = sessions.find((s) => s.id === activeSessionId);
-  const stream = streamEl();
-  if (!stream) {
-    return;
-  }
-  if (!session) {
-    setTitle("New chat");
-    showEmptyState();
-    return;
-  }
-  setTitle(session.title);
-  stream.replaceChildren();
-  if (!session.messages.length) {
-    showEmptyState();
-    return;
-  }
-  clearEmptyState();
-  hydrateCapabilitiesFromSession(session);
-  for (const msg of session.messages) {
-    if (msg.role === "grant") {
-      appendGrantCard(msg);
-    } else {
-      appendMessage(msg.role, msg.text);
-    }
-  }
-  syncTruthStrip();
-}
-
-/** Re-bind mock capability map to this session’s grant messages (preview). */
-function hydrateCapabilitiesFromSession(session) {
-  resetMockCapabilities();
-  for (const msg of session?.messages || []) {
-    if (msg.role !== "grant" || !msg.toolId) {
-      continue;
-    }
-    if (msg.state === "pending") {
-      const req = requestTool({
-        toolId: msg.toolId,
-        args: msg.args || { path: "Downloads" },
-      });
-      if (req.approvalId) {
-        msg.approvalId = req.approvalId;
-      }
-      if (req.label) {
-        msg.label = req.label;
-      }
-      if (req.summary) {
-        msg.summary = req.summary;
-      }
-      if (req.scope) {
-        msg.scope = req.scope;
-      }
-      if (req.status === "denied") {
-        msg.state = "denied";
-      }
-    } else if (msg.state === "granted" || msg.state === "denied") {
-      applyCapabilityState(msg.toolId, msg.state);
-    }
-  }
-}
-
-function stopMockStream({ keepPartial = true } = {}) {
-  clearStreamTimer();
-  streamGeneration += 1;
-  turnBusy = false;
-  setAgentComposerProcessing(false);
-  const streaming = streamEl()?.querySelector(".agent-msg-agent.is-streaming");
-  if (streaming) {
-    streaming.classList.remove("is-streaming");
-    if (!keepPartial) {
-      streaming.remove();
-    } else {
-      const body = streaming.querySelector(".agent-msg-body");
-      if (body && body.textContent.trim()) {
-        body.innerHTML = renderMarkdown(body.textContent);
-        const note = document.createElement("div");
-        note.className = "agent-msg-stopped";
-        note.innerHTML =
-          `<span>Stopped</span>` +
-          `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
-        streaming.append(note);
-      }
-    }
-  }
-}
-
-function startMockStream(replyText) {
-  startMockStreamForPrompt("", replyText);
-}
-
-function startMockStreamForPrompt(userText, replyOverride) {
-  stopMockStream({ keepPartial: true });
-  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
-  const turn = getMockTurn(userText);
-  const thinkingText = turn.thinking;
-  const replyText = replyOverride || turn.answer || MOCK_REPLY;
-  const toolPreview = turn.toolPreview;
-  const followUps = turn.followUps || [];
-  const generation = (streamGeneration += 1);
-  const thinkStartedAt = Date.now();
-  turnBusy = true;
-  setAgentComposerProcessing(true);
-  appendTurnDivider("Turn");
-  const timeline = appendTurnTimeline();
-  setTimelineStep(timeline, "thinking", "running");
-
-  const thinking = appendThinkingBlock("", {
-    streaming: reasoningVisible,
-    open: reasoningVisible,
-  });
-  const thinkBody = thinking?.querySelector(".agent-thinking-body");
-  if (thinking && !reasoningVisible) {
-    thinking.hidden = true;
-    if (thinkBody) {
-      thinkBody.textContent = thinkingText;
-    }
-  }
-
-  let phase = reasoningVisible ? "thinking" : "tool";
-  let thinkIndex = 0;
-  let toolRow = null;
-  let toolTicks = 0;
-  let answerRow = null;
-  let answerBody = null;
-  let answerIndex = 0;
-
-  const beginToolOrAnswer = () => {
-    finishThinkingBlock(thinking, thinkStartedAt);
-    setTimelineStep(timeline, "thinking", "done");
-    if (toolPreview) {
-      phase = "tool";
-      toolTicks = 0;
-      setTimelineStep(timeline, "tool", "running", toolPreview.label);
-      toolRow = appendToolTimelineRow(toolPreview);
-    } else {
-      setTimelineStep(timeline, "tool", "idle");
-      beginAnswer();
-    }
-  };
-
-  const beginAnswer = () => {
-    phase = "answer";
-    setTimelineStep(timeline, "answer", "running");
-    answerRow = appendMessage("agent", "", { streaming: true });
-    answerBody = answerRow?.querySelector(".agent-msg-body");
-    answerIndex = 0;
-  };
-
-  if (phase === "tool") {
-    beginToolOrAnswer();
-  }
-
-  streamTimer = window.setInterval(() => {
-    if (generation !== streamGeneration) {
-      clearStreamTimer();
-      return;
-    }
-    const scroller = streamScrollEl();
-
-    if (phase === "thinking" && thinkBody) {
-      thinkIndex = Math.min(thinkingText.length, thinkIndex + 3 + (thinkIndex % 2));
-      thinkBody.textContent = thinkingText.slice(0, thinkIndex);
-      if (scroller) {
-        scroller.scrollTop = scroller.scrollHeight;
-      }
-      if (thinkIndex >= thinkingText.length) {
-        beginToolOrAnswer();
-      }
-      return;
-    }
-
-    if (phase === "tool") {
-      toolTicks += 1;
-      if (toolTicks >= 14) {
-        const denied = toolPreview?.kind === "deny";
-        finishToolTimelineRow(toolRow, {
-          status: denied ? "denied" : "done",
-          statusLabel: denied ? "Needs ceremony" : "Ready to ask",
-        });
-        setTimelineStep(
-          timeline,
-          "tool",
-          denied ? "denied" : "done",
-          toolPreview?.label || "",
-        );
-        beginAnswer();
-      }
-      return;
-    }
-
-    if (!answerBody) {
-      clearStreamTimer();
-      turnBusy = false;
-      setAgentComposerProcessing(false);
-      drainFollowUpQueue();
-      return;
-    }
-
-    answerIndex = Math.min(replyText.length, answerIndex + 2 + (answerIndex % 3));
-    answerBody.textContent = replyText.slice(0, answerIndex);
-    if (scroller) {
-      scroller.scrollTop = scroller.scrollHeight;
-    }
-    if (answerIndex >= replyText.length) {
-      clearStreamTimer();
-      answerRow?.classList.remove("is-streaming");
-      answerRow?.classList.add("agent-msg-enter");
-      answerBody.innerHTML = renderMarkdown(replyText);
-      const regen = answerRow?.querySelector("[data-regenerate]");
-      if (regen) {
-        regen.disabled = false;
-      }
-      setTimelineStep(timeline, "answer", "done");
-      setTimelineStep(timeline, "done", "done");
-      turnBusy = false;
-      setAgentComposerProcessing(false);
-      const session = sessions.find((s) => s.id === activeSessionId);
-      if (session) {
-        session.messages.push({
-          role: "agent",
-          text: replyText,
-          thinking: thinkingText,
-        });
-      }
-      noteMockTurnTokens(Math.max(200, Math.round(replyText.length / 3)));
-      maybeOfferToolAfterReply();
-      appendFollowUpChips(followUps);
-      syncTruthStrip();
-      syncWorkbenchPanels();
-      scrollStreamToEnd();
-      drainFollowUpQueue();
-    }
-  }, 18);
-}
 
 function runParticleDrop(durationMs) {
   if (prefersReducedMotion()) {
@@ -1639,30 +1167,48 @@ function runParticleDrop(durationMs) {
   particleRaf = window.requestAnimationFrame(tick);
 }
 
-function ensureSessionForPrompt(prompt) {
-  if (activeSessionId) {
-    const existing = sessions.find((s) => s.id === activeSessionId);
-    if (existing && existing.messages.length === 0) {
-      existing.title = titleFromPrompt(prompt);
-      return existing;
-    }
-    if (existing && existing.title === "New chat") {
-      existing.title = titleFromPrompt(prompt);
-      return existing;
-    }
+
+
+/** Track A honesty: live · preview · offline — the live flag flips only on a
+ *  real probe result (agent-live.js), never assumed (§AL.3). */
+function syncAgentInferenceStatus() {
+  const el = document.querySelector("[data-agent-inference-status]");
+  if (!el) {
+    return;
   }
-  const session = {
-    id: `s-${Date.now()}`,
-    title: titleFromPrompt(prompt),
-    group: "Today",
-    messages: [],
-  };
-  sessions = [session, ...sessions];
-  activeSessionId = session.id;
-  return session;
+  const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+  const state = getLiveInferenceState();
+  const live = state.live === true;
+  if (live) {
+    el.hidden = false;
+    el.dataset.state = "live";
+    el.textContent = state.model
+      ? `Live · local model on this machine — ${state.model}`
+      : "Live · local model on this machine";
+    document.body.dataset.agentInference = "live";
+    return;
+  }
+  if (offline) {
+    el.hidden = false;
+    el.dataset.state = "offline";
+    el.textContent =
+      "Offline · preview path only — no live model on this machine yet";
+    document.body.dataset.agentInference = "offline-preview";
+    return;
+  }
+  el.hidden = false;
+  el.dataset.state = "preview";
+  el.textContent =
+    "Preview · not live inference — mock replies until a local model is wired";
+  document.body.dataset.agentInference = "preview";
 }
 
-export function showAgentHarness({ prompt, fromShelf = false, syncStage = true } = {}) {
+export function showAgentHarness({
+  prompt,
+  fromShelf = false,
+  syncStage = true,
+  restore = false,
+} = {}) {
   const harness = harnessEl();
   if (!harness) {
     return;
@@ -1689,7 +1235,14 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
   if (prompt) {
     const session = ensureSessionForPrompt(prompt);
     session.messages.push({ role: "user", text: prompt });
-    maybeUpdatePlanFromPrompt(prompt);
+    if (maybeUpdatePlanFromPrompt(prompt)) {
+      openWorkbench({ tab: "plan" });
+    }
+  } else if (restore || workspaceHydrated) {
+    /* Refresh / host restore — keep persisted chats; don't mint a blank New chat. */
+    if (!activeSessionId) {
+      activeSessionId = sessions[0]?.id || null;
+    }
   } else if (fromShelf) {
     /* Entering with the Shelf morph — land on a clean New chat so the room is visible. */
     const fresh = {
@@ -1729,18 +1282,24 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
     here without a face (e.g. Send), settle the composer face so the dock is never empty.
   */
   if (!fromShelf) {
-    void import(`./agent-shelf.js?v=${TIP}`).then((shelf) => {
-      if (!shelf.agentShelfFaceActive()) {
-        shelf.snapAgentShelfFace();
-      }
-      syncComposerGeometry();
-    });
+    if (!agentShelfFaceActive()) {
+      snapAgentShelfFace();
+    }
+    syncComposerGeometry();
   }
 
   harness.hidden = false;
   harness.setAttribute("aria-hidden", "false");
   syncTruthStrip();
   syncSessionModeUi();
+  syncWorkbenchOpenUi();
+  syncAgentInferenceStatus();
+  void probeLiveInference().then(() => {
+    if (active) {
+      syncAgentInferenceStatus();
+      syncModelTrigger();
+    }
+  });
   renderSessions();
   renderActiveSession();
 
@@ -1764,7 +1323,7 @@ export function showAgentHarness({ prompt, fromShelf = false, syncStage = true }
       if (motionGen !== harnessMotionGen || !active) {
         return;
       }
-      startMockStreamForPrompt(openPrompt);
+      startTurnForPrompt(openPrompt);
     }, prefersReducedMotion() ? 40 : HARNESS_CONTENT_AT_MS);
   }
 
@@ -1804,14 +1363,12 @@ function teardownHarnessDom(motionGen, { restoreShelfApps = true } = {}) {
     harness.setAttribute("aria-hidden", "true");
   }
   if (restoreShelfApps) {
-    void import(`./agent-shelf.js?v=${TIP}`).then((shelf) => {
-      /* Reverse morph back to Home Shelf — same dance as Dock Agent leave. */
-      if (shelf.agentShelfFaceActive()) {
-        shelf.hideAgentShelfFace();
-      } else {
-        shelf.snapAppsShelfFace();
-      }
-    });
+    /* Reverse morph back to Home Shelf — same dance as Dock Agent leave. */
+    if (agentShelfFaceActive()) {
+      hideAgentShelfFace();
+    } else {
+      snapAppsShelfFace();
+    }
   }
 }
 
@@ -1843,6 +1400,9 @@ export function hideAgentHarness({ restoreShelfApps = true, syncStage = true } =
   active = false;
   closeHarnessDrawer();
   closeSessionSearch();
+  closeApproveMenu();
+  closeModelMenu();
+  closeHarnessPage();
   document.body.classList.remove("agent-harness-sidebar-collapsed");
   resetMockCapabilities();
   syncTruthStrip();
@@ -1877,6 +1437,7 @@ export function sendToAgentHarness(prompt) {
       enqueueFollowUp(text);
       return;
     }
+    closeHarnessPage();
     const session = ensureSessionForPrompt(text);
     if (session.title === "New chat" || session.messages.length === 0) {
       session.title = titleFromPrompt(text);
@@ -1887,72 +1448,80 @@ export function sendToAgentHarness(prompt) {
     setTitle(session.title);
     clearEmptyState();
     appendMessage("user", text);
-    maybeUpdatePlanFromPrompt(text);
-    syncWorkbenchPanels();
-    startMockStreamForPrompt(text);
+    if (maybeUpdatePlanFromPrompt(text)) {
+      openWorkbench({ tab: "plan" });
+    } else {
+      syncWorkbenchPanels();
+    }
+    startTurnForPrompt(text);
     return;
   }
   showAgentHarness({ prompt: text });
 }
 
-function selectSession(sessionId) {
-  if (!sessionId || !sessions.some((s) => s.id === sessionId)) {
-    return;
-  }
-  stopMockStream({ keepPartial: true });
-  activeSessionId = sessionId;
-  renderSessions();
-  renderActiveSession();
-}
 
-function newChat() {
-  stopMockStream({ keepPartial: false });
-  followUpQueue = [];
-  renderFollowUpQueue();
-  const session = {
-    id: `s-${Date.now()}`,
-    title: "New chat",
-    group: "Today",
-    messages: [],
-  };
-  sessions = [session, ...sessions];
-  activeSessionId = session.id;
-  renderSessions();
-  renderActiveSession();
-  shelfComposerInput()?.focus({ preventScroll: true });
-  syncAgentSendButton();
-}
 
-function renameSession(sessionId) {
-  const session = sessions.find((s) => s.id === sessionId);
-  if (!session) {
-    return;
-  }
-  const next = window.prompt("Rename chat", session.title);
-  if (!next?.trim()) {
-    return;
-  }
-  session.title = next.trim().slice(0, 64);
-  if (session.id === activeSessionId) {
-    setTitle(session.title);
-  }
-  renderSessions();
-}
 
-function deleteSession(sessionId) {
-  sessions = sessions.filter((s) => s.id !== sessionId);
-  if (activeSessionId === sessionId) {
-    activeSessionId = sessions[0]?.id || null;
-    renderActiveSession();
-  }
-  renderSessions();
-}
+
+
+let sessionActionsId = null;
+
+
+
+
+
+
+/** When creating a project from a chat’s menu, file that chat into it. */
+let pendingProjectAssignSessionId = null;
 
 export function bindAgentHarness() {
   if (bound) {
     return;
   }
   bound = true;
+  refreshHarnessDomCache();
+  registerAgentHarnessApi({
+    agentHarnessActive,
+    showAgentHarness,
+    hideAgentHarness,
+    sendToAgentHarness,
+    stopAgentHarnessStream,
+  });
+  bindAgentWorkspaceSnapshot(getAgentWorkspaceSnapshot);
+  window.addEventListener("online", () => {
+    syncAgentInferenceStatus();
+    void probeLiveInference({ force: true }).then(() => {
+      if (active) {
+        syncAgentInferenceStatus();
+        syncModelTrigger();
+      }
+    });
+  });
+  window.addEventListener("offline", () => {
+    if (active) {
+      syncAgentInferenceStatus();
+    }
+  });
+
+  /* w1: real probe — live flips only on llama-server truth (§AL.3). */
+  void probeLiveInference().then(() => {
+    if (active) {
+      syncAgentInferenceStatus();
+      syncModelTrigger();
+    }
+  });
+
+  /* Warm the hardware estimate so Settings / model menu stay honest. */
+  void probeHardwareEstimate().then(() => {
+    syncTruthStrip();
+    syncWorkbenchPanels();
+    if (harnessPageOpen()) {
+      renderHarnessPage();
+    }
+    if (modelMenuOpen()) {
+      renderModelMenu();
+    }
+  });
 
   /* Esc: search (90) → drawer (85) → Shelf reverse dance (75). */
   registerEscapeHandler("agent-session-search", {
@@ -1965,6 +1534,48 @@ export function bindAgentHarness() {
     isActive: () =>
       active && document.body.classList.contains("agent-harness-drawer-open"),
     dismiss: () => closeHarnessDrawer(),
+  });
+  registerEscapeHandler("agent-approve-menu", {
+    priority: 88,
+    isActive: () => approveMenuOpen(),
+    dismiss: () => closeApproveMenu(),
+  });
+  registerEscapeHandler("agent-model-menu", {
+    priority: 87,
+    isActive: () => modelMenuOpen(),
+    dismiss: () => closeModelMenu(),
+  });
+  registerEscapeHandler("agent-harness-page", {
+    priority: 84,
+    isActive: () => active && harnessPageOpen(),
+    dismiss: () => closeHarnessPage(),
+  });
+  registerEscapeHandler("agent-session-actions", {
+    priority: 89,
+    isActive: () => sessionActionsOpen(),
+    dismiss: () => closeSessionActions(),
+  });
+  registerEscapeHandler("agent-workbench", {
+    priority: 83,
+    isActive: () => active && workbenchOpen && !harnessPageOpen(),
+    dismiss: () => closeWorkbench(),
+  });
+
+  window.addEventListener("resize", () => {
+    if (approveMenuOpen()) {
+      positionFloatingMenu(approveMenuEl(), approveBtnEl(), {
+        minWidth: 300,
+        maxWidth: 360,
+      });
+    }
+    if (modelMenuOpen()) {
+      const anchor = modelMenuAnchor || modelBtnEl();
+      positionFloatingMenu(modelMenuEl(), anchor, {
+        minWidth: 230,
+        maxWidth: 280,
+        preferRight: anchor === modelBtnEl(),
+      });
+    }
   });
 
   if (typeof window.matchMedia === "function") {
@@ -1994,6 +1605,46 @@ export function bindAgentHarness() {
       renderSessionSearchResults(event.target.value);
     }
   });
+
+  /* Capture-phase: opaque Home frames must never navigate on form submit
+     (default GET reloads the sandbox and wipes in-memory projects). */
+  document.addEventListener(
+    "submit",
+    (event) => {
+      const form = event.target?.closest?.("[data-project-create]") || event.target;
+      if (form?.matches?.("[data-project-create]") || form?.closest?.("[data-project-create]")) {
+        event.preventDefault();
+        event.stopPropagation();
+        submitProjectCreate();
+      }
+    },
+    true
+  );
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      const inCreate = event.target?.closest?.("[data-project-create]");
+      if (!inCreate) {
+        return;
+      }
+      const form = projectCreateEl();
+      if (!form || form.hidden) {
+        return;
+      }
+      if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        submitProjectCreate();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeProjectCreate();
+      }
+    },
+    true
+  );
 
   document.addEventListener("click", (event) => {
     if (
@@ -2106,7 +1757,7 @@ export function bindAgentHarness() {
       const lastUser = [...(session?.messages || [])]
         .reverse()
         .find((m) => m.role === "user");
-      startMockStreamForPrompt(lastUser?.text || "");
+      startTurnForPrompt(lastUser?.text || "");
       return;
     }
     const thinkToggle = event.target.closest?.("[data-truth-thinking-toggle]");
@@ -2121,17 +1772,158 @@ export function bindAgentHarness() {
       setSessionMode(segment.dataset.segment);
       return;
     }
-    const toolChip = event.target.closest?.("[data-tool-mode]");
-    if (toolChip?.dataset.toolMode) {
+    const approveBtn = event.target.closest?.("#agent-approve-btn");
+    if (approveBtn) {
       event.preventDefault();
-      setToolMode(toolChip.dataset.toolMode);
+      toggleApproveMenu();
+      return;
+    }
+    const approveOpt = event.target.closest?.(".agent-approve-option[data-tool-mode]");
+    if (approveOpt?.dataset.toolMode) {
+      event.preventDefault();
+      setToolMode(approveOpt.dataset.toolMode);
+      return;
+    }
+    const modelBtn = event.target.closest?.("#agent-model-picker");
+    if (modelBtn) {
+      event.preventDefault();
+      toggleModelMenu();
+      return;
+    }
+    if (event.target.closest?.("[data-model-add]")) {
+      event.preventDefault();
+      closeModelMenu();
+      openHarnessPage("configure", { section: "models" });
+      return;
+    }
+    const sidebarNav = event.target.closest?.("[data-sidebar-nav]");
+    if (sidebarNav?.dataset.sidebarNav) {
+      event.preventDefault();
+      /* Sidebar rows open center pages — tap again to return to the chat.
+         Use DOM active state (harnessPage lives in agent-configure.js). */
+      const dest = sidebarNav.dataset.sidebarNav;
+      if (sidebarNav.classList.contains("is-active")) {
+        closeHarnessPage();
+      } else {
+        openHarnessPage(dest, dest === "configure" ? { section: "overview" } : {});
+      }
+      return;
+    }
+    const configureChip = event.target.closest?.("[data-configure-section]");
+    if (configureChip?.dataset.configureSection) {
+      event.preventDefault();
+      openConfigureSection(configureChip.dataset.configureSection);
+      return;
+    }
+    const overviewRow = event.target.closest?.("[data-open-configure-section]");
+    if (overviewRow?.dataset.openConfigureSection) {
+      event.preventDefault();
+      openConfigureSection(overviewRow.dataset.openConfigureSection);
+      return;
+    }
+    if (event.target.closest?.("[data-project-add]")) {
+      event.preventDefault();
+      openProjectCreate();
+      return;
+    }
+    if (event.target.closest?.("[data-project-create-cancel]")) {
+      event.preventDefault();
+      closeProjectCreate();
+      return;
+    }
+    /* Click away: save if named (so “save” isn’t a silent cancel), else dismiss. */
+    const createOpen = projectCreateEl() && !projectCreateEl().hidden;
+    if (
+      createOpen &&
+      !event.target.closest?.("[data-project-create]") &&
+      !event.target.closest?.("[data-project-add]")
+    ) {
+      const pending = String(
+        document.querySelector("[data-project-create-input]")?.value || ""
+      ).trim();
+      if (pending) {
+        submitProjectCreate();
+      } else {
+        closeProjectCreate();
+      }
+    }
+    const projectRemove = event.target.closest?.("[data-project-remove]");
+    if (projectRemove?.dataset.projectRemove) {
+      event.preventDefault();
+      const id = projectRemove.dataset.projectRemove;
+      removeProject(id);
+      for (const session of sessions) {
+        if (session.projectId === id) {
+          session.projectId = null;
+        }
+      }
+      renderSessions();
+      persistAgentWorkspaceSoon();
+      return;
+    }
+    const projectToggle = event.target.closest?.("[data-project-toggle]");
+    if (projectToggle?.dataset.projectToggle) {
+      event.preventDefault();
+      const item = projectToggle.closest(".agent-projects-item");
+      const nest = item?.querySelector(".agent-projects-sessions");
+      if (nest) {
+        const open = nest.hidden;
+        nest.hidden = !open;
+        projectToggle.setAttribute("aria-expanded", open ? "true" : "false");
+      }
+      return;
+    }
+    if (event.target.closest?.("[data-page-close]")) {
+      event.preventDefault();
+      closeHarnessPage();
+      return;
+    }
+    const modelUse = event.target.closest?.("[data-model-use]");
+    if (modelUse?.dataset.modelUse) {
+      event.preventDefault();
+      selectAgentModel(modelUse.dataset.modelUse);
+      return;
+    }
+    const modelOpt = event.target.closest?.(".agent-model-option[data-model-id]");
+    if (modelOpt?.dataset.modelId) {
+      event.preventDefault();
+      selectAgentModel(modelOpt.dataset.modelId);
+      return;
+    }
+    const modelGet = event.target.closest?.("[data-model-download]");
+    if (modelGet?.dataset.modelDownload && !modelGet.disabled) {
+      event.preventDefault();
+      previewGetModel(modelGet.dataset.modelDownload);
+      return;
+    }
+    if (
+      approveMenuOpen() &&
+      !event.target.closest?.(".agent-approve-wrap") &&
+      !event.target.closest?.("#agent-approve-menu")
+    ) {
+      closeApproveMenu();
+    }
+    if (
+      modelMenuOpen() &&
+      !event.target.closest?.(".agent-model-wrap") &&
+      !event.target.closest?.("#agent-model-menu")
+    ) {
+      closeModelMenu();
+    }
+    if (event.target.closest?.("[data-workbench-open]")) {
+      event.preventDefault();
+      openWorkbench({ force: true });
+      return;
+    }
+    if (event.target.closest?.("[data-workbench-close]")) {
+      event.preventDefault();
+      closeWorkbench();
       return;
     }
     const wbTab = event.target.closest?.("[data-workbench-tab]");
     if (wbTab?.dataset.workbenchTab) {
       event.preventDefault();
-      setWorkbenchTab(wbTab.dataset.workbenchTab);
-      syncWorkbenchPanels();
+      openWorkbench({ tab: wbTab.dataset.workbenchTab, force: true });
       return;
     }
     if (event.target.closest?.("[data-tools-demo-grant]")) {
@@ -2153,6 +1945,7 @@ export function bindAgentHarness() {
     const lib = event.target.closest?.("[data-library-attach]");
     if (lib?.dataset.libraryAttach) {
       event.preventDefault();
+      openWorkbench({ tab: "library", force: true });
       const noun = lib.dataset.libraryAttach;
       const input = shelfComposerInput();
       if (input) {
@@ -2167,15 +1960,16 @@ export function bindAgentHarness() {
     const out = event.target.closest?.("[data-output-id]");
     if (out?.dataset.outputId) {
       event.preventDefault();
+      openWorkbench({ tab: "outputs", force: true });
       window.alert(
         `Preview artifact: ${out.dataset.outputId}\n\nMock only — not written to disk. ADE sandbox later.`,
       );
       return;
     }
-    const queueChip = event.target.closest?.(".agent-queue-chip");
-    if (queueChip?.dataset.queueId) {
+    const queueRemove = event.target.closest?.(".agent-queue-item-remove");
+    if (queueRemove?.dataset.queueId) {
       event.preventDefault();
-      followUpQueue = followUpQueue.filter((q) => q.id !== queueChip.dataset.queueId);
+      followUpQueue = followUpQueue.filter((q) => q.id !== queueRemove.dataset.queueId);
       renderFollowUpQueue();
       return;
     }
@@ -2201,35 +1995,38 @@ export function bindAgentHarness() {
       }
       return;
     }
-    const starter = event.target.closest?.("[data-starter]");
-    if (starter?.dataset.starter) {
+    const sessionMenuBtn = event.target.closest?.("[data-session-menu]");
+    if (sessionMenuBtn?.dataset.sessionMenu) {
       event.preventDefault();
-      sendToAgentHarness(starter.dataset.starter);
+      const id = sessionMenuBtn.dataset.sessionMenu;
+      if (sessionActionsOpen() && sessionActionsId === id) {
+        closeSessionActions();
+      } else {
+        openSessionActions(id, sessionMenuBtn);
+      }
       return;
     }
-    const menu = event.target.closest?.(".agent-harness-session-menu");
-    if (menu) {
+    const sessionAction = event.target.closest?.("[data-session-action]");
+    if (sessionAction?.dataset.sessionAction) {
       event.preventDefault();
-      const id = menu.closest(".agent-harness-session")?.dataset.sessionId;
-      const session = sessions.find((s) => s.id === id);
-      if (!session) {
-        return;
-      }
-      const choice = window.prompt(
-        'Type "pin", "export", "rename", or "delete"',
-        session.pinned ? "export" : "pin",
-      );
-      if (choice === "delete") {
-        deleteSession(id);
-      } else if (choice === "rename") {
-        renameSession(id);
-      } else if (choice === "pin") {
-        session.pinned = !session.pinned;
-        renderSessions();
-      } else if (choice === "export") {
-        activeSessionId = id;
-        exportActiveSessionMarkdown();
-      }
+      runSessionAction(sessionAction.dataset.sessionAction);
+      return;
+    }
+    const sessionProject = event.target.closest?.("[data-session-project]");
+    if (sessionProject?.dataset.sessionProject) {
+      event.preventDefault();
+      const id = sessionActionsId;
+      const projectId = sessionProject.dataset.sessionProject;
+      closeSessionActions();
+      assignSessionProject(id, projectId);
+      return;
+    }
+    if (
+      sessionActionsOpen() &&
+      !event.target.closest?.("#agent-session-actions") &&
+      !event.target.closest?.("[data-session-menu]")
+    ) {
+      closeSessionActions();
     }
   });
 

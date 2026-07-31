@@ -2,7 +2,7 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-const TIP = "home-20260724co";
+import { TIP } from "./agent-tip.js?v=home-20260728ag";
 
 let planMarkdown = `### To-dos
 - [ ] Clarify what to build
@@ -16,7 +16,8 @@ let selectedModelId = "local-preview";
 /** Mock context fill 0–1 for truth-strip meter (fx6). */
 let mockContextRatio = 0.12;
 
-const REASONING_VISIBLE_KEY = "elastos.agent.reasoningVisible";
+/** In-memory only — host session.agent is the durable store. */
+let reasoningVisibleStore = true;
 
 export const MOCK_THINKING =
   "Check locality first — answer must stay on this device.\n" +
@@ -57,33 +58,177 @@ const capabilities = new Map([
 const pendingApprovals = new Map();
 let approvalSeq = 0;
 
+/**
+ * Mock model catalog — presentation until Spark/`ai-provider` lists real weights.
+ * status: installed (selectable) | available (recommend download) | blocked (needs hardware/Spark)
+ */
+const MODEL_CATALOG = [
+  {
+    id: "local-preview",
+    label: "Local preview",
+    tier: "preview",
+    hwTier: "nano",
+    status: "installed",
+    fitsDevice: true,
+    sizeLabel: "",
+    detail: "On this device · preview path · not a downloaded weight file",
+    tokensPerSecEstimate: null,
+    vramGbEstimate: null,
+  },
+  {
+    id: "qwen-stub-small",
+    label: "Qwen 2.5 · 3B",
+    tier: "fits",
+    hwTier: "nano",
+    status: "available",
+    fitsDevice: true,
+    sizeLabel: "~2 GB",
+    detail: "Preview stub — Get installs in-session only, not real weights on disk",
+    tokensPerSecEstimate: 28,
+    vramGbEstimate: 4,
+  },
+  {
+    id: "llama-stub-mini",
+    label: "Llama 3.2 · 1B",
+    tier: "fits",
+    hwTier: "nano",
+    status: "available",
+    fitsDevice: true,
+    sizeLabel: "~1.3 GB",
+    detail: "Fast answers · best fit when RAM is tight",
+    tokensPerSecEstimate: 40,
+    vramGbEstimate: 2,
+  },
+  {
+    id: "qwen-stub-coder",
+    label: "Qwen 2.5 Coder · 7B",
+    tier: "fits",
+    hwTier: "mini",
+    status: "available",
+    fitsDevice: true,
+    sizeLabel: "~4.5 GB",
+    detail: "Better for Build / capsule drafts",
+    tokensPerSecEstimate: 18,
+    vramGbEstimate: 6,
+  },
+  {
+    id: "spark-stub",
+    label: "Large local · 70B",
+    tier: "unsupported",
+    hwTier: "medium",
+    status: "blocked",
+    fitsDevice: false,
+    sizeLabel: "~40 GB",
+    detail: "Needs Spark-class GPU — not this device",
+    tokensPerSecEstimate: null,
+    vramGbEstimate: 48,
+  },
+];
+
+const HW_TIER_BLURB = {
+  nano: "Nano · laptop / light local",
+  mini: "Mini · 24–48 GB class",
+  medium: "Medium · large unified / multi-GPU",
+};
+
+/* ---- Hardware estimate (browser-side, honest) ----------------------------
+   The real probe belongs to the runtime (`ai-provider`, Spark/W2) — same split
+   as Local Studio's controller-side diagnostics. Until then the browser can
+   only estimate: CPU cores, coarse memory (Chrome caps deviceMemory at 8),
+   GPU family via WebGPU. Everything here is labeled "estimate". */
+
+/** @type {{ cores: number|null, poolGb: number|null, memLabel: string, gpuLabel: string, deviceLabel: string, source: "browser-estimate" }|null} */
+let hardwareEstimate = null;
+let hardwareProbePromise = null;
+
+export function probeHardwareEstimate() {
+  if (hardwareProbePromise) {
+    return hardwareProbePromise;
+  }
+  hardwareProbePromise = (async () => {
+    const cores = Number(navigator.hardwareConcurrency) || null;
+    /* deviceMemory caps at 8 — treat as a conservative floor, label "8+". */
+    const rawMem = Number(navigator.deviceMemory) || null;
+    const poolGb = rawMem;
+    const memLabel = rawMem ? (rawMem >= 8 ? "8+ GB" : `${rawMem} GB`) : "memory unknown";
+    let gpuLabel = "";
+    try {
+      const adapter = await navigator.gpu?.requestAdapter?.();
+      const info = adapter?.info;
+      const arch = info?.architecture || info?.vendor || "";
+      if (arch) {
+        gpuLabel = arch.includes("apple") || arch.includes("metal")
+          ? "Apple GPU"
+          : arch.replace(/^./, (c) => c.toUpperCase());
+      }
+    } catch {
+      /* WebGPU unavailable — leave blank, stay honest. */
+    }
+    const parts = [];
+    if (gpuLabel) {
+      parts.push(gpuLabel);
+    }
+    if (cores) {
+      parts.push(`${cores} cores`);
+    }
+    parts.push(memLabel);
+    hardwareEstimate = {
+      cores,
+      poolGb,
+      memLabel,
+      gpuLabel,
+      deviceLabel: `This device · ${parts.join(" · ")}`,
+      source: "browser-estimate",
+    };
+    return hardwareEstimate;
+  })();
+  return hardwareProbePromise;
+}
+
+export function getHardwareEstimate() {
+  return hardwareEstimate;
+}
+
+/**
+ * Fit vs the memory pool estimate (unified-memory budget, Local Studio style).
+ * Falls back to the catalog's static flag when the browser gave us nothing.
+ * @returns {"fits"|"blocked"}
+ */
+export function fitForModel(model) {
+  if (model.status === "blocked" || model.fitsDevice === false) {
+    return "blocked";
+  }
+  const pool = hardwareEstimate?.poolGb;
+  if (!pool || model.vramGbEstimate == null) {
+    return model.fitsDevice ? "fits" : "blocked";
+  }
+  return model.vramGbEstimate <= pool ? "fits" : "blocked";
+}
+
+/** Best single pick for this hardware — strongest model that fits; installed breaks ties. */
+export function recommendedModel() {
+  const candidates = listModels()
+    .filter((m) => m.tier !== "preview" && fitForModel(m) === "fits")
+    .sort((a, b) => {
+      const sizeDelta = (b.vramGbEstimate || 0) - (a.vramGbEstimate || 0);
+      if (sizeDelta !== 0) {
+        return sizeDelta;
+      }
+      return (b.status === "installed" ? 1 : 0) - (a.status === "installed" ? 1 : 0);
+    });
+  return candidates[0] || listInstalledModels()[0] || null;
+}
+
 export function listModels() {
-  return [
-    {
-      id: "local-preview",
-      label: "Local preview",
-      tier: "preview",
-      fitsDevice: true,
-      tokensPerSecEstimate: null,
-      vramGbEstimate: null,
-    },
-    {
-      id: "qwen-stub-small",
-      label: "Small local (stub)",
-      tier: "fits",
-      fitsDevice: true,
-      tokensPerSecEstimate: 28,
-      vramGbEstimate: 4,
-    },
-    {
-      id: "spark-stub",
-      label: "Needs Spark (stub)",
-      tier: "unsupported",
-      fitsDevice: false,
-      tokensPerSecEstimate: null,
-      vramGbEstimate: 48,
-    },
-  ];
+  return MODEL_CATALOG.map((m) => ({ ...m }));
+}
+
+export function listInstalledModels() {
+  return listModels().filter((m) => m.status === "installed");
+}
+
+export function listRecommendedModels() {
+  return listModels().filter((m) => m.status === "available" || m.status === "blocked");
 }
 
 export function getSelectedModelId() {
@@ -91,15 +236,33 @@ export function getSelectedModelId() {
 }
 
 export function setSelectedModelId(modelId) {
-  const match = listModels().find((m) => m.id === modelId);
+  const match = MODEL_CATALOG.find((m) => m.id === modelId && m.status === "installed");
   if (match) {
     selectedModelId = match.id;
   }
   return getSelectedModel();
 }
 
+/** Preview-only: mark an available stub as installed + select it. No real download. */
+export function mockInstallModel(modelId) {
+  const match = MODEL_CATALOG.find((m) => m.id === modelId);
+  if (!match) {
+    return { ok: false, reason: "missing", model: null };
+  }
+  if (match.status === "blocked") {
+    return { ok: false, reason: "blocked", model: { ...match } };
+  }
+  match.status = "installed";
+  selectedModelId = match.id;
+  return { ok: true, reason: "preview-install", model: { ...match } };
+}
+
 export function getSelectedModel() {
-  return listModels().find((m) => m.id === selectedModelId) || listModels()[0];
+  return (
+    listModels().find((m) => m.id === selectedModelId && m.status === "installed") ||
+    listInstalledModels()[0] ||
+    listModels()[0]
+  );
 }
 
 /** Advance mock context after a turn (presentation only). */
@@ -141,6 +304,9 @@ export function getTruthSnapshot() {
   if (model.tier === "unsupported") {
     hwLabel = "Needs Spark";
     hwState = "warn";
+  } else if (hardwareEstimate?.poolGb) {
+    hwLabel = `${hardwareEstimate.memLabel} est`;
+    hwState = "ok";
   } else if (model.tokensPerSecEstimate != null) {
     hwLabel = `~${model.tokensPerSecEstimate} tok/s stub`;
     hwState = "ok";
@@ -280,13 +446,15 @@ export function resolveMockApproval({ approvalId, toolId, decision }) {
     };
   }
   if (decision === "allow_once") {
-    cap.state = "granted";
+    /* One-shot only — do not sticky-grant the session (label honesty). */
+    cap.state = "none";
     if (record) {
       pendingApprovals.delete(record.approvalId);
     }
     return {
       status: "ok",
       preview: true,
+      once: true,
       toolId: cap.id,
       label: cap.label,
       result: mockToolResult(cap.id, record?.args || {}),
@@ -373,27 +541,14 @@ export function providerTip() {
   return TIP;
 }
 
-/** Thinking visibility preference (fx7). Default on. */
+/** Thinking visibility preference (fx7). Default on. Host snapshot persists. */
 export function loadReasoningVisible() {
-  try {
-    if (typeof localStorage === "undefined") {
-      return true;
-    }
-    return localStorage.getItem(REASONING_VISIBLE_KEY) !== "0";
-  } catch {
-    return true;
-  }
+  return reasoningVisibleStore !== false;
 }
 
 export function setReasoningVisible(visible) {
-  try {
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(REASONING_VISIBLE_KEY, visible ? "1" : "0");
-    }
-  } catch {
-    /* ignore */
-  }
-  return Boolean(visible);
+  reasoningVisibleStore = Boolean(visible);
+  return reasoningVisibleStore;
 }
 
 /**
@@ -491,11 +646,11 @@ export function setPlanMarkdown(markdown) {
   return planMarkdown;
 }
 
-/** Mock agent refreshes plan when user asks to plan/build. */
+/** Mock agent refreshes plan when user asks to plan/build. @returns {boolean} whether plan changed */
 export function maybeUpdatePlanFromPrompt(userText) {
   const t = String(userText || "").toLowerCase();
   if (!t.includes("plan") && !t.includes("build") && !t.includes("capsule")) {
-    return planMarkdown;
+    return false;
   }
   planMarkdown = `### To-dos
 - [x] Heard the request
@@ -503,5 +658,195 @@ export function maybeUpdatePlanFromPrompt(userText) {
 - [ ] List required capabilities
 - [ ] ADE sandbox write (later)
 - [ ] Local install (later)`;
-  return planMarkdown;
+  return true;
+}
+
+/* ---- Configure / Usage / Projects seams (preview literacy) -------------
+   Machine probe ≠ agent ambient authority. Download Get ≠ silent network.
+   Projects use ElastOS nouns (title + optional rootRef), never host cwd. */
+
+export function getMachineProfile() {
+  const hw = getHardwareEstimate();
+  return {
+    label: hw?.deviceLabel?.replace(/^This device ·\s*/i, "") || "This device",
+    platform: hw?.gpuLabel?.includes("Apple") ? "Mac" : "This device",
+    cores: hw?.cores ?? null,
+    memoryGb: hw?.poolGb ?? null,
+    memLabel: hw?.memLabel ?? "memory unknown",
+    gpuLine: hw?.gpuLabel || "GPU unknown",
+    isThisMachine: true,
+    source: hw?.source ?? "browser-estimate",
+    readyForFit: Boolean(hw),
+    deviceLabel: hw?.deviceLabel ?? "This device",
+  };
+}
+
+export function getRuntimeSnapshot() {
+  const truth = getTruthSnapshot();
+  return {
+    locality: truth.locality,
+    preview: true,
+    backend: null,
+    process: "none",
+    modelLabel: truth.modelLabel,
+    contextLabel: truth.contextLabel,
+    toolsLabel: truth.toolsLabel,
+    hwLabel: truth.hwLabel,
+    note: "No model process loaded yet. Live health when llama-provider is wired.",
+  };
+}
+
+export function getConfigureOverviewSnapshot() {
+  const machine = getMachineProfile();
+  const runtime = getRuntimeSnapshot();
+  const model = getSelectedModel();
+  return [
+    {
+      id: "machine",
+      title: "Machine",
+      status: machine.readyForFit ? "Ready" : "Estimate",
+      statusTitle: "Profile available — not an agent grant",
+      detail: `${machine.platform} · ${machine.memLabel} est`,
+      section: "machine",
+    },
+    {
+      id: "models",
+      title: "Models",
+      status: model?.label ?? "None",
+      statusTitle: "Selected model for this room",
+      detail: "Mine · Picks · Get",
+      section: "models",
+    },
+    {
+      id: "tools",
+      title: "Tools",
+      status: String(toolsSummaryLabel() || "").replace(/^Tools:\s*/i, "") || "none",
+      statusTitle: "Capability state — grants only",
+      detail: "Library · Wallet — nothing ambient",
+      section: "tools",
+    },
+    {
+      id: "runtime",
+      title: "Runtime",
+      status: "Preview",
+      statusTitle: "Preview literacy — not live controller health",
+      detail: `${runtime.locality} · ${runtime.process}`,
+      section: "runtime",
+    },
+  ];
+}
+
+export function listPicksByTier() {
+  const order = ["nano", "mini", "medium"];
+  return order.map((hwTier) => ({
+    hwTier,
+    blurb: HW_TIER_BLURB[hwTier] || hwTier,
+    models: listModels()
+      .filter((m) => m.hwTier === hwTier && m.tier !== "preview")
+      .map((m) => ({ ...m, fit: fitForModel(m) })),
+  }));
+}
+
+/** Preview Get — never silent network. Later: real Inbox grant for fetch+store. */
+export function requestModelGet(modelId) {
+  const match = MODEL_CATALOG.find((m) => m.id === modelId);
+  if (!match) {
+    return { kind: "missing", modelId };
+  }
+  if (match.status === "installed") {
+    return { kind: "already", modelId };
+  }
+  if (match.status === "blocked" || fitForModel(match) === "blocked") {
+    return { kind: "blocked", modelId, reason: "Needs more memory or Spark-class hardware" };
+  }
+  return { kind: "preview-theatre", modelId, label: match.label };
+}
+
+/** ~53 weeks of UTC days — all zeros until live inference accounting (Studio-style grid). */
+function emptyUsageDaily() {
+  const days = [];
+  const end = new Date();
+  end.setUTCHours(0, 0, 0, 0);
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - 53 * 7 + 1);
+  for (let t = start.getTime(); t <= end.getTime(); t += 86400000) {
+    const d = new Date(t);
+    days.push({
+      date: d.toISOString().slice(0, 10),
+      total_tokens: 0,
+      requests: 0,
+    });
+  }
+  return days;
+}
+
+export function getUsageSnapshot() {
+  return {
+    preview: true,
+    tokens: 0,
+    requests: 0,
+    sessions: 0,
+    activeDays: 0,
+    byModel: [],
+    daily: emptyUsageDaily(),
+    locality: "On this device",
+    note: "Metering when live inference accounting exists",
+  };
+}
+
+/**
+ * In-memory project list. Durable store is host session.agent via harness snapshot
+ * (opaque sandbox has no localStorage — Principle 10: one canonical path).
+ */
+let projectStore = [];
+
+function readProjectStore() {
+  return Array.isArray(projectStore) ? projectStore : [];
+}
+
+function writeProjectStore(projects) {
+  projectStore = Array.isArray(projects) ? projects : [];
+}
+
+export function listProjects() {
+  return readProjectStore().map((p) => ({ ...p }));
+}
+
+export function createProject(title) {
+  const name = String(title || "").trim();
+  if (!name) {
+    return null;
+  }
+  const project = {
+    id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    title: name,
+    rootRef: null,
+    createdAt: Date.now(),
+  };
+  writeProjectStore([project, ...readProjectStore()]);
+  return { ...project };
+}
+
+export function removeProject(projectId) {
+  const id = String(projectId || "");
+  writeProjectStore(readProjectStore().filter((p) => p.id !== id));
+  return true;
+}
+
+/** Replace the in-memory project list (host session restore). */
+export function replaceProjects(projects) {
+  const next = Array.isArray(projects)
+    ? projects
+        .filter((p) => p && typeof p === "object" && typeof p.id === "string" && p.title)
+        .map((p) => ({
+          id: String(p.id).slice(0, 80),
+          title: String(p.title).trim().slice(0, 48),
+          rootRef: p.rootRef && typeof p.rootRef === "object" ? p.rootRef : null,
+          createdAt: Number(p.createdAt) || Date.now(),
+        }))
+        .filter((p) => p.title)
+        .slice(0, 40)
+    : [];
+  writeProjectStore(next);
+  return listProjects();
 }

@@ -1,3 +1,4 @@
+import { TIP as APP_ICON_ASSET_VERSION } from "./agent-tip.js?v=home-20260728ag";
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");
 export let desktopWorkspace = document.querySelector(".desktop-workspace");
@@ -63,11 +64,16 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260724co", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260728ag", import.meta.url).href;
 const HOME_GUI_UI_STYLESHEET_ID = "home-gui-elastos-ui";
-const HOME_GUI_UI_STYLESHEET_URL = new URL("./elastos-ui.css?v=home-20260724co", import.meta.url).href;
+const HOME_GUI_UI_STYLESHEET_URL = new URL("./elastos-ui.css?v=home-20260728ag", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260724co", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260728ag", import.meta.url).href;
+const HOME_GUI_AGENT_STYLESHEET_ID = "home-gui-agent-stylesheet";
+const HOME_GUI_AGENT_STYLESHEET_URL = new URL(
+  "./agent-harness.css?v=home-20260728ag",
+  import.meta.url,
+).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -290,14 +296,20 @@ function ensureHomeGuiStylesheet() {
     uiLink.href = HOME_GUI_UI_STYLESHEET_URL;
     head?.appendChild?.(uiLink);
   }
-  if (document.querySelector(`#${HOME_GUI_STYLESHEET_ID}`)) {
-    return;
+  if (!document.querySelector(`#${HOME_GUI_STYLESHEET_ID}`)) {
+    const link = document.createElement("link");
+    link.id = HOME_GUI_STYLESHEET_ID;
+    link.rel = "stylesheet";
+    link.href = HOME_GUI_STYLESHEET_URL;
+    head?.appendChild?.(link);
   }
-  const link = document.createElement("link");
-  link.id = HOME_GUI_STYLESHEET_ID;
-  link.rel = "stylesheet";
-  link.href = HOME_GUI_STYLESHEET_URL;
-  head?.appendChild?.(link);
+  if (!document.querySelector(`#${HOME_GUI_AGENT_STYLESHEET_ID}`)) {
+    const agentLink = document.createElement("link");
+    agentLink.id = HOME_GUI_AGENT_STYLESHEET_ID;
+    agentLink.rel = "stylesheet";
+    agentLink.href = HOME_GUI_AGENT_STYLESHEET_URL;
+    head?.appendChild?.(agentLink);
+  }
 }
 
 export function beginShellInteraction() {
@@ -1152,7 +1164,6 @@ export function clampDesktopLayoutToViewport() {
 }
 
 /* Tip-busted with home-gui assets so Shelf/Apps pick up new masters. */
-const APP_ICON_ASSET_VERSION = "home-20260724co";
 const APP_ICON_IDS = new Set([
   "browser",
   "library",

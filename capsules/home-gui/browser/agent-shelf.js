@@ -7,13 +7,22 @@
 
    Send opens Agent Harness (Home drops, dock stays) — see agent-harness.js. */
 
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260724co";
-
-const TIP = "home-20260724co";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260728ag";
+import { TIP } from "./agent-tip.js?v=home-20260728ag";
+import {
+  agentHarnessActive,
+  hideAgentHarness,
+  sendToAgentHarness,
+  showAgentHarness,
+  stopAgentHarnessStream,
+} from "./agent-send.js?v=home-20260728ag";
 
 let bound = false;
 let morphGeneration = 0;
 let morphTimer = 0;
+/** @type {{ id: string, name: string, size: number }[]} */
+let composerAttachments = [];
+let attachSeq = 0;
 
 /** Real dock width/height stretch — both directions, even ease-in-out. */
 const MORPH_STRETCH_MS = 950;
@@ -306,10 +315,6 @@ function calmDockIconsForMorph(taskbar) {
   });
 }
 
-async function harnessApi() {
-  return import(`./agent-harness.js?v=${TIP}`);
-}
-
 export async function sendAgentComposerMessage() {
   const input = composerInput();
   const taskbar = taskbarEl();
@@ -318,9 +323,8 @@ export async function sendAgentComposerMessage() {
     return;
   }
 
-  const harness = await harnessApi();
   if (btn?.dataset.mode === "stop") {
-    harness.stopAgentHarnessStream();
+    stopAgentHarnessStream();
     return;
   }
 
@@ -335,6 +339,8 @@ export async function sendAgentComposerMessage() {
 
   input.value = "";
   autosizeComposer(input);
+  /* Attachments are preview chips only — the turn consumed them. */
+  clearComposerAttachments();
 
   const waitReady = () =>
     new Promise((resolve) => {
@@ -360,15 +366,13 @@ export async function sendAgentComposerMessage() {
     });
 
   await waitReady();
-  harness.sendToAgentHarness(prompt);
+  await sendToAgentHarness(prompt);
 }
 
 function openHarnessWithShelf() {
-  void harnessApi().then((harness) => {
-    if (!harness.agentHarnessActive()) {
-      harness.showAgentHarness({ fromShelf: true });
-    }
-  });
+  if (!agentHarnessActive()) {
+    showAgentHarness({ fromShelf: true });
+  }
 }
 
 function prefersReducedMotion() {
@@ -539,18 +543,13 @@ export function hideAgentShelfFace() {
   };
 
   if (!taskbar.classList.contains("is-agent-face")) {
-    void harnessApi().then((harness) => {
-      /* syncStage: leave Agent Space → Desktop so refresh lands on Home. */
-      harness.hideAgentHarness({ restoreShelfApps: false, syncStage: true });
-    });
+    hideAgentHarness({ restoreShelfApps: false, syncStage: true });
     finishClosed();
     return;
   }
 
   if (prefersReducedMotion()) {
-    void harnessApi().then((harness) => {
-      harness.hideAgentHarness({ restoreShelfApps: false, syncStage: true });
-    });
+    hideAgentHarness({ restoreShelfApps: false, syncStage: true });
     snapAppsShelfFace();
     toggle?.focus({ preventScroll: true });
     return;
@@ -561,9 +560,7 @@ export function hideAgentShelfFace() {
   syncFaceAria({ agent: true, launcher: false });
 
   scheduleMorph(generation, MORPH_LEAVE_MS, () => {
-    void harnessApi().then((harness) => {
-      harness.hideAgentHarness({ restoreShelfApps: false, syncStage: true });
-    });
+    hideAgentHarness({ restoreShelfApps: false, syncStage: true });
 
     setMorphPhase(taskbar, "shrink");
     syncFaceAria({ agent: false, launcher: false });
@@ -618,9 +615,7 @@ export function showLauncherShelfFace() {
     setMorphPhase(taskbar, "");
     document.querySelector("#agent-shelf-toggle")?.setAttribute("aria-pressed", "false");
     setAgentComposerProcessing(false);
-    void harnessApi().then((harness) => {
-      harness.hideAgentHarness({ restoreShelfApps: false, syncStage: true });
-    });
+    hideAgentHarness({ restoreShelfApps: false, syncStage: true });
   }
 
   /* Capture idle dock width before any face class — morph grows height only. */
@@ -751,6 +746,85 @@ export function hideLauncherShelfFace({ snap = false } = {}) {
   });
 }
 
+function attachmentsHost() {
+  return document.querySelector("[data-agent-attachments]");
+}
+
+function attachInput() {
+  return document.getElementById("agent-attach-input");
+}
+
+function renderComposerAttachments() {
+  const host = attachmentsHost();
+  if (!host) {
+    return;
+  }
+  host.replaceChildren();
+  if (!composerAttachments.length) {
+    host.hidden = true;
+    const field = composerInput();
+    if (field) {
+      field.placeholder = "Ask on this machine";
+    }
+    return;
+  }
+  host.hidden = false;
+  for (const file of composerAttachments) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "agent-attach-chip";
+    chip.dataset.attachId = file.id;
+    chip.title = "Remove attachment (preview)";
+    chip.innerHTML =
+      `<span class="agent-attach-chip-name"></span>` +
+      `<span class="agent-attach-chip-meta"></span>` +
+      `<span class="agent-attach-chip-x" aria-hidden="true">×</span>`;
+    chip.querySelector(".agent-attach-chip-name").textContent = file.name;
+    const kb = Math.max(1, Math.round(file.size / 1024));
+    chip.querySelector(".agent-attach-chip-meta").textContent = `${kb} KB · preview`;
+    host.append(chip);
+  }
+}
+
+export function clearComposerAttachments() {
+  composerAttachments = [];
+  renderComposerAttachments();
+}
+
+function openAttachPicker() {
+  const input = attachInput();
+  if (!input) {
+    return;
+  }
+  input.value = "";
+  input.click();
+}
+
+function onAttachFilesSelected(event) {
+  const input = event.target;
+  const files = [...(input?.files || [])];
+  if (!files.length) {
+    return;
+  }
+  for (const file of files.slice(0, 8)) {
+    attachSeq += 1;
+    composerAttachments.push({
+      id: `att-${attachSeq}`,
+      name: file.name || "file",
+      size: Number(file.size) || 0,
+    });
+  }
+  if (composerAttachments.length > 8) {
+    composerAttachments = composerAttachments.slice(-8);
+  }
+  renderComposerAttachments();
+  /* Preview only — names in the composer, no Library/Carrier grant. */
+  const field = composerInput();
+  if (field && !field.value.trim() && files[0]?.name) {
+    field.placeholder = `Ask about ${files[0].name}…`;
+  }
+}
+
 export function bindAgentShelf() {
   if (bound) {
     return;
@@ -783,18 +857,29 @@ export function bindAgentShelf() {
       hideAgentShelfFace();
       return;
     }
+    if (event.target.closest?.("#agent-attach-btn")) {
+      event.preventDefault();
+      openAttachPicker();
+      return;
+    }
+    const chip = event.target.closest?.(".agent-attach-chip[data-attach-id]");
+    if (chip?.dataset.attachId) {
+      event.preventDefault();
+      composerAttachments = composerAttachments.filter((f) => f.id !== chip.dataset.attachId);
+      renderComposerAttachments();
+      return;
+    }
     const send = event.target.closest?.("#agent-composer-send");
     if (send) {
       event.preventDefault();
       void sendAgentComposerMessage();
       return;
     }
-    if (event.target.closest?.(".agent-approve-btn")) {
-      event.preventDefault();
-      return;
-    }
-    if (event.target.closest?.("#agent-model-picker")) {
-      event.preventDefault();
+  });
+
+  document.addEventListener("change", (event) => {
+    if (event.target?.id === "agent-attach-input") {
+      onAttachFilesSelected(event);
     }
   });
 

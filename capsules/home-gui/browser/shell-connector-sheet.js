@@ -1,13 +1,13 @@
 import {
   escapeHtml,
   pushUiPreferencesToFrameWindow,
-} from "./shell-core.js?v=home-20260724co";
+} from "./shell-core.js?v=home-20260728ag";
 import {
   iframeAllowForLaunch,
   iframeSandboxForLaunch,
   launchHomeTarget,
-} from "./shell-windows.js?v=home-20260724co";
-import { showWalletRail, walletRailOpen } from "./shell-wallet-rail.js?v=home-20260724co";
+} from "./shell-windows.js?v=home-20260728ag";
+import { showWalletRail, walletRailOpen } from "./shell-wallet-rail.js?v=home-20260728ag";
 
 /* Connector sheet: thin ceremony surface for wallet-metamask / unisat /
    walletconnect. Same launch path as a window, mounted in a rail-aligned

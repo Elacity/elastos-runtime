@@ -5172,16 +5172,38 @@ fn sanitize_home_session_targets(
     known_targets: &BTreeSet<String>,
 ) -> Option<serde_json::Value> {
     let session_object = session.as_object_mut()?;
-    let windows = session_object
+    if let Some(windows) = session_object
         .get_mut("windows")
-        .and_then(|value| value.as_array_mut())?;
-    windows.retain(|window| {
-        window
-            .get("target")
-            .and_then(|target| target.as_str())
-            .is_some_and(|target| known_targets.contains(target))
-    });
-    if windows.is_empty() {
+        .and_then(|value| value.as_array_mut())
+    {
+        windows.retain(|window| {
+            window
+                .get("target")
+                .and_then(|target| target.as_str())
+                .is_some_and(|target| known_targets.contains(target))
+        });
+    }
+    let has_windows = session_object
+        .get("windows")
+        .and_then(|value| value.as_array())
+        .is_some_and(|windows| !windows.is_empty());
+    /* Agent Space has no app windows — still keep active_stage / space_order /
+    agent workspace so refresh returns the user to chat. */
+    let active_stage = session_object
+        .get("active_stage")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let has_agent_stage = active_stage == "agent";
+    let has_space_order = session_object
+        .get("space_order")
+        .and_then(|value| value.as_array())
+        .is_some_and(|order| !order.is_empty());
+    let has_agent_workspace = session_object
+        .get("agent")
+        .and_then(|value| value.as_object())
+        .is_some_and(|agent| !agent.is_empty());
+    if !has_windows && !has_agent_stage && !has_space_order && !has_agent_workspace {
         return None;
     }
     Some(session)

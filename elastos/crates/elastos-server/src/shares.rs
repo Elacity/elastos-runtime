@@ -196,9 +196,7 @@ pub fn build_share_bundle_with_viewer_dir(
             );
         }
     };
-    let viewer_assets = viewer_index
-        .parent()
-        .unwrap_or(viewer_dir);
+    let viewer_assets = viewer_index.parent().unwrap_or(viewer_dir);
     std::fs::copy(&viewer_index, bundle_dir.path().join("index.html"))?;
     for asset in ["elastos-theme.js", "elastos-ui.css"] {
         let src = viewer_assets.join(asset);

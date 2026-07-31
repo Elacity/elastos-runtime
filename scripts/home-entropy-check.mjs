@@ -915,7 +915,8 @@ assertToken(
 
 const shellHostStyle = read("capsules/home/browser/style.css");
 const homeGuiStyle = read("capsules/home-gui/browser/style.css");
-const shellStyle = `${shellHostStyle}\n${homeGuiStyle}`;
+const homeGuiAgentStyle = read("capsules/home-gui/browser/agent-harness.css");
+const shellStyle = `${shellHostStyle}\n${homeGuiStyle}\n${homeGuiAgentStyle}`;
 assert(
   homeGuiStyle.includes("--bar-menu-item-min-h: 1.7rem") &&
     homeGuiStyle.includes("--bar-menu-font: 0.88rem") &&
@@ -1829,7 +1830,7 @@ const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
 const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260723a";
-const homeGuiAssetVersion = "home-20260724ci";
+const homeGuiAssetVersion = "home-20260728ag";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -2123,6 +2124,7 @@ assert(
   !shellIndex.includes(`/apps/home-gui/style.css?v=${homeGuiAssetVersion}`) &&
     homeGuiIndex.includes(`./elastos-ui.css?v=${homeGuiAssetVersion}`) &&
     homeGuiIndex.includes(`./style.css?v=${homeGuiAssetVersion}`) &&
+    homeGuiIndex.includes(`./agent-harness.css?v=${homeGuiAssetVersion}`) &&
     homeGuiIndex.includes(`./home-gui-shell.js?v=${homeGuiAssetVersion}`),
   "Home GUI must own its document, token sheet, stylesheet, and entry module on its isolated capsule origin",
 );
@@ -2298,12 +2300,12 @@ assert(
     homeGuiTemplateHtml.includes("shelf-morph-exit") &&
     homeGuiTemplateHtml.indexOf('id="agent-shelf-toggle"') <
       homeGuiTemplateHtml.indexOf('id="launcher-toggle"') &&
-    homeGuiTemplateHtml.includes('placeholder="Do anything"') &&
-    homeGuiTemplateHtml.includes("Approve for me") &&
+    homeGuiTemplateHtml.includes('placeholder="Ask on this machine"') &&
+    homeGuiTemplateHtml.includes("Ask for approval") &&
     homeGuiTemplateHtml.includes('id="agent-composer-send"') &&
     homeGuiTemplateHtml.includes('data-mode="send"') &&
-    shellStyle.includes('max-height: min(42vh, 320px)') &&
-    shellStyle.includes('scrollbar-color:') &&
+    shellStyle.includes("max-height: min(42vh, 280px)") &&
+    shellStyle.includes("scrollbar-color:") &&
     read("capsules/home-gui/browser/agent-shelf.js").includes("syncAgentSendButton") &&
     read("capsules/home-gui/browser/agent-shelf.js").includes("MORPH_EXIT_MS") &&
     read("capsules/home-gui/browser/agent-shelf.js").includes("MORPH_STRETCH_MS") &&
@@ -2318,9 +2320,7 @@ assert(
     shellStyle.includes(
       "body.agent-harness-active.agent-harness-rising:not(.expose-active) header.toolbar",
     ) &&
-    shellStyle.includes(
-      "transition: transform 720ms cubic-bezier(0.22, 1, 0.36, 1)",
-    ) &&
+    shellStyle.includes("720ms var(--harness-ease)") &&
     read("capsules/home-gui/browser/agent-harness.js").includes(
       "const HOME_RISE_MS = 720",
     ) &&
@@ -2347,13 +2347,27 @@ assert(
     read("capsules/home-gui/browser/agent-harness.js").includes("showAgentHarness") &&
     read("capsules/home-gui/browser/agent-harness.js").includes("hideAgentHarness") &&
     read("capsules/home-gui/browser/agent-harness.js").includes("sendToAgentHarness") &&
-    read("capsules/home-gui/browser/agent-harness.js").includes("What's on your mind") &&
+    read("capsules/home-gui/browser/agent-stream.js").includes("What's on your mind") &&
+    read("capsules/home-gui/browser/agent-stream.js").includes(
+      "Private on this machine · tools start at zero · grants ask once",
+    ) &&
+    read("capsules/home-gui/browser/agent-stream.js").includes(
+      "Preview path · not live inference yet",
+    ) &&
     read("capsules/home-gui/browser/agent-harness.js").includes(
-      "Private on this machine · tools start at zero",
+      "syncAgentInferenceStatus",
+    ) &&
+    homeGuiTemplateHtml.includes("data-agent-inference-status") &&
+    read("capsules/home-gui/browser/agent-configure.js").includes(
+      "Tokens used (preview)",
+    ) &&
+    read("capsules/home-gui/browser/agent-grants.js").includes(
+      "Allow once is one-shot and does not call Capsules yet",
     ) &&
     shellStyle.includes(".agent-harness-empty-greeting") &&
     shellStyle.includes(".agent-harness-empty-sub") &&
-    shellStyle.includes("translateX(calc(var(--harness-sidebar-w) / -2))") &&
+    shellStyle.includes("left: var(--agent-column-left, 0px)") &&
+    shellStyle.includes(".agent-harness-empty") &&
     shellStyle.includes(".agent-harness") &&
     shellStyle.includes("body.agent-harness-active") &&
     !shellStyle.includes(".taskbar.is-agent-face.is-agent-workspace") &&
@@ -2386,9 +2400,12 @@ assert(
   "fx2d: harness tip aligned, Esc via Shelf, motion gen, Agent drop reject",
 );
 assert(
-  read("capsules/home-gui/browser/mock-agent-provider.js").includes(
-    `const TIP = "${homeGuiAssetVersion}"`,
+  read("capsules/home-gui/browser/agent-tip.js").includes(
+    `export const TIP = "${homeGuiAssetVersion}"`,
   ) &&
+    read("capsules/home-gui/browser/mock-agent-provider.js").includes(
+      `from "./agent-tip.js?v=${homeGuiAssetVersion}"`,
+    ) &&
     read("capsules/home-gui/browser/mock-agent-provider.js").includes("listCapabilities") &&
     read("capsules/home-gui/browser/mock-agent-provider.js").includes("requestTool") &&
     read("capsules/home-gui/browser/mock-agent-provider.js").includes("resolveMockApproval") &&
@@ -2397,20 +2414,105 @@ assert(
     ) &&
     read("capsules/home-gui/browser/agent-harness.js").includes("appendGrantCard") &&
     read("capsules/home-gui/browser/agent-harness.js").includes("syncTruthStrip") &&
-    homeGuiTemplateHtml.includes("agent-harness-truth") &&
-    homeGuiTemplateHtml.includes("agent-harness-truth-preview") &&
-    !homeGuiTemplateHtml.includes(
-      'class="agent-harness-truth visually-hidden"',
-    ) &&
-    read("capsules/home-gui/browser/agent-harness.js").includes("preview · mock") &&
+    read("capsules/home-gui/browser/agent-grants.js").includes("export function appendGrantCard") &&
+    read("capsules/home-gui/browser/agent-grants.js").includes("export function syncTruthStrip") &&
+    homeGuiTemplateHtml.includes("data-truth-thinking-toggle") &&
+    read("capsules/home-gui/browser/agent-grants.js").includes("preview · mock") &&
     shellStyle.includes(".agent-grant-card") &&
-    shellStyle.includes(".agent-harness-truth") &&
-    homeGuiTemplateHtml.includes("Not the grant path") &&
+    homeGuiTemplateHtml.includes("UI ≠ authority") &&
     read("capsules/home-gui/browser/mock-agent-provider.js").includes(
       "never mints Carrier/Capsule grants",
     ),
-  "fx4: mock provider seams + visible truth strip + Inbox-style grant cards (UI ≠ authority)",
+  "fx4: mock provider seams + thinking toggle + Inbox-style grant cards (UI ≠ authority)",
 );
+assert(
+  read("capsules/home-gui/browser/mock-agent-provider.js").includes(
+    'if (decision === "allow_once")',
+  ) &&
+    read("capsules/home-gui/browser/mock-agent-provider.js").includes(
+      "One-shot only — do not sticky-grant",
+    ) &&
+    !sourceBlock(
+      read("capsules/home-gui/browser/mock-agent-provider.js"),
+      'if (decision === "allow_once")',
+      "allow_once branch",
+    ).includes('cap.state = "granted"'),
+  "fx4: allow_once is one-shot preview (not sticky session grant)",
+);
+assert(
+  read("capsules/home-gui/browser/agent-live.js").includes(
+    "export async function probeLiveInference",
+  ) &&
+    read("capsules/home-gui/browser/agent-live.js").includes(
+      "export async function requestLiveChatCompletion",
+    ) &&
+    read("capsules/home-gui/browser/agent-live.js").includes('backend: "local"') &&
+    read("capsules/home-gui/browser/agent-live.js").includes(
+      `from "./shell-core.js?v=${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/agent-stream.js").includes(
+      "export function startTurnForPrompt",
+    ) &&
+    read("capsules/home-gui/browser/agent-stream.js").includes(
+      `from "./agent-live.js?v=${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/agent-stream.js").includes("startMockStreamForPrompt(userText)") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("startTurnForPrompt") &&
+    !read("capsules/home-gui/browser/agent-harness.js").includes("const live = false") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("getLiveInferenceState") &&
+    shellStyle.includes('.agent-inference-status[data-state="live"]') &&
+    read(
+      "elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs",
+    ).includes('"chat_completions" | "list_backends" | "ping" => &[HOME_GUI_SHELL_ID]') &&
+    read(
+      "elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs",
+    ).includes('"status" | "health" | "list_models" => &[HOME_GUI_SHELL_ID]') &&
+    read("capsules/home-gui/browser/mock-agent-provider.js").includes(
+      "never calls live ai-provider",
+    ),
+  "w1: live local chat_completions with honest probe + mock fallback (no token-stream claim)",
+);
+assert(
+  read("capsules/home-gui/browser/agent-workspace.js").includes(
+    "export function getAgentWorkspaceSnapshot",
+  ) &&
+    read("capsules/home-gui/browser/agent-workspace.js").includes(
+      "export function applyAgentWorkspaceSnapshot",
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      "bindAgentWorkspaceStore",
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      `from "./agent-workspace.js?v=${homeGuiAssetVersion}"`,
+    ),
+  "fx: agent workspace persist lives in agent-workspace.js with harness store bind",
+);
+assert(
+  read("capsules/home-gui/browser/agent-configure.js").includes("export function bindAgentConfigure") &&
+    read("capsules/home-gui/browser/agent-configure.js").includes("export function openHarnessPage") &&
+    read("capsules/home-gui/browser/agent-configure.js").includes("export function openWorkbench") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      `from "./agent-configure.js?v=${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes("bindAgentConfigure") &&
+    read("capsules/home-gui/browser/agent-grants.js").includes("export function bindAgentGrants") &&
+    read("capsules/home-gui/browser/agent-stream.js").includes("export function bindAgentStream") &&
+    read("capsules/home-gui/browser/agent-stream.js").includes("export function startMockStreamForPrompt") &&
+    read("capsules/home-gui/browser/agent-sessions.js").includes("export function bindAgentSessions") &&
+    read("capsules/home-gui/browser/agent-sessions.js").includes("export function selectSession") &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      `from "./agent-grants.js?v=${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      `from "./agent-stream.js?v=${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      `from "./agent-sessions.js?v=${homeGuiAssetVersion}"`,
+    ),
+  "fx: agent configure/grants/stream/sessions bind-API extracts",
+);
+
+
 assert(
   homeGuiTemplateHtml.includes('data-shelf-face="launcher"') &&
     homeGuiTemplateHtml.includes('id="launcher"') &&
@@ -2429,24 +2531,32 @@ assert(
     read("capsules/home-gui/browser/shell-surface.js").includes("flyLauncherCardToDock") &&
     shellStyle.includes(".shelf-face-launcher.launcher") &&
     shellStyle.includes("is-launcher-closing") &&
-    shellStyle.includes("launcher-dock-breathe-in") &&
+    read("capsules/home-gui/browser/shell-surface.js").includes(
+      "breatheDockWidthWithBinRide",
+    ) &&
     shellStyle.includes(".launcher-fly-icon") &&
     read("capsules/home-gui/browser/shell-surface.js").includes("LAUNCHER_FLY_MS") &&
     !shellStyle.includes(".launcher {\n  position: fixed"),
   "Apps launcher: planted close, breathe icons, fluid fly-to-dock",
 );
 assert(
-  read("capsules/home-gui/browser/agent-harness.js").includes(
-    `const TIP = "${homeGuiAssetVersion}"`,
+  read("capsules/home-gui/browser/agent-tip.js").includes(
+    `export const TIP = "${homeGuiAssetVersion}"`,
   ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      `from "./agent-tip.js?v=${homeGuiAssetVersion}"`,
+    ) &&
     read("capsules/home-gui/browser/agent-shelf.js").includes(
-      `const TIP = "${homeGuiAssetVersion}"`,
+      `from "./agent-tip.js?v=${homeGuiAssetVersion}"`,
     ) &&
     read("capsules/home-gui/browser/shell-stages.js").includes(
-      `const TIP = "${homeGuiAssetVersion}"`,
+      `from "./agent-tip.js?v=${homeGuiAssetVersion}"`,
     ) &&
     read("capsules/home-gui/browser/agent-shelf.js").includes(
-      "import(`./agent-harness.js?v=${TIP}`)",
+      `from "./agent-send.js?v=${homeGuiAssetVersion}"`,
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.js").includes(
+      "registerAgentHarnessApi",
     ) &&
     read("capsules/home-gui/browser/shell-stages.js").includes(
       "import(`./agent-shelf.js?v=${TIP}`)",
@@ -2454,7 +2564,7 @@ assert(
     read("capsules/home-gui/browser/agent-harness.js").includes("scheduleHarnessSettled") &&
     read("capsules/home-gui/browser/agent-harness.js").includes("teardownHarnessDom") &&
     read("capsules/home-gui/browser/agent-harness.js").includes("scheduleHarnessTeardown") &&
-    read("capsules/home-gui/browser/agent-harness.js").includes(
+    read("capsules/home-gui/browser/agent-stream.js").includes(
       "sanitize or use a text-safe",
     ) &&
     read("capsules/home-gui/browser/shell-stages.js").includes(
@@ -2505,8 +2615,8 @@ assert(
       "body.agent-harness-active.agent-harness-drawer-open .agent-harness",
     ) &&
     shellStyle.includes(".taskbar.is-agent-face .agent-model-tier") &&
-    homeGuiTemplateHtml.indexOf('id="agent-model-picker"') <
-      homeGuiTemplateHtml.indexOf('class="agent-composer-tools-right"'),
+    homeGuiTemplateHtml.includes('id="agent-model-picker"') &&
+    homeGuiTemplateHtml.includes('class="agent-composer-tools-right"'),
   "fx2x Part X: narrow pager hide, drawer sessions, minimal composer",
 );
 assert(
@@ -2553,7 +2663,7 @@ assert(
     shellStages.includes("Part XII — mobile plane swipe") &&
     homeGuiJs.includes("bindMobilePlaneSwipe()") &&
     shellStyle.includes("height: auto") &&
-    shellStyle.includes("max-height: calc(100dvh - 100px)") &&
+    shellStyle.includes("max-height: calc(100dvh - 54px)") &&
     shellStyle.includes("repeat(4, minmax(0, 1fr))"),
   "fx2xii Part XII: mobile plane swipe + Apps panel hugs content on phone",
 );
@@ -2567,7 +2677,9 @@ assert(
     read("capsules/home-gui/browser/agent-harness.js").includes("toggleSidebarCollapsed") &&
     shellStyle.includes("agent-harness-sidebar-collapsed") &&
     shellStyle.includes("body.agent-harness-drawer-open .agent-harness.is-visible .agent-harness-main") &&
-    shellStyle.includes("translateX(min(var(--harness-sidebar-w), 86vw))") &&
+    shellStyle.includes(
+      "translateX(calc(min(var(--harness-sidebar-w), 86vw) - 2px))",
+    ) &&
     shellStyle.includes(".agent-session-search-panel"),
   "Agent sidebar: Claude-style panel/search icons, search UI, push drawer on narrow",
 );
@@ -2697,10 +2809,11 @@ const persistSessionBlock = sourceBlock(
   "Home browser session persistence",
 );
 assert(
-  persistSessionBlock.includes("windows: []") &&
+  persistSessionBlock.includes("const windows = persistedBrowserSessionEntries()") &&
     persistSessionBlock.includes("desktops") &&
-    persistSessionBlock.includes("saveShellSessionState({"),
-  "Home must persist an explicit empty session (and Desktop Spaces) after the last window closes",
+    persistSessionBlock.includes("saveShellSessionState(payload)") &&
+    persistSessionBlock.includes("payload.agent"),
+  "Home must persist window session + Desktop Spaces + agent workspace after last window closes",
 );
 assert(
   persistSessionBlock.includes("root_shell: rootShell") &&
@@ -2762,7 +2875,7 @@ assert(
 );
 assert(
   shellSurface.includes('state.source === "launcher"') &&
-    shellSurface.includes("never silent-unpin") &&
+    shellSurface.includes("keepLauncherOpen") &&
     shellSurface.includes("hideLauncher()") &&
     shellSurface.includes('shellState.dragState.source === "launcher"'),
   "Launcher/dock drops onto Desktop must add aliases without unpinning the dock",
@@ -4874,7 +4987,7 @@ assert(
     !marketplaceUi.includes("Install pending") &&
     !marketplaceUi.includes("Install unavailable") &&
     !marketplaceUi.includes("app-price") &&
-    !marketplaceUi.includes("App Store") &&
+    !marketplaceUi.includes('"App Store"') &&
     !marketplaceIndex.includes("install-modal") &&
     !marketplaceIndex.includes('data-tab="discover"'),
   "Apps catalog chrome: sidebar destinations, list rows, Open pills; no Install theater",

@@ -21,7 +21,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260724co";
+} from "./shell-core.js?v=home-20260728ag";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,8 +31,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260724co";
-import { playUiSound } from "./shell-sounds.js?v=home-20260724co";
+} from "./shell-window-geometry.js?v=home-20260728ag";
+import { playUiSound } from "./shell-sounds.js?v=home-20260728ag";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -51,7 +51,8 @@ import {
   exitFullscreenStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260724co";
+} from "./shell-stages.js?v=home-20260728ag";
+import { TIP as SHELL_TIP } from "./agent-tip.js?v=home-20260728ag";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -246,6 +247,35 @@ function stableSpaceKeyForId(spaceId) {
   return `fs:${entry.targetId}:${inst}`;
 }
 
+let agentWorkspaceSnapshotFn = null;
+let agentWorkspacePersistTimer = 0;
+
+/** Agent harness registers a snapshotter so chat/projects ride the host session. */
+export function bindAgentWorkspaceSnapshot(getSnapshot) {
+  agentWorkspaceSnapshotFn = typeof getSnapshot === "function" ? getSnapshot : null;
+}
+
+function agentWorkspaceForPersist() {
+  try {
+    const snap = agentWorkspaceSnapshotFn?.();
+    return snap && typeof snap === "object" ? snap : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Debounced persist after pin / project / chat edits (host session blob). */
+export function scheduleAgentWorkspacePersist() {
+  if (shellState.restoringSession) {
+    return;
+  }
+  window.clearTimeout(agentWorkspacePersistTimer);
+  agentWorkspacePersistTimer = window.setTimeout(() => {
+    agentWorkspacePersistTimer = 0;
+    persistBrowserSession();
+  }, 200);
+}
+
 function persistBrowserSession() {
   if (shellState.restoringSession) {
     return;
@@ -257,23 +287,43 @@ function persistBrowserSession() {
   const spaceOrder = (
     Array.isArray(shellState.spaceOrder) ? shellState.spaceOrder : []
   ).map((id) => stableSpaceKeyForId(id));
-  if (windows.length === 0) {
-    saveShellSessionState({
-      root_shell: rootShell,
-      windows: [],
-      desktops,
-      active_stage: activeStage,
-      space_order: spaceOrder,
-    });
-    return;
-  }
-  saveShellSessionState({
+  const agent = agentWorkspaceForPersist();
+  const payload = {
     root_shell: rootShell,
     windows,
     desktops,
     active_stage: activeStage,
     space_order: spaceOrder,
-  });
+  };
+  if (agent) {
+    payload.agent = agent;
+  } else {
+    /* Keep prior agent workspace if harness isn't bound yet this tick. */
+    const prior = loadShellSessionState()?.agent;
+    if (prior && typeof prior === "object") {
+      payload.agent = prior;
+    }
+  }
+  saveShellSessionState(payload);
+}
+
+
+/** Snap Shelf + harness after refresh when active_stage was Agent. */
+async function restoreAgentSurface(storedSession) {
+  try {
+    const shelf = await import(`./agent-shelf.js?v=${SHELL_TIP}`);
+    shelf.snapAgentShelfFace?.();
+    const harness = await import(`./agent-harness.js?v=${SHELL_TIP}`);
+    harness.bindAgentHarness?.();
+    harness.applyAgentWorkspaceSnapshot?.(storedSession?.agent);
+    harness.showAgentHarness?.({
+      fromShelf: true,
+      syncStage: false,
+      restore: true,
+    });
+  } catch (error) {
+    console.warn("agent surface restore failed", error);
+  }
 }
 
 function resolveStableSpaceKey(savedKey, restoredEntries) {
@@ -1432,12 +1482,16 @@ export async function restoreShellSession() {
         : desktopStageId();
     const savedStage = resolveStableSpaceKey(savedStageKey, []);
     if (savedStage === "agent" || remappedOrder.includes("agent") || remappedOrder.length > 0) {
-      setActiveStage(savedStage === "agent" ? "agent" : desktopStageId(), {
+      const goAgent = savedStage === "agent";
+      setActiveStage(goAgent ? "agent" : desktopStageId(), {
         announce: false,
         animate: false,
         focus: false,
-        syncHarness: savedStage === "agent",
+        syncHarness: false,
       });
+      if (goAgent) {
+        await restoreAgentSurface(storedSession);
+      }
       persistBrowserSession();
       return;
     }
@@ -1487,12 +1541,16 @@ export async function restoreShellSession() {
         : desktopStageId();
     const savedStage = resolveStableSpaceKey(savedStageKey, []);
     if (savedStage === "agent" || remappedOrder.includes("agent")) {
-      setActiveStage(savedStage === "agent" ? "agent" : desktopStageId(), {
+      const goAgent = savedStage === "agent";
+      setActiveStage(goAgent ? "agent" : desktopStageId(), {
         announce: false,
         animate: false,
         focus: false,
-        syncHarness: savedStage === "agent",
+        syncHarness: false,
       });
+      if (goAgent) {
+        await restoreAgentSurface(storedSession);
+      }
       persistBrowserSession();
       return;
     }
@@ -1512,7 +1570,16 @@ export async function restoreShellSession() {
       ? storedSession.active_stage.trim()
       : desktopStageId();
   const savedStage = resolveStableSpaceKey(savedStageKey, restoredEntries);
-  setActiveStage(savedStage, { announce: false, animate: false, focus: false });
+  const goAgent = savedStage === "agent";
+  setActiveStage(savedStage, {
+    announce: false,
+    animate: false,
+    focus: false,
+    syncHarness: !goAgent,
+  });
+  if (goAgent) {
+    await restoreAgentSurface(storedSession);
+  }
 
   const activeEntry = restoredEntries.find(
     ({ restoredWindow }) => restoredWindow.active && !restoredWindow.hidden,

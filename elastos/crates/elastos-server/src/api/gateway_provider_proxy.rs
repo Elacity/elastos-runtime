@@ -1347,6 +1347,29 @@ pub(super) async fn gateway_provider_proxy(
                     .into_response()
             }
         },
+        // w1 Home Agent chat: local inference only. Chat carries no tool or
+        // capsule authority; grants remain fail-closed preview until w3.
+        "ai" => match op.as_str() {
+            "chat_completions" | "list_backends" | "ping" => &[HOME_GUI_SHELL_ID],
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "Gateway provider operation not found",
+                )
+                    .into_response()
+            }
+        },
+        // Read-only llama-server truth for honest live/preview status.
+        "llama" => match op.as_str() {
+            "status" | "health" | "list_models" => &[HOME_GUI_SHELL_ID],
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "Gateway provider operation not found",
+                )
+                    .into_response()
+            }
+        },
         "inspect" => match op.as_str() {
             "capsules" | "capsule" | "self" | "plan" | "request_act" => &[SYSTEM_CAPSULE_ID],
             _ => {

@@ -1470,8 +1470,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Alpha")).unwrap();
         let second = documents_create_local(dir.path(), TEST_PRINCIPAL, Some("Beta")).unwrap();
-        let pinned = documents_set_pin_local(dir.path(), TEST_PRINCIPAL, &second.doc_did, true)
-            .unwrap();
+        let pinned =
+            documents_set_pin_local(dir.path(), TEST_PRINCIPAL, &second.doc_did, true).unwrap();
         assert!(pinned.pinned);
         let summary = documents_load_summary(dir.path(), TEST_PRINCIPAL).unwrap();
         assert_eq!(summary[0].doc_did, second.doc_did);
