@@ -55,6 +55,7 @@ verify:
     node scripts/home-entropy-check.mjs
     node scripts/home-clipboard-source-gate.mjs
     node scripts/browser-entropy-check.mjs
+    node --test scripts/browser-window-close-handshake.test.mjs
     python3 scripts/source-home-capsule-inventory-smoke.py
     ./scripts/command-smoke.sh
     just candidate-command-audit
