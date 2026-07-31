@@ -6,6 +6,49 @@ use super::typed_data::validate_eip712_typed_data_shape;
 use elastos_auth::{normalize_evm_address, validate_evm_address};
 use serde_json::Value;
 
+fn parse_eip712_domain_chain_id(value: &Value) -> Result<u64, String> {
+    if let Some(chain_id) = value.as_u64() {
+        return Ok(chain_id);
+    }
+    let invalid = || {
+        "EIP-712 domain.chainId must be an unsigned u64 integer or an exact decimal/0x-prefixed string"
+            .to_string()
+    };
+    let raw = value.as_str().ok_or_else(invalid)?;
+    if let Some(hex) = raw.strip_prefix("0x") {
+        if hex.is_empty()
+            || !hex
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+        {
+            return Err(invalid());
+        }
+        return u64::from_str_radix(hex, 16).map_err(|_| invalid());
+    }
+    if raw.is_empty() || !raw.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    raw.parse::<u64>().map_err(|_| invalid())
+}
+
+pub(crate) fn validate_eip712_domain_chain_id(
+    typed_data: &Value,
+    requested_chain_namespace: &str,
+) -> Result<(), String> {
+    let requested_chain_id = eip155_chain_id(requested_chain_namespace)?;
+    let Some(domain_chain_id) = typed_data
+        .get("domain")
+        .and_then(Value::as_object)
+        .and_then(|domain| domain.get("chainId"))
+    else {
+        return Ok(());
+    };
+    if parse_eip712_domain_chain_id(domain_chain_id)? != requested_chain_id {
+        return Err("EIP-712 domain.chainId does not match requested chain namespace".to_string());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_browser_personal_sign_payload(
     payload: &Value,
     account: &LinkedAccount,
@@ -124,6 +167,7 @@ pub(crate) fn validate_browser_typed_data_sign_payload(
     let typed_data: Value =
         serde_json::from_str(canonical).map_err(|err| format!("invalid typed data: {err}"))?;
     validate_eip712_typed_data_shape(&typed_data)?;
+    validate_eip712_domain_chain_id(&typed_data, chain_namespace)?;
     let page_url = payload
         .get("page_url")
         .and_then(Value::as_str)

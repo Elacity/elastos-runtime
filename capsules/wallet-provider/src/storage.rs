@@ -208,20 +208,40 @@ pub(super) fn prune_store(mut store: WalletStore, now: u64) -> WalletStore {
     for request in &mut store.approval_requests {
         expire_approval_if_elapsed(request, now);
     }
-    if store.approval_requests.len() > MAX_APPROVAL_HISTORY {
-        store.approval_requests.sort_by_key(|request| {
-            (
-                request.status == ApprovalStatus::Pending,
-                request.created_at,
-            )
-        });
-        let excess = store.approval_requests.len() - MAX_APPROVAL_HISTORY;
-        store.approval_requests.drain(0..excess);
-        store
-            .approval_requests
-            .sort_by_key(|request| request.created_at);
-    }
     store
+        .approval_requests
+        .sort_by_key(|request| request.created_at);
+    store.approval_requests.reverse();
+    let mut retained_resolved_by_principal = std::collections::HashMap::new();
+    store.approval_requests.retain(|request| {
+        if approval_authority_is_active(request, now) {
+            return true;
+        }
+        let retained = retained_resolved_by_principal
+            .entry(request.principal_id.clone())
+            .or_insert(0usize);
+        if *retained >= MAX_RESOLVED_APPROVAL_HISTORY_PER_PRINCIPAL {
+            return false;
+        }
+        *retained += 1;
+        true
+    });
+    store.approval_requests.reverse();
+    store
+}
+
+pub(super) fn approval_authority_is_active(request: &WalletApprovalRequest, now: u64) -> bool {
+    if matches!(
+        request.status,
+        ApprovalStatus::Pending | ApprovalStatus::Approved
+    ) && request.expires_at > now
+    {
+        return true;
+    }
+    request.status == ApprovalStatus::Completed
+        && request.intent == "transaction_intent"
+        && request.signed_result.is_some()
+        && request.validated_chain_outcome.is_none()
 }
 
 pub(super) fn prune_expired_lifecycles(store: &mut WalletStore, now: u64) {

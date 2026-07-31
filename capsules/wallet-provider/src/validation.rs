@@ -206,7 +206,7 @@ pub(super) fn validate_opaque_id(value: &str, label: &str) -> Result<(), String>
     Ok(())
 }
 
-pub(super) fn validate_evm_chain_namespace(value: &str) -> Result<(), String> {
+pub(super) fn eip155_chain_id(value: &str) -> Result<u64, String> {
     validate_opaque_id(value, "chain_namespace")?;
     let chain_id = value
         .strip_prefix("eip155:")
@@ -217,7 +217,11 @@ pub(super) fn validate_evm_chain_namespace(value: &str) -> Result<(), String> {
     if chain_id == 0 {
         return Err("managed wallet chain ID must be non-zero".to_string());
     }
-    Ok(())
+    Ok(chain_id)
+}
+
+pub(super) fn validate_evm_chain_namespace(value: &str) -> Result<(), String> {
+    eip155_chain_id(value).map(|_| ())
 }
 
 pub(super) fn validate_managed_chain_namespace(value: &str) -> Result<(), String> {
@@ -291,6 +295,16 @@ pub(super) fn validate_signing_intent(value: &str) -> Result<(), String> {
         | "revocation" => Ok(()),
         _ => Err("unsupported signing intent".to_string()),
     }
+}
+
+pub(super) fn managed_signing_intent_is_supported(value: &str) -> bool {
+    matches!(
+        value,
+        "transaction_intent"
+            | "browser_personal_sign"
+            | "browser_typed_data_sign"
+            | "bitcoin_bip322_proof"
+    )
 }
 
 pub(super) fn validate_domain(value: &str) -> Result<(), String> {

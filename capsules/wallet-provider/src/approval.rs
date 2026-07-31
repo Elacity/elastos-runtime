@@ -84,6 +84,14 @@ impl WalletProvider {
         if let Err(response) = self.ensure_managed_account_can_sign(&account) {
             return response;
         }
+        if is_managed_proof_type(&account.proof_type)
+            && !managed_signing_intent_is_supported(&input.intent)
+        {
+            return Response::error(
+                "unsupported_managed_signing_intent",
+                "managed signing is implemented only for Browser personal_sign, typed data, transaction, and Bitcoin BIP-322 intents",
+            );
+        }
         if account.chain_namespace == BITCOIN_MAINNET_CHAIN_NAMESPACE
             && input.intent != "bitcoin_bip322_proof"
         {
@@ -124,6 +132,20 @@ impl WalletProvider {
             {
                 return Response::error("invalid_bitcoin_bip322_proof", err);
             }
+        }
+
+        let active_request_count = self
+            .store
+            .approval_requests
+            .iter()
+            .filter(|request| request.principal_id == input.principal_id)
+            .filter(|request| approval_authority_is_active(request, now))
+            .count();
+        if active_request_count >= MAX_ACTIVE_APPROVAL_REQUESTS_PER_PRINCIPAL {
+            return Response::error(
+                "approval_limit_reached",
+                "too many active wallet approval requests for this principal",
+            );
         }
 
         let request = WalletApprovalRequest {
@@ -656,6 +678,18 @@ impl WalletProvider {
                 "wallet approval request must be approved before managed signing",
             );
         }
+        if value_hash(&request.payload) != request.payload_hash {
+            return Response::error(
+                "signing_error",
+                "wallet approval payload no longer matches the reviewed payload hash",
+            );
+        }
+        if !managed_signing_intent_is_supported(&request.intent) {
+            return Response::error(
+                "unsupported_managed_signing_intent",
+                "managed signing is implemented only for Browser personal_sign, typed data, transaction, and Bitcoin BIP-322 intents",
+            );
+        }
         let Some(account) = self.store.accounts.iter().find(|account| {
             account.principal_id == principal_id
                 && account.account_id == request.account_id
@@ -668,6 +702,33 @@ impl WalletProvider {
                 "external_wallet_required",
                 "approved request requires an external wallet signature handoff",
             );
+        }
+        if request.proof_binding_id != account.proof_binding_id
+            || request.chain_namespace != account.chain_namespace
+            || request.address != account.address
+            || request.proof_type != account.proof_type
+            || request.connector_id != account.connector_id
+        {
+            return Response::error(
+                "signing_error",
+                "wallet approval authority no longer matches its managed account",
+            );
+        }
+        if request.intent == "browser_personal_sign" {
+            if let Err(err) = validate_browser_personal_sign_payload(&request.payload, account) {
+                return Response::error("invalid_browser_personal_sign", err);
+            }
+        }
+        if request.intent == "browser_typed_data_sign" {
+            if let Err(err) = validate_browser_typed_data_sign_payload(&request.payload, account) {
+                return Response::error("invalid_browser_typed_data_sign", err);
+            }
+        }
+        if request.intent == "transaction_intent" {
+            if let Err(err) = validate_eip155_transaction_intent_payload(&request.payload, account)
+            {
+                return Response::error("invalid_transaction_intent", err);
+            }
         }
         if request.intent == "bitcoin_bip322_proof" {
             if let Err(err) =

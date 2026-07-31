@@ -136,7 +136,7 @@ fn approval_request_preserves_valid_expiry_and_rejects_invalid_lifetimes() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
-    let account_id = match invoke_wallet(
+    let (account_id, address) = match invoke_wallet(
         &mut provider,
         principal_id,
         "wallet",
@@ -146,9 +146,10 @@ fn approval_request_preserves_valid_expiry_and_rejects_invalid_lifetimes() {
             create_new: false,
         },
     ) {
-        Response::Ok { data: Some(data) } => {
-            data["account"]["account_id"].as_str().unwrap().to_string()
-        }
+        Response::Ok { data: Some(data) } => (
+            data["account"]["account_id"].as_str().unwrap().to_string(),
+            data["account"]["address"].as_str().unwrap().to_string(),
+        ),
         other => panic!("expected managed account, got {other:?}"),
     };
     let valid_expires_at = now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS);
@@ -159,10 +160,10 @@ fn approval_request_preserves_valid_expiry_and_rejects_invalid_lifetimes() {
         WalletProviderOperationV2::RequestApproval {
             account_id: account_id.clone(),
             chain_namespace: "eip155:20".into(),
-            intent: "publish_envelope".into(),
-            resource: "elastos://content/publish".into(),
-            reason: "Publish document revision".into(),
-            payload: json!({ "cid": "bafy-valid-expiry" }),
+            intent: "browser_personal_sign".into(),
+            resource: "elastos://wallet/eip155:20/sign/browser_personal_sign".into(),
+            reason: "Browser page requests personal_sign".into(),
+            payload: browser_personal_sign_payload(&account_id, &address, "Valid expiry"),
             expires_at: valid_expires_at,
         },
     ) {
@@ -185,10 +186,10 @@ fn approval_request_preserves_valid_expiry_and_rejects_invalid_lifetimes() {
             WalletProviderOperationV2::RequestApproval {
                 account_id: account_id.clone(),
                 chain_namespace: "eip155:20".into(),
-                intent: "publish_envelope".into(),
-                resource: "elastos://content/publish".into(),
+                intent: "browser_personal_sign".into(),
+                resource: "elastos://wallet/eip155:20/sign/browser_personal_sign".into(),
                 reason: "Invalid approval lifetime".into(),
-                payload: json!({ "cid": "bafy-invalid-expiry" }),
+                payload: browser_personal_sign_payload(&account_id, &address, "Invalid expiry"),
                 expires_at,
             },
         ) {

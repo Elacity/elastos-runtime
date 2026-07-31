@@ -13,7 +13,7 @@ fn wallet_outer(request: &WalletProviderRequestV2, envelope: Value) -> Value {
 fn write_pre_v2_pending_approval_store(dir: &Path) -> PathBuf {
     let mut provider = init_provider(dir);
     let principal_id = "person:local:alice";
-    let account_id = match invoke_wallet(
+    let (account_id, address) = match invoke_wallet(
         &mut provider,
         principal_id,
         "wallet",
@@ -23,9 +23,10 @@ fn write_pre_v2_pending_approval_store(dir: &Path) -> PathBuf {
             create_new: false,
         },
     ) {
-        Response::Ok { data: Some(data) } => {
-            data["account"]["account_id"].as_str().unwrap().to_string()
-        }
+        Response::Ok { data: Some(data) } => (
+            data["account"]["account_id"].as_str().unwrap().to_string(),
+            data["account"]["address"].as_str().unwrap().to_string(),
+        ),
         other => panic!("expected managed account, got {other:?}"),
     };
     assert!(matches!(
@@ -34,12 +35,16 @@ fn write_pre_v2_pending_approval_store(dir: &Path) -> PathBuf {
             principal_id,
             "documents",
             WalletProviderOperationV2::RequestApproval {
-                account_id,
+                account_id: account_id.clone(),
                 chain_namespace: "eip155:20".into(),
-                intent: "publish_envelope".into(),
-                resource: "elastos://content/publish".into(),
+                intent: "browser_personal_sign".into(),
+                resource: "elastos://wallet/eip155:20/sign/browser_personal_sign".into(),
                 reason: "Legacy pending request".into(),
-                payload: json!({ "cid": "bafy-legacy" }),
+                payload: browser_personal_sign_payload(
+                    &account_id,
+                    &address,
+                    "Legacy pending request",
+                ),
                 expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
             },
         ),
@@ -434,7 +439,7 @@ fn managed_atomic_signing_rolls_back_and_allows_safe_retry() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
-    let account_id = match invoke_wallet(
+    let (account_id, address) = match invoke_wallet(
         &mut provider,
         principal_id,
         "wallet",
@@ -444,9 +449,10 @@ fn managed_atomic_signing_rolls_back_and_allows_safe_retry() {
             create_new: false,
         },
     ) {
-        Response::Ok { data: Some(data) } => {
-            data["account"]["account_id"].as_str().unwrap().to_string()
-        }
+        Response::Ok { data: Some(data) } => (
+            data["account"]["account_id"].as_str().unwrap().to_string(),
+            data["account"]["address"].as_str().unwrap().to_string(),
+        ),
         other => panic!("expected managed account, got {other:?}"),
     };
     let request_id = match invoke_wallet(
@@ -454,12 +460,12 @@ fn managed_atomic_signing_rolls_back_and_allows_safe_retry() {
         principal_id,
         "documents",
         WalletProviderOperationV2::RequestApproval {
-            account_id,
+            account_id: account_id.clone(),
             chain_namespace: "eip155:20".into(),
-            intent: "publish_envelope".into(),
-            resource: "elastos://content/publish".into(),
-            reason: "Publish document revision".into(),
-            payload: json!({ "cid": "bafy-atomic" }),
+            intent: "browser_personal_sign".into(),
+            resource: "elastos://wallet/eip155:20/sign/browser_personal_sign".into(),
+            reason: "Browser page requests personal_sign".into(),
+            payload: browser_personal_sign_payload(&account_id, &address, "Atomic signing"),
             expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
         },
     ) {
