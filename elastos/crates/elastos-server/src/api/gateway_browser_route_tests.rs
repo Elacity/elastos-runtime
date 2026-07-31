@@ -4896,6 +4896,7 @@ async fn test_browser_close_provider_unavailable_keeps_bounded_engine_cleanup_ob
             url: "https://provider-unavailable.invalid/".to_string(),
             exit_id: "local-runtime".to_string(),
             engine_route_provider: "mock-browser-engine".to_string(),
+            selected_engine_adapter: Some("mock-adapter".to_string()),
             profile_key_hash: browser_lifecycle_hash("provider-unavailable-profile"),
             vm_key_hash: browser_lifecycle_hash("provider-unavailable-vm"),
         },

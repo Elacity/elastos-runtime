@@ -30,6 +30,12 @@ control_socket="$tmp_dir/browser-vm-control.sock"
 const fs = require("node:fs");
 const http = require("node:http");
 const socketPath = process.argv[2];
+const controlService = {
+  schema: "elastos.browser.vm-control-service.identity/v1",
+  service_id: `service:${"c".repeat(64)}`,
+  control_socket_path: socketPath,
+  config_fingerprint: null,
+};
 try { fs.unlinkSync(socketPath); } catch {}
 
 function json(res, status, body) {
@@ -43,6 +49,7 @@ const server = http.createServer((req, res) => {
     json(res, 200, {
       schema: "elastos.browser.vm-control-service.status/v1",
       ok: true,
+      control_service: controlService,
       active_pages: 0,
     });
     return;
@@ -105,7 +112,10 @@ const server = http.createServer((req, res) => {
         kind: "per_launch_vm_target",
         session_dir: "/tmp/elastos-browser-vm-sessions/vm-contract-smoke",
       },
+      control_service: controlService,
       process: {
+        schema: "elastos.browser.host-process-binding/v1",
+        ownership_id: `process:${"d".repeat(64)}`,
         pid: process.pid,
         stream_bridge_pid: null,
       },
@@ -219,7 +229,15 @@ console.log(JSON.stringify({
       kind: "per_launch_vm_target",
       session_dir: "/tmp/elastos-browser-vm-sessions/vm-contract-smoke",
     },
+    control_service: {
+      schema: "elastos.browser.vm-control-service.identity/v1",
+      service_id: `service:${"c".repeat(64)}`,
+      control_socket_path: process.env.CONTROL_SOCKET,
+      config_fingerprint: null,
+    },
     process: {
+      schema: "elastos.browser.host-process-binding/v1",
+      ownership_id: `process:${"d".repeat(64)}`,
       pid: Number(process.env.CONTROL_PROCESS_PID),
       stream_bridge_pid: null,
     },

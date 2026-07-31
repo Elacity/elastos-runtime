@@ -2317,6 +2317,13 @@ enum MockDispatchedBrowserLaunchFailure {
     ResponseLoss,
     MalformedSuccess,
     PendingThenTerminal,
+    PendingThenLateSuccess,
+    TransientThenLateSuccess,
+    TimeoutThenLateSuccess,
+    ImmediateLateSuccess,
+    LateSuccessCleanupRetry,
+    AlwaysUnavailable,
+    HangingReconciliation,
     DidNotActResourcesInUse,
 }
 
@@ -2424,6 +2431,32 @@ fn mock_browser_terminal_cleanup_response(request: &serde_json::Value) -> serde_
             }
         }
     })
+}
+
+fn assert_browser_close_request_contract(request: &serde_json::Value) {
+    let request = request
+        .as_object()
+        .expect("Browser close request must be an object");
+    assert_eq!(
+        request.len(),
+        4,
+        "Browser close request must match the adapter's strict shape"
+    );
+    assert_eq!(
+        request.get("op").and_then(serde_json::Value::as_str),
+        Some("close_page")
+    );
+    assert!(request
+        .get("page_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
+    assert!(request
+        .get("principal_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
+    assert!(request
+        .get("runtime_cleanup")
+        .is_some_and(serde_json::Value::is_object));
 }
 
 #[async_trait::async_trait]
@@ -2777,6 +2810,7 @@ impl Provider for MockBrowserEngineProvider {
             }));
         }
         if request.get("op").and_then(|value| value.as_str()) == Some("close_page") {
+            assert_browser_close_request_contract(request);
             let page_id = mock_browser_requested_page_id(request);
             if page_id == "page:mock-browser-close-fails" {
                 return Ok(json!({
@@ -2912,6 +2946,9 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                 if (matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::PendingThenTerminal
+                        | MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
                 ) && launch_call == 0)
                 {
                     return Err(ProviderError::Provider(
@@ -2943,7 +2980,14 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                             "page_id": "unsafe page id",
                         }
                     })),
-                    MockDispatchedBrowserLaunchFailure::PendingThenTerminal => Ok(response),
+                    MockDispatchedBrowserLaunchFailure::PendingThenTerminal
+                    | MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
+                    | MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
+                    | MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
+                    | MockDispatchedBrowserLaunchFailure::ImmediateLateSuccess
+                    | MockDispatchedBrowserLaunchFailure::LateSuccessCleanupRetry
+                    | MockDispatchedBrowserLaunchFailure::AlwaysUnavailable
+                    | MockDispatchedBrowserLaunchFailure::HangingReconciliation => Ok(response),
                     MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse => unreachable!(),
                 }
             }
@@ -2998,6 +3042,100 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                         }
                     }));
                 }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::AlwaysUnavailable
+                ) {
+                    return Err(ProviderError::Provider(
+                        "simulated unavailable Browser reconciliation authority".to_string(),
+                    ));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::HangingReconciliation
+                ) {
+                    return std::future::pending::<
+                        Result<serde_json::Value, ProviderError>,
+                    >()
+                    .await;
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
+                ) && reconciliation_call == 0
+                {
+                    return std::future::pending::<
+                        Result<serde_json::Value, ProviderError>,
+                    >()
+                    .await;
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
+                ) && reconciliation_call == 0
+                {
+                    return Err(ProviderError::Provider(
+                        "simulated transient Browser reconciliation failure".to_string(),
+                    ));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
+                ) && reconciliation_call == 0
+                {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "cleanup_pending",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::ImmediateLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::LateSuccessCleanupRetry
+                ) {
+                    let generation = request["lifecycle_generation"]
+                        .as_str()
+                        .expect("mock lifecycle generation");
+                    let stream_id = request["stream_id"].as_str().expect("mock stream id");
+                    let page_id = format!(
+                        "page:late-effect:{}",
+                        generation.trim_start_matches("sha256:")
+                    );
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "effect_acquired",
+                            "lifecycle_generation": generation,
+                            "stream_id": stream_id,
+                            "effect": {
+                                "provider": "browser-engine-adapter",
+                                "protocol_version": "2.0",
+                                "page_id": page_id,
+                                "adapter": "mock-browser-engine",
+                                "engine": "selkies_gstreamer",
+                                "stream_id": stream_id,
+                                "runtime_cleanup": {
+                                    "schema": "elastos.browser.engine-cleanup-binding/v2",
+                                    "page_id": page_id,
+                                    "generation": generation,
+                                    "stream_id": stream_id,
+                                    "adapter": "mock-browser-engine",
+                                    "engine": "selkies_gstreamer",
+                                    "control_socket_path": "/tmp/mock-browser-late-effect.sock"
+                                }
+                            }
+                        }
+                    }));
+                }
                 if let Some(effect) = self.effect.lock().await.clone() {
                     return Ok(json!({
                         "status": "ok",
@@ -3021,7 +3159,23 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                 }))
             }
             Some("close_page") => {
-                self.close_calls.lock().await.push(request.clone());
+                assert_browser_close_request_contract(request);
+                let close_call = {
+                    let mut close_calls = self.close_calls.lock().await;
+                    close_calls.push(request.clone());
+                    close_calls.len()
+                };
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::LateSuccessCleanupRetry
+                ) && close_call <= 2
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "engine_cleanup_indeterminate",
+                        "message": "simulated nonterminal Browser cleanup"
+                    }));
+                }
                 *self.effect.lock().await = None;
                 Ok(mock_browser_terminal_cleanup_response(request))
             }
@@ -3068,6 +3222,7 @@ impl Provider for MockRetryingBrowserEngineProvider {
             return Ok(response);
         }
         if request.get("op").and_then(|value| value.as_str()) == Some("close_page") {
+            assert_browser_close_request_contract(request);
             self.close_calls.lock().await.push(request.clone());
             let should_fail = self
                 .close_failures_remaining

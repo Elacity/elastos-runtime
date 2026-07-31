@@ -92,6 +92,11 @@ the public repository.
 ## Browser Truth
 
 - Browser architecture is coherent enough to preserve.
+- Runtime now owns autonomous Browser launch settlement: startup scans and
+  commit notifications drive bounded, single-lane reconciliation until exact
+  terminal cleanup, and the Adapter can reconstruct canonical close ownership
+  from the control journal's validated durable cleanup binding without a
+  persisted supervisor result.
 - The Browser objective still fails product audio proof and hash-bound manual UX evidence.
 - Docker/Selkies is only `managed_baseline_not_final_product`.
 - The hosted Selkies/GStreamer service is a managed baseline, not accepted as the final Browser.

@@ -32,8 +32,6 @@ const BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA: &str =
     "elastos.browser.engine.launch-reconciliation/v1";
 const BROWSER_ENGINE_RECONCILIATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
-const BROWSER_ENGINE_RECONCILIATION_TOTAL_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2);
 const MAX_BROWSER_ENGINE_RECONCILIATION_RESPONSE_BYTES: usize = 64 * 1024;
 const BROWSER_SUPERVISOR_CLEANUP_RESULT_SCHEMA: &str =
     "elastos.browser.supervisor-cleanup-result/v2";
@@ -53,6 +51,8 @@ enum Request {
         lifecycle_generation: Option<String>,
         #[serde(default)]
         stream_id: Option<String>,
+        #[serde(default)]
+        adapter_id: Option<String>,
     },
     Launch {
         url: String,
@@ -166,8 +166,32 @@ struct EngineCleanupBinding {
     isolated_session: bool,
     #[serde(default)]
     isolation: Option<SupervisorIsolation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_service: Option<ControlServiceIdentity>,
     #[serde(default)]
     process: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ControlServiceIdentity {
+    schema: String,
+    service_id: String,
+    control_socket_path: String,
+    #[serde(default)]
+    config_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableControlLaunchIdentity {
+    adapter: String,
+    engine: AdapterKind,
+    lifecycle_generation: String,
+    stream_id: String,
+    principal_id: Option<String>,
+    display_mode: BrowserDisplayMode,
+    guarantee_level: BrowserGuaranteeLevel,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +208,7 @@ struct PageControlSession {
     isolated_session: bool,
     isolation_session_dir: Option<String>,
     isolation_kind: Option<String>,
+    control_service: Option<ControlServiceIdentity>,
     process: Option<Value>,
 }
 
@@ -210,6 +235,7 @@ fn engine_cleanup_binding(page_id: &str, session: &PageControlSession) -> Engine
                 kind: kind.clone(),
                 session_dir: session_dir.clone(),
             }),
+        control_service: session.control_service.clone(),
         process: session.process.clone(),
     }
 }
@@ -237,6 +263,7 @@ fn page_control_session_from_cleanup(
             .isolation
             .as_ref()
             .map(|isolation| isolation.kind.clone()),
+        control_service: binding.control_service.clone(),
         process: binding.process.clone(),
     })
 }
@@ -272,11 +299,215 @@ fn validate_engine_cleanup_binding(binding: &EngineCleanupBinding) -> Result<(),
         {
             return Err("invalid Runtime Browser cleanup isolation binding".to_string());
         }
+        if isolation.kind == "per_launch_vm_target" {
+            let identity = binding.control_service.as_ref().ok_or_else(|| {
+                "Browser VM cleanup control-service identity is unavailable".to_string()
+            })?;
+            validate_control_service_identity(identity, binding.shutdown_socket_path.as_deref())?;
+            if !host_process_binding_is_safe(binding.process.as_ref()) {
+                return Err("Browser VM cleanup host-process binding is invalid".to_string());
+            }
+        }
+    }
+    if binding
+        .isolation
+        .as_ref()
+        .map(|isolation| isolation.kind.as_str())
+        != Some("per_launch_vm_target")
+    {
+        if let Some(process) = &binding.process {
+            let Value::Object(process) = process else {
+                return Err("Browser cleanup process binding is invalid".to_string());
+            };
+            if !(2..=3).contains(&process.len())
+                || !process.contains_key("pid")
+                || !process.contains_key("stream_bridge_pid")
+                || process.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "pid" | "stream_bridge_pid" | "network_sandbox"
+                    )
+                })
+                || !process_id_is_safe(process.get("pid"))
+                || !optional_process_id_is_safe(process.get("stream_bridge_pid"))
+                || process
+                    .get("network_sandbox")
+                    .is_some_and(|value| value.as_str() != Some("linux_new_netns"))
+            {
+                return Err("Browser cleanup process binding is invalid".to_string());
+            }
+        }
     }
     if serde_json::to_vec(binding).map_or(true, |bytes| bytes.len() > 16 * 1024) {
         return Err("Runtime Browser cleanup binding is too large".to_string());
     }
     Ok(())
+}
+
+fn validate_control_service_identity(
+    identity: &ControlServiceIdentity,
+    expected_socket_path: Option<&str>,
+) -> Result<(), String> {
+    if identity.schema != "elastos.browser.vm-control-service.identity/v1"
+        || !identity
+            .service_id
+            .strip_prefix("service:")
+            .is_some_and(is_lower_hex_64)
+        || expected_socket_path != Some(identity.control_socket_path.as_str())
+        || validate_control_socket_path(&identity.control_socket_path).is_err()
+        || identity
+            .config_fingerprint
+            .as_deref()
+            .is_some_and(|value| !is_lower_hex_64(value))
+    {
+        return Err("Browser control-service identity is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn host_process_binding_is_safe(process: Option<&Value>) -> bool {
+    let Some(Value::Object(process)) = process else {
+        return false;
+    };
+    process.len() == 4
+        && process.get("schema").and_then(Value::as_str)
+            == Some("elastos.browser.host-process-binding/v1")
+        && process
+            .get("ownership_id")
+            .and_then(Value::as_str)
+            .and_then(|value| value.strip_prefix("process:"))
+            .is_some_and(is_lower_hex_64)
+        && process_id_is_safe(process.get("pid"))
+        && process.get("stream_bridge_pid").is_some_and(Value::is_null)
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn live_vm_control_service_identity(
+    adapter: &AdapterConfig,
+) -> Result<(String, ControlServiceIdentity), String> {
+    let control_socket_path = adapter
+        .supervisor
+        .as_ref()
+        .and_then(|supervisor| supervisor.control_socket_path.as_deref())
+        .ok_or_else(|| "selected Browser control service is unavailable".to_string())?;
+    let status = supervisor_control_json_bounded(
+        control_socket_path,
+        "GET",
+        "/status",
+        None,
+        BROWSER_ENGINE_RECONCILIATION_TIMEOUT,
+        MAX_BROWSER_ENGINE_RECONCILIATION_RESPONSE_BYTES,
+    )?;
+    if status.get("schema").and_then(Value::as_str)
+        != Some("elastos.browser.vm-control-service.status/v1")
+    {
+        return Err("Browser control-service status schema is invalid".to_string());
+    }
+    let identity = serde_json::from_value::<ControlServiceIdentity>(
+        status
+            .get("control_service")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|_| "Browser live control-service identity is unavailable".to_string())?;
+    validate_control_service_identity(&identity, Some(control_socket_path))?;
+    Ok((control_socket_path.to_string(), identity))
+}
+
+fn process_id_is_safe(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_u64)
+        .is_some_and(|pid| pid > 0 && pid <= i32::MAX as u64)
+}
+
+fn optional_process_id_is_safe(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| value.is_null() || process_id_is_safe(Some(value)))
+}
+
+fn page_control_session_from_durable_reconciliation(
+    reconciliation: &Value,
+    adapter: &AdapterConfig,
+    control_socket_path: &str,
+    live_control_service: &ControlServiceIdentity,
+    principal_id: Option<&str>,
+    lifecycle_generation: &str,
+    stream_id: &str,
+) -> Result<(String, PageControlSession), String> {
+    let launch = serde_json::from_value::<DurableControlLaunchIdentity>(
+        reconciliation.get("launch").cloned().unwrap_or(Value::Null),
+    )
+    .map_err(|_| "Browser control-service launch binding is invalid".to_string())?;
+    let binding = serde_json::from_value::<EngineCleanupBinding>(
+        reconciliation
+            .get("cleanup_binding")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|_| "Browser control-service cleanup binding is unavailable".to_string())?;
+    validate_engine_cleanup_binding(&binding)?;
+    let recorded_control_service = serde_json::from_value::<ControlServiceIdentity>(
+        reconciliation
+            .get("control_service")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|_| "Browser durable control-service identity is unavailable".to_string())?;
+    let responder_control_service = serde_json::from_value::<ControlServiceIdentity>(
+        reconciliation
+            .get("responder_control_service")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|_| "Browser responding control-service identity is unavailable".to_string())?;
+    if launch.lifecycle_generation != lifecycle_generation
+        || launch.stream_id != stream_id
+        || launch.principal_id.as_deref() != principal_id
+        || launch.adapter != adapter.id
+        || binding.generation != lifecycle_generation
+        || binding.stream_id != stream_id
+        || binding.principal_id.as_deref() != principal_id
+        || binding.adapter != launch.adapter
+        || binding.engine != launch.engine
+        || binding.display_mode != launch.display_mode
+        || binding.guarantee_level != launch.guarantee_level
+        || binding.control_service.as_ref() != Some(live_control_service)
+        || recorded_control_service != *live_control_service
+        || responder_control_service != *live_control_service
+    {
+        return Err("Browser durable launch or cleanup identity changed".to_string());
+    }
+    if launch
+        .principal_id
+        .as_deref()
+        .is_some_and(|principal| !is_safe_id(principal) || principal.len() > 512)
+    {
+        return Err("Browser durable launch principal is invalid".to_string());
+    }
+    if adapter.kind != launch.engine
+        || !adapter.display_modes.contains(&launch.display_mode)
+        || !adapter_supports_guarantee(adapter.kind, launch.guarantee_level)
+    {
+        return Err("Browser durable launch adapter contract changed".to_string());
+    }
+    if binding.shutdown_socket_path.as_deref() != Some(control_socket_path)
+        || !binding.isolated_session
+        || binding
+            .isolation
+            .as_ref()
+            .map(|isolation| isolation.kind.as_str())
+            != Some("per_launch_vm_target")
+    {
+        return Err("Browser durable launch control or isolation binding changed".to_string());
+    }
+    let page_id = binding.page_id.clone();
+    let session = page_control_session_from_cleanup(&binding)?;
+    Ok((page_id, session))
 }
 
 fn engine_terminal_cleanup_result(
@@ -356,7 +587,8 @@ impl BrowserEngineAdapter {
                 principal_id,
                 lifecycle_generation,
                 stream_id,
-            } => self.status_request(principal_id, lifecycle_generation, stream_id),
+                adapter_id,
+            } => self.status_request(principal_id, lifecycle_generation, stream_id, adapter_id),
             Request::Launch {
                 url,
                 stream_session,
@@ -472,6 +704,7 @@ impl BrowserEngineAdapter {
         principal_id: Option<String>,
         lifecycle_generation: Option<String>,
         stream_id: Option<String>,
+        adapter_id: Option<String>,
     ) -> Response {
         if lifecycle_generation.is_some() || stream_id.is_some() {
             let (Some(lifecycle_generation), Some(stream_id)) = (lifecycle_generation, stream_id)
@@ -481,7 +714,12 @@ impl BrowserEngineAdapter {
                     "Browser launch reconciliation requires lifecycle_generation and stream_id",
                 );
             };
-            return self.reconcile_launch(principal_id, &lifecycle_generation, &stream_id);
+            return self.reconcile_launch(
+                principal_id,
+                &lifecycle_generation,
+                &stream_id,
+                adapter_id.as_deref(),
+            );
         }
         self.status(principal_id)
     }
@@ -515,11 +753,14 @@ impl BrowserEngineAdapter {
         principal_id: Option<String>,
         lifecycle_generation: &str,
         stream_id: &str,
+        adapter_id: Option<&str>,
     ) -> Response {
         if !is_safe_id(lifecycle_generation)
             || lifecycle_generation.len() > 256
             || !is_safe_id(stream_id)
             || stream_id.len() > 256
+            || adapter_id
+                .is_some_and(|value| value.is_empty() || !is_safe_id(value) || value.len() > 256)
         {
             return Response::error(
                 "invalid_request",
@@ -527,12 +768,47 @@ impl BrowserEngineAdapter {
             );
         }
 
+        let Some(adapter_id) = adapter_id else {
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "cleanup_pending",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "reason": "selected Browser Engine Adapter identity is unavailable",
+            }));
+        };
+        let Some(selected_adapter) = self.select_adapter(Some(adapter_id)) else {
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "cleanup_pending",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "reason": "selected Browser Engine Adapter is unavailable",
+            }));
+        };
+        let live_vm_control_service = if selected_adapter.kind == AdapterKind::ChromiumMicrovm {
+            match live_vm_control_service_identity(&selected_adapter) {
+                Ok(identity) => Some(identity),
+                Err(_) => {
+                    return Response::ok(json!({
+                        "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                        "state": "cleanup_pending",
+                        "lifecycle_generation": lifecycle_generation,
+                        "stream_id": stream_id,
+                        "reason": "selected Browser control-service identity is unavailable",
+                    }));
+                }
+            }
+        } else {
+            None
+        };
         let exact_sessions = self
             .page_control_sessions
             .iter()
             .filter(|(_, session)| {
                 session.generation == lifecycle_generation && session.stream_id == stream_id
             })
+            .map(|(page_id, session)| (page_id.clone(), session.clone()))
             .collect::<Vec<_>>();
         if exact_sessions.len() > 1 {
             return Response::ok(json!({
@@ -544,11 +820,30 @@ impl BrowserEngineAdapter {
             }));
         }
         if let Some((page_id, session)) = exact_sessions.into_iter().next() {
-            if !page_control_session_principal_matches(session, principal_id.as_deref()) {
+            if !page_control_session_principal_matches(&session, principal_id.as_deref()) {
                 return Response::error(
                     "cleanup_binding_mismatch",
                     "Browser launch reconciliation principal changed",
                 );
+            }
+            if session.adapter_id != selected_adapter.id
+                || validate_engine_cleanup_binding(&engine_cleanup_binding(&page_id, &session))
+                    .is_err()
+                || live_vm_control_service.as_ref().is_some_and(
+                    |(control_socket_path, live_control_service)| {
+                        session.shutdown_socket_path.as_deref()
+                            != Some(control_socket_path.as_str())
+                            || session.control_service.as_ref() != Some(live_control_service)
+                    },
+                )
+            {
+                return Response::ok(json!({
+                    "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                    "state": "cleanup_pending",
+                    "lifecycle_generation": lifecycle_generation,
+                    "stream_id": stream_id,
+                    "reason": "selected Browser Engine Adapter or cleanup identity changed",
+                }));
             }
             return Response::ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
@@ -562,7 +857,7 @@ impl BrowserEngineAdapter {
                     "adapter": session.adapter_id,
                     "engine": session.engine,
                     "stream_id": session.stream_id,
-                    "runtime_cleanup": engine_cleanup_binding(page_id, session),
+                    "runtime_cleanup": engine_cleanup_binding(&page_id, &session),
                 },
             }));
         }
@@ -578,229 +873,116 @@ impl BrowserEngineAdapter {
             }));
         }
 
-        let mut control_services = BTreeMap::<String, Vec<AdapterConfig>>::new();
-        for adapter in self.adapters.clone() {
-            if let Some(control_socket_path) = adapter
-                .supervisor
-                .as_ref()
-                .and_then(|supervisor| supervisor.control_socket_path.as_ref())
-            {
-                control_services
-                    .entry(control_socket_path.clone())
-                    .or_default()
-                    .push(adapter);
-            }
-        }
-        let mut every_control_service_proved_terminal = !control_services.is_empty();
-        let mut terminal_effects = None::<(bool, bool)>;
-        let reconciliation_deadline =
-            std::time::Instant::now() + BROWSER_ENGINE_RECONCILIATION_TOTAL_TIMEOUT;
-        for (control_socket_path, adapters) in control_services {
-            let remaining =
-                reconciliation_deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                every_control_service_proved_terminal = false;
-                break;
-            }
-            let Ok(reconciliation) = supervisor_control_json_bounded(
-                &control_socket_path,
-                "POST",
-                "/launches/reconcile",
-                Some(json!({
-                    "schema": "elastos.browser.vm-control-service.reconcile-launch/v1",
-                    "lifecycle_generation": lifecycle_generation,
-                    "stream_id": stream_id,
-                })),
-                BROWSER_ENGINE_RECONCILIATION_TIMEOUT.min(remaining),
-                MAX_BROWSER_ENGINE_RECONCILIATION_RESPONSE_BYTES,
-            ) else {
-                every_control_service_proved_terminal = false;
-                continue;
-            };
-            if reconciliation.get("schema").and_then(Value::as_str)
-                != Some("elastos.browser.vm-control-service.launch-reconciliation/v1")
-                || reconciliation
-                    .get("launch")
-                    .and_then(|value| value.get("lifecycle_generation"))
-                    .and_then(Value::as_str)
-                    != Some(lifecycle_generation)
-                || reconciliation
-                    .get("launch")
-                    .and_then(|value| value.get("stream_id"))
-                    .and_then(Value::as_str)
-                    != Some(stream_id)
-            {
-                every_control_service_proved_terminal = false;
-                continue;
-            }
-            match reconciliation.get("state").and_then(Value::as_str) {
-                Some("did_not_act") => {
-                    let effects = reconciliation.get("effects");
-                    if effects
-                        .and_then(|effects| effects.get("page_acquired"))
-                        .and_then(Value::as_bool)
-                        != Some(false)
-                        || effects
-                            .and_then(|effects| effects.get("vm_acquired"))
-                            .and_then(Value::as_bool)
-                            != Some(false)
-                    {
-                        every_control_service_proved_terminal = false;
-                    }
-                    continue;
-                }
-                Some("terminal_post_effect_cleanup") => {
-                    let effects = reconciliation.get("effects");
-                    let Some(page_acquired) = effects
-                        .and_then(|effects| effects.get("page_acquired"))
-                        .and_then(Value::as_bool)
-                    else {
-                        every_control_service_proved_terminal = false;
-                        continue;
-                    };
-                    let Some(vm_acquired) = effects
-                        .and_then(|effects| effects.get("vm_acquired"))
-                        .and_then(Value::as_bool)
-                    else {
-                        every_control_service_proved_terminal = false;
-                        continue;
-                    };
-                    let aggregate = terminal_effects.get_or_insert((false, false));
-                    aggregate.0 |= page_acquired;
-                    aggregate.1 |= vm_acquired;
-                    continue;
-                }
-                Some("cleanup_pending") => {
-                    every_control_service_proved_terminal = false;
-                    continue;
-                }
-                Some("effect_acquired") => {}
-                _ => {
-                    every_control_service_proved_terminal = false;
-                    continue;
-                }
-            }
-
-            let Some(launch) = reconciliation.get("launch") else {
-                every_control_service_proved_terminal = false;
-                continue;
-            };
-            let Some(adapter_id) = launch.get("adapter").and_then(Value::as_str) else {
-                every_control_service_proved_terminal = false;
-                continue;
-            };
-            let Some(adapter) = adapters.iter().find(|adapter| adapter.id == adapter_id) else {
-                every_control_service_proved_terminal = false;
-                continue;
-            };
-            let recovered_principal = launch
-                .get("principal_id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if principal_id.as_deref() != recovered_principal.as_deref()
-                || launch.get("engine").and_then(Value::as_str)
-                    != serde_json::to_value(adapter.kind)
-                        .ok()
-                        .as_ref()
-                        .and_then(Value::as_str)
-            {
-                every_control_service_proved_terminal = false;
-                continue;
-            }
-            let Ok(display_mode) = serde_json::from_value::<BrowserDisplayMode>(
-                launch.get("display_mode").cloned().unwrap_or(Value::Null),
-            ) else {
-                every_control_service_proved_terminal = false;
-                continue;
-            };
-            let Ok(guarantee_level) = serde_json::from_value::<BrowserGuaranteeLevel>(
-                launch
-                    .get("guarantee_level")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            ) else {
-                every_control_service_proved_terminal = false;
-                continue;
-            };
-            let Ok(result) = serde_json::from_value::<SupervisorLaunchResult>(
-                reconciliation
-                    .get("supervisor_result")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            ) else {
-                every_control_service_proved_terminal = false;
-                continue;
-            };
-            if validate_supervisor_result(&result, adapter, stream_id, display_mode).is_err() {
-                every_control_service_proved_terminal = false;
-                continue;
-            }
-            let recovered_control_socket = result
-                .control_socket_path
-                .clone()
-                .or_else(|| Some(control_socket_path.clone()));
-            let Some(recovered_control_socket) = recovered_control_socket else {
-                every_control_service_proved_terminal = false;
-                continue;
-            };
-            if validate_control_socket_path(&recovered_control_socket).is_err() {
-                every_control_service_proved_terminal = false;
-                continue;
-            }
-            let shutdown_socket_path = (result
-                .isolation
-                .as_ref()
-                .map(|isolation| isolation.kind.as_str())
-                == Some("per_launch_vm_target"))
-            .then(|| control_socket_path.clone());
-            let page_id = result.page_id.clone();
-            self.page_control_sessions.insert(
-                page_id.clone(),
-                PageControlSession {
-                    generation: lifecycle_generation.to_string(),
-                    stream_id: stream_id.to_string(),
-                    socket_path: recovered_control_socket,
-                    shutdown_socket_path,
-                    adapter_id: adapter.id.clone(),
-                    principal_id: recovered_principal,
-                    engine: adapter.kind,
-                    display_mode,
-                    guarantee_level,
-                    isolated_session: result.isolated_session,
-                    isolation_session_dir: result
-                        .isolation
-                        .as_ref()
-                        .map(|isolation| isolation.session_dir.clone()),
-                    isolation_kind: result
-                        .isolation
-                        .as_ref()
-                        .map(|isolation| isolation.kind.clone()),
-                    process: result.process.clone(),
-                },
-            );
-            let session = self
-                .page_control_sessions
-                .get(&page_id)
-                .expect("reconciled Browser page session");
+        let Some((control_socket_path, live_control_service)) = live_vm_control_service else {
             return Response::ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
-                "state": "effect_acquired",
+                "state": "cleanup_pending",
                 "lifecycle_generation": lifecycle_generation,
                 "stream_id": stream_id,
-                "effect": {
-                    "provider": BROWSER_ENGINE_PROVIDER_ID,
-                    "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
-                    "page_id": page_id,
-                    "adapter": session.adapter_id,
-                    "engine": session.engine,
-                    "stream_id": session.stream_id,
-                    "runtime_cleanup": engine_cleanup_binding(&page_id, session),
-                },
+                "reason": "selected Browser control service is unavailable",
+            }));
+        };
+        let reconciliation = supervisor_control_json_bounded(
+            &control_socket_path,
+            "POST",
+            "/launches/reconcile",
+            Some(json!({
+                "schema": "elastos.browser.vm-control-service.reconcile-launch/v1",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+            })),
+            BROWSER_ENGINE_RECONCILIATION_TIMEOUT,
+            MAX_BROWSER_ENGINE_RECONCILIATION_RESPONSE_BYTES,
+        );
+        let Ok(reconciliation) = reconciliation else {
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "cleanup_pending",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "reason": "selected Browser control service did not reconcile",
+            }));
+        };
+        let response_identity = serde_json::from_value::<ControlServiceIdentity>(
+            reconciliation
+                .get("responder_control_service")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        let record_identity = serde_json::from_value::<ControlServiceIdentity>(
+            reconciliation
+                .get("control_service")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        if reconciliation.get("schema").and_then(Value::as_str)
+            != Some("elastos.browser.vm-control-service.launch-reconciliation/v1")
+            || reconciliation
+                .pointer("/launch/lifecycle_generation")
+                .and_then(Value::as_str)
+                != Some(lifecycle_generation)
+            || reconciliation
+                .pointer("/launch/stream_id")
+                .and_then(Value::as_str)
+                != Some(stream_id)
+            || response_identity.as_ref().ok() != Some(&live_control_service)
+            || record_identity.as_ref().ok() != Some(&live_control_service)
+        {
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "cleanup_pending",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "reason": "Browser durable or responding control-service identity changed",
             }));
         }
-
-        if every_control_service_proved_terminal {
-            if let Some((page_acquired, vm_acquired)) = terminal_effects {
+        match reconciliation.get("state").and_then(Value::as_str) {
+            Some("did_not_act")
+                if reconciliation
+                    .pointer("/effects/page_acquired")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                    && reconciliation
+                        .pointer("/effects/vm_acquired")
+                        .and_then(Value::as_bool)
+                        == Some(false) =>
+            {
+                return Response::ok(json!({
+                    "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                    "state": "did_not_act",
+                    "lifecycle_generation": lifecycle_generation,
+                    "stream_id": stream_id,
+                    "effects": {
+                        "page_acquired": false,
+                        "vm_acquired": false,
+                    },
+                }));
+            }
+            Some("terminal_post_effect_cleanup") => {
+                let Some(page_acquired) = reconciliation
+                    .pointer("/effects/page_acquired")
+                    .and_then(Value::as_bool)
+                else {
+                    return Response::ok(json!({
+                        "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                        "state": "cleanup_pending",
+                        "lifecycle_generation": lifecycle_generation,
+                        "stream_id": stream_id,
+                        "reason": "terminal Browser cleanup effects are incomplete",
+                    }));
+                };
+                let Some(vm_acquired) = reconciliation
+                    .pointer("/effects/vm_acquired")
+                    .and_then(Value::as_bool)
+                else {
+                    return Response::ok(json!({
+                        "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                        "state": "cleanup_pending",
+                        "lifecycle_generation": lifecycle_generation,
+                        "stream_id": stream_id,
+                        "reason": "terminal Browser cleanup effects are incomplete",
+                    }));
+                };
                 return Response::ok(json!({
                     "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                     "state": "terminal_post_effect_cleanup",
@@ -812,16 +994,41 @@ impl BrowserEngineAdapter {
                     },
                 }));
             }
-            return Response::ok(json!({
-                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
-                "state": "did_not_act",
-                "lifecycle_generation": lifecycle_generation,
-                "stream_id": stream_id,
-                "effects": {
-                    "page_acquired": false,
-                    "vm_acquired": false,
-                },
-            }));
+            Some("cleanup_pending") | Some("effect_acquired") => {
+                if let Ok((page_id, session)) = page_control_session_from_durable_reconciliation(
+                    &reconciliation,
+                    &selected_adapter,
+                    &control_socket_path,
+                    &live_control_service,
+                    principal_id.as_deref(),
+                    lifecycle_generation,
+                    stream_id,
+                ) {
+                    if !self.page_control_sessions.contains_key(&page_id) {
+                        self.page_control_sessions.insert(page_id.clone(), session);
+                        let session = self
+                            .page_control_sessions
+                            .get(&page_id)
+                            .expect("reconciled Browser page session");
+                        return Response::ok(json!({
+                            "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                            "state": "effect_acquired",
+                            "lifecycle_generation": lifecycle_generation,
+                            "stream_id": stream_id,
+                            "effect": {
+                                "provider": BROWSER_ENGINE_PROVIDER_ID,
+                                "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
+                                "page_id": page_id,
+                                "adapter": session.adapter_id,
+                                "engine": session.engine,
+                                "stream_id": session.stream_id,
+                                "runtime_cleanup": engine_cleanup_binding(&page_id, session),
+                            },
+                        }));
+                    }
+                }
+            }
+            _ => {}
         }
 
         Response::ok(json!({
@@ -1039,6 +1246,57 @@ impl BrowserEngineAdapter {
                     return Response::error("invalid_supervisor_result", err);
                 }
             }
+            let control_service = if shutdown_socket_path.is_some() {
+                let Some(identity) = result.control_service.clone() else {
+                    return Response::error(
+                        "invalid_supervisor_result",
+                        "Browser VM supervisor omitted its control-service identity",
+                    );
+                };
+                if let Err(err) =
+                    validate_control_service_identity(&identity, shutdown_socket_path.as_deref())
+                {
+                    return Response::error("invalid_supervisor_result", err);
+                }
+                let live_status = supervisor_control_json_bounded(
+                    shutdown_socket_path
+                        .as_deref()
+                        .expect("VM shutdown socket path"),
+                    "GET",
+                    "/status",
+                    None,
+                    BROWSER_ENGINE_RECONCILIATION_TIMEOUT,
+                    MAX_BROWSER_ENGINE_RECONCILIATION_RESPONSE_BYTES,
+                );
+                let live_identity = live_status.and_then(|status| {
+                    if status.get("schema").and_then(Value::as_str)
+                        != Some("elastos.browser.vm-control-service.status/v1")
+                    {
+                        return Err(
+                            "Browser VM control service returned an invalid status schema"
+                                .to_string(),
+                        );
+                    }
+                    serde_json::from_value::<ControlServiceIdentity>(
+                        status
+                            .get("control_service")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    )
+                    .map_err(|_| {
+                        "Browser VM live control-service identity is unavailable".to_string()
+                    })
+                });
+                if live_identity.as_ref().ok() != Some(&identity) {
+                    return Response::error(
+                        "invalid_supervisor_result",
+                        "Browser VM control-service identity changed after dispatch",
+                    );
+                }
+                Some(identity)
+            } else {
+                result.control_service.clone()
+            };
             self.page_control_sessions.insert(
                 result.page_id.clone(),
                 PageControlSession {
@@ -1060,6 +1318,7 @@ impl BrowserEngineAdapter {
                         .isolation
                         .as_ref()
                         .map(|isolation| isolation.kind.clone()),
+                    control_service,
                     process: result.process.clone(),
                 },
             );
@@ -1753,6 +2012,8 @@ struct SupervisorLaunchResult {
     isolated_session: bool,
     #[serde(default)]
     isolation: Option<SupervisorIsolation>,
+    #[serde(default)]
+    control_service: Option<ControlServiceIdentity>,
     #[serde(default)]
     process: Option<Value>,
 }

@@ -380,6 +380,24 @@ async function request(method, path, body) {
   const launch = await request("POST", "/pages", openRequest("https://example.com/"));
   if (launch.schema !== "elastos.browser.engine.supervisor-result/v1") throw new Error("wrong launch schema");
   if (launch.engine !== "chromium_microvm") throw new Error("wrong engine");
+  if (
+    launch.control_service?.schema !==
+      "elastos.browser.vm-control-service.identity/v1" ||
+    !/^service:[0-9a-f]{64}$/.test(
+      launch.control_service?.service_id || "",
+    ) ||
+    launch.control_service?.control_socket_path !== socketPath
+  ) {
+    throw new Error(`launch lacks exact selected control-service identity: ${JSON.stringify(launch)}`);
+  }
+  if (
+    launch.process?.schema !== "elastos.browser.host-process-binding/v1" ||
+    !/^process:[0-9a-f]{64}$/.test(launch.process?.ownership_id || "") ||
+    !Number.isInteger(launch.process?.pid) ||
+    launch.process.pid <= 1
+  ) {
+    throw new Error(`launch lacks exact owned host-process binding: ${JSON.stringify(launch)}`);
+  }
   if (launch.display_session.media_transport !== "runtime_relay") throw new Error("missing runtime relay media transport");
   if (launch.display_session.audio !== true || launch.display_session.video !== true) throw new Error("split audio/video offers did not normalize to audio+video");
   const activeReconciliation = await reconcile(launch.stream_id);
@@ -438,6 +456,7 @@ async function request(method, path, body) {
     shutdown_socket_path: socketPath,
     isolated_session: true,
     isolation: page.isolation,
+    control_service: page.control_service,
     process: page.process,
   });
   const cleanup = cleanupBinding(launch);
@@ -467,7 +486,11 @@ async function request(method, path, body) {
     page_id: "page:missing-map-live-child",
     generation: "sha256:missing-map-live-child",
     control_socket_path: `${cleanup.control_socket_path}.missing`,
-    process: { pid: process.pid, stream_bridge_pid: null },
+    process: {
+      ...cleanup.process,
+      ownership_id: `process:${"f".repeat(64)}`,
+      pid: process.pid,
+    },
   };
   const indeterminate = await requestRaw("POST", "/shutdown", {
     page_id: liveChildBinding.page_id,

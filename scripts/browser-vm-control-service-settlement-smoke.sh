@@ -290,6 +290,7 @@ function cleanupBinding(page) {
     shutdown_socket_path: socketPath,
     isolated_session: true,
     isolation: page.isolation,
+    control_service: page.control_service,
     process: page.process,
   };
 }
@@ -393,9 +394,10 @@ if (process.env.PHASE === "cleanup-retry") {
   const pending = await reconcile(streamId);
   if (
     pending.state !== "cleanup_pending" ||
-    pending.cleanup_binding?.page_id !== page.page_id
+    pending.cleanup_binding?.page_id !== page.page_id ||
+    pending.supervisor_result !== undefined
   ) {
-    throw new Error(`restart did not retain exact pending ownership: ${JSON.stringify(pending)}`);
+    throw new Error(`restart did not retain only its exact durable cleanup binding: ${JSON.stringify(pending)}`);
   }
   const first = await requestRaw("POST", "/shutdown", closeBody(page));
   if (
@@ -418,12 +420,23 @@ if (process.env.PHASE === "cleanup-retry") {
   if (fs.existsSync(page.control_socket_path)) {
     fs.unlinkSync(page.control_socket_path);
   }
-  const terminal = await request("POST", "/shutdown", closeBody(page));
-  if (terminal.terminal !== true || terminal.already_absent !== true) {
-    throw new Error(`exact absence did not settle restart cleanup: ${JSON.stringify(terminal)}`);
+  const stillIndeterminate = await requestRaw(
+    "POST",
+    "/shutdown",
+    closeBody(page),
+  );
+  if (
+    stillIndeterminate.status !== 400 ||
+    !String(stillIndeterminate.body.error || "").includes(
+      "exact owned launcher unavailable",
+    )
+  ) {
+    throw new Error(
+      `stale process identity synthesized terminal cleanup: ${JSON.stringify(stillIndeterminate)}`,
+    );
   }
-  if ((await reconcile(streamId)).state !== "terminal_post_effect_cleanup") {
-    throw new Error("restart cleanup did not persist terminal state");
+  if ((await reconcile(streamId)).state !== "cleanup_pending") {
+    throw new Error("stale process identity did not remain pending");
   }
 } else if (process.env.PHASE === "capacity") {
   const before = fs.readFileSync(process.env.JOURNAL_PATH);

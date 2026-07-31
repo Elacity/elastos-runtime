@@ -14,6 +14,10 @@ import {
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
 } from "./shell-core.js?v=home-20260725a";
+import {
+  isTrustedHomeGuiMessage,
+  projectHomeGuiAuthority,
+} from "./home-gui-authority.js?v=home-20260726a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -89,6 +93,7 @@ function settleRequest(message) {
 }
 
 async function applySummary(summary, options = {}) {
+  projectHomeGuiAuthority(document.body, summary);
   const previous = currentSummary;
   currentSummary = summary;
   await syncHomeGuiProjection(previous, summary, {
@@ -223,7 +228,7 @@ function hasExactKeys(value, expectedKeys) {
 }
 
 window.addEventListener("message", (event) => {
-  if (event.source !== window.parent || event.origin !== homeOrigin) {
+  if (!isTrustedHomeGuiMessage(event, window.parent, homeOrigin)) {
     return;
   }
   const message = event.data && typeof event.data === "object" ? event.data : null;

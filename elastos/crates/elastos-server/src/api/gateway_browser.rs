@@ -8,6 +8,8 @@ use crate::api::browser_engine_protocol::{
     BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
     BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
 };
+use std::sync::{Mutex as StdMutex, Weak};
+use tokio::sync::{watch, Notify};
 #[path = "gateway_browser_engine.rs"]
 mod gateway_browser_engine;
 #[path = "gateway_browser_response.rs"]
@@ -635,6 +637,7 @@ async fn execute_browser_open(
         url: url.clone(),
         exit_id: browser_lifecycle_exit_id(remote_exit_id.as_deref()),
         engine_route_provider: engine_registration.provider.clone(),
+        selected_engine_adapter: adapter_id.clone(),
         profile_key_hash: browser_lifecycle_hash(profile_key),
         vm_key_hash: browser_lifecycle_vm_key_hash(&[
             profile_key,
@@ -1066,7 +1069,6 @@ async fn execute_browser_open(
                 &context.principal_id,
                 authority.verified_context().launch_id(),
                 false,
-                "browser_open_ownership_persistence_failure",
             )
             .await;
             return Err(
@@ -1097,7 +1099,6 @@ async fn execute_browser_open(
             &context.principal_id,
             authority.verified_context().launch_id(),
             true,
-            "browser_open_completion_audit_failure",
         )
         .await;
         return Err(BrowserOpenFailure::text(status, message).with_outcome(outcome));
@@ -1123,6 +1124,210 @@ enum BrowserDispatchedLaunchReconciliation {
     CleanupPending,
 }
 
+enum BrowserLaunchReconciliationDecision {
+    DidNotAct,
+    TerminalPostEffectCleanup {
+        page_acquired: bool,
+        vm_acquired: bool,
+    },
+    CloseExactEffect(Box<BrowserLaunchEffect>),
+    RetainIndeterminate(Option<String>),
+}
+
+const BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF: Duration = Duration::from_millis(100);
+const BROWSER_LAUNCH_RECONCILIATION_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT: usize = 8;
+
+static BROWSER_LIFECYCLE_RECONCILER_WAKES: OnceLock<StdMutex<BTreeMap<String, Weak<Notify>>>> =
+    OnceLock::new();
+
+struct BrowserLifecycleReconcilerRegistration {
+    scope: String,
+    wake: Arc<Notify>,
+}
+
+impl Drop for BrowserLifecycleReconcilerRegistration {
+    fn drop(&mut self) {
+        let Some(registry) = BROWSER_LIFECYCLE_RECONCILER_WAKES.get() else {
+            return;
+        };
+        let Ok(mut registry) = registry.lock() else {
+            return;
+        };
+        let wake = Arc::downgrade(&self.wake);
+        if registry
+            .get(&self.scope)
+            .is_some_and(|registered| Weak::ptr_eq(registered, &wake))
+        {
+            registry.remove(&self.scope);
+        }
+    }
+}
+
+pub(in crate::api::gateway) struct BrowserLifecycleReconciler {
+    shutdown: watch::Sender<bool>,
+    wake: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl BrowserLifecycleReconciler {
+    pub(in crate::api::gateway) fn cancel(&self) {
+        let _ = self.shutdown.send(true);
+        self.wake.notify_waiters();
+    }
+
+    pub(in crate::api::gateway) async fn join(self) -> Result<(), String> {
+        self.task
+            .await
+            .map_err(|err| format!("Browser launch reconciler task failed: {err}"))
+    }
+}
+
+pub(in crate::api::gateway) fn start_browser_lifecycle_reconciler(
+    state: GatewayState,
+) -> Result<BrowserLifecycleReconciler, String> {
+    let scope = state.data_dir.to_string_lossy().into_owned();
+    let wake = Arc::new(Notify::new());
+    let registry = BROWSER_LIFECYCLE_RECONCILER_WAKES.get_or_init(Default::default);
+    {
+        let mut registry = registry
+            .lock()
+            .map_err(|_| "Browser launch reconciler registry is unavailable".to_string())?;
+        if registry.get(&scope).and_then(Weak::upgrade).is_some() {
+            return Err(
+                "Browser launch reconciler is already running for this data root".to_string(),
+            );
+        }
+        registry.insert(scope.clone(), Arc::downgrade(&wake));
+    }
+    let registration = BrowserLifecycleReconcilerRegistration {
+        scope,
+        wake: wake.clone(),
+    };
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task_wake = wake.clone();
+    let task = tokio::spawn(async move {
+        run_browser_lifecycle_reconciler(state, task_wake, shutdown_rx, registration).await;
+    });
+    Ok(BrowserLifecycleReconciler {
+        shutdown,
+        wake,
+        task,
+    })
+}
+
+async fn run_browser_lifecycle_reconciler(
+    state: GatewayState,
+    wake: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
+    _registration: BrowserLifecycleReconcilerRegistration,
+) {
+    let mut backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let settled = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    release_browser_lifecycle_reconciliation_claims(&state.data_dir).await;
+                    break;
+                }
+                continue;
+            }
+            settled = retry_pending_browser_lifecycle_obligations(&state) => settled,
+        };
+        if settled {
+            backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = wake.notified() => {
+                backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
+            }
+            _ = tokio::time::sleep(backoff) => {
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(BROWSER_LAUNCH_RECONCILIATION_MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+pub(in crate::api::gateway) fn notify_browser_lifecycle_reconciler(data_dir: &FsPath) {
+    let Some(registry) = BROWSER_LIFECYCLE_RECONCILER_WAKES.get() else {
+        return;
+    };
+    let scope = data_dir.to_string_lossy().into_owned();
+    let wake = registry.lock().ok().and_then(|mut registry| {
+        match registry.get(&scope).and_then(Weak::upgrade) {
+            Some(wake) => Some(wake),
+            None => {
+                registry.remove(&scope);
+                None
+            }
+        }
+    });
+    if let Some(wake) = wake {
+        wake.notify_one();
+    }
+}
+
+fn browser_launch_reconciliation_decision(
+    result: Result<BrowserDispatchedLaunchReconciliation, String>,
+) -> BrowserLaunchReconciliationDecision {
+    match result {
+        Ok(BrowserDispatchedLaunchReconciliation::DidNotAct) => {
+            BrowserLaunchReconciliationDecision::DidNotAct
+        }
+        Ok(BrowserDispatchedLaunchReconciliation::TerminalPostEffectCleanup {
+            page_acquired,
+            vm_acquired,
+        }) => BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup {
+            page_acquired,
+            vm_acquired,
+        },
+        Ok(BrowserDispatchedLaunchReconciliation::EffectAcquired(effect)) => {
+            BrowserLaunchReconciliationDecision::CloseExactEffect(effect)
+        }
+        Ok(BrowserDispatchedLaunchReconciliation::CleanupPending) => {
+            BrowserLaunchReconciliationDecision::RetainIndeterminate(None)
+        }
+        Err(err) => BrowserLaunchReconciliationDecision::RetainIndeterminate(Some(err)),
+    }
+}
+
+async fn attempt_browser_launch_reconciliation_bounded(
+    state: &GatewayState,
+    generation: &str,
+    engine_route_provider: &str,
+    selected_engine_adapter: Option<&str>,
+    principal_id: &str,
+    stream_id: &str,
+    stream_cleanup: Option<BrowserStreamCleanup>,
+) -> Result<BrowserDispatchedLaunchReconciliation, String> {
+    tokio::time::timeout(
+        BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+        attempt_browser_launch_reconciliation(
+            state,
+            generation,
+            engine_route_provider,
+            selected_engine_adapter,
+            principal_id,
+            stream_id,
+            stream_cleanup,
+        ),
+    )
+    .await
+    .map_err(|_| "browser-engine launch reconciliation timed out".to_string())?
+}
+
 async fn reconcile_dispatched_browser_launch_failure(
     state: &GatewayState,
     reservation: &BrowserLaunchReservation,
@@ -1133,23 +1338,24 @@ async fn reconcile_dispatched_browser_launch_failure(
     message: &str,
 ) -> serde_json::Value {
     mark_browser_launch_failed(reservation, message.to_string()).await;
-    match attempt_browser_launch_reconciliation(
+    let reconciliation = attempt_browser_launch_reconciliation_bounded(
         state,
         reservation.generation(),
         reservation.engine_route_provider(),
+        reservation.selected_engine_adapter(),
         principal_id,
         stream_id,
         stream_cleanup.clone(),
     )
-    .await
-    {
-        Ok(BrowserDispatchedLaunchReconciliation::DidNotAct) => {
+    .await;
+    match browser_launch_reconciliation_decision(reconciliation) {
+        BrowserLaunchReconciliationDecision::DidNotAct => {
             release_browser_open_resources(state, reservation, stream_cleanup).await
         }
-        Ok(BrowserDispatchedLaunchReconciliation::TerminalPostEffectCleanup {
+        BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup {
             page_acquired,
             vm_acquired,
-        }) => {
+        } => {
             release_browser_launch(reservation).await;
             if let Err(err) = close_browser_stream_cleanup(state, stream_cleanup).await {
                 tracing::warn!(
@@ -1161,7 +1367,7 @@ async fn reconcile_dispatched_browser_launch_failure(
                 browser_terminal_post_dispatch_outcome(page_acquired, vm_acquired)
             }
         }
-        Ok(BrowserDispatchedLaunchReconciliation::EffectAcquired(effect)) => {
+        BrowserLaunchReconciliationDecision::CloseExactEffect(effect) => {
             let effect = *effect;
             let page_id = effect.page_id.clone();
             let ownership_persisted = complete_browser_launch(&state.data_dir, reservation, effect)
@@ -1174,11 +1380,18 @@ async fn reconcile_dispatched_browser_launch_failure(
                 principal_id,
                 owner_launch_id,
                 ownership_persisted,
-                "browser_open_dispatched_failure_reconciliation",
             )
             .await
         }
-        Ok(BrowserDispatchedLaunchReconciliation::CleanupPending) | Err(_) => {
+        BrowserLaunchReconciliationDecision::RetainIndeterminate(reconciliation_error) => {
+            if let Some(err) = reconciliation_error {
+                tracing::warn!(
+                    error = %err,
+                    generation = reservation.generation(),
+                    stream_id,
+                    "Browser dispatched launch reconciliation remains indeterminate"
+                );
+            }
             if let Err(err) = record_browser_launch_reconciliation_obligation(
                 &state.data_dir,
                 reservation,
@@ -1203,6 +1416,7 @@ async fn attempt_browser_launch_reconciliation(
     state: &GatewayState,
     generation: &str,
     engine_route_provider: &str,
+    selected_engine_adapter: Option<&str>,
     principal_id: &str,
     stream_id: &str,
     stream_cleanup: Option<BrowserStreamCleanup>,
@@ -1230,6 +1444,7 @@ async fn attempt_browser_launch_reconciliation(
             "principal_id": principal_id,
             "lifecycle_generation": generation,
             "stream_id": stream_id,
+            "adapter_id": selected_engine_adapter,
         }),
     )
     .map_err(|(_, message)| message)?;
@@ -1321,6 +1536,11 @@ async fn attempt_browser_launch_reconciliation(
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| is_safe_runtime_id(value))
                 .ok_or_else(|| "browser-engine reconciliation adapter is unsafe".to_string())?;
+            if selected_engine_adapter.is_some_and(|selected| selected != engine_adapter) {
+                return Err(
+                    "browser-engine reconciliation selected adapter identity changed".to_string(),
+                );
+            }
             let engine = effect
                 .get("engine")
                 .and_then(serde_json::Value::as_str)
@@ -1463,11 +1683,9 @@ fn browser_provider_cleanup_value_is_safe(value: &serde_json::Value, depth: usiz
 }
 
 async fn cleanup_stale_browser_pages(state: &GatewayState) {
-    retry_pending_browser_launch_reconciliations(state).await;
-    retry_pending_browser_engine_cleanups(state).await;
-    retry_pending_browser_stream_cleanups(state).await;
+    retry_pending_browser_lifecycle_obligations(state).await;
     for page in take_stale_browser_pages(&state.data_dir).await {
-        close_browser_page_record(state, page, "stale_browser_session_janitor").await;
+        close_browser_page_record(state, page).await;
     }
     if !browser_scope_has_live_sessions(&state.data_dir).await {
         match prune_orphan_browser_runtime_stream_sockets() {
@@ -1483,23 +1701,42 @@ async fn cleanup_stale_browser_pages(state: &GatewayState) {
     }
 }
 
-async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) {
-    for reconciliation in claim_pending_browser_launch_reconciliations(&state.data_dir).await {
-        let result = attempt_browser_launch_reconciliation(
+async fn retry_pending_browser_lifecycle_obligations(state: &GatewayState) -> bool {
+    let launch_settled = retry_pending_browser_launch_reconciliations(state).await;
+    let engine_settled = retry_pending_browser_engine_cleanups(state).await;
+    let stream_settled = retry_pending_browser_stream_cleanups(state).await;
+    launch_settled || engine_settled || stream_settled
+}
+
+async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> bool {
+    let mut settled = false;
+    for reconciliation in claim_pending_browser_launch_reconciliations(
+        &state.data_dir,
+        BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT,
+    )
+    .await
+    {
+        let result = attempt_browser_launch_reconciliation_bounded(
             state,
             &reconciliation.generation,
             &reconciliation.engine_route_provider,
+            reconciliation.selected_engine_adapter.as_deref(),
             &reconciliation.principal_id,
             &reconciliation.stream_id,
             reconciliation.stream_cleanup.clone(),
         )
         .await;
-        match result {
-            Ok(BrowserDispatchedLaunchReconciliation::DidNotAct)
-            | Ok(BrowserDispatchedLaunchReconciliation::TerminalPostEffectCleanup { .. }) => {
-                if let Err(err) =
-                    close_browser_stream_cleanup(state, reconciliation.stream_cleanup.clone()).await
-                {
+        match browser_launch_reconciliation_decision(result) {
+            BrowserLaunchReconciliationDecision::DidNotAct
+            | BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup { .. } => {
+                let stream_result = tokio::time::timeout(
+                    BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+                    close_browser_stream_cleanup(state, reconciliation.stream_cleanup.clone()),
+                )
+                .await
+                .map_err(|_| "Browser stream cleanup timed out".to_string())
+                .and_then(|result| result);
+                if let Err(err) = stream_result {
                     tracing::warn!(
                         error = %err,
                         generation = %reconciliation.generation,
@@ -1522,9 +1759,11 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) {
                     );
                     release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
                         .await;
+                } else {
+                    settled = true;
                 }
             }
-            Ok(BrowserDispatchedLaunchReconciliation::EffectAcquired(effect)) => {
+            BrowserLaunchReconciliationDecision::CloseExactEffect(effect) => {
                 let effect = *effect;
                 let cleanup = BrowserEngineCleanup {
                     cleanup_id: reconciliation.cleanup_id.clone(),
@@ -1556,15 +1795,20 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) {
                         .await;
                     continue;
                 }
-                let engine_result = attempt_browser_engine_cleanup(
-                    state,
-                    &cleanup,
-                    "pending_launch_reconciliation_retry",
+                let engine_result = tokio::time::timeout(
+                    BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+                    attempt_browser_engine_cleanup(state, &cleanup),
                 )
-                .await;
-                let stream_result =
-                    close_browser_stream_cleanup(state, reconciliation.stream_cleanup.clone())
-                        .await;
+                .await
+                .map_err(|_| "Browser engine cleanup timed out".to_string())
+                .and_then(|result| result);
+                let stream_result = tokio::time::timeout(
+                    BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+                    close_browser_stream_cleanup(state, reconciliation.stream_cleanup.clone()),
+                )
+                .await
+                .map_err(|_| "Browser stream cleanup timed out".to_string())
+                .and_then(|result| result);
                 if engine_result.is_ok() && stream_result.is_ok() {
                     if let Err(err) =
                         forget_browser_engine_cleanup_obligation(&state.data_dir, &cleanup).await
@@ -1575,6 +1819,8 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) {
                             page_id = %cleanup.page_id,
                             "Browser reconciled cleanup terminal release could not be committed"
                         );
+                    } else {
+                        settled = true;
                     }
                 } else {
                     release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
@@ -1586,20 +1832,45 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) {
                     );
                 }
             }
-            Ok(BrowserDispatchedLaunchReconciliation::CleanupPending) | Err(_) => {
+            BrowserLaunchReconciliationDecision::RetainIndeterminate(error) => {
+                if let Some(error) = error {
+                    tracing::warn!(
+                        error,
+                        generation = %reconciliation.generation,
+                        "Browser launch reconciliation retry remains indeterminate"
+                    );
+                }
                 release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation).await;
             }
         }
     }
+    settled
 }
 
-async fn retry_pending_browser_engine_cleanups(state: &GatewayState) {
-    for cleanup in claim_pending_browser_engine_cleanups(&state.data_dir).await {
-        let engine_result =
-            attempt_browser_engine_cleanup(state, &cleanup, "pending_engine_cleanup_retry").await;
+async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
+    let mut settled = false;
+    for cleanup in claim_pending_browser_engine_cleanups(
+        &state.data_dir,
+        BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT,
+    )
+    .await
+    {
+        let engine_result = tokio::time::timeout(
+            BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+            attempt_browser_engine_cleanup(state, &cleanup),
+        )
+        .await
+        .map_err(|_| "Browser engine cleanup timed out".to_string())
+        .and_then(|result| result);
         let stream_cleanup =
             browser_pending_stream_cleanup_for_engine(&state.data_dir, &cleanup).await;
-        let stream_result = close_browser_stream_cleanup(state, stream_cleanup).await;
+        let stream_result = tokio::time::timeout(
+            BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+            close_browser_stream_cleanup(state, stream_cleanup),
+        )
+        .await
+        .map_err(|_| "Browser stream cleanup timed out".to_string())
+        .and_then(|result| result);
         match (engine_result, stream_result) {
             (Ok(_), Ok(())) => {
                 if let Err(err) =
@@ -1611,6 +1882,8 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) {
                         error = %err,
                         "Browser terminal cleanup could not commit durable owner release"
                     );
+                } else {
+                    settled = true;
                 }
             }
             (engine_result, stream_result) => {
@@ -1624,20 +1897,37 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) {
             }
         }
     }
+    settled
 }
 
-async fn retry_pending_browser_stream_cleanups(state: &GatewayState) {
-    for cleanup in claim_pending_browser_stream_cleanups(&state.data_dir).await {
-        if let Err(err) = close_browser_stream_cleanup(state, Some(cleanup)).await {
+async fn retry_pending_browser_stream_cleanups(state: &GatewayState) -> bool {
+    let mut settled = false;
+    for cleanup in claim_pending_browser_stream_cleanups(
+        &state.data_dir,
+        BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT,
+    )
+    .await
+    {
+        let result = tokio::time::timeout(
+            BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+            close_browser_stream_cleanup(state, Some(cleanup)),
+        )
+        .await
+        .map_err(|_| "Browser stream cleanup timed out".to_string())
+        .and_then(|result| result);
+        if let Err(err) = result {
             tracing::warn!(
                 error = %err,
                 "Browser pending stream cleanup retry failed"
             );
+        } else {
+            settled = true;
         }
     }
+    settled
 }
 
-async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanup, reason: &str) {
+async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanup) {
     let engine_cleanup = page.engine_cleanup;
     forget_browser_open_job_for_owner(
         &state.data_dir,
@@ -1654,7 +1944,7 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
             "Browser stale page cleanup obligation could not be persisted; attempting exact deterministic cleanup"
         );
     }
-    let engine_result = attempt_browser_engine_cleanup(state, &engine_cleanup, reason).await;
+    let engine_result = attempt_browser_engine_cleanup(state, &engine_cleanup).await;
     let stream_result = close_browser_stream_cleanup(state, page.stream_cleanup).await;
     match (&engine_result, &stream_result) {
         (Ok(_), Ok(())) => {
@@ -1684,7 +1974,6 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
 async fn attempt_browser_engine_cleanup(
     state: &GatewayState,
     cleanup: &BrowserEngineCleanup,
-    reason: &str,
 ) -> Result<serde_json::Value, String> {
     require_browser_engine_provider_binding(state, cleanup).await?;
     let call = browser_provider_resource_call(
@@ -1694,7 +1983,6 @@ async fn attempt_browser_engine_cleanup(
         serde_json::json!({
             "page_id": cleanup.page_id,
             "principal_id": cleanup.principal_id,
-            "reason": reason,
             "runtime_cleanup": cleanup.provider_cleanup,
         }),
     )
@@ -1784,7 +2072,6 @@ async fn reap_browser_open_effect_after_failure(
     principal_id: &str,
     owner_launch_id: &str,
     ownership_persisted: bool,
-    reason: &str,
 ) -> serde_json::Value {
     let page_cleanup = match browser_page_cleanup_for_principal(
         &state.data_dir,
@@ -1827,7 +2114,7 @@ async fn reap_browser_open_effect_after_failure(
                 false
             }
         };
-    let engine_result = attempt_browser_engine_cleanup(state, &engine_cleanup, reason).await;
+    let engine_result = attempt_browser_engine_cleanup(state, &engine_cleanup).await;
     if !ownership_persisted && !obligation_persisted && engine_result.is_err() {
         tracing::warn!(
             page_id,
@@ -2241,8 +2528,7 @@ pub(super) async fn browser_app_page_close(
     {
         return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
     }
-    let engine_result =
-        attempt_browser_engine_cleanup(&state, &engine_cleanup, "browser_page_close").await;
+    let engine_result = attempt_browser_engine_cleanup(&state, &engine_cleanup).await;
     let stream_result = if page_cleanup.active_session {
         release_browser_page_and_stream_for_principal(
             &state,

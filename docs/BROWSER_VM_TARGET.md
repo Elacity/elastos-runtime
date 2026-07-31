@@ -302,7 +302,14 @@ their result before signaling the child, so the child-exit event cannot replace
 the requested outcome with a timing-dependent error.
 
 An acquired page persists its exact Runtime cleanup binding with the
-generation/stream record. Cleanup transitions that record to
+generation/stream record; the durable journal does not retain the larger
+supervisor result as a second source of truth. After an Adapter restart, launch
+reconciliation validates the journal's exact generation, stream, page,
+principal, adapter, engine, display, guarantee, control/shutdown socket,
+isolation, and process binding before reconstructing the same page-control
+session used by canonical close. A missing, malformed, substituted,
+unavailable, conflicting, or ambiguous binding remains `cleanup_pending`.
+Cleanup transitions that record to
 `cleanup_pending` before acting and retains the in-memory page/VM owner until
 the shutdown hook, launcher child, control socket, page route, and VM absence
 are proven. A failed cleanup remains retryable under the same binding.
@@ -315,6 +322,15 @@ persisted cleanup binding, and every bound process and socket must be absent.
 A surviving or otherwise unprovable resource remains pending. Runtime owns the
 separate stream cleanup obligation and clears the full lifecycle only after
 both the engine receipt and stream cleanup are terminal.
+
+Runtime owns one lifecycle reconciliation service for these durable
+obligations. It scans at gateway startup, is notified when a new launch,
+exact-engine-cleanup, or stream-cleanup obligation is durably committed, and
+retries those claims without requiring another Browser open. The service
+uses one worker lane, capped batches, bounded provider calls, and exponential
+backoff capped at 30 seconds. Unresolved ownership can therefore remain
+retryable indefinitely without a task per obligation or a busy loop. Gateway
+shutdown explicitly cancels and joins the service.
 
 ## Artifact Preflight
 
@@ -569,10 +585,15 @@ Browser open failures carry `elastos.browser.open-outcome/v1`. Runtime reports
 generation and stream have an independent `did_not_act` proof.
 Transport loss, malformed or unsafe success replies, and post-launch validation
 failures are reconciled against that same identity. An exact recovered effect
-is closed through its typed cleanup binding; an exact terminal proof reports
+is never adopted after the open has failed: Runtime promotes it directly into
+exact cleanup and keeps replacement blocked until the typed terminal engine
+receipt and stream cleanup are durably committed. An exact terminal proof reports
 `terminal_post_effect_cleanup`. If neither an effect nor no-effect can be
 proved, Runtime durably retains the stream and launch ownership as
 `cleanup_pending`, reports page and VM acquisition as indeterminate, and blocks
-replacement until reconciliation completes. Browser UI renders these states
+replacement while the lifecycle service continues reconciliation. A late
+failure likewise retains cleanup ownership until a typed terminal receipt;
+absence, timeout, and provider failure never imply `did_not_act` or successful
+closure. Browser UI renders these states
 directly and does not infer lifecycle ownership from process-error text or claim
 a missing terminal page close for an indeterminate or pre-effect failure.

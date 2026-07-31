@@ -420,6 +420,7 @@ function cleanupBinding(page) {
     shutdown_socket_path: socketPath,
     isolated_session: true,
     isolation: page.isolation,
+    control_service: page.control_service,
     process: page.process,
   };
 }
@@ -855,6 +856,7 @@ const cleanupBody = (page) => ({
     shutdown_socket_path: socketPath,
     isolated_session: true,
     isolation: page.isolation,
+    control_service: page.control_service,
     process: page.process,
   },
 });
@@ -1045,6 +1047,7 @@ function shutdownBody(page) {
       shutdown_socket_path: socketPath,
       isolated_session: true,
       isolation: page.isolation,
+      control_service: page.control_service,
       process: page.process,
     },
     force_retire_vm: true,

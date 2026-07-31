@@ -910,6 +910,7 @@ const shellManifest = JSON.parse(
 );
 const shellServiceWorker = read("capsules/home/browser/service-worker.js");
 const homeGuiIndex = read("capsules/home-gui/browser/index.html");
+const homeGuiAuthority = read("capsules/home-gui/browser/home-gui-authority.js");
 const homeGuiShell = read("capsules/home-gui/browser/home-gui-shell.js");
 const homeGuiTemplateHtml = read("capsules/home-gui/browser/home-gui-template.html");
 const homeGuiJs = read("capsules/home-gui/browser/home-gui.js");
@@ -1091,6 +1092,13 @@ const homeBrowserContextOpaqueSmoke = read(
 );
 const homeBrowserContextOpaqueServer = read(
   "scripts/fixtures/home-browser-context-opaque-frame-proof/server.py",
+);
+const homeGuiSignOutSmoke = read("scripts/home-gui-sign-out-smoke.mjs");
+const homeGuiSignOutOpaqueSmoke = read(
+  "scripts/home-gui-sign-out-opaque-frame-smoke.sh",
+);
+const homeGuiSignOutOpaqueServer = read(
+  "scripts/fixtures/home-gui-sign-out-opaque-frame-proof/server.py",
 );
 const servicesCapsule = read("capsules/services/capsule.json");
 const peopleCapsule = read("capsules/people/capsule.json");
@@ -6629,7 +6637,10 @@ assert(
     homeGuiCore.includes("browser_context_id") &&
     homeGuiCore.includes("if (!hasHomeBrowserContextId())") &&
     homeGuiShell.includes('message.type === "home:shell-context"') &&
-    homeGuiShell.includes("event.source !== window.parent || event.origin !== homeOrigin") &&
+    homeGuiShell.includes("isTrustedHomeGuiMessage(event, window.parent, homeOrigin)") &&
+    homeGuiAuthority.includes(
+      "event.source === expectedSource && event.origin === expectedOrigin",
+    ) &&
     !homeGuiCore.includes("localStorage") &&
     !homeGuiShell.includes("localStorage") &&
     !homeGuiCore.includes("Math.random") &&
@@ -6805,7 +6816,18 @@ assert(
 );
 assert(
   homeGuiTemplateHtml.includes("toolbar-sign-out") &&
-    shellAuth.includes("/api/auth/sessions/sign-out"),
+    shellAuth.includes("/api/auth/sessions/sign-out") &&
+    homeGuiAuthority.includes("summary?.authority?.signed_in === true") &&
+    homeGuiShell.includes("projectHomeGuiAuthority(document.body, summary);") &&
+    homeGuiShell.includes('signOut: () => requestHome("home:sign-out")') &&
+    !homeGuiShell.includes("/api/auth/sessions/sign-out") &&
+    homeGuiSignOutSmoke.includes("only exact signed_in=true may project signed authority") &&
+    homeGuiSignOutOpaqueSmoke.includes("--headless=new") &&
+    homeGuiSignOutOpaqueServer.includes('sandbox="allow-scripts allow-forms allow-pointer-lock allow-modals"') &&
+    homeGuiSignOutOpaqueServer.includes("proof:forge-summary") &&
+    homeGuiSignOutOpaqueServer.includes("proof:click-sign-out") &&
+    homeShellBridgeSmoke.includes("an unauthorized frame or substituted token reached Runtime sign-out") &&
+    homeShellBridgeSmoke.includes("trusted Home GUI sign-out did not make exactly one Runtime revocation request"),
   "Home must expose an explicit sign-out path that clears the browser session through Runtime",
 );
 assert(

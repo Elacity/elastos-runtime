@@ -457,6 +457,18 @@ pub(super) fn validate_supervisor_result(
             );
         }
         if isolation.kind == "per_launch_vm_target" {
+            let control_service = result.control_service.as_ref().ok_or_else(|| {
+                "Browser VM supervisor result omitted control-service identity".to_string()
+            })?;
+            validate_control_service_identity(
+                control_service,
+                Some(control_service.control_socket_path.as_str()),
+            )?;
+            if !host_process_binding_is_safe(result.process.as_ref()) {
+                return Err(
+                    "Browser VM supervisor result omitted exact host-process binding".to_string(),
+                );
+            }
             if result
                 .display_session
                 .get("media_transport")
@@ -487,7 +499,13 @@ pub(super) fn validate_supervisor_result(
             }
         }
     }
-    if result.isolated_session {
+    if result.isolated_session
+        && result
+            .isolation
+            .as_ref()
+            .map(|isolation| isolation.kind.as_str())
+            != Some("per_launch_vm_target")
+    {
         let Some(process) = result.process.as_ref().and_then(Value::as_object) else {
             return Err(
                 "isolated Browser supervisor result omitted exact child process ownership"

@@ -23,6 +23,9 @@ pub async fn start_gateway_server(
         cache_dir,
         data_dir,
     };
+    let browser_lifecycle_reconciler =
+        super::gateway_browser::start_browser_lifecycle_reconciler(state.clone())
+            .map_err(anyhow::Error::msg)?;
     let app = gateway_router_with_api_url(state, gateway_api_url);
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);
@@ -41,7 +44,7 @@ pub async fn start_gateway_server(
     }
     println!();
     println!("  Cache is unbounded (Tier 1) — delete cache dir to reclaim space");
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
@@ -49,7 +52,11 @@ pub async fn start_gateway_server(
         shutdown_signal().await;
         println!("\nShutting down gateway...");
     })
-    .await?;
+    .await;
+    browser_lifecycle_reconciler.cancel();
+    let reconciliation_result = browser_lifecycle_reconciler.join().await;
+    serve_result?;
+    reconciliation_result.map_err(anyhow::Error::msg)?;
     Ok(())
 }
 

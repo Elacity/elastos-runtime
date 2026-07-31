@@ -5418,13 +5418,14 @@ mod tests {
         .unwrap());
     }
 
-    #[test]
-    fn sign_out_revokes_http_only_home_cookie_session() {
+    #[tokio::test]
+    async fn sign_out_revokes_only_active_session_without_resetting_principal_or_passkey() {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
-        let grant = issue_passkey_session_grant(
+        store_test_credential(temp.path(), credential.clone());
+        let active = issue_passkey_session_grant(
             &state,
             "identity-test",
             &credential,
@@ -5433,18 +5434,53 @@ mod tests {
             "test passkey grant",
         )
         .unwrap();
-        let headers = home_session_cookie_headers(&grant.home_token);
+        let retained = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "retained passkey grant",
+        )
+        .unwrap();
+        let principal_before =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &active.proof_binding_id)
+                .unwrap();
+        let headers = home_session_cookie_headers(&active.home_token);
 
         let response = sign_out_session_inner(&state, &headers).unwrap();
 
         assert_eq!(response.status, "signed_out");
-        assert_eq!(response.session_id, grant.session_id);
+        assert_eq!(response.session_id, active.session_id);
         assert!(!crate::auth::is_auth_session_active(
             temp.path(),
-            &grant.session_id,
+            &active.session_id,
             crate::auth::now_ts()
         )
         .unwrap());
+        assert!(crate::auth::is_auth_session_active(
+            temp.path(),
+            &retained.session_id,
+            crate::auth::now_ts()
+        )
+        .unwrap());
+
+        let principal_after =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &active.proof_binding_id)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(principal_after).unwrap(),
+            serde_json::to_value(principal_before).unwrap(),
+        );
+
+        let passkeys = passkey_list_inner(&state, &home_token_headers(&retained.home_token))
+            .await
+            .unwrap();
+        assert!(passkeys.passkeys.iter().any(|passkey| {
+            passkey.proof_binding_id == active.proof_binding_id
+                && passkey.principal_id == active.principal_id
+                && passkey.current
+        }));
     }
 
     #[tokio::test]

@@ -57,6 +57,7 @@ pub(in crate::api::gateway) struct BrowserLaunchReservation {
     cleanup_id: String,
     generation: String,
     engine_route_provider: String,
+    selected_engine_adapter: Option<String>,
 }
 
 impl BrowserLaunchReservation {
@@ -71,6 +72,10 @@ impl BrowserLaunchReservation {
     pub(in crate::api::gateway) fn engine_route_provider(&self) -> &str {
         &self.engine_route_provider
     }
+
+    pub(in crate::api::gateway) fn selected_engine_adapter(&self) -> Option<&str> {
+        self.selected_engine_adapter.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +84,7 @@ pub(in crate::api::gateway) struct BrowserLaunchLifecycle {
     pub(in crate::api::gateway) url: String,
     pub(in crate::api::gateway) exit_id: String,
     pub(in crate::api::gateway) engine_route_provider: String,
+    pub(in crate::api::gateway) selected_engine_adapter: Option<String>,
     pub(in crate::api::gateway) profile_key_hash: Option<String>,
     pub(in crate::api::gateway) vm_key_hash: Option<String>,
 }
@@ -124,6 +130,7 @@ struct BrowserSessionRecord {
     generation: String,
     page_id: Option<String>,
     engine_route_provider: String,
+    selected_engine_adapter: Option<String>,
     engine_provider: Option<String>,
     engine_protocol_version: Option<String>,
     engine_adapter: Option<String>,
@@ -250,6 +257,8 @@ pub(in crate::api::gateway) struct BrowserLaunchReconciliation {
     pub(in crate::api::gateway) owner_launch_id: String,
     pub(in crate::api::gateway) generation: String,
     pub(in crate::api::gateway) engine_route_provider: String,
+    #[serde(default)]
+    pub(in crate::api::gateway) selected_engine_adapter: Option<String>,
     pub(in crate::api::gateway) stream_id: String,
     #[serde(default)]
     pub(in crate::api::gateway) stream_cleanup: Option<BrowserStreamCleanup>,
@@ -293,6 +302,10 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
     if principal_id.trim().is_empty()
         || lifecycle.owner_launch_id.trim().is_empty()
         || lifecycle.engine_route_provider.trim().is_empty()
+        || lifecycle
+            .selected_engine_adapter
+            .as_deref()
+            .is_some_and(|adapter| adapter.len() > 128 || !is_safe_runtime_id(adapter))
     {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -402,6 +415,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
     ));
     let cleanup_id = format!("browser-cleanup:{}", generation.replace(':', "-"));
     let engine_route_provider = lifecycle.engine_route_provider.clone();
+    let selected_engine_adapter = lifecycle.selected_engine_adapter.clone();
     let now = Instant::now();
     let started_at = SystemTime::now();
     registry.sessions.insert(
@@ -414,6 +428,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             generation: generation.clone(),
             page_id: None,
             engine_route_provider: lifecycle.engine_route_provider,
+            selected_engine_adapter: lifecycle.selected_engine_adapter,
             engine_provider: None,
             engine_protocol_version: None,
             engine_adapter: None,
@@ -440,6 +455,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
         cleanup_id,
         generation,
         engine_route_provider,
+        selected_engine_adapter,
     })
 }
 
@@ -592,6 +608,11 @@ pub(in crate::api::gateway) async fn complete_browser_launch(
         if record.cleanup_id != reservation.cleanup_id
             || record.generation != reservation.generation
             || record.scope != browser_session_scope(data_dir)
+            || record.selected_engine_adapter != reservation.selected_engine_adapter
+            || record
+                .selected_engine_adapter
+                .as_deref()
+                .is_some_and(|selected| selected != effect.engine_adapter)
         {
             return Err("Browser launch ownership changed before effect binding".to_string());
         }
@@ -641,6 +662,7 @@ pub(in crate::api::gateway) async fn record_browser_launch_reconciliation_obliga
     if record.scope != scope
         || record.cleanup_id != reservation.cleanup_id
         || record.generation != reservation.generation
+        || record.selected_engine_adapter != reservation.selected_engine_adapter
         || stream_cleanup.as_ref().is_some_and(|cleanup| {
             cleanup.stream_id != stream_id || cleanup.principal_id != record.principal_id
         })
@@ -654,6 +676,7 @@ pub(in crate::api::gateway) async fn record_browser_launch_reconciliation_obliga
         owner_launch_id: record.owner_launch_id.clone(),
         generation: record.generation.clone(),
         engine_route_provider: record.engine_route_provider.clone(),
+        selected_engine_adapter: record.selected_engine_adapter.clone(),
         stream_id: stream_id.to_string(),
         stream_cleanup,
     };
@@ -670,11 +693,14 @@ pub(in crate::api::gateway) async fn record_browser_launch_reconciliation_obliga
         },
     );
     registry.sessions.remove(&reservation.id);
+    drop(registry);
+    super::notify_browser_lifecycle_reconciler(data_dir);
     Ok(())
 }
 
 pub(in crate::api::gateway) async fn claim_pending_browser_launch_reconciliations(
     data_dir: &Path,
+    limit: usize,
 ) -> Vec<BrowserLaunchReconciliation> {
     let scope = browser_session_scope(data_dir);
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
@@ -686,6 +712,7 @@ pub(in crate::api::gateway) async fn claim_pending_browser_launch_reconciliation
         .pending_launch_reconciliations
         .values_mut()
         .filter(|obligation| obligation.scope == scope && !obligation.in_flight)
+        .take(limit)
         .map(|obligation| {
             obligation.in_flight = true;
             obligation.reconciliation.clone()
@@ -707,6 +734,30 @@ pub(in crate::api::gateway) async fn release_browser_launch_reconciliation_claim
         .get_mut(&key)
     {
         obligation.in_flight = false;
+    }
+}
+
+pub(in crate::api::gateway) async fn release_browser_lifecycle_reconciliation_claims(
+    data_dir: &Path,
+) {
+    let scope = browser_session_scope(data_dir);
+    let stream_prefix = format!("{scope}\n");
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    for obligation in registry.pending_launch_reconciliations.values_mut() {
+        if obligation.scope == scope {
+            obligation.in_flight = false;
+        }
+    }
+    for obligation in registry.pending_engine_cleanups.values_mut() {
+        if obligation.scope == scope {
+            obligation.in_flight = false;
+        }
+    }
+    for (key, obligation) in registry.pending_stream_cleanups.iter_mut() {
+        if key.starts_with(&stream_prefix) {
+            obligation.in_flight = false;
+        }
     }
 }
 
@@ -772,6 +823,8 @@ pub(in crate::api::gateway) async fn promote_browser_launch_reconciliation_effec
     registry.sessions.retain(|_, session| {
         session.scope != scope || session.generation != reconciliation.generation
     });
+    drop(registry);
+    super::notify_browser_lifecycle_reconciler(data_dir);
     Ok(())
 }
 
@@ -1082,6 +1135,7 @@ pub(in crate::api::gateway) async fn record_browser_engine_cleanup_obligation(
             browser_page: browser_page.clone(),
         },
     );
+    let is_new_obligation = !registry.pending_engine_cleanups.contains_key(&key);
     registry
         .pending_engine_cleanups
         .entry(key)
@@ -1096,11 +1150,16 @@ pub(in crate::api::gateway) async fn record_browser_engine_cleanup_obligation(
             in_flight: true,
             attempts: 1,
         });
+    drop(registry);
+    if persist_result.is_ok() && is_new_obligation {
+        super::notify_browser_lifecycle_reconciler(data_dir);
+    }
     persist_result
 }
 
 pub(in crate::api::gateway) async fn claim_pending_browser_engine_cleanups(
     data_dir: &Path,
+    limit: usize,
 ) -> Vec<BrowserEngineCleanup> {
     let scope = browser_session_scope(data_dir);
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
@@ -1112,6 +1171,7 @@ pub(in crate::api::gateway) async fn claim_pending_browser_engine_cleanups(
         .pending_engine_cleanups
         .values_mut()
         .filter(|obligation| obligation.scope == scope && !obligation.in_flight)
+        .take(limit)
         .map(|obligation| {
             obligation.in_flight = true;
             obligation.attempts = obligation.attempts.saturating_add(1);
@@ -1188,9 +1248,9 @@ pub(in crate::api::gateway) async fn record_browser_stream_cleanup_failure(
     let scope = browser_session_scope(data_dir);
     let key = browser_stream_cleanup_key(&scope, &cleanup.stream_id);
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    let is_new_obligation = !registry.pending_stream_cleanups.contains_key(&key);
     registry
-        .lock()
-        .await
         .pending_stream_cleanups
         .entry(key)
         .and_modify(|obligation| {
@@ -1201,6 +1261,10 @@ pub(in crate::api::gateway) async fn record_browser_stream_cleanup_failure(
             cleanup,
             in_flight: false,
         });
+    drop(registry);
+    if persist_result.is_ok() && is_new_obligation {
+        super::notify_browser_lifecycle_reconciler(data_dir);
+    }
     persist_result
 }
 
@@ -1486,6 +1550,7 @@ pub(in crate::api::gateway) async fn take_stale_browser_pages(
 
 pub(in crate::api::gateway) async fn claim_pending_browser_stream_cleanups(
     data_dir: &Path,
+    limit: usize,
 ) -> Vec<BrowserStreamCleanup> {
     let scope = browser_session_scope(data_dir);
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
@@ -1498,6 +1563,7 @@ pub(in crate::api::gateway) async fn claim_pending_browser_stream_cleanups(
         .pending_stream_cleanups
         .iter_mut()
         .filter(|(key, obligation)| key.starts_with(&prefix) && !obligation.in_flight)
+        .take(limit)
         .map(|(_, obligation)| {
             obligation.in_flight = true;
             obligation.cleanup.clone()
@@ -1953,6 +2019,10 @@ fn browser_launch_reconciliation_is_safe(reconciliation: &BrowserLaunchReconcili
         && reconciliation.owner_launch_id.len() <= 512
         && reconciliation.generation.len() <= 256
         && reconciliation.engine_route_provider.len() <= 256
+        && reconciliation
+            .selected_engine_adapter
+            .as_deref()
+            .is_none_or(|adapter| adapter.len() <= 128 && is_safe_runtime_id(adapter))
         && reconciliation.stream_id.len() <= 256
         && is_safe_runtime_id(&reconciliation.cleanup_id)
         && is_safe_runtime_id(&reconciliation.principal_id)
@@ -2350,6 +2420,7 @@ mod tests {
             generation: "sha256:generation".to_string(),
             page_id: page_id.map(str::to_string),
             engine_route_provider: "mock-browser-route".to_string(),
+            selected_engine_adapter: Some("mock-adapter".to_string()),
             engine_provider: page_id.map(|_| "mock-browser-engine".to_string()),
             engine_protocol_version: page_id.map(|_| BROWSER_ENGINE_PROTOCOL_VERSION.to_string()),
             engine_adapter: page_id.map(|_| "mock-adapter".to_string()),
@@ -2390,6 +2461,7 @@ mod tests {
             url: "https://example.com/".to_string(),
             exit_id: "local-runtime".to_string(),
             engine_route_provider: "mock-browser-route".to_string(),
+            selected_engine_adapter: Some("mock-adapter".to_string()),
             profile_key_hash: Some("sha256:profilehash".to_string()),
             vm_key_hash: Some("sha256:vmhash".to_string()),
         }
@@ -2838,7 +2910,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 1);
-        let retry = claim_pending_browser_engine_cleanups(dir.path()).await;
+        let retry = claim_pending_browser_engine_cleanups(dir.path(), usize::MAX).await;
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0], cleanup);
 
@@ -2874,7 +2946,7 @@ mod tests {
             .is_err());
         assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 1);
         assert_eq!(
-            claim_pending_browser_stream_cleanups(dir.path()).await,
+            claim_pending_browser_stream_cleanups(dir.path(), usize::MAX).await,
             vec![cleanup.clone()]
         );
 
@@ -2991,6 +3063,14 @@ mod tests {
         let reconciliation_path =
             browser_launch_reconciliation_path(dir.path(), reservation.cleanup_id());
         assert!(reconciliation_path.exists());
+        let durable_reconciliation: BrowserLaunchReconciliation = serde_json::from_slice(
+            &std::fs::read(&reconciliation_path).expect("durable launch reconciliation"),
+        )
+        .unwrap();
+        assert_eq!(
+            durable_reconciliation.selected_engine_adapter.as_deref(),
+            Some("mock-adapter")
+        );
         assert_eq!(browser_page_session_count(dir.path()).await, 0);
 
         let scope = browser_session_scope(dir.path());
@@ -3019,10 +3099,14 @@ mod tests {
         assert_eq!(blocked.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(blocked.1.contains("cleanup is pending"));
 
-        let recovered = claim_pending_browser_launch_reconciliations(dir.path()).await;
+        let recovered = claim_pending_browser_launch_reconciliations(dir.path(), usize::MAX).await;
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].generation, reservation.generation());
         assert_eq!(recovered[0].stream_id, stream_cleanup.stream_id);
+        assert_eq!(
+            recovered[0].selected_engine_adapter.as_deref(),
+            Some("mock-adapter")
+        );
         forget_browser_launch_reconciliation_obligation(dir.path(), &recovered[0])
             .await
             .unwrap();

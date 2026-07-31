@@ -730,6 +730,7 @@ include!("support_providers.rs");
 include!("support_runtime.rs");
 
 mod browser_profile;
+mod browser_reconciliation;
 mod documents;
 mod esp;
 #[path = "../gateway_browser_route_tests.rs"]

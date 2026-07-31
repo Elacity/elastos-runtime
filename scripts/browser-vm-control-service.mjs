@@ -19,6 +19,10 @@ const LAUNCH_RECONCILIATION_JOURNAL_SCHEMA =
 const LAUNCH_SETTLEMENT_DID_NOT_ACT = "did_not_act";
 const LAUNCH_SETTLEMENT_TERMINAL = "terminal_post_effect_cleanup";
 const LAUNCH_SETTLEMENT_PENDING = "cleanup_pending";
+const CONTROL_SERVICE_IDENTITY_SCHEMA =
+  "elastos.browser.vm-control-service.identity/v1";
+const HOST_PROCESS_BINDING_SCHEMA =
+  "elastos.browser.host-process-binding/v1";
 const ownedLauncherChildren = new Set();
 
 function fail(message) {
@@ -38,6 +42,47 @@ function trackOwnedLauncherChild(child) {
   return child;
 }
 
+function newHostProcessOwnershipId() {
+  return `process:${crypto.randomBytes(32).toString("hex")}`;
+}
+
+function bindOwnedLauncherProcess(child, ownershipId) {
+  if (
+    !child ||
+    !Number.isInteger(child.pid) ||
+    child.pid <= 1 ||
+    child.pid > 0x7fffffff ||
+    !ownedLauncherChildren.has(child) ||
+    !/^process:[0-9a-f]{64}$/.test(ownershipId)
+  ) {
+    throw new Error(
+      "Browser VM control service could not bind its exact owned launcher process",
+    );
+  }
+  return {
+    schema: HOST_PROCESS_BINDING_SCHEMA,
+    ownership_id: ownershipId,
+    pid: child.pid,
+    stream_bridge_pid: null,
+  };
+}
+
+function exactOwnedLauncherProcess(binding, record, vmRecord, launcherChild) {
+  const ownedBinding =
+    vmRecord?.process_binding || record?.process_binding || record?.page?.process;
+  if (
+    !hostProcessBindingIsSafe(binding?.process) ||
+    !isDeepStrictEqual(binding.process, ownedBinding) ||
+    !launcherChild ||
+    launcherChild.pid !== binding.process.pid
+  ) {
+    throw new Error(
+      "Browser VM cleanup has no exact control-service-owned process handle",
+    );
+  }
+  return launcherChild;
+}
+
 function parseConfig() {
   const raw = process.env[CONFIG_ENV];
   if (!raw) fail(`${CONFIG_ENV} is required`);
@@ -55,6 +100,32 @@ function safeId(value) {
   return typeof value === "string" && /^[A-Za-z0-9:_-]+$/.test(value);
 }
 
+function controlServiceIdentityIsSafe(identity, controlSocketPath) {
+  return (
+    identity?.schema === CONTROL_SERVICE_IDENTITY_SCHEMA &&
+    typeof identity.service_id === "string" &&
+    /^service:[0-9a-f]{64}$/.test(identity.service_id) &&
+    typeof identity.control_socket_path === "string" &&
+    identity.control_socket_path.startsWith("/") &&
+    !/[\r\n\0]/.test(identity.control_socket_path) &&
+    identity.control_socket_path === controlSocketPath &&
+    (identity.config_fingerprint === null ||
+      /^[0-9a-f]{64}$/.test(identity.config_fingerprint))
+  );
+}
+
+function hostProcessBindingIsSafe(binding) {
+  return (
+    binding?.schema === HOST_PROCESS_BINDING_SCHEMA &&
+    typeof binding.ownership_id === "string" &&
+    /^process:[0-9a-f]{64}$/.test(binding.ownership_id) &&
+    Number.isInteger(binding.pid) &&
+    binding.pid > 1 &&
+    binding.pid <= 0x7fffffff &&
+    binding.stream_bridge_pid === null
+  );
+}
+
 function validateRuntimeCleanupBinding(binding, pageId) {
   if (
     binding?.schema !== "elastos.browser.engine-cleanup-binding/v2" ||
@@ -66,7 +137,12 @@ function validateRuntimeCleanupBinding(binding, pageId) {
     typeof binding.engine !== "string" ||
     binding.isolated_session !== true ||
     binding.isolation?.schema !== "elastos.browser.engine.isolation/v1" ||
-    binding.isolation?.kind !== "per_launch_vm_target"
+    binding.isolation?.kind !== "per_launch_vm_target" ||
+    !controlServiceIdentityIsSafe(
+      binding.control_service,
+      binding.shutdown_socket_path,
+    ) ||
+    !hostProcessBindingIsSafe(binding.process)
   ) {
     throw new Error("invalid Runtime Browser cleanup binding");
   }
@@ -87,28 +163,10 @@ function validateRuntimeCleanupBinding(binding, pageId) {
   return binding;
 }
 
-function cleanupProcessIds(binding) {
-  return ["pid", "stream_bridge_pid"]
-    .map((key) => Number(binding?.process?.[key] || 0))
-    .filter((pid) => Number.isInteger(pid) && pid > 0);
-}
-
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code !== "ESRCH";
-  }
-}
-
-function exactCleanupEffectsAbsent(binding, pageId, activePages, activeVms) {
-  const processIds = cleanupProcessIds(binding);
+function exactCleanupEffects(binding, pageId, activePages, activeVms, childAbsent) {
   const pageAbsent =
     !activePages.has(pageId) &&
     [...activeVms.values()].every((record) => !record.pages.has(pageId));
-  const childAbsent =
-    processIds.length > 0 && processIds.every((pid) => !processIsAlive(pid));
   const socketAbsent = !fs.existsSync(binding.control_socket_path);
   return {
     page_absent: pageAbsent,
@@ -132,7 +190,12 @@ function launchIdentityMatchesCleanupBinding(launch, binding) {
   );
 }
 
-function cleanupBindingForSupervisorResult(config, launch, result) {
+function cleanupBindingForSupervisorResult(
+  config,
+  controlServiceIdentity,
+  launch,
+  result,
+) {
   const binding = {
     schema: "elastos.browser.engine-cleanup-binding/v2",
     page_id: result.page_id,
@@ -147,7 +210,8 @@ function cleanupBindingForSupervisorResult(config, launch, result) {
     shutdown_socket_path: config.control_socket_path,
     isolated_session: true,
     isolation: result.isolation,
-    process: result.process ?? null,
+    control_service: controlServiceIdentity,
+    process: result.process,
   };
   validateRuntimeCleanupBinding(binding, result.page_id);
   return binding;
@@ -173,7 +237,12 @@ function terminalCleanupReceipt(binding, effects, fields = {}) {
   };
 }
 
-function requireExactRuntimeCleanupRecord(config, binding, record) {
+function requireExactRuntimeCleanupRecord(
+  config,
+  controlServiceIdentity,
+  binding,
+  record,
+) {
   const launch = record?.launch;
   const page = record?.page;
   const exact =
@@ -188,6 +257,7 @@ function requireExactRuntimeCleanupRecord(config, binding, record) {
     (binding.principal_id || "") === (launch.principal_id || "") &&
     binding.control_socket_path === page.control_socket_path &&
     binding.shutdown_socket_path === config.control_socket_path &&
+    isDeepStrictEqual(binding.control_service, controlServiceIdentity) &&
     JSON.stringify(binding.isolation) === JSON.stringify(page.isolation) &&
     JSON.stringify(binding.process) === JSON.stringify(page.process);
   if (!exact) {
@@ -204,6 +274,9 @@ function requireExactDurableCleanupRecord(store, binding) {
   if (
     !record ||
     !record.cleanup_binding ||
+    !record.control_service ||
+    !isDeepStrictEqual(record.control_service, store.control_service) ||
+    !isDeepStrictEqual(binding.control_service, store.control_service) ||
     !launchIdentityMatchesCleanupBinding(record.launch, binding) ||
     !isDeepStrictEqual(record.cleanup_binding, binding) ||
     ![
@@ -230,6 +303,12 @@ function validateConfig(config) {
     throw new Error("unsupported Browser VM control service config schema");
   }
   validateAbsolutePath(config.control_socket_path, "control_socket_path");
+  if (config.control_service_identity_path !== undefined) {
+    validateAbsolutePath(
+      config.control_service_identity_path,
+      "control_service_identity_path",
+    );
+  }
   validateAbsolutePath(config.launcher_program, "launcher_program");
   if (!fs.existsSync(config.launcher_program)) {
     throw new Error(`launcher_program does not exist: ${config.launcher_program}`);
@@ -279,6 +358,72 @@ function validateConfig(config) {
   if (!Number.isInteger(timeout) || timeout < 1000 || timeout > 600000) {
     throw new Error("launch_timeout_ms must be 1000..600000");
   }
+}
+
+function controlServiceIdentityPath(config) {
+  return (
+    config.control_service_identity_path ||
+    `${config.control_socket_path}.identity.json`
+  );
+}
+
+function loadOrCreateControlServiceIdentity(config) {
+  const identityPath = controlServiceIdentityPath(config);
+  let persisted = null;
+  try {
+    const stat = fs.lstatSync(identityPath);
+    requireOwnerOnlyRegularFile(
+      identityPath,
+      stat,
+      "Browser VM control service identity",
+    );
+    persisted = JSON.parse(fs.readFileSync(identityPath, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (persisted !== null) {
+    if (
+      persisted?.schema !== CONTROL_SERVICE_IDENTITY_SCHEMA ||
+      !/^service:[0-9a-f]{64}$/.test(persisted.service_id || "") ||
+      persisted.control_socket_path !== config.control_socket_path
+    ) {
+      throw new Error("Browser VM control service identity is invalid");
+    }
+  } else {
+    persisted = {
+      schema: CONTROL_SERVICE_IDENTITY_SCHEMA,
+      service_id: `service:${crypto.randomBytes(32).toString("hex")}`,
+      control_socket_path: config.control_socket_path,
+    };
+    fs.mkdirSync(path.dirname(identityPath), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const temporaryPath = `${identityPath}.tmp.${process.pid}.${crypto
+      .randomBytes(8)
+      .toString("hex")}`;
+    let fd;
+    try {
+      fd = fs.openSync(temporaryPath, "wx", 0o600);
+      fs.writeFileSync(fd, JSON.stringify(persisted));
+      fs.fchmodSync(fd, 0o600);
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = undefined;
+      fs.renameSync(temporaryPath, identityPath);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      try {
+        fs.unlinkSync(temporaryPath);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+  }
+  return {
+    ...persisted,
+    config_fingerprint: config.config_fingerprint || null,
+  };
 }
 
 function jsonResponse(res, status, body) {
@@ -441,6 +586,11 @@ function launchReconciliationRecordIsSafe(record) {
       (safeId(launch.principal_id) && launch.principal_id.length <= 512)) &&
     launch.display_mode === "webrtc_remote_display" &&
     launch.guarantee_level === "mechanism_microvm" &&
+    (record.control_service === undefined ||
+      controlServiceIdentityIsSafe(
+        record.control_service,
+        record.control_service?.control_socket_path,
+      )) &&
     typeof record.updated_at === "string" &&
     record.updated_at.length <= 64 &&
     Number.isFinite(Date.parse(record.updated_at)) &&
@@ -464,6 +614,9 @@ function durableLaunchReconciliationRecord(record) {
   };
   if (record.cleanup_binding !== undefined) {
     durable.cleanup_binding = record.cleanup_binding;
+  }
+  if (record.control_service !== undefined) {
+    durable.control_service = record.control_service;
   }
   return durable;
 }
@@ -577,11 +730,12 @@ function persistLaunchReconciliations(store) {
   }
 }
 
-function launchReconciliationStore(config) {
+function launchReconciliationStore(config, controlServiceIdentity) {
   const journalPath = launchReconciliationJournalPath(config);
   return {
     journal_path: journalPath,
     records: loadLaunchReconciliations(journalPath),
+    control_service: controlServiceIdentity,
   };
 }
 
@@ -618,6 +772,7 @@ function recordLaunchReconciliation(
     schema: "elastos.browser.vm-control-service.launch-reconciliation/v1",
     state,
     launch: launchReconciliationIdentity(launch),
+    control_service: launchReconciliationStore.control_service,
     updated_at: new Date().toISOString(),
     ...fields,
   };
@@ -679,6 +834,7 @@ function reconcileLaunch(launchReconciliationStore, activePages, body) {
     return {
       schema: "elastos.browser.vm-control-service.launch-reconciliation/v1",
       state: "cleanup_pending",
+      responder_control_service: launchReconciliationStore.control_service,
       launch: {
         lifecycle_generation: body.lifecycle_generation,
         stream_id: body.stream_id,
@@ -694,13 +850,17 @@ function reconcileLaunch(launchReconciliationStore, activePages, body) {
     return {
       schema: "elastos.browser.vm-control-service.launch-reconciliation/v1",
       state: "indeterminate",
+      responder_control_service: launchReconciliationStore.control_service,
       launch: {
         lifecycle_generation: body.lifecycle_generation,
         stream_id: body.stream_id,
       },
     };
   }
-  return record;
+  return {
+    ...record,
+    responder_control_service: launchReconciliationStore.control_service,
+  };
 }
 
 function markLaunchReconciliationTerminal(
@@ -768,6 +928,17 @@ function validateSupervisorResult(result, launch) {
   }
   if (result.isolation?.kind !== "per_launch_vm_target") {
     throw new Error("launcher must report per_launch_vm_target isolation");
+  }
+  if (
+    !controlServiceIdentityIsSafe(
+      result.control_service,
+      result.control_service?.control_socket_path,
+    ) ||
+    !hostProcessBindingIsSafe(result.process)
+  ) {
+    throw new Error(
+      "launcher result lacks an exact control-service-owned host process binding",
+    );
   }
   try {
     validateAbsolutePath(result.isolation?.session_dir, "launcher isolation session_dir");
@@ -1346,6 +1517,8 @@ function vmSupervisorResultFromGuest(result, launch, vmRecord) {
   normalized.control_socket_path = vmRecord.control_socket_path;
   normalized.isolated_session = true;
   normalized.isolation = vmRecord.isolation;
+  normalized.control_service = vmRecord.control_service;
+  normalized.process = vmRecord.process_binding;
   normalized.network_mode = "runtime_net_only";
   normalized.direct_network = false;
   normalized.wallet_injection = false;
@@ -1510,6 +1683,8 @@ function retainLaunchReconciliationPendingInMemory(
     schema: "elastos.browser.vm-control-service.launch-reconciliation/v1",
     state: "cleanup_pending",
     launch: current?.launch || launchReconciliationIdentity(launch),
+    control_service:
+      current?.control_service || launchReconciliationStore.control_service,
     updated_at: new Date().toISOString(),
     effects: { page_acquired: null, vm_acquired: null },
   });
@@ -1609,6 +1784,7 @@ async function settleDispatchedLaunchFailure(
 
 async function openPage(
   config,
+  controlServiceIdentity,
   body,
   activePages,
   activeVms,
@@ -1712,6 +1888,7 @@ async function openPage(
           effects: { page_acquired: true, vm_acquired: true },
           cleanup_binding: cleanupBindingForSupervisorResult(
             config,
+            controlServiceIdentity,
             launch,
             result,
           ),
@@ -1723,6 +1900,7 @@ async function openPage(
         launch,
         vm_key: vmKey,
         launcher_child: null,
+        process_binding: activeVm.process_binding,
         started_at: new Date(startedAt).toISOString(),
       });
       activeVm.pages.add(result.page_id);
@@ -1818,6 +1996,7 @@ async function openPage(
       request_id: `browser-vm:${crypto.randomBytes(8).toString("hex")}`,
     },
   };
+  const processOwnershipId = newHostProcessOwnershipId();
   const serialized = JSON.stringify(request);
   const timeoutMs = Number(config.launch_timeout_ms ?? 120000);
   const startedAt = Date.now();
@@ -1877,6 +2056,11 @@ async function openPage(
           signal,
         );
     const result = JSON.parse(launcher.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) || "");
+    result.control_service = controlServiceIdentity;
+    result.process = bindOwnedLauncherProcess(
+      launcher.child,
+      processOwnershipId,
+    );
     validateSupervisorResult(result, launch);
     recordLaunchReconciliation(
       launchReconciliations,
@@ -1886,6 +2070,7 @@ async function openPage(
         effects: { page_acquired: true, vm_acquired: true },
         cleanup_binding: cleanupBindingForSupervisorResult(
           config,
+          controlServiceIdentity,
           launch,
           result,
         ),
@@ -1897,6 +2082,7 @@ async function openPage(
       launch,
       vm_key: vmKey,
       launcher_child: launcher.child || null,
+      process_binding: result.process,
       started_at: new Date(startedAt).toISOString(),
     });
     if (vmKey && result.control_socket_path) {
@@ -1904,6 +2090,8 @@ async function openPage(
         control_socket_path: result.control_socket_path,
         isolation: result.isolation,
         launcher_child: launcher.child || null,
+        control_service: controlServiceIdentity,
+        process_binding: result.process,
         pages: new Set([result.page_id]),
         pending_reconciliations: new Map(),
         profile_lease_key: profileLeaseKey,
@@ -2011,6 +2199,7 @@ async function openPage(
 
 async function shutdownPage(
   config,
+  controlServiceIdentity,
   body,
   activePages,
   activeVms,
@@ -2033,7 +2222,12 @@ async function shutdownPage(
   );
   const record = activePages.get(pageId);
   if (record) {
-    requireExactRuntimeCleanupRecord(config, runtimeCleanup, record);
+    requireExactRuntimeCleanupRecord(
+      config,
+      controlServiceIdentity,
+      runtimeCleanup,
+      record,
+    );
   }
   let vmKey = record?.vm_key || null;
   let vmRecord = vmKey ? activeVms.get(vmKey) : null;
@@ -2078,55 +2272,22 @@ async function shutdownPage(
   };
 
   if (!record && !vmRecord) {
-    const effects = exactCleanupEffectsAbsent(
-      runtimeCleanup,
-      pageId,
-      activePages,
-      activeVms,
-    );
-    const unresolved = Object.entries(effects)
-      .filter(([, value]) => value !== true)
-      .map(([key]) => key);
-    if (unresolved.length > 0) {
-      if (durableRecord.state !== LAUNCH_SETTLEMENT_PENDING) {
-        recordCleanupPending();
-      }
+    if (durableRecord.state !== LAUNCH_SETTLEMENT_TERMINAL) {
       throw new Error(
-        `Browser VM cleanup remains indeterminate after service restart: ${unresolved.join(", ")}`,
+        "Browser VM cleanup remains indeterminate after service restart: exact owned launcher unavailable",
       );
     }
-    if (durableRecord.state !== LAUNCH_SETTLEMENT_TERMINAL) {
-      recordCleanupPending();
-      try {
-        await runShutdownProgram(null);
-      } catch (error) {
-        throw new Error(
-          `Browser VM cleanup failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    }
-    const receipt = terminalCleanupReceipt(
+    return terminalCleanupReceipt(
       runtimeCleanup,
-      exactCleanupEffectsAbsent(
-        runtimeCleanup,
-        pageId,
-        activePages,
-        activeVms,
-      ),
+      {
+        page_absent: true,
+        child_absent: true,
+        vm_absent: true,
+        route_absent: true,
+        socket_absent: true,
+      },
       { already_absent: true },
     );
-    markLaunchReconciliationTerminal(
-      launchReconciliations,
-      runtimeCleanup.generation,
-      runtimeCleanup.stream_id,
-      {
-        page_acquired: true,
-        vm_acquired: true,
-      },
-    );
-    return receipt;
   }
   if (
     vmRecord &&
@@ -2136,6 +2297,13 @@ async function shutdownPage(
       "Browser VM cleanup cannot retire a VM that still owns another page",
     );
   }
+  const launcherChild = vmRecord?.launcher_child || record?.launcher_child;
+  const ownedLauncherChild = exactOwnedLauncherProcess(
+    runtimeCleanup,
+    record,
+    vmRecord,
+    launcherChild,
+  );
   recordCleanupPending();
   if (record) record.cleanup_pending = true;
 
@@ -2171,13 +2339,20 @@ async function shutdownPage(
   } catch (error) {
     cleanupErrors.push(error instanceof Error ? error.message : String(error));
   }
-  const launcherChild = vmRecord?.launcher_child || record?.launcher_child;
-  if (cleanupErrors.length === 0 && launcherChild) {
+  if (cleanupErrors.length === 0) {
     try {
       await terminatePersistentLauncher(
-        launcherChild,
+        ownedLauncherChild,
         Number(config.shutdown_timeout_ms ?? 30000),
       );
+      if (
+        ownedLauncherChild.exitCode == null &&
+        ownedLauncherChild.signalCode == null
+      ) {
+        throw new Error(
+          "Browser VM exact owned launcher did not produce an exit receipt",
+        );
+      }
     } catch (error) {
       cleanupErrors.push(error instanceof Error ? error.message : String(error));
     }
@@ -2199,14 +2374,7 @@ async function shutdownPage(
     throw new Error(`Browser VM cleanup failed: ${cleanupErrors.join("; ")}`);
   }
 
-  const processIds = cleanupProcessIds(runtimeCleanup);
   const externallyUnresolved = [];
-  if (
-    processIds.length === 0 ||
-    processIds.some((pid) => processIsAlive(pid))
-  ) {
-    externallyUnresolved.push("child_absent", "vm_absent");
-  }
   if (fs.existsSync(runtimeCleanup.control_socket_path)) {
     externallyUnresolved.push("socket_absent");
   }
@@ -2226,7 +2394,13 @@ async function shutdownPage(
   }
   const receipt = terminalCleanupReceipt(
     runtimeCleanup,
-    exactCleanupEffectsAbsent(runtimeCleanup, pageId, activePages, activeVms),
+    exactCleanupEffects(
+      runtimeCleanup,
+      pageId,
+      activePages,
+      activeVms,
+      true,
+    ),
     {
       forced_vm_retirement: Boolean(closeError),
       ...(closeError ? { control_error: closeError } : {}),
@@ -2369,6 +2543,7 @@ function serviceHasEffects(activePages, activeVms, pendingLaunches) {
 
 function main() {
   const config = parseConfig();
+  const controlServiceIdentity = loadOrCreateControlServiceIdentity(config);
   const serviceStartedAtMs = Date.now();
   const serviceStartedAt = new Date(serviceStartedAtMs).toISOString();
   const activePages = new Map();
@@ -2380,7 +2555,10 @@ function main() {
   let shutdownPromise = null;
   let ownedControlSocketIdentity = null;
   prepareControlSocket(config.control_socket_path);
-  const launchReconciliations = launchReconciliationStore(config);
+  const launchReconciliations = launchReconciliationStore(
+    config,
+    controlServiceIdentity,
+  );
   const server = http.createServer(async (req, res) => {
     let responseStarted = false;
     const sendJson = (status, body) => {
@@ -2397,6 +2575,7 @@ function main() {
           started_at: serviceStartedAt,
           uptime_ms: Math.max(0, Date.now() - serviceStartedAtMs),
           config_fingerprint: config.config_fingerprint || null,
+          control_service: controlServiceIdentity,
           active_pages: activePages.size,
           active_vms: activeVms.size,
           warm_vms: [...activeVms.values()].filter((record) => record.pages.size === 0).length,
@@ -2485,6 +2664,7 @@ function main() {
           const body = await readJsonBody(req);
           const launchTask = openPage(
             config,
+            controlServiceIdentity,
             body,
             activePages,
             activeVms,
@@ -2514,6 +2694,7 @@ function main() {
           200,
           await shutdownPage(
             config,
+            controlServiceIdentity,
             body,
             activePages,
             activeVms,

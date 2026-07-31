@@ -1533,4 +1533,55 @@ assert(
   systemStepUpBegin,
 );
 
+const signOutRequestsBefore = requests.filter(
+  (request) => request.url === "/api/auth/sessions/sign-out",
+).length;
+sendChildMessage("null", { postMessage() {} }, {
+  type: "home:sign-out",
+  requestId: "forged-sign-out-source",
+  homeToken: "gui-token",
+});
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:sign-out",
+  requestId: "substituted-sign-out-token",
+  homeToken: "wrong-token",
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(
+  requests.filter((request) => request.url === "/api/auth/sessions/sign-out").length ===
+    signOutRequestsBefore,
+  "an unauthorized frame or substituted token reached Runtime sign-out",
+  requests,
+);
+
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:sign-out",
+  requestId: "trusted-gui-sign-out",
+  homeToken: "gui-token",
+});
+for (
+  let attempt = 0;
+  attempt < 20 &&
+  requests.filter((request) => request.url === "/api/auth/sessions/sign-out").length ===
+    signOutRequestsBefore;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  requests.filter((request) => request.url === "/api/auth/sessions/sign-out").length ===
+    signOutRequestsBefore + 1,
+  "trusted Home GUI sign-out did not make exactly one Runtime revocation request",
+  requests,
+);
+assert(
+  shellMessages.some((message) =>
+    message.payload?.type === "home:shell-response" &&
+    message.payload?.requestId === "trusted-gui-sign-out" &&
+    message.payload?.result === true
+  ),
+  "trusted Home GUI did not receive the host sign-out receipt",
+  shellMessages,
+);
+
 console.log("[home-shell-bridge] PASS");
