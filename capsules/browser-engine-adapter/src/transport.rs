@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) const VZ_TRANSPORT_AUTHORITY_SCHEMA: &str = "elastos.browser.vz-transport-authority/v1";
 pub(super) const VZ_TRANSPORT_SECRET_SCHEMA: &str = "elastos.browser.vz-transport-secret/v1";
+pub(super) const VZ_LAUNCH_SETTLEMENT_SCHEMA: &str = "elastos.browser.vz-launch-settlement/v1";
 
 pub(super) fn validate_vz_transport_launch(
     authority: &Value,
@@ -209,6 +210,114 @@ pub(super) fn validate_vz_transport_effect_receipt(
         return Err("Browser VZ supervisor transport effect receipt is not exact".to_string());
     }
     Ok(())
+}
+
+pub(super) fn validate_vz_launch_settlement(
+    settlement: &Value,
+    transport: &VzTransportLaunchContext,
+) -> Result<(), String> {
+    validate_vz_launch_settlement_binding(settlement, &transport.authority)?;
+    if value_contains_exact_transport_secret(settlement, &transport.secret) {
+        return Err("Browser VZ launch settlement binding is not exact".to_string());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_vz_launch_settlement_binding(
+    settlement: &Value,
+    authority: &Value,
+) -> Result<(), String> {
+    validate_vz_transport_authority(authority)?;
+    let object = settlement
+        .as_object()
+        .ok_or_else(|| "Browser VZ launch settlement must be an object".to_string())?;
+    let keys = [
+        "schema",
+        "state",
+        "message",
+        "binding_hash",
+        "generation",
+        "page_id",
+        "vm_id",
+        "stream_id",
+        "media_stream_id",
+        "effects",
+        "absence",
+    ];
+    let effects = settlement
+        .get("effects")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Browser VZ launch settlement effects are missing".to_string())?;
+    let effect_keys = [
+        "session_directory",
+        "control_socket",
+        "ordinary_stream_bridge",
+        "media_stream_bridge",
+        "turn_process",
+        "supervisor_child",
+        "vm",
+    ];
+    let absence = settlement
+        .get("absence")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Browser VZ launch settlement absence proof is missing".to_string())?;
+    let absence_keys = [
+        "child_absent",
+        "supervisor_child_absent",
+        "control_socket_absent",
+        "route_absent",
+        "turn_listener_absent",
+        "turn_relay_ports_absent",
+        "ordinary_stream_bridge_absent",
+        "media_stream_bridge_absent",
+        "session_directory_absent",
+        "vm_absent",
+    ];
+    let state = settlement
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Browser VZ launch settlement state is missing".to_string())?;
+    let message = settlement
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= 8_192 && !value.contains('\0'))
+        .ok_or_else(|| "Browser VZ launch settlement message is invalid".to_string())?;
+    let _ = message;
+    if object.len() != keys.len()
+        || keys.iter().any(|key| !object.contains_key(*key))
+        || effects.len() != effect_keys.len()
+        || effect_keys.iter().any(|key| !effects.contains_key(*key))
+        || absence.len() != absence_keys.len()
+        || absence_keys.iter().any(|key| !absence.contains_key(*key))
+        || effect_keys
+            .iter()
+            .any(|key| effects.get(*key).and_then(Value::as_bool).is_none())
+        || absence_keys
+            .iter()
+            .any(|key| absence.get(*key).and_then(Value::as_bool).is_none())
+        || settlement.get("schema").and_then(Value::as_str) != Some(VZ_LAUNCH_SETTLEMENT_SCHEMA)
+        || settlement.get("binding_hash") != authority.get("binding_hash")
+        || settlement.get("generation") != authority.get("generation")
+        || settlement.get("page_id") != authority.get("page_id")
+        || settlement.get("vm_id") != authority.get("vm_id")
+        || settlement.get("stream_id") != authority.pointer("/egress/stream_id")
+        || settlement.get("media_stream_id") != authority.pointer("/media/stream_id")
+        || value_contains_transport_secret(settlement)
+    {
+        return Err("Browser VZ launch settlement binding is not exact".to_string());
+    }
+    let acted = effect_keys
+        .iter()
+        .any(|key| effects.get(*key).and_then(Value::as_bool) == Some(true));
+    let terminal_absence = absence_keys
+        .iter()
+        .all(|key| absence.get(*key).and_then(Value::as_bool) == Some(true));
+    match state {
+        "did_not_act" if !acted && terminal_absence => Ok(()),
+        "terminal_post_effect_cleanup" if acted && terminal_absence => Ok(()),
+        "cleanup_pending" if acted && !terminal_absence => Ok(()),
+        _ => Err("Browser VZ launch settlement classification is invalid".to_string()),
+    }
 }
 
 pub(super) fn vz_public_transport_proof(

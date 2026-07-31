@@ -252,7 +252,7 @@ async fn test_browser_app_summary_reports_registered_engine_adapter_status() {
         payload["engine_adapter"]["provider"],
         "elastos://browser-engine/*"
     );
-    assert_eq!(payload["engine_adapter"]["adapter_count"], 1);
+    assert_eq!(payload["engine_adapter"]["adapter_count"], 2);
     assert_eq!(
         payload["engine_adapter"]["adapters"][0]["id"],
         "mock-browser-engine"
@@ -265,6 +265,11 @@ async fn test_browser_app_summary_reports_registered_engine_adapter_status() {
         payload["engine_adapter"]["adapters"][0]["backing_substrate"],
         "operator_rbi"
     );
+    assert_eq!(
+        payload["engine_adapter"]["adapters"][1]["id"],
+        "mock-jetson-engine"
+    );
+    assert_eq!(payload["engine_adapter"]["adapters"][1]["default"], false);
     assert_eq!(payload["engine_adapter"]["byte_transport"], "adapter_ipc");
     assert_eq!(
         payload["engine_adapter"]["display_session_schema"],
@@ -325,6 +330,47 @@ async fn test_browser_app_summary_rejects_missing_authority_status_proofs() {
         "invalid_provider_status"
     );
     assert_eq!(payload["net"]["exit_provider"]["direct_network"], false);
+}
+
+#[tokio::test]
+async fn test_browser_open_rejects_invalid_adapter_inventory_before_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let app = gateway_router(malformed_browser_summary_test_state(dir.path()).await);
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://invalid-adapter-inventory.invalid/","reason":"fail before reservation","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(payload["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("Adapter status authority is invalid")));
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(
+        browser_launch_reconciliation_obligation_count(dir.path()).await,
+        0
+    );
+    assert!(!dir.path().join("browser-lifecycle").exists());
+    assert!(!dir.path().join("browser-streams").exists());
 }
 
 #[tokio::test]
@@ -1999,16 +2045,17 @@ async fn test_browser_open_reports_engine_capacity_unavailable() {
         payload["outcome"]["schema"],
         "elastos.browser.open-outcome/v1"
     );
-    assert_eq!(payload["outcome"]["state"], "terminal_pre_effect_failure");
+    assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
     assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
     assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
+    assert_eq!(payload["outcome"]["effects"]["stream_acquired"], true);
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
 }
 
 #[tokio::test]
-async fn test_browser_async_open_reports_structured_pre_effect_failure() {
+async fn test_browser_async_open_reports_structured_post_dispatch_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
@@ -2023,7 +2070,7 @@ async fn test_browser_async_open_reports_structured_pre_effect_failure() {
                 .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"url":"https://resources-in-use.invalid/","reason":"structured pre-effect regression","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi","async_open":true}"#,
+                    r#"{"url":"https://resources-in-use.invalid/","reason":"structured post-dispatch cleanup regression","display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi","async_open":true}"#,
                 ))
                 .unwrap(),
         )
@@ -2062,7 +2109,7 @@ async fn test_browser_async_open_reports_structured_pre_effect_failure() {
     let failed = failed.expect("async Browser open should return a terminal failure");
     assert_eq!(
         failed["error"]["outcome"]["state"],
-        "terminal_pre_effect_failure"
+        "terminal_post_effect_cleanup"
     );
     assert_eq!(failed["error"]["code"], "resources_in_use");
     assert_eq!(
@@ -2070,6 +2117,10 @@ async fn test_browser_async_open_reports_structured_pre_effect_failure() {
         false
     );
     assert_eq!(failed["error"]["outcome"]["effects"]["vm_acquired"], false);
+    assert_eq!(
+        failed["error"]["outcome"]["effects"]["stream_acquired"],
+        true
+    );
     assert_eq!(browser_page_session_count(dir.path()).await, 0);
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
     assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
@@ -2107,9 +2158,10 @@ async fn test_browser_resources_in_use_requires_exact_did_not_act_reconciliation
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["code"], "resources_in_use");
-    assert_eq!(payload["outcome"]["state"], "terminal_pre_effect_failure");
+    assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
     assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
     assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
+    assert_eq!(payload["outcome"]["effects"]["stream_acquired"], true);
     assert_eq!(
         reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
         1
@@ -2119,6 +2171,248 @@ async fn test_browser_resources_in_use_requires_exact_did_not_act_reconciliation
     assert_eq!(
         browser_launch_reconciliation_obligation_count(dir.path()).await,
         0
+    );
+}
+
+fn write_browser_vz_transport_test_config(data_dir: &std::path::Path) {
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let path = config_dir.join("browser-vz-vsock-transport.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "elastos.browser.vz-transport-config/v1",
+            "enabled": true,
+            "turn_listen_host": "127.0.0.1",
+            "turn_advertised_host": "127.0.0.1",
+            "turn_relay_host": "127.0.0.1",
+            "turn_port_start": 43300,
+            "turn_port_end": 43331,
+            "turn_relay_port_start": 43400,
+            "turn_relay_port_end": 43527,
+            "turn_relay_block_size": 8,
+            "guest_turn_host": "127.0.0.1",
+            "guest_turn_port": 3478,
+            "bootstrap_vsock_port": 19090,
+            "egress_vsock_port": 19091,
+            "media_vsock_port": 19093,
+            "ttl_secs": 300
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+}
+
+#[tokio::test]
+async fn test_exact_vz_did_not_act_releases_all_runtime_obligations_without_reconciliation() {
+    let dir = tempfile::tempdir().unwrap();
+    write_browser_vz_transport_test_config(dir.path());
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+        dir.path(),
+        MockDispatchedBrowserLaunchFailure::ExactVzDidNotAct,
+    )
+    .await;
+    let app = gateway_router(state);
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://exact-vz-did-not-act.invalid/","reason":"consume exact VZ DidNotAct","display_mode":"webrtc_remote_display","guarantee_level":"mechanism_microvm"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response_status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        response_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{payload}"
+    );
+    assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
+    assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
+    assert_eq!(payload["outcome"]["effects"]["vm_acquired"], false);
+    assert_eq!(payload["outcome"]["effects"]["stream_acquired"], true);
+    assert_eq!(
+        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(close_calls.lock().await.is_empty());
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(
+        browser_launch_reconciliation_obligation_count(dir.path()).await,
+        0
+    );
+    assert!(!dir.path().join("browser-lifecycle").exists());
+    assert!(!dir.path().join("browser-streams").exists());
+}
+
+#[tokio::test]
+async fn test_mismatched_vz_did_not_act_remains_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    write_browser_vz_transport_test_config(dir.path());
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+        dir.path(),
+        MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct,
+    )
+    .await;
+    let app = gateway_router(state);
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://mismatched-vz-did-not-act.invalid/","reason":"reject substituted VZ DidNotAct","display_mode":"webrtc_remote_display","guarantee_level":"mechanism_microvm"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response_status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        response_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{payload}"
+    );
+    assert_eq!(payload["outcome"]["state"], "cleanup_pending");
+    assert_eq!(
+        payload["outcome"]["ownership"],
+        "launch_reconciliation_pending"
+    );
+    assert_eq!(
+        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(close_calls.lock().await.is_empty());
+    assert_eq!(
+        browser_launch_reconciliation_obligation_count(dir.path()).await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_exact_terminal_vz_settlement_releases_restart_reconciliation_obligations() {
+    let dir = tempfile::tempdir().unwrap();
+    write_browser_vz_transport_test_config(dir.path());
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+        dir.path(),
+        MockDispatchedBrowserLaunchFailure::TerminalVzSettlement,
+    )
+    .await;
+    let app = gateway_router(state);
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://terminal-vz-settlement.invalid/","reason":"consume exact terminal VZ settlement","display_mode":"webrtc_remote_display","guarantee_level":"mechanism_microvm"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["outcome"]["state"], "terminal_post_effect_cleanup");
+    assert_eq!(payload["outcome"]["effects"]["page_acquired"], false);
+    assert_eq!(payload["outcome"]["effects"]["vm_acquired"], true);
+    assert_eq!(
+        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(close_calls.lock().await.is_empty());
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(
+        browser_launch_reconciliation_obligation_count(dir.path()).await,
+        0
+    );
+    assert!(!dir.path().join("browser-lifecycle").exists());
+    assert!(!dir.path().join("browser-streams").exists());
+}
+
+#[tokio::test]
+async fn test_mismatched_terminal_vz_settlement_retains_restart_reconciliation_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    write_browser_vz_transport_test_config(dir.path());
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let (state, close_calls, reconciliation_calls) = browser_engine_reconciliation_test_state(
+        dir.path(),
+        MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement,
+    )
+    .await;
+    let app = gateway_router(state);
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://mismatched-terminal-vz.invalid/","reason":"retain mismatched terminal VZ settlement","display_mode":"webrtc_remote_display","guarantee_level":"mechanism_microvm"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["outcome"]["state"], "cleanup_pending");
+    assert_eq!(
+        payload["outcome"]["ownership"],
+        "launch_reconciliation_pending"
+    );
+    assert_eq!(
+        reconciliation_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(close_calls.lock().await.is_empty());
+    assert_eq!(
+        browser_launch_reconciliation_obligation_count(dir.path()).await,
+        1
     );
 }
 
@@ -4881,6 +5175,128 @@ async fn test_browser_close_typed_already_absent_is_terminal_without_retry_oblig
 }
 
 #[tokio::test]
+async fn test_browser_refresh_recovers_and_closes_exact_instance_bound_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let owner_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let refreshed_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let owner_launch_id =
+        runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &owner_token)
+            .verified_context()
+            .launch_id()
+            .to_string();
+    let refreshed_launch_id =
+        runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &refreshed_token)
+            .verified_context()
+            .launch_id()
+            .to_string();
+    assert_ne!(owner_launch_id, refreshed_launch_id);
+    let browser_instance = "browser:0123456789abcdef0123456789abcdef";
+    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
+
+    let opened = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", owner_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "url": "glidefinance.io",
+                        "reason": "Browser refresh recovery",
+                        "browser_instance": browser_instance,
+                        "viewport": {"width": 900, "height": 520},
+                        "display_mode": "webrtc_remote_display",
+                        "guarantee_level": "operator_rbi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let opened_status = opened.status();
+    let opened_body = axum::body::to_bytes(opened.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        opened_status,
+        StatusCode::OK,
+        "Browser open failed: {}",
+        String::from_utf8_lossy(&opened_body)
+    );
+    let opened: serde_json::Value = serde_json::from_slice(&opened_body).unwrap();
+    let page_id = opened["engine_page"]["page_id"].as_str().unwrap();
+    let cleanup_id = browser_cleanup_id(&opened);
+
+    let foreign = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/browser/summary?browser_instance=browser%3Afedcba9876543210fedcba9876543210")
+                .header("x-elastos-home-token", refreshed_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::OK);
+    let foreign: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(foreign.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(foreign["sessions"]["recoverable_page"].is_null());
+
+    let summary = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(format!(
+                    "/api/apps/browser/summary?browser_instance={browser_instance}"
+                ))
+                .header("x-elastos-home-token", refreshed_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(summary.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary["sessions"]["recoverable_page"]["state"], "active");
+    assert_eq!(summary["sessions"]["recoverable_page"]["page_id"], page_id);
+    assert_eq!(
+        summary["sessions"]["recoverable_page"]["cleanup"]["id"],
+        cleanup_id
+    );
+
+    let close = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(format!("/api/apps/browser/pages/{page_id}/close"))
+                .header("x-elastos-home-token", refreshed_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(browser_close_body(cleanup_id))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(close.status(), StatusCode::OK);
+    assert_eq!(browser_page_session_count(dir.path()).await, 0);
+    assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+    assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 0);
+}
+
+#[tokio::test]
 async fn test_browser_close_provider_unavailable_keeps_bounded_engine_cleanup_obligation() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
@@ -4893,6 +5309,7 @@ async fn test_browser_close_provider_unavailable_keeps_bounded_engine_cleanup_ob
         &authority.principal_id,
         BrowserLaunchLifecycle {
             owner_launch_id,
+            browser_instance: None,
             url: "https://provider-unavailable.invalid/".to_string(),
             exit_id: "local-runtime".to_string(),
             engine_route_provider: "mock-browser-engine".to_string(),

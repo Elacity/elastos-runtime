@@ -51,6 +51,7 @@ const LOCAL_EXIT_SUMMARY = "Use this device's Exit Node for Browser traffic.";
 const DEFAULT_ENGINE_LABEL = "Automatic";
 const DEFAULT_ENGINE_SUMMARY = "Use the best Browser Engine available.";
 const params = new URLSearchParams(window.location.search);
+const browserInstanceId = params.get("browser_instance") || "";
 const launchToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
 const homeParentOrigin = params.get("home_origin") || "";
 const debugMetrics =
@@ -1211,7 +1212,10 @@ async function fetchBrowserSummary() {
   if (browserSummaryPromise) {
     return browserSummaryPromise;
   }
-  browserSummaryPromise = fetchJson("/api/apps/browser/summary", { method: "GET" })
+  const summaryPath = browserInstanceId
+    ? `/api/apps/browser/summary?browser_instance=${encodeURIComponent(browserInstanceId)}`
+    : "/api/apps/browser/summary";
+  browserSummaryPromise = fetchJson(summaryPath, { method: "GET" })
     .then((summary) => {
       browserSummary = summary;
       syncEngineSelect(summary);
@@ -1424,6 +1428,9 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
     }
     if (browserEngineId) {
       body.adapter_id = browserEngineId;
+    }
+    if (browserInstanceId) {
+      body.browser_instance = browserInstanceId;
     }
     const accepted = await fetchJson("/api/apps/browser/open", {
       method: "POST",
@@ -1766,10 +1773,11 @@ window.addEventListener("pagehide", releaseRuntimePageForUnload);
 const initialUrl = params.get("url") || DEFAULT_URL;
 addressInput.value = initialUrl;
 updateNavState();
-void fetchBrowserSummary();
-requestRuntimeOpen(initialUrl, { history: "replace" }).catch((error) => {
-  if (isAuthoritySessionError(error) && requestHomeRelaunch(friendlyOpenError(error))) {
-    return;
-  }
-  showStatus(friendlyOpenError(error), { sticky: true });
-});
+fetchBrowserSummary()
+  .then(() => requestRuntimeOpen(initialUrl, { history: "replace" }))
+  .catch((error) => {
+    if (isAuthoritySessionError(error) && requestHomeRelaunch(friendlyOpenError(error))) {
+      return;
+    }
+    showStatus(friendlyOpenError(error), { sticky: true });
+  });

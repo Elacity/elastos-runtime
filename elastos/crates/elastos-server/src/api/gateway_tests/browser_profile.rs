@@ -139,6 +139,7 @@ async fn browser_profile_reset_refuses_live_principal_session() {
         &context.principal_id,
         BrowserLaunchLifecycle {
             owner_launch_id: "launch:profile-reset-test".to_string(),
+            browser_instance: None,
             url: "https://example.com/".to_string(),
             exit_id: "local-runtime".to_string(),
             engine_route_provider: "mock-browser-engine".to_string(),

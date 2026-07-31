@@ -2,6 +2,115 @@
 
 use super::*;
 
+pub(in crate::api::gateway) async fn resolve_browser_engine_adapter(
+    registry: &ProviderRegistry,
+    principal_id: &str,
+    requested_adapter: Option<&str>,
+) -> Result<String, String> {
+    let response = registry
+        .send_raw(
+            "browser-engine",
+            &serde_json::json!({
+                "op": "status",
+                "principal_id": principal_id,
+            }),
+        )
+        .await
+        .map_err(|err| format!("Browser Engine Adapter status is unavailable: {err}"))?;
+    if response.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        return Err(response
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .map(|message| format!("Browser Engine Adapter status failed: {message}"))
+            .unwrap_or_else(|| "Browser Engine Adapter status failed closed".to_string()));
+    }
+    let data = provider_response_data(&response)
+        .ok_or_else(|| "Browser Engine Adapter status omitted its response object".to_string())?;
+    if data.get("provider").and_then(serde_json::Value::as_str) != Some(BROWSER_ENGINE_PROVIDER_ID)
+        || data
+            .get("protocol_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(BROWSER_ENGINE_PROTOCOL_VERSION)
+        || data.get("status").and_then(serde_json::Value::as_str) != Some("configured")
+        || data
+            .get("direct_network")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || data
+            .get("wallet_injection")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
+        return Err("Browser Engine Adapter status authority is invalid".to_string());
+    }
+
+    let adapters = data
+        .get("adapters")
+        .and_then(serde_json::Value::as_array)
+        .filter(|adapters| !adapters.is_empty() && adapters.len() <= 64)
+        .ok_or_else(|| {
+            "Browser Engine Adapter status has no bounded Adapter inventory".to_string()
+        })?;
+    if data
+        .get("adapter_count")
+        .and_then(serde_json::Value::as_u64)
+        != Some(adapters.len() as u64)
+    {
+        return Err("Browser Engine Adapter status count does not match its inventory".to_string());
+    }
+
+    let mut ids = std::collections::BTreeSet::new();
+    let mut default_adapter = None;
+    for adapter in adapters {
+        let adapter = adapter
+            .as_object()
+            .ok_or_else(|| "Browser Engine Adapter inventory contains a non-object".to_string())?;
+        let id = adapter
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| id.len() <= 128 && is_safe_runtime_id(id))
+            .ok_or_else(|| "Browser Engine Adapter inventory contains an invalid ID".to_string())?;
+        if !ids.insert(id.to_string())
+            || adapter
+                .get("direct_network")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || adapter
+                .get("wallet_injection")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err("Browser Engine Adapter inventory is not exact".to_string());
+        }
+        match adapter.get("default").and_then(serde_json::Value::as_bool) {
+            Some(true) if default_adapter.replace(id.to_string()).is_none() => {}
+            Some(true) => {
+                return Err(
+                    "Browser Engine Adapter inventory declares multiple defaults".to_string(),
+                )
+            }
+            Some(false) => {}
+            None => {
+                return Err(
+                    "Browser Engine Adapter inventory omitted an exact default marker".to_string(),
+                )
+            }
+        }
+    }
+
+    if let Some(requested_adapter) = requested_adapter {
+        return ids
+            .contains(requested_adapter)
+            .then(|| requested_adapter.to_string())
+            .ok_or_else(|| {
+                "requested Browser Engine Adapter is not in the registered inventory".to_string()
+            });
+    }
+    default_adapter
+        .ok_or_else(|| "Browser Engine Adapter inventory declares no default".to_string())
+}
+
 pub(in crate::api::gateway) async fn browser_engine_summary(
     registry: Option<&Arc<ProviderRegistry>>,
     principal_id: &str,

@@ -133,6 +133,10 @@ enum Response {
     Error {
         code: String,
         message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        adapter: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        launch_settlement_result: Option<Value>,
     },
 }
 
@@ -149,6 +153,17 @@ impl Response {
         Self::Error {
             code: code.to_string(),
             message: message.into(),
+            adapter: None,
+            launch_settlement_result: None,
+        }
+    }
+
+    fn supervisor_error(adapter: &AdapterConfig, error: SupervisorLaunchError) -> Self {
+        Self::Error {
+            code: error.code,
+            message: error.message,
+            adapter: Some(adapter.id.clone()),
+            launch_settlement_result: error.launch_settlement_result,
         }
     }
 }
@@ -1088,6 +1103,19 @@ impl BrowserEngineAdapter {
                 .cloned()
                 .unwrap_or(Value::Null),
         );
+        let stable_terminal_service_identity = record_identity.as_ref().is_ok_and(|record| {
+            reconciliation.get("state").and_then(Value::as_str)
+                == Some("terminal_post_effect_cleanup")
+                && reconciliation.get("launch_settlement_result").is_some()
+                && record.schema == live_control_service.schema
+                && record.service_id == live_control_service.service_id
+                && record.control_socket_path == live_control_service.control_socket_path
+                && validate_control_service_identity(
+                    record,
+                    Some(live_control_service.control_socket_path.as_str()),
+                )
+                .is_ok()
+        });
         if reconciliation.get("schema").and_then(Value::as_str)
             != Some("elastos.browser.vm-control-service.launch-reconciliation/v1")
             || reconciliation
@@ -1101,7 +1129,8 @@ impl BrowserEngineAdapter {
             || reconciliation.get("transport_authority") != transport_authority
             || reconciliation.pointer("/launch/transport_authority") != transport_authority
             || response_identity.as_ref().ok() != Some(&live_control_service)
-            || record_identity.as_ref().ok() != Some(&live_control_service)
+            || (record_identity.as_ref().ok() != Some(&live_control_service)
+                && !stable_terminal_service_identity)
         {
             return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
@@ -1160,6 +1189,62 @@ impl BrowserEngineAdapter {
                 };
                 let terminal_cleanup_receipt = match transport_authority {
                     Some(authority) => {
+                        if let Some(settlement) = reconciliation.get("launch_settlement_result") {
+                            let launch = reconciliation.get("launch").and_then(Value::as_object);
+                            if selected_adapter.kind != AdapterKind::ChromiumMicrovm
+                                || page_acquired
+                                || vm_acquired
+                                    != settlement
+                                        .pointer("/effects/vm")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false)
+                                || launch
+                                    .and_then(|value| value.get("adapter"))
+                                    .and_then(Value::as_str)
+                                    != Some(selected_adapter.id.as_str())
+                                || launch.and_then(|value| value.get("engine"))
+                                    != Some(&json!(selected_adapter.kind))
+                                || launch
+                                    .and_then(|value| value.get("principal_id"))
+                                    .and_then(Value::as_str)
+                                    != principal_id.as_deref()
+                                || launch
+                                    .and_then(|value| value.get("display_mode"))
+                                    .and_then(Value::as_str)
+                                    != Some(BrowserDisplayMode::WebrtcRemoteDisplay.as_str())
+                                || launch
+                                    .and_then(|value| value.get("guarantee_level"))
+                                    .and_then(Value::as_str)
+                                    != Some(BrowserGuaranteeLevel::MechanismMicrovm.as_str())
+                                || launch.and_then(|value| value.get("page_id"))
+                                    != authority.get("page_id")
+                                || launch.and_then(|value| value.get("vm_id"))
+                                    != authority.get("vm_id")
+                                || settlement.get("state").and_then(Value::as_str)
+                                    != Some("terminal_post_effect_cleanup")
+                                || validate_vz_launch_settlement_binding(settlement, authority)
+                                    .is_err()
+                            {
+                                return reconcile_ok(json!({
+                                    "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                                    "state": "cleanup_pending",
+                                    "lifecycle_generation": lifecycle_generation,
+                                    "stream_id": stream_id,
+                                    "reason": "terminal Browser VZ launch settlement is invalid",
+                                }));
+                            }
+                            return reconcile_ok(json!({
+                                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                                "state": "terminal_post_effect_cleanup",
+                                "lifecycle_generation": lifecycle_generation,
+                                "stream_id": stream_id,
+                                "effects": {
+                                    "page_acquired": page_acquired,
+                                    "vm_acquired": vm_acquired,
+                                },
+                                "terminal_cleanup_receipt": settlement,
+                            }));
+                        }
                         let binding =
                             reconciliation
                                 .get("cleanup_binding")
@@ -1497,7 +1582,7 @@ impl BrowserEngineAdapter {
             transport,
         ) {
             Ok(result) => result,
-            Err(err) => return Response::error(&err.code, err.message),
+            Err(err) => return Response::supervisor_error(adapter, err),
         };
         if let Err(err) = validate_supervisor_result(
             &result,

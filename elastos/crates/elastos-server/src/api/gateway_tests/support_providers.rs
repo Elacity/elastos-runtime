@@ -2325,6 +2325,10 @@ enum MockDispatchedBrowserLaunchFailure {
     AlwaysUnavailable,
     HangingReconciliation,
     DidNotActResourcesInUse,
+    ExactVzDidNotAct,
+    MismatchedVzDidNotAct,
+    TerminalVzSettlement,
+    MismatchedTerminalVzSettlement,
 }
 
 struct MockReconciliatingBrowserEngineProvider {
@@ -2883,18 +2887,31 @@ impl Provider for MockBrowserEngineProvider {
                 "provider": "browser-engine-adapter",
                 "protocol_version": "2.0",
                 "status": "configured",
-                "adapter_count": 1,
-                "adapters": [{
-                    "id": "mock-browser-engine",
-                    "engine": "selkies_gstreamer",
-                    "default": true,
-                    "backing_substrate": "operator_rbi",
-                    "supported_display_modes": ["webrtc_remote_display"],
-                    "supported_guarantee_levels": ["operator_rbi"],
-                    "network_mode": "runtime_net_only",
-                    "direct_network": false,
-                    "wallet_injection": false
-                }],
+                "adapter_count": 2,
+                "adapters": [
+                    {
+                        "id": "mock-browser-engine",
+                        "engine": "selkies_gstreamer",
+                        "default": true,
+                        "backing_substrate": "operator_rbi",
+                        "supported_display_modes": ["webrtc_remote_display"],
+                        "supported_guarantee_levels": ["operator_rbi"],
+                        "network_mode": "runtime_net_only",
+                        "direct_network": false,
+                        "wallet_injection": false
+                    },
+                    {
+                        "id": "mock-jetson-engine",
+                        "engine": "selkies_gstreamer",
+                        "default": false,
+                        "backing_substrate": "operator_rbi",
+                        "supported_display_modes": ["webrtc_remote_display"],
+                        "supported_guarantee_levels": ["operator_rbi"],
+                        "network_mode": "runtime_net_only",
+                        "direct_network": false,
+                        "wallet_injection": false
+                    }
+                ],
                 "direct_network": false,
                 "wallet_injection": false,
                 "stream_session_schema": "elastos.exit.stream-session/v1",
@@ -2943,12 +2960,73 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                         "message": "simulated Browser VM resource lease conflict",
                     }));
                 }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::ExactVzDidNotAct
+                        | MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct
+                ) {
+                    let adapter = request
+                        .get("adapter_id")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("Runtime must bind the default Adapter before VZ dispatch");
+                    assert_eq!(adapter, "mock-browser-engine");
+                    let authority = request
+                        .get("transport_authority")
+                        .expect("VZ settlement test transport authority");
+                    let mut settlement = json!({
+                        "schema": "elastos.browser.vz-launch-settlement/v1",
+                        "state": "did_not_act",
+                        "message": "injected exact VZ pre-effect failure",
+                        "binding_hash": authority["binding_hash"],
+                        "generation": authority["generation"],
+                        "page_id": authority["page_id"],
+                        "vm_id": authority["vm_id"],
+                        "stream_id": authority["egress"]["stream_id"],
+                        "media_stream_id": authority["media"]["stream_id"],
+                        "effects": {
+                            "session_directory": false,
+                            "control_socket": false,
+                            "ordinary_stream_bridge": false,
+                            "media_stream_bridge": false,
+                            "turn_process": false,
+                            "supervisor_child": false,
+                            "vm": false,
+                        },
+                        "absence": {
+                            "child_absent": true,
+                            "supervisor_child_absent": true,
+                            "control_socket_absent": true,
+                            "route_absent": true,
+                            "turn_listener_absent": true,
+                            "turn_relay_ports_absent": true,
+                            "ordinary_stream_bridge_absent": true,
+                            "media_stream_bridge_absent": true,
+                            "session_directory_absent": true,
+                            "vm_absent": true,
+                        },
+                    });
+                    if matches!(
+                        self.failure,
+                        MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct
+                    ) {
+                        settlement["vm_id"] = json!("vm:vz-substituted");
+                    }
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "engine_process_unavailable",
+                        "message": "injected VZ pre-effect failure",
+                        "adapter": adapter,
+                        "launch_settlement_result": settlement,
+                    }));
+                }
                 if (matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::PendingThenTerminal
                         | MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
                         | MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
                         | MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                        | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
                 ) && launch_call == 0)
                 {
                     return Err(ProviderError::Provider(
@@ -2989,6 +3067,12 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                     | MockDispatchedBrowserLaunchFailure::AlwaysUnavailable
                     | MockDispatchedBrowserLaunchFailure::HangingReconciliation => Ok(response),
                     MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse => unreachable!(),
+                    MockDispatchedBrowserLaunchFailure::ExactVzDidNotAct
+                    | MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct => unreachable!(),
+                    MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                    | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement => {
+                        Ok(response)
+                    }
                 }
             }
             Some("status") if request.get("lifecycle_generation").is_some() => {
@@ -3010,6 +3094,83 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                                 "page_acquired": false,
                                 "vm_acquired": false,
                             },
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct
+                ) {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "cleanup_pending",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "transport_authority": request["transport_authority"],
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                        | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                ) {
+                    let authority = request
+                        .get("transport_authority")
+                        .expect("terminal VZ reconciliation authority");
+                    let mut settlement = json!({
+                        "schema": "elastos.browser.vz-launch-settlement/v1",
+                        "state": "terminal_post_effect_cleanup",
+                        "message": "injected exact terminal VZ cleanup",
+                        "binding_hash": authority["binding_hash"],
+                        "generation": authority["generation"],
+                        "page_id": authority["page_id"],
+                        "vm_id": authority["vm_id"],
+                        "stream_id": authority["egress"]["stream_id"],
+                        "media_stream_id": authority["media"]["stream_id"],
+                        "effects": {
+                            "session_directory": true,
+                            "control_socket": true,
+                            "ordinary_stream_bridge": true,
+                            "media_stream_bridge": true,
+                            "turn_process": true,
+                            "supervisor_child": false,
+                            "vm": true,
+                        },
+                        "absence": {
+                            "child_absent": true,
+                            "supervisor_child_absent": true,
+                            "control_socket_absent": true,
+                            "route_absent": true,
+                            "turn_listener_absent": true,
+                            "turn_relay_ports_absent": true,
+                            "ordinary_stream_bridge_absent": true,
+                            "media_stream_bridge_absent": true,
+                            "session_directory_absent": true,
+                            "vm_absent": true,
+                        },
+                    });
+                    if matches!(
+                        self.failure,
+                        MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                    ) {
+                        settlement["media_stream_id"] = json!("stream:vz-media-substituted");
+                    }
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "terminal_post_effect_cleanup",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "transport_authority": authority,
+                            "effects": {
+                                "page_acquired": false,
+                                "vm_acquired": true,
+                            },
+                            "terminal_cleanup_receipt": settlement,
                         }
                     }));
                 }
@@ -3340,8 +3501,16 @@ impl Provider for MockRejectingBrowserEngineProvider {
                 "status": "ok",
                 "data": {
                     "provider": "browser-engine-adapter",
+                    "protocol_version": "2.0",
                     "status": "configured",
                     "adapter_count": 1,
+                    "adapters": [{
+                        "id": "mock-browser-engine",
+                        "engine": "selkies_gstreamer",
+                        "default": true,
+                        "direct_network": false,
+                        "wallet_injection": false
+                    }],
                     "direct_network": false,
                     "wallet_injection": false,
                     "stream_session_schema": "elastos.exit.stream-session/v1",

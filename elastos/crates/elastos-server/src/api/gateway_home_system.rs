@@ -2252,6 +2252,7 @@ async fn home_realtime_snapshot(
         &state.data_dir,
         &context.principal_id,
         None,
+        None,
     )
     .await;
     let desktop_signature = home_desktop_events_signature(state, context).await;

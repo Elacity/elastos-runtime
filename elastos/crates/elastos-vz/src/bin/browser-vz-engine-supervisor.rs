@@ -2,11 +2,12 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -16,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use elastos_common::{
-    CapsuleManifest, CapsuleRole, CapsuleType, MicroVmConfig, Permissions, ResourceLimits,
-    SCHEMA_V1,
+    CapsuleManifest, CapsuleRole, CapsuleStatus, CapsuleType, MicroVmConfig, Permissions,
+    ResourceLimits, SCHEMA_V1,
 };
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 use elastos_vz::{VmConfig, VzConfig, VzProvider};
@@ -31,29 +32,25 @@ use tracing_subscriber::{fmt, EnvFilter};
 const OPEN_REQUEST_ENV: &str = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 const VZ_TRANSPORT_AUTHORITY_SCHEMA: &str = "elastos.browser.vz-transport-authority/v1";
 const VZ_TRANSPORT_SECRET_SCHEMA: &str = "elastos.browser.vz-transport-secret/v1";
+const VZ_LAUNCH_SETTLEMENT_SCHEMA: &str = "elastos.browser.vz-launch-settlement/v1";
 const DEFAULT_CONTROL_PORT: u32 = 19092;
-const DEFAULT_RELAY_PORT: u32 = 19091;
 const DEFAULT_PROFILE_DISK_MIB: u64 = 2048;
 const UNIX_SOCKET_PATH_BUDGET: usize = 100;
 const EGRESS_COPY_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_CONTROL_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SETTLEMENT_MESSAGE_CHARS: usize = 2 * 1024;
 const DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS: u32 = 120_000;
-const DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS: u32 = 3_000;
 const BROWSER_VM_TARGET_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
-const ICE_CONFIG_BOOT_ARG: &str = "elastos.browser_ice_config_hex";
 const DISPLAY_MODE_BOOT_ARG: &str = "elastos.browser_display_mode";
 const DISPLAY_WIDTH_BOOT_ARG: &str = "elastos.browser_width";
 const DISPLAY_HEIGHT_BOOT_ARG: &str = "elastos.browser_height";
-const DEFAULT_HIBERNATION_MAX_ENTRIES: u32 = 4;
-const DEFAULT_HIBERNATION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-const HIBERNATION_LIFETIME_LOCK: &str = ".lifetime.lock";
 const DISK_LIFETIME_LOCK_SUFFIX: &str = ".lifetime.lock";
-const VM_ICE_ENV_KEYS: [&str; 8] = [
+const LEGACY_VZ_CONFIGURATION_KEYS: [&str; 14] = [
     "ELASTOS_BROWSER_VM_ICE_SERVER",
     "ELASTOS_BROWSER_VM_ICE_SERVERS_JSON",
     "ELASTOS_BROWSER_VM_ICE_USERNAME",
@@ -62,6 +59,18 @@ const VM_ICE_ENV_KEYS: [&str; 8] = [
     "ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4",
     "ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4",
     "ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX",
+    "ELASTOS_BROWSER_VM_HIBERNATION",
+    "ELASTOS_BROWSER_VM_HIBERNATION_DIR",
+    "ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES",
+    "ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS",
+    "ELASTOS_BROWSER_VM_DISABLE_EGRESS_BRIDGE",
+    "ELASTOS_BROWSER_VM_RELAY_PORT",
+];
+const VZ_AUTHORITY_BOOT_ARG_PREFIXES: [&str; 4] = [
+    "elastos.browser_vz_transport=",
+    "elastos.browser_bootstrap_port=",
+    "elastos.browser_relay_port=",
+    "elastos.browser_ice_config_hex=",
 ];
 
 #[tokio::main]
@@ -82,20 +91,285 @@ fn init_tracing() {
         .try_init();
 }
 
-async fn run() -> Result<(), String> {
-    if !elastos_vz::is_supported() {
-        return Err(
-            "browser-vz-engine-supervisor requires macOS arm64 with Apple Virtualization.framework"
-                .to_string(),
-        );
+#[derive(Debug, Clone)]
+struct VzLaunchIdentity {
+    binding_hash: Value,
+    generation: Value,
+    page_id: Value,
+    vm_id: Value,
+    stream_id: Value,
+    media_stream_id: Value,
+}
+
+impl VzLaunchIdentity {
+    fn from_launch(launch: &Value) -> Self {
+        Self {
+            binding_hash: launch
+                .pointer("/transport_authority/binding_hash")
+                .cloned()
+                .unwrap_or(Value::Null),
+            generation: launch
+                .get("lifecycle_generation")
+                .cloned()
+                .unwrap_or(Value::Null),
+            page_id: launch.get("page_id").cloned().unwrap_or(Value::Null),
+            vm_id: launch.get("vm_id").cloned().unwrap_or(Value::Null),
+            stream_id: launch.get("stream_id").cloned().unwrap_or(Value::Null),
+            media_stream_id: launch
+                .pointer("/transport_authority/media/stream_id")
+                .cloned()
+                .unwrap_or(Value::Null),
+        }
+    }
+}
+
+fn did_not_act_settlement(identity: &VzLaunchIdentity, message: impl AsRef<str>) -> String {
+    serde_json::to_string(&json!({
+        "schema": VZ_LAUNCH_SETTLEMENT_SCHEMA,
+        "state": "did_not_act",
+        "message": bounded_message(message.as_ref()),
+        "binding_hash": identity.binding_hash,
+        "generation": identity.generation,
+        "page_id": identity.page_id,
+        "vm_id": identity.vm_id,
+        "stream_id": identity.stream_id,
+        "media_stream_id": identity.media_stream_id,
+        "effects": {
+            "session_directory": false,
+            "control_socket": false,
+            "ordinary_stream_bridge": false,
+            "media_stream_bridge": false,
+            "turn_process": false,
+            "supervisor_child": false,
+            "vm": false,
+        },
+        "absence": {
+            "child_absent": true,
+            "supervisor_child_absent": true,
+            "control_socket_absent": true,
+            "route_absent": true,
+            "turn_listener_absent": true,
+            "turn_relay_ports_absent": true,
+            "ordinary_stream_bridge_absent": true,
+            "media_stream_bridge_absent": true,
+            "session_directory_absent": true,
+            "vm_absent": true,
+        },
+    }))
+    .unwrap_or_else(|_| unbound_launch_error("exact did_not_act settlement serialization failed"))
+}
+
+fn bounded_message(message: &str) -> String {
+    message.chars().take(MAX_SETTLEMENT_MESSAGE_CHARS).collect()
+}
+
+fn unbound_launch_error(message: impl AsRef<str>) -> String {
+    format!(
+        "Browser VZ launch validation failed before exact identity validation: {}",
+        bounded_message(message.as_ref())
+    )
+}
+
+struct VzLaunchOwner {
+    identity: VzLaunchIdentity,
+    paths: LaunchPaths,
+    transport: VzTransportLaunch,
+    acquired_paths: AcquiredLaunchPaths,
+    session_directory: bool,
+    control_socket: bool,
+    ordinary_stream_bridge: bool,
+    media_stream_bridge: bool,
+    turn_process: bool,
+    vm: bool,
+    control_proxy_spawned: bool,
+    turn_cleanup: TurnCleanupEvidence,
+    provider: Option<Arc<VzProvider>>,
+    handle: Option<CapsuleHandle>,
+    shutdown: Option<Arc<AtomicBool>>,
+    ordinary_bridge: Option<tokio::task::JoinHandle<bool>>,
+    media_bridge: Option<tokio::task::JoinHandle<bool>>,
+    control_proxy: Option<thread::JoinHandle<bool>>,
+    launch_rootfs: Option<PreparedLaunchRootfs>,
+    profile_disk: Option<PreparedBrowserProfileDisk>,
+}
+
+enum TurnCleanupEvidence {
+    NotStarted,
+    Owned(LaunchTurn),
+    AbsenceProved,
+    Indeterminate,
+}
+
+impl VzLaunchOwner {
+    fn new(identity: VzLaunchIdentity, paths: LaunchPaths, transport: VzTransportLaunch) -> Self {
+        Self {
+            identity,
+            paths,
+            transport,
+            acquired_paths: AcquiredLaunchPaths::default(),
+            session_directory: false,
+            control_socket: false,
+            ordinary_stream_bridge: false,
+            media_stream_bridge: false,
+            turn_process: false,
+            vm: false,
+            control_proxy_spawned: false,
+            turn_cleanup: TurnCleanupEvidence::NotStarted,
+            provider: None,
+            handle: None,
+            shutdown: None,
+            ordinary_bridge: None,
+            media_bridge: None,
+            control_proxy: None,
+            launch_rootfs: None,
+            profile_disk: None,
+        }
     }
 
+    async fn settle_failure(&mut self, message: impl AsRef<str>) -> String {
+        let absence = self.cleanup().await;
+        self.settlement_with_absence(message, absence)
+    }
+
+    fn settlement_with_absence(&self, message: impl AsRef<str>, absence: Value) -> String {
+        let terminal = absence
+            .as_object()
+            .is_some_and(|values| values.values().all(|value| value == &Value::Bool(true)));
+        serde_json::to_string(&json!({
+            "schema": VZ_LAUNCH_SETTLEMENT_SCHEMA,
+            "state": if terminal {
+                "terminal_post_effect_cleanup"
+            } else {
+                "cleanup_pending"
+            },
+            "message": bounded_message(message.as_ref()),
+            "binding_hash": self.identity.binding_hash,
+            "generation": self.identity.generation,
+            "page_id": self.identity.page_id,
+            "vm_id": self.identity.vm_id,
+            "stream_id": self.identity.stream_id,
+            "media_stream_id": self.identity.media_stream_id,
+            "effects": self.effects(),
+            "absence": absence,
+        }))
+        .unwrap_or_else(|_| {
+            "Browser VZ launch cleanup settlement serialization failed; cleanup remains indeterminate"
+                .to_string()
+        })
+    }
+
+    fn effects(&self) -> Value {
+        // Effect booleans are conservative may-have-acted markers. They are
+        // set no later than the first point where acquisition may have
+        // occurred and never mean cleanup or absence has already been proved.
+        json!({
+            "session_directory": self.session_directory,
+            "control_socket": self.control_socket,
+            "ordinary_stream_bridge": self.ordinary_stream_bridge,
+            "media_stream_bridge": self.media_stream_bridge,
+            "turn_process": self.turn_process,
+            "supervisor_child": false,
+            "vm": self.vm,
+        })
+    }
+
+    async fn cleanup(&mut self) -> Value {
+        if let Some(shutdown) = self.shutdown.as_ref() {
+            shutdown.store(true, Ordering::Relaxed);
+        }
+        let vm_absent = if let (Some(provider), Some(handle)) =
+            (self.provider.as_ref(), self.handle.as_ref())
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(30), provider.stop(handle)).await;
+            matches!(
+                tokio::time::timeout(Duration::from_secs(30), provider.status(handle),).await,
+                Ok(Ok(CapsuleStatus::Stopped | CapsuleStatus::Failed))
+            )
+        } else {
+            !self.vm
+        };
+        if vm_absent {
+            self.handle.take();
+            self.provider.take();
+        }
+        let control_proxy_absent = match self.control_proxy.take() {
+            Some(proxy) => join_control_proxy_bounded(proxy, Duration::from_secs(30)),
+            None if !self.control_proxy_spawned => true,
+            None => false,
+        };
+        let ordinary_stream_bridge_absent = match self.ordinary_bridge.take() {
+            Some(bridge) => matches!(
+                tokio::time::timeout(Duration::from_secs(30), bridge).await,
+                Ok(Ok(true))
+            ),
+            None => !self.ordinary_stream_bridge,
+        };
+        let media_stream_bridge_absent = match self.media_bridge.take() {
+            Some(bridge) => matches!(
+                tokio::time::timeout(Duration::from_secs(30), bridge).await,
+                Ok(Ok(true))
+            ),
+            None => !self.media_stream_bridge,
+        };
+        let turn_cleanup =
+            std::mem::replace(&mut self.turn_cleanup, TurnCleanupEvidence::Indeterminate);
+        let turn_child_absent = match turn_cleanup {
+            TurnCleanupEvidence::Owned(mut turn) => turn.terminate_and_reap(),
+            TurnCleanupEvidence::AbsenceProved => true,
+            TurnCleanupEvidence::NotStarted => !self.turn_process,
+            TurnCleanupEvidence::Indeterminate => false,
+        };
+        self.turn_cleanup = if turn_child_absent {
+            TurnCleanupEvidence::AbsenceProved
+        } else {
+            TurnCleanupEvidence::Indeterminate
+        };
+        self.profile_disk.take();
+        self.launch_rootfs.take();
+        let path_absence = remove_owned_launch_paths(&self.paths, &self.acquired_paths);
+        let vm_state_absent = self
+            .identity
+            .vm_id
+            .as_str()
+            .is_some_and(|vm_id| remove_owned_vm_state(&self.paths, vm_id, vm_absent));
+        let turn_listener_absent = turn_listener_port_absent(&self.transport);
+        let turn_relay_ports_absent = turn_relay_ports_absent(&self.transport);
+        let child_absent = turn_child_absent
+            && control_proxy_absent
+            && ordinary_stream_bridge_absent
+            && media_stream_bridge_absent;
+        json!({
+            "child_absent": child_absent,
+            "supervisor_child_absent": true,
+            "control_socket_absent": control_proxy_absent && path_absence.control_socket,
+            "route_absent": vm_absent,
+            "turn_listener_absent": turn_listener_absent,
+            "turn_relay_ports_absent": turn_relay_ports_absent,
+            "ordinary_stream_bridge_absent": ordinary_stream_bridge_absent,
+            "media_stream_bridge_absent": media_stream_bridge_absent,
+            "session_directory_absent": path_absence.socket_directory
+                && path_absence.session_directory
+                && vm_state_absent,
+            "vm_absent": vm_absent,
+        })
+    }
+}
+
+async fn run() -> Result<(), String> {
     trace_stage("read_request", "");
-    let (request, request_from_stdin) = read_open_request()?;
+    let (request, request_from_stdin) = read_open_request().map_err(unbound_launch_error)?;
     let launch = request
         .get("launch_request")
-        .ok_or_else(|| "Browser VM open request missing launch_request".to_string())?;
-    let transport = validate_launch_request(launch, request_from_stdin)?;
+        .ok_or_else(|| unbound_launch_error("Browser VM open request missing launch_request"))?;
+    let transport =
+        validate_launch_request(launch, request_from_stdin).map_err(unbound_launch_error)?;
+    let identity = VzLaunchIdentity::from_launch(launch);
+    if !elastos_vz::is_supported() {
+        return Err(did_not_act_settlement(
+            &identity,
+            "browser-vz-engine-supervisor requires macOS arm64 with Apple Virtualization.framework",
+        ));
+    }
     trace_stage(
         "validated_request",
         format!(
@@ -107,7 +381,8 @@ async fn run() -> Result<(), String> {
         ),
     );
 
-    let paths = LaunchPaths::from_env(launch)?;
+    let paths =
+        LaunchPaths::from_env(launch).map_err(|error| did_not_act_settlement(&identity, error))?;
     trace_stage(
         "resolved_paths",
         format!(
@@ -129,6 +404,7 @@ async fn run() -> Result<(), String> {
             boot_args = override_args;
         }
     }
+    validate_vz_boot_args(&boot_args).map_err(|error| did_not_act_settlement(&identity, error))?;
     if !boot_args
         .split_whitespace()
         .any(|arg| arg.starts_with("elastos.browser_epoch="))
@@ -139,167 +415,191 @@ async fn run() -> Result<(), String> {
             current_unix_seconds()
         );
     }
-    append_browser_display_boot_args(&mut boot_args, launch, transport.as_ref())?;
-    let profile_disk = prepare_browser_profile_disk(&request)?;
-    append_browser_profile_boot_arg(&mut boot_args, &profile_disk.profile_key);
-
-    fs::create_dir_all(&paths.session_dir).map_err(|err| err.to_string())?;
-    fs::create_dir_all(&paths.state_dir).map_err(|err| err.to_string())?;
-    prepare_socket_path(&paths.control_socket_path)?;
-    let turn = transport
-        .as_ref()
-        .map(|transport| LaunchTurn::start(&paths, transport))
-        .transpose()?;
-    let hibernation = if transport.is_some() {
-        None
-    } else {
-        BrowserVmHibernation::from_env(
-            &paths,
-            launch,
-            &profile_disk.profile_key,
-            &profile_disk.path,
-            &boot_args,
-        )?
-    };
-    let launch_rootfs = prepare_launch_rootfs(&paths, hibernation.as_ref())?;
+    append_browser_display_boot_args(&mut boot_args, launch, &transport)
+        .map_err(|error| did_not_act_settlement(&identity, error))?;
+    preflight_vz_launch(&paths, &transport, request_from_stdin)
+        .map_err(|error| did_not_act_settlement(&identity, error))?;
+    let mut owner = VzLaunchOwner::new(identity, paths, transport);
+    macro_rules! post_effect_try {
+        ($expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => return Err(owner.settle_failure(error.to_string()).await),
+            }
+        };
+    }
+    owner.session_directory = true;
+    post_effect_try!(create_owned_launch_paths(
+        &owner.paths,
+        &owner.transport,
+        &mut owner.acquired_paths,
+    ));
+    post_effect_try!(fs::create_dir_all(&owner.paths.state_dir));
+    post_effect_try!(prepare_socket_path(&owner.paths.control_socket_path));
+    owner.profile_disk = Some(post_effect_try!(prepare_browser_profile_disk(&request)));
+    append_browser_profile_boot_arg(
+        &mut boot_args,
+        &owner
+            .profile_disk
+            .as_ref()
+            .expect("Browser VZ profile disk owner")
+            .profile_key,
+    );
+    owner.turn_process = true;
+    owner.turn_cleanup = TurnCleanupEvidence::Indeterminate;
+    match LaunchTurn::start(&owner.paths, &owner.transport) {
+        Ok(turn) => {
+            owner.turn_cleanup = TurnCleanupEvidence::Owned(turn);
+        }
+        Err(error) => {
+            owner.turn_cleanup = if error.child_absent {
+                TurnCleanupEvidence::AbsenceProved
+            } else {
+                TurnCleanupEvidence::Indeterminate
+            };
+            return Err(owner.settle_failure(error.message).await);
+        }
+    }
+    owner.launch_rootfs = Some(post_effect_try!(prepare_launch_rootfs(&owner.paths)));
     trace_stage(
         "prepared_rootfs",
         format!(
             "base={} launch={}",
-            paths.rootfs_path.display(),
-            launch_rootfs.path.display()
+            owner.paths.rootfs_path.display(),
+            owner
+                .launch_rootfs
+                .as_ref()
+                .expect("Browser VZ launch rootfs owner")
+                .path
+                .display()
         ),
     );
 
     trace_stage("provider_init_start", "");
-    let provider = Arc::new(
-        VzProvider::new(
-            VzConfig::new()
-                .with_kernel_path(&paths.kernel_path)
-                .with_state_dir(&paths.state_dir)
-                .with_rootfs_cache_dir(&paths.rootfs_cache_dir),
-        )
-        .map_err(|err| err.to_string())?,
-    );
-    provider.init().await.map_err(|err| err.to_string())?;
+    owner.provider = Some(Arc::new(post_effect_try!(VzProvider::new(
+        VzConfig::new()
+            .with_kernel_path(&owner.paths.kernel_path)
+            .with_state_dir(&owner.paths.state_dir)
+            .with_rootfs_cache_dir(&owner.paths.rootfs_cache_dir),
+    ))));
+    let provider = Arc::clone(owner.provider.as_ref().expect("Browser VZ provider owner"));
+    post_effect_try!(provider.init().await);
     trace_stage("provider_init_done", "");
 
     let mut vm_config = VmConfig {
-        vm_id: browser_vm_id(transport.as_ref())?,
-        kernel_path: paths.kernel_path.clone(),
+        vm_id: post_effect_try!(browser_vm_id(&owner.transport)),
+        kernel_path: owner.paths.kernel_path.clone(),
         boot_args,
-        rootfs_path: launch_rootfs.path.clone(),
+        rootfs_path: owner
+            .launch_rootfs
+            .as_ref()
+            .expect("Browser VZ launch rootfs owner")
+            .path
+            .clone(),
         rootfs_readonly: false,
-        mem_size_mib: paths.memory_mib,
-        vcpu_count: paths.vcpu_count,
+        mem_size_mib: owner.paths.memory_mib,
+        vcpu_count: owner.paths.vcpu_count,
         http_port: None,
         data_disk_path: None,
         vsock_cid: 3,
         network: None,
-        network_disabled: transport.is_some(),
+        network_disabled: true,
         interactive_stdio: false,
         carrier_socket_path: None,
-        initramfs_path: paths.initramfs_path.clone(),
+        initramfs_path: owner.paths.initramfs_path.clone(),
     };
-    vm_config.data_disk_path = Some(profile_disk.path.clone());
+    vm_config.data_disk_path = Some(
+        owner
+            .profile_disk
+            .as_ref()
+            .expect("Browser VZ profile disk owner")
+            .path
+            .clone(),
+    );
 
     trace_stage(
         "load_vm_start",
         format!("boot_args={}", vm_config.boot_args),
     );
-    let handle = provider
-        .load_with_vm_config(vm_config, manifest)
-        .await
-        .map_err(|err| err.to_string())?;
+    owner.vm = true;
+    owner.handle = Some(post_effect_try!(
+        provider.load_with_vm_config(vm_config, manifest).await
+    ));
+    let handle = owner.handle.as_ref().expect("Browser VZ VM owner").clone();
     trace_stage("load_vm_done", "");
-    if !restore_browser_vm_hibernation(Arc::clone(&provider), &handle, hibernation.as_ref()).await?
-    {
-        trace_stage("start_vm_start", "");
-        if let Err(error) = provider.start(&handle).await {
-            let _ = fs::remove_dir_all(&paths.session_dir);
-            return Err(error.to_string());
-        }
-        trace_stage("start_vm_done", "");
-    }
+    trace_stage("start_vm_start", "");
+    post_effect_try!(provider.start(&handle).await);
+    trace_stage("start_vm_done", "");
 
-    let guest_transport_receipt = match transport.as_ref() {
-        Some(transport) => {
-            match bootstrap_vz_transport(Arc::clone(&provider), &handle, transport).await {
-                Ok(receipt) => Some(receipt),
-                Err(error) => {
-                    let _ = provider.stop(&handle).await;
-                    let _ = fs::remove_dir_all(&paths.session_dir);
-                    return Err(error);
-                }
-            }
-        }
-        None => None,
-    };
+    let guest_transport_receipt = post_effect_try!(
+        bootstrap_vz_transport(Arc::clone(&provider), &handle, &owner.transport,).await
+    );
     let shutdown = Arc::new(AtomicBool::new(false));
+    owner.shutdown = Some(Arc::clone(&shutdown));
     trace_stage("spawn_egress_bridge", "");
-    let egress_max_sessions = env_u32("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS", 16)?;
+    let egress_max_sessions =
+        post_effect_try!(env_u32("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS", 16,));
     if egress_max_sessions == 0 || egress_max_sessions > 256 {
-        return Err("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS must be from 1 to 256".to_string());
+        return Err(owner
+            .settle_failure("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS must be from 1 to 256")
+            .await);
     }
-    let egress_port = transport
-        .as_ref()
-        .and_then(|transport| {
-            transport
-                .authority
-                .pointer("/egress/vsock_port")
-                .and_then(Value::as_u64)
-        })
+    let egress_port = owner
+        .transport
+        .authority
+        .pointer("/egress/vsock_port")
+        .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(paths.relay_port);
-    let egress = if env_bool("ELASTOS_BROWSER_VM_DISABLE_EGRESS_BRIDGE", false) {
-        tokio::spawn(async {})
-    } else {
-        spawn_egress_bridge(
-            Arc::clone(&provider),
-            handle.clone(),
-            egress_port,
-            paths.runtime_stream_path.clone(),
-            Arc::clone(&shutdown),
-            egress_max_sessions as usize,
-        )
-    };
-    let media = transport.as_ref().map(|transport| {
-        spawn_egress_bridge(
-            Arc::clone(&provider),
-            handle.clone(),
-            transport
-                .authority
-                .pointer("/media/vsock_port")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .expect("validated Browser VZ media vsock port"),
-            PathBuf::from(
-                transport
-                    .authority
-                    .pointer("/media/runtime_socket_path")
-                    .and_then(Value::as_str)
-                    .expect("validated Browser VZ media Runtime socket"),
-            ),
-            Arc::clone(&shutdown),
-            egress_max_sessions as usize,
-        )
-    });
-    trace_stage("spawn_control_proxy", "");
-    let control_proxy = spawn_control_proxy(
+        .expect("validated Browser VZ egress vsock port");
+    owner.ordinary_bridge = Some(spawn_egress_bridge(
         Arc::clone(&provider),
         handle.clone(),
-        paths.control_port,
-        paths.control_socket_path.clone(),
+        egress_port,
+        owner.paths.runtime_stream_path.clone(),
         Arc::clone(&shutdown),
-    )?;
+        egress_max_sessions as usize,
+    ));
+    owner.ordinary_stream_bridge = true;
+    owner.media_bridge = Some(spawn_egress_bridge(
+        Arc::clone(&provider),
+        handle.clone(),
+        owner
+            .transport
+            .authority
+            .pointer("/media/vsock_port")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .expect("validated Browser VZ media vsock port"),
+        PathBuf::from(
+            owner
+                .transport
+                .authority
+                .pointer("/media/runtime_socket_path")
+                .and_then(Value::as_str)
+                .expect("validated Browser VZ media Runtime socket"),
+        ),
+        Arc::clone(&shutdown),
+        egress_max_sessions as usize,
+    ));
+    owner.media_stream_bridge = true;
+    trace_stage("spawn_control_proxy", "");
+    owner.control_socket = true;
+    owner.control_proxy = Some(post_effect_try!(spawn_control_proxy(
+        Arc::clone(&provider),
+        handle.clone(),
+        owner.paths.control_port,
+        owner.paths.control_socket_path.clone(),
+        Arc::clone(&shutdown),
+    )));
+    owner.control_proxy_spawned = true;
 
     trace_stage("open_guest_page_start", "");
     let mut result = match open_guest_page(
         Arc::clone(&provider),
         &handle,
-        paths.control_port,
+        owner.paths.control_port,
         &request,
-        &paths,
+        &owner.paths,
     )
     .await
     {
@@ -310,72 +610,60 @@ async fn run() -> Result<(), String> {
                     tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
                 }
             }
-            shutdown.store(true, Ordering::Relaxed);
-            let _ = provider.stop(&handle).await;
-            return Err(error);
+            return Err(owner.settle_failure(error).await);
         }
     };
-    if let Some(transport) = transport.as_ref() {
-        if result.get("page_id") != transport.authority.get("page_id") {
-            shutdown.store(true, Ordering::Relaxed);
-            let _ = provider.stop(&handle).await;
-            return Err("Browser VZ guest page identity changed".to_string());
-        }
-        result["vm_id"] = transport
-            .authority
-            .get("vm_id")
-            .cloned()
-            .expect("validated Browser VZ vm_id");
-        result["transport_authority"] = transport.authority.clone();
-        result["transport_receipt"] = vz_transport_effect_receipt(
-            transport,
-            guest_transport_receipt
-                .as_ref()
-                .expect("Browser VZ guest transport bootstrap receipt"),
-        )?;
-        if let Some(display) = result
-            .get_mut("display_session")
-            .and_then(Value::as_object_mut)
-        {
-            display.remove("ice_servers");
-            display.insert(
-                "ice_connection_policy".to_string(),
-                json!("engine_relay_only"),
-            );
-        }
+    if result.get("page_id") != owner.transport.authority.get("page_id") {
+        return Err(owner
+            .settle_failure("Browser VZ guest page identity changed")
+            .await);
+    }
+    result["vm_id"] = owner
+        .transport
+        .authority
+        .get("vm_id")
+        .cloned()
+        .expect("validated Browser VZ vm_id");
+    result["transport_authority"] = owner.transport.authority.clone();
+    result["transport_receipt"] = post_effect_try!(vz_transport_effect_receipt(
+        &owner.transport,
+        &guest_transport_receipt,
+    ));
+    if let Some(display) = result
+        .get_mut("display_session")
+        .and_then(Value::as_object_mut)
+    {
+        display.remove("ice_servers");
+        display.insert(
+            "ice_connection_policy".to_string(),
+            json!("engine_relay_only"),
+        );
     }
     trace_stage("open_guest_page_done", "");
 
-    println!(
-        "{}",
-        serde_json::to_string(&result).map_err(|err| err.to_string())?
-    );
-    wait_for_shutdown_or_transport_expiry(transport.as_ref()).await;
-    shutdown.store(true, Ordering::Relaxed);
-    let _ = control_proxy.join();
-    let _ = egress.await;
-    if let Some(media) = media {
-        let _ = media.await;
+    println!("{}", post_effect_try!(serde_json::to_string(&result)));
+    wait_for_shutdown_or_transport_expiry(Some(&owner.transport)).await;
+    let absence = owner.cleanup().await;
+    if !absence
+        .as_object()
+        .is_some_and(|values| values.values().all(|value| value == &Value::Bool(true)))
+    {
+        return Err(owner.settlement_with_absence(
+            "Browser VZ normal shutdown did not prove terminal cleanup",
+            absence,
+        ));
     }
-    save_browser_vm_hibernation(Arc::clone(&provider), &handle, hibernation.as_ref()).await;
-    let _ = provider.stop(&handle).await;
-    drop(turn);
-    let _ = fs::remove_file(&paths.control_socket_path);
-    let _ = fs::remove_dir_all(&paths.session_dir);
     Ok(())
 }
 
-fn browser_vm_id(transport: Option<&VzTransportLaunch>) -> Result<String, String> {
-    match transport {
-        Some(transport) => transport
-            .authority
-            .get("vm_id")
-            .and_then(Value::as_str)
-            .filter(|vm_id| safe_id(vm_id))
-            .map(str::to_string)
-            .ok_or_else(|| "Browser VZ transport VM identity is invalid".to_string()),
-        None => Ok(format!("browser-vm-{}", uuid::Uuid::new_v4())),
-    }
+fn browser_vm_id(transport: &VzTransportLaunch) -> Result<String, String> {
+    transport
+        .authority
+        .get("vm_id")
+        .and_then(Value::as_str)
+        .filter(|vm_id| safe_id(vm_id))
+        .map(str::to_string)
+        .ok_or_else(|| "Browser VZ transport VM identity is invalid".to_string())
 }
 
 fn trace_stage(stage: &str, detail: impl AsRef<str>) {
@@ -420,7 +708,7 @@ struct VzTransportLaunch {
 fn validate_launch_request(
     launch: &Value,
     request_from_stdin: bool,
-) -> Result<Option<VzTransportLaunch>, String> {
+) -> Result<VzTransportLaunch, String> {
     if launch.get("schema").and_then(Value::as_str)
         != Some("elastos.browser.engine.launch-request/v1")
     {
@@ -475,7 +763,7 @@ fn validate_launch_request(
 fn validate_vz_transport_launch(
     launch: &Value,
     request_from_stdin: bool,
-) -> Result<Option<VzTransportLaunch>, String> {
+) -> Result<VzTransportLaunch, String> {
     let fields = [
         launch.get("page_id"),
         launch.get("vm_id"),
@@ -483,7 +771,10 @@ fn validate_vz_transport_launch(
         launch.get("transport_secret"),
     ];
     if fields.iter().all(Option::is_none) {
-        return Ok(None);
+        return Err(
+            "Browser VZ launch requires a complete versioned Runtime transport authority"
+                .to_string(),
+        );
     }
     if fields.iter().any(Option::is_none) {
         return Err("Browser VZ transport launch binding is incomplete".to_string());
@@ -514,7 +805,7 @@ fn validate_vz_transport_launch(
     {
         return Err("Browser VZ transport launch identity changed".to_string());
     }
-    Ok(Some(VzTransportLaunch { authority, secret }))
+    Ok(VzTransportLaunch { authority, secret })
 }
 
 fn validate_vz_transport_authority(authority: &Value, require_live: bool) -> Result<(), String> {
@@ -875,56 +1166,48 @@ fn launch_viewport(launch: &Value) -> Result<Option<(u64, u64)>, String> {
 fn append_browser_display_boot_args(
     boot_args: &mut String,
     launch: &Value,
-    transport: Option<&VzTransportLaunch>,
+    transport: &VzTransportLaunch,
 ) -> Result<(), String> {
-    if let Some(transport) = transport {
-        append_browser_display_boot_args_with_ice_config(boot_args, launch, true, None)?;
-        let bootstrap_port = transport
-            .authority
-            .get("bootstrap_vsock_port")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "Browser VZ bootstrap port is missing".to_string())?;
-        write!(
-            boot_args,
-            " elastos.browser_vz_transport=vsock_v1 elastos.browser_bootstrap_port={bootstrap_port}"
-        )
-        .map_err(|err| err.to_string())?;
-        return Ok(());
-    }
-    let display_mode = launch
-        .get("display_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("webrtc_remote_display");
-    let ice_has_turn_server = if display_mode == "webrtc_remote_display" {
-        ice_env_has_turn_server()?
-    } else {
-        true
-    };
-    let ice_config_hex = ice_boot_config_hex()?;
-    append_browser_display_boot_args_with_ice_config(
+    append_browser_display_boot_args_without_legacy_media(boot_args, launch)?;
+    let bootstrap_port = transport
+        .authority
+        .get("bootstrap_vsock_port")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Browser VZ bootstrap port is missing".to_string())?;
+    write!(
         boot_args,
-        launch,
-        ice_has_turn_server,
-        ice_config_hex.as_deref(),
+        " elastos.browser_vz_transport=vsock_v1 elastos.browser_bootstrap_port={bootstrap_port}"
     )
+    .map_err(|err| err.to_string())
 }
 
-fn append_browser_display_boot_args_with_ice_config(
+fn validate_vz_boot_args(boot_args: &str) -> Result<(), String> {
+    let mixed = boot_args
+        .split_whitespace()
+        .filter(|argument| {
+            VZ_AUTHORITY_BOOT_ARG_PREFIXES
+                .iter()
+                .any(|prefix| argument.starts_with(prefix))
+        })
+        .collect::<Vec<_>>();
+    if mixed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Browser VZ launch rejects boot arguments that substitute Runtime transport authority: {}",
+            mixed.join(", ")
+        ))
+    }
+}
+
+fn append_browser_display_boot_args_without_legacy_media(
     boot_args: &mut String,
     launch: &Value,
-    ice_has_turn_server: bool,
-    ice_config_hex: Option<&str>,
 ) -> Result<(), String> {
     let display_mode = launch
         .get("display_mode")
         .and_then(Value::as_str)
         .unwrap_or("webrtc_remote_display");
-    if display_mode == "webrtc_remote_display" && !ice_has_turn_server {
-        return Err(
-            "Browser VZ webrtc_remote_display requires ELASTOS_BROWSER_VM_ICE_SERVER or ELASTOS_BROWSER_VM_ICE_SERVERS_JSON with at least one turn:/turns: URL for media_transport=runtime_relay"
-              .to_string(),
-        );
-    }
     write!(boot_args, " {DISPLAY_MODE_BOOT_ARG}={display_mode}").map_err(|err| err.to_string())?;
     if let Some((width, height)) = launch_viewport(launch)? {
         write!(
@@ -933,105 +1216,7 @@ fn append_browser_display_boot_args_with_ice_config(
         )
         .map_err(|err| err.to_string())?;
     }
-    if let Some(config_hex) = ice_config_hex {
-        write!(boot_args, " {ICE_CONFIG_BOOT_ARG}={config_hex}").map_err(|err| err.to_string())?;
-    }
     Ok(())
-}
-
-fn ice_boot_config_hex() -> Result<Option<String>, String> {
-    let mut config = serde_json::Map::new();
-    for key in VM_ICE_ENV_KEYS {
-        if let Some(value) = env_non_empty(key) {
-            config.insert(key.to_string(), json!(value));
-        }
-    }
-    if config.is_empty() {
-        return Ok(None);
-    }
-    let raw = serde_json::to_vec(&Value::Object(config)).map_err(|err| err.to_string())?;
-    if raw.len() > 4096 {
-        return Err("Browser VM ICE boot config is too large for kernel boot args".to_string());
-    }
-    Ok(Some(hex_encode(&raw)))
-}
-
-fn ice_env_has_turn_server() -> Result<bool, String> {
-    let mut urls = Vec::new();
-    if let Some(url) = env_non_empty("ELASTOS_BROWSER_VM_ICE_SERVER") {
-        urls.push(url);
-    }
-    if let Some(raw) = env_non_empty("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON") {
-        let parsed: Value = serde_json::from_str(&raw)
-            .map_err(|err| format!("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON is invalid JSON: {err}"))?;
-        let entries = parsed
-            .as_array()
-            .ok_or_else(|| "ELASTOS_BROWSER_VM_ICE_SERVERS_JSON must be an array".to_string())?;
-        for entry in entries {
-            collect_ice_urls(entry, &mut urls)?;
-        }
-    }
-    Ok(urls.iter().any(|url| {
-        let lower = url.trim().to_ascii_lowercase();
-        lower.starts_with("turn:") || lower.starts_with("turns:")
-    }))
-}
-
-fn collect_ice_urls(entry: &Value, urls: &mut Vec<String>) -> Result<(), String> {
-    if let Some(url) = entry.as_str() {
-        urls.push(validate_ice_url(url)?);
-        return Ok(());
-    }
-    let object = entry.as_object().ok_or_else(|| {
-        "ICE server entries must be URL strings or RTCIceServer objects".to_string()
-    })?;
-    let value = object
-        .get("urls")
-        .ok_or_else(|| "ICE server entries must include urls".to_string())?;
-    if let Some(url) = value.as_str() {
-        urls.push(validate_ice_url(url)?);
-        return Ok(());
-    }
-    let values = value
-        .as_array()
-        .ok_or_else(|| "ICE server urls must be a string or array".to_string())?;
-    if values.is_empty() || values.len() > 8 {
-        return Err("ICE server urls must contain 1..8 entries".to_string());
-    }
-    for url in values {
-        let url = url
-            .as_str()
-            .ok_or_else(|| "ICE server urls entries must be strings".to_string())?;
-        urls.push(validate_ice_url(url)?);
-    }
-    Ok(())
-}
-
-fn validate_ice_url(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if trimmed.is_empty()
-        || trimmed.len() > 512
-        || trimmed
-            .bytes()
-            .any(|byte| byte == b'\0' || byte == b'\r' || byte == b'\n')
-        || !(lower.starts_with("stun:")
-            || lower.starts_with("turn:")
-            || lower.starts_with("turns:"))
-    {
-        return Err(
-            "ICE server URLs must use stun:, turn:, or turns: without control characters"
-                .to_string(),
-        );
-    }
-    Ok(trimmed.to_string())
-}
-
-fn env_non_empty(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1066,17 +1251,16 @@ fn validate_absolute_path(label: &str, value: &str) -> Result<(), String> {
 
 #[derive(Debug)]
 struct LaunchPaths {
-    data_dir: PathBuf,
     kernel_path: PathBuf,
     rootfs_path: PathBuf,
     initramfs_path: Option<PathBuf>,
     state_dir: PathBuf,
     rootfs_cache_dir: PathBuf,
     session_dir: PathBuf,
+    socket_dir: PathBuf,
     control_socket_path: PathBuf,
     runtime_stream_path: PathBuf,
     control_port: u32,
-    relay_port: u32,
     memory_mib: u32,
     vcpu_count: u8,
 }
@@ -1086,14 +1270,33 @@ struct LaunchTurn {
     config_path: PathBuf,
 }
 
+struct LaunchTurnStartError {
+    message: String,
+    child_absent: bool,
+}
+
+impl From<String> for LaunchTurnStartError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            child_absent: true,
+        }
+    }
+}
+
 impl LaunchTurn {
-    fn start(paths: &LaunchPaths, transport: &VzTransportLaunch) -> Result<Self, String> {
+    fn start(
+        paths: &LaunchPaths,
+        transport: &VzTransportLaunch,
+    ) -> Result<Self, LaunchTurnStartError> {
         let program = env_path("ELASTOS_BROWSER_VM_TURN_PROGRAM")
             .ok_or_else(|| "ELASTOS_BROWSER_VM_TURN_PROGRAM is required".to_string())?;
         let metadata = fs::metadata(&program)
             .map_err(|err| format!("Browser VZ TURN program is unavailable: {err}"))?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            return Err("Browser VZ TURN program must be an executable regular file".to_string());
+            return Err("Browser VZ TURN program must be an executable regular file"
+                .to_string()
+                .into());
         }
         let turn = transport
             .authority
@@ -1130,6 +1333,12 @@ impl LaunchTurn {
             .map(|millis| millis.div_ceil(1_000))
             .filter(|seconds| *seconds > 0)
             .ok_or_else(|| "Browser VZ TURN authority is expired".to_string())?;
+        let listen_addr = std::net::SocketAddr::new(
+            listen_host
+                .parse()
+                .map_err(|_| "Browser VZ TURN listen host is invalid".to_string())?,
+            listen_port,
+        );
         let config_path = paths.session_dir.join("turnserver.conf");
         let mut file = OpenOptions::new()
             .write(true)
@@ -1155,6 +1364,7 @@ impl LaunchTurn {
              max-port={relay_max}\n\
              realm=elastos-browser-{realm_suffix}\n\
              fingerprint\n\
+             allow-loopback-peers\n\
              use-auth-secret\n\
              static-auth-secret={secret}\n\
              no-udp\n\
@@ -1182,45 +1392,85 @@ impl LaunchTurn {
         let mut turn = Self { child, config_path };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(status) = turn
-                .child
-                .try_wait()
-                .map_err(|err| format!("Browser VZ TURN process status failed: {err}"))?
-            {
-                let _ = fs::remove_file(&turn.config_path);
-                return Err(format!(
-                    "Browser VZ TURN process exited before readiness: {status}"
-                ));
+            match turn.child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = remove_file_if_present(&turn.config_path);
+                    return Err(LaunchTurnStartError {
+                        message: format!(
+                            "Browser VZ TURN process exited before readiness: {status}"
+                        ),
+                        child_absent: true,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(turn.fail_after_spawn(format!(
+                        "Browser VZ TURN process status failed: {error}"
+                    )));
+                }
             }
-            if std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::new(
-                    listen_host
-                        .parse()
-                        .map_err(|_| "Browser VZ TURN listen host is invalid".to_string())?,
-                    listen_port,
-                ),
-                Duration::from_millis(100),
-            )
-            .is_ok()
+            if std::net::TcpStream::connect_timeout(&listen_addr, Duration::from_millis(100))
+                .is_ok()
             {
                 break;
             }
             if Instant::now() >= deadline {
-                return Err("Browser VZ TURN listener did not become ready".to_string());
+                return Err(turn.fail_after_spawn(
+                    "Browser VZ TURN listener did not become ready".to_string(),
+                ));
             }
             thread::sleep(Duration::from_millis(25));
         }
-        fs::remove_file(&turn.config_path)
-            .map_err(|err| format!("Browser VZ TURN config retirement failed: {err}"))?;
+        if let Err(error) = remove_file_if_present(&turn.config_path) {
+            return Err(
+                turn.fail_after_spawn(format!("Browser VZ TURN config retirement failed: {error}"))
+            );
+        }
         Ok(turn)
+    }
+
+    fn fail_after_spawn(&mut self, message: String) -> LaunchTurnStartError {
+        LaunchTurnStartError {
+            message,
+            child_absent: self.terminate_and_reap(),
+        }
+    }
+
+    fn terminate_and_reap(&mut self) -> bool {
+        let child_absent = match self.child.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                let _ = self.child.kill();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match self.child.try_wait() {
+                        Ok(Some(_)) => break true,
+                        Ok(None) if Instant::now() < deadline => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        Ok(None) | Err(_) => break false,
+                    }
+                }
+            }
+            Err(_) => false,
+        };
+        let config_absent =
+            remove_file_if_present(&self.config_path).is_ok() && !self.config_path.exists();
+        child_absent && config_absent
     }
 }
 
 impl Drop for LaunchTurn {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = fs::remove_file(&self.config_path);
+        let _ = self.terminate_and_reap();
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -1240,17 +1490,10 @@ impl LaunchPaths {
         let rootfs_cache_dir = data_dir.join("rootfs-cache");
         let session_root =
             env_path("ELASTOS_BROWSER_VM_ROOT").unwrap_or_else(|| PathBuf::from("/tmp/evzs"));
-        let session_dir = session_root.join(format!(
-            "{}-{}",
-            path_segment(
-                launch
-                    .get("stream_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stream")
-            ),
-            uuid::Uuid::new_v4().simple()
-        ));
-        let control_socket_path = session_dir.join("c.sock");
+        let socket_root = env_path("ELASTOS_BROWSER_VM_SOCKET_ROOT")
+            .unwrap_or_else(|| PathBuf::from("/tmp/evzrc"));
+        let (session_dir, socket_dir, control_socket_path) =
+            bound_vz_launch_paths(&session_root, &socket_root, launch)?;
         let runtime_stream_path = PathBuf::from(
             launch
                 .get("adapter_ipc")
@@ -1281,23 +1524,434 @@ impl LaunchPaths {
             }
         }
         Ok(Self {
-            data_dir,
             kernel_path,
             rootfs_path,
             initramfs_path,
             state_dir,
             rootfs_cache_dir,
             session_dir,
+            socket_dir,
             control_socket_path,
             runtime_stream_path,
             control_port: env_u32(
                 "ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PORT",
                 DEFAULT_CONTROL_PORT,
             )?,
-            relay_port: env_u32("ELASTOS_BROWSER_VM_RELAY_PORT", DEFAULT_RELAY_PORT)?,
             memory_mib: env_u32("ELASTOS_BROWSER_VM_MEMORY_MIB", 2048)?,
             vcpu_count: env_u32("ELASTOS_BROWSER_VM_VCPUS", 2)? as u8,
         })
+    }
+}
+
+fn bound_vz_launch_paths(
+    session_root: &Path,
+    socket_root: &Path,
+    launch: &Value,
+) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let binding_digest = launch
+        .pointer("/transport_authority/binding_hash")
+        .and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .filter(|value| value.len() == 64)
+        .ok_or_else(|| "Browser VZ launch binding hash is unavailable".to_string())?;
+    let binding_segment = &binding_digest[..32];
+    let session_dir = session_root.join(format!("vz-{binding_segment}"));
+    let socket_dir = socket_root.join(binding_segment);
+    let control_socket_path = socket_dir.join("c.sock");
+    validate_unix_socket_path_budget("control_socket_path", &control_socket_path)?;
+    Ok((session_dir, socket_dir, control_socket_path))
+}
+
+fn preflight_vz_launch(
+    paths: &LaunchPaths,
+    transport: &VzTransportLaunch,
+    request_from_stdin: bool,
+) -> Result<(), String> {
+    let mixed = LEGACY_VZ_CONFIGURATION_KEYS
+        .into_iter()
+        .filter(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        .collect::<Vec<_>>();
+    if !mixed.is_empty() {
+        return Err(format!(
+            "Browser VZ launch rejects legacy or mixed transport configuration: {}",
+            mixed.join(", ")
+        ));
+    }
+    if !request_from_stdin {
+        return Err("Browser VZ transport launch requires the private stdin wrapper".to_string());
+    }
+    validate_private_stdin_descriptor(libc::STDIN_FILENO)?;
+    for (label, artifact) in [
+        ("kernel", &paths.kernel_path),
+        ("rootfs", &paths.rootfs_path),
+    ] {
+        let metadata = fs::metadata(artifact)
+            .map_err(|err| format!("Browser VZ {label} preflight failed: {err}"))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "Browser VZ {label} must be a regular file: {}",
+                artifact.display()
+            ));
+        }
+    }
+    if let Some(initramfs) = paths.initramfs_path.as_ref() {
+        if !fs::metadata(initramfs)
+            .map_err(|err| format!("Browser VZ initramfs preflight failed: {err}"))?
+            .is_file()
+        {
+            return Err(format!(
+                "Browser VZ initramfs must be a regular file: {}",
+                initramfs.display()
+            ));
+        }
+    }
+    let turn_program = env_path("ELASTOS_BROWSER_VM_TURN_PROGRAM")
+        .ok_or_else(|| "ELASTOS_BROWSER_VM_TURN_PROGRAM is required".to_string())?;
+    let turn_metadata = fs::metadata(&turn_program)
+        .map_err(|err| format!("Browser VZ TURN program preflight failed: {err}"))?;
+    if !turn_metadata.is_file() || turn_metadata.permissions().mode() & 0o111 == 0 {
+        return Err("Browser VZ TURN program must be an executable regular file".to_string());
+    }
+    let executable = std::env::current_exe()
+        .map_err(|err| format!("Browser VZ supervisor path preflight failed: {err}"))?;
+    let executable_metadata = fs::metadata(&executable)
+        .map_err(|err| format!("Browser VZ supervisor metadata preflight failed: {err}"))?;
+    if !executable_metadata.is_file() || executable_metadata.permissions().mode() & 0o111 == 0 {
+        return Err("Browser VZ supervisor must be an executable regular file".to_string());
+    }
+    verify_virtualization_entitlement(&executable)?;
+    validate_owner_only_root_if_present(
+        "socket",
+        paths
+            .socket_dir
+            .parent()
+            .ok_or_else(|| "Browser VZ socket root is unavailable".to_string())?,
+    )?;
+    validate_owner_only_root_if_present(
+        "session",
+        paths
+            .session_dir
+            .parent()
+            .ok_or_else(|| "Browser VZ session root is unavailable".to_string())?,
+    )?;
+    for (label, owned_path) in [
+        ("binding socket directory", &paths.socket_dir),
+        ("control socket", &paths.control_socket_path),
+        ("session directory", &paths.session_dir),
+    ] {
+        if owned_path.exists() {
+            return Err(format!(
+                "Browser VZ {label} already exists for this exact binding: {}",
+                owned_path.display()
+            ));
+        }
+    }
+    validate_runtime_stream_socket_path(&paths.runtime_stream_path)?;
+    validate_runtime_stream_socket_path(&PathBuf::from(
+        transport
+            .authority
+            .pointer("/media/runtime_socket_path")
+            .and_then(Value::as_str)
+            .expect("validated Browser VZ media Runtime socket"),
+    ))?;
+    preflight_turn_ports(transport)
+}
+
+fn verify_virtualization_entitlement(executable: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let verified = Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict"])
+            .arg(executable)
+            .status()
+            .map_err(|err| format!("Browser VZ codesign verification failed: {err}"))?;
+        if !verified.success() {
+            return Err("Browser VZ supervisor signature verification failed".to_string());
+        }
+        let entitlements = Command::new("/usr/bin/codesign")
+            .args(["-d", "--entitlements", ":-"])
+            .arg(executable)
+            .output()
+            .map_err(|err| format!("Browser VZ entitlement inspection failed: {err}"))?;
+        let mut text = String::from_utf8_lossy(&entitlements.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&entitlements.stderr));
+        if !entitlements.status.success()
+            || !text.contains("com.apple.security.virtualization")
+            || !text.contains("<true/>")
+        {
+            return Err(
+                "Browser VZ supervisor lacks the signed virtualization entitlement".to_string(),
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = executable;
+    }
+    Ok(())
+}
+
+fn validate_private_stdin_descriptor(fd: RawFd) -> Result<(), String> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "Browser VZ private stdin descriptor metadata failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let file_kind = stat.st_mode & libc::S_IFMT;
+    let anonymous_pipe = (file_kind == libc::S_IFIFO && stat.st_nlink == 0)
+        || (file_kind == libc::S_IFSOCK
+            && stat.st_nlink == 0
+            && is_anonymous_unix_stream_socket(fd));
+    let owner_only_file = file_kind == libc::S_IFREG && stat.st_mode & 0o077 == 0;
+    if stat.st_uid != unsafe { libc::geteuid() } || !(anonymous_pipe || owner_only_file) {
+        return Err(
+            "Browser VZ private stdin must be an owner-only file or owned anonymous pipe"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn is_anonymous_unix_stream_socket(fd: RawFd) -> bool {
+    let mut socket_type = 0;
+    let mut socket_type_length = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            std::ptr::addr_of_mut!(socket_type).cast(),
+            &mut socket_type_length,
+        )
+    } != 0
+        || socket_type != libc::SOCK_STREAM
+    {
+        return false;
+    }
+
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_un>::zeroed();
+    let mut address_length = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    if unsafe { libc::getsockname(fd, address.as_mut_ptr().cast(), &mut address_length) } != 0 {
+        return false;
+    }
+    let address = unsafe { address.assume_init() };
+    address.sun_family as libc::c_int == libc::AF_UNIX && address.sun_path[0] == 0
+}
+
+fn validate_owner_only_root_if_present(label: &str, root: &Path) -> Result<(), String> {
+    let Ok(metadata) = fs::metadata(root) else {
+        return Ok(());
+    };
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(format!(
+            "Browser VZ {label} root must be an owner-only directory: {}",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+struct TurnPortBindings {
+    listen_host: String,
+    listen_port: u16,
+    relay_host: String,
+    relay_min: u16,
+    relay_max: u16,
+}
+
+fn turn_port_bindings(transport: &VzTransportLaunch) -> Result<TurnPortBindings, String> {
+    let turn = transport
+        .authority
+        .get("turn")
+        .ok_or_else(|| "Browser VZ TURN authority is missing".to_string())?;
+    let listen_host = turn
+        .get("listen_host")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Browser VZ TURN listen host is missing".to_string())?;
+    let relay_host = turn
+        .get("relay_host")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Browser VZ TURN relay host is missing".to_string())?;
+    let listen_port = require_json_port(turn.get("listen_port"), "listen_port")?;
+    let relay_min = require_json_port(turn.get("relay_port_min"), "relay_port_min")?;
+    let relay_max = require_json_port(turn.get("relay_port_max"), "relay_port_max")?;
+    Ok(TurnPortBindings {
+        listen_host: listen_host.to_string(),
+        listen_port,
+        relay_host: relay_host.to_string(),
+        relay_min,
+        relay_max,
+    })
+}
+
+fn preflight_turn_ports(transport: &VzTransportLaunch) -> Result<(), String> {
+    let bindings = turn_port_bindings(transport)?;
+    let _listener =
+        std::net::TcpListener::bind((bindings.listen_host.as_str(), bindings.listen_port))
+            .map_err(|err| format!("Browser VZ TURN listen port is unavailable: {err}"))?;
+    let mut relay_tcp = Vec::new();
+    let mut relay_udp = Vec::new();
+    for port in bindings.relay_min..=bindings.relay_max {
+        relay_tcp.push(
+            std::net::TcpListener::bind((bindings.relay_host.as_str(), port)).map_err(|err| {
+                format!("Browser VZ TURN relay TCP port {port} is unavailable: {err}")
+            })?,
+        );
+        relay_udp.push(
+            std::net::UdpSocket::bind((bindings.relay_host.as_str(), port)).map_err(|err| {
+                format!("Browser VZ TURN relay UDP port {port} is unavailable: {err}")
+            })?,
+        );
+    }
+    Ok(())
+}
+
+fn turn_listener_port_absent(transport: &VzTransportLaunch) -> bool {
+    let Ok(bindings) = turn_port_bindings(transport) else {
+        return false;
+    };
+    std::net::TcpListener::bind((bindings.listen_host.as_str(), bindings.listen_port)).is_ok()
+}
+
+fn turn_relay_ports_absent(transport: &VzTransportLaunch) -> bool {
+    let Ok(bindings) = turn_port_bindings(transport) else {
+        return false;
+    };
+    let mut tcp = Vec::new();
+    let mut udp = Vec::new();
+    for port in bindings.relay_min..=bindings.relay_max {
+        let Ok(tcp_listener) = std::net::TcpListener::bind((bindings.relay_host.as_str(), port))
+        else {
+            return false;
+        };
+        tcp.push(tcp_listener);
+        let Ok(udp_socket) = std::net::UdpSocket::bind((bindings.relay_host.as_str(), port)) else {
+            return false;
+        };
+        udp.push(udp_socket);
+    }
+    true
+}
+
+#[derive(Default)]
+struct AcquiredLaunchPaths {
+    socket_directory: bool,
+    session_directory: bool,
+}
+
+fn create_owned_launch_paths(
+    paths: &LaunchPaths,
+    transport: &VzTransportLaunch,
+    acquired: &mut AcquiredLaunchPaths,
+) -> Result<(), String> {
+    let socket_root = paths
+        .socket_dir
+        .parent()
+        .ok_or_else(|| "Browser VZ socket root is unavailable".to_string())?;
+    fs::create_dir_all(socket_root)
+        .map_err(|err| format!("Browser VZ socket root creation failed: {err}"))?;
+    fs::set_permissions(socket_root, fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("Browser VZ socket root permissions failed: {err}"))?;
+    let session_root = paths
+        .session_dir
+        .parent()
+        .ok_or_else(|| "Browser VZ session root is unavailable".to_string())?;
+    fs::create_dir_all(session_root)
+        .map_err(|err| format!("Browser VZ session root creation failed: {err}"))?;
+    fs::set_permissions(session_root, fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("Browser VZ session root permissions failed: {err}"))?;
+    fs::create_dir(&paths.socket_dir)
+        .map_err(|err| format!("Browser VZ binding socket directory creation failed: {err}"))?;
+    acquired.socket_directory = true;
+    fs::set_permissions(&paths.socket_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("Browser VZ binding socket permissions failed: {err}"))?;
+    fs::create_dir(&paths.session_dir)
+        .map_err(|err| format!("Browser VZ session directory creation failed: {err}"))?;
+    acquired.session_directory = true;
+    fs::set_permissions(&paths.session_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|err| format!("Browser VZ session permissions failed: {err}"))?;
+    let owner = json!({
+        "schema": "elastos.browser.vz-socket-owner/v1",
+        "binding_hash": transport.authority["binding_hash"],
+        "generation": transport.authority["generation"],
+        "page_id": transport.authority["page_id"],
+        "vm_id": transport.authority["vm_id"],
+        "stream_id": transport.authority["egress"]["stream_id"],
+        "media_stream_id": transport.authority["media"]["stream_id"],
+    });
+    let owner_path = paths.socket_dir.join("owner.json");
+    let mut owner_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&owner_path)
+        .map_err(|err| format!("Browser VZ socket owner creation failed: {err}"))?;
+    serde_json::to_writer(&mut owner_file, &owner).map_err(|err| err.to_string())?;
+    owner_file
+        .write_all(b"\n")
+        .and_then(|_| owner_file.sync_all())
+        .map_err(|err| format!("Browser VZ socket owner write failed: {err}"))
+}
+
+struct OwnedPathAbsence {
+    control_socket: bool,
+    socket_directory: bool,
+    session_directory: bool,
+}
+
+fn remove_owned_launch_paths(
+    paths: &LaunchPaths,
+    acquired: &AcquiredLaunchPaths,
+) -> OwnedPathAbsence {
+    let control_socket = if acquired.socket_directory {
+        remove_file_if_present(&paths.control_socket_path).is_ok()
+            && !paths.control_socket_path.exists()
+    } else {
+        !paths.control_socket_path.exists()
+    };
+    let socket_directory = if acquired.socket_directory {
+        remove_directory_if_present(&paths.socket_dir).is_ok() && !paths.socket_dir.exists()
+    } else {
+        !paths.socket_dir.exists()
+    };
+    let session_directory = if acquired.session_directory {
+        remove_directory_if_present(&paths.session_dir).is_ok() && !paths.session_dir.exists()
+    } else {
+        !paths.session_dir.exists()
+    };
+    OwnedPathAbsence {
+        control_socket,
+        socket_directory,
+        session_directory,
+    }
+}
+
+fn remove_owned_vm_state(paths: &LaunchPaths, vm_id: &str, vm_absent: bool) -> bool {
+    if !vm_absent || !safe_id(vm_id) {
+        return false;
+    }
+    let vm_state_dir = paths.state_dir.join(vm_id);
+    match fs::symlink_metadata(&vm_state_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            remove_directory_if_present(&vm_state_dir).is_ok() && !vm_state_dir.exists()
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+fn remove_directory_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -1314,6 +1968,7 @@ impl Drop for LifetimeFileLock {
 }
 
 impl LifetimeFileLock {
+    #[cfg(test)]
     fn acquire_lock_file(path: &Path, resource: &str) -> Result<Self, String> {
         Self::acquire(path, path, resource)
     }
@@ -1380,288 +2035,6 @@ fn resources_in_use_error(resource: &str, path: &Path) -> String {
     .to_string()
 }
 
-#[derive(Debug)]
-struct BrowserVmHibernation {
-    key: String,
-    state_dir: PathBuf,
-    state_path: PathBuf,
-    state_tmp_path: PathBuf,
-    metadata_path: PathBuf,
-    launch_rootfs_path: PathBuf,
-    _lease: HibernationLease,
-}
-
-#[derive(Debug)]
-struct HibernationLease {
-    _lock: LifetimeFileLock,
-}
-
-impl HibernationLease {
-    fn acquire(state_dir: &Path) -> Result<Self, String> {
-        fs::create_dir_all(state_dir).map_err(|err| err.to_string())?;
-        Ok(Self {
-            _lock: LifetimeFileLock::acquire_lock_file(
-                &state_dir.join(HIBERNATION_LIFETIME_LOCK),
-                "shared Browser VZ hibernation state",
-            )?,
-        })
-    }
-}
-
-impl BrowserVmHibernation {
-    fn from_env(
-        paths: &LaunchPaths,
-        launch: &Value,
-        profile_key: &str,
-        profile_disk_path: &Path,
-        boot_args: &str,
-    ) -> Result<Option<Self>, String> {
-        if !env_bool("ELASTOS_BROWSER_VM_HIBERNATION", false) {
-            return Ok(None);
-        }
-        let hibernation_root = env_path("ELASTOS_BROWSER_VM_HIBERNATION_DIR")
-            .unwrap_or_else(|| paths.data_dir.join("browser-vm/hibernation"));
-        validate_clean_absolute_path("ELASTOS_BROWSER_VM_HIBERNATION_DIR", &hibernation_root)?;
-        let max_entries = env_u32(
-            "ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES",
-            DEFAULT_HIBERNATION_MAX_ENTRIES,
-        )?;
-        if !(1..=32).contains(&max_entries) {
-            return Err(
-                "ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES must be from 1 to 32".to_string(),
-            );
-        }
-        let max_age_secs = env_u64(
-            "ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS",
-            DEFAULT_HIBERNATION_MAX_AGE_SECS,
-        )?;
-        if !(60 * 60..=30 * 24 * 60 * 60).contains(&max_age_secs) {
-            return Err(
-                "ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS must be from 3600 to 2592000"
-                    .to_string(),
-            );
-        }
-        let key_material = json!({
-            "schema": "elastos.browser.vm-hibernation-key/v1",
-            "platform": {
-                "os": std::env::consts::OS,
-                "arch": std::env::consts::ARCH,
-            },
-            "engine": {
-                "kind": "chromium_microvm",
-                "display_mode": launch.get("display_mode").and_then(Value::as_str),
-                "guarantee_level": launch.get("guarantee_level").and_then(Value::as_str),
-                "network_mode": "runtime_net_only",
-                "direct_network": false,
-                "wallet_injection": false,
-            },
-            "resources": {
-                "memory_mib": paths.memory_mib,
-                "vcpu_count": paths.vcpu_count,
-            },
-            "artifacts": {
-                "kernel": file_fingerprint(&paths.kernel_path)?,
-                "rootfs": file_fingerprint(&paths.rootfs_path)?,
-                "initramfs": paths
-                  .initramfs_path
-                  .as_ref()
-                  .map(|path| file_fingerprint(path))
-                  .transpose()?,
-            },
-            "profile": {
-                "profile_key": profile_key,
-                "disk": profile_disk_identity(profile_disk_path)?,
-            },
-            "boot_args": boot_args,
-        });
-        let key = sha256_json(&key_material)?;
-        let state_dir = hibernation_root.join(&key[..2]).join(&key);
-        let state_path = state_dir.join("machine.state");
-        let state_tmp_path = state_dir.join("machine.state.tmp");
-        let metadata_path = state_dir.join("metadata.json");
-        let launch_rootfs_path = state_dir.join("rootfs.ext4");
-        let lease = HibernationLease::acquire(&state_dir)?;
-        match prune_hibernation_cache(
-            &hibernation_root,
-            &state_dir,
-            max_entries as usize,
-            Duration::from_secs(max_age_secs),
-        ) {
-            Ok(removed) if removed > 0 => trace_stage(
-                "hibernate_cache_pruned",
-                format!("removed={removed} max_entries={max_entries}"),
-            ),
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("browser-vz-engine-supervisor hibernate_cache_prune_failed error={error}")
-            }
-        }
-        Ok(Some(Self {
-            key,
-            state_dir,
-            state_path,
-            state_tmp_path,
-            metadata_path,
-            launch_rootfs_path,
-            _lease: lease,
-        }))
-    }
-}
-
-#[derive(Debug)]
-struct HibernationCacheEntry {
-    path: PathBuf,
-    last_modified: SystemTime,
-    active: bool,
-}
-
-fn prune_hibernation_cache(
-    root: &Path,
-    protected: &Path,
-    max_entries: usize,
-    max_age: Duration,
-) -> Result<usize, String> {
-    prune_hibernation_cache_at(root, protected, max_entries, max_age, SystemTime::now())
-}
-
-fn prune_hibernation_cache_at(
-    root: &Path,
-    protected: &Path,
-    max_entries: usize,
-    max_age: Duration,
-    now: SystemTime,
-) -> Result<usize, String> {
-    let mut entries = hibernation_cache_entries(root)?;
-    for entry in &mut entries {
-        entry.active = hibernation_entry_has_live_lease(&entry.path)?;
-    }
-
-    let mut removed = 0;
-    for entry in &entries {
-        if entry.path != protected
-            && !entry.active
-            && now.duration_since(entry.last_modified).unwrap_or_default() > max_age
-        {
-            remove_hibernation_cache_entry(&entry.path)?;
-            removed += 1;
-        }
-    }
-
-    entries.retain(|entry| entry.path.exists());
-    entries.sort_by(|left, right| {
-        left.last_modified
-            .cmp(&right.last_modified)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    let mut remaining = entries.len();
-    for entry in entries {
-        if remaining <= max_entries {
-            break;
-        }
-        if entry.path == protected || entry.active {
-            continue;
-        }
-        remove_hibernation_cache_entry(&entry.path)?;
-        removed += 1;
-        remaining -= 1;
-    }
-    Ok(removed)
-}
-
-fn hibernation_cache_entries(root: &Path) -> Result<Vec<HibernationCacheEntry>, String> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    for prefix in fs::read_dir(root).map_err(|err| err.to_string())? {
-        let prefix = prefix.map_err(|err| err.to_string())?;
-        if !prefix.file_type().map_err(|err| err.to_string())?.is_dir() {
-            continue;
-        }
-        let prefix_name = prefix.file_name();
-        let Some(prefix_name) = prefix_name.to_str() else {
-            continue;
-        };
-        if !is_lower_hex(prefix_name, 2) {
-            continue;
-        }
-        for candidate in fs::read_dir(prefix.path()).map_err(|err| err.to_string())? {
-            let candidate = candidate.map_err(|err| err.to_string())?;
-            if !candidate
-                .file_type()
-                .map_err(|err| err.to_string())?
-                .is_dir()
-            {
-                continue;
-            }
-            let key = candidate.file_name();
-            let Some(key) = key.to_str() else {
-                continue;
-            };
-            if !is_lower_hex(key, 64) || !key.starts_with(prefix_name) {
-                continue;
-            }
-            let path = candidate.path();
-            entries.push(HibernationCacheEntry {
-                last_modified: hibernation_entry_last_modified(&path)?,
-                path,
-                active: false,
-            });
-        }
-    }
-    Ok(entries)
-}
-
-fn hibernation_entry_last_modified(path: &Path) -> Result<SystemTime, String> {
-    let mut modified = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .map_err(|err| err.to_string())?;
-    for name in [
-        "machine.state",
-        "machine.state.tmp",
-        "metadata.json",
-        "rootfs.ext4",
-    ] {
-        match fs::metadata(path.join(name)).and_then(|metadata| metadata.modified()) {
-            Ok(candidate) if candidate > modified => modified = candidate,
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(modified)
-}
-
-fn hibernation_entry_has_live_lease(path: &Path) -> Result<bool, String> {
-    let lock_path = path.join(HIBERNATION_LIFETIME_LOCK);
-    let file = match open_lifetime_lock(&lock_path, false) {
-        Ok(file) => file,
-        Err(_) if !lock_path.exists() => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let acquired = try_lock_exclusive(&file)?;
-    if acquired {
-        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    }
-    Ok(!acquired)
-}
-
-fn remove_hibernation_cache_entry(path: &Path) -> Result<(), String> {
-    let prefix = path.parent().map(Path::to_path_buf);
-    fs::remove_dir_all(path).map_err(|err| err.to_string())?;
-    if let Some(prefix) = prefix {
-        let _ = fs::remove_dir(prefix);
-    }
-    Ok(())
-}
-
-fn is_lower_hex(value: &str, len: usize) -> bool {
-    value.len() == len
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
@@ -1706,88 +2079,6 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("/var/lib/elastos")
 }
 
-fn validate_clean_absolute_path(label: &str, path: &Path) -> Result<(), String> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| component.as_os_str() == std::ffi::OsStr::new(".."))
-        || path.to_string_lossy().contains(['\0', '\r', '\n'])
-    {
-        return Err(format!(
-            "{label} must be an absolute path without traversal or control characters"
-        ));
-    }
-    Ok(())
-}
-
-fn file_fingerprint(path: &Path) -> Result<Value, String> {
-    let metadata =
-        fs::metadata(path).map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a file", path.display()));
-    }
-    Ok(json!({
-        "path": path.to_string_lossy(),
-        "len": metadata.len(),
-        "modified_unix_nanos": metadata_modified_unix_nanos(&metadata),
-    }))
-}
-
-fn profile_disk_identity(path: &Path) -> Result<Value, String> {
-    let metadata = fs::metadata(path).map_err(|err| {
-        format!(
-            "failed to stat Browser profile disk {}: {err}",
-            path.display()
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "Browser profile disk is not a file: {}",
-            path.display()
-        ));
-    }
-    Ok(json!({
-        "path": path.to_string_lossy(),
-        "len": metadata.len(),
-        "dev": metadata.dev(),
-        "ino": metadata.ino(),
-    }))
-}
-
-fn metadata_modified_unix_nanos(metadata: &fs::Metadata) -> u128 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
-}
-
-fn sha256_json(value: &Value) -> Result<String, String> {
-    let bytes = serde_json::to_vec(value).map_err(|err| err.to_string())?;
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    Ok(hex_encode(&hasher.finalize()))
-}
-
-fn path_segment(value: &str) -> String {
-    let mut segment = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(24)
-        .collect::<String>();
-    if segment.is_empty() {
-        segment.push_str("session");
-    }
-    segment
-}
-
 fn validate_unix_socket_path_budget(label: &str, path: &Path) -> Result<(), String> {
     let text = path.to_string_lossy();
     if text.len() >= UNIX_SOCKET_PATH_BUDGET {
@@ -1806,31 +2097,7 @@ struct PreparedLaunchRootfs {
     _lock: Option<LifetimeFileLock>,
 }
 
-fn prepare_launch_rootfs(
-    paths: &LaunchPaths,
-    hibernation: Option<&BrowserVmHibernation>,
-) -> Result<PreparedLaunchRootfs, String> {
-    if let Some(hibernation) = hibernation {
-        if !hibernation.launch_rootfs_path.exists() {
-            if hibernation.state_path.exists() {
-                let _ = fs::remove_file(&hibernation.state_path);
-            }
-            clone_or_copy_file(&paths.rootfs_path, &hibernation.launch_rootfs_path).map_err(
-                |err| {
-                    format!(
-                        "failed to prepare Browser VM hibernation rootfs {} from {}: {}",
-                        hibernation.launch_rootfs_path.display(),
-                        paths.rootfs_path.display(),
-                        err
-                    )
-                },
-            )?;
-        }
-        return Ok(PreparedLaunchRootfs {
-            path: hibernation.launch_rootfs_path.clone(),
-            _lock: None,
-        });
-    }
+fn prepare_launch_rootfs(paths: &LaunchPaths) -> Result<PreparedLaunchRootfs, String> {
     if std::env::var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH")
         .map(|value| value == "0" || value.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
@@ -2074,164 +2341,13 @@ fn prepare_socket_path(path: &Path) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            fs::remove_file(path).map_err(|err| err.to_string())
-        }
         Ok(_) => Err(format!(
-            "Browser VZ control socket path exists and is not a socket: {}",
+            "Browser VZ control socket path already exists for this exact binding: {}",
             path.display()
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
-}
-
-async fn restore_browser_vm_hibernation(
-    provider: Arc<VzProvider>,
-    handle: &CapsuleHandle,
-    hibernation: Option<&BrowserVmHibernation>,
-) -> Result<bool, String> {
-    let Some(hibernation) = hibernation else {
-        return Ok(false);
-    };
-    if !hibernation.state_path.exists() {
-        trace_stage(
-            "hibernate_restore_skip",
-            format!("key={} reason=no_state", hibernation.key),
-        );
-        return Ok(false);
-    }
-    match provider.supports_hibernation(handle).await {
-        Ok(true) => {}
-        Ok(false) => {
-            trace_stage(
-                "hibernate_restore_skip",
-                format!("key={} reason=unsupported_config", hibernation.key),
-            );
-            return Ok(false);
-        }
-        Err(error) => return Err(error.to_string()),
-    }
-    trace_stage(
-        "hibernate_restore_start",
-        format!(
-            "key={} state={}",
-            hibernation.key,
-            hibernation.state_path.display()
-        ),
-    );
-    match provider
-        .restore_from_hibernation(handle, &hibernation.state_path)
-        .await
-    {
-        Ok(()) => {
-            trace_stage("hibernate_restore_done", format!("key={}", hibernation.key));
-            Ok(true)
-        }
-        Err(error) => {
-            eprintln!(
-                "browser-vz-engine-supervisor hibernate_restore_failed key={} error={}",
-                hibernation.key, error
-            );
-            discard_bad_hibernation_state(hibernation);
-            Ok(false)
-        }
-    }
-}
-
-async fn save_browser_vm_hibernation(
-    provider: Arc<VzProvider>,
-    handle: &CapsuleHandle,
-    hibernation: Option<&BrowserVmHibernation>,
-) {
-    let Some(hibernation) = hibernation else {
-        return;
-    };
-    match provider.supports_hibernation(handle).await {
-        Ok(true) => {}
-        Ok(false) => {
-            trace_stage(
-                "hibernate_save_skip",
-                format!("key={} reason=unsupported_config", hibernation.key),
-            );
-            return;
-        }
-        Err(error) => {
-            eprintln!(
-                "browser-vz-engine-supervisor hibernate_support_check_failed key={} error={}",
-                hibernation.key, error
-            );
-            return;
-        }
-    }
-    if let Err(error) = fs::create_dir_all(&hibernation.state_dir) {
-        eprintln!(
-            "browser-vz-engine-supervisor hibernate_prepare_failed key={} error={}",
-            hibernation.key, error
-        );
-        return;
-    }
-    let _ = fs::remove_file(&hibernation.state_tmp_path);
-    trace_stage(
-        "hibernate_save_start",
-        format!(
-            "key={} state={}",
-            hibernation.key,
-            hibernation.state_path.display()
-        ),
-    );
-    match provider
-        .hibernate_to(handle, &hibernation.state_tmp_path)
-        .await
-    {
-        Ok(()) => {
-            if let Err(error) = fs::rename(&hibernation.state_tmp_path, &hibernation.state_path) {
-                eprintln!(
-                    "browser-vz-engine-supervisor hibernate_publish_failed key={} error={}",
-                    hibernation.key, error
-                );
-                discard_hibernation_tmp_state(hibernation);
-                return;
-            }
-            if let Err(error) = write_hibernation_metadata(hibernation) {
-                eprintln!(
-                    "browser-vz-engine-supervisor hibernate_metadata_failed key={} error={}",
-                    hibernation.key, error
-                );
-            }
-            trace_stage("hibernate_save_done", format!("key={}", hibernation.key));
-        }
-        Err(error) => {
-            eprintln!(
-                "browser-vz-engine-supervisor hibernate_save_failed key={} error={}",
-                hibernation.key, error
-            );
-            discard_hibernation_tmp_state(hibernation);
-        }
-    }
-}
-
-fn discard_bad_hibernation_state(hibernation: &BrowserVmHibernation) {
-    let _ = fs::remove_file(&hibernation.state_path);
-}
-
-fn discard_hibernation_tmp_state(hibernation: &BrowserVmHibernation) {
-    let _ = fs::remove_file(&hibernation.state_tmp_path);
-}
-
-fn write_hibernation_metadata(hibernation: &BrowserVmHibernation) -> Result<(), String> {
-    let metadata = json!({
-        "schema": "elastos.browser.vm-hibernation-state/v1",
-        "key": hibernation.key,
-        "created_at_unix_secs": current_unix_seconds(),
-        "state_path": hibernation.state_path.to_string_lossy(),
-        "rootfs_path": hibernation.launch_rootfs_path.to_string_lossy(),
-    });
-    fs::write(
-        &hibernation.metadata_path,
-        serde_json::to_vec_pretty(&metadata).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| err.to_string())
 }
 
 fn current_unix_seconds() -> u64 {
@@ -2284,12 +2400,7 @@ async fn open_guest_page(
                     Err(error) if is_retryable_guest_control_open_error(&error) => {
                         last_error = error;
                     }
-                    Err(error) if is_guest_control_response_timeout(&error) => {
-                        let probe =
-                            probe_guest_control_status(provider.clone(), handle, control_port)
-                                .await;
-                        break Err(format!("{error}; guest control status probe: {probe}"));
-                    }
+                    Err(error) if is_guest_control_response_timeout(&error) => break Err(error),
                     Err(error) => break Err(error),
                 }
             }
@@ -2324,39 +2435,6 @@ async fn open_guest_page(
         display.insert("direct_network".to_string(), json!(false));
     }
     Ok(result)
-}
-
-async fn probe_guest_control_status(
-    provider: Arc<VzProvider>,
-    handle: &CapsuleHandle,
-    control_port: u32,
-) -> String {
-    let timeout_ms = env_u32(
-        "ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS",
-        DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS,
-    )
-    .unwrap_or(DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS)
-    .clamp(1, 30_000);
-    let timeout = Duration::from_millis(timeout_ms as u64);
-    trace_stage("guest_control_status_probe_start", "");
-    let result = match connect_vsock_with_retry(provider, handle, control_port, timeout).await {
-        Ok(fd) => match http_json_over_fd(fd, "GET", "/status", None, Some(timeout)) {
-            Ok(value) => format!("ok {}", bounded_json(&value, 512)),
-            Err(error) => format!("http_error {error}"),
-        },
-        Err(error) => format!("connect_error {error}"),
-    };
-    trace_stage("guest_control_status_probe_done", &result);
-    result
-}
-
-fn bounded_json(value: &Value, limit: usize) -> String {
-    let mut text = serde_json::to_string(value).unwrap_or_else(|_| "<invalid-json>".to_string());
-    if text.len() > limit {
-        text.truncate(limit);
-        text.push_str("...");
-    }
-    text
 }
 
 fn guest_control_open_request(request: &Value) -> Value {
@@ -2793,12 +2871,13 @@ fn spawn_control_proxy(
     control_port: u32,
     socket_path: PathBuf,
     shutdown: Arc<AtomicBool>,
-) -> Result<thread::JoinHandle<()>, String> {
+) -> Result<thread::JoinHandle<bool>, String> {
     let listener = UnixListener::bind(&socket_path).map_err(|err| err.to_string())?;
     listener
         .set_nonblocking(true)
         .map_err(|err| err.to_string())?;
     Ok(thread::spawn(move || {
+        let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
         while !shutdown.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((host_stream, _)) => {
@@ -2808,7 +2887,7 @@ fn spawn_control_proxy(
                     }
                     let provider = Arc::clone(&provider);
                     let handle = handle.clone();
-                    thread::spawn(move || {
+                    workers.push(thread::spawn(move || {
                         let runtime = match tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
@@ -2846,7 +2925,7 @@ fn spawn_control_proxy(
                                 let _ = write_error_response(host_stream, &error.to_string());
                             }
                         }
-                    });
+                    }));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(25));
@@ -2854,7 +2933,19 @@ fn spawn_control_proxy(
                 Err(_) => break,
             }
         }
+        workers.into_iter().all(|worker| worker.join().is_ok())
     }))
+}
+
+fn join_control_proxy_bounded(handle: thread::JoinHandle<bool>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if !handle.is_finished() {
+        return false;
+    }
+    matches!(handle.join(), Ok(true))
 }
 
 fn proxy_http_control_request(
@@ -3020,12 +3111,35 @@ fn spawn_egress_bridge(
     runtime_stream_path: PathBuf,
     shutdown: Arc<AtomicBool>,
     max_sessions: usize,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
         let mut session_id = 0_u64;
+        let mut workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut workers_joined = true;
         let session_slots = Arc::new(Semaphore::new(max_sessions));
         while !shutdown.load(Ordering::Relaxed) {
-            let Ok(session_slot) = Arc::clone(&session_slots).acquire_owned().await else {
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let worker = workers.swap_remove(index);
+                    workers_joined &= worker.await.is_ok();
+                } else {
+                    index += 1;
+                }
+            }
+            let session_slot = loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break None;
+                }
+                match Arc::clone(&session_slots).try_acquire_owned() {
+                    Ok(slot) => break Some(slot),
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => break None,
+                }
+            };
+            let Some(session_slot) = session_slot else {
                 break;
             };
             match connect_vsock_until_shutdown(
@@ -3044,7 +3158,7 @@ fn spawn_egress_bridge(
                         eprintln!("Browser VM host egress bridge accepted session {session_id}");
                     }
                     let host_path = runtime_stream_path.clone();
-                    let _worker = tokio::task::spawn_blocking(move || {
+                    workers.push(tokio::task::spawn_blocking(move || {
                         let _session_slot = session_slot;
                         let guest_stream = File::from(fd);
                         let result = (|| -> Result<(), String> {
@@ -3067,7 +3181,7 @@ fn spawn_egress_bridge(
                                 "Browser VM host egress bridge session {session_id} failed: {error}"
                             );
                         }
-                    });
+                    }));
                 }
                 Err(_) => {
                     drop(session_slot);
@@ -3075,6 +3189,10 @@ fn spawn_egress_bridge(
                 }
             }
         }
+        for worker in workers {
+            workers_joined &= worker.await.is_ok();
+        }
+        workers_joined
     })
 }
 
@@ -3366,6 +3484,370 @@ mod tests {
         VzTransportLaunch { authority, secret }
     }
 
+    fn launch_for_transport(transport: &VzTransportLaunch) -> Value {
+        json!({
+            "schema": "elastos.browser.engine.launch-request/v1",
+            "adapter": "browser-engine-adapter",
+            "engine": "chromium_microvm",
+            "stream_id": transport.authority["egress"]["stream_id"],
+            "lifecycle_generation": transport.authority["generation"],
+            "page_id": transport.authority["page_id"],
+            "vm_id": transport.authority["vm_id"],
+            "principal_id": transport.authority["principal_id"],
+            "display_mode": "webrtc_remote_display",
+            "guarantee_level": "mechanism_microvm",
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "wallet_injection": false,
+            "adapter_ipc": {
+                "kind": "unix_socket",
+                "runtime_stream_path": transport.authority["egress"]["runtime_socket_path"],
+            },
+            "transport_authority": transport.authority,
+            "transport_secret": transport.secret,
+        })
+    }
+
+    #[test]
+    fn canonical_vz_launch_requires_complete_transport_before_effects() {
+        let transport = transport_fixture('d');
+        let launch = launch_for_transport(&transport);
+        validate_launch_request(&launch, true).unwrap();
+
+        let mut missing = launch.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("transport_authority");
+        let error = validate_launch_request(&missing, true).unwrap_err();
+        assert!(error.contains("binding is incomplete"));
+
+        let mut disabled = launch.clone();
+        for field in [
+            "transport_authority",
+            "transport_secret",
+            "page_id",
+            "vm_id",
+        ] {
+            disabled.as_object_mut().unwrap().remove(field);
+        }
+        let error = validate_launch_request(&disabled, true).unwrap_err();
+        assert!(error.contains("requires a complete versioned Runtime transport authority"));
+
+        let error = validate_launch_request(&launch, false).unwrap_err();
+        assert!(error.contains("private stdin"));
+
+        assert!(
+            validate_vz_boot_args("console=hvc0 elastos.browser_vz_transport=private_tcp")
+                .unwrap_err()
+                .contains("substitute Runtime transport authority")
+        );
+        assert!(validate_vz_boot_args("console=hvc0 elastos.browser_ice_config_hex=7b7d").is_err());
+    }
+
+    #[test]
+    fn private_stdin_descriptor_accepts_only_anonymous_pipe_transport_or_owner_only_file() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let pipe_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let pipe_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        validate_private_stdin_descriptor(pipe_read.as_raw_fd()).unwrap();
+        drop((pipe_read, pipe_write));
+
+        let mut socket_fds = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, socket_fds.as_mut_ptr())
+            },
+            0
+        );
+        let socket_read = unsafe { OwnedFd::from_raw_fd(socket_fds[0]) };
+        let socket_write = unsafe { OwnedFd::from_raw_fd(socket_fds[1]) };
+        validate_private_stdin_descriptor(socket_read.as_raw_fd()).unwrap();
+        drop((socket_read, socket_write));
+
+        let root = tempfile::tempdir().unwrap();
+        let named_socket_path = root.path().join("named.sock");
+        let named_socket = std::os::unix::net::UnixListener::bind(&named_socket_path).unwrap();
+        assert!(validate_private_stdin_descriptor(named_socket.as_raw_fd()).is_err());
+
+        let private_file_path = root.path().join("private-request.json");
+        fs::write(&private_file_path, b"{}").unwrap();
+        fs::set_permissions(&private_file_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let private_file = File::open(&private_file_path).unwrap();
+        validate_private_stdin_descriptor(private_file.as_raw_fd()).unwrap();
+
+        fs::set_permissions(&private_file_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let shared_file = File::open(&private_file_path).unwrap();
+        assert!(validate_private_stdin_descriptor(shared_file.as_raw_fd()).is_err());
+    }
+
+    #[test]
+    fn legacy_hibernation_limits_fail_preflight_before_any_path_effect() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES");
+        std::env::set_var("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES", "4");
+        let root = tempfile::tempdir().unwrap();
+        let paths = LaunchPaths {
+            kernel_path: root.path().join("missing-kernel"),
+            rootfs_path: root.path().join("missing-rootfs"),
+            initramfs_path: None,
+            state_dir: root.path().join("state"),
+            rootfs_cache_dir: root.path().join("cache"),
+            session_dir: root.path().join("session"),
+            socket_dir: root.path().join("socket"),
+            control_socket_path: root.path().join("socket/c.sock"),
+            runtime_stream_path: root.path().join("missing-runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+
+        let error = preflight_vz_launch(&paths, &transport_fixture('h'), true).unwrap_err();
+
+        assert!(error.contains("legacy or mixed transport configuration"));
+        assert!(error.contains("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES"));
+        assert!(!paths.session_dir.exists());
+        assert!(!paths.socket_dir.exists());
+    }
+
+    #[test]
+    fn binding_hash_keeps_control_socket_short_when_session_root_is_long() {
+        let transport = transport_fixture('e');
+        let launch = launch_for_transport(&transport);
+        let long_root = PathBuf::from(format!("/tmp/{}", "evidence/".repeat(24)));
+        let (session, socket_dir, control) =
+            bound_vz_launch_paths(&long_root, Path::new("/tmp/evzrc"), &launch).unwrap();
+        assert!(session.to_string_lossy().len() > UNIX_SOCKET_PATH_BUDGET);
+        assert!(control.to_string_lossy().len() < UNIX_SOCKET_PATH_BUDGET);
+        assert!(control.starts_with(&socket_dir));
+        assert!(socket_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn post_effect_failure_emits_exact_terminal_cleanup() {
+        let mut transport = transport_fixture('f');
+        transport.authority["turn"]["relay_host"] = json!("127.0.0.1");
+        transport
+            .authority
+            .as_object_mut()
+            .unwrap()
+            .remove("binding_hash");
+        let binding_hash = sha256_label(&canonical_json_bytes(&transport.authority).unwrap());
+        transport.authority["binding_hash"] = json!(binding_hash);
+        transport.secret["binding_hash"] = transport.authority["binding_hash"].clone();
+        let launch = launch_for_transport(&transport);
+        let root = tempfile::tempdir().unwrap();
+        let paths = LaunchPaths {
+            kernel_path: root.path().join("kernel"),
+            rootfs_path: root.path().join("rootfs"),
+            initramfs_path: None,
+            state_dir: root.path().join("state"),
+            rootfs_cache_dir: root.path().join("rootfs-cache"),
+            session_dir: root.path().join("session"),
+            socket_dir: root.path().join("socket"),
+            control_socket_path: root.path().join("socket/c.sock"),
+            runtime_stream_path: root.path().join("runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        let identity = VzLaunchIdentity::from_launch(&launch);
+        let mut owner = VzLaunchOwner::new(identity, paths, transport);
+        owner.session_directory = true;
+        create_owned_launch_paths(&owner.paths, &owner.transport, &mut owner.acquired_paths)
+            .unwrap();
+        fs::write(
+            &owner.paths.control_socket_path,
+            b"owned control placeholder",
+        )
+        .unwrap();
+        owner.control_socket = true;
+
+        let settlement: Value =
+            serde_json::from_str(&owner.settle_failure("injected post-effect failure").await)
+                .unwrap();
+        assert_eq!(settlement["state"], "terminal_post_effect_cleanup");
+        assert_eq!(settlement["effects"]["session_directory"], true);
+        assert_eq!(settlement["effects"]["control_socket"], true);
+        assert_eq!(settlement["absence"]["session_directory_absent"], true);
+        assert_eq!(settlement["absence"]["control_socket_absent"], true);
+        assert_eq!(
+            settlement["binding_hash"],
+            launch["transport_authority"]["binding_hash"]
+        );
+        assert!(!owner.paths.session_dir.exists());
+        assert!(!owner.paths.socket_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_path_acquisition_preserves_foreign_launch_paths() {
+        let transport = transport_fixture('q');
+        let launch = launch_for_transport(&transport);
+        let root = tempfile::tempdir().unwrap();
+        let paths = LaunchPaths {
+            kernel_path: root.path().join("kernel"),
+            rootfs_path: root.path().join("rootfs"),
+            initramfs_path: None,
+            state_dir: root.path().join("state"),
+            rootfs_cache_dir: root.path().join("rootfs-cache"),
+            session_dir: root.path().join("session"),
+            socket_dir: root.path().join("socket"),
+            control_socket_path: root.path().join("socket/c.sock"),
+            runtime_stream_path: root.path().join("runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        fs::create_dir_all(&paths.socket_dir).unwrap();
+        fs::create_dir_all(&paths.session_dir).unwrap();
+        fs::write(paths.socket_dir.join("foreign.socket"), b"preserve").unwrap();
+        fs::write(paths.session_dir.join("foreign.session"), b"preserve").unwrap();
+        let identity = VzLaunchIdentity::from_launch(&launch);
+        let mut owner = VzLaunchOwner::new(identity, paths, transport);
+        owner.session_directory = true;
+
+        let error =
+            create_owned_launch_paths(&owner.paths, &owner.transport, &mut owner.acquired_paths)
+                .unwrap_err();
+        let settlement: Value = serde_json::from_str(&owner.settle_failure(error).await).unwrap();
+
+        assert_eq!(settlement["state"], "cleanup_pending");
+        assert_eq!(settlement["absence"]["session_directory_absent"], false);
+        assert!(owner.paths.socket_dir.join("foreign.socket").exists());
+        assert!(owner.paths.session_dir.join("foreign.session").exists());
+    }
+
+    #[tokio::test]
+    async fn indeterminate_turn_child_keeps_exact_cleanup_pending() {
+        let mut transport = transport_fixture('i');
+        transport.authority["turn"]["relay_host"] = json!("127.0.0.1");
+        transport
+            .authority
+            .as_object_mut()
+            .unwrap()
+            .remove("binding_hash");
+        let binding_hash = sha256_label(&canonical_json_bytes(&transport.authority).unwrap());
+        transport.authority["binding_hash"] = json!(binding_hash);
+        transport.secret["binding_hash"] = transport.authority["binding_hash"].clone();
+        let launch = launch_for_transport(&transport);
+        let root = tempfile::tempdir().unwrap();
+        let paths = LaunchPaths {
+            kernel_path: root.path().join("kernel"),
+            rootfs_path: root.path().join("rootfs"),
+            initramfs_path: None,
+            state_dir: root.path().join("state"),
+            rootfs_cache_dir: root.path().join("rootfs-cache"),
+            session_dir: root.path().join("session"),
+            socket_dir: root.path().join("socket"),
+            control_socket_path: root.path().join("socket/c.sock"),
+            runtime_stream_path: root.path().join("runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        let identity = VzLaunchIdentity::from_launch(&launch);
+        let mut owner = VzLaunchOwner::new(identity, paths, transport);
+        owner.turn_process = true;
+        owner.turn_cleanup = TurnCleanupEvidence::Indeterminate;
+
+        let settlement: Value =
+            serde_json::from_str(&owner.settle_failure("lost TURN child status").await).unwrap();
+
+        assert_eq!(settlement["state"], "cleanup_pending");
+        assert_eq!(settlement["effects"]["turn_process"], true);
+        assert_eq!(settlement["absence"]["child_absent"], false);
+    }
+
+    #[test]
+    fn cleanup_join_evidence_rejects_failed_or_unfinished_workers() {
+        assert!(join_control_proxy_bounded(
+            thread::spawn(|| true),
+            Duration::from_secs(1),
+        ));
+        assert!(!join_control_proxy_bounded(
+            thread::spawn(|| false),
+            Duration::from_secs(1),
+        ));
+        assert!(!join_control_proxy_bounded(
+            thread::spawn(|| {
+                thread::sleep(Duration::from_millis(50));
+                true
+            }),
+            Duration::from_millis(1),
+        ));
+        thread::sleep(Duration::from_millis(60));
+    }
+
+    #[test]
+    fn exact_vm_state_is_retired_only_after_vm_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = LaunchPaths {
+            kernel_path: root.path().join("kernel"),
+            rootfs_path: root.path().join("rootfs"),
+            initramfs_path: None,
+            state_dir: root.path().join("state"),
+            rootfs_cache_dir: root.path().join("rootfs-cache"),
+            session_dir: root.path().join("session"),
+            socket_dir: root.path().join("socket"),
+            control_socket_path: root.path().join("socket/c.sock"),
+            runtime_stream_path: root.path().join("runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        let vm_id = "browser-vm-exact-state";
+        let exact_state = paths.state_dir.join(vm_id);
+        let sibling_state = paths.state_dir.join("browser-vm-preserved");
+        fs::create_dir_all(&exact_state).unwrap();
+        fs::create_dir_all(&sibling_state).unwrap();
+        fs::write(exact_state.join("identifier.bin"), b"exact").unwrap();
+        fs::write(sibling_state.join("identifier.bin"), b"sibling").unwrap();
+
+        assert!(!remove_owned_vm_state(&paths, vm_id, false));
+        assert!(exact_state.exists());
+        assert!(remove_owned_vm_state(&paths, vm_id, true));
+        assert!(!exact_state.exists());
+        assert!(sibling_state.exists());
+        assert!(remove_owned_vm_state(
+            &paths,
+            "browser-vm-already-absent",
+            true,
+        ));
+    }
+
+    #[test]
+    fn malformed_unbound_launch_error_is_not_an_exact_settlement() {
+        let error = unbound_launch_error("missing launch identity");
+        assert!(!error.contains(VZ_LAUNCH_SETTLEMENT_SCHEMA));
+        assert!(serde_json::from_str::<Value>(&error).is_err());
+    }
+
+    #[test]
+    fn exact_settlement_remains_within_control_service_parse_window() {
+        let transport = transport_fixture('b');
+        let launch = launch_for_transport(&transport);
+        let identity = VzLaunchIdentity::from_launch(&launch);
+        let settlement = did_not_act_settlement(&identity, "x".repeat(16 * 1024));
+        let parsed: Value = serde_json::from_str(&settlement).unwrap();
+
+        assert!(settlement.len() < 8 * 1024);
+        assert_eq!(
+            parsed["message"].as_str().unwrap().chars().count(),
+            MAX_SETTLEMENT_MESSAGE_CHARS
+        );
+        assert_eq!(parsed["state"], "did_not_act");
+        assert_eq!(
+            parsed["binding_hash"],
+            launch["transport_authority"]["binding_hash"]
+        );
+    }
+
     fn guest_transport_receipt(authority: &Value) -> Value {
         json!({
             "schema": "elastos.browser.vz-transport-bootstrap-receipt/v1",
@@ -3394,7 +3876,7 @@ mod tests {
         validate_vz_transport_authority(&first.authority, true).unwrap();
         validate_vz_transport_secret(&first.authority, &first.secret).unwrap();
         assert_eq!(
-            browser_vm_id(Some(&first)).unwrap(),
+            browser_vm_id(&first).unwrap(),
             first.authority["vm_id"].as_str().unwrap()
         );
 
@@ -3419,25 +3901,31 @@ mod tests {
     fn launch_owned_turn_failure_is_typed_and_retires_private_config() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _turn_program = EnvVarRestore::capture("ELASTOS_BROWSER_VM_TURN_PROGRAM");
+        let _turn_capture = EnvVarRestore::capture("ELASTOS_TEST_TURN_CONFIG_CAPTURE");
         let root = tempfile::tempdir().unwrap();
         let program = root.path().join("turn-failure.sh");
-        fs::write(&program, "#!/bin/sh\nexit 17\n").unwrap();
+        let capture = root.path().join("captured-turnserver.conf");
+        fs::write(
+            &program,
+            "#!/bin/sh\ncp \"$2\" \"$ELASTOS_TEST_TURN_CONFIG_CAPTURE\"\nexit 17\n",
+        )
+        .unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
         std::env::set_var("ELASTOS_BROWSER_VM_TURN_PROGRAM", &program);
+        std::env::set_var("ELASTOS_TEST_TURN_CONFIG_CAPTURE", &capture);
         let session_dir = root.path().join("session");
         fs::create_dir_all(&session_dir).unwrap();
         let paths = LaunchPaths {
-            data_dir: root.path().to_path_buf(),
             kernel_path: root.path().join("kernel"),
             rootfs_path: root.path().join("rootfs"),
             initramfs_path: None,
             state_dir: root.path().join("state"),
             rootfs_cache_dir: root.path().join("cache"),
             session_dir: session_dir.clone(),
+            socket_dir: session_dir.join("socket"),
             control_socket_path: session_dir.join("control.sock"),
             runtime_stream_path: session_dir.join("runtime.sock"),
             control_port: 19092,
-            relay_port: 19091,
             memory_mib: 2048,
             vcpu_count: 2,
         };
@@ -3445,8 +3933,11 @@ mod tests {
             Ok(_) => panic!("failing TURN fixture unexpectedly started"),
             Err(error) => error,
         };
-        assert!(error.contains("exited before readiness"));
+        assert!(error.message.contains("exited before readiness"));
+        assert!(error.child_absent);
         assert!(!session_dir.join("turnserver.conf").exists());
+        let captured = fs::read_to_string(capture).unwrap();
+        assert!(captured.lines().any(|line| line == "allow-loopback-peers"));
     }
 
     struct EnvVarRestore {
@@ -3470,82 +3961,6 @@ mod tests {
                 None => std::env::remove_var(self.name),
             }
         }
-    }
-
-    fn with_hibernation_env<T>(root: &Path, test: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _enabled = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION");
-        let _dir = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION_DIR");
-        let _max_entries = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES");
-        let _max_age = EnvVarRestore::capture("ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS");
-        std::env::set_var("ELASTOS_BROWSER_VM_HIBERNATION", "1");
-        std::env::set_var("ELASTOS_BROWSER_VM_HIBERNATION_DIR", root);
-        std::env::remove_var("ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES");
-        std::env::remove_var("ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS");
-        test()
-    }
-
-    fn hibernation_fixture_paths(root: &Path) -> (LaunchPaths, PathBuf) {
-        let data_dir = root.join("data");
-        let kernel_path = data_dir.join("bin/vmlinux");
-        let rootfs_path = data_dir.join("browser-vm/rootfs.ext4");
-        let initramfs_path = data_dir.join("bin/initrd");
-        let profile_disk_path = data_dir.join("profiles/profile.ext4");
-        fs::create_dir_all(kernel_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(rootfs_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(initramfs_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(profile_disk_path.parent().unwrap()).unwrap();
-        fs::write(&kernel_path, b"kernel-a").unwrap();
-        fs::write(&rootfs_path, b"rootfs-a").unwrap();
-        fs::write(&initramfs_path, b"initramfs-a").unwrap();
-        fs::write(&profile_disk_path, b"profile-a").unwrap();
-        (
-            LaunchPaths {
-                data_dir,
-                kernel_path,
-                rootfs_path,
-                initramfs_path: Some(initramfs_path),
-                state_dir: root.join("state"),
-                rootfs_cache_dir: root.join("rootfs-cache"),
-                session_dir: root.join("session"),
-                control_socket_path: root.join("session/c.sock"),
-                runtime_stream_path: root.join("runtime.sock"),
-                control_port: DEFAULT_CONTROL_PORT,
-                relay_port: DEFAULT_RELAY_PORT,
-                memory_mib: 2048,
-                vcpu_count: 2,
-            },
-            profile_disk_path,
-        )
-    }
-
-    fn hibernation_launch() -> Value {
-        json!({
-            "schema": "elastos.browser.engine.launch-request/v1",
-            "display_mode": "webrtc_remote_display",
-            "guarantee_level": "mechanism_microvm"
-        })
-    }
-
-    fn hibernation_for(
-        paths: &LaunchPaths,
-        launch: &Value,
-        profile_key: &str,
-        profile_disk_path: &Path,
-        boot_args: &str,
-    ) -> BrowserVmHibernation {
-        BrowserVmHibernation::from_env(paths, launch, profile_key, profile_disk_path, boot_args)
-            .unwrap()
-            .expect("hibernation should be enabled for this test")
-    }
-
-    fn create_hibernation_cache_entry(root: &Path, index: u64) -> PathBuf {
-        let key = format!("{index:064x}");
-        let path = root.join(&key[..2]).join(key);
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("rootfs.ext4"), b"rootfs").unwrap();
-        fs::write(path.join("machine.state"), b"state").unwrap();
-        path
     }
 
     #[test]
@@ -3618,11 +4033,9 @@ mod tests {
                 "height": 758
             }
         });
-        validate_launch_request(&launch, false).unwrap();
         let mut boot_args = "console=hvc0".to_string();
 
-        append_browser_display_boot_args_with_ice_config(&mut boot_args, &launch, true, None)
-            .unwrap();
+        append_browser_display_boot_args_without_legacy_media(&mut boot_args, &launch).unwrap();
 
         assert!(boot_args.contains("elastos.browser_display_mode=webrtc_remote_display"));
         assert!(boot_args.contains("elastos.browser_width=1470"));
@@ -3882,138 +4295,28 @@ mod tests {
     }
 
     #[test]
-    fn hibernation_key_changes_when_profile_artifacts_resources_or_boot_args_change() {
-        let tmp = tempfile::tempdir().unwrap();
-        with_hibernation_env(&tmp.path().join("hibernation"), || {
-            let (mut paths, profile_disk_path) = hibernation_fixture_paths(tmp.path());
-            let launch = hibernation_launch();
-            let base_key = hibernation_for(
-                &paths,
-                &launch,
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0 elastos.browser_width=1280",
-            )
-            .key;
-
-            let profile_key_changed = hibernation_for(
-                &paths,
-                &launch,
-                "profile-b",
-                &profile_disk_path,
-                "console=hvc0 elastos.browser_width=1280",
-            )
-            .key;
-            assert_ne!(base_key, profile_key_changed);
-
-            let profile_disk_b = tmp.path().join("data/profiles/profile-b.ext4");
-            fs::write(&profile_disk_b, b"profile-b").unwrap();
-            let profile_disk_changed = hibernation_for(
-                &paths,
-                &launch,
-                "profile-a",
-                &profile_disk_b,
-                "console=hvc0 elastos.browser_width=1280",
-            )
-            .key;
-            assert_ne!(base_key, profile_disk_changed);
-
-            paths.memory_mib = 4096;
-            let memory_changed = hibernation_for(
-                &paths,
-                &launch,
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0 elastos.browser_width=1280",
-            )
-            .key;
-            assert_ne!(base_key, memory_changed);
-            paths.memory_mib = 2048;
-
-            paths.vcpu_count = 4;
-            let vcpu_changed = hibernation_for(
-                &paths,
-                &launch,
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0 elastos.browser_width=1280",
-            )
-            .key;
-            assert_ne!(base_key, vcpu_changed);
-            paths.vcpu_count = 2;
-
-            let kernel_b = tmp.path().join("data/bin/vmlinux-b");
-            fs::write(&kernel_b, b"kernel-b").unwrap();
-            paths.kernel_path = kernel_b;
-            let kernel_changed = hibernation_for(
-                &paths,
-                &launch,
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0 elastos.browser_width=1280",
-            )
-            .key;
-            assert_ne!(base_key, kernel_changed);
-            paths.kernel_path = tmp.path().join("data/bin/vmlinux");
-
-            let rootfs_b = tmp.path().join("data/browser-vm/rootfs-b.ext4");
-            fs::write(&rootfs_b, b"rootfs-b").unwrap();
-            paths.rootfs_path = rootfs_b;
-            let rootfs_changed = hibernation_for(
-                &paths,
-                &launch,
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0 elastos.browser_width=1280",
-            )
-            .key;
-            assert_ne!(base_key, rootfs_changed);
-            paths.rootfs_path = tmp.path().join("data/browser-vm/rootfs.ext4");
-
-            let boot_args_changed = hibernation_for(
-                &paths,
-                &launch,
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0 elastos.browser_width=1470",
-            )
-            .key;
-            assert_ne!(base_key, boot_args_changed);
-        });
-    }
-
-    #[test]
-    fn hibernation_prepare_launch_rootfs_removes_stale_state_when_cache_is_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        with_hibernation_env(&tmp.path().join("hibernation"), || {
-            let (paths, profile_disk_path) = hibernation_fixture_paths(tmp.path());
-            let hibernation = hibernation_for(
-                &paths,
-                &hibernation_launch(),
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0",
-            );
-            fs::create_dir_all(&hibernation.state_dir).unwrap();
-            fs::write(&hibernation.state_path, b"stale machine state").unwrap();
-            assert!(!hibernation.launch_rootfs_path.exists());
-
-            let launch_rootfs = prepare_launch_rootfs(&paths, Some(&hibernation)).unwrap();
-
-            assert_eq!(launch_rootfs.path, hibernation.launch_rootfs_path);
-            assert!(hibernation.launch_rootfs_path.is_file());
-            assert!(!hibernation.state_path.exists());
-        });
-    }
-
-    #[test]
     fn shared_writable_rootfs_rejects_a_second_vm_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = ENV_LOCK.lock().unwrap();
         let _restore = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
         std::env::set_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH", "0");
-        let (paths, _) = hibernation_fixture_paths(tmp.path());
-        let owner = prepare_launch_rootfs(&paths, None).unwrap();
+        let rootfs_path = tmp.path().join("rootfs.ext4");
+        fs::write(&rootfs_path, b"rootfs").unwrap();
+        let paths = LaunchPaths {
+            kernel_path: tmp.path().join("kernel"),
+            rootfs_path,
+            initramfs_path: None,
+            state_dir: tmp.path().join("state"),
+            rootfs_cache_dir: tmp.path().join("rootfs-cache"),
+            session_dir: tmp.path().join("session"),
+            socket_dir: tmp.path().join("socket"),
+            control_socket_path: tmp.path().join("socket/c.sock"),
+            runtime_stream_path: tmp.path().join("runtime.sock"),
+            control_port: DEFAULT_CONTROL_PORT,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        let owner = prepare_launch_rootfs(&paths).unwrap();
         let lock_path = disk_lifetime_lock_path(&paths.rootfs_path);
         assert_eq!(
             lock_path,
@@ -4026,14 +4329,14 @@ mod tests {
         assert_eq!(fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o600);
         assert_disk_inode_is_unlocked(&paths.rootfs_path);
 
-        let error = prepare_launch_rootfs(&paths, None).unwrap_err();
+        let error = prepare_launch_rootfs(&paths).unwrap_err();
         let typed: Value = serde_json::from_str(&error).unwrap();
         assert_eq!(typed["code"], "resources_in_use");
         assert_eq!(typed["resource"], "shared writable Browser VZ rootfs");
         assert_eq!(typed["path"], paths.rootfs_path.to_string_lossy().as_ref());
 
         drop(owner);
-        prepare_launch_rootfs(&paths, None).unwrap();
+        prepare_launch_rootfs(&paths).unwrap();
     }
 
     fn assert_disk_inode_is_unlocked(disk_path: &Path) {
@@ -4047,88 +4350,6 @@ mod tests {
             "disk inode should remain available to Virtualization.framework"
         );
         assert_eq!(unsafe { libc::flock(disk.as_raw_fd(), libc::LOCK_UN) }, 0);
-    }
-
-    #[test]
-    fn hibernation_restore_failure_cleanup_removes_bad_state_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        with_hibernation_env(&tmp.path().join("hibernation"), || {
-            let (paths, profile_disk_path) = hibernation_fixture_paths(tmp.path());
-            let hibernation = hibernation_for(
-                &paths,
-                &hibernation_launch(),
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0",
-            );
-            fs::create_dir_all(&hibernation.state_dir).unwrap();
-            fs::write(&hibernation.state_path, b"bad machine state").unwrap();
-
-            discard_bad_hibernation_state(&hibernation);
-
-            assert!(!hibernation.state_path.exists());
-        });
-    }
-
-    #[test]
-    fn hibernation_save_failure_cleanup_removes_tmp_state_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        with_hibernation_env(&tmp.path().join("hibernation"), || {
-            let (paths, profile_disk_path) = hibernation_fixture_paths(tmp.path());
-            let hibernation = hibernation_for(
-                &paths,
-                &hibernation_launch(),
-                "profile-a",
-                &profile_disk_path,
-                "console=hvc0",
-            );
-            fs::create_dir_all(&hibernation.state_dir).unwrap();
-            fs::write(&hibernation.state_tmp_path, b"partial machine state").unwrap();
-
-            discard_hibernation_tmp_state(&hibernation);
-
-            assert!(!hibernation.state_tmp_path.exists());
-        });
-    }
-
-    #[test]
-    fn hibernation_lifetime_lock_rejects_a_second_owner() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state_dir = tmp.path().join("state");
-        let lease = HibernationLease::acquire(&state_dir).unwrap();
-
-        let error = HibernationLease::acquire(&state_dir).unwrap_err();
-        let typed: Value = serde_json::from_str(&error).unwrap();
-        assert_eq!(typed["code"], "resources_in_use");
-        drop(lease);
-        HibernationLease::acquire(&state_dir).unwrap();
-    }
-
-    #[test]
-    fn hibernation_cache_prune_bounds_entries_without_removing_live_or_current_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("hibernation");
-        let mut entries = Vec::new();
-        for index in 0..6 {
-            entries.push(create_hibernation_cache_entry(&root, index));
-        }
-        let current = entries[5].clone();
-        let live = entries[4].clone();
-        let _live_lease = HibernationLease::acquire(&live).unwrap();
-
-        let removed = prune_hibernation_cache_at(
-            &root,
-            &current,
-            2,
-            Duration::from_secs(DEFAULT_HIBERNATION_MAX_AGE_SECS),
-            SystemTime::now(),
-        )
-        .unwrap();
-
-        assert_eq!(removed, 4);
-        assert!(current.is_dir());
-        assert!(live.is_dir());
-        assert_eq!(hibernation_cache_entries(&root).unwrap().len(), 2);
     }
 
     #[test]
@@ -4177,26 +4398,5 @@ mod tests {
         child.wait().unwrap();
 
         LifetimeFileLock::acquire_lock_file(&lock_path, "test Browser VM resource").unwrap();
-    }
-
-    #[test]
-    fn hibernation_cache_prune_expires_inactive_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("hibernation");
-        let current = create_hibernation_cache_entry(&root, 0);
-        let expired = create_hibernation_cache_entry(&root, 1);
-
-        let removed = prune_hibernation_cache_at(
-            &root,
-            &current,
-            8,
-            Duration::from_secs(DEFAULT_HIBERNATION_MAX_AGE_SECS),
-            SystemTime::now() + Duration::from_secs(DEFAULT_HIBERNATION_MAX_AGE_SECS + 60),
-        )
-        .unwrap();
-
-        assert_eq!(removed, 1);
-        assert!(current.is_dir());
-        assert!(!expired.exists());
     }
 }

@@ -304,6 +304,70 @@ pub(in crate::api::gateway) fn validate_live_browser_vz_transport_authority(
     Ok(())
 }
 
+pub(in crate::api::gateway) fn normalize_browser_vz_webrtc_signal(
+    authority: &serde_json::Value,
+    signal: &mut serde_json::Value,
+) -> Result<(), String> {
+    validate_live_browser_vz_transport_authority(authority)?;
+    if signal.get("type").and_then(serde_json::Value::as_str) != Some("candidate") {
+        return Ok(());
+    }
+    let candidate = signal
+        .get_mut("candidate")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "Browser VZ WebRTC candidate is missing".to_string())?;
+    let line = candidate
+        .get("candidate")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Browser VZ WebRTC candidate line is missing".to_string())?;
+    let mut fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+    let address = fields.get(4).copied().unwrap_or_default();
+    if !address.to_ascii_lowercase().ends_with(".local") {
+        return Ok(());
+    }
+    if !is_mdns_candidate_address(address)
+        || fields.len() < 8
+        || !fields[0].starts_with("candidate:")
+        || fields[0].len() == "candidate:".len()
+        || fields[1].parse::<u16>().ok().is_none_or(|value| value == 0)
+        || !fields[2].eq_ignore_ascii_case("udp")
+        || fields[3].parse::<u32>().is_err()
+        || fields[5].parse::<u16>().ok().is_none_or(|port| port == 0)
+        || !fields[6].eq_ignore_ascii_case("typ")
+        || !fields[7].eq_ignore_ascii_case("host")
+    {
+        return Err("Browser VZ mDNS ICE candidate shape is invalid".to_string());
+    }
+    let loopback_host = authority
+        .pointer("/turn/listen_host")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .filter(std::net::IpAddr::is_loopback)
+        .ok_or_else(|| "Browser VZ media loopback authority is invalid".to_string())?;
+    let loopback_host = loopback_host.to_string();
+    fields[4] = &loopback_host;
+    candidate.insert(
+        "candidate".to_string(),
+        serde_json::Value::String(fields.join(" ")),
+    );
+    Ok(())
+}
+
+fn is_mdns_candidate_address(value: &str) -> bool {
+    let value = value.strip_suffix(".local").unwrap_or_default();
+    !value.is_empty()
+        && value.len() <= 247
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
 pub(in crate::api::gateway) fn validate_browser_vz_transport_secret(
     authority: &serde_json::Value,
     secret: &serde_json::Value,
@@ -891,7 +955,11 @@ fn current_unix_secs() -> Result<u64, String> {
 mod tests {
     use super::*;
     #[cfg(unix)]
+    use std::io::Write as _;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
 
     fn write_config(root: &Path) {
         let config_dir = root.join("config");
@@ -959,6 +1027,7 @@ mod tests {
             principal_id,
             BrowserLaunchLifecycle {
                 owner_launch_id: "launch:vz-reservation-proof".to_string(),
+                browser_instance: None,
                 url: "https://example.com/".to_string(),
                 exit_id: "local-runtime".to_string(),
                 engine_route_provider: "browser-engine".to_string(),
@@ -978,6 +1047,12 @@ mod tests {
             "sha256:".len() + 16
         );
 
+        let socket_suffix = root
+            .path()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap();
+        let egress_socket_path = format!("/tmp/elastos-vz-{socket_suffix}.sock");
         let launch = prepare_browser_vz_transport_launch(
             root.path(),
             BrowserVzTransportLaunchBinding {
@@ -987,7 +1062,7 @@ mod tests {
                 principal_id,
                 egress_stream_id: "stream:vz-reservation-proof",
                 egress_target: "tls://example.com:443",
-                egress_runtime_socket_path: "/tmp/elastos-vz-reservation-proof.sock",
+                egress_runtime_socket_path: &egress_socket_path,
             },
         )
         .unwrap()
@@ -998,7 +1073,98 @@ mod tests {
             Some(generation.as_str())
         );
 
+        #[cfg(unix)]
+        let integration_result = {
+            let expected_binding = launch.authority["binding_hash"].clone();
+            let request = serde_json::json!({
+                "schema": "elastos.browser.vm-engine.open/v1",
+                "profile": {
+                    "schema": "elastos.browser.profile/v1",
+                    "uri": "localhost://Users/vz-reservation-proof/BrowserProfiles/default/profile.ext4",
+                    "persistent": true
+                },
+                "launch_request": {
+                    "schema": "elastos.browser.engine.launch-request/v1",
+                    "adapter": "browser-vm-product",
+                    "engine": "chromium_microvm",
+                    "stream_id": launch.authority["egress"]["stream_id"],
+                    "lifecycle_generation": generation.clone(),
+                    "page_id": reservation.page_id(),
+                    "vm_id": reservation.vm_id(),
+                    "principal_id": principal_id,
+                    "target": launch.authority["egress"]["target"],
+                    "display_mode": "webrtc_remote_display",
+                    "guarantee_level": "mechanism_microvm",
+                    "network_mode": "runtime_net_only",
+                    "direct_network": false,
+                    "wallet_injection": false,
+                    "adapter_ipc": {
+                        "kind": "unix_socket",
+                        "runtime_stream_path": egress_socket_path.clone()
+                    },
+                    "transport_authority": launch.authority.clone(),
+                    "transport_secret": launch.secret.clone()
+                }
+            });
+            let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../scripts/browser-vm-remote-vz-launcher.integration.mjs");
+            let child = Command::new("node")
+                .arg(script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| error.to_string());
+            match child {
+                Ok(mut child) => {
+                    let write_result = child
+                        .stdin
+                        .take()
+                        .ok_or_else(|| "wrapper integration stdin is unavailable".to_string())
+                        .and_then(|mut stdin| {
+                            serde_json::to_writer(&mut stdin, &request)
+                                .map_err(|error| error.to_string())?;
+                            stdin.write_all(b"\n").map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = write_result {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        Err(error)
+                    } else {
+                        child
+                            .wait_with_output()
+                            .map_err(|error| error.to_string())
+                            .and_then(|output| {
+                                if !output.status.success() {
+                                    return Err(format!(
+                                        "wrapper integration failed: {}",
+                                        String::from_utf8_lossy(&output.stderr)
+                                    ));
+                                }
+                                serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|proof| {
+                                        if proof["binding_hash"] != expected_binding {
+                                            return Err(
+                                                "wrapper integration binding changed".to_string()
+                                            );
+                                        }
+                                        Ok(proof)
+                                    })
+                            })
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        };
         release_browser_launch(&reservation).await;
+        #[cfg(unix)]
+        {
+            let proof = integration_result.unwrap();
+            assert_eq!(proof["terminal"], true);
+            assert_eq!(proof["generation"], generation);
+            assert_eq!(proof["zero_owned_residue"], true);
+        }
     }
 
     #[test]
@@ -1108,6 +1274,94 @@ mod tests {
     }
 
     #[test]
+    fn runtime_normalizes_only_exact_vz_mdns_host_candidates_to_loopback() {
+        let root = tempfile::tempdir().unwrap();
+        write_config(root.path());
+        let launch = prepare_browser_vz_transport_launch(
+            root.path(),
+            BrowserVzTransportLaunchBinding {
+                generation:
+                    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                page_id: "page:vz-mdns",
+                vm_id: "browser-vm-mdns",
+                principal_id: "person:local:mdns",
+                egress_stream_id: "stream:mdns",
+                egress_target: "tls://example.com:443",
+                egress_runtime_socket_path: "/tmp/elastos-egress-mdns.sock",
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let mut signal = serde_json::json!({
+            "schema": "elastos.browser.webrtc-candidate/v1",
+            "type": "candidate",
+            "candidate": {
+                "candidate": "candidate:3955298333 1 udp 2113937151 ccf2ec08-92fe-49de-ac42-3e7d307d613f.local 55791 typ host generation 0 ufrag ZTI2",
+                "sdpMid": "video0",
+                "sdpMLineIndex": 0
+            }
+        });
+
+        normalize_browser_vz_webrtc_signal(&launch.authority, &mut signal).unwrap();
+        assert_eq!(
+            signal.pointer("/candidate/candidate").and_then(serde_json::Value::as_str),
+            Some(
+                "candidate:3955298333 1 udp 2113937151 127.0.0.1 55791 typ host generation 0 ufrag ZTI2"
+            )
+        );
+        assert_eq!(signal["candidate"]["sdpMid"], "video0");
+        assert_eq!(signal["candidate"]["sdpMLineIndex"], 0);
+
+        let mut numeric = serde_json::json!({
+            "schema": "elastos.browser.webrtc-candidate/v1",
+            "type": "candidate",
+            "candidate": {
+                "candidate": "candidate:1 1 udp 2113937151 127.0.0.1 50000 typ host",
+                "sdpMid": "audio0",
+                "sdpMLineIndex": 0
+            }
+        });
+        let unchanged = numeric.clone();
+        normalize_browser_vz_webrtc_signal(&launch.authority, &mut numeric).unwrap();
+        assert_eq!(numeric, unchanged);
+
+        let mut malformed = serde_json::json!({
+            "schema": "elastos.browser.webrtc-candidate/v1",
+            "type": "candidate",
+            "candidate": {
+                "candidate": "candidate:1 1 udp 2113937151 browser.local 50000 typ relay"
+            }
+        });
+        assert!(
+            normalize_browser_vz_webrtc_signal(&launch.authority, &mut malformed)
+                .unwrap_err()
+                .contains("shape")
+        );
+        malformed["candidate"]["candidate"] =
+            serde_json::json!("candidate:1 1 udp 2113937151 -broken.local 50000 typ host");
+        assert!(
+            normalize_browser_vz_webrtc_signal(&launch.authority, &mut malformed)
+                .unwrap_err()
+                .contains("shape")
+        );
+
+        let mut substituted_authority = launch.authority;
+        substituted_authority["turn"]["listen_host"] = serde_json::json!("127.0.0.2");
+        assert!(normalize_browser_vz_webrtc_signal(
+            &substituted_authority,
+            &mut serde_json::json!({
+                "schema": "elastos.browser.webrtc-candidate/v1",
+                "type": "candidate",
+                "candidate": {
+                    "candidate": "candidate:1 1 udp 2113937151 browser.local 50000 typ host"
+                }
+            }),
+        )
+        .unwrap_err()
+        .contains("binding hash"));
+    }
+
+    #[test]
     fn runtime_accepts_only_exact_typed_transport_terminal_cleanup() {
         let root = tempfile::tempdir().unwrap();
         write_config(root.path());
@@ -1169,6 +1423,8 @@ mod tests {
             launch.authority["generation"].as_str().unwrap(),
             launch.authority["egress"]["stream_id"].as_str().unwrap(),
             Some("browser-vm-product"),
+            true,
+            true,
         )
         .unwrap();
 
@@ -1181,6 +1437,8 @@ mod tests {
                 launch.authority["generation"].as_str().unwrap(),
                 launch.authority["egress"]["stream_id"].as_str().unwrap(),
                 Some("browser-vm-product"),
+                true,
+                true,
             )
             .is_err()
         );
@@ -1194,6 +1452,8 @@ mod tests {
                 launch.authority["generation"].as_str().unwrap(),
                 launch.authority["egress"]["stream_id"].as_str().unwrap(),
                 Some("browser-vm-product"),
+                true,
+                true,
             )
             .is_err()
         );

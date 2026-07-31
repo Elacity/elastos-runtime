@@ -485,32 +485,29 @@ The VM guest start script accepts explicit relay configuration through
 `ELASTOS_BROWSER_VM_ICE_SERVER`, `ELASTOS_BROWSER_VM_ICE_SERVERS_JSON`,
 `ELASTOS_BROWSER_VM_ICE_USERNAME`, `ELASTOS_BROWSER_VM_ICE_CREDENTIAL`, and
 `ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY`, then copies the same ICE server list
-into the typed display session and Selkies RTC config.
-On macOS VZ, the same boot-config channel may include
-`ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4`,
-`ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4`, and
-`ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX`. If those are omitted, source-home Mac
-config derives the relay host IPv4 from the first IPv4 TURN URL and the guest
-assigns a scoped sibling address such as `192.168.65.2/24` only on the VZ media
-NIC. The guest does not install a default route for page traffic; Chromium page
-egress remains bound to the Runtime Exit proxy.
+into the typed display session and Selkies RTC config on the Linux/crosvm path.
+Those environment and boot-argument settings are not an Apple VZ compatibility
+path.
+
+Apple VZ accepts only the complete
+`elastos.browser.vz-transport-authority/v1` plus its private, hash-bound launch
+secret over the launcher stdin pipe. Runtime is the sole source of the
+generation, page, VM, ordinary/media streams, exact Runtime socket paths, vsock
+ports, TURN endpoint and relay range, and expiry. The native supervisor starts
+the VM with zero VZ network devices, sends the bounded authority over bootstrap
+vsock, and starts the Browser stack only after the guest validates the
+descriptor and proves loopback-only network state. Ordinary egress and media
+use their fixed vsock-to-Runtime bridges. VZ NAT, a media NIC, a default guest
+route, legacy ICE boot configuration, and VZ hibernation are not available.
+Missing, stale, disabled, partial, or mixed legacy/VZ configuration fails before
+VM dispatch.
+
 Source-home config also loads Runtime-owned TURN credentials from
 `$HOME/runtime-turn/turn-credentials.env` or
 `$DATA_DIR/runtime-turn/turn-credentials.env` when explicit operator ICE
-environment variables are not already set, so Mac staging does not depend on a
-manual shell export. On macOS, `browser-runtime-turn.mjs` keeps one local coturn
-service and writes both the host-reachable TURN URL and the VZ media-link TURN
-URL into `ELASTOS_BROWSER_VM_ICE_SERVERS_JSON`; the host TURN URL must pass a
-credentialed allocation check before setup can report success, which prevents a
-different local coturn daemon with stale credentials from masquerading as a
-healthy Runtime relay.
-For `webrtc_remote_display`, the VZ launcher requires at least one `turn:` or
-`turns:` URL and bakes the relay config into the guest boot args as
-`elastos.browser_ice_config_hex`; STUN-only or empty ICE config fails closed
-instead of launching a video surface that can only wait forever. The guest init
-loads `virtio_net` for the VZ NAT device, and the guest brings up its
-non-loopback VM NIC only when an ICE relay is configured. The guest NIC is only
-the Runtime-owned media relay path, with WebRTC on relay-only ICE policy.
+environment variables are not already set for configurations that still use
+that Linux/crosvm input. The VZ launcher does not read that file or inherit
+those ICE variables; Runtime issues a launch-scoped TURN authority instead.
 
 ## Apple VZ Launcher
 
@@ -526,6 +523,15 @@ Browser page, then:
   before attaching `/dev/vda`. On APFS this uses clone-on-write `cp -c` with a
   byte-copy fallback. The installed `browser-vm/rootfs.ext4` is the immutable
   base image, not the live writable boot disk;
+- requires a signed native supervisor with the
+  `com.apple.security.virtualization` entitlement and preflights the native
+  binary, private-stdin wrapper, kernel, rootfs/initramfs artifacts, exact Unix
+  socket paths, and TURN/listener/relay ports before the first launch effect;
+- derives a short owner-only control-socket root from the exact authority
+  binding hash, independently of long data, session, or evidence paths;
+- configures zero VZ network devices and disables hibernation for every launch;
+- bootstraps the exact ordinary stream, media stream, and TURN authority over a
+  launch-bound guest vsock before the Browser stack starts;
 - exposes guest control vsock port `19092` only after the VM-local Browser
   control socket is ready, then bridges it to a page-scoped host Unix socket;
 - bridges guest egress vsock port `19091` to the Runtime-owned
@@ -535,6 +541,24 @@ Browser page, then:
 - translates the guest Selkies open contract back into the Runtime-facing
   `chromium_microvm` Browser supervisor result;
 - exits only when the Browser VM control service terminates it on page shutdown.
+
+The native supervisor and remote VZ wrapper return
+`elastos.browser.vz-launch-settlement/v1` on launch failure. It preserves the
+exact binding hash, generation, page, VM, ordinary stream, media stream, and
+effect fields. Effect booleans are conservative, exact-binding
+`may_have_acted` markers; they never prove acquisition or cleanup by
+themselves. `did_not_act` is emitted only after the complete launch identity
+and authority have validated. Malformed or unbound input does not receive an
+apparently exact settlement with null identity fields.
+`terminal_post_effect_cleanup` is valid only when every owned child, VM,
+control socket, stream bridge, TURN listener/relay range, route, and session
+directory is independently proven absent by bounded wait/join, terminal VM
+status, exact path checks, and port rebinding; otherwise the result is
+`cleanup_pending`. The remote wrapper also gives its native supervisor process
+a non-secret exact-binding command-line marker, so cleanup and absence checks
+can find that process even if failure occurs before its PID file is durable. The
+control service validates that binding, persists it without transport secrets,
+and propagates the settled error rather than the original process error.
 
 The gateway-facing process remains `browser-vm-control-service.mjs`. Configure
 that service with `persistent_launcher: true` and
@@ -560,7 +584,7 @@ IndexedDB, service workers, history, and other Chromium profile state live under
 If the required profile disk is missing or cannot be mounted/formatted, the
 Browser VM fails closed instead of falling back to an ephemeral profile.
 The VZ launcher also holds non-blocking kernel lifetime locks on the principal
-profile disk and on any shared writable rootfs or hibernation state. A second VM
+profile disk and on any shared writable rootfs. A second VM
 cannot attach those resources: launch returns the typed `resources_in_use`
 outcome. Kernel ownership releases the lock automatically if the launcher dies;
 PID files are not lifecycle authority.

@@ -10,6 +10,7 @@ const MAX_BROWSER_ENGINE_LAUNCH_REQUEST_BYTES: usize = 64 * 1024;
 pub(super) struct SupervisorLaunchError {
     pub(super) code: String,
     pub(super) message: String,
+    pub(super) launch_settlement_result: Option<Value>,
 }
 
 impl SupervisorLaunchError {
@@ -17,20 +18,25 @@ impl SupervisorLaunchError {
         Self {
             code: "engine_process_unavailable".to_string(),
             message: message.into(),
+            launch_settlement_result: None,
         }
     }
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TypedSupervisorLaunchError {
     schema: String,
     code: String,
     message: String,
+    #[serde(default)]
+    launch_settlement_result: Option<Value>,
 }
 
 fn supervisor_launch_error(
     status: std::process::ExitStatus,
     stderr: &str,
+    transport: Option<&VzTransportLaunchContext>,
 ) -> SupervisorLaunchError {
     if let Some(error) = stderr
         .lines()
@@ -38,9 +44,15 @@ fn supervisor_launch_error(
         .find_map(|line| serde_json::from_str::<TypedSupervisorLaunchError>(line).ok())
         .filter(|error| error.schema == "elastos.browser.engine.launch-error/v1")
     {
+        let launch_settlement_result = error.launch_settlement_result.filter(|settlement| {
+            transport.is_some_and(|transport| {
+                validate_vz_launch_settlement(settlement, transport).is_ok()
+            })
+        });
         return SupervisorLaunchError {
             code: error.code,
             message: error.message,
+            launch_settlement_result,
         };
     }
     SupervisorLaunchError::process(format!(
@@ -131,7 +143,7 @@ pub(super) fn run_supervisor_launch(
         let _ = pipe.read_to_string(&mut stderr);
     }
     if !status.success() {
-        return Err(supervisor_launch_error(status, &stderr));
+        return Err(supervisor_launch_error(status, &stderr, transport));
     }
     let result_value = serde_json::from_str::<Value>(stdout.trim()).map_err(|err| {
         SupervisorLaunchError::process(format!("invalid browser engine supervisor output: {err}"))

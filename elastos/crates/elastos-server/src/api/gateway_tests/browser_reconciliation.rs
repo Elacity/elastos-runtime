@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 fn browser_lifecycle(owner_launch_id: &str) -> BrowserLaunchLifecycle {
     BrowserLaunchLifecycle {
         owner_launch_id: owner_launch_id.to_string(),
+        browser_instance: None,
         url: "https://example.com/".to_string(),
         exit_id: "mock-exit".to_string(),
         engine_route_provider: "mock-browser-engine".to_string(),
@@ -34,7 +35,7 @@ async fn record_pending_launch(
 }
 
 async fn yield_until_atomic(counter: &std::sync::atomic::AtomicUsize, expected: usize) {
-    for _ in 0..10_000 {
+    for _ in 0..100_000 {
         if counter.load(Ordering::SeqCst) >= expected {
             return;
         }

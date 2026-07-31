@@ -91,6 +91,7 @@ impl BrowserLaunchReservation {
 #[derive(Debug, Clone)]
 pub(in crate::api::gateway) struct BrowserLaunchLifecycle {
     pub(in crate::api::gateway) owner_launch_id: String,
+    pub(in crate::api::gateway) browser_instance: Option<String>,
     pub(in crate::api::gateway) url: String,
     pub(in crate::api::gateway) exit_id: String,
     pub(in crate::api::gateway) engine_route_provider: String,
@@ -136,6 +137,7 @@ struct BrowserSessionRecord {
     scope: String,
     principal_id: String,
     owner_launch_id: String,
+    browser_instance: Option<String>,
     cleanup_id: String,
     generation: String,
     expected_page_id: String,
@@ -242,6 +244,8 @@ pub(in crate::api::gateway) struct BrowserEngineCleanup {
     pub(in crate::api::gateway) page_id: String,
     pub(in crate::api::gateway) principal_id: String,
     pub(in crate::api::gateway) owner_launch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) browser_instance: Option<String>,
     pub(in crate::api::gateway) generation: String,
     pub(in crate::api::gateway) engine_route_provider: String,
     pub(in crate::api::gateway) engine_provider: String,
@@ -270,6 +274,8 @@ pub(in crate::api::gateway) struct BrowserLaunchReconciliation {
     pub(in crate::api::gateway) cleanup_id: String,
     pub(in crate::api::gateway) principal_id: String,
     pub(in crate::api::gateway) owner_launch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) browser_instance: Option<String>,
     pub(in crate::api::gateway) generation: String,
     pub(in crate::api::gateway) engine_route_provider: String,
     #[serde(default)]
@@ -353,6 +359,10 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             .selected_engine_adapter
             .as_deref()
             .is_some_and(|adapter| adapter.len() > 128 || !is_safe_runtime_id(adapter))
+        || lifecycle
+            .browser_instance
+            .as_deref()
+            .is_some_and(|instance| browser_instance_id(Some(instance.to_string())).is_err())
     {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -374,6 +384,18 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
         return Err((
             StatusCode::CONFLICT,
             "Browser lifecycle is already active or launching for this verified launch".to_string(),
+        ));
+    }
+    if lifecycle.browser_instance.as_ref().is_some_and(|instance| {
+        registry.sessions.values().any(|session| {
+            session.scope == scope
+                && session.principal_id == principal_id
+                && session.browser_instance.as_ref() == Some(instance)
+        })
+    }) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Browser instance already owns an active or launching lifecycle".to_string(),
         ));
     }
     let stream_scope_prefix = format!("{scope}\n");
@@ -479,6 +501,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             scope,
             principal_id: principal_id.to_string(),
             owner_launch_id: lifecycle.owner_launch_id,
+            browser_instance: lifecycle.browser_instance,
             cleanup_id: cleanup_id.clone(),
             generation: generation.clone(),
             expected_page_id: page_id.clone(),
@@ -906,6 +929,7 @@ fn browser_launch_reconciliation_for_record(
         cleanup_id: record.cleanup_id.clone(),
         principal_id: record.principal_id.clone(),
         owner_launch_id: record.owner_launch_id.clone(),
+        browser_instance: record.browser_instance.clone(),
         generation: record.generation.clone(),
         engine_route_provider: record.engine_route_provider.clone(),
         selected_engine_adapter: record.selected_engine_adapter.clone(),
@@ -1095,7 +1119,7 @@ pub(in crate::api::gateway) async fn browser_page_cleanup_for_principal(
     let active = registry.sessions.values().find(|session| {
         session.scope == scope
             && session.principal_id == principal_id
-            && session.owner_launch_id == owner_launch_id
+            && (session.owner_launch_id == owner_launch_id || session.browser_instance.is_some())
             && session.cleanup_id == cleanup_id
             && session.page_id.as_deref() == Some(page_id)
     });
@@ -1117,7 +1141,8 @@ pub(in crate::api::gateway) async fn browser_page_cleanup_for_principal(
             obligation.scope == scope
                 && obligation.cleanup.page_id == page_id
                 && obligation.cleanup.principal_id == principal_id
-                && obligation.cleanup.owner_launch_id == owner_launch_id
+                && (obligation.cleanup.owner_launch_id == owner_launch_id
+                    || obligation.cleanup.browser_instance.is_some())
                 && obligation.cleanup.cleanup_id == cleanup_id
         })
         .map(|obligation| {
@@ -1558,10 +1583,33 @@ pub(in crate::api::gateway) async fn touch_browser_page(
     false
 }
 
+pub(in crate::api::gateway) async fn touch_browser_page_transport_authority(
+    data_dir: &Path,
+    page_id: &str,
+    principal_id: &str,
+    owner_launch_id: &str,
+) -> Option<Option<serde_json::Value>> {
+    let scope = browser_session_scope(data_dir);
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    for session in registry.sessions.values_mut() {
+        if session.scope == scope
+            && session.principal_id == principal_id
+            && session.owner_launch_id == owner_launch_id
+            && session.page_id.as_deref() == Some(page_id)
+        {
+            session.last_seen_at = Instant::now();
+            return Some(session.transport_authority.clone());
+        }
+    }
+    None
+}
+
 pub(in crate::api::gateway) async fn browser_gateway_session_status(
     data_dir: &Path,
     principal_id: &str,
     owner_launch_id: Option<&str>,
+    browser_instance: Option<&str>,
 ) -> serde_json::Value {
     let limits = browser_session_limits();
     let scope = browser_session_scope(data_dir);
@@ -1649,6 +1697,18 @@ pub(in crate::api::gateway) async fn browser_gateway_session_status(
             })
         })
         .or_else(|| {
+            browser_instance.and_then(|browser_instance| {
+                let mut matches = registry.sessions.values().filter(|session| {
+                    session.scope == scope
+                        && session.principal_id == principal_id
+                        && session.browser_instance.as_deref() == Some(browser_instance)
+                        && session.state == BrowserSessionState::Active
+                });
+                let page = matches.next().and_then(browser_recoverable_active_page);
+                (matches.next().is_none()).then_some(page).flatten()
+            })
+        })
+        .or_else(|| {
             owner_launch_id.and_then(|owner_launch_id| {
                 registry
                     .pending_engine_cleanups
@@ -1659,6 +1719,21 @@ pub(in crate::api::gateway) async fn browser_gateway_session_status(
                             && obligation.cleanup.owner_launch_id == owner_launch_id
                     })
                     .map(browser_recoverable_cleanup_page)
+            })
+        })
+        .or_else(|| {
+            browser_instance.and_then(|browser_instance| {
+                let mut matches = registry
+                    .pending_engine_cleanups
+                    .values()
+                    .filter(|obligation| {
+                        obligation.scope == scope
+                            && obligation.cleanup.principal_id == principal_id
+                            && obligation.cleanup.browser_instance.as_deref()
+                                == Some(browser_instance)
+                    });
+                let page = matches.next().map(browser_recoverable_cleanup_page);
+                (matches.next().is_none()).then_some(page).flatten()
             })
         });
     serde_json::json!({
@@ -1728,31 +1803,6 @@ pub(in crate::api::gateway) async fn browser_principal_has_live_sessions(
                 key.starts_with(&format!("{scope}\n"))
                     && obligation.cleanup.principal_id == principal_id
             })
-}
-
-pub(in crate::api::gateway) async fn browser_scope_has_live_sessions(data_dir: &Path) -> bool {
-    let scope = browser_session_scope(data_dir);
-    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
-    let mut registry = registry.lock().await;
-    if registry.load_durable_ownerships(data_dir).is_err() {
-        return true;
-    }
-    registry
-        .sessions
-        .values()
-        .any(|session| session.scope == scope)
-        || registry
-            .pending_launch_reconciliations
-            .values()
-            .any(|obligation| obligation.scope == scope)
-        || registry
-            .pending_engine_cleanups
-            .values()
-            .any(|obligation| obligation.scope == scope)
-        || registry
-            .pending_stream_cleanups
-            .keys()
-            .any(|key| key.starts_with(&format!("{scope}\n")))
 }
 
 pub(in crate::api::gateway) async fn take_stale_browser_pages(
@@ -1827,6 +1877,7 @@ fn browser_engine_cleanup(session: &BrowserSessionRecord) -> Option<BrowserEngin
         page_id: session.page_id.clone()?,
         principal_id: session.principal_id.clone(),
         owner_launch_id: session.owner_launch_id.clone(),
+        browser_instance: session.browser_instance.clone(),
         generation: session.generation.clone(),
         engine_route_provider: session.engine_route_provider.clone(),
         engine_provider: session.engine_provider.clone()?,
@@ -2185,6 +2236,10 @@ fn browser_engine_cleanup_is_safe(cleanup: &BrowserEngineCleanup) -> bool {
         && cleanup.page_id.len() <= 256
         && cleanup.principal_id.len() <= 512
         && cleanup.owner_launch_id.len() <= 512
+        && cleanup
+            .browser_instance
+            .as_deref()
+            .is_none_or(|instance| browser_instance_id(Some(instance.to_string())).is_ok())
         && cleanup.generation.len() <= 256
         && cleanup.engine_route_provider.len() <= 256
         && cleanup.engine_provider.len() <= 256
@@ -2254,6 +2309,10 @@ fn browser_launch_reconciliation_is_safe(reconciliation: &BrowserLaunchReconcili
         && reconciliation.cleanup_id.len() <= 128
         && reconciliation.principal_id.len() <= 512
         && reconciliation.owner_launch_id.len() <= 512
+        && reconciliation
+            .browser_instance
+            .as_deref()
+            .is_none_or(|instance| browser_instance_id(Some(instance.to_string())).is_ok())
         && reconciliation.generation.len() <= 256
         && reconciliation.engine_route_provider.len() <= 256
         && reconciliation
@@ -2671,6 +2730,7 @@ mod tests {
             scope: scope.to_string(),
             principal_id: "person:local:test".to_string(),
             owner_launch_id: "launch:test".to_string(),
+            browser_instance: None,
             cleanup_id: format!("browser-cleanup:{}", page_id.unwrap_or("launching")),
             generation: "sha256:generation".to_string(),
             expected_page_id: "page:vz-test".to_string(),
@@ -2716,6 +2776,7 @@ mod tests {
     fn test_lifecycle(owner_launch_id: &str) -> BrowserLaunchLifecycle {
         BrowserLaunchLifecycle {
             owner_launch_id: owner_launch_id.to_string(),
+            browser_instance: None,
             url: "https://example.com/".to_string(),
             exit_id: "local-runtime".to_string(),
             engine_route_provider: "mock-browser-route".to_string(),
@@ -2783,7 +2844,8 @@ mod tests {
         );
         drop(registry);
 
-        let status = browser_gateway_session_status(dir.path(), "person:local:test", None).await;
+        let status =
+            browser_gateway_session_status(dir.path(), "person:local:test", None, None).await;
 
         assert_eq!(status["launching_sessions"], 1);
         assert_eq!(status["active_sessions"], 1);
@@ -3217,14 +3279,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_restart_recovers_exact_durable_cleanup_ownership() {
+    async fn runtime_restart_recovers_exact_durable_cleanup_ownership_by_browser_instance() {
         let dir = tempfile::tempdir().unwrap();
         let principal_id = "person:local:restart";
         let owner_launch_id = "launch:restart";
-        let reservation =
-            reserve_browser_launch(dir.path(), principal_id, test_lifecycle(owner_launch_id))
-                .await
-                .unwrap();
+        let refreshed_owner_launch_id = "launch:restart-refreshed";
+        let browser_instance = "browser:0123456789abcdef0123456789abcdef";
+        let mut lifecycle = test_lifecycle(owner_launch_id);
+        lifecycle.browser_instance = Some(browser_instance.to_string());
+        let reservation = reserve_browser_launch(dir.path(), principal_id, lifecycle)
+            .await
+            .unwrap();
         let cleanup = complete_browser_launch(
             dir.path(),
             &reservation,
@@ -3267,8 +3332,22 @@ mod tests {
         registry.loaded_scopes.remove(&scope);
         drop(registry);
 
-        let status =
-            browser_gateway_session_status(dir.path(), principal_id, Some(owner_launch_id)).await;
+        let foreign = browser_gateway_session_status(
+            dir.path(),
+            principal_id,
+            Some(refreshed_owner_launch_id),
+            Some("browser:fedcba9876543210fedcba9876543210"),
+        )
+        .await;
+        assert!(foreign["recoverable_page"].is_null());
+
+        let status = browser_gateway_session_status(
+            dir.path(),
+            principal_id,
+            Some(refreshed_owner_launch_id),
+            Some(browser_instance),
+        )
+        .await;
         assert_eq!(status["active_sessions"], 0);
         assert_eq!(status["engine_cleanup_obligations"], 1);
         assert_eq!(status["recoverable_page"]["state"], "cleanup_pending");
@@ -3282,7 +3361,7 @@ mod tests {
             dir.path(),
             "page:restart",
             principal_id,
-            owner_launch_id,
+            refreshed_owner_launch_id,
             &cleanup.id,
         )
         .await
@@ -3293,19 +3372,33 @@ mod tests {
             recovered.engine_cleanup.generation,
             reservation.generation()
         );
+        assert_eq!(recovered.engine_cleanup.owner_launch_id, owner_launch_id);
+        assert_eq!(
+            recovered.engine_cleanup.browser_instance.as_deref(),
+            Some(browser_instance)
+        );
+        assert!(browser_page_cleanup_for_principal(
+            dir.path(),
+            "page:restart",
+            principal_id,
+            refreshed_owner_launch_id,
+            "browser-cleanup:substituted",
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     #[tokio::test]
     async fn runtime_restart_recovers_indeterminate_launch_and_blocks_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let principal_id = "person:local:launch-reconciliation-restart";
-        let reservation = reserve_browser_launch(
-            dir.path(),
-            principal_id,
-            test_lifecycle("launch:reconciliation-restart"),
-        )
-        .await
-        .unwrap();
+        let browser_instance = "browser:00112233445566778899aabbccddeeff";
+        let mut lifecycle = test_lifecycle("launch:reconciliation-restart");
+        lifecycle.browser_instance = Some(browser_instance.to_string());
+        let reservation = reserve_browser_launch(dir.path(), principal_id, lifecycle)
+            .await
+            .unwrap();
         let stream_cleanup = BrowserStreamCleanup {
             stream_id: "stream:reconciliation-restart".to_string(),
             principal_id: principal_id.to_string(),
@@ -3329,6 +3422,10 @@ mod tests {
             durable_reconciliation.selected_engine_adapter.as_deref(),
             Some("mock-adapter")
         );
+        assert_eq!(
+            durable_reconciliation.browser_instance.as_deref(),
+            Some(browser_instance)
+        );
         assert_eq!(browser_page_session_count(dir.path()).await, 0);
 
         let scope = browser_session_scope(dir.path());
@@ -3344,6 +3441,7 @@ mod tests {
             dir.path(),
             principal_id,
             Some("launch:reconciliation-restart"),
+            None,
         )
         .await;
         assert_eq!(status["launch_reconciliation_obligations"], 1);
@@ -3364,6 +3462,10 @@ mod tests {
         assert_eq!(
             recovered[0].selected_engine_adapter.as_deref(),
             Some("mock-adapter")
+        );
+        assert_eq!(
+            recovered[0].browser_instance.as_deref(),
+            Some(browser_instance)
         );
         forget_browser_launch_reconciliation_obligation(dir.path(), &recovered[0])
             .await

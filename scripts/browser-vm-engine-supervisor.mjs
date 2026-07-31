@@ -26,14 +26,15 @@ const INVOCATION_ONLY_VM_ENV = new Set([
 ]);
 
 class BrowserLaunchError extends Error {
-  constructor(code, message) {
+  constructor(code, message, launchSettlementResult = undefined) {
     super(message);
     this.code = code;
+    this.launch_settlement_result = launchSettlementResult;
   }
 }
 
-function launchError(code, message) {
-  return new BrowserLaunchError(code, message);
+function launchError(code, message, launchSettlementResult = undefined) {
+  return new BrowserLaunchError(code, message, launchSettlementResult);
 }
 
 function fail(error) {
@@ -43,6 +44,9 @@ function fail(error) {
       schema: "elastos.browser.engine.launch-error/v1",
       code: error.code,
       message,
+      ...(error.launch_settlement_result === undefined
+        ? {}
+        : { launch_settlement_result: error.launch_settlement_result }),
     }));
   } else {
     console.error(message);
@@ -105,11 +109,6 @@ function validateRequestTransport(request, fromPrivateStdin) {
 
 function safeId(value) {
   return typeof value === "string" && /^[A-Za-z0-9:_-]+$/.test(value);
-}
-
-function sessionSuffix(value) {
-  const digest = crypto.createHash("sha256").update(String(value || "session")).digest("hex").slice(0, 16);
-  return `bvm-${digest}-${crypto.randomBytes(4).toString("hex")}`;
 }
 
 function validateAbsolutePath(value, label) {
@@ -456,8 +455,12 @@ function postJsonOverUnix(socketPath, requestPath, body, timeoutMs) {
           }
           if ((response.statusCode || 500) < 200 || (response.statusCode || 500) >= 300) {
             reject(
-              parsed.code
-                ? launchError(parsed.code, parsed.message || parsed.error || `Browser VM control returned ${response.statusCode}`)
+              parsed.code || parsed.launch_settlement_result
+                ? launchError(
+                    parsed.code || "engine_process_unavailable",
+                    parsed.message || parsed.error || `Browser VM control returned ${response.statusCode}`,
+                    parsed.launch_settlement_result,
+                  )
                 : new Error(parsed.error || parsed.message || `Browser VM control returned ${response.statusCode}`),
             );
             return;
@@ -934,9 +937,19 @@ function validateSupervisorResult(result, request) {
   if (result.display_session?.media_transport !== "runtime_relay") {
     throw new Error("Browser VM display sessions must report media_transport=runtime_relay");
   }
+  if (
+    result.isolation?.schema !== "elastos.browser.engine.isolation/v1" ||
+    result.isolation?.kind !== "per_launch_vm_target"
+  ) {
+    throw new Error("Browser VM control returned an invalid isolation binding");
+  }
+  validateAbsolutePath(
+    result.isolation.session_dir,
+    "Browser VM control isolation session_dir",
+  );
 }
 
-async function delegateToVmControl({ controlSocket, request, timeoutMs, platform, sessionDir }) {
+async function delegateToVmControl({ controlSocket, request, timeoutMs, platform }) {
   const result = await postJsonOverUnix(
     controlSocket,
     "/pages",
@@ -959,13 +972,6 @@ async function delegateToVmControl({ controlSocket, request, timeoutMs, platform
   validateSupervisorResult(result, request);
   if (!result.control_socket_path) result.control_socket_path = controlSocket;
   if (!result.isolated_session) result.isolated_session = true;
-  if (!result.isolation) {
-    result.isolation = {
-      schema: "elastos.browser.engine.isolation/v1",
-      kind: "per_launch_vm_target",
-      session_dir: sessionDir,
-    };
-  }
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
@@ -1016,9 +1022,6 @@ async function main() {
   validateRequestTransport(request, fromPrivateStdin);
   validateLaunchRequest(request);
 
-  const sessionDir = path.join(root, sessionSuffix(request.stream_id));
-  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
-
   const controlSocket = process.env[CONTROL_SOCKET_ENV] || "";
   if (controlSocket) {
     await ensureVmControlAvailable({ controlSocket, dataDir, platform, root });
@@ -1027,7 +1030,6 @@ async function main() {
       request,
       timeoutMs: Number(process.env.ELASTOS_BROWSER_VM_ENGINE_TIMEOUT_MS || "165000"),
       platform,
-      sessionDir,
     });
     return;
   }

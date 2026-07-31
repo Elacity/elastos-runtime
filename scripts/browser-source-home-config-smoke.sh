@@ -358,8 +358,8 @@ if (
 ) {
   throw new Error("Remote VZ source-home config must bind the remote TURN program path");
 }
-if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION !== "0") {
-  throw new Error("Mac source-home VZ transport config must disable hibernation");
+if ("ELASTOS_BROWSER_VM_HIBERNATION" in (macAdapter?.supervisor?.env || {})) {
+  throw new Error("Mac source-home VZ transport config must not carry legacy hibernation configuration");
 }
 if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS !== "300000") {
   throw new Error("Mac VZ source-home Browser config may keep same-principal Browser VMs warm briefly");
@@ -367,14 +367,14 @@ if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS !== "30000
 if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_REUSE_IDLE_VMS !== "1") {
   throw new Error("Mac VZ source-home Browser config must explicitly opt in to profile-keyed idle VM reuse");
 }
-if (!macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION_DIR?.endsWith("/mac-vm-data/browser-vm/hibernation")) {
-  throw new Error("Mac source-home Browser config must keep VZ hibernation state under Runtime data");
-}
-if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES !== "4") {
-  throw new Error("Mac source-home Browser config must bound retained VZ hibernation states");
-}
-if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS !== "604800") {
-  throw new Error("Mac source-home Browser config must expire stale VZ hibernation states");
+for (const legacyKey of [
+  "ELASTOS_BROWSER_VM_HIBERNATION_DIR",
+  "ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES",
+  "ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS",
+]) {
+  if (legacyKey in (macAdapter?.supervisor?.env || {})) {
+    throw new Error(`Mac source-home VZ transport config must omit ${legacyKey}`);
+  }
 }
 if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !== macVmAdapterPath.replace(/\/mac-vm-config\/browser-engine-adapter\.json$/, "/browser-vm-remote-vz-launcher")) {
   throw new Error("Mac source-home Browser config must pass the VZ control launcher through the VM supervisor");
@@ -451,7 +451,8 @@ if (
   defaultMacVzTransport.schema !==
     "elastos.browser.vz-transport-config/v1" ||
   defaultMacVzTransport.turn_advertised_host !== "127.0.0.1" ||
-  defaultMacAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION !== "0"
+  "ELASTOS_BROWSER_VM_HIBERNATION" in
+    (defaultMacAdapter?.supervisor?.env || {})
 ) {
   throw new Error("Local Mac source-home Browser config must use no-NIC VZ transport by default");
 }

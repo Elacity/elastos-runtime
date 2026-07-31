@@ -29,7 +29,6 @@ const VM_LAUNCHER_ENV_KEYS = [
 ];
 const REMOTE_VZ_PATH_ENV_KEYS = [
   "ELASTOS_BROWSER_REMOTE_VZ_DATA_DIR",
-  "ELASTOS_BROWSER_REMOTE_VZ_TURN_ENV",
   "ELASTOS_BROWSER_REMOTE_VZ_TURN_PROGRAM",
   "ELASTOS_BROWSER_REMOTE_VZ_PROFILE_ROOT",
 ];
@@ -610,13 +609,20 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = nul
     ELASTOS_BROWSER_VM_REUSE_IDLE_VMS: args.platform.startsWith("linux-")
       ? VM_LINUX_REUSE_IDLE_VMS
       : VM_REUSE_IDLE_VMS,
-    ELASTOS_BROWSER_VM_HIBERNATION:
-      args.platform === "darwin-arm64" && !vzTransport ? "1" : "0",
-    ELASTOS_BROWSER_VM_HIBERNATION_DIR: path.join(args.dataDir, "browser-vm/hibernation"),
-    ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES: VM_HIBERNATION_MAX_ENTRIES,
-    ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS: VM_HIBERNATION_MAX_AGE_SECS,
     ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE: "1",
   };
+  if (!vzTransport) {
+    env.ELASTOS_BROWSER_VM_HIBERNATION =
+      args.platform === "darwin-arm64" ? "1" : "0";
+    env.ELASTOS_BROWSER_VM_HIBERNATION_DIR = path.join(
+      args.dataDir,
+      "browser-vm/hibernation",
+    );
+    env.ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES =
+      VM_HIBERNATION_MAX_ENTRIES;
+    env.ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS =
+      VM_HIBERNATION_MAX_AGE_SECS;
+  }
   if (!remoteVzControlLauncher && !vzTransport) {
     copyVmIceEnv(env, sourceEnv);
     copyVmMediaRelayEnv(env, args.platform, sourceEnv);

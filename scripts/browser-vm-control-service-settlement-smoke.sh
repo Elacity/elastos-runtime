@@ -39,6 +39,46 @@ const suffix = launch.stream_id.replace(/[^A-Za-z0-9_-]/g, "_");
 const pageId = launch.page_id || `page:settlement-${suffix}`;
 const controlSocketPath = `${proofDir}/${suffix}.sock`;
 const pidPath = `${proofDir}/${suffix}.pid`;
+const typedFailure = process.env.TYPED_TRANSPORT_FAILURE;
+if (typedFailure && launch.transport_authority) {
+  const acted = typedFailure !== "did_not_act";
+  const terminal = typedFailure !== "cleanup_pending";
+  process.stderr.write(`${JSON.stringify({
+    schema: "elastos.browser.vz-launch-settlement/v1",
+    state: typedFailure,
+    message: `injected ${typedFailure}`,
+    binding_hash: process.env.TYPED_TRANSPORT_SUBSTITUTE
+      ? `sha256:${"f".repeat(64)}`
+      : launch.transport_authority.binding_hash,
+    generation: launch.transport_authority.generation,
+    page_id: launch.transport_authority.page_id,
+    vm_id: launch.transport_authority.vm_id,
+    stream_id: launch.transport_authority.egress.stream_id,
+    media_stream_id: launch.transport_authority.media.stream_id,
+    effects: {
+      session_directory: acted,
+      control_socket: acted,
+      ordinary_stream_bridge: acted,
+      media_stream_bridge: acted,
+      turn_process: acted,
+      supervisor_child: acted,
+      vm: acted,
+    },
+    absence: {
+      child_absent: true,
+      supervisor_child_absent: true,
+      control_socket_absent: true,
+      route_absent: true,
+      turn_listener_absent: true,
+      turn_relay_ports_absent: true,
+      ordinary_stream_bridge_absent: true,
+      media_stream_bridge_absent: true,
+      session_directory_absent: true,
+      vm_absent: terminal,
+    },
+  })}\n`);
+  process.exit(24);
+}
 if (process.env.LAUNCH_MARKER_PATH) {
   fs.appendFileSync(process.env.LAUNCH_MARKER_PATH, `${launch.stream_id}\n`);
 }
@@ -214,6 +254,8 @@ start_service() {
   SHUTDOWN_STATE_FILE="$tmp_dir/shutdown-state" \
   LAUNCH_MARKER_PATH="$launch_marker" \
   FAIL_TRANSPORT_LAUNCH="${FAIL_TRANSPORT_LAUNCH:-}" \
+  TYPED_TRANSPORT_FAILURE="${TYPED_TRANSPORT_FAILURE:-}" \
+  TYPED_TRANSPORT_SUBSTITUTE="${TYPED_TRANSPORT_SUBSTITUTE:-}" \
     "$node_bin" "$repo_root/scripts/browser-vm-control-service.mjs" \
       > "$tmp_dir/${label}.out" 2> "$tmp_dir/${label}.err" &
   service_pid=$!
@@ -441,6 +483,26 @@ function closeBody(page) {
   };
 }
 
+function runtimeSerializedCloseBody(page) {
+  const body = closeBody(page);
+  const serialized = structuredClone(body);
+  serialized.runtime_cleanup.isolation = canonicalJson(
+    serialized.runtime_cleanup.isolation,
+  );
+  serialized.runtime_cleanup.process = canonicalJson(
+    serialized.runtime_cleanup.process,
+  );
+  if (
+    JSON.stringify(body.runtime_cleanup.isolation) ===
+      JSON.stringify(serialized.runtime_cleanup.isolation) ||
+    JSON.stringify(body.runtime_cleanup.process) ===
+      JSON.stringify(serialized.runtime_cleanup.process)
+  ) {
+    throw new Error("Runtime serialization fixture did not reorder both bindings");
+  }
+  return JSON.parse(JSON.stringify(serialized));
+}
+
 const reconcile = (id) =>
   request("POST", "/launches/reconcile", {
     schema: "elastos.browser.vm-control-service.reconcile-launch/v1",
@@ -469,9 +531,83 @@ async function waitFor(predicate, message) {
   throw new Error(message);
 }
 
-if (process.env.PHASE === "cleanup-retry") {
+async function requireBindingRejected(page, label, mutate) {
+  const body = runtimeSerializedCloseBody(page);
+  mutate(body.runtime_cleanup);
+  const rejected = await requestRaw("POST", "/shutdown", body);
+  if (rejected.status !== 400) {
+    throw new Error(
+      `${label} cleanup binding was accepted: ${JSON.stringify(rejected)}`,
+    );
+  }
+  const status = await request("GET", "/status");
+  if (
+    status.active_pages !== 1 ||
+    status.active_vms !== 1 ||
+    !processAlive(page.process.pid) ||
+    !fs.existsSync(page.control_socket_path)
+  ) {
+    throw new Error(
+      `${label} cleanup binding released its exact owner: ${JSON.stringify(status)}`,
+    );
+  }
+  const retained = await reconcile(streamId);
+  if (
+    retained.state !== "effect_acquired" ||
+    retained.supervisor_result?.page_id !== page.page_id
+  ) {
+    throw new Error(
+      `${label} cleanup binding lost durable effect ownership: ${JSON.stringify(retained)}`,
+    );
+  }
+}
+
+if (process.env.PHASE === "binding-equality") {
   const page = await request("POST", "/pages", openBody(streamId));
-  const first = await requestRaw("POST", "/shutdown", closeBody(page));
+  await requireBindingRejected(page, "changed isolation", (binding) => {
+    binding.isolation.session_dir += "-substitute";
+  });
+  await requireBindingRejected(page, "missing isolation", (binding) => {
+    delete binding.isolation.kind;
+  });
+  await requireBindingRejected(page, "additional isolation", (binding) => {
+    binding.isolation.unexpected = true;
+  });
+  await requireBindingRejected(page, "changed process", (binding) => {
+    binding.process.pid += 1;
+  });
+  await requireBindingRejected(page, "missing process", (binding) => {
+    delete binding.process.stream_bridge_pid;
+  });
+  await requireBindingRejected(page, "additional process", (binding) => {
+    binding.process.unexpected = true;
+  });
+  const terminal = await request(
+    "POST",
+    "/shutdown",
+    runtimeSerializedCloseBody(page),
+  );
+  if (
+    terminal.terminal !== true ||
+    Object.values(terminal.effects || {}).some((value) => value !== true)
+  ) {
+    throw new Error(
+      `semantically exact serialized binding was not terminal: ${JSON.stringify(terminal)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (durable.state !== "terminal_post_effect_cleanup") {
+    throw new Error(
+      `serialized cleanup did not persist terminal state: ${JSON.stringify(durable)}`,
+    );
+  }
+} else if (process.env.PHASE === "cleanup-retry") {
+  const page = await request("POST", "/pages", openBody(streamId));
+  const first = await requestRaw(
+    "POST",
+    "/shutdown",
+    runtimeSerializedCloseBody(page),
+  );
   if (
     first.status !== 400 ||
     !String(first.body.error || "").includes("cleanup failed")
@@ -540,7 +676,11 @@ if (process.env.PHASE === "cleanup-retry") {
   ) {
     throw new Error(`restart did not retain only its exact durable cleanup binding: ${JSON.stringify(pending)}`);
   }
-  const first = await requestRaw("POST", "/shutdown", closeBody(page));
+  const first = await requestRaw(
+    "POST",
+    "/shutdown",
+    runtimeSerializedCloseBody(page),
+  );
   if (
     first.status !== 400 ||
     !String(first.body.error || "").includes("indeterminate after service restart")
@@ -564,7 +704,7 @@ if (process.env.PHASE === "cleanup-retry") {
   const stillIndeterminate = await requestRaw(
     "POST",
     "/shutdown",
-    closeBody(page),
+    runtimeSerializedCloseBody(page),
   );
   if (
     stillIndeterminate.status !== 400 ||
@@ -759,10 +899,105 @@ if (process.env.PHASE === "cleanup-retry") {
       "dispatched transport failure journal lost its binding or persisted a secret",
     );
   }
+} else if (process.env.PHASE === "typed-transport-failure") {
+  const expected = process.env.EXPECTED_SETTLEMENT;
+  const failed = await requestRaw("POST", "/pages", openBody(streamId));
+  const settlement = failed.body.launch_settlement_result;
+  if (
+    failed.status !== 400 ||
+    settlement?.schema !==
+      "elastos.browser.vz-launch-settlement/v1" ||
+    settlement.state !== expected ||
+    settlement.binding_hash !==
+      issuedTransportAuthority.binding_hash ||
+    settlement.generation !==
+      issuedTransportAuthority.generation ||
+    settlement.page_id !== issuedTransportAuthority.page_id ||
+    settlement.vm_id !== issuedTransportAuthority.vm_id ||
+    settlement.stream_id !==
+      issuedTransportAuthority.egress.stream_id ||
+    settlement.media_stream_id !==
+      issuedTransportAuthority.media.stream_id
+  ) {
+    throw new Error(
+      `typed transport failure was not propagated exactly: ${JSON.stringify(failed)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== expected ||
+    durable.launch_settlement_result?.binding_hash !==
+      issuedTransportAuthority.binding_hash
+  ) {
+    throw new Error(
+      `typed transport settlement was not durable: ${JSON.stringify(durable)}`,
+    );
+  }
+  const journal = fs.readFileSync(process.env.JOURNAL_PATH, "utf8");
+  if (
+    journal.includes(issuedTransportSecret.credential) ||
+    journal.includes(issuedTransportSecret.auth_secret)
+  ) {
+    throw new Error("typed transport settlement persisted a private secret");
+  }
+} else if (process.env.PHASE === "verify-typed-restart") {
+  const expected = process.env.EXPECTED_SETTLEMENT;
+  const persisted = JSON.parse(
+    fs.readFileSync(process.env.JOURNAL_PATH, "utf8"),
+  ).records.find(
+    (record) =>
+      record.launch?.lifecycle_generation === generation(streamId) &&
+      record.launch?.stream_id === streamId,
+  );
+  issuedTransportAuthority =
+    persisted?.launch?.transport_authority || null;
+  if (!issuedTransportAuthority) {
+    throw new Error("typed transport restart lost its exact authority");
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== expected ||
+    durable.launch_settlement_result?.state !== expected ||
+    durable.launch_settlement_result?.binding_hash !==
+      issuedTransportAuthority.binding_hash ||
+    durable.launch_settlement_result?.generation !==
+      issuedTransportAuthority.generation
+  ) {
+    throw new Error(
+      `typed transport settlement did not survive restart: ${JSON.stringify(durable)}`,
+    );
+  }
+} else if (process.env.PHASE === "substituted-transport-failure") {
+  const failed = await requestRaw("POST", "/pages", openBody(streamId));
+  if (
+    failed.status !== 400 ||
+    failed.body.launch_settlement_result !== undefined
+  ) {
+    throw new Error(
+      `substituted transport settlement was adopted: ${JSON.stringify(failed)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== "cleanup_pending" ||
+    durable.launch_settlement_result !== undefined
+  ) {
+    throw new Error(
+      `substituted transport settlement escaped cleanup ownership: ${JSON.stringify(durable)}`,
+    );
+  }
 } else {
   throw new Error(`unknown settlement phase: ${process.env.PHASE}`);
 }
 NODE
+
+binding_socket="$tmp_dir/binding-control.sock"
+start_service "$binding_socket" "" "binding-service"
+CONTROL_SOCKET="$binding_socket" \
+STREAM_ID="stream:settlement-binding-equality" \
+PHASE="binding-equality" \
+  "$node_bin" "$client"
+stop_service
 
 retry_socket="$tmp_dir/retry-control.sock"
 start_service "$retry_socket" "$flaky_shutdown" "retry-service"
@@ -854,6 +1089,49 @@ TRANSPORT=1 \
   "$node_bin" "$client"
 stop_service
 unset FAIL_TRANSPORT_LAUNCH
+
+for typed_settlement in did_not_act cleanup_pending terminal_post_effect_cleanup; do
+  typed_socket="$tmp_dir/typed-${typed_settlement}-control.sock"
+  typed_journal="${typed_socket}.launch-reconciliations.json"
+  TYPED_TRANSPORT_FAILURE="$typed_settlement" \
+    start_service "$typed_socket" "" "typed-${typed_settlement}-service"
+  CONTROL_SOCKET="$typed_socket" \
+  STREAM_ID="stream:typed-${typed_settlement}" \
+  JOURNAL_PATH="$typed_journal" \
+  PHASE="typed-transport-failure" \
+  EXPECTED_SETTLEMENT="$typed_settlement" \
+  TRANSPORT=1 \
+    "$node_bin" "$client"
+  stop_service
+  start_service \
+    "$typed_socket" \
+    "" \
+    "typed-${typed_settlement}-restart-service"
+  CONTROL_SOCKET="$typed_socket" \
+  STREAM_ID="stream:typed-${typed_settlement}" \
+  JOURNAL_PATH="$typed_journal" \
+  PHASE="verify-typed-restart" \
+  EXPECTED_SETTLEMENT="$typed_settlement" \
+  TRANSPORT=1 \
+    "$node_bin" "$client"
+  stop_service
+done
+unset TYPED_TRANSPORT_FAILURE
+
+substituted_socket="$tmp_dir/substituted-transport-control.sock"
+substituted_journal="${substituted_socket}.launch-reconciliations.json"
+TYPED_TRANSPORT_FAILURE="terminal_post_effect_cleanup" \
+TYPED_TRANSPORT_SUBSTITUTE=1 \
+  start_service "$substituted_socket" "" "substituted-transport-service"
+CONTROL_SOCKET="$substituted_socket" \
+STREAM_ID="stream:substituted-transport" \
+JOURNAL_PATH="$substituted_journal" \
+PHASE="substituted-transport-failure" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+stop_service
+unset TYPED_TRANSPORT_FAILURE
+unset TYPED_TRANSPORT_SUBSTITUTE
 
 transport_socket="$tmp_dir/transport-control.sock"
 transport_journal="${transport_socket}.launch-reconciliations.json"

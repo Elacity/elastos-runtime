@@ -14,6 +14,7 @@ fn test_browser_engine_cleanup(page_id: &str) -> BrowserEngineCleanup {
         page_id: page_id.to_string(),
         principal_id: "person:local:test".to_string(),
         owner_launch_id: "launch:test".to_string(),
+        browser_instance: None,
         generation: "sha256:test-generation".to_string(),
         engine_route_provider: "mock-browser-route".to_string(),
         engine_provider: "browser-engine-adapter".to_string(),

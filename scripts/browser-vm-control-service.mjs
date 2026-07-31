@@ -28,6 +28,29 @@ const VZ_TRANSPORT_AUTHORITY_SCHEMA =
   "elastos.browser.vz-transport-authority/v1";
 const VZ_TRANSPORT_SECRET_SCHEMA =
   "elastos.browser.vz-transport-secret/v1";
+const VZ_LAUNCH_SETTLEMENT_SCHEMA =
+  "elastos.browser.vz-launch-settlement/v1";
+const VZ_LAUNCH_EFFECT_KEYS = [
+  "session_directory",
+  "control_socket",
+  "ordinary_stream_bridge",
+  "media_stream_bridge",
+  "turn_process",
+  "supervisor_child",
+  "vm",
+];
+const VZ_LAUNCH_ABSENCE_KEYS = [
+  "child_absent",
+  "supervisor_child_absent",
+  "control_socket_absent",
+  "route_absent",
+  "turn_listener_absent",
+  "turn_relay_ports_absent",
+  "ordinary_stream_bridge_absent",
+  "media_stream_bridge_absent",
+  "session_directory_absent",
+  "vm_absent",
+];
 const TERMINAL_CLEANUP_EFFECT_KEYS = [
   "page_absent",
   "child_absent",
@@ -350,6 +373,86 @@ function validateVzTransportSecret(authority, secret) {
     throw new Error("Browser VZ TURN credential mismatch");
   }
   return secret;
+}
+
+function validateVzLaunchSettlement(settlement) {
+  if (
+    !exactObjectKeys(settlement, [
+      "schema",
+      "state",
+      "message",
+      "binding_hash",
+      "generation",
+      "page_id",
+      "vm_id",
+      "stream_id",
+      "media_stream_id",
+      "effects",
+      "absence",
+    ]) ||
+    settlement.schema !== VZ_LAUNCH_SETTLEMENT_SCHEMA ||
+    ![
+      LAUNCH_SETTLEMENT_DID_NOT_ACT,
+      LAUNCH_SETTLEMENT_PENDING,
+      LAUNCH_SETTLEMENT_TERMINAL,
+    ].includes(settlement.state) ||
+    typeof settlement.message !== "string" ||
+    settlement.message.length > 8192 ||
+    !sha256LabelIsSafe(settlement.binding_hash) ||
+    !sha256LabelIsSafe(settlement.generation) ||
+    !safeId(settlement.page_id) ||
+    !safeId(settlement.vm_id) ||
+    !safeId(settlement.stream_id) ||
+    !safeId(settlement.media_stream_id) ||
+    !exactObjectKeys(settlement.effects, VZ_LAUNCH_EFFECT_KEYS) ||
+    VZ_LAUNCH_EFFECT_KEYS.some(
+      (key) => typeof settlement.effects[key] !== "boolean",
+    ) ||
+    !exactObjectKeys(settlement.absence, VZ_LAUNCH_ABSENCE_KEYS) ||
+    VZ_LAUNCH_ABSENCE_KEYS.some(
+      (key) => typeof settlement.absence[key] !== "boolean",
+    )
+  ) {
+    throw new Error("Browser VZ launcher returned an invalid launch settlement");
+  }
+  const terminalAbsence = VZ_LAUNCH_ABSENCE_KEYS.every(
+    (key) => settlement.absence[key] === true,
+  );
+  if (
+    (settlement.state === LAUNCH_SETTLEMENT_DID_NOT_ACT &&
+      (VZ_LAUNCH_EFFECT_KEYS.some(
+        (key) => settlement.effects[key] !== false,
+      ) ||
+        !terminalAbsence)) ||
+    (settlement.state === LAUNCH_SETTLEMENT_TERMINAL &&
+      (!terminalAbsence ||
+        VZ_LAUNCH_EFFECT_KEYS.every(
+          (key) => settlement.effects[key] === false,
+        ))) ||
+    (settlement.state === LAUNCH_SETTLEMENT_PENDING &&
+      terminalAbsence)
+  ) {
+    throw new Error("Browser VZ launch settlement state contradicts its effects");
+  }
+  return settlement;
+}
+
+function validateVzLaunchSettlementForLaunch(settlement, launch) {
+  validateVzLaunchSettlement(settlement);
+  const authority = validateVzTransportAuthority(
+    launch.transport_authority,
+  );
+  if (
+    settlement.binding_hash !== authority.binding_hash ||
+    settlement.generation !== authority.generation ||
+    settlement.page_id !== authority.page_id ||
+    settlement.vm_id !== authority.vm_id ||
+    settlement.stream_id !== authority.egress.stream_id ||
+    settlement.media_stream_id !== authority.media.stream_id
+  ) {
+    throw new Error("Browser VZ launch settlement binding changed");
+  }
+  return settlement;
 }
 
 function valueContainsTransportSecret(value, secret = null) {
@@ -724,8 +827,8 @@ function requireExactRuntimeCleanupRecord(
     binding.control_socket_path === page.control_socket_path &&
     binding.shutdown_socket_path === config.control_socket_path &&
     isDeepStrictEqual(binding.control_service, controlServiceIdentity) &&
-    JSON.stringify(binding.isolation) === JSON.stringify(page.isolation) &&
-    JSON.stringify(binding.process) === JSON.stringify(page.process) &&
+    isDeepStrictEqual(binding.isolation, page.isolation) &&
+    isDeepStrictEqual(binding.process, page.process) &&
     isDeepStrictEqual(
       binding.transport_authority,
       launch.transport_authority,
@@ -1077,13 +1180,33 @@ function launchReconciliationRecordIsSafe(record) {
   } catch {
     transportIsSafe = false;
   }
+  let launchSettlementIsSafe =
+    record.launch_settlement_result === undefined;
+  if (record.launch_settlement_result !== undefined) {
+    try {
+      validateVzLaunchSettlementForLaunch(
+        record.launch_settlement_result,
+        launch,
+      );
+      launchSettlementIsSafe =
+        record.launch_settlement_result.state === state;
+    } catch {
+      launchSettlementIsSafe = false;
+    }
+  }
+  const typedTerminalLaunchSettlement =
+    launchSettlementIsSafe &&
+    record.launch_settlement_result?.state ===
+      LAUNCH_SETTLEMENT_TERMINAL;
   const terminalCleanupReceiptIsSafe =
-    state === "terminal_post_effect_cleanup"
-      ? durableTerminalCleanupReceiptIsSafe(
-          record.terminal_cleanup_receipt,
-          launch,
-          record.cleanup_binding,
-        )
+    state === LAUNCH_SETTLEMENT_TERMINAL
+      ? typedTerminalLaunchSettlement
+        ? record.terminal_cleanup_receipt === undefined
+        : durableTerminalCleanupReceiptIsSafe(
+            record.terminal_cleanup_receipt,
+            launch,
+            record.cleanup_binding,
+          )
       : record.terminal_cleanup_receipt === undefined;
   return (
     record?.schema ===
@@ -1117,6 +1240,7 @@ function launchReconciliationRecordIsSafe(record) {
     (state !== "terminal_post_effect_cleanup" ||
       (typeof effects.page_acquired === "boolean" &&
         typeof effects.vm_acquired === "boolean")) &&
+    launchSettlementIsSafe &&
     terminalCleanupReceiptIsSafe
   );
 }
@@ -1138,6 +1262,10 @@ function durableLaunchReconciliationRecord(record) {
   if (record.terminal_cleanup_receipt !== undefined) {
     durable.terminal_cleanup_receipt =
       record.terminal_cleanup_receipt;
+  }
+  if (record.launch_settlement_result !== undefined) {
+    durable.launch_settlement_result =
+      record.launch_settlement_result;
   }
   return durable;
 }
@@ -1748,7 +1876,12 @@ function retainIdleVm(config, vmKey, vmRecord, activeVms) {
 function launchSettlementError(error, settlement, cleanupError = null) {
   const settledError =
     error instanceof Error ? error : new Error(String(error));
-  settledError.launch_settlement = settlement;
+  if (settledError.vz_launch_settlement) {
+    settledError.launch_settlement =
+      settledError.vz_launch_settlement.state;
+  } else {
+    settledError.launch_settlement = settlement;
+  }
   if (cleanupError) {
     settledError.launch_cleanup_error =
       cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
@@ -1891,6 +2024,13 @@ function launcherError(message, stderr) {
         typeof parsed.message === "string"
       ) {
         return codedError(parsed.code, parsed.message);
+      }
+      if (parsed?.schema === VZ_LAUNCH_SETTLEMENT_SCHEMA) {
+        const settlement = validateVzLaunchSettlement(parsed);
+        const error = new Error(settlement.message || message);
+        error.vz_launch_settlement = settlement;
+        error.launch_settlement = settlement.state;
+        return error;
       }
     } catch {}
   }
@@ -2304,7 +2444,12 @@ function recordProvenLaunchFailure(
   const settlement = error?.launch_settlement;
   if (
     settlement !== LAUNCH_SETTLEMENT_DID_NOT_ACT &&
-    settlement !== LAUNCH_SETTLEMENT_TERMINAL
+    settlement !== LAUNCH_SETTLEMENT_TERMINAL &&
+    !(
+      settlement === LAUNCH_SETTLEMENT_PENDING &&
+      error?.vz_launch_settlement?.state ===
+        LAUNCH_SETTLEMENT_PENDING
+    )
   ) {
     return;
   }
@@ -2317,7 +2462,16 @@ function recordProvenLaunchFailure(
         effects:
           settlement === LAUNCH_SETTLEMENT_DID_NOT_ACT
             ? { page_acquired: false, vm_acquired: false }
-            : { page_acquired: true, vm_acquired: true },
+            : settlement === LAUNCH_SETTLEMENT_PENDING
+              ? { page_acquired: null, vm_acquired: null }
+            : {
+                page_acquired: false,
+                vm_acquired:
+                  error?.vz_launch_settlement?.effects?.vm ?? true,
+              },
+        ...(error?.vz_launch_settlement
+          ? { launch_settlement_result: error.vz_launch_settlement }
+          : {}),
       },
     );
   } catch (journalError) {
@@ -2369,7 +2523,7 @@ async function settleDispatchedLaunchFailure(
 ) {
   if (
     transportLaunch &&
-    error?.launch_settlement !== LAUNCH_SETTLEMENT_DID_NOT_ACT
+    !error?.vz_launch_settlement
   ) {
     return launchSettlementError(
       error,
@@ -2785,9 +2939,22 @@ async function openPage(
   } catch (error) {
     let settledError = error;
     if (launchMayHaveActed) {
+      if (settledError?.vz_launch_settlement) {
+        try {
+          validateVzLaunchSettlementForLaunch(
+            settledError.vz_launch_settlement,
+            launch,
+          );
+        } catch (settlementError) {
+          settledError = launchSettlementError(
+            settlementError,
+            LAUNCH_SETTLEMENT_PENDING,
+          );
+        }
+      }
       settledError = await settleDispatchedLaunchFailure(
         launcher,
-        error,
+        settledError,
         Number(config.shutdown_timeout_ms ?? 30000),
         Boolean(launch.transport_authority),
       );
@@ -2808,11 +2975,22 @@ async function openPage(
       ...(settledError?.launch_cleanup_error
         ? { cleanup_error: settledError.launch_cleanup_error }
         : {}),
+      ...(settledError?.vz_launch_settlement
+        ? { launch_settlement_result: settledError.vz_launch_settlement }
+        : {}),
     });
     if (error instanceof SyntaxError) {
-      throw new Error(`Browser VM launcher output is not JSON: ${error.message}`);
+      const syntaxError = new Error(
+        `Browser VM launcher output is not JSON: ${error.message}`,
+      );
+      syntaxError.launch_settlement = settledError?.launch_settlement;
+      syntaxError.launch_cleanup_error =
+        settledError?.launch_cleanup_error;
+      syntaxError.vz_launch_settlement =
+        settledError?.vz_launch_settlement;
+      throw syntaxError;
     }
-    throw error;
+    throw settledError;
   } finally {
     pendingLaunches.delete(requestId);
   }
@@ -3411,9 +3589,17 @@ function main() {
       const message = error instanceof Error ? error.message : String(error);
       sendJson(
         error?.code === "resources_in_use" ? 409 : 400,
-        typeof error?.code === "string"
-          ? { code: error.code, message }
-          : { error: message },
+        {
+          ...(typeof error?.code === "string"
+            ? { code: error.code, message }
+            : { error: message }),
+          ...(error?.vz_launch_settlement
+            ? {
+                launch_settlement_result:
+                  error.vz_launch_settlement,
+              }
+            : {}),
+        },
       );
     }
   });

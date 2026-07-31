@@ -18,13 +18,15 @@ const BROWSER_ADAPTER_IPC_TMP_DIR: &str = "elastos-browser-adapter-ipc";
 const BROWSER_RUNTIME_RELAY_OPEN_MAX_BYTES: usize = 16 * 1024;
 #[cfg(unix)]
 const BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 300;
-#[cfg(unix)]
-const BROWSER_RUNTIME_STREAM_STALE_SECS: u64 = BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS * 2;
 const EXIT_STREAM_SESSION_SCHEMA: &str = "elastos.exit.stream-session/v1";
 const EXIT_REMOTE_CARRIER_SESSION_SCHEMA: &str = "elastos.exit.remote-carrier-session/v1";
 
 #[cfg(unix)]
 static BROWSER_VZ_FIXED_MEDIA_LISTENERS: OnceLock<
+    tokio::sync::Mutex<BTreeMap<PathBuf, watch::Sender<bool>>>,
+> = OnceLock::new();
+#[cfg(unix)]
+static BROWSER_RUNTIME_STREAM_LISTENERS: OnceLock<
     tokio::sync::Mutex<BTreeMap<PathBuf, watch::Sender<bool>>>,
 > = OnceLock::new();
 
@@ -933,29 +935,79 @@ async fn spawn_browser_runtime_stream_listener(
     path: &FsPath,
     target: BrowserRuntimeStreamTarget,
 ) -> anyhow::Result<()> {
+    spawn_browser_runtime_stream_listener_with_accept_timeout(
+        path,
+        target,
+        Duration::from_secs(BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS),
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn spawn_browser_runtime_stream_listener_with_accept_timeout(
+    path: &FsPath,
+    target: BrowserRuntimeStreamTarget,
+    accept_timeout: Duration,
+) -> anyhow::Result<()> {
+    let listeners = BROWSER_RUNTIME_STREAM_LISTENERS.get_or_init(Default::default);
+    let mut listeners = listeners.lock().await;
+    if listeners.contains_key(path) {
+        anyhow::bail!(
+            "Runtime browser stream listener binding already exists: {}",
+            path.display()
+        );
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if metadata.file_type().is_socket() {
-            std::fs::remove_file(path)?;
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(stream) => {
+                    drop(stream);
+                    anyhow::bail!(
+                        "Runtime browser stream socket has a live owner: {}",
+                        path.display()
+                    );
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    std::fs::remove_file(path)?;
+                }
+                Err(err) => {
+                    anyhow::bail!(
+                        "Runtime browser stream socket ownership is indeterminate at {}: {err}",
+                        path.display()
+                    );
+                }
+            }
         } else {
             anyhow::bail!("Runtime browser stream path exists and is not a Unix socket");
         }
     }
     let listener = UnixListener::bind(path)
         .map_err(|err| anyhow::anyhow!("UnixListener::bind({}) failed: {err}", path.display()))?;
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     let cleanup_path = path.to_path_buf();
+    let (cancel, mut cancelled) = watch::channel(false);
+    listeners.insert(cleanup_path.clone(), cancel);
+    drop(listeners);
     tokio::spawn(async move {
         let mut accepted_any = false;
+        let mut sessions = tokio::task::JoinSet::new();
         loop {
-            let timeout = Duration::from_secs(BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS);
-            match tokio::time::timeout(timeout, listener.accept()).await {
+            tokio::select! {
+                _ = cancelled.changed() => break,
+                accepted = tokio::time::timeout(accept_timeout, listener.accept()) => match accepted {
                 Ok(Ok((mut stream, _addr))) => {
                     accepted_any = true;
                     let target = target.clone();
                     let session_path = cleanup_path.clone();
-                    tokio::spawn(async move {
+                    sessions.spawn(async move {
                         match target {
                             BrowserRuntimeStreamTarget::LocalRelay(relay) => {
                                 if let Err(err) = bridge_browser_runtime_stream_to_local_relay(
@@ -999,68 +1051,104 @@ async fn spawn_browser_runtime_stream_listener(
                     break;
                 }
                 Err(_) => {
-                    tracing::debug!(
-                        path = %cleanup_path.display(),
-                        accepted_any,
-                        "browser runtime stream listener expired"
-                    );
-                    break;
+                    if !accepted_any {
+                        tracing::debug!(
+                            path = %cleanup_path.display(),
+                            "browser runtime stream listener expired before first use"
+                        );
+                        break;
+                    }
                 }
-            }
+                },
+                result = sessions.join_next(), if !sessions.is_empty() => {
+                    if let Some(Err(err)) = result {
+                        tracing::warn!(
+                            path = %cleanup_path.display(),
+                            error = %err,
+                            "browser runtime stream relay task failed"
+                        );
+                    }
+                }
+            };
         }
-        let _ = std::fs::remove_file(cleanup_path);
+        sessions.abort_all();
+        while sessions.join_next().await.is_some() {}
+        drop(listener);
+        let _ = std::fs::remove_file(&cleanup_path);
+        let listeners = BROWSER_RUNTIME_STREAM_LISTENERS.get_or_init(Default::default);
+        listeners.lock().await.remove(&cleanup_path);
     });
     Ok(())
 }
 
 #[cfg(unix)]
-pub(in crate::api::gateway) fn prune_orphan_browser_runtime_stream_sockets() -> anyhow::Result<usize>
-{
-    let stream_dir = browser_runtime_stream_root().join(BROWSER_RUNTIME_STREAM_TMP_DIR);
-    prune_orphan_browser_runtime_stream_sockets_in_dir(&stream_dir, std::time::SystemTime::now())
+pub(in crate::api::gateway) async fn close_browser_runtime_stream_listener(
+    data_dir: &FsPath,
+    stream_id: &str,
+) -> Result<(), String> {
+    let socket_path = browser_runtime_stream_socket_path(data_dir, stream_id)
+        .map_err(|err| format!("Browser runtime stream socket binding is invalid: {err}"))?;
+    let listeners = BROWSER_RUNTIME_STREAM_LISTENERS.get_or_init(Default::default);
+    let cancel = listeners.lock().await.get(&socket_path).cloned();
+    if let Some(cancel) = cancel {
+        cancel
+            .send(true)
+            .map_err(|_| "Browser runtime stream listener owner disappeared".to_string())?;
+    } else if socket_path.exists() {
+        let metadata = std::fs::symlink_metadata(&socket_path)
+            .map_err(|err| format!("Browser runtime stream socket metadata failed: {err}"))?;
+        if !metadata.file_type().is_socket() {
+            return Err(
+                "Browser runtime stream path exists without an exact Runtime socket".to_string(),
+            );
+        }
+        match UnixStream::connect(&socket_path).await {
+            Ok(stream) => {
+                drop(stream);
+                return Err(
+                    "Browser runtime stream socket has a live owner outside this Runtime"
+                        .to_string(),
+                );
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                std::fs::remove_file(&socket_path).map_err(|err| {
+                    format!("Browser runtime stale stream socket retirement failed: {err}")
+                })?;
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(format!(
+                    "Browser runtime stream socket ownership is indeterminate: {err}"
+                ))
+            }
+        }
+    } else {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let registered = listeners.lock().await.contains_key(&socket_path);
+        if !registered && !socket_path.exists() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Browser runtime stream listener cleanup timed out".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
-#[cfg(unix)]
-fn prune_orphan_browser_runtime_stream_sockets_in_dir(
-    stream_dir: &FsPath,
-    now: std::time::SystemTime,
-) -> anyhow::Result<usize> {
-    let Ok(entries) = std::fs::read_dir(stream_dir) else {
-        return Ok(0);
-    };
-    let stale_after = Duration::from_secs(BROWSER_RUNTIME_STREAM_STALE_SECS);
-    let mut removed = 0_usize;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("sock") {
-            continue;
-        }
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
-        };
-        let file_type = metadata.file_type();
-        if !file_type.is_socket() && !file_type.is_fifo() {
-            continue;
-        }
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let Ok(age) = now.duration_since(modified) else {
-            continue;
-        };
-        if age < stale_after {
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed = removed.saturating_add(1),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(removed)
+#[cfg(not(unix))]
+pub(in crate::api::gateway) async fn close_browser_runtime_stream_listener(
+    _data_dir: &FsPath,
+    _stream_id: &str,
+) -> Result<(), String> {
+    Err("Browser runtime stream sockets require a Unix host adapter".to_string())
 }
 
 #[cfg(not(unix))]
@@ -1072,24 +1160,28 @@ async fn spawn_browser_runtime_stream_listener(
 }
 
 pub(in crate::api::gateway) fn browser_runtime_stream_socket_path(
-    _data_dir: &FsPath,
+    data_dir: &FsPath,
     stream_id: &str,
 ) -> anyhow::Result<PathBuf> {
-    browser_stream_socket_path(stream_id, BROWSER_RUNTIME_STREAM_TMP_DIR)
+    browser_stream_socket_path(data_dir, stream_id, BROWSER_RUNTIME_STREAM_TMP_DIR)
 }
 
-fn browser_adapter_ipc_socket_path(_data_dir: &FsPath, stream_id: &str) -> anyhow::Result<PathBuf> {
-    browser_stream_socket_path(stream_id, BROWSER_ADAPTER_IPC_TMP_DIR)
+fn browser_adapter_ipc_socket_path(data_dir: &FsPath, stream_id: &str) -> anyhow::Result<PathBuf> {
+    browser_stream_socket_path(data_dir, stream_id, BROWSER_ADAPTER_IPC_TMP_DIR)
 }
 
-fn browser_stream_socket_path(stream_id: &str, directory: &str) -> anyhow::Result<PathBuf> {
+fn browser_stream_socket_path(
+    data_dir: &FsPath,
+    stream_id: &str,
+    directory: &str,
+) -> anyhow::Result<PathBuf> {
     if !stream_id
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
     {
         anyhow::bail!("stream_id must be a safe identifier");
     }
-    let digest = Sha256::digest(stream_id.as_bytes());
+    let digest = Sha256::digest(format!("{}\n{stream_id}", data_dir.to_string_lossy()).as_bytes());
     let socket_name = format!("{}.sock", hex::encode(&digest[..16]));
     // Unix socket paths have a small platform limit. Keep Browser stream sockets
     // in /tmp rather than platform temp roots like macOS /var/folders/.../T.
@@ -1182,13 +1274,18 @@ pub(in crate::api::gateway) fn browser_engine_stream_session(
 pub(in crate::api::gateway) fn browser_stream_cleanup(
     receipt: &serde_json::Value,
 ) -> Option<BrowserStreamCleanup> {
-    if receipt.get("schema").and_then(|value| value.as_str())
-        != Some(EXIT_REMOTE_CARRIER_SESSION_SCHEMA)
-        || receipt
-            .get("byte_transport")
-            .and_then(|value| value.as_str())
-            != Some("carrier_stream")
-    {
+    let schema = receipt.get("schema").and_then(serde_json::Value::as_str);
+    let byte_transport = receipt
+        .get("byte_transport")
+        .and_then(serde_json::Value::as_str);
+    if !matches!(
+        (schema, byte_transport),
+        (Some(EXIT_STREAM_SESSION_SCHEMA), Some("adapter_ipc"))
+            | (
+                Some(EXIT_REMOTE_CARRIER_SESSION_SCHEMA),
+                Some("carrier_stream")
+            )
+    ) {
         return None;
     }
     let stream_id = receipt
@@ -1312,11 +1409,129 @@ mod tests {
             .get("runtime_stream_path")
             .and_then(|value| value.as_str())
             .unwrap();
+        let runtime_stream_path = PathBuf::from(runtime_stream_path);
 
         assert!(path.starts_with("/tmp/elastos-browser-adapter-ipc/"));
         assert!(path.ends_with(".sock"));
         assert!(runtime_stream_path.starts_with("/tmp/elastos-browser-streams/"));
-        assert_ne!(path, runtime_stream_path);
+        assert_ne!(PathBuf::from(path), runtime_stream_path);
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::symlink_metadata(&runtime_stream_path)
+                    .unwrap()
+                    .permissions(),
+            ) & 0o777,
+            0o600
+        );
+        close_browser_runtime_stream_listener(dir.path(), "stream:missing-path-test")
+            .await
+            .unwrap();
+        assert!(!runtime_stream_path.exists());
+    }
+
+    #[test]
+    fn local_adapter_stream_receipt_retains_exact_cleanup_binding() {
+        let cleanup = browser_stream_cleanup(&json!({
+            "schema": EXIT_STREAM_SESSION_SCHEMA,
+            "byte_transport": "adapter_ipc",
+            "stream_id": "stream:local-cleanup-test",
+            "principal_id": "person:local:cleanup-test",
+        }))
+        .expect("local Runtime stream cleanup");
+        assert_eq!(cleanup.stream_id, "stream:local-cleanup-test");
+        assert_eq!(cleanup.principal_id, "person:local:cleanup-test");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_runtime_stream_listener_survives_multiple_accept_timeouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_path = dir.path().join("runtime.sock");
+        let relay_path = dir.path().join("relay.sock");
+        let relay_listener = UnixListener::bind(&relay_path).unwrap();
+        spawn_browser_runtime_stream_listener_with_accept_timeout(
+            &runtime_path,
+            BrowserRuntimeStreamTarget::LocalRelay(Some(BrowserExitRelay { path: relay_path })),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+
+        let relay = tokio::spawn(async move {
+            let (mut stream, _) = relay_listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            stream.write_all(b"x").await.unwrap();
+        });
+        let mut browser = UnixStream::connect(&runtime_path).await.unwrap();
+        browser
+            .write_all(
+                br#"{"schema":"elastos.exit.relay-open/v1","stream_id":"stream:lifetime-test","target":"tls://example.com:443","scheme":"tls","host":"example.com"}
+"#,
+            )
+            .await
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), browser.read_exact(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(byte, [b'x']);
+        assert!(runtime_path.exists());
+
+        let listeners = BROWSER_RUNTIME_STREAM_LISTENERS.get_or_init(Default::default);
+        listeners
+            .lock()
+            .await
+            .get(&runtime_path)
+            .cloned()
+            .unwrap()
+            .send(true)
+            .unwrap();
+        for _ in 0..200 {
+            if !runtime_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!runtime_path.exists());
+        relay.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_stream_socket_ownership_is_data_root_scoped_and_live_safe() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let stream_id = "stream:two-runtime-roots";
+        let first_path = browser_runtime_stream_socket_path(first.path(), stream_id).unwrap();
+        let second_path = browser_runtime_stream_socket_path(second.path(), stream_id).unwrap();
+        assert_ne!(first_path, second_path);
+
+        let foreign = std::os::unix::net::UnixListener::bind(&first_path).unwrap();
+        let error = spawn_browser_runtime_stream_listener(
+            &first_path,
+            BrowserRuntimeStreamTarget::LocalRelay(None),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("live owner"));
+        assert!(first_path.exists());
+
+        spawn_browser_runtime_stream_listener(
+            &second_path,
+            BrowserRuntimeStreamTarget::LocalRelay(None),
+        )
+        .await
+        .unwrap();
+        close_browser_runtime_stream_listener(second.path(), stream_id)
+            .await
+            .unwrap();
+        assert!(first_path.exists());
+        let connection = std::os::unix::net::UnixStream::connect(&first_path).unwrap();
+        drop(connection);
+        drop(foreign);
+        std::fs::remove_file(first_path).unwrap();
     }
 
     #[tokio::test]
@@ -1351,36 +1566,6 @@ mod tests {
                 .get("runtime_stream_path")
                 .and_then(|value| value.as_str())
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prune_orphan_runtime_stream_sockets_removes_only_stale_browser_sockets() {
-        let dir = tempfile::tempdir().unwrap();
-        let fresh_path = dir.path().join("fresh.sock");
-        let stale_path = dir.path().join("stale.sock");
-        let regular_path = dir.path().join("regular.sock");
-
-        let fresh = std::os::unix::net::UnixListener::bind(&fresh_path).unwrap();
-        let stale = std::os::unix::net::UnixListener::bind(&stale_path).unwrap();
-        drop(fresh);
-        drop(stale);
-        std::fs::write(&regular_path, b"not a socket").unwrap();
-
-        let now = std::time::SystemTime::now();
-        let removed = prune_orphan_browser_runtime_stream_sockets_in_dir(dir.path(), now).unwrap();
-        assert_eq!(removed, 0);
-        assert!(fresh_path.exists());
-        assert!(stale_path.exists());
-        assert!(regular_path.exists());
-
-        let future = now + Duration::from_secs(BROWSER_RUNTIME_STREAM_STALE_SECS + 1);
-        let removed =
-            prune_orphan_browser_runtime_stream_sockets_in_dir(dir.path(), future).unwrap();
-        assert_eq!(removed, 2);
-        assert!(!fresh_path.exists());
-        assert!(!stale_path.exists());
-        assert!(regular_path.exists());
     }
 
     #[test]

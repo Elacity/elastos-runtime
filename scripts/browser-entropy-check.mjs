@@ -160,11 +160,20 @@ const browserVmArtifactPreflightSmoke = read(
 );
 const browserVmControlService = read("scripts/browser-vm-control-service.mjs");
 const browserVmRemoteVzLauncher = read("scripts/browser-vm-remote-vz-launcher.mjs");
+const browserVmRemoteVzLauncherIntegration = read(
+  "scripts/browser-vm-remote-vz-launcher.integration.mjs",
+);
+const browserVzSupervisorProcessTest = read(
+  "elastos/crates/elastos-vz/tests/browser_vz_engine_supervisor_process.rs",
+);
 const browserVmControlServiceSmoke = read(
   "scripts/browser-vm-control-service-smoke.sh",
 );
 const browserVmControlServicePersistentSmoke = read(
   "scripts/browser-vm-control-service-persistent-smoke.sh",
+);
+const browserVmControlServiceSettlementSmoke = read(
+  "scripts/browser-vm-control-service-settlement-smoke.sh",
 );
 const remoteCarrierExitArtifactReadiness = read(
   "scripts/remote-carrier-exit-artifact-readiness.mjs",
@@ -1204,7 +1213,13 @@ assert(
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_PROFILE_ROOT") &&
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_TURN_ENV") &&
     browserVmRemoteVzLauncher.includes("optionalRemoteEnvExports") &&
-    browserVmRemoteVzLauncher.includes("remoteRuntimeTurnEnv") &&
+    browserVmRemoteVzLauncher.includes("rejectLegacyVzConfiguration") &&
+    browserVmRemoteVzLauncher.includes("elastos.browser.vz-transport-authority/v1") &&
+    browserVmRemoteVzLauncher.includes("elastos.browser.vz-launch-settlement/v1") &&
+    browserVmRemoteVzLauncher.includes("boundSocketPaths") &&
+    browserVmRemoteVzLauncher.includes("validateRemoteTransportResult") &&
+    browserVmRemoteVzLauncher.includes("routeAbsenceProved") &&
+    browserVmRemoteVzLauncher.includes("codesign --verify --strict") &&
     browserVmRemoteVzLauncher.includes("remoteProfileDiskPath") &&
     browserVmRemoteVzLauncher.includes("BrowserProfiles/default/profile.ext4") &&
     browserVmRemoteVzLauncher.includes('ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS') &&
@@ -1222,13 +1237,21 @@ assert(
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS") &&
     browserVmRemoteVzLauncher.includes('ELASTOS_BROWSER_REMOTE_VZ_RELAY_MAX_SESSIONS || "16"') &&
     browserVmRemoteVzLauncher.includes("remoteSupervisorCleanupCommand") &&
-    browserVmRemoteVzLauncher.includes("remoteStaleSupervisorCleanupCommand") &&
+    browserVmRemoteVzLauncher.includes("--elastos-vz-binding=") &&
+    browserVmRemoteVzLauncher.includes("ps -ww -axo command=") &&
+    browserVmRemoteVzLauncher.includes("ps -ww -axo pid=,command=") &&
+    browserVmRemoteVzLauncher.includes("terminate_owned_supervisor") &&
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_REAP_STALE_SUPERVISORS") &&
-    browserVmRemoteVzLauncher.includes("remoteStaleRelayCleanupCommand") &&
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_REAP_STALE_RELAYS") &&
-    browserVmRemoteVzLauncher.includes("[remote-vz cleanup] reaping stale relay shim") &&
-    browserVmRemoteVzLauncher.includes('proc_command=$(ps -p "$pid" -o command= 2>/dev/null || true)') &&
-    browserVmRemoteVzLauncher.includes("[remote-vz cleanup] reaping stale browser-vz-engine-supervisor") &&
+    !browserVmRemoteVzLauncher.includes("remoteStaleSupervisorCleanupCommand") &&
+    !browserVmRemoteVzLauncher.includes("remoteStaleRelayCleanupCommand") &&
+    browserVmRemoteVzLauncher.includes("remoteTransportAbsenceChecks") &&
+    browserVmRemoteVzLauncher.includes("${field} proof failed") &&
+    !browserVmRemoteVzLauncher.includes("let cleanupOk") &&
+    browserVmRemoteVzLauncher.includes("let cleanupPromise = null") &&
+    browserVmRemoteVzLauncher.includes("performOwnedResourceCleanup") &&
+    !browserVmRemoteVzLauncher.includes("if (cleanupStarted) return null") &&
+    browserVmRemoteVzLauncher.includes('proc_command=$(/bin/ps -ww -p "$pid" -o command= 2>/dev/null || true)') &&
     browserVmRemoteVzLauncher.includes("supervisor-${suffix}.pid") &&
     browserVmRemoteVzLauncher.includes("cleanup_supervisor") &&
     browserVmRemoteVzLauncher.includes("remoteRelayCleanupCommand") &&
@@ -1242,7 +1265,7 @@ assert(
     browserVmRemoteVzLauncher.includes('child.kill("SIGTERM")') &&
     browserVmRemoteVzLauncher.includes("/tmp/evzl") &&
     browserVmRemoteVzLauncher.includes("/tmp/evzs") &&
-    browserVmRemoteVzLauncher.includes("sessionSuffix") &&
+    browserVmRemoteVzLauncher.includes("bindingDigest") &&
     browserVmRemoteVzLauncher.includes("bvm-") &&
     browserVmRemoteVzLauncher.includes("validateUnixSocketPathBudget") &&
     browserVmRemoteVzLauncher.includes("adapter_ipc") &&
@@ -1250,6 +1273,15 @@ assert(
     browserVmRemoteVzLauncher.includes("control_socket_path") &&
     browserVmRemoteVzLauncher.includes("rm -f") &&
     browserVmRemoteVzLauncher.includes("per_launch_vm_target") &&
+    browserVmRemoteVzLauncherIntegration.includes("private_stdin_eof") &&
+    browserVmRemoteVzLauncherIntegration.includes("post_effect_cleanup") &&
+    browserVmRemoteVzLauncherIntegration.includes("zero_owned_residue") &&
+    browserVmRemoteVzLauncherIntegration.includes("long_roots") &&
+    browserVzSupervisorProcessTest.includes(
+      "missing_transport_exits_before_any_vz_or_path_effect",
+    ) &&
+    browserVzSupervisorProcessTest.includes('"load_vm_start"') &&
+    browserVzSupervisorProcessTest.includes('"start_vm_start"') &&
     !browserVmRemoteVzLauncher.includes("remote_provider:"),
   "Remote Browser VZ launcher must bridge Runtime stream IPC and VM control sockets with short macOS-safe socket paths",
 );
@@ -1334,6 +1366,10 @@ assert(
     browserVmControlService.includes("Browser VM active page capacity reached") &&
     browserVmControlService.includes("page_close_forced_vm_retirement") &&
     browserVmControlService.includes("per_launch_vm_target") &&
+    browserVmControlService.includes("elastos.browser.vz-launch-settlement/v1") &&
+    browserVmControlService.includes("validateVzLaunchSettlementForLaunch") &&
+    browserVmControlService.includes("throw settledError") &&
+    browserVmControlService.includes("launch_settlement_result") &&
     browserVmControlServiceSmoke.includes("elastos.browser.vm-control-service-smoke/v1") &&
     browserVmControlServiceSmoke.includes("capacity conflict changed the healthy owner") &&
     browserVmControlServiceSmoke.includes("explicit close did not permit the next lifecycle") &&
@@ -1347,6 +1383,10 @@ assert(
     browserVmControlServicePersistentSmoke.includes("different principal/profile launch did not terminate the previous idle VM") &&
     browserVmControlServicePersistentSmoke.includes('"reuse_idle_vms": True') &&
     browserVmControlServicePersistentSmoke.includes("Browser VM launcher output is not JSON") &&
+    browserVmControlServiceSettlementSmoke.includes("elastos.browser.vm-control-service-settlement-smoke/v1") &&
+    browserVmControlServiceSettlementSmoke.includes("verify-typed-restart") &&
+    browserVmControlServiceSettlementSmoke.includes("did_not_act cleanup_pending terminal_post_effect_cleanup") &&
+    browserVmControlServiceSettlementSmoke.includes("substituted transport settlement escaped cleanup ownership") &&
     browserVmEngineContractSmoke.includes("elastos.browser.vm-engine-contract-smoke/v1") &&
     browserVmRemoteControlPreflightSmoke.includes("elastos.browser.vm-remote-control-preflight-smoke/v1") &&
     browserVmRemoteControlPreflightSmoke.includes("remote_vm_control_socket") &&
@@ -1417,7 +1457,7 @@ assert(
     browserVzEngineSupervisor.includes("init=/opt/elastos/bin/browser-vm-init") &&
     browserVzEngineSupervisor.includes("root=/dev/vda rootfstype=ext4 rw") &&
     browserVzEngineSupervisor.includes("DEFAULT_CONTROL_PORT: u32 = 19092") &&
-    browserVzEngineSupervisor.includes("DEFAULT_RELAY_PORT: u32 = 19091") &&
+    !browserVzEngineSupervisor.includes("DEFAULT_RELAY_PORT") &&
     browserVzEngineSupervisor.includes("DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
     browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
     browserVzEngineSupervisor.includes("DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
@@ -1430,8 +1470,21 @@ assert(
     browserVzEngineSupervisor.includes("Browser VZ launcher requires adapter_ipc.runtime_stream_path") &&
     browserVzEngineSupervisor.includes("validate_runtime_stream_socket_path") &&
     browserVzEngineSupervisor.includes("launch_requires_runtime_owned_stream_path_for_egress") &&
-    browserVzEngineSupervisor.includes("Browser VZ webrtc_remote_display requires") &&
-    browserVzEngineSupervisor.includes("elastos.browser_ice_config_hex") &&
+    browserVzEngineSupervisor.includes("Browser VZ launcher requires display_mode=webrtc_remote_display") &&
+    browserVzEngineSupervisor.includes("VzTransportLaunch") &&
+    browserVzEngineSupervisor.includes("LEGACY_VZ_CONFIGURATION_KEYS") &&
+    browserVzEngineSupervisor.includes("VZ_AUTHORITY_BOOT_ARG_PREFIXES") &&
+    browserVzEngineSupervisor.includes("validate_vz_boot_args") &&
+    browserVzEngineSupervisor.includes("preflight_vz_launch") &&
+    browserVzEngineSupervisor.includes("bound_vz_launch_paths") &&
+    browserVzEngineSupervisor.includes("VzLaunchOwner") &&
+    browserVzEngineSupervisor.includes("TurnCleanupEvidence") &&
+    browserVzEngineSupervisor.includes("LaunchTurnStartError") &&
+    browserVzEngineSupervisor.includes("child_absent: self.terminate_and_reap()") &&
+    browserVzEngineSupervisor.includes("TurnCleanupEvidence::Indeterminate => false") &&
+    browserVzEngineSupervisor.includes("elastos.browser.vz-launch-settlement/v1") &&
+    browserVzEngineSupervisor.includes("network_disabled: true") &&
+    browserVzEngineSupervisor.includes("elastos.browser_ice_config_hex=") &&
     browserVzEngineSupervisor.includes("elastos.browser_width") &&
     browserVzEngineSupervisor.includes("elastos.browser_height") &&
     browserVzEngineSupervisor.includes("display_boot_args_include_launch_viewport") &&
@@ -1450,20 +1503,17 @@ assert(
     browserVzEngineSupervisor.includes("DEFAULT_PROFILE_DISK_MIB") &&
     !browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
     browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_MIB") &&
-    browserVzEngineSupervisor.includes('env_u32("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS", 16)') &&
+    browserVzEngineSupervisor.includes('"ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS"') &&
+    browserVzEngineSupervisor.includes("post_effect_try!(env_u32(") &&
     browserVzEngineSupervisor.includes("attach_browser_profile_disk") &&
     browserVzEngineSupervisor.includes("profile_disk_from_request") &&
     browserVzEngineSupervisor.includes("validate_profile_disk_path") &&
     browserVzEngineSupervisor.includes("data_disk_path = Some") &&
     browserVzEngineSupervisor.includes("elastos.browser_profile_disk=required") &&
     browserVzEngineSupervisor.includes("browser_profile_uses_principal_owned_data_disk_descriptor") &&
-    browserVzEngineSupervisor.includes("BrowserVmHibernation::from_env") &&
-    browserVzEngineSupervisor.includes("discard_bad_hibernation_state") &&
-    browserVzEngineSupervisor.includes("discard_hibernation_tmp_state") &&
-    browserVzEngineSupervisor.includes("hibernation_key_changes_when_profile_artifacts_resources_or_boot_args_change") &&
-    browserVzEngineSupervisor.includes("hibernation_prepare_launch_rootfs_removes_stale_state_when_cache_is_missing") &&
-    browserVzEngineSupervisor.includes("hibernation_restore_failure_cleanup_removes_bad_state_file") &&
-    browserVzEngineSupervisor.includes("hibernation_save_failure_cleanup_removes_tmp_state_file") &&
+    !browserVzEngineSupervisor.includes("BrowserVmHibernation") &&
+    !browserVzEngineSupervisor.includes("discard_bad_hibernation_state") &&
+    !browserVzEngineSupervisor.includes("discard_hibernation_tmp_state") &&
     browserVzEngineSupervisor.includes('#[cfg(target_os = "macos")]') &&
     browserVmTargetStage.includes("elastos.browser.vm-target-stage/v1") &&
     browserVmTargetStage.includes("browser-vm-init") &&

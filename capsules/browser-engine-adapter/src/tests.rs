@@ -1,4 +1,8 @@
 use super::*;
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,6 +87,100 @@ fn stream_receipt(byte_transport: &str) -> StreamSessionReceipt {
             runtime_stream_path: Some("/tmp/elastos-runtime-stream.sock".to_string()),
         }),
         relay_ipc: None,
+    }
+}
+
+fn canonical_test_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(canonical_test_json).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, canonical_test_json(value)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+
+fn test_sha256_label(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn test_vz_transport_launch(generation: &str) -> VzTransportLaunchContext {
+    let expires_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 300_000;
+    let expires_at_unix_ms = expires_at_unix_ms / 1_000 * 1_000;
+    let username = format!("{}:adapter-dispatch", expires_at_unix_ms / 1_000);
+    let auth_secret = "adapter-production-path-secret";
+    let mut mac = Hmac::<Sha1>::new_from_slice(auth_secret.as_bytes()).unwrap();
+    mac.update(username.as_bytes());
+    let credential = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    let mut authority = json!({
+        "schema": "elastos.browser.vz-transport-authority/v1",
+        "generation": generation,
+        "page_id": "page:adapter-production-path",
+        "vm_id": "vm:adapter-production-path",
+        "principal_id": "person:local:test",
+        "egress": {
+            "schema": "elastos.browser.vz-transport-stream/v1",
+            "stream_id": "stream:proof:test",
+            "target": "tls://glidefinance.io:443",
+            "runtime_socket_path": "/tmp/elastos-runtime-stream.sock",
+            "vsock_port": 19091
+        },
+        "media": {
+            "schema": "elastos.browser.vz-transport-stream/v1",
+            "stream_id": "stream:adapter-production-media",
+            "target": "tcp://127.0.0.1:49160",
+            "runtime_socket_path": "/tmp/elastos-runtime-media.sock",
+            "vsock_port": 19094
+        },
+        "turn": {
+            "schema": "elastos.browser.vz-turn-authority/v1",
+            "guest_url": "turn:127.0.0.1:3478?transport=tcp",
+            "guest_host": "127.0.0.1",
+            "guest_port": 3478,
+            "listen_host": "127.0.0.1",
+            "listen_port": 49160,
+            "advertised_host": "127.0.0.1",
+            "relay_host": "127.0.0.1",
+            "relay_port_min": 55000,
+            "relay_port_max": 55003,
+            "protocols": ["turn", "tcp"],
+            "username": username,
+            "credential_hash": test_sha256_label(credential.as_bytes()),
+            "auth_secret_hash": test_sha256_label(auth_secret.as_bytes())
+        },
+        "bootstrap_vsock_port": 19093,
+        "expires_at_unix_ms": expires_at_unix_ms
+    });
+    let canonical = serde_json::to_vec(&canonical_test_json(authority.clone())).unwrap();
+    authority["binding_hash"] = json!(test_sha256_label(&canonical));
+    let secret = json!({
+        "schema": "elastos.browser.vz-transport-secret/v1",
+        "binding_hash": authority["binding_hash"],
+        "credential": credential,
+        "auth_secret": auth_secret
+    });
+    validate_vz_transport_launch(
+        &authority,
+        &secret,
+        generation,
+        "stream:proof:test",
+        "page:adapter-production-path",
+        "vm:adapter-production-path",
+        Some("person:local:test"),
+    )
+    .unwrap();
+    VzTransportLaunchContext {
+        page_id: "page:adapter-production-path".to_string(),
+        vm_id: "vm:adapter-production-path".to_string(),
+        authority,
+        secret,
     }
 }
 
@@ -378,6 +476,272 @@ fn protocol_v2_rejects_old_launch_before_dispatching_any_effect() {
 
     assert!(error.to_string().contains("lifecycle_generation"));
     assert!(provider.page_control_sessions.is_empty());
+}
+
+#[test]
+fn full_width_generation_dispatches_exact_vz_authority_over_private_stdin() {
+    let generation = format!("sha256:{}", "6".repeat(64));
+    let transport = test_vz_transport_launch(&generation);
+    let adapter: AdapterConfig = serde_json::from_value(json!({
+        "id": "browser-vm-product",
+        "kind": "chromium_microvm",
+        "display_modes": ["webrtc_remote_display"],
+        "supervisor": {
+            "program": "/bin/sh",
+            "args": [
+                "-c",
+                "test -z \"${ELASTOS_BROWSER_ENGINE_REQUEST:-}\" || exit 70; request=$(cat); printf '%s' \"$request\" | grep -Fq \"\\\"lifecycle_generation\\\":\\\"$EXPECTED_GENERATION\\\"\" || exit 71; printf '%s' \"$request\" | grep -Fq \"\\\"binding_hash\\\":\\\"$EXPECTED_BINDING\\\"\" || exit 72; printf '%s' \"$request\" | grep -Fq transport_secret || exit 73; printf '%s\\n' '{\"schema\":\"elastos.browser.engine.launch-error/v1\",\"code\":\"dispatch_probe_complete\",\"message\":\"exact VZ request reached the supervisor over private stdin\"}' >&2; exit 42"
+            ],
+            "timeout_ms": 2000,
+            "env": {
+                "EXPECTED_GENERATION": generation,
+                "EXPECTED_BINDING": transport.authority["binding_hash"]
+            }
+        }
+    }))
+    .unwrap();
+    let context = LaunchContext {
+        url: "https://glidefinance.io/",
+        stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: Some("browser-vm-product".to_string()),
+        principal_id: Some("person:local:test".to_string()),
+        reason: Some("actual reservation generation dispatch proof".to_string()),
+        wallet: json!({}),
+        viewport: None,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+    };
+
+    let error = match run_supervisor_launch(
+        adapter.supervisor.as_ref().unwrap(),
+        &adapter,
+        &context,
+        &generation,
+        Some(&transport),
+    ) {
+        Ok(_) => panic!("dispatch probe must stop before a launch effect"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "dispatch_probe_complete", "{}", error.message);
+    assert_eq!(
+        error.message,
+        "exact VZ request reached the supervisor over private stdin"
+    );
+}
+
+fn did_not_act_vz_settlement(transport: &VzTransportLaunchContext) -> Value {
+    json!({
+        "schema": "elastos.browser.vz-launch-settlement/v1",
+        "state": "did_not_act",
+        "message": "injected exact pre-effect VZ failure",
+        "binding_hash": transport.authority["binding_hash"],
+        "generation": transport.authority["generation"],
+        "page_id": transport.authority["page_id"],
+        "vm_id": transport.authority["vm_id"],
+        "stream_id": transport.authority["egress"]["stream_id"],
+        "media_stream_id": transport.authority["media"]["stream_id"],
+        "effects": {
+            "session_directory": false,
+            "control_socket": false,
+            "ordinary_stream_bridge": false,
+            "media_stream_bridge": false,
+            "turn_process": false,
+            "supervisor_child": false,
+            "vm": false,
+        },
+        "absence": {
+            "child_absent": true,
+            "supervisor_child_absent": true,
+            "control_socket_absent": true,
+            "route_absent": true,
+            "turn_listener_absent": true,
+            "turn_relay_ports_absent": true,
+            "ordinary_stream_bridge_absent": true,
+            "media_stream_bridge_absent": true,
+            "session_directory_absent": true,
+            "vm_absent": true,
+        },
+    })
+}
+
+fn terminal_vz_settlement(transport: &VzTransportLaunchContext) -> Value {
+    let mut settlement = did_not_act_vz_settlement(transport);
+    settlement["state"] = json!("terminal_post_effect_cleanup");
+    settlement["message"] = json!("injected exact post-effect VZ cleanup");
+    for effect in [
+        "session_directory",
+        "control_socket",
+        "ordinary_stream_bridge",
+        "media_stream_bridge",
+        "turn_process",
+        "vm",
+    ] {
+        settlement["effects"][effect] = json!(true);
+    }
+    settlement
+}
+
+fn reconcile_terminal_vz_settlement(mutate: impl FnOnce(&mut Value)) -> Value {
+    let generation = format!("sha256:{}", "d".repeat(64));
+    let stream_id = "stream:proof:test";
+    let transport = test_vz_transport_launch(&generation);
+    let authority = transport.authority.clone();
+    let request_authority = transport.authority.clone();
+    let settlement = terminal_vz_settlement(&transport);
+    let mut reconciliation = json!({
+        "schema": "elastos.browser.vm-control-service.launch-reconciliation/v1",
+        "state": "terminal_post_effect_cleanup",
+        "launch": {
+            "adapter": "browser-vm-product",
+            "engine": "chromium_microvm",
+            "lifecycle_generation": generation,
+            "stream_id": stream_id,
+            "principal_id": "person:local:test",
+            "display_mode": "webrtc_remote_display",
+            "guarantee_level": "mechanism_microvm",
+            "page_id": authority["page_id"],
+            "vm_id": authority["vm_id"],
+            "transport_authority": authority,
+        },
+        "transport_authority": transport.authority,
+        "effects": {
+            "page_acquired": false,
+            "vm_acquired": true,
+        },
+        "launch_settlement_result": settlement,
+    });
+    let control_socket = spawn_status_socket_with_path(|path| {
+        reconciliation["control_service"] = test_control_service_identity(path);
+        mutate(&mut reconciliation);
+        reconciliation
+    });
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(json!({
+        "adapters": [{
+            "id": "browser-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/false",
+                "timeout_ms": 2000,
+                "control_socket_path": control_socket
+            }
+        }]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+    serde_json::to_value(provider.reconcile_launch(
+        Some("person:local:test".to_string()),
+        &generation,
+        stream_id,
+        Some("browser-vm-product"),
+        Some(&request_authority),
+    ))
+    .unwrap()
+}
+
+#[test]
+fn exact_vz_did_not_act_settlement_survives_supervisor_failure() {
+    let generation = format!("sha256:{}", "7".repeat(64));
+    let transport = test_vz_transport_launch(&generation);
+    let settlement = did_not_act_vz_settlement(&transport);
+    let launch_error = json!({
+        "schema": "elastos.browser.engine.launch-error/v1",
+        "code": "engine_process_unavailable",
+        "message": "injected exact pre-effect VZ failure",
+        "launch_settlement_result": settlement,
+    });
+    let adapter: AdapterConfig = serde_json::from_value(json!({
+        "id": "browser-vm-product",
+        "kind": "chromium_microvm",
+        "display_modes": ["webrtc_remote_display"],
+        "supervisor": {
+            "program": "/bin/sh",
+            "args": ["-c", "printf '%s\\n' \"$LAUNCH_ERROR\" >&2; exit 42"],
+            "timeout_ms": 2000,
+            "env": {
+                "LAUNCH_ERROR": launch_error.to_string(),
+            }
+        }
+    }))
+    .unwrap();
+    let context = LaunchContext {
+        url: "https://glidefinance.io/",
+        stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: Some("browser-vm-product".to_string()),
+        principal_id: Some("person:local:test".to_string()),
+        reason: Some("exact VZ settlement propagation".to_string()),
+        wallet: json!({}),
+        viewport: None,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+    };
+
+    let error = run_supervisor_launch(
+        adapter.supervisor.as_ref().unwrap(),
+        &adapter,
+        &context,
+        &generation,
+        Some(&transport),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.launch_settlement_result.as_ref(),
+        launch_error.get("launch_settlement_result")
+    );
+}
+
+#[test]
+fn mismatched_vz_settlement_is_not_preserved() {
+    let generation = format!("sha256:{}", "8".repeat(64));
+    let transport = test_vz_transport_launch(&generation);
+    let mut settlement = did_not_act_vz_settlement(&transport);
+    settlement["generation"] = json!(format!("sha256:{}", "9".repeat(64)));
+    let launch_error = json!({
+        "schema": "elastos.browser.engine.launch-error/v1",
+        "code": "engine_process_unavailable",
+        "message": "injected mismatched VZ failure",
+        "launch_settlement_result": settlement,
+    });
+    let adapter: AdapterConfig = serde_json::from_value(json!({
+        "id": "browser-vm-product",
+        "kind": "chromium_microvm",
+        "display_modes": ["webrtc_remote_display"],
+        "supervisor": {
+            "program": "/bin/sh",
+            "args": ["-c", "printf '%s\\n' \"$LAUNCH_ERROR\" >&2; exit 42"],
+            "timeout_ms": 2000,
+            "env": {
+                "LAUNCH_ERROR": launch_error.to_string(),
+            }
+        }
+    }))
+    .unwrap();
+    let context = LaunchContext {
+        url: "https://glidefinance.io/",
+        stream_session: &stream_receipt("adapter_ipc"),
+        profile: test_browser_profile(),
+        adapter_id: Some("browser-vm-product".to_string()),
+        principal_id: Some("person:local:test".to_string()),
+        reason: Some("reject mismatched VZ settlement".to_string()),
+        wallet: json!({}),
+        viewport: None,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+    };
+
+    let error = run_supervisor_launch(
+        adapter.supervisor.as_ref().unwrap(),
+        &adapter,
+        &context,
+        &generation,
+        Some(&transport),
+    )
+    .unwrap_err();
+
+    assert!(error.launch_settlement_result.is_none());
 }
 
 #[test]
@@ -1770,14 +2134,14 @@ fn launch_reconciliation_did_not_act_uses_only_the_selected_control_service() {
 
 #[test]
 fn launch_reconciliation_accepts_exact_selected_did_not_act_proof() {
-    let generation = "sha256:did-not-act-proof";
+    let generation = format!("sha256:{}", "d".repeat(64));
     let stream_id = "stream:did-not-act-proof";
     let control_socket = spawn_status_socket_with_path(|_| {
         json!({
             "schema": "elastos.browser.vm-control-service.launch-reconciliation/v1",
             "state": "did_not_act",
             "launch": {
-                "lifecycle_generation": generation,
+                "lifecycle_generation": &generation,
                 "stream_id": stream_id
             },
             "effects": {
@@ -1803,7 +2167,7 @@ fn launch_reconciliation_accepts_exact_selected_did_not_act_proof() {
 
     let response = serde_json::to_value(provider.reconcile_launch(
         None,
-        generation,
+        &generation,
         stream_id,
         Some("browser-vm-product"),
         None,
@@ -1959,6 +2323,82 @@ fn launch_reconciliation_accepts_restart_persistent_terminal_cleanup_proof() {
     assert_eq!(response["data"]["state"], "terminal_post_effect_cleanup");
     assert_eq!(response["data"]["effects"]["page_acquired"], true);
     assert_eq!(response["data"]["effects"]["vm_acquired"], true);
+}
+
+#[test]
+fn launch_reconciliation_adopts_exact_terminal_vz_settlement_without_page_binding() {
+    let response = reconcile_terminal_vz_settlement(|value| {
+        value["control_service"]["config_fingerprint"] = json!("b".repeat(64));
+    });
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["state"], "terminal_post_effect_cleanup");
+    assert_eq!(response["data"]["effects"]["page_acquired"], false);
+    assert_eq!(response["data"]["effects"]["vm_acquired"], true);
+    assert_eq!(
+        response["data"]["terminal_cleanup_receipt"]["schema"],
+        "elastos.browser.vz-launch-settlement/v1"
+    );
+}
+
+#[test]
+fn launch_reconciliation_rejects_malformed_terminal_vz_settlements() {
+    let substitutions = [
+        (
+            "/launch_settlement_result/generation",
+            json!(format!("sha256:{}", "e".repeat(64))),
+        ),
+        (
+            "/launch_settlement_result/page_id",
+            json!("page:vz-substituted"),
+        ),
+        (
+            "/launch_settlement_result/vm_id",
+            json!("vm:vz-substituted"),
+        ),
+        (
+            "/launch_settlement_result/stream_id",
+            json!("stream:vz-substituted"),
+        ),
+        (
+            "/launch_settlement_result/media_stream_id",
+            json!("stream:vz-media-substituted"),
+        ),
+        (
+            "/launch_settlement_result/binding_hash",
+            json!(format!("sha256:{}", "f".repeat(64))),
+        ),
+        ("/launch_settlement_result/state", json!("cleanup_pending")),
+        ("/launch_settlement_result/absence/vm_absent", json!(false)),
+        ("/launch/adapter", json!("browser-vm-substituted")),
+        (
+            "/control_service/service_id",
+            json!(format!("service:{}", "e".repeat(64))),
+        ),
+        (
+            "/control_service/control_socket_path",
+            json!("/tmp/substituted-control.sock"),
+        ),
+        (
+            "/control_service/config_fingerprint",
+            json!("not-a-sha256-fingerprint"),
+        ),
+    ];
+    for (path, replacement) in substitutions {
+        let response = reconcile_terminal_vz_settlement(|value| {
+            *value.pointer_mut(path).expect("test substitution path") = replacement;
+        });
+        assert_eq!(response["status"], "ok", "{path}: {response}");
+        assert_eq!(
+            response["data"]["state"], "cleanup_pending",
+            "{path}: {response}"
+        );
+    }
+
+    let extra_field = reconcile_terminal_vz_settlement(|value| {
+        value["launch_settlement_result"]["credential"] = json!("must-not-escape");
+    });
+    assert_eq!(extra_field["data"]["state"], "cleanup_pending");
 }
 
 #[test]

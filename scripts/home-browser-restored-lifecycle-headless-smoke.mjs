@@ -10,7 +10,8 @@ const browserContextId = "browser:00112233445566778899aabbccddeeff";
 const browserInstanceId = "browser:11223344-5566-7788-99aa-bbccddeeff00";
 const homeAuthorityToken = "fixture-home-authority-token";
 const homeGuiToken = "fixture-home-gui-launch-token";
-const browserToken = "fixture-browser-launch-token";
+const browserOwnerToken = "fixture-browser-owner-launch-token";
+const browserRefreshedToken = "fixture-browser-refreshed-launch-token";
 const openId = "browser-open-fixture-0001";
 const pageId = "browser-page-fixture-0001";
 const principalId = "did:elastos:fixture-home-refresh";
@@ -22,6 +23,8 @@ const state = {
   homeGuiLaunches: { placeholder: 0, restored: 0 },
   browserLaunches: { placeholder: 0, restored: 0 },
   browserOpenRequests: 0,
+  browserSummaryBindings: 0,
+  browserOpenBindings: 0,
   browserOpenEffects: 0,
   browserOpenIntent: null,
   browserOpenCompleted: false,
@@ -281,7 +284,11 @@ function launchRoute(origin, target, query) {
   if (target === "browser" && state.phase === "restored") {
     params.set("fixture_duplicate_open", "1");
   }
-  const token = target === "home-gui" ? homeGuiToken : browserToken;
+  const token = target === "home-gui"
+    ? homeGuiToken
+    : state.phase === "restored"
+      ? browserRefreshedToken
+      : browserOwnerToken;
   return `/apps/${target}/?${params.toString()}#home_token=${encodeURIComponent(token)}`;
 }
 
@@ -382,17 +389,29 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === "/api/apps/browser/summary" && req.method === "GET") {
-    if (!requireToken(req, browserToken, res)) {
+    if (!requireToken(req, browserRefreshedToken, res)) {
       return true;
     }
+    assert(
+      url.searchParams.get("browser_instance") === browserInstanceId,
+      "refreshed Browser summary omitted its exact stable instance binding",
+      { actual: url.searchParams.get("browser_instance"), expected: browserInstanceId },
+    );
+    state.browserSummaryBindings += 1;
     json(res, 200, browserSummary());
     return true;
   }
   if (url.pathname === "/api/apps/browser/open" && req.method === "POST") {
-    if (!requireToken(req, browserToken, res)) {
+    if (!requireToken(req, browserRefreshedToken, res)) {
       return true;
     }
     const intent = await readBody(req);
+    assert(
+      intent?.browser_instance === browserInstanceId,
+      "refreshed Browser open omitted its exact stable instance binding",
+      { actual: intent?.browser_instance, expected: browserInstanceId },
+    );
+    state.browserOpenBindings += 1;
     state.browserOpenRequests += 1;
     if (state.browserOpenIntent === null) {
       state.browserOpenIntent = intent;
@@ -409,7 +428,7 @@ async function handleApi(req, res, url) {
     return true;
   }
   if (url.pathname === `/api/apps/browser/open/${openId}` && req.method === "GET") {
-    if (!requireToken(req, browserToken, res)) {
+    if (!requireToken(req, browserRefreshedToken, res)) {
       return true;
     }
     state.browserStatusPolls += 1;
@@ -425,7 +444,7 @@ async function handleApi(req, res, url) {
     url.pathname === `/api/apps/browser/pages/${pageId}/webrtc` &&
     req.method === "POST"
   ) {
-    if (!requireToken(req, browserToken, res)) {
+    if (!requireToken(req, browserRefreshedToken, res)) {
       return true;
     }
     const signal = await readBody(req);
@@ -461,7 +480,7 @@ async function handleApi(req, res, url) {
     url.pathname === `/api/apps/browser/pages/${pageId}/status` &&
     req.method === "GET"
   ) {
-    if (!requireToken(req, browserToken, res)) {
+    if (!requireToken(req, browserRefreshedToken, res)) {
       return true;
     }
     json(res, 200, {
@@ -480,7 +499,7 @@ async function handleApi(req, res, url) {
       url.pathname === `/api/apps/browser/pages/${pageId}/input`) &&
     req.method === "POST"
   ) {
-    if (!requireToken(req, browserToken, res)) {
+    if (!requireToken(req, browserRefreshedToken, res)) {
       return true;
     }
     json(res, 200, {
@@ -494,7 +513,7 @@ async function handleApi(req, res, url) {
     url.pathname === `/api/apps/browser/pages/${pageId}/close` &&
     req.method === "POST"
   ) {
-    if (!requireToken(req, browserToken, res)) {
+    if (!requireToken(req, browserRefreshedToken, res)) {
       return true;
     }
     const closeRequest = await readBody(req);
@@ -800,6 +819,8 @@ try {
   assert(state.browserLaunches.placeholder === 1, "first Home replaced the Browser window", state);
   assert(state.browserLaunches.restored === 1, "refresh replaced the Browser window", state);
   assert(state.browserOpenRequests === 2, "completed-open race did not issue two matching requests", state);
+  assert(state.browserSummaryBindings > 0, "refreshed Browser summary was not instance-bound", state);
+  assert(state.browserOpenBindings === 2, "refreshed Browser opens were not instance-bound", state);
   assert(state.browserOpenEffects === 1, "matching completed-open race duplicated provider work", state);
   assert(state.browserCleanupEffects === 1, "opaque Home reload did not reap exactly one recovered page", state);
   assert(state.browserPageCount === 1, "restored Browser owns the wrong active page count", state);
