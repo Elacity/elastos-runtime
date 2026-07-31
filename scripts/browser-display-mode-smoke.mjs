@@ -386,7 +386,15 @@ assert(
     ) &&
     browserSource.includes('const iceTransportPolicy =') &&
     browserSource.includes('displaySession.media_transport === "runtime_relay" && !engineRelayOnly') &&
-    browserSource.includes('displaySession.ice_connection_policy === "engine_relay_only"') &&
+    browserSource.includes('displaySession.ice_connection_policy === "runtime_launch_relay_only"') &&
+    browserSource.includes("validateRuntimeLaunchTurn(") &&
+    browserSource.includes('"elastos.browser.media-diagnostic/v1"') &&
+    browserSource.includes('"viewer_ice_pair"') &&
+    browserSource.includes('"viewer_ontrack"') &&
+    browserSource.includes('"viewer_first_frame"') &&
+    browserSource.includes("selected_local_candidate_type") &&
+    browserSource.includes("video_packets_received") &&
+    browserSource.includes("runtimeLaunchRelayOnly ||") &&
     browserSource.includes("iceTransportPolicy,") &&
     browserSource.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
     browserSource.includes("await onRecoveryRequired(message, options)") &&

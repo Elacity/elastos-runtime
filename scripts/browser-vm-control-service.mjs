@@ -30,6 +30,15 @@ const VZ_TRANSPORT_SECRET_SCHEMA =
   "elastos.browser.vz-transport-secret/v1";
 const VZ_LAUNCH_SETTLEMENT_SCHEMA =
   "elastos.browser.vz-launch-settlement/v1";
+const VZ_MEDIA_DIAGNOSTIC_SCHEMA =
+  "elastos.browser.media-diagnostic/v1";
+const VZ_MEDIA_DIAGNOSTIC_EVENTS = new Set([
+  "turn_process_started",
+  "turn_listener_ready",
+  "turn_authentication_failed",
+  "turn_allocation_failed",
+  "turn_allocation_succeeded",
+]);
 const VZ_LAUNCH_EFFECT_KEYS = [
   "session_directory",
   "control_socket",
@@ -1025,6 +1034,65 @@ function logEvent(event, fields = {}) {
     ts: new Date().toISOString(),
     ...fields,
   })}\n`);
+}
+
+function parseVzMediaDiagnostic(line, launch) {
+  if (typeof line !== "string" || line.length === 0 || line.length > 8192) {
+    return null;
+  }
+  let diagnostic;
+  try {
+    diagnostic = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const authority = launch?.transport_authority;
+  if (
+    !exactObjectKeys(diagnostic, [
+      "schema",
+      "event",
+      "binding_hash",
+      "generation",
+      "page_id",
+      "vm_id",
+      "media_stream_id",
+      "ordinal",
+    ]) ||
+    diagnostic.schema !== VZ_MEDIA_DIAGNOSTIC_SCHEMA ||
+    !VZ_MEDIA_DIAGNOSTIC_EVENTS.has(diagnostic.event) ||
+    !sha256LabelIsSafe(diagnostic.binding_hash) ||
+    !sha256LabelIsSafe(diagnostic.generation) ||
+    !safeId(diagnostic.page_id) ||
+    !safeId(diagnostic.vm_id) ||
+    !safeId(diagnostic.media_stream_id) ||
+    !Number.isSafeInteger(diagnostic.ordinal) ||
+    diagnostic.ordinal < 0 ||
+    diagnostic.ordinal >= 64 ||
+    diagnostic.binding_hash !== authority?.binding_hash ||
+    diagnostic.generation !== launch?.lifecycle_generation ||
+    diagnostic.generation !== authority?.generation ||
+    diagnostic.page_id !== launch?.page_id ||
+    diagnostic.page_id !== authority?.page_id ||
+    diagnostic.vm_id !== launch?.vm_id ||
+    diagnostic.vm_id !== authority?.vm_id ||
+    diagnostic.media_stream_id !== authority?.media?.stream_id
+  ) {
+    return null;
+  }
+  return diagnostic;
+}
+
+function logVzMediaDiagnostic(diagnostic) {
+  logEvent("media_diagnostic", {
+    component: "turn",
+    diagnostic_event: diagnostic.event,
+    binding_hash: diagnostic.binding_hash,
+    generation: diagnostic.generation,
+    page_id: diagnostic.page_id,
+    vm_id: diagnostic.vm_id,
+    media_stream_id: diagnostic.media_stream_id,
+    ordinal: diagnostic.ordinal,
+  });
 }
 
 function readJsonBody(req, maxBytes = 1024 * 1024) {
@@ -2279,7 +2347,7 @@ function vmSupervisorResultFromGuest(result, launch, vmRecord) {
   return normalized;
 }
 
-function runPersistentProgram(program, args, env, stdin, timeoutMs, signal) {
+function runPersistentProgram(program, args, env, stdin, timeoutMs, signal, launch) {
   return new Promise((resolve, reject) => {
     let child;
     try {
@@ -2295,6 +2363,7 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal) {
     }
     let stdout = "";
     let stderr = "";
+    let diagnosticStderr = "";
     let phase = "running";
     let timer;
     const clearSettlementTriggers = () => {
@@ -2357,9 +2426,22 @@ function runPersistentProgram(program, args, env, stdin, timeoutMs, signal) {
       }
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      stderr += text;
       if (stderr.length > 64 * 1024) {
         stderr = stderr.slice(-64 * 1024);
+      }
+      diagnosticStderr += text;
+      const lines = diagnosticStderr.split(/\r?\n/);
+      diagnosticStderr = lines.pop() || "";
+      if (diagnosticStderr.length > 8192) {
+        diagnosticStderr = "";
+      }
+      for (const line of lines) {
+        const diagnostic = parseVzMediaDiagnostic(line, launch);
+        if (diagnostic) {
+          logVzMediaDiagnostic(diagnostic);
+        }
       }
     });
     child.on("error", (error) => {
@@ -2820,6 +2902,7 @@ async function openPage(
           `${serialized}\n`,
           timeoutMs,
           signal,
+          launch,
         )
       : await runProgram(
           config.launcher_program,

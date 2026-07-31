@@ -86,6 +86,23 @@ fs.writeFileSync(pidPath, `${process.pid}\n`, { mode: 0o600 });
 if (process.env.FAIL_TRANSPORT_LAUNCH === "1" && launch.transport_authority) {
   process.exit(23);
 }
+if (process.env.MEDIA_DIAGNOSTIC_SMOKE === "1" && launch.transport_authority) {
+  const diagnostic = {
+    schema: "elastos.browser.media-diagnostic/v1",
+    event: "turn_allocation_succeeded",
+    binding_hash: launch.transport_authority.binding_hash,
+    generation: launch.transport_authority.generation,
+    page_id: launch.transport_authority.page_id,
+    vm_id: launch.transport_authority.vm_id,
+    media_stream_id: launch.transport_authority.media.stream_id,
+    ordinal: 0,
+  };
+  process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
+  process.stderr.write(`${JSON.stringify({
+    ...diagnostic,
+    credential: "must-not-reach-control-service-log",
+  })}\n`);
+}
 
 const sendJson = (res, status, value) => {
   const bytes = Buffer.from(JSON.stringify(value));
@@ -256,6 +273,7 @@ start_service() {
   FAIL_TRANSPORT_LAUNCH="${FAIL_TRANSPORT_LAUNCH:-}" \
   TYPED_TRANSPORT_FAILURE="${TYPED_TRANSPORT_FAILURE:-}" \
   TYPED_TRANSPORT_SUBSTITUTE="${TYPED_TRANSPORT_SUBSTITUTE:-}" \
+  MEDIA_DIAGNOSTIC_SMOKE="${MEDIA_DIAGNOSTIC_SMOKE:-}" \
     "$node_bin" "$repo_root/scripts/browser-vm-control-service.mjs" \
       > "$tmp_dir/${label}.out" 2> "$tmp_dir/${label}.err" &
   service_pid=$!
@@ -1135,7 +1153,8 @@ unset TYPED_TRANSPORT_SUBSTITUTE
 
 transport_socket="$tmp_dir/transport-control.sock"
 transport_journal="${transport_socket}.launch-reconciliations.json"
-start_service "$transport_socket" "" "transport-service"
+MEDIA_DIAGNOSTIC_SMOKE=1 \
+  start_service "$transport_socket" "" "transport-service"
 CONTROL_SOCKET="$transport_socket" \
 STREAM_ID="stream:transport-settlement" \
 JOURNAL_PATH="$transport_journal" \
@@ -1143,5 +1162,11 @@ PHASE="transport-cleanup" \
 TRANSPORT=1 \
   "$node_bin" "$client"
 stop_service
+grep -q '"event":"media_diagnostic".*"diagnostic_event":"turn_allocation_succeeded"' \
+  "$tmp_dir/transport-service.err"
+if grep -q 'must-not-reach-control-service-log' "$tmp_dir/transport-service.err"; then
+  echo "invalid Browser media diagnostic leaked child stderr into the control log" >&2
+  exit 1
+fi
 
 printf '%s\n' '{"schema":"elastos.browser.vm-control-service-settlement-smoke/v1","ok":true}'

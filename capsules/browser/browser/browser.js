@@ -26,8 +26,8 @@ import {
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260725a";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260728a";
+} from "./browser-status.js?v=browser-20260730b";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260730b";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -38,7 +38,6 @@ const PAGE_STATUS_AFTER_INPUT_FOLLOWUP_DELAYS_MS = [650, 1800, 3500, 6500];
 const PAGE_HEARTBEAT_INTERVAL_MS = 60_000;
 const BROWSER_OPEN_POLL_INTERVAL_MS = 1_200;
 const BROWSER_OPEN_POLL_TIMEOUT_MS = 5 * 60_000;
-const REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS = 1;
 const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024;
 const PRODUCT_DISPLAY_MODE = "webrtc_remote_display";
 const PRODUCT_DISPLAY_ASPECT_WIDTH = 16;
@@ -102,9 +101,6 @@ let lastPageStatus = null;
 let unloadCleanupStarted = false;
 let remoteDisplay = null;
 let relaunchRequested = false;
-let remoteReconnectTimer = 0;
-let remoteReconnectInFlight = false;
-let remoteReconnectAttempt = 0;
 let lastRequestedUrl = DEFAULT_URL;
 let lastLibraryFilePickerRequestId = "";
 let browserSummary = null;
@@ -307,18 +303,10 @@ const runtimePageCleanup = createRuntimePageCleanupController({
   onTerminal: (owner, _outcome, failure) => {
     const applied = finalizeRuntimePageClose(owner);
     if (applied && failure && !unloadCleanupStarted) {
-      if (
-        failure.retry &&
-        remoteReconnectAttempt < REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS
-      ) {
-        remoteReconnectAttempt += 1;
-        scheduleRemoteReplacementAfterTerminal();
-      } else {
-        showStatus(
-          "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
-          { sticky: true },
-        );
-      }
+      showStatus(
+        "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
+        { sticky: true },
+      );
       return;
     }
     if (
@@ -374,9 +362,7 @@ function runtimeOwnedFailureSummary(kind) {
   return "Browser display signaling failed.";
 }
 
-async function failRuntimeOwnedPage(kind, message, options) {
-  options = options || {};
-  const retry = options.retry !== false;
+async function failRuntimeOwnedPage(kind, message) {
   const owner = currentRuntimePageOwner();
   if (!owner) {
     return {
@@ -386,7 +372,6 @@ async function failRuntimeOwnedPage(kind, message, options) {
       terminal_kind: "no_page",
     };
   }
-  stopRemoteReconnect();
   stopPageStatusPolling();
   stopPageHeartbeat();
   closeRemoteDisplay();
@@ -397,7 +382,7 @@ async function failRuntimeOwnedPage(kind, message, options) {
   return runtimePageCleanup.fail(owner, {
     kind,
     message,
-    retry,
+    retry: false,
   });
 }
 
@@ -416,13 +401,7 @@ function requireTerminalRuntimePageCloseOutcome(outcome) {
   return outcome;
 }
 
-function stopRemoteReconnect() {
-  window.clearTimeout(remoteReconnectTimer);
-  remoteReconnectTimer = 0;
-  remoteReconnectInFlight = false;
-}
-
-function remoteReconnectUrl() {
+function currentBrowserUrl() {
   return (
     currentPage?.actual_url ||
     currentPage?.url ||
@@ -432,77 +411,21 @@ function remoteReconnectUrl() {
   );
 }
 
-function scheduleRemoteReconnect(
+function settleRemoteDisplayFailure(
   message,
-  { failureKind = "signaling", retry = true } = {},
+  { failureKind = "signaling" } = {},
 ) {
   if (unloadCleanupStarted || relaunchRequested) {
     return Promise.resolve();
   }
-  return failRuntimeOwnedPage(failureKind, message, {
-    retry:
-      retry &&
-      remoteReconnectAttempt < REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS,
-  });
-}
-
-function scheduleRemoteReplacementAfterTerminal() {
-  if (remoteReconnectInFlight || remoteReconnectTimer) {
-    return;
-  }
-  const nextUrl = remoteReconnectUrl();
-  const delay = Math.min(
-    30_000,
-    1_000 * 2 ** Math.min(Math.max(remoteReconnectAttempt - 1, 0), 5),
-  );
-  showStatus(
-    `Runtime cleanup is terminal. Reconnecting ${nextUrl}${delay > 1000 ? ` in ${Math.round(delay / 1000)}s` : ""}.`,
-    { sticky: true },
-  );
-  remoteReconnectTimer = window.setTimeout(async () => {
-    remoteReconnectTimer = 0;
-    if (
-      unloadCleanupStarted ||
-      relaunchRequested ||
-      currentPage?.page_id ||
-      document.body.dataset.loading === "true"
-    ) {
-      return;
-    }
-    remoteReconnectInFlight = true;
-    try {
-      await requestRuntimeOpen(nextUrl, { history: "replace", reconnect: true });
-      if (relaunchRequested) {
-        return;
-      }
-      if (remoteDisplay.isTrackReady()) {
-        remoteReconnectAttempt = 0;
-        showStatus("Browser session reconnected.");
-      } else {
-        showStatus(
-          "Browser session reopened, but video is still waiting. One recovery attempt has been used.",
-          { sticky: true },
-        );
-      }
-    } catch (error) {
-      if (!isAuthoritySessionError(error)) {
-        remoteReconnectInFlight = false;
-        showStatus(
-          `${friendlyOpenError(error)} Browser display recovery stopped after one attempt.`,
-          { sticky: true },
-        );
-      }
-    } finally {
-      remoteReconnectInFlight = false;
-    }
-  }, delay);
+  return failRuntimeOwnedPage(failureKind, message);
 }
 
 function recoverMissingRuntimePage(error, message) {
   if (!isMissingRuntimePageError(error)) {
     return false;
   }
-  scheduleRemoteReconnect(message, { failureKind: "display_status" });
+  settleRemoteDisplayFailure(message, { failureKind: "display_status" });
   return true;
 }
 
@@ -1000,7 +923,7 @@ remoteDisplay = createBrowserRemoteDisplay({
   getLastPageStatus: () => lastPageStatus,
   handleRemoteInputChannelMessage,
   handleRemoteInputChannelTeardown: teardownRemoteClipboard,
-  onRecoveryRequired: scheduleRemoteReconnect,
+  onRecoveryRequired: settleRemoteDisplayFailure,
   remoteVideo,
   renderEmpty,
   renderPanel,
@@ -1023,8 +946,8 @@ function closeRemoteDisplay() {
   remoteDisplay?.close();
 }
 
-async function connectRemoteDisplay(displaySession) {
-  await remoteDisplay.connect(displaySession);
+async function connectRemoteDisplay(displaySession, enginePage = currentPage) {
+  await remoteDisplay.connect(displaySession, enginePage);
 }
 
 function unlockRemoteAudioFromGesture() {
@@ -1344,7 +1267,7 @@ async function waitForRuntimeOpen(response, { engineLabel, exitLabel }) {
   );
 }
 
-async function requestRuntimeOpen(value, { history = "push", reconnect = false } = {}) {
+async function requestRuntimeOpen(value, { history = "push" } = {}) {
   const nextUrl = normalizeUrl(value);
   const visibleAddress = visibleAddressForUrl(nextUrl);
   const browserEngineId = selectedBrowserEngineId;
@@ -1355,13 +1278,6 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
     Boolean(currentPage?.page_id) && remoteExitId !== currentRemoteExitId;
   const isEngineSwitch =
     Boolean(currentPage?.page_id) && browserEngineId !== currentBrowserEngineId;
-  if (!reconnect) {
-    stopRemoteReconnect();
-    remoteReconnectAttempt = 0;
-  } else {
-    window.clearTimeout(remoteReconnectTimer);
-    remoteReconnectTimer = 0;
-  }
   setLoading(true);
   showStatus(`Opening ${visibleAddress} using ${engineLabel} and ${exitLabel}...`, {
     sticky: true,
@@ -1385,11 +1301,11 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
     }
     const previousClose = await closeRuntimePage(previousPage, {
       generation: previousGeneration,
-      explicitRetry: !reconnect,
+      explicitRetry: true,
     });
     requireTerminalRuntimePageCloseOutcome(previousClose);
     const staleClose = await closeRuntimePage(stalePage, {
-      explicitRetry: !reconnect,
+      explicitRetry: true,
     });
     requireTerminalRuntimePageCloseOutcome(staleClose);
     const ownerAfterClose = currentRuntimePageOwner();
@@ -1479,7 +1395,7 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
         `Browser display mode ${currentDisplayMode || "none"} is not supported by this host.`,
       );
     }
-    await connectRemoteDisplay(page.display_session);
+    await connectRemoteDisplay(page.display_session, page);
     startPageStatusPolling();
     startPageHeartbeat();
     if (!remoteDisplay.isTrackReady()) {
@@ -1495,7 +1411,6 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
       const outcome = await failRuntimeOwnedPage(
         error.runtimeOwnedFailureKind || "signaling",
         friendlyOpenError(error),
-        { retry: !reconnect },
       );
       if (outcome?.state !== "terminal") {
         throw cleanupPendingError(outcome);
@@ -1516,7 +1431,7 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
 
 async function navigateAddress(value) {
   const nextUrl = normalizeUrl(value);
-  const currentUrl = remoteReconnectUrl();
+  const currentUrl = currentBrowserUrl();
   const crossStreamTarget = !sameBrowserStreamTarget(currentUrl, nextUrl);
   clearAddressDraft();
   if (!currentPage?.page_id) {
@@ -1588,7 +1503,7 @@ engineSelect?.addEventListener("change", () => {
   selectedBrowserEngineId = engineSelect.value || "";
   syncEngineSelect(browserSummary);
   if (currentPage?.page_id && selectedBrowserEngineId !== currentBrowserEngineId) {
-    const nextUrl = remoteReconnectUrl();
+    const nextUrl = currentBrowserUrl();
     requestRuntimeOpen(nextUrl, { history: "replace" }).catch((error) => {
       selectedBrowserEngineId = currentBrowserEngineId;
       syncEngineSelect(browserSummary);
@@ -1601,7 +1516,7 @@ exitSelect?.addEventListener("change", () => {
   selectedRemoteExitId = exitSelect.value || "";
   syncExitSelect(browserSummary);
   if (currentPage?.page_id && selectedRemoteExitId !== currentRemoteExitId) {
-    const nextUrl = remoteReconnectUrl();
+    const nextUrl = currentBrowserUrl();
     requestRuntimeOpen(nextUrl, { history: "replace" }).catch((error) => {
       selectedRemoteExitId = currentRemoteExitId;
       syncExitSelect(browserSummary);
@@ -1692,7 +1607,6 @@ async function resetBrowserProfile() {
       : null;
   setLoading(true);
   showStatus("Closing Browser page before profile reset...", { sticky: true });
-  stopRemoteReconnect();
   try {
     const activeClose = await closeRuntimePage(activePage, {
       explicitRetry: true,

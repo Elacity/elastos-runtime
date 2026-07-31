@@ -21,6 +21,9 @@ pub(in crate::api::gateway) const BROWSER_VZ_TRANSPORT_AUTHORITY_SCHEMA: &str =
     "elastos.browser.vz-transport-authority/v1";
 pub(in crate::api::gateway) const BROWSER_VZ_TRANSPORT_SECRET_SCHEMA: &str =
     "elastos.browser.vz-transport-secret/v1";
+pub(in crate::api::gateway) const BROWSER_VZ_VIEWER_TURN_CAPABILITY_SCHEMA: &str =
+    "elastos.browser.vz-viewer-turn-capability/v1";
+pub(in crate::api::gateway) const BROWSER_VZ_VIEWER_TURN_POLICY: &str = "runtime_launch_relay_only";
 
 const BROWSER_VZ_TRANSPORT_CONFIG_SCHEMA: &str = "elastos.browser.vz-transport-config/v1";
 const BROWSER_VZ_TRANSPORT_STREAM_SCHEMA: &str = "elastos.browser.vz-transport-stream/v1";
@@ -407,6 +410,192 @@ pub(in crate::api::gateway) fn validate_browser_vz_transport_secret(
         return Err("Browser VZ TURN REST credential is invalid".to_string());
     }
     Ok(())
+}
+
+pub(in crate::api::gateway) fn browser_vz_viewer_turn_capability(
+    authority: &serde_json::Value,
+    secret: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    validate_browser_vz_transport_secret(authority, secret)?;
+    let advertised_host = authority
+        .pointer("/turn/advertised_host")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Browser VZ TURN advertised host is missing".to_string())?;
+    let advertised_host = advertised_host
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .filter(std::net::IpAddr::is_ipv6)
+        .map_or_else(
+            || advertised_host.to_string(),
+            |address| format!("[{address}]"),
+        );
+    let listen_port = authority
+        .pointer("/turn/listen_port")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "Browser VZ TURN listen port is missing".to_string())?;
+    let turn_url = format!("turn:{advertised_host}:{listen_port}?transport=tcp");
+    let capability = serde_json::json!({
+        "schema": BROWSER_VZ_VIEWER_TURN_CAPABILITY_SCHEMA,
+        "binding_hash": authority["binding_hash"],
+        "generation": authority["generation"],
+        "page_id": authority["page_id"],
+        "vm_id": authority["vm_id"],
+        "egress_stream_id": authority["egress"]["stream_id"],
+        "media_stream_id": authority["media"]["stream_id"],
+        "expires_at_unix_ms": authority["expires_at_unix_ms"],
+        "credential_hash": authority["turn"]["credential_hash"],
+        "turn_url": turn_url,
+        "ice_server": {
+            "urls": [turn_url],
+            "username": authority["turn"]["username"],
+            "credential": secret["credential"],
+        },
+    });
+    validate_browser_vz_viewer_turn_capability(authority, &capability)?;
+    Ok(capability)
+}
+
+pub(in crate::api::gateway) fn validate_browser_vz_viewer_turn_capability(
+    authority: &serde_json::Value,
+    capability: &serde_json::Value,
+) -> Result<(), String> {
+    validate_live_browser_vz_transport_authority(authority)?;
+    let object = capability
+        .as_object()
+        .ok_or_else(|| "Browser VZ viewer TURN capability must be an object".to_string())?;
+    let keys = [
+        "schema",
+        "binding_hash",
+        "generation",
+        "page_id",
+        "vm_id",
+        "egress_stream_id",
+        "media_stream_id",
+        "expires_at_unix_ms",
+        "credential_hash",
+        "turn_url",
+        "ice_server",
+    ];
+    if object.len() != keys.len()
+        || keys.iter().any(|key| !object.contains_key(*key))
+        || capability.get("schema").and_then(serde_json::Value::as_str)
+            != Some(BROWSER_VZ_VIEWER_TURN_CAPABILITY_SCHEMA)
+        || capability.get("binding_hash") != authority.get("binding_hash")
+        || capability.get("generation") != authority.get("generation")
+        || capability.get("page_id") != authority.get("page_id")
+        || capability.get("vm_id") != authority.get("vm_id")
+        || capability.get("egress_stream_id") != authority.pointer("/egress/stream_id")
+        || capability.get("media_stream_id") != authority.pointer("/media/stream_id")
+        || capability.get("expires_at_unix_ms") != authority.get("expires_at_unix_ms")
+        || capability.get("credential_hash") != authority.pointer("/turn/credential_hash")
+    {
+        return Err("Browser VZ viewer TURN capability binding is invalid".to_string());
+    }
+    let turn_url = capability
+        .get("turn_url")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512)
+        .ok_or_else(|| "Browser VZ viewer TURN URL is invalid".to_string())?;
+    let ice_server = capability
+        .get("ice_server")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "Browser VZ viewer TURN ICE server is invalid".to_string())?;
+    if ice_server.len() != 3
+        || !["urls", "username", "credential"]
+            .iter()
+            .all(|key| ice_server.contains_key(*key))
+        || ice_server.get("urls") != Some(&serde_json::json!([turn_url]))
+        || ice_server.get("username") != authority.pointer("/turn/username")
+    {
+        return Err("Browser VZ viewer TURN ICE server binding is invalid".to_string());
+    }
+    let credential = require_bounded_secret(
+        capability
+            .get("ice_server")
+            .ok_or_else(|| "Browser VZ viewer TURN ICE server is missing".to_string())?,
+        "credential",
+    )?;
+    if sha256_label(credential.as_bytes())
+        != authority
+            .pointer("/turn/credential_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    {
+        return Err("Browser VZ viewer TURN credential hash mismatch".to_string());
+    }
+    let advertised_host = authority
+        .pointer("/turn/advertised_host")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Browser VZ TURN advertised host is missing".to_string())?;
+    let advertised_host = advertised_host
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .filter(std::net::IpAddr::is_ipv6)
+        .map_or_else(
+            || advertised_host.to_string(),
+            |address| format!("[{address}]"),
+        );
+    let listen_port = authority
+        .pointer("/turn/listen_port")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "Browser VZ TURN listen port is missing".to_string())?;
+    if turn_url != format!("turn:{advertised_host}:{listen_port}?transport=tcp") {
+        return Err("Browser VZ viewer TURN endpoint mismatch".to_string());
+    }
+    Ok(())
+}
+
+pub(in crate::api::gateway) fn project_browser_vz_viewer_turn(
+    engine_page: &serde_json::Value,
+    authority: &serde_json::Value,
+    capability: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    validate_browser_vz_viewer_turn_capability(authority, capability)?;
+    let proof = engine_page
+        .get("transport_proof")
+        .ok_or_else(|| "Browser VZ viewer projection requires a transport proof".to_string())?;
+    if proof.get("schema").and_then(serde_json::Value::as_str)
+        != Some("elastos.browser.vz-transport-public-proof/v1")
+        || proof.get("binding_hash") != authority.get("binding_hash")
+        || proof.get("generation") != authority.get("generation")
+        || proof.get("page_id") != authority.get("page_id")
+        || proof.get("vm_id") != authority.get("vm_id")
+        || proof.get("expires_at_unix_ms") != authority.get("expires_at_unix_ms")
+        || proof.get("credential_hash") != authority.pointer("/turn/credential_hash")
+        || proof.pointer("/egress/stream_id") != authority.pointer("/egress/stream_id")
+        || proof.pointer("/media/stream_id") != authority.pointer("/media/stream_id")
+        || engine_page.get("page_id") != authority.get("page_id")
+        || engine_page.get("stream_id") != authority.pointer("/egress/stream_id")
+    {
+        return Err("Browser VZ viewer transport proof binding mismatch".to_string());
+    }
+    let mut projected = engine_page.clone();
+    let display = projected
+        .get_mut("display_session")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| "Browser VZ viewer display session is missing".to_string())?;
+    if display
+        .get("ice_connection_policy")
+        .and_then(serde_json::Value::as_str)
+        != Some("engine_relay_only")
+        || display.contains_key("ice_servers")
+        || display.contains_key("runtime_turn")
+    {
+        return Err("Browser VZ viewer display session policy is invalid".to_string());
+    }
+    let mut runtime_turn = capability.clone();
+    let ice_server = runtime_turn
+        .as_object_mut()
+        .expect("validated Browser VZ viewer capability")
+        .remove("ice_server")
+        .expect("validated Browser VZ viewer ICE server");
+    display.insert(
+        "ice_connection_policy".to_string(),
+        serde_json::Value::String(BROWSER_VZ_VIEWER_TURN_POLICY.to_string()),
+    );
+    display.insert("ice_servers".to_string(), serde_json::json!([ice_server]));
+    display.insert("runtime_turn".to_string(), runtime_turn);
+    Ok(projected)
 }
 
 pub(in crate::api::gateway) fn validate_browser_vz_transport_effect_receipt(
@@ -1017,6 +1206,31 @@ mod tests {
         })
     }
 
+    fn viewer_engine_page(authority: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "elastos.browser.engine.page/v1",
+            "provider": "browser-engine-adapter",
+            "protocol_version": "2.0",
+            "page_id": authority["page_id"],
+            "adapter": "browser-vm-product",
+            "engine": "chromium_microvm",
+            "stream_id": authority["egress"]["stream_id"],
+            "display_session": {
+                "schema": "elastos.browser.display-session/v1",
+                "session_id": "display:vz-viewer-proof",
+                "mode": "webrtc_remote_display",
+                "offerer": "engine",
+                "media_transport": "runtime_relay",
+                "ice_connection_policy": "engine_relay_only",
+            },
+            "transport_proof": browser_vz_public_transport_proof(
+                authority,
+                &effect_receipt(authority),
+            )
+            .unwrap(),
+        })
+    }
+
     #[tokio::test]
     async fn reserved_generation_prepares_vz_transport_authority() {
         let root = tempfile::tempdir().unwrap();
@@ -1211,6 +1425,166 @@ mod tests {
         let public = browser_vz_public_transport_proof(&launch.authority, &receipt).unwrap();
         assert!(public.get("credential").is_none());
         assert!(public.get("auth_secret").is_none());
+    }
+
+    #[test]
+    fn viewer_turn_capability_is_exact_ephemeral_and_relay_only() {
+        let root = tempfile::tempdir().unwrap();
+        write_config(root.path());
+        let launch = prepare_browser_vz_transport_launch(
+            root.path(),
+            BrowserVzTransportLaunchBinding {
+                generation:
+                    "sha256:abababababababababababababababababababababababababababababababab",
+                page_id: "page:vz-viewer",
+                vm_id: "browser-vm-viewer",
+                principal_id: "person:local:viewer",
+                egress_stream_id: "stream:viewer",
+                egress_target: "tls://example.com:443",
+                egress_runtime_socket_path: "/tmp/elastos-egress-viewer.sock",
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let capability =
+            browser_vz_viewer_turn_capability(&launch.authority, &launch.secret).unwrap();
+        let engine_page = viewer_engine_page(&launch.authority);
+        let projected =
+            project_browser_vz_viewer_turn(&engine_page, &launch.authority, &capability).unwrap();
+
+        assert_eq!(
+            projected["display_session"]["ice_connection_policy"],
+            BROWSER_VZ_VIEWER_TURN_POLICY
+        );
+        assert_eq!(
+            projected["display_session"]["runtime_turn"]["binding_hash"],
+            launch.authority["binding_hash"]
+        );
+        assert_eq!(
+            projected["display_session"]["runtime_turn"]["egress_stream_id"],
+            launch.authority["egress"]["stream_id"]
+        );
+        assert_eq!(
+            projected["display_session"]["runtime_turn"]["media_stream_id"],
+            launch.authority["media"]["stream_id"]
+        );
+        assert_eq!(
+            projected["display_session"]["ice_servers"][0]["credential"],
+            launch.secret["credential"]
+        );
+        assert_eq!(
+            projected["display_session"]["ice_servers"][0]["urls"],
+            serde_json::json!([capability["turn_url"]])
+        );
+        assert!(projected["display_session"]["runtime_turn"]
+            .get("credential")
+            .is_none());
+        assert!(projected["display_session"]["runtime_turn"]
+            .get("ice_server")
+            .is_none());
+
+        let credential = launch.secret["credential"].as_str().unwrap();
+        for durable in [
+            launch.authority.clone(),
+            engine_page,
+            effect_receipt(&launch.authority),
+            browser_vz_public_transport_proof(
+                &launch.authority,
+                &effect_receipt(&launch.authority),
+            )
+            .unwrap(),
+            serde_json::json!({
+                "schema": "elastos.browser.engine-cleanup-binding/v2",
+                "page_id": launch.authority["page_id"],
+                "generation": launch.authority["generation"],
+                "stream_id": launch.authority["egress"]["stream_id"],
+                "transport_authority": launch.authority,
+            }),
+        ] {
+            assert!(!serde_json::to_string(&durable)
+                .unwrap()
+                .contains(credential));
+        }
+    }
+
+    #[test]
+    fn viewer_turn_capability_rejects_substitution_and_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        write_config(root.path());
+        let launch = prepare_browser_vz_transport_launch(
+            root.path(),
+            BrowserVzTransportLaunchBinding {
+                generation:
+                    "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                page_id: "page:vz-viewer-substitution",
+                vm_id: "browser-vm-viewer-substitution",
+                principal_id: "person:local:viewer-substitution",
+                egress_stream_id: "stream:viewer-substitution",
+                egress_target: "tls://example.com:443",
+                egress_runtime_socket_path: "/tmp/elastos-egress-viewer-substitution.sock",
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let capability =
+            browser_vz_viewer_turn_capability(&launch.authority, &launch.secret).unwrap();
+
+        for (pointer, substituted) in [
+            ("/page_id", serde_json::json!("page:vz-foreign")),
+            ("/vm_id", serde_json::json!("browser-vm-foreign")),
+            ("/egress_stream_id", serde_json::json!("stream:foreign")),
+            (
+                "/binding_hash",
+                serde_json::json!(
+                    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                ),
+            ),
+        ] {
+            let mut value = capability.clone();
+            *value.pointer_mut(pointer).unwrap() = substituted;
+            assert!(validate_browser_vz_viewer_turn_capability(&launch.authority, &value).is_err());
+        }
+        let mut bad_credential = capability.clone();
+        bad_credential["ice_server"]["credential"] = serde_json::json!("substituted-credential");
+        assert!(
+            validate_browser_vz_viewer_turn_capability(&launch.authority, &bad_credential)
+                .unwrap_err()
+                .contains("credential hash")
+        );
+
+        let mut expired_authority = launch.authority.clone();
+        expired_authority["expires_at_unix_ms"] = serde_json::json!(1_000);
+        let suffix = expired_authority["turn"]["username"]
+            .as_str()
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .1
+            .to_string();
+        expired_authority["turn"]["username"] = serde_json::json!(format!("1:{suffix}"));
+        let auth_secret = launch.secret["auth_secret"].as_str().unwrap();
+        let expired_credential = turn_rest_credential(
+            auth_secret,
+            expired_authority["turn"]["username"].as_str().unwrap(),
+        )
+        .unwrap();
+        expired_authority["turn"]["credential_hash"] =
+            serde_json::json!(sha256_label(expired_credential.as_bytes()));
+        let mut unsigned = expired_authority.clone();
+        unsigned.as_object_mut().unwrap().remove("binding_hash");
+        expired_authority["binding_hash"] =
+            serde_json::json!(sha256_label(&canonical_json_bytes(&unsigned).unwrap()));
+        let expired_secret = serde_json::json!({
+            "schema": BROWSER_VZ_TRANSPORT_SECRET_SCHEMA,
+            "binding_hash": expired_authority["binding_hash"],
+            "credential": expired_credential,
+            "auth_secret": auth_secret,
+        });
+        assert!(
+            browser_vz_viewer_turn_capability(&expired_authority, &expired_secret)
+                .unwrap_err()
+                .contains("expired")
+        );
     }
 
     #[test]

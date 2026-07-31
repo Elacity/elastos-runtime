@@ -1282,6 +1282,66 @@ async fn test_browser_async_duplicate_open_coalesces_by_verified_launch_owner() 
 }
 
 #[tokio::test]
+async fn test_browser_async_open_rejects_second_owner_for_same_browser_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let first_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let second_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
+    let body = r#"{"url":"https://slow-open.invalid/","reason":"one Browser instance owner","browser_instance":"browser:0123456789abcdef0123456789abcdef","viewport":{"width":900,"height":520},"display_mode":"webrtc_remote_display","guarantee_level":"operator_rbi","async_open":true}"#;
+
+    let first = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", first_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let second = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/open")
+                .header("x-elastos-home-token", second_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(second_body.to_vec()).unwrap(),
+        "Browser instance already owns an active or in-flight open"
+    );
+
+    for _ in 0..20 {
+        let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+        let requested = auth_state
+            .audit
+            .iter()
+            .filter(|event| event.event_type == "browser.open.requested")
+            .count();
+        if requested == 1 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("exactly one Browser open reached Runtime dispatch");
+}
+
+#[tokio::test]
 async fn test_browser_open_job_and_page_routes_require_exact_verified_launch_owner() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
@@ -5338,6 +5398,7 @@ async fn test_browser_close_provider_unavailable_keeps_bounded_engine_cleanup_ob
                 "engine": "mock-engine",
             }),
             browser_page: serde_json::json!({"page_id": "page:provider-unavailable"}),
+            viewer_turn_capability: None,
             stream_cleanup: None,
         },
     )

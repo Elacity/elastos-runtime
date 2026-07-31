@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  collectWebrtcStats,
   friendlyOpenError,
   runtimeOpenOutcome,
 } from "./browser-status.js";
@@ -85,4 +86,74 @@ test("launcher wording alone cannot synthesize a cleanup outcome", () => {
     friendlyOpenError(error),
     "Browser is temporarily unavailable. Refresh Browser or choose another Browser Engine.",
   );
+});
+
+test("WebRTC diagnostics expose only selected pair types and inbound counters", async () => {
+  const report = new Map([
+    [
+      "video",
+      {
+        id: "video",
+        type: "inbound-rtp",
+        kind: "video",
+        bytesReceived: 4096,
+        packetsReceived: 32,
+        framesDecoded: 8,
+      },
+    ],
+    [
+      "audio",
+      {
+        id: "audio",
+        type: "inbound-rtp",
+        kind: "audio",
+        bytesReceived: 1024,
+        packetsReceived: 16,
+      },
+    ],
+    [
+      "local",
+      {
+        id: "local",
+        type: "local-candidate",
+        candidateType: "relay",
+        protocol: "tcp",
+        address: "must-not-be-projected",
+      },
+    ],
+    [
+      "remote",
+      {
+        id: "remote",
+        type: "remote-candidate",
+        candidateType: "relay",
+        protocol: "tcp",
+        address: "must-not-be-projected",
+      },
+    ],
+    [
+      "pair",
+      {
+        id: "pair",
+        type: "candidate-pair",
+        state: "succeeded",
+        nominated: true,
+        localCandidateId: "local",
+        remoteCandidateId: "remote",
+      },
+    ],
+  ]);
+
+  const stats = await collectWebrtcStats({
+    getStats: async () => report,
+  });
+
+  assert.equal(stats.video_bytes_received, 4096);
+  assert.equal(stats.video_packets_received, 32);
+  assert.equal(stats.audio_bytes_received, 1024);
+  assert.equal(stats.audio_packets_received, 16);
+  assert.equal(stats.selected_local_candidate_type, "relay");
+  assert.equal(stats.selected_remote_candidate_type, "relay");
+  assert.equal(stats.selected_protocol, "tcp");
+  assert.doesNotMatch(JSON.stringify(stats), /must-not-be-projected/);
 });

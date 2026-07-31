@@ -436,11 +436,16 @@ pub(super) async fn browser_app_open(
     let request_origin = browser_request_origin(&headers);
     if input.async_open {
         let owner_launch_id = authority.verified_context().launch_id();
+        let browser_instance = match browser_instance_id(input.browser_instance.clone()) {
+            Ok(value) => value,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        };
         let intent_hash = browser_open_intent_hash(&input);
         let reservation = match create_browser_open_job(
             &state.data_dir,
             &context.principal_id,
             owner_launch_id,
+            browser_instance.as_deref(),
             &intent_hash,
         )
         .await
@@ -1243,6 +1248,59 @@ async fn execute_browser_open(
             page.insert("transport_proof".to_string(), proof);
         }
     }
+    let viewer_turn_capability = if let Some(transport) = vz_transport_launch.as_ref() {
+        match browser_vz_viewer_turn_capability(&transport.authority, &transport.secret) {
+            Ok(capability) => Some(capability),
+            Err(message) => {
+                let outcome = reconcile_dispatched_browser_launch_failure(
+                    state,
+                    &launch_reservation,
+                    &context.principal_id,
+                    authority.verified_context().launch_id(),
+                    &engine_stream_id,
+                    stream_cleanup.clone(),
+                    &message,
+                )
+                .await;
+                return Err(BrowserOpenFailure::provider(
+                    "browser-engine",
+                    anyhow::anyhow!(message),
+                )
+                .with_outcome(outcome));
+            }
+        }
+    } else {
+        None
+    };
+    let viewer_browser_page = match (
+        vz_transport_launch.as_ref(),
+        viewer_turn_capability.as_ref(),
+    ) {
+        (Some(transport), Some(capability)) => {
+            match project_browser_vz_viewer_turn(&browser_page, &transport.authority, capability) {
+                Ok(page) => page,
+                Err(message) => {
+                    let outcome = reconcile_dispatched_browser_launch_failure(
+                        state,
+                        &launch_reservation,
+                        &context.principal_id,
+                        authority.verified_context().launch_id(),
+                        &engine_stream_id,
+                        stream_cleanup.clone(),
+                        &message,
+                    )
+                    .await;
+                    return Err(BrowserOpenFailure::provider(
+                        "browser-engine",
+                        anyhow::anyhow!(message),
+                    )
+                    .with_outcome(outcome));
+                }
+            }
+        }
+        (None, None) => browser_page.clone(),
+        _ => unreachable!("Browser VZ viewer capability is derived from the launch transport"),
+    };
     let runtime_cleanup = match complete_browser_launch(
         &state.data_dir,
         &launch_reservation,
@@ -1254,6 +1312,7 @@ async fn execute_browser_open(
             engine: engine.to_string(),
             provider_cleanup,
             browser_page: browser_page.clone(),
+            viewer_turn_capability,
             stream_cleanup: stream_cleanup.clone(),
         },
     )
@@ -1308,7 +1367,7 @@ async fn execute_browser_open(
         "target": target,
         "guarantee_level": guarantee_level.as_str(),
         "stream_session": browser_visible_stream_session(&stream_session),
-        "engine_page": browser_page,
+        "engine_page": viewer_browser_page,
         "runtime_cleanup": runtime_cleanup,
     }))
 }
@@ -1982,6 +2041,7 @@ async fn attempt_browser_launch_reconciliation(
                         "engine": engine,
                         "stream_id": stream_id,
                     }),
+                    viewer_turn_capability: None,
                     stream_cleanup,
                 }),
             ))
@@ -2306,6 +2366,12 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                     release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
                         .await;
                 } else {
+                    release_browser_open_job_instance_for_owner(
+                        &state.data_dir,
+                        &reconciliation.principal_id,
+                        &reconciliation.owner_launch_id,
+                    )
+                    .await;
                     settled = true;
                 }
             }
@@ -2368,6 +2434,12 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                             "Browser reconciled cleanup terminal release could not be committed"
                         );
                     } else {
+                        release_browser_open_job_instance_for_owner(
+                            &state.data_dir,
+                            &cleanup.principal_id,
+                            &cleanup.owner_launch_id,
+                        )
+                        .await;
                         settled = true;
                     }
                 } else {
@@ -2431,6 +2503,12 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
                         "Browser terminal cleanup could not commit durable owner release"
                     );
                 } else {
+                    release_browser_open_job_instance_for_owner(
+                        &state.data_dir,
+                        &cleanup.principal_id,
+                        &cleanup.owner_launch_id,
+                    )
+                    .await;
                     settled = true;
                 }
             }

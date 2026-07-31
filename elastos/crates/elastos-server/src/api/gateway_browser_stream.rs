@@ -8,7 +8,18 @@ use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt as _;
 #[cfg(unix)]
-use tokio::io::{copy, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+#[cfg(unix)]
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
+#[cfg(unix)]
+use std::task::{Context, Poll};
+#[cfg(unix)]
+use tokio::io::{
+    copy, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
+};
 #[cfg(unix)]
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 
@@ -18,6 +29,8 @@ const BROWSER_ADAPTER_IPC_TMP_DIR: &str = "elastos-browser-adapter-ipc";
 const BROWSER_RUNTIME_RELAY_OPEN_MAX_BYTES: usize = 16 * 1024;
 #[cfg(unix)]
 const BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 300;
+#[cfg(unix)]
+const BROWSER_MEDIA_DIAGNOSTIC_EVENT_LIMIT: u64 = 64;
 const EXIT_STREAM_SESSION_SCHEMA: &str = "elastos.exit.stream-session/v1";
 const EXIT_REMOTE_CARRIER_SESSION_SCHEMA: &str = "elastos.exit.remote-carrier-session/v1";
 
@@ -29,6 +42,185 @@ static BROWSER_VZ_FIXED_MEDIA_LISTENERS: OnceLock<
 static BROWSER_RUNTIME_STREAM_LISTENERS: OnceLock<
     tokio::sync::Mutex<BTreeMap<PathBuf, watch::Sender<bool>>>,
 > = OnceLock::new();
+
+#[cfg(unix)]
+struct BrowserMediaCountedStream<T> {
+    inner: T,
+    read_bytes: Arc<AtomicU64>,
+    written_bytes: Arc<AtomicU64>,
+}
+
+#[cfg(unix)]
+impl<T> BrowserMediaCountedStream<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            read_bytes: Arc::new(AtomicU64::new(0)),
+            written_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn byte_counts(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (
+            Arc::clone(&self.read_bytes),
+            Arc::clone(&self.written_bytes),
+        )
+    }
+}
+
+#[cfg(unix)]
+impl<T: AsyncRead + Unpin> AsyncRead for BrowserMediaCountedStream<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buffer.filled().len();
+        match Pin::new(&mut this.inner).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) => {
+                this.read_bytes.fetch_add(
+                    u64::try_from(buffer.filled().len().saturating_sub(before)).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<T: AsyncWrite + Unpin> AsyncWrite for BrowserMediaCountedStream<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) => {
+                this.written_bytes.fetch_add(
+                    u64::try_from(written).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
+#[cfg(unix)]
+struct BrowserMediaSessionDiagnostic {
+    generation: String,
+    page_id: String,
+    media_stream_id: String,
+    budget: Arc<BrowserMediaDiagnosticBudget>,
+    guest_to_turn: Arc<AtomicU64>,
+    turn_to_guest: Arc<AtomicU64>,
+    reported: bool,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserMediaDiagnosticDecision {
+    Emit,
+    SuppressionSummary,
+    Suppressed,
+}
+
+#[cfg(unix)]
+struct BrowserMediaDiagnosticBudget {
+    generation: String,
+    page_id: String,
+    media_stream_id: String,
+    events_seen: AtomicU64,
+    suppression_reported: AtomicBool,
+}
+
+#[cfg(unix)]
+impl BrowserMediaDiagnosticBudget {
+    fn new(generation: String, page_id: String, media_stream_id: String) -> Self {
+        Self {
+            generation,
+            page_id,
+            media_stream_id,
+            events_seen: AtomicU64::new(0),
+            suppression_reported: AtomicBool::new(false),
+        }
+    }
+
+    fn next(&self) -> BrowserMediaDiagnosticDecision {
+        let ordinal = self
+            .events_seen
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX);
+        if ordinal < BROWSER_MEDIA_DIAGNOSTIC_EVENT_LIMIT {
+            BrowserMediaDiagnosticDecision::Emit
+        } else if !self.suppression_reported.swap(true, Ordering::Relaxed) {
+            BrowserMediaDiagnosticDecision::SuppressionSummary
+        } else {
+            BrowserMediaDiagnosticDecision::Suppressed
+        }
+    }
+
+    fn event_allowed(&self) -> bool {
+        match self.next() {
+            BrowserMediaDiagnosticDecision::Emit => true,
+            BrowserMediaDiagnosticDecision::SuppressionSummary => {
+                tracing::warn!(
+                    generation = self.generation,
+                    page_id = self.page_id,
+                    media_stream_id = self.media_stream_id,
+                    media_event = "diagnostics_suppressed",
+                    diagnostic_event_limit = BROWSER_MEDIA_DIAGNOSTIC_EVENT_LIMIT,
+                    suppressed_events_at_least = 1_u64,
+                    "Browser VZ media diagnostic"
+                );
+                false
+            }
+            BrowserMediaDiagnosticDecision::Suppressed => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl BrowserMediaSessionDiagnostic {
+    fn mark_reported(&mut self) {
+        self.reported = true;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BrowserMediaSessionDiagnostic {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        if self.budget.event_allowed() {
+            tracing::warn!(
+                generation = self.generation,
+                page_id = self.page_id,
+                media_stream_id = self.media_stream_id,
+                media_event = "guest_relay_cancelled",
+                guest_to_turn_bytes = self.guest_to_turn.load(Ordering::Relaxed),
+                turn_to_guest_bytes = self.turn_to_guest.load(Ordering::Relaxed),
+                "Browser VZ media diagnostic"
+            );
+        }
+    }
+}
 
 pub(in crate::api::gateway) async fn gateway_browser_net_http(
     registry: &ProviderRegistry,
@@ -310,6 +502,21 @@ pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
         .port()
         .ok_or_else(|| anyhow::anyhow!("Browser VZ media target port is missing"))?;
     let target = std::net::SocketAddr::new(host, port);
+    let generation = authority
+        .get("generation")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Browser VZ media generation is missing"))?
+        .to_string();
+    let page_id = authority
+        .get("page_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Browser VZ media page binding is missing"))?
+        .to_string();
+    let media_stream_id = authority
+        .pointer("/media/stream_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Browser VZ media stream binding is missing"))?
+        .to_string();
     let expires_at = authority
         .get("expires_at_unix_ms")
         .and_then(serde_json::Value::as_u64)
@@ -349,6 +556,11 @@ pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
     listeners.insert(socket_path.clone(), cancel);
     drop(listeners);
     tokio::spawn(async move {
+        let media_diagnostics = Arc::new(BrowserMediaDiagnosticBudget::new(
+            generation.clone(),
+            page_id.clone(),
+            media_stream_id.clone(),
+        ));
         let mut sessions = tokio::task::JoinSet::new();
         let expiry = tokio::time::sleep(lifetime);
         tokio::pin!(expiry);
@@ -357,21 +569,103 @@ pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
                 _ = cancelled.changed() => break,
                 _ = &mut expiry => break,
                 accepted = listener.accept() => match accepted {
-                    Ok((mut guest, _)) => {
+                    Ok((guest, _)) => {
+                        let generation = generation.clone();
+                        let page_id = page_id.clone();
+                        let media_stream_id = media_stream_id.clone();
+                        let media_diagnostics = Arc::clone(&media_diagnostics);
+                        if media_diagnostics.event_allowed() {
+                            tracing::info!(
+                                generation,
+                                page_id,
+                                media_stream_id,
+                                media_event = "guest_relay_accepted",
+                                "Browser VZ media diagnostic"
+                            );
+                        }
                         sessions.spawn(async move {
-                            let mut turn = TcpStream::connect(target).await?;
-                            copy_bidirectional(&mut guest, &mut turn).await
+                            let mut guest = BrowserMediaCountedStream::new(guest);
+                            let (guest_to_turn, turn_to_guest) = guest.byte_counts();
+                            let mut diagnostic = BrowserMediaSessionDiagnostic {
+                                generation: generation.clone(),
+                                page_id: page_id.clone(),
+                                media_stream_id: media_stream_id.clone(),
+                                budget: Arc::clone(&media_diagnostics),
+                                guest_to_turn: Arc::clone(&guest_to_turn),
+                                turn_to_guest: Arc::clone(&turn_to_guest),
+                                reported: false,
+                            };
+                            let mut turn = match TcpStream::connect(target).await {
+                                Ok(turn) => {
+                                    if media_diagnostics.event_allowed() {
+                                        tracing::info!(
+                                            generation,
+                                            page_id,
+                                            media_stream_id,
+                                            media_event = "turn_connected",
+                                            "Browser VZ media diagnostic"
+                                        );
+                                    }
+                                    turn
+                                }
+                                Err(error) => {
+                                    if media_diagnostics.event_allowed() {
+                                        tracing::warn!(
+                                            generation,
+                                            page_id,
+                                            media_stream_id,
+                                            media_event = "turn_connect_failed",
+                                            error_kind = ?error.kind(),
+                                            "Browser VZ media diagnostic"
+                                        );
+                                    }
+                                    diagnostic.mark_reported();
+                                    return;
+                                }
+                            };
+                            let result = copy_bidirectional(&mut guest, &mut turn).await;
+                            let guest_to_turn_bytes = guest_to_turn.load(Ordering::Relaxed);
+                            let turn_to_guest_bytes = turn_to_guest.load(Ordering::Relaxed);
+                            if media_diagnostics.event_allowed() {
+                                match result {
+                                    Ok(_) => tracing::info!(
+                                        generation,
+                                        page_id,
+                                        media_stream_id,
+                                        media_event = "guest_relay_closed",
+                                        guest_to_turn_bytes,
+                                        turn_to_guest_bytes,
+                                        "Browser VZ media diagnostic"
+                                    ),
+                                    Err(error) => tracing::warn!(
+                                        generation,
+                                        page_id,
+                                        media_stream_id,
+                                        media_event = "guest_relay_failed",
+                                        guest_to_turn_bytes,
+                                        turn_to_guest_bytes,
+                                        error_kind = ?error.kind(),
+                                        "Browser VZ media diagnostic"
+                                    ),
+                                }
+                            }
+                            diagnostic.mark_reported();
                         });
                     }
                     Err(_) => break,
                 },
                 result = sessions.join_next(), if !sessions.is_empty() => {
-                    if let Some(Ok(Err(err))) = result {
-                        tracing::warn!(
-                            target = %target,
-                            error = %err,
-                            "Browser VZ fixed media forwarding failed"
-                        );
+                    if let Some(Err(error)) = result {
+                        if media_diagnostics.event_allowed() {
+                            tracing::warn!(
+                                generation,
+                                page_id,
+                                media_stream_id,
+                                media_event = "guest_relay_task_failed",
+                                error = %error,
+                                "Browser VZ media diagnostic"
+                            );
+                        }
                     }
                 }
             }
@@ -1633,6 +1927,60 @@ mod tests {
             browser_runtime_stream_line_kind(br#"{"schema":"elastos.exit.relay-open/v1"}"#),
             "json"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn media_counted_stream_retains_both_direction_totals() {
+        let (mut guest_client, guest_relay) = tokio::io::duplex(64);
+        let (turn_relay, mut turn_server) = tokio::io::duplex(64);
+        let mut guest_relay = BrowserMediaCountedStream::new(guest_relay);
+        let (guest_to_turn, turn_to_guest) = guest_relay.byte_counts();
+        let bridge = tokio::spawn(async move {
+            let mut turn_relay = turn_relay;
+            copy_bidirectional(&mut guest_relay, &mut turn_relay).await
+        });
+
+        guest_client.write_all(b"offer").await.unwrap();
+        guest_client.shutdown().await.unwrap();
+        let mut offer = [0_u8; 5];
+        turn_server.read_exact(&mut offer).await.unwrap();
+        assert_eq!(&offer, b"offer");
+
+        turn_server.write_all(b"answer").await.unwrap();
+        turn_server.shutdown().await.unwrap();
+        let mut answer = [0_u8; 6];
+        guest_client.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"answer");
+
+        bridge.await.unwrap().unwrap();
+        assert_eq!(guest_to_turn.load(Ordering::Relaxed), 5);
+        assert_eq!(turn_to_guest.load(Ordering::Relaxed), 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_diagnostic_budget_bounds_reconnect_churn() {
+        let budget = BrowserMediaDiagnosticBudget::new(
+            "sha256:generation".to_string(),
+            "page:test".to_string(),
+            "stream:media-test".to_string(),
+        );
+        let mut emitted = 0_u64;
+        let mut summaries = 0_u64;
+        let mut suppressed = 0_u64;
+
+        for _ in 0..(BROWSER_MEDIA_DIAGNOSTIC_EVENT_LIMIT * 20) {
+            match budget.next() {
+                BrowserMediaDiagnosticDecision::Emit => emitted += 1,
+                BrowserMediaDiagnosticDecision::SuppressionSummary => summaries += 1,
+                BrowserMediaDiagnosticDecision::Suppressed => suppressed += 1,
+            }
+        }
+
+        assert_eq!(emitted, BROWSER_MEDIA_DIAGNOSTIC_EVENT_LIMIT);
+        assert_eq!(summaries, 1);
+        assert_eq!(suppressed, BROWSER_MEDIA_DIAGNOSTIC_EVENT_LIMIT * 19 - 1);
     }
 
     #[cfg(unix)]

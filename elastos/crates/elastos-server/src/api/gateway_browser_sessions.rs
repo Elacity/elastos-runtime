@@ -108,6 +108,7 @@ pub(in crate::api::gateway) struct BrowserLaunchEffect {
     pub(in crate::api::gateway) engine: String,
     pub(in crate::api::gateway) provider_cleanup: serde_json::Value,
     pub(in crate::api::gateway) browser_page: serde_json::Value,
+    pub(in crate::api::gateway) viewer_turn_capability: Option<serde_json::Value>,
     pub(in crate::api::gateway) stream_cleanup: Option<BrowserStreamCleanup>,
 }
 
@@ -151,6 +152,7 @@ struct BrowserSessionRecord {
     engine: Option<String>,
     provider_cleanup: Option<serde_json::Value>,
     browser_page: Option<serde_json::Value>,
+    viewer_turn_capability: Option<serde_json::Value>,
     stream_cleanup: Option<BrowserStreamCleanup>,
     transport_authority: Option<serde_json::Value>,
     state: BrowserSessionState,
@@ -205,8 +207,11 @@ struct BrowserOpenJobRecord {
     scope: String,
     principal_id: String,
     owner_launch_id: String,
+    browser_instance: Option<String>,
     intent_hash: String,
     state: BrowserOpenJobState,
+    instance_release_proven: bool,
+    retains_browser_instance: bool,
     updated_at: Instant,
 }
 
@@ -215,6 +220,18 @@ enum BrowserOpenJobState {
     Pending,
     Completed(serde_json::Value),
     Failed(serde_json::Value),
+}
+
+impl BrowserOpenJobState {
+    fn coalesces_open(&self) -> bool {
+        matches!(self, Self::Pending | Self::Completed(_))
+            || matches!(
+                self,
+                Self::Failed(error)
+                    if error.pointer("/outcome/state").and_then(serde_json::Value::as_str)
+                        == Some("cleanup_pending")
+            )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -515,6 +532,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             engine: None,
             provider_cleanup: None,
             browser_page: None,
+            viewer_turn_capability: None,
             stream_cleanup: None,
             transport_authority: None,
             state: BrowserSessionState::Launching,
@@ -546,6 +564,7 @@ pub(in crate::api::gateway) async fn create_browser_open_job(
     data_dir: &Path,
     principal_id: &str,
     owner_launch_id: &str,
+    browser_instance: Option<&str>,
     intent_hash: &str,
 ) -> Result<BrowserOpenJobReservation, (StatusCode, String)> {
     if principal_id.trim().is_empty()
@@ -565,10 +584,7 @@ pub(in crate::api::gateway) async fn create_browser_open_job(
         job.scope == scope
             && job.principal_id == principal_id
             && job.owner_launch_id == owner_launch_id
-            && matches!(
-                &job.state,
-                BrowserOpenJobState::Pending | BrowserOpenJobState::Completed(_)
-            )
+            && job.state.coalesces_open()
     }) {
         if job.intent_hash != intent_hash {
             return Err((
@@ -586,6 +602,19 @@ pub(in crate::api::gateway) async fn create_browser_open_job(
             should_spawn: false,
         });
     }
+    if browser_instance.is_some_and(|browser_instance| {
+        registry.jobs.values().any(|job| {
+            job.scope == scope
+                && job.principal_id == principal_id
+                && job.browser_instance.as_deref() == Some(browser_instance)
+                && job.retains_browser_instance
+        })
+    }) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Browser instance already owns an active or in-flight open".to_string(),
+        ));
+    }
     let id = registry.next_job_id();
     let now = Instant::now();
     registry.jobs.insert(
@@ -594,8 +623,11 @@ pub(in crate::api::gateway) async fn create_browser_open_job(
             scope: scope.clone(),
             principal_id: principal_id.to_string(),
             owner_launch_id: owner_launch_id.to_string(),
+            browser_instance: browser_instance.map(str::to_string),
             intent_hash: intent_hash.to_string(),
             state: BrowserOpenJobState::Pending,
+            instance_release_proven: false,
+            retains_browser_instance: browser_instance.is_some(),
             updated_at: now,
         },
     );
@@ -662,6 +694,25 @@ pub(in crate::api::gateway) async fn forget_browser_open_job_for_owner(
     });
 }
 
+pub(in crate::api::gateway) async fn release_browser_open_job_instance_for_owner(
+    data_dir: &Path,
+    principal_id: &str,
+    owner_launch_id: &str,
+) {
+    let scope = browser_session_scope(data_dir);
+    let registry = BROWSER_OPEN_JOB_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    for job in registry.jobs.values_mut() {
+        if job.scope == scope
+            && job.principal_id == principal_id
+            && job.owner_launch_id == owner_launch_id
+        {
+            job.instance_release_proven = true;
+            job.retains_browser_instance = false;
+        }
+    }
+}
+
 async fn update_browser_open_job(handle: &BrowserOpenJobHandle, state: BrowserOpenJobState) {
     let registry = BROWSER_OPEN_JOB_REGISTRY.get_or_init(Default::default);
     let mut registry = registry.lock().await;
@@ -671,6 +722,9 @@ async fn update_browser_open_job(handle: &BrowserOpenJobHandle, state: BrowserOp
             && job.principal_id == handle.principal_id
             && job.owner_launch_id == handle.owner_launch_id
         {
+            job.retains_browser_instance = job.browser_instance.is_some()
+                && !job.instance_release_proven
+                && state.coalesces_open();
             job.state = state;
             job.updated_at = Instant::now();
         }
@@ -706,6 +760,21 @@ pub(in crate::api::gateway) async fn complete_browser_launch(
         {
             return Err("Browser launch ownership changed before effect binding".to_string());
         }
+        match (
+            record.transport_authority.as_ref(),
+            effect.viewer_turn_capability.as_ref(),
+        ) {
+            (Some(authority), Some(capability)) => {
+                validate_browser_vz_viewer_turn_capability(authority, capability)?;
+                project_browser_vz_viewer_turn(&effect.browser_page, authority, capability)?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(
+                    "Browser launch viewer TURN capability ownership is incomplete".to_string(),
+                )
+            }
+        }
         record.page_id = Some(effect.page_id);
         record.engine_provider = Some(effect.engine_provider);
         record.engine_protocol_version = Some(effect.engine_protocol_version);
@@ -713,6 +782,7 @@ pub(in crate::api::gateway) async fn complete_browser_launch(
         record.engine = Some(effect.engine);
         record.provider_cleanup = Some(effect.provider_cleanup);
         record.browser_page = Some(effect.browser_page);
+        record.viewer_turn_capability = effect.viewer_turn_capability;
         record.stream_cleanup = effect.stream_cleanup;
         record.state = BrowserSessionState::Active;
         record.phase = BrowserLifecyclePhase::ActiveSession;
@@ -2568,12 +2638,21 @@ fn read_bounded_browser_json_dir<T: for<'de> Deserialize<'de>>(
 }
 
 fn browser_recoverable_active_page(session: &BrowserSessionRecord) -> Option<serde_json::Value> {
+    let browser_page = session
+        .transport_authority
+        .as_ref()
+        .zip(session.viewer_turn_capability.as_ref())
+        .and_then(|(authority, capability)| {
+            project_browser_vz_viewer_turn(session.browser_page.as_ref()?, authority, capability)
+                .ok()
+        })
+        .or_else(|| session.browser_page.clone())?;
     Some(serde_json::json!({
         "schema": "elastos.browser.recoverable-page/v1",
         "state": "active",
         "page_id": session.page_id.as_deref()?,
         "cleanup": browser_cleanup_handle(&session.cleanup_id),
-        "engine_page": session.browser_page.as_ref()?,
+        "engine_page": browser_page,
     }))
 }
 
@@ -2753,6 +2832,7 @@ mod tests {
                 })
             }),
             browser_page: page_id.map(|page_id| serde_json::json!({"page_id": page_id})),
+            viewer_turn_capability: None,
             stream_cleanup: None,
             transport_authority: None,
             state,
@@ -2810,8 +2890,227 @@ mod tests {
                 "schema": "elastos.browser.engine.page/v1",
                 "page_id": page_id,
             }),
+            viewer_turn_capability: None,
             stream_cleanup,
         }
+    }
+
+    fn write_viewer_turn_test_config(root: &Path) {
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let path = config_dir.join("browser-vz-vsock-transport.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "elastos.browser.vz-transport-config/v1",
+                "enabled": true,
+                "turn_listen_host": "127.0.0.1",
+                "turn_advertised_host": "127.0.0.1",
+                "turn_relay_host": "127.0.0.1",
+                "turn_port_start": 43600,
+                "turn_port_end": 43631,
+                "turn_relay_port_start": 43700,
+                "turn_relay_port_end": 43827,
+                "turn_relay_block_size": 8,
+                "guest_turn_host": "127.0.0.1",
+                "guest_turn_port": 3478,
+                "bootstrap_vsock_port": 19090,
+                "egress_vsock_port": 19091,
+                "media_vsock_port": 19093,
+                "ttl_secs": 300,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn viewer_turn_refresh_and_cleanup_keep_capability_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        write_viewer_turn_test_config(dir.path());
+        let principal_id = "person:local:viewer-refresh";
+        let owner_launch_id = "launch:viewer-refresh";
+        let refreshed_owner_launch_id = "launch:viewer-refresh-new-frame";
+        let browser_instance = "browser:abcdefabcdefabcdefabcdefabcdefab";
+        let stream_id = "stream:viewer-refresh";
+        let mut lifecycle = test_lifecycle(owner_launch_id);
+        lifecycle.browser_instance = Some(browser_instance.to_string());
+        lifecycle.selected_engine_adapter = Some("browser-vm-product".to_string());
+        let reservation = reserve_browser_launch(dir.path(), principal_id, lifecycle)
+            .await
+            .unwrap();
+        let launch = prepare_browser_vz_transport_launch(
+            dir.path(),
+            BrowserVzTransportLaunchBinding {
+                generation: reservation.generation(),
+                page_id: reservation.page_id(),
+                vm_id: reservation.vm_id(),
+                principal_id,
+                egress_stream_id: stream_id,
+                egress_target: "tls://example.com:443",
+                egress_runtime_socket_path: "/tmp/elastos-viewer-refresh.sock",
+            },
+        )
+        .unwrap()
+        .unwrap();
+        bind_browser_vz_transport_authority(
+            dir.path(),
+            &reservation,
+            stream_id,
+            None,
+            launch.authority.clone(),
+        )
+        .await
+        .unwrap();
+        let effect_receipt = serde_json::json!({
+            "schema": "elastos.browser.vz-transport-effect-receipt/v1",
+            "binding_hash": launch.authority["binding_hash"],
+            "generation": launch.authority["generation"],
+            "page_id": launch.authority["page_id"],
+            "vm_id": launch.authority["vm_id"],
+            "expires_at_unix_ms": launch.authority["expires_at_unix_ms"],
+            "terminal": true,
+            "effects": {
+                "vz_network_devices_zero": true,
+                "guest_bootstrap_validated": true,
+                "guest_loopback_only": true,
+                "guest_interfaces": ["lo"],
+                "guest_default_route_absent": true,
+                "guest_direct_network_absent": true,
+                "ordinary_stream_fixed_target": true,
+                "media_stream_fixed_target": true,
+                "turn_launch_owned": true,
+                "turn_listener_loopback": true,
+                "hibernation_disabled": true,
+            },
+        });
+        let public_proof =
+            browser_vz_public_transport_proof(&launch.authority, &effect_receipt).unwrap();
+        let browser_page = serde_json::json!({
+            "schema": "elastos.browser.engine.page/v1",
+            "provider": BROWSER_ENGINE_PROVIDER_ID,
+            "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
+            "page_id": reservation.page_id(),
+            "adapter": "browser-vm-product",
+            "engine": "chromium_microvm",
+            "stream_id": stream_id,
+            "display_session": {
+                "schema": "elastos.browser.display-session/v1",
+                "session_id": "display:viewer-refresh",
+                "mode": "webrtc_remote_display",
+                "offerer": "engine",
+                "media_transport": "runtime_relay",
+                "ice_connection_policy": "engine_relay_only",
+            },
+            "transport_proof": public_proof,
+        });
+        let capability =
+            browser_vz_viewer_turn_capability(&launch.authority, &launch.secret).unwrap();
+        let credential = launch.secret["credential"].as_str().unwrap().to_string();
+        let cleanup = complete_browser_launch(
+            dir.path(),
+            &reservation,
+            BrowserLaunchEffect {
+                page_id: reservation.page_id().to_string(),
+                engine_provider: BROWSER_ENGINE_PROVIDER_ID.to_string(),
+                engine_protocol_version: BROWSER_ENGINE_PROTOCOL_VERSION.to_string(),
+                engine_adapter: "browser-vm-product".to_string(),
+                engine: "chromium_microvm".to_string(),
+                provider_cleanup: serde_json::json!({
+                    "schema": BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
+                    "page_id": reservation.page_id(),
+                    "generation": reservation.generation(),
+                    "stream_id": stream_id,
+                    "adapter": "browser-vm-product",
+                    "engine": "chromium_microvm",
+                    "transport_authority": launch.authority,
+                }),
+                browser_page,
+                viewer_turn_capability: Some(capability),
+                stream_cleanup: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let ownership_path = browser_ownership_path(dir.path(), &cleanup.id);
+        let durable = std::fs::read_to_string(&ownership_path).unwrap();
+        assert!(!durable.contains(&credential));
+        assert!(!durable.contains("viewer_turn_capability"));
+        assert!(!durable.contains("runtime_turn"));
+
+        let foreign = browser_gateway_session_status(
+            dir.path(),
+            principal_id,
+            Some(refreshed_owner_launch_id),
+            Some("browser:11111111111111111111111111111111"),
+        )
+        .await;
+        assert!(foreign["recoverable_page"].is_null());
+        let refreshed = browser_gateway_session_status(
+            dir.path(),
+            principal_id,
+            Some(refreshed_owner_launch_id),
+            Some(browser_instance),
+        )
+        .await;
+        assert_eq!(refreshed["recoverable_page"]["state"], "active");
+        assert_eq!(
+            refreshed["recoverable_page"]["engine_page"]["display_session"]
+                ["ice_connection_policy"],
+            BROWSER_VZ_VIEWER_TURN_POLICY
+        );
+        assert_eq!(
+            refreshed["recoverable_page"]["engine_page"]["display_session"]["ice_servers"][0]
+                ["credential"],
+            credential
+        );
+
+        let page_cleanup = browser_page_cleanup_for_principal(
+            dir.path(),
+            reservation.page_id(),
+            principal_id,
+            refreshed_owner_launch_id,
+            &cleanup.id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!serde_json::to_string(&page_cleanup.engine_cleanup)
+            .unwrap()
+            .contains(&credential));
+        record_browser_engine_cleanup_obligation(dir.path(), page_cleanup.engine_cleanup.clone())
+            .await
+            .unwrap();
+        let _ = release_browser_page_for_principal(
+            dir.path(),
+            reservation.page_id(),
+            principal_id,
+            owner_launch_id,
+        )
+        .await;
+        let cleanup_pending = browser_gateway_session_status(
+            dir.path(),
+            principal_id,
+            Some(refreshed_owner_launch_id),
+            Some(browser_instance),
+        )
+        .await;
+        assert_eq!(
+            cleanup_pending["recoverable_page"]["state"],
+            "cleanup_pending"
+        );
+        assert!(!serde_json::to_string(&cleanup_pending)
+            .unwrap()
+            .contains(&credential));
+        forget_browser_engine_cleanup_obligation(dir.path(), &page_cleanup.engine_cleanup)
+            .await
+            .unwrap();
+        assert_eq!(browser_page_session_count(dir.path()).await, 0);
+        assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 0);
+        assert!(!ownership_path.exists());
     }
 
     #[tokio::test]
@@ -2955,6 +3254,7 @@ mod tests {
             dir.path(),
             "person:local:test",
             "launch:owner-a",
+            None,
             "intent:a",
         )
         .await
@@ -2965,6 +3265,7 @@ mod tests {
             dir.path(),
             "person:local:test",
             "launch:owner-a",
+            None,
             "intent:a",
         )
         .await
@@ -2976,6 +3277,7 @@ mod tests {
             dir.path(),
             "person:local:test",
             "launch:owner-b",
+            None,
             "intent:a",
         )
         .await
@@ -2987,6 +3289,7 @@ mod tests {
             dir.path(),
             "person:local:test",
             "launch:owner-a",
+            None,
             "intent:b",
         )
         .await
@@ -2998,6 +3301,7 @@ mod tests {
             dir.path(),
             "person:local:test",
             "launch:owner-a",
+            None,
             "intent:a",
         )
         .await
@@ -3027,6 +3331,7 @@ mod tests {
             dir.path(),
             "person:local:test",
             "launch:owner-a",
+            None,
             "intent:b",
         )
         .await
@@ -3037,6 +3342,7 @@ mod tests {
             dir.path(),
             "person:local:test",
             "launch:owner-c",
+            None,
             "intent:failed",
         )
         .await
@@ -3050,12 +3356,130 @@ mod tests {
             dir.path(),
             "person:local:test",
             "launch:owner-c",
+            None,
             "intent:retry",
         )
         .await
         .unwrap();
         assert!(retry.should_spawn);
         assert_ne!(retry.handle.id, failed.handle.id);
+    }
+
+    #[tokio::test]
+    async fn browser_open_jobs_reject_second_owner_for_verified_browser_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let browser_instance = "browser:0123456789abcdef0123456789abcdef";
+        let first = create_browser_open_job(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-a",
+            Some(browser_instance),
+            "intent:instance",
+        )
+        .await
+        .unwrap();
+        assert!(first.should_spawn);
+
+        let conflict = create_browser_open_job(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-b",
+            Some(browser_instance),
+            "intent:instance",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+        assert!(conflict.1.contains("active or in-flight open"));
+
+        fail_browser_open_job(
+            &first.handle,
+            serde_json::json!({"error": "simulated terminal failure"}),
+        )
+        .await;
+        let retry = create_browser_open_job(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-b",
+            Some(browser_instance),
+            "intent:instance",
+        )
+        .await
+        .unwrap();
+        assert!(retry.should_spawn);
+
+        fail_browser_open_job(
+            &retry.handle,
+            serde_json::json!({
+                "outcome": {
+                    "state": "cleanup_pending"
+                }
+            }),
+        )
+        .await;
+        let retained = create_browser_open_job(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-c",
+            Some(browser_instance),
+            "intent:instance",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(retained.0, StatusCode::CONFLICT);
+
+        release_browser_open_job_instance_for_owner(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-b",
+        )
+        .await;
+        let after_terminal_cleanup = create_browser_open_job(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-c",
+            Some(browser_instance),
+            "intent:instance",
+        )
+        .await
+        .unwrap();
+        assert!(after_terminal_cleanup.should_spawn);
+
+        let race_instance = "browser:fedcba9876543210fedcba9876543210";
+        let terminal_before_result = create_browser_open_job(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-d",
+            Some(race_instance),
+            "intent:race",
+        )
+        .await
+        .unwrap();
+        release_browser_open_job_instance_for_owner(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-d",
+        )
+        .await;
+        fail_browser_open_job(
+            &terminal_before_result.handle,
+            serde_json::json!({
+                "outcome": {
+                    "state": "cleanup_pending"
+                }
+            }),
+        )
+        .await;
+        let after_terminal_race = create_browser_open_job(
+            dir.path(),
+            "person:local:test-instance",
+            "launch:instance-owner-e",
+            Some(race_instance),
+            "intent:race",
+        )
+        .await
+        .unwrap();
+        assert!(after_terminal_race.should_spawn);
     }
 
     #[tokio::test]
@@ -3084,6 +3508,7 @@ mod tests {
                     "engine": "mock-engine",
                 }),
                 browser_page: serde_json::json!({"page_id": "page:healthy"}),
+                viewer_turn_capability: None,
                 stream_cleanup: None,
             },
         )
@@ -3311,6 +3736,7 @@ mod tests {
                     "schema": "elastos.browser.engine.page/v1",
                     "page_id": "page:restart",
                 }),
+                viewer_turn_capability: None,
                 stream_cleanup: None,
             },
         )

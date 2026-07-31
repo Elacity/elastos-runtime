@@ -112,6 +112,9 @@ const browserNativeOperatorConfig = read(
   "scripts/browser-native-operator-config.mjs",
 );
 const browserDisplayModeSmoke = read("scripts/browser-display-mode-smoke.mjs");
+const browserRuntimeTurnCapabilitySmoke = read(
+  "scripts/browser-runtime-turn-capability-smoke.mjs",
+);
 const browserObjectiveAudit = read("scripts/browser-objective-audit.mjs");
 const browserProviderDecisionReport = read(
   "scripts/browser-provider-decision-report.mjs",
@@ -406,10 +409,12 @@ assert(
 
 assert(
   browserJs.includes("isMissingRuntimePageError") &&
-    browserJs.includes("scheduleRemoteReconnect") &&
+    browserJs.includes("settleRemoteDisplayFailure") &&
     browserJs.includes("RUNTIME_OWNED_PAGE_FAILURE_KINDS") &&
     browserJs.includes("runtimePageCleanup.fail") &&
-    browserJs.includes("scheduleRemoteReplacementAfterTerminal") &&
+    browserJs.includes("retry: false") &&
+    !browserJs.includes("scheduleRemoteReplacementAfterTerminal") &&
+    !browserJs.includes("scheduleRemoteReconnect") &&
     browserJs.includes(
       "Runtime cleanup is pending; the existing page remains owned and no replacement will open until Runtime confirms a terminal close.",
     ) &&
@@ -419,14 +424,15 @@ assert(
     ) &&
     !browserRemoteDisplay.includes("Refresh Browser") &&
     browserJs.includes("recoverMissingRuntimePage") &&
-    browserJs.includes("Browser session reconnected.") &&
+    browserJs.includes(
+      "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
+    ) &&
+    !browserJs.includes("Browser session reconnected.") &&
     browserJs.includes("track.addEventListener(\"mute\"") &&
     browserJs.includes("track.addEventListener(\"ended\"") &&
-    !browserJs.includes("Browser session ended. Open the address again") &&
-    !browserJs.includes("Reopen the page to start a clean Runtime session") &&
     browserSelkiesControlService.includes("crypto.randomBytes(8)") &&
     !browserSelkiesControlService.includes("update(`${url}\\0${streamId}`)"),
-  "Browser sessions must use launch-unique provider page ids and reconnect missing pages instead of reusing stale deterministic ids or requiring manual reopen",
+  "Browser sessions must use launch-unique provider page ids, retain cleanup ownership, and stop after terminal display failure until an explicit user open",
 );
 
 assert(
@@ -1838,7 +1844,8 @@ assert(
     ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260728a") &&
+    browser.includes("browser.js?v=browser-20260730a") &&
+    !browser.includes("browser.js?v=browser-20260728a") &&
     !browser.includes("browser.js?v=browser-20260727a") &&
     !browser.includes("browser.js?v=browser-20260726b") &&
     !browser.includes("browser.js?v=browser-20260726a") &&
@@ -1881,8 +1888,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-status.js?v=browser-20260725a") &&
-    browserRemoteDisplay.includes("browser-status.js?v=browser-20260725a") &&
+  browserJs.includes("browser-status.js?v=browser-20260730b") &&
+    browserRemoteDisplay.includes("browser-status.js?v=browser-20260730b") &&
     !browserJs.includes("browser-status.js?v=browser-20260711c") &&
     !browserRemoteDisplay.includes("browser-status.js?v=browser-20260711c") &&
     !browserJs.includes("browser-status.js?v=browser-20260626e") &&
@@ -1897,7 +1904,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260728a") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260730b") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260728a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260724a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260711h") &&
@@ -1924,11 +1932,12 @@ assert(
     ) &&
     browserJs.includes("iceTransportPolicy,") &&
     browserRemoteDisplay.includes(
-      'displaySession.ice_connection_policy === "engine_relay_only"',
+      'displaySession.ice_connection_policy === "runtime_launch_relay_only"',
     ) &&
     browserRemoteDisplay.includes(
-      "displaySession.ice_servers !== undefined",
+      "validateRuntimeLaunchTurn(displaySession, enginePage)",
     ) &&
+    browserRemoteDisplay.includes("runtimeLaunchRelayOnly ||") &&
     browserRemoteDisplay.includes("sdpHasOnlyRelayCandidates") &&
     browserRemoteDisplay.includes(
       'iceCandidateType(normalized) !== "relay"',
@@ -1945,6 +1954,23 @@ assert(
     browserJs.includes("Runtime confirmed the failed Browser session closed") &&
     !browserJs.includes("The stuck Browser session was closed"),
   "Browser WebRTC must use relay-only ICE for runtime_relay sessions, poll late engine candidates, and retain exact Runtime page ownership until terminal cleanup without downgrading display modes or exposing relay internals to users",
+);
+
+assert(
+  browserRuntimeTurnCapabilitySmoke.includes(
+    "validateRuntimeLaunchTurn",
+  ) &&
+    browserRuntimeTurnCapabilitySmoke.includes("substitution_rejected") &&
+    browserRuntimeTurnCapabilitySmoke.includes("expiry_rejected") &&
+    browserRuntimeTurnCapabilitySmoke.includes("credential_hash_verified") &&
+    browserRuntimeTurnCapabilitySmoke.includes("home_persistence_absent") &&
+    homePasskeyVirtualAuthSmoke.includes(
+      '["credential", "auth_secret", "transport_secret"].includes(key)',
+    ) &&
+    homePasskeyVirtualAuthSmoke.includes(
+      "JSON.stringify(redactSensitive(error.details), null, 2)",
+    ),
+  "Browser launch TURN must be hash-bound, expiry-bound, substitution-safe, relay-only, and redacted from persisted proof output",
 );
 
 const releaseRuntimePageForUnloadBlock = sourceBlock(
@@ -2034,8 +2060,9 @@ assert(
   browserJs.includes("function recoverMissingRuntimePage") &&
     browserJs.includes('recoverMissingRuntimePage(error, "Browser session was released.")') &&
     !browserJs.includes("Browser Runtime frame was released.") &&
-    browserJs.includes('showStatus("Browser session reconnected.")'),
-  "Browser visible WebRTC pages must recover when the VM page was released behind the iframe",
+    browserJs.includes("settleRemoteDisplayFailure") &&
+    !browserJs.includes('showStatus("Browser session reconnected.")'),
+  "Browser visible WebRTC pages must settle exact Runtime ownership and require an explicit user open after the VM page is released",
 );
 
 assert(

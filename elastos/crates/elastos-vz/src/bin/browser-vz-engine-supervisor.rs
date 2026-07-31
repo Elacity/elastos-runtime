@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -33,6 +33,7 @@ const OPEN_REQUEST_ENV: &str = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 const VZ_TRANSPORT_AUTHORITY_SCHEMA: &str = "elastos.browser.vz-transport-authority/v1";
 const VZ_TRANSPORT_SECRET_SCHEMA: &str = "elastos.browser.vz-transport-secret/v1";
 const VZ_LAUNCH_SETTLEMENT_SCHEMA: &str = "elastos.browser.vz-launch-settlement/v1";
+const VZ_MEDIA_DIAGNOSTIC_SCHEMA: &str = "elastos.browser.media-diagnostic/v1";
 const DEFAULT_CONTROL_PORT: u32 = 19092;
 const DEFAULT_PROFILE_DISK_MIB: u64 = 2048;
 const UNIX_SOCKET_PATH_BUDGET: usize = 100;
@@ -1268,6 +1269,7 @@ struct LaunchPaths {
 struct LaunchTurn {
     child: std::process::Child,
     config_path: PathBuf,
+    log_threads: Vec<thread::JoinHandle<()>>,
 }
 
 struct LaunchTurnStartError {
@@ -1282,6 +1284,95 @@ impl From<String> for LaunchTurnStartError {
             child_absent: true,
         }
     }
+}
+
+#[derive(Clone)]
+struct TurnDiagnosticSink {
+    binding_hash: String,
+    generation: String,
+    page_id: String,
+    vm_id: String,
+    media_stream_id: String,
+    emitted: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl TurnDiagnosticSink {
+    fn from_transport(transport: &VzTransportLaunch) -> Result<Self, String> {
+        let field = |pointer: &str, label: &str| {
+            transport
+                .authority
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 512 && safe_id(value))
+                .map(str::to_string)
+                .ok_or_else(|| format!("Browser VZ TURN diagnostic {label} is invalid"))
+        };
+        Ok(Self {
+            binding_hash: field("/binding_hash", "binding_hash")?,
+            generation: field("/generation", "generation")?,
+            page_id: field("/page_id", "page_id")?,
+            vm_id: field("/vm_id", "vm_id")?,
+            media_stream_id: field("/media/stream_id", "media_stream_id")?,
+            emitted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    fn emit(&self, event: &'static str) {
+        let ordinal = self.emitted.fetch_add(1, Ordering::Relaxed);
+        if ordinal >= 64 {
+            return;
+        }
+        eprintln!(
+            "{}",
+            json!({
+                "schema": VZ_MEDIA_DIAGNOSTIC_SCHEMA,
+                "event": event,
+                "binding_hash": self.binding_hash,
+                "generation": self.generation,
+                "page_id": self.page_id,
+                "vm_id": self.vm_id,
+                "media_stream_id": self.media_stream_id,
+                "ordinal": ordinal,
+            })
+        );
+    }
+}
+
+fn classify_turn_log_line(line: &str) -> Option<&'static str> {
+    if line.len() > 4096 {
+        return None;
+    }
+    let line = line.to_ascii_lowercase();
+    if line.contains("unauthorized")
+        || line.contains("not authorized")
+        || (line.contains(" 401") && line.contains("error"))
+    {
+        return Some("turn_authentication_failed");
+    }
+    if line.contains("allocate")
+        && (line.contains("success") || line.contains("created allocation"))
+    {
+        return Some("turn_allocation_succeeded");
+    }
+    if line.contains("allocate")
+        && (line.contains("error") || line.contains("fail") || line.contains("denied"))
+    {
+        return Some("turn_allocation_failed");
+    }
+    None
+}
+
+fn start_turn_log_reader<R: Read + Send + 'static>(
+    reader: R,
+    diagnostics: TurnDiagnosticSink,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if let Some(event) = classify_turn_log_line(&line) {
+                diagnostics.emit(event);
+            }
+        }
+    })
 }
 
 impl LaunchTurn {
@@ -1308,6 +1399,7 @@ impl LaunchTurn {
             .get("auth_secret")
             .and_then(Value::as_str)
             .ok_or_else(|| "Browser VZ TURN private launch secret is missing".to_string())?;
+        let diagnostics = TurnDiagnosticSink::from_transport(transport)?;
         let listen_host = turn
             .get("listen_host")
             .and_then(Value::as_str)
@@ -1372,6 +1464,9 @@ impl LaunchTurn {
              no-dtls\n\
              no-cli\n\
              no-daemon\n\
+             verbose\n\
+             simple-log\n\
+             log-file=stdout\n\
              stale-nonce=120\n\
              max-allocate-lifetime={remaining_secs}\n\
              channel-lifetime={remaining_secs}\n\
@@ -1381,20 +1476,33 @@ impl LaunchTurn {
             .and_then(|_| file.sync_all())
             .map_err(|err| format!("Browser VZ TURN config write failed: {err}"))?;
         drop(file);
-        let child = std::process::Command::new(&program)
+        let mut child = std::process::Command::new(&program)
             .arg("-c")
             .arg(&config_path)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|err| format!("Browser VZ TURN process failed to start: {err}"))?;
-        let mut turn = Self { child, config_path };
+        let mut log_threads = Vec::with_capacity(2);
+        if let Some(stdout) = child.stdout.take() {
+            log_threads.push(start_turn_log_reader(stdout, diagnostics.clone()));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            log_threads.push(start_turn_log_reader(stderr, diagnostics.clone()));
+        }
+        diagnostics.emit("turn_process_started");
+        let mut turn = Self {
+            child,
+            config_path,
+            log_threads,
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match turn.child.try_wait() {
                 Ok(Some(status)) => {
                     let _ = remove_file_if_present(&turn.config_path);
+                    let _ = turn.reap_log_threads();
                     return Err(LaunchTurnStartError {
                         message: format!(
                             "Browser VZ TURN process exited before readiness: {status}"
@@ -1412,6 +1520,7 @@ impl LaunchTurn {
             if std::net::TcpStream::connect_timeout(&listen_addr, Duration::from_millis(100))
                 .is_ok()
             {
+                diagnostics.emit("turn_listener_ready");
                 break;
             }
             if Instant::now() >= deadline {
@@ -1456,7 +1565,14 @@ impl LaunchTurn {
         };
         let config_absent =
             remove_file_if_present(&self.config_path).is_ok() && !self.config_path.exists();
-        child_absent && config_absent
+        let log_threads_reaped = child_absent && self.reap_log_threads();
+        child_absent && config_absent && log_threads_reaped
+    }
+
+    fn reap_log_threads(&mut self) -> bool {
+        self.log_threads
+            .drain(..)
+            .all(|thread| thread.join().is_ok())
     }
 }
 
@@ -3419,7 +3535,6 @@ async fn wait_for_shutdown_or_transport_expiry(transport: Option<&VzTransportLau
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::BufRead as _;
     use std::os::fd::{FromRawFd, IntoRawFd};
     use std::sync::{mpsc, Mutex};
 
@@ -3829,6 +3944,32 @@ mod tests {
     }
 
     #[test]
+    fn turn_log_diagnostics_classify_outcomes_without_retaining_log_content() {
+        assert_eq!(
+            classify_turn_log_line(
+                "session 0001: realm <example> user <redacted>: incoming packet ALLOCATE processed, success"
+            ),
+            Some("turn_allocation_succeeded")
+        );
+        assert_eq!(
+            classify_turn_log_line(
+                "session 0002: realm <example> user <redacted>: incoming packet ALLOCATE processed, error 437"
+            ),
+            Some("turn_allocation_failed")
+        );
+        assert_eq!(
+            classify_turn_log_line(
+                "session 0003: realm <example> user <redacted>: incoming packet message processed, error 401: Unauthorized"
+            ),
+            Some("turn_authentication_failed")
+        );
+        assert_eq!(
+            classify_turn_log_line("static-auth-secret=must-never-be-forwarded"),
+            None
+        );
+    }
+
+    #[test]
     fn exact_settlement_remains_within_control_service_parse_window() {
         let transport = transport_fixture('b');
         let launch = launch_for_transport(&transport);
@@ -3938,6 +4079,8 @@ mod tests {
         assert!(!session_dir.join("turnserver.conf").exists());
         let captured = fs::read_to_string(capture).unwrap();
         assert!(captured.lines().any(|line| line == "allow-loopback-peers"));
+        assert!(captured.lines().any(|line| line == "log-file=stdout"));
+        assert!(captured.lines().any(|line| line == "simple-log"));
     }
 
     struct EnvVarRestore {

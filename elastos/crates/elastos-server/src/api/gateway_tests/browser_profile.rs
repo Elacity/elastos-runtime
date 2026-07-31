@@ -168,6 +168,7 @@ async fn browser_profile_reset_refuses_live_principal_session() {
                 "engine": "mock-engine",
             }),
             browser_page: serde_json::json!({"page_id": "profile-reset-live-page"}),
+            viewer_turn_capability: None,
             stream_cleanup: None,
         },
     )

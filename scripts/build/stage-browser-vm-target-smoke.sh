@@ -68,6 +68,13 @@ for (const expected of [
   "browser-vm-bootstrap-relay.json",
   "guest_loopback_tcp",
   "browser-vm-media-relay.json",
+  "wait_for_runtime_relay_ready",
+  "elastos.browser.vm-runtime-relay.ready/v1",
+  "browser-vm-runtime-relay.ready",
+  "browser-vm-media-relay.ready",
+  "media runtime",
+  "relay startup failed",
+  ">/dev/hvc0",
 ]) {
   if (!init.includes(expected)) throw new Error(`VZ init is missing ${expected}`);
 }

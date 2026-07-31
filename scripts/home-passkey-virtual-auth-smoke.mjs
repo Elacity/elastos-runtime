@@ -298,7 +298,12 @@ function redactSensitive(value) {
     return value;
   }
   return Object.fromEntries(
-    Object.entries(value).map(([key, entry]) => [key, redactSensitive(entry)]),
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      ["credential", "auth_secret", "transport_secret"].includes(key)
+        ? "[redacted]"
+        : redactSensitive(entry),
+    ]),
   );
 }
 
@@ -3534,7 +3539,7 @@ async function main() {
     if (error.skip) {
       console.log(error.message);
       if (error.details) {
-        console.log(JSON.stringify(error.details, null, 2));
+        console.log(JSON.stringify(redactSensitive(error.details), null, 2));
       }
       return;
     }

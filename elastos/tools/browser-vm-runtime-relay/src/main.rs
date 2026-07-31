@@ -162,13 +162,21 @@ fn run_relay(config: &RelayConfig, stdout: &mut dyn Write) -> Result<(), String>
         let session_id = accepted;
         eprintln!("browser VM runtime relay accepted session {session_id}");
         workers.push(thread::spawn(move || {
-            let host_stream = transport.connect()?;
-            let (guest_to_runtime, runtime_to_guest) =
-                forward_pair(guest_stream, host_stream, buffer_bytes)?;
-            eprintln!(
-                "browser VM runtime relay session {session_id} guest_to_runtime={guest_to_runtime} runtime_to_guest={runtime_to_guest}"
-            );
-            Ok::<(), String>(())
+            let result = transport.connect().and_then(|host_stream| {
+                forward_pair(guest_stream, host_stream, buffer_bytes)
+            });
+            match result {
+                Ok((guest_to_runtime, runtime_to_guest)) => {
+                    eprintln!(
+                        "browser VM runtime relay session {session_id} guest_to_runtime={guest_to_runtime} runtime_to_guest={runtime_to_guest}"
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    eprintln!("browser VM runtime relay session {session_id} failed: {error}");
+                    Err(error)
+                }
+            }
         }));
     }
 

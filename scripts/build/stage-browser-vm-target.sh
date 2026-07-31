@@ -331,6 +331,93 @@ rootfs_checkpoint "main init log redirected"
 
 rootfs_checkpoint "rootfs diagnostics initialized"
 
+relay_console_log() {
+  message="$*"
+  rootfs_mark "$message"
+  if [ -w /dev/hvc0 ]; then
+    printf 'browser-vm-init: %s\n' "$message" >/dev/hvc0 2>/dev/null || true
+  fi
+}
+
+relay_start_failure() {
+  label="$1"
+  log_file="$2"
+  detail=""
+  if [ -f "$log_file" ]; then
+    detail="$(head -c 512 "$log_file" 2>/dev/null | tr '\r\n' '  ' || true)"
+  fi
+  [ -n "$detail" ] || detail="no bounded startup error was emitted"
+  relay_console_log "$label relay startup failed: $detail"
+}
+
+wait_for_runtime_relay_ready() {
+  label="$1"
+  relay_pid="$2"
+  ready_file="$3"
+  log_file="$4"
+  listener_kind="$5"
+  listener_value="$6"
+  listener_port="${7:-}"
+
+  for _ in $(seq 1 100); do
+    [ -s "$ready_file" ] && break
+    if ! kill -0 "$relay_pid" 2>/dev/null; then
+      wait "$relay_pid" 2>/dev/null || true
+      relay_start_failure "$label" "$log_file"
+      return 1
+    fi
+    sleep 0.1
+  done
+  if [ ! -s "$ready_file" ]; then
+    kill "$relay_pid" 2>/dev/null || true
+    wait "$relay_pid" 2>/dev/null || true
+    relay_start_failure "$label" "$log_file"
+    return 1
+  fi
+
+  if ! /opt/elastos/bin/node - \
+      "$ready_file" "$listener_kind" "$listener_value" "$listener_port" <<'NODE'
+const fs = require("fs");
+const [readyPath, expectedKind, expectedValue, expectedPort] = process.argv.slice(2);
+const lines = fs.readFileSync(readyPath, "utf8").trim().split(/\r?\n/).filter(Boolean);
+if (lines.length !== 1) process.exit(1);
+const receipt = JSON.parse(lines[0]);
+if (
+  receipt.schema !== "elastos.browser.vm-runtime-relay.ready/v1" ||
+  receipt.network_mode !== "runtime_net_only" ||
+  receipt.direct_network !== false ||
+  receipt.transport !== "vsock_listen" ||
+  receipt.guest_listener?.kind !== expectedKind
+) {
+  process.exit(1);
+}
+if (expectedKind === "unix_socket") {
+  if (receipt.guest_listener.path !== expectedValue || expectedPort !== "") process.exit(1);
+} else if (expectedKind === "loopback_tcp") {
+  if (
+    receipt.guest_listener.host !== expectedValue ||
+    receipt.guest_listener.port !== Number(expectedPort)
+  ) {
+    process.exit(1);
+  }
+} else {
+  process.exit(1);
+}
+NODE
+  then
+    kill "$relay_pid" 2>/dev/null || true
+    wait "$relay_pid" 2>/dev/null || true
+    relay_start_failure "$label" "$log_file"
+    return 1
+  fi
+
+  if [ "$listener_kind" = "loopback_tcp" ]; then
+    relay_console_log "$label relay ready listener=$listener_kind endpoint=$listener_value:$listener_port transport=vsock_listen"
+  else
+    relay_console_log "$label relay ready listener=$listener_kind transport=vsock_listen"
+  fi
+}
+
 dump_browser_logs() {
   for log in /var/log/elastos/browser-vm-*.log; do
     [ -f "$log" ] || continue
@@ -350,6 +437,16 @@ on_exit() {
   fi
   if [ "$status" -ne 0 ] && [ -n "${ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PID:-}" ]; then
     kill "$ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PID" 2>/dev/null || true
+  fi
+  if [ "$status" -ne 0 ]; then
+    for relay_pid in \
+      "${ELASTOS_BROWSER_VM_RUNTIME_RELAY_PID:-}" \
+      "${ELASTOS_BROWSER_VM_MEDIA_RELAY_PID:-}"
+    do
+      [ -n "$relay_pid" ] || continue
+      kill "$relay_pid" 2>/dev/null || true
+      wait "$relay_pid" 2>/dev/null || true
+    done
   fi
   exit "$status"
 }
@@ -495,6 +592,8 @@ ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PORT="$(cmdline_value elastos.browser_control_
 : "${ELASTOS_BROWSER_VM_GUEST_RELAY_IPC:=/run/elastos/browser-exit.sock}"
 : "${ELASTOS_BROWSER_VM_CONTROL_SOCKET:=/run/elastos/browser-selkies-control.sock}"
 ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PID=""
+ELASTOS_BROWSER_VM_RUNTIME_RELAY_PID=""
+ELASTOS_BROWSER_VM_MEDIA_RELAY_PID=""
 
 if [ "$ELASTOS_BROWSER_VM_VZ_TRANSPORT" = "vsock_v1" ]; then
   case "$ELASTOS_BROWSER_VM_BOOTSTRAP_PORT" in
@@ -580,10 +679,47 @@ JSON
   }
 }
 JSON
+  chmod 600 \
+    /run/elastos/browser-vm-runtime-relay.json \
+    /run/elastos/browser-vm-media-relay.json
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY=/run/elastos/browser-vm-runtime-relay.ready
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG=/var/log/elastos/browser-vm-runtime-relay.log
+  ELASTOS_BROWSER_VM_MEDIA_RELAY_READY=/run/elastos/browser-vm-media-relay.ready
+  ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG=/var/log/elastos/browser-vm-media-relay.log
+  : >"$ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY"
+  : >"$ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG"
+  : >"$ELASTOS_BROWSER_VM_MEDIA_RELAY_READY"
+  : >"$ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG"
+  chmod 600 \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY" \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_READY" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG"
   ELASTOS_BROWSER_VM_RUNTIME_RELAY_CONFIG="$(cat /run/elastos/browser-vm-runtime-relay.json)" \
-    /opt/elastos/bin/browser-vm-runtime-relay &
+    /opt/elastos/bin/browser-vm-runtime-relay \
+    >"$ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY" \
+    2>"$ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG" &
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_PID="$!"
+  wait_for_runtime_relay_ready \
+    "ordinary runtime" \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_PID" \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY" \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG" \
+    "unix_socket" \
+    "$ELASTOS_BROWSER_VM_GUEST_RELAY_IPC"
   ELASTOS_BROWSER_VM_RUNTIME_RELAY_CONFIG="$(cat /run/elastos/browser-vm-media-relay.json)" \
-    /opt/elastos/bin/browser-vm-runtime-relay &
+    /opt/elastos/bin/browser-vm-runtime-relay \
+    >"$ELASTOS_BROWSER_VM_MEDIA_RELAY_READY" \
+    2>"$ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG" &
+  ELASTOS_BROWSER_VM_MEDIA_RELAY_PID="$!"
+  wait_for_runtime_relay_ready \
+    "media runtime" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_PID" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_READY" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG" \
+    "loopback_tcp" \
+    "$ELASTOS_BROWSER_VM_GUEST_TURN_HOST" \
+    "$ELASTOS_BROWSER_VM_GUEST_TURN_PORT"
 elif [ "$ELASTOS_BROWSER_VM_TRANSPORT" = "private_tcp" ]; then
   cat > /run/elastos/browser-vm-runtime-relay.json <<JSON
 {

@@ -101,8 +101,14 @@ export async function collectWebrtcStats(peerConnection) {
     return null;
   }
   const report = await peerConnection.getStats();
+  const reportItems = [...report.values()];
+  const reportById = new Map(
+    reportItems
+      .filter((item) => typeof item?.id === "string")
+      .map((item) => [item.id, item]),
+  );
   const stats = {};
-  for (const item of report.values()) {
+  for (const item of reportItems) {
     const mediaKind = item.kind || item.mediaType;
     const isInboundVideo =
       item.type === "inbound-rtp" &&
@@ -121,15 +127,26 @@ export async function collectWebrtcStats(peerConnection) {
       stats.video_frames_dropped = Number(item.framesDropped || 0);
       stats.video_fps = Number(item.framesPerSecond || 0);
       stats.video_bytes_received = Number(item.bytesReceived || 0);
+      stats.video_packets_received = Number(item.packetsReceived || 0);
       stats.video_packets_lost = Number(item.packetsLost || 0);
       stats.video_jitter_ms = Number(item.jitter || 0) * 1000;
     } else if (isInboundAudio) {
       stats.audio_bytes_received = Number(item.bytesReceived || 0);
+      stats.audio_packets_received = Number(item.packetsReceived || 0);
       stats.audio_packets_lost = Number(item.packetsLost || 0);
       stats.audio_jitter_ms = Number(item.jitter || 0) * 1000;
     } else if (item.type === "candidate-pair" && item.state === "succeeded" && item.nominated) {
+      const localCandidate = reportById.get(item.localCandidateId);
+      const remoteCandidate = reportById.get(item.remoteCandidateId);
       stats.rtt_ms = Number(item.currentRoundTripTime || 0) * 1000;
       stats.available_incoming_bitrate = Number(item.availableIncomingBitrate || 0);
+      stats.selected_local_candidate_type =
+        String(localCandidate?.candidateType || "unknown");
+      stats.selected_remote_candidate_type =
+        String(remoteCandidate?.candidateType || "unknown");
+      stats.selected_protocol = String(
+        localCandidate?.protocol || remoteCandidate?.protocol || "unknown",
+      );
     }
   }
   return stats;
