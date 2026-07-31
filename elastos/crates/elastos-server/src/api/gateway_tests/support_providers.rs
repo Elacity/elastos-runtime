@@ -2066,31 +2066,30 @@ impl MockBrowserOwnershipCounts {
 struct MockRemoteCarrierExitProvider {
     close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
     close_failures_remaining: Arc<TokioMutex<usize>>,
+    close_hangs_remaining: std::sync::atomic::AtomicUsize,
     ownership: Option<Arc<MockBrowserOwnershipCounts>>,
 }
 
 impl MockRemoteCarrierExitProvider {
+    fn with_close_behavior(
+        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+        failures: usize,
+        hangs: usize,
+        ownership: Option<Arc<MockBrowserOwnershipCounts>>,
+    ) -> Self {
+        Self {
+            close_calls,
+            close_failures_remaining: Arc::new(TokioMutex::new(failures)),
+            close_hangs_remaining: std::sync::atomic::AtomicUsize::new(hangs),
+            ownership,
+        }
+    }
+
     fn with_close_failures(
         close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
         failures: usize,
     ) -> Self {
-        Self {
-            close_calls,
-            close_failures_remaining: Arc::new(TokioMutex::new(failures)),
-            ownership: None,
-        }
-    }
-
-    fn with_close_failures_and_ownership(
-        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
-        failures: usize,
-        ownership: Arc<MockBrowserOwnershipCounts>,
-    ) -> Self {
-        Self {
-            close_calls,
-            close_failures_remaining: Arc::new(TokioMutex::new(failures)),
-            ownership: Some(ownership),
-        }
+        Self::with_close_behavior(close_calls, failures, 0, None)
     }
 }
 
@@ -2222,6 +2221,18 @@ impl Provider for MockRemoteCarrierExitProvider {
             .unwrap_or("did:elastos:test");
         if request.get("op").and_then(|value| value.as_str()) == Some("close_stream") {
             self.close_calls.lock().await.push(request.clone());
+            let should_hang = self
+                .close_hangs_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok();
+            if should_hang {
+                std::future::pending::<()>().await;
+                unreachable!("hanging Exit close must be cancelled by Runtime timeout");
+            }
             let mut failures_remaining = self.close_failures_remaining.lock().await;
             if *failures_remaining > 0 {
                 *failures_remaining -= 1;

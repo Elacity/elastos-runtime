@@ -148,6 +148,8 @@ pub(super) struct BrowserProviderResourceCall {
 pub(super) struct BrowserPageCloseRequest {
     pub(super) schema: String,
     pub(super) cleanup_id: String,
+    #[serde(default)]
+    pub(super) browser_instance: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1548,7 +1550,8 @@ enum BrowserLaunchReconciliationDecision {
     RetainIndeterminate(Option<String>),
 }
 
-const BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(in crate::api::gateway) const BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT: Duration =
+    Duration::from_secs(30);
 const BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF: Duration = Duration::from_millis(100);
 const BROWSER_LAUNCH_RECONCILIATION_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT: usize = 8;
@@ -1582,13 +1585,68 @@ impl Drop for BrowserLifecycleReconcilerRegistration {
 pub(in crate::api::gateway) struct BrowserLifecycleReconciler {
     shutdown: watch::Sender<bool>,
     wake: Arc<Notify>,
+    #[cfg(test)]
+    sweep_observer: Option<Arc<BrowserLifecycleSweepObserver>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+struct BrowserLifecycleSweepObserver {
+    completed: std::sync::atomic::AtomicUsize,
+    completed_tx: watch::Sender<usize>,
+    continue_sweeps: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl BrowserLifecycleSweepObserver {
+    fn new() -> Self {
+        let (completed_tx, _) = watch::channel(0);
+        Self {
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            completed_tx,
+            continue_sweeps: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn wait_for(&self, expected: usize) {
+        let mut completed_rx = self.completed_tx.subscribe();
+        loop {
+            if *completed_rx.borrow_and_update() >= expected {
+                return;
+            }
+            completed_rx
+                .changed()
+                .await
+                .expect("Browser lifecycle sweep observer must remain available");
+        }
+    }
+
+    async fn complete_and_pause(&self) {
+        let completed = self
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        self.completed_tx.send_replace(completed);
+        self.continue_sweeps
+            .acquire()
+            .await
+            .expect("Browser lifecycle sweep observer must remain available")
+            .forget();
+    }
+
+    fn resume(&self) {
+        self.continue_sweeps.add_permits(1);
+    }
 }
 
 impl BrowserLifecycleReconciler {
     pub(in crate::api::gateway) fn cancel(&self) {
         let _ = self.shutdown.send(true);
         self.wake.notify_waiters();
+        #[cfg(test)]
+        if let Some(observer) = self.sweep_observer.as_ref() {
+            observer.resume();
+        }
     }
 
     pub(in crate::api::gateway) async fn join(self) -> Result<(), String> {
@@ -1596,10 +1654,48 @@ impl BrowserLifecycleReconciler {
             .await
             .map_err(|err| format!("Browser launch reconciler task failed: {err}"))
     }
+
+    #[cfg(test)]
+    pub(in crate::api::gateway) async fn wait_for_completed_sweeps(&self, expected: usize) {
+        self.sweep_observer
+            .as_ref()
+            .expect("controlled Browser lifecycle reconciler")
+            .wait_for(expected)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(in crate::api::gateway) fn resume_sweeps(&self) {
+        self.sweep_observer
+            .as_ref()
+            .expect("controlled Browser lifecycle reconciler")
+            .resume();
+    }
 }
 
 pub(in crate::api::gateway) fn start_browser_lifecycle_reconciler(
     state: GatewayState,
+) -> Result<BrowserLifecycleReconciler, String> {
+    start_browser_lifecycle_reconciler_inner(
+        state,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(in crate::api::gateway) fn start_controlled_browser_lifecycle_reconciler(
+    state: GatewayState,
+) -> Result<BrowserLifecycleReconciler, String> {
+    start_browser_lifecycle_reconciler_inner(
+        state,
+        Some(Arc::new(BrowserLifecycleSweepObserver::new())),
+    )
+}
+
+fn start_browser_lifecycle_reconciler_inner(
+    state: GatewayState,
+    #[cfg(test)] sweep_observer: Option<Arc<BrowserLifecycleSweepObserver>>,
 ) -> Result<BrowserLifecycleReconciler, String> {
     let scope = state.data_dir.to_string_lossy().into_owned();
     let wake = Arc::new(Notify::new());
@@ -1621,12 +1717,26 @@ pub(in crate::api::gateway) fn start_browser_lifecycle_reconciler(
     };
     let (shutdown, shutdown_rx) = watch::channel(false);
     let task_wake = wake.clone();
+    #[cfg(test)]
+    let task_sweep_observer = sweep_observer.clone();
     let task = tokio::spawn(async move {
+        #[cfg(test)]
+        run_browser_lifecycle_reconciler(
+            state,
+            task_wake,
+            shutdown_rx,
+            task_sweep_observer,
+            registration,
+        )
+        .await;
+        #[cfg(not(test))]
         run_browser_lifecycle_reconciler(state, task_wake, shutdown_rx, registration).await;
     });
     Ok(BrowserLifecycleReconciler {
         shutdown,
         wake,
+        #[cfg(test)]
+        sweep_observer,
         task,
     })
 }
@@ -1635,6 +1745,7 @@ async fn run_browser_lifecycle_reconciler(
     state: GatewayState,
     wake: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
+    #[cfg(test)] sweep_observer: Option<Arc<BrowserLifecycleSweepObserver>>,
     _registration: BrowserLifecycleReconcilerRegistration,
 ) {
     let mut backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
@@ -1651,8 +1762,12 @@ async fn run_browser_lifecycle_reconciler(
                 }
                 continue;
             }
-            settled = retry_pending_browser_lifecycle_obligations(&state) => settled,
+            settled = cleanup_stale_browser_pages(&state) => settled,
         };
+        #[cfg(test)]
+        if let Some(observer) = sweep_observer.as_ref() {
+            observer.complete_and_pause().await;
+        }
         if settled {
             backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
         }
@@ -2278,11 +2393,23 @@ fn browser_provider_cleanup_value_is_safe(value: &serde_json::Value, depth: usiz
     }
 }
 
-async fn cleanup_stale_browser_pages(state: &GatewayState) {
-    retry_pending_browser_lifecycle_obligations(state).await;
-    for page in take_stale_browser_pages(&state.data_dir).await {
+pub(in crate::api::gateway) async fn cleanup_stale_browser_pages(state: &GatewayState) -> bool {
+    let settled = retry_pending_browser_lifecycle_obligations(state).await;
+    let stale_pages = match take_stale_browser_pages(&state.data_dir).await {
+        Ok(pages) => pages,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Browser stale ownership could not be transferred into durable cleanup"
+            );
+            return settled;
+        }
+    };
+    let reaped_stale_page = !stale_pages.is_empty();
+    for page in stale_pages {
         close_browser_page_record(state, page).await;
     }
+    settled || reaped_stale_page
 }
 
 async fn retry_pending_browser_lifecycle_obligations(state: &GatewayState) -> bool {
@@ -2424,14 +2551,12 @@ async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> b
                 .map_err(|_| "Browser stream cleanup timed out".to_string())
                 .and_then(|result| result);
                 if engine_result.is_ok() && stream_result.is_ok() {
-                    if let Err(err) =
-                        forget_browser_engine_cleanup_obligation(&state.data_dir, &cleanup).await
-                    {
+                    if let Err(err) = commit_browser_terminal_cleanup(state, &cleanup, None).await {
                         release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
                         tracing::warn!(
                             error = %err,
                             page_id = %cleanup.page_id,
-                            "Browser reconciled cleanup terminal release could not be committed"
+                            "Browser reconciled cleanup terminal receipt and release could not be committed"
                         );
                     } else {
                         release_browser_open_job_instance_for_owner(
@@ -2493,14 +2618,12 @@ async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
         .and_then(|result| result);
         match (engine_result, stream_result) {
             (Ok(_), Ok(())) => {
-                if let Err(err) =
-                    forget_browser_engine_cleanup_obligation(&state.data_dir, &cleanup).await
-                {
+                if let Err(err) = commit_browser_terminal_cleanup(state, &cleanup, None).await {
                     release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
                     tracing::warn!(
                         page_id = %cleanup.page_id,
                         error = %err,
-                        "Browser terminal cleanup could not commit durable owner release"
+                        "Browser terminal cleanup could not commit its receipt and owner release"
                     );
                 } else {
                     release_browser_open_job_instance_for_owner(
@@ -2534,6 +2657,7 @@ async fn retry_pending_browser_stream_cleanups(state: &GatewayState) -> bool {
     )
     .await
     {
+        let cleanup_for_release = cleanup.clone();
         let result = tokio::time::timeout(
             BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
             close_browser_stream_cleanup(state, Some(cleanup)),
@@ -2542,6 +2666,7 @@ async fn retry_pending_browser_stream_cleanups(state: &GatewayState) -> bool {
         .map_err(|_| "Browser stream cleanup timed out".to_string())
         .and_then(|result| result);
         if let Err(err) = result {
+            release_browser_stream_cleanup_claim(&state.data_dir, &cleanup_for_release).await;
             tracing::warn!(
                 error = %err,
                 "Browser pending stream cleanup retry failed"
@@ -2553,6 +2678,16 @@ async fn retry_pending_browser_stream_cleanups(state: &GatewayState) -> bool {
     settled
 }
 
+async fn commit_browser_terminal_cleanup(
+    state: &GatewayState,
+    cleanup: &BrowserEngineCleanup,
+    terminal_owner_launch_id: Option<&str>,
+) -> Result<(), String> {
+    record_browser_reaped_page_tombstone(&state.data_dir, cleanup, terminal_owner_launch_id)
+        .await?;
+    forget_browser_engine_cleanup_obligation(&state.data_dir, cleanup).await
+}
+
 async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanup) {
     let engine_cleanup = page.engine_cleanup;
     forget_browser_open_job_for_owner(
@@ -2561,27 +2696,34 @@ async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanu
         &engine_cleanup.owner_launch_id,
     )
     .await;
-    if let Err(err) =
-        record_browser_engine_cleanup_obligation(&state.data_dir, engine_cleanup.clone()).await
-    {
-        tracing::warn!(
-            page_id = %engine_cleanup.page_id,
-            error = %err,
-            "Browser stale page cleanup obligation could not be persisted; attempting exact deterministic cleanup"
-        );
+    let engine_result = tokio::time::timeout(
+        BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+        attempt_browser_engine_cleanup(state, &engine_cleanup),
+    )
+    .await
+    .map_err(|_| "Browser stale page engine cleanup timed out".to_string())
+    .and_then(|result| result);
+    let stream_cleanup_for_release = page.stream_cleanup.clone();
+    let stream_result = tokio::time::timeout(
+        BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+        close_browser_stream_cleanup(state, page.stream_cleanup),
+    )
+    .await
+    .map_err(|_| "Browser stale page stream cleanup timed out".to_string())
+    .and_then(|result| result);
+    if stream_result.is_err() {
+        if let Some(cleanup) = stream_cleanup_for_release.as_ref() {
+            release_browser_stream_cleanup_claim(&state.data_dir, cleanup).await;
+        }
     }
-    let engine_result = attempt_browser_engine_cleanup(state, &engine_cleanup).await;
-    let stream_result = close_browser_stream_cleanup(state, page.stream_cleanup).await;
     match (&engine_result, &stream_result) {
         (Ok(_), Ok(())) => {
-            if let Err(err) =
-                forget_browser_engine_cleanup_obligation(&state.data_dir, &engine_cleanup).await
-            {
+            if let Err(err) = commit_browser_terminal_cleanup(state, &engine_cleanup, None).await {
                 release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
                 tracing::warn!(
                     page_id = %engine_cleanup.page_id,
                     error = %err,
-                    "Browser stale page terminal release could not be committed"
+                    "Browser stale page terminal receipt and release could not be committed"
                 );
             }
         }
@@ -2752,21 +2894,25 @@ async fn reap_browser_open_effect_after_failure(
             return browser_cleanup_pending_outcome(true, true, true);
         }
     };
+    let stream_cleanup = page_cleanup.stream_cleanup.clone();
     let engine_cleanup = page_cleanup.engine_cleanup;
-    let obligation_persisted =
-        match record_browser_engine_cleanup_obligation(&state.data_dir, engine_cleanup.clone())
-            .await
-        {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(
-                    page_id,
-                    error = %err,
-                    "Browser open failure cleanup could not persist its obligation"
-                );
-                false
-            }
-        };
+    let obligation_persisted = match record_browser_engine_cleanup_obligation(
+        &state.data_dir,
+        engine_cleanup.clone(),
+        stream_cleanup,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                page_id,
+                error = %err,
+                "Browser open failure cleanup could not persist its obligation"
+            );
+            false
+        }
+    };
     let engine_result = attempt_browser_engine_cleanup(state, &engine_cleanup).await;
     if !ownership_persisted && !obligation_persisted && engine_result.is_err() {
         tracing::warn!(
@@ -2784,14 +2930,12 @@ async fn reap_browser_open_effect_after_failure(
     )
     .await;
     if engine_result.is_ok() && stream_result.is_ok() {
-        if let Err(err) =
-            forget_browser_engine_cleanup_obligation(&state.data_dir, &engine_cleanup).await
-        {
+        if let Err(err) = commit_browser_terminal_cleanup(state, &engine_cleanup, None).await {
             release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
             tracing::warn!(
                 page_id,
                 error = %err,
-                "Browser open failure terminal cleanup could not release its durable obligation"
+                "Browser open failure terminal cleanup could not commit its receipt and release"
             );
             return browser_cleanup_pending_outcome(false, false, false);
         }
@@ -3146,7 +3290,7 @@ pub(super) async fn browser_app_page_close(
         return (StatusCode::BAD_REQUEST, "invalid browser page id").into_response();
     }
     let principal_id = context.principal_id;
-    let cleanup_id = match close_request {
+    let (cleanup_id, requested_browser_instance) = match close_request {
         Some(Json(request)) => {
             if request.schema != "elastos.browser.close-request/v2"
                 || request.cleanup_id.len() > 128
@@ -3154,7 +3298,11 @@ pub(super) async fn browser_app_page_close(
             {
                 return (StatusCode::BAD_REQUEST, "invalid Browser cleanup handle").into_response();
             }
-            request.cleanup_id
+            let browser_instance = match browser_instance_id(request.browser_instance) {
+                Ok(browser_instance) => browser_instance,
+                Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+            };
+            (request.cleanup_id, browser_instance)
         }
         None => {
             return (
@@ -3175,11 +3323,43 @@ pub(super) async fn browser_app_page_close(
     {
         Ok(Some(cleanup)) => cleanup,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, "browser session is not active").into_response()
+            match browser_reaped_page_tombstone_matches(
+                &state.data_dir,
+                &page_id,
+                &principal_id,
+                &owner_launch_id,
+                &cleanup_id,
+                requested_browser_instance.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(receipt)) => {
+                    return Json(browser_public_already_absent_close_receipt(
+                        &page_id,
+                        &cleanup_id,
+                        receipt.browser_instance.as_deref(),
+                    ))
+                    .into_response();
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+                }
+            }
+            return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
         }
         Err(message) => return (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
     };
     let cleanup_owner_launch_id = page_cleanup.engine_cleanup.owner_launch_id.clone();
+    let cleanup_browser_instance = page_cleanup.engine_cleanup.browser_instance.as_deref();
+    let supplied_instance_matches = requested_browser_instance
+        .as_deref()
+        .is_some_and(|instance| cleanup_browser_instance == Some(instance));
+    if (cleanup_owner_launch_id != owner_launch_id || requested_browser_instance.is_some())
+        && !supplied_instance_matches
+    {
+        return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
+    }
     if page_cleanup.active_session {
         let _ = mark_browser_page_retiring(
             &state.data_dir,
@@ -3190,8 +3370,12 @@ pub(super) async fn browser_app_page_close(
         .await;
     }
     let engine_cleanup = page_cleanup.engine_cleanup.clone();
-    if let Err(message) =
-        record_browser_engine_cleanup_obligation(&state.data_dir, engine_cleanup.clone()).await
+    if let Err(message) = record_browser_engine_cleanup_obligation(
+        &state.data_dir,
+        engine_cleanup.clone(),
+        page_cleanup.stream_cleanup.clone(),
+    )
+    .await
     {
         return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
     }
@@ -3208,7 +3392,7 @@ pub(super) async fn browser_app_page_close(
         close_browser_stream_cleanup(&state, page_cleanup.stream_cleanup).await
     };
     let terminal = if engine_result.is_ok() && stream_result.is_ok() {
-        forget_browser_engine_cleanup_obligation(&state.data_dir, &engine_cleanup).await
+        commit_browser_terminal_cleanup(&state, &engine_cleanup, Some(&owner_launch_id)).await
     } else {
         release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
         Ok(())
@@ -3228,6 +3412,32 @@ pub(super) async fn browser_app_page_close(
         .into_response(),
         Err(message) => gateway_provider_error_response("browser-engine", anyhow::anyhow!(message)),
     }
+}
+
+fn browser_public_already_absent_close_receipt(
+    page_id: &str,
+    cleanup_id: &str,
+    browser_instance: Option<&str>,
+) -> serde_json::Value {
+    let mut receipt = serde_json::json!({
+        "schema": "elastos.browser.close-result/v1",
+        "page_id": page_id,
+        "closed": false,
+        "already_closed": true,
+        "cleanup_id": cleanup_id,
+        "terminal_effects": {
+            "page_absent": true
+        },
+        "cleanup": {
+            "schema": "elastos.browser.runtime-session-cleanup/v1",
+            "ok": true,
+            "action": "already_absent"
+        }
+    });
+    if let Some(browser_instance) = browser_instance {
+        receipt["browser_instance"] = serde_json::json!(browser_instance);
+    }
+    receipt
 }
 
 fn browser_public_terminal_close_receipt(
@@ -3252,6 +3462,9 @@ fn browser_public_terminal_close_receipt(
             "action": "released_exact_runtime_browser_ownership"
         }
     });
+    if let Some(browser_instance) = cleanup.browser_instance.as_deref() {
+        public_receipt["browser_instance"] = serde_json::json!(browser_instance);
+    }
     if let (Some(authority), Some(transport_receipt)) = (
         cleanup.provider_cleanup.get("transport_authority"),
         cleanup.provider_cleanup.get("transport_receipt"),

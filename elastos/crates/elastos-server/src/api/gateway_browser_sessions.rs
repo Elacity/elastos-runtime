@@ -14,15 +14,22 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 
 const DEFAULT_MAX_BROWSER_SESSIONS: usize = 4;
 const DEFAULT_MAX_BROWSER_SESSIONS_PER_PRINCIPAL: usize = 4;
 const MAX_BROWSER_SESSIONS_LIMIT: usize = 32;
-const ACTIVE_HEARTBEAT_STALE_TTL: Duration = Duration::from_secs(5 * 60);
+pub(in crate::api::gateway) const ACTIVE_HEARTBEAT_STALE_TTL: Duration =
+    Duration::from_secs(5 * 60);
 const OPEN_JOB_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_BROWSER_DURABLE_OWNERSHIPS: usize = MAX_BROWSER_SESSIONS_LIMIT * 2;
 const MAX_BROWSER_DURABLE_OWNERSHIP_BYTES: usize = 64 * 1024;
+const BROWSER_REAPED_PAGE_TOMBSTONE_SCHEMA: &str = "elastos.browser.reaped-page-terminal/v1";
+// A terminal receipt lives exactly as long as the Home launch authority that can use it.
+const BROWSER_REAPED_PAGE_TOMBSTONE_RETENTION_SECS: u64 = HOME_LAUNCH_TOKEN_TTL_SECS;
+const MAX_BROWSER_REAPED_PAGE_TOMBSTONES: usize = MAX_BROWSER_SESSIONS_LIMIT * 2;
+const MAX_BROWSER_REAPED_PAGE_TOMBSTONE_BYTES: usize = 4096;
 const BROWSER_DURABLE_OWNERSHIP_SCHEMA: &str = "elastos.browser.runtime-ownership/v1";
 const BROWSER_LAUNCH_RECONCILIATION_SCHEMA: &str =
     "elastos.browser.runtime-launch-reconciliation/v1";
@@ -345,6 +352,25 @@ struct BrowserLaunchReconciliationObligation {
 struct BrowserStreamCleanupObligation {
     cleanup: BrowserStreamCleanup,
     in_flight: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct BrowserReapedPageTombstone {
+    schema: String,
+    page_id: String,
+    cleanup_id: String,
+    principal_id: String,
+    owner_launch_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser_instance: Option<String>,
+    terminal_kind: String,
+    reaped_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::api::gateway) struct BrowserReapedPageTerminalReceipt {
+    pub(in crate::api::gateway) browser_instance: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1427,7 +1453,13 @@ pub(in crate::api::gateway) async fn browser_page_stream_cleanup_for_principal(
 pub(in crate::api::gateway) async fn record_browser_engine_cleanup_obligation(
     data_dir: &Path,
     cleanup: BrowserEngineCleanup,
+    stream_cleanup: Option<BrowserStreamCleanup>,
 ) -> Result<(), String> {
+    if stream_cleanup.as_ref().is_some_and(|stream| {
+        stream.stream_id != cleanup.stream_id || stream.principal_id != cleanup.principal_id
+    }) {
+        return Err("Browser cleanup stream ownership changed".to_string());
+    }
     let scope = browser_session_scope(data_dir);
     let key = browser_engine_cleanup_key(&scope, &cleanup);
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
@@ -1437,19 +1469,41 @@ pub(in crate::api::gateway) async fn record_browser_engine_cleanup_obligation(
         .sessions
         .values()
         .find(|session| session.scope == scope && session.cleanup_id == cleanup.cleanup_id);
+    if session.is_some_and(|session| session.stream_cleanup != stream_cleanup) {
+        return Err("Browser cleanup stream ownership changed".to_string());
+    }
     let browser_page = session
         .and_then(|session| session.browser_page.clone())
+        .or_else(|| {
+            registry
+                .pending_engine_cleanups
+                .get(&key)
+                .and_then(|obligation| obligation.browser_page.clone())
+        })
         .unwrap_or_else(|| serde_json::json!({"page_id": cleanup.page_id}));
     let persist_result = write_browser_durable_ownership(
         data_dir,
         &BrowserDurableOwnership {
             schema: BROWSER_DURABLE_OWNERSHIP_SCHEMA.to_string(),
             engine_cleanup: cleanup.clone(),
-            stream_cleanup: session.and_then(|session| session.stream_cleanup.clone()),
+            stream_cleanup: stream_cleanup.clone(),
             browser_page: browser_page.clone(),
         },
     );
     let is_new_obligation = !registry.pending_engine_cleanups.contains_key(&key);
+    if let Some(stream) = stream_cleanup {
+        registry
+            .pending_stream_cleanups
+            .entry(browser_stream_cleanup_key(&scope, &stream.stream_id))
+            .and_modify(|obligation| {
+                obligation.cleanup = stream.clone();
+                obligation.in_flight = true;
+            })
+            .or_insert(BrowserStreamCleanupObligation {
+                cleanup: stream,
+                in_flight: true,
+            });
+    }
     registry
         .pending_engine_cleanups
         .entry(key)
@@ -1877,14 +1931,64 @@ pub(in crate::api::gateway) async fn browser_principal_has_live_sessions(
 
 pub(in crate::api::gateway) async fn take_stale_browser_pages(
     data_dir: &Path,
-) -> Vec<BrowserPageCleanup> {
+) -> Result<Vec<BrowserPageCleanup>, String> {
     let scope = browser_session_scope(data_dir);
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
     let mut registry = registry.lock().await;
-    if registry.load_durable_ownerships(data_dir).is_err() {
-        return Vec::new();
+    registry.load_durable_ownerships(data_dir)?;
+    registry.take_stale_active_pages(data_dir, &scope, Instant::now())
+}
+
+pub(in crate::api::gateway) async fn record_browser_reaped_page_tombstone(
+    data_dir: &Path,
+    cleanup: &BrowserEngineCleanup,
+    terminal_owner_launch_id: Option<&str>,
+) -> Result<(), String> {
+    let now_unix_ms = browser_now_unix_ms()?;
+    let mut owner_launch_ids = vec![cleanup.owner_launch_id.clone()];
+    if let Some(owner_launch_id) = terminal_owner_launch_id {
+        owner_launch_ids.push(owner_launch_id.to_string());
     }
-    registry.take_stale_active_pages(&scope, Instant::now())
+    owner_launch_ids.sort();
+    owner_launch_ids.dedup();
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let _registry = registry.lock().await;
+    persist_browser_reaped_page_tombstone(
+        data_dir,
+        BrowserReapedPageTombstone {
+            schema: BROWSER_REAPED_PAGE_TOMBSTONE_SCHEMA.to_string(),
+            page_id: cleanup.page_id.clone(),
+            cleanup_id: cleanup.cleanup_id.clone(),
+            principal_id: cleanup.principal_id.clone(),
+            owner_launch_ids,
+            browser_instance: cleanup.browser_instance.clone(),
+            terminal_kind: "already_absent".to_string(),
+            reaped_at_unix_ms: now_unix_ms,
+        },
+        now_unix_ms,
+    )
+}
+
+pub(in crate::api::gateway) async fn browser_reaped_page_tombstone_matches(
+    data_dir: &Path,
+    page_id: &str,
+    principal_id: &str,
+    owner_launch_id: &str,
+    cleanup_id: &str,
+    browser_instance: Option<&str>,
+) -> Result<Option<BrowserReapedPageTerminalReceipt>, String> {
+    let now_unix_ms = browser_now_unix_ms()?;
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let _registry = registry.lock().await;
+    browser_reaped_page_tombstone_matches_at(
+        data_dir,
+        page_id,
+        principal_id,
+        owner_launch_id,
+        cleanup_id,
+        browser_instance,
+        now_unix_ms,
+    )
 }
 
 pub(in crate::api::gateway) async fn claim_pending_browser_stream_cleanups(
@@ -1908,6 +2012,20 @@ pub(in crate::api::gateway) async fn claim_pending_browser_stream_cleanups(
             obligation.cleanup.clone()
         })
         .collect()
+}
+
+pub(in crate::api::gateway) async fn release_browser_stream_cleanup_claim(
+    data_dir: &Path,
+    cleanup: &BrowserStreamCleanup,
+) {
+    let scope = browser_session_scope(data_dir);
+    let key = browser_stream_cleanup_key(&scope, &cleanup.stream_id);
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    if let Some(obligation) = registry.lock().await.pending_stream_cleanups.get_mut(&key) {
+        if obligation.cleanup == *cleanup {
+            obligation.in_flight = false;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1999,6 +2117,10 @@ fn browser_launch_reconciliation_dir(data_dir: &Path) -> std::path::PathBuf {
     browser_lifecycle_root(data_dir).join("reconciliation")
 }
 
+fn browser_reaped_page_tombstone_dir(data_dir: &Path) -> std::path::PathBuf {
+    browser_lifecycle_root(data_dir).join("reaped-pages")
+}
+
 fn browser_durable_file_name(value: &str) -> String {
     format!("{}.json", hex::encode(Sha256::digest(value.as_bytes())))
 }
@@ -2013,6 +2135,10 @@ fn browser_stream_cleanup_path(data_dir: &Path, stream_id: &str) -> std::path::P
 
 fn browser_launch_reconciliation_path(data_dir: &Path, cleanup_id: &str) -> std::path::PathBuf {
     browser_launch_reconciliation_dir(data_dir).join(browser_durable_file_name(cleanup_id))
+}
+
+fn browser_reaped_page_tombstone_path(data_dir: &Path, cleanup_id: &str) -> std::path::PathBuf {
+    browser_reaped_page_tombstone_dir(data_dir).join(browser_durable_file_name(cleanup_id))
 }
 
 #[cfg(unix)]
@@ -2254,6 +2380,200 @@ fn write_browser_launch_reconciliation(
     )
 }
 
+fn browser_now_unix_ms() -> Result<u64, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Browser terminal receipt clock is before the Unix epoch".to_string())?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| "Browser terminal receipt clock exceeded its bounded range".to_string())
+}
+
+fn browser_reaped_page_tombstone_is_safe(
+    tombstone: &BrowserReapedPageTombstone,
+    now_unix_ms: u64,
+) -> bool {
+    const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
+    tombstone.schema == BROWSER_REAPED_PAGE_TOMBSTONE_SCHEMA
+        && tombstone.terminal_kind == "already_absent"
+        && !tombstone.page_id.is_empty()
+        && tombstone.page_id.len() <= 256
+        && is_safe_runtime_id(&tombstone.page_id)
+        && !tombstone.cleanup_id.is_empty()
+        && tombstone.cleanup_id.len() <= 128
+        && is_safe_runtime_id(&tombstone.cleanup_id)
+        && !tombstone.principal_id.is_empty()
+        && tombstone.principal_id.len() <= 512
+        && is_safe_runtime_id(&tombstone.principal_id)
+        && !tombstone.owner_launch_ids.is_empty()
+        && tombstone.owner_launch_ids.len() <= 2
+        && tombstone
+            .owner_launch_ids
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        && tombstone.owner_launch_ids.iter().all(|owner_launch_id| {
+            !owner_launch_id.is_empty()
+                && owner_launch_id.len() <= 512
+                && is_safe_runtime_id(owner_launch_id)
+        })
+        && tombstone
+            .browser_instance
+            .as_deref()
+            .is_none_or(|instance| browser_instance_id(Some(instance.to_string())).is_ok())
+        && tombstone.reaped_at_unix_ms > 0
+        && tombstone.reaped_at_unix_ms <= now_unix_ms.saturating_add(MAX_CLOCK_SKEW_MS)
+}
+
+fn browser_reaped_page_tombstone_is_expired(
+    tombstone: &BrowserReapedPageTombstone,
+    now_unix_ms: u64,
+) -> bool {
+    now_unix_ms.saturating_sub(tombstone.reaped_at_unix_ms)
+        > BROWSER_REAPED_PAGE_TOMBSTONE_RETENTION_SECS.saturating_mul(1_000)
+}
+
+fn load_fresh_browser_reaped_page_tombstones(
+    data_dir: &Path,
+    now_unix_ms: u64,
+) -> Result<Vec<BrowserReapedPageTombstone>, String> {
+    let tombstones = read_bounded_browser_json_dir::<BrowserReapedPageTombstone>(
+        data_dir,
+        &browser_reaped_page_tombstone_dir(data_dir),
+        MAX_BROWSER_REAPED_PAGE_TOMBSTONES,
+        MAX_BROWSER_REAPED_PAGE_TOMBSTONE_BYTES,
+    )?;
+    let mut fresh = Vec::with_capacity(tombstones.len());
+    for tombstone in tombstones {
+        if !browser_reaped_page_tombstone_is_safe(&tombstone, now_unix_ms) {
+            return Err("Browser terminal close receipt is invalid".to_string());
+        }
+        if browser_reaped_page_tombstone_is_expired(&tombstone, now_unix_ms) {
+            remove_browser_durable_file(
+                data_dir,
+                browser_reaped_page_tombstone_path(data_dir, &tombstone.cleanup_id),
+            )?;
+        } else {
+            fresh.push(tombstone);
+        }
+    }
+    Ok(fresh)
+}
+
+fn browser_reaped_page_tombstone_has_same_binding(
+    left: &BrowserReapedPageTombstone,
+    right: &BrowserReapedPageTombstone,
+) -> bool {
+    left.page_id == right.page_id
+        && left.cleanup_id == right.cleanup_id
+        && left.principal_id == right.principal_id
+        && left.browser_instance == right.browser_instance
+        && left.terminal_kind == right.terminal_kind
+}
+
+fn persist_browser_reaped_page_tombstone(
+    data_dir: &Path,
+    tombstone: BrowserReapedPageTombstone,
+    now_unix_ms: u64,
+) -> Result<(), String> {
+    if !browser_reaped_page_tombstone_is_safe(&tombstone, now_unix_ms) {
+        return Err("Browser terminal close receipt is invalid".to_string());
+    }
+    let mut existing = load_fresh_browser_reaped_page_tombstones(data_dir, now_unix_ms)?;
+    if let Some(previous) = existing
+        .iter()
+        .find(|previous| previous.cleanup_id == tombstone.cleanup_id)
+    {
+        if !browser_reaped_page_tombstone_has_same_binding(previous, &tombstone) {
+            return Err("Browser terminal close receipt ownership changed".to_string());
+        }
+        let mut owner_launch_ids = previous.owner_launch_ids.clone();
+        owner_launch_ids.extend(tombstone.owner_launch_ids);
+        owner_launch_ids.sort();
+        owner_launch_ids.dedup();
+        if owner_launch_ids.len() > 2 {
+            return Err(
+                "Browser terminal close receipt owner aliases exceeded their bound".to_string(),
+            );
+        }
+        if owner_launch_ids == previous.owner_launch_ids {
+            return Ok(());
+        }
+        let mut expanded = previous.clone();
+        expanded.owner_launch_ids = owner_launch_ids;
+        return write_browser_json_atomic(
+            data_dir,
+            &browser_reaped_page_tombstone_path(data_dir, &expanded.cleanup_id),
+            &expanded,
+            MAX_BROWSER_REAPED_PAGE_TOMBSTONE_BYTES,
+        );
+    }
+    if existing.len() >= MAX_BROWSER_REAPED_PAGE_TOMBSTONES {
+        existing.sort_by_key(|receipt| receipt.reaped_at_unix_ms);
+        let retire_count = existing
+            .len()
+            .saturating_add(1)
+            .saturating_sub(MAX_BROWSER_REAPED_PAGE_TOMBSTONES);
+        for retired in existing.iter().take(retire_count) {
+            remove_browser_durable_file(
+                data_dir,
+                browser_reaped_page_tombstone_path(data_dir, &retired.cleanup_id),
+            )?;
+        }
+    }
+    write_browser_json_atomic(
+        data_dir,
+        &browser_reaped_page_tombstone_path(data_dir, &tombstone.cleanup_id),
+        &tombstone,
+        MAX_BROWSER_REAPED_PAGE_TOMBSTONE_BYTES,
+    )
+}
+
+fn browser_reaped_page_tombstone_matches_at(
+    data_dir: &Path,
+    page_id: &str,
+    principal_id: &str,
+    owner_launch_id: &str,
+    cleanup_id: &str,
+    browser_instance: Option<&str>,
+    now_unix_ms: u64,
+) -> Result<Option<BrowserReapedPageTerminalReceipt>, String> {
+    let tombstones = load_fresh_browser_reaped_page_tombstones(data_dir, now_unix_ms)?;
+    let Some(tombstone) = tombstones.into_iter().find(|tombstone| {
+        tombstone.page_id == page_id
+            && tombstone.cleanup_id == cleanup_id
+            && tombstone.principal_id == principal_id
+            && tombstone.terminal_kind == "already_absent"
+    }) else {
+        return Ok(None);
+    };
+    if browser_instance.is_some() && tombstone.browser_instance.as_deref() != browser_instance {
+        return Ok(None);
+    }
+    if tombstone
+        .owner_launch_ids
+        .iter()
+        .any(|authorized| authorized == owner_launch_id)
+    {
+        return Ok(Some(BrowserReapedPageTerminalReceipt {
+            browser_instance: tombstone.browser_instance,
+        }));
+    }
+    if browser_instance.is_none()
+        || tombstone.browser_instance.as_deref() != browser_instance
+        || tombstone.owner_launch_ids.len() >= 2
+    {
+        return Ok(None);
+    }
+
+    let mut expanded = tombstone;
+    expanded.owner_launch_ids.push(owner_launch_id.to_string());
+    expanded.owner_launch_ids.sort();
+    persist_browser_reaped_page_tombstone(data_dir, expanded.clone(), now_unix_ms)?;
+    Ok(Some(BrowserReapedPageTerminalReceipt {
+        browser_instance: expanded.browser_instance,
+    }))
+}
+
 fn remove_browser_durable_file(data_dir: &Path, path: PathBuf) -> Result<(), String> {
     let parent = path
         .parent()
@@ -2298,6 +2618,45 @@ fn set_browser_durable_delete_failure(path: &Path, fail: bool) {
     } else {
         failures.remove(path);
     }
+}
+
+#[cfg(test)]
+pub(in crate::api::gateway) fn set_browser_engine_cleanup_delete_failure(
+    data_dir: &Path,
+    cleanup_id: &str,
+    fail: bool,
+) {
+    set_browser_durable_delete_failure(&browser_ownership_path(data_dir, cleanup_id), fail);
+}
+
+#[cfg(test)]
+pub(in crate::api::gateway) async fn clear_browser_lifecycle_memory_for_restart(data_dir: &Path) {
+    let scope = browser_session_scope(data_dir);
+    let mut registry = BROWSER_SESSION_REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .await;
+    registry
+        .sessions
+        .retain(|_, session| session.scope != scope);
+    registry
+        .pending_launch_reconciliations
+        .retain(|_, obligation| obligation.scope != scope);
+    registry
+        .pending_engine_cleanups
+        .retain(|_, obligation| obligation.scope != scope);
+    registry
+        .pending_stream_cleanups
+        .retain(|key, _| !key.starts_with(&format!("{scope}\n")));
+    registry.loaded_scopes.remove(&scope);
+    drop(registry);
+
+    BROWSER_OPEN_JOB_REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .await
+        .jobs
+        .retain(|_, job| job.scope != scope);
 }
 
 fn browser_engine_cleanup_is_safe(cleanup: &BrowserEngineCleanup) -> bool {
@@ -2540,7 +2899,12 @@ impl BrowserSessionRegistry {
         format!("browser-launch:{:016x}", self.serial)
     }
 
-    fn take_stale_active_pages(&mut self, scope: &str, now: Instant) -> Vec<BrowserPageCleanup> {
+    fn take_stale_active_pages(
+        &mut self,
+        data_dir: &Path,
+        scope: &str,
+        now: Instant,
+    ) -> Result<Vec<BrowserPageCleanup>, String> {
         let stale_keys: Vec<_> = self
             .sessions
             .iter()
@@ -2551,19 +2915,55 @@ impl BrowserSessionRegistry {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        stale_keys
+        let stale_ownerships = stale_keys
             .into_iter()
-            .filter_map(|key| {
-                self.sessions.remove(&key).and_then(|session| {
-                    let engine_cleanup = browser_engine_cleanup(&session)?;
-                    Some(BrowserPageCleanup {
-                        engine_cleanup,
-                        stream_cleanup: session.stream_cleanup,
-                        active_session: false,
-                    })
-                })
+            .map(|key| {
+                let session = self
+                    .sessions
+                    .get(&key)
+                    .ok_or_else(|| "Browser stale ownership changed before transfer".to_string())?;
+                let ownership = browser_durable_ownership(session).ok_or_else(|| {
+                    "Browser stale provider cleanup binding is incomplete".to_string()
+                })?;
+                Ok((key, ownership))
             })
-            .collect()
+            .collect::<Result<Vec<_>, String>>()?;
+
+        for (_, ownership) in &stale_ownerships {
+            write_browser_durable_ownership(data_dir, ownership)?;
+        }
+
+        let mut stale_pages = Vec::with_capacity(stale_ownerships.len());
+        for (key, ownership) in stale_ownerships {
+            let engine_cleanup = ownership.engine_cleanup;
+            let stream_cleanup = ownership.stream_cleanup;
+            if let Some(stream) = stream_cleanup.clone() {
+                self.pending_stream_cleanups.insert(
+                    browser_stream_cleanup_key(scope, &stream.stream_id),
+                    BrowserStreamCleanupObligation {
+                        cleanup: stream,
+                        in_flight: true,
+                    },
+                );
+            }
+            self.pending_engine_cleanups.insert(
+                browser_engine_cleanup_key(scope, &engine_cleanup),
+                BrowserEngineCleanupObligation {
+                    scope: scope.to_string(),
+                    cleanup: engine_cleanup.clone(),
+                    browser_page: Some(ownership.browser_page),
+                    in_flight: true,
+                    attempts: 1,
+                },
+            );
+            self.sessions.remove(&key);
+            stale_pages.push(BrowserPageCleanup {
+                engine_cleanup,
+                stream_cleanup,
+                active_session: false,
+            });
+        }
+        Ok(stale_pages)
     }
 }
 
@@ -3081,9 +3481,13 @@ mod tests {
         assert!(!serde_json::to_string(&page_cleanup.engine_cleanup)
             .unwrap()
             .contains(&credential));
-        record_browser_engine_cleanup_obligation(dir.path(), page_cleanup.engine_cleanup.clone())
-            .await
-            .unwrap();
+        record_browser_engine_cleanup_obligation(
+            dir.path(),
+            page_cleanup.engine_cleanup.clone(),
+            page_cleanup.stream_cleanup.clone(),
+        )
+        .await
+        .unwrap();
         let _ = release_browser_page_for_principal(
             dir.path(),
             reservation.page_id(),
@@ -3194,57 +3598,259 @@ mod tests {
         assert_eq!(scope_a_count, 1);
     }
 
-    #[test]
-    fn browser_registry_takes_stale_active_pages_for_cleanup() {
-        let mut registry = BrowserSessionRegistry::default();
-        let now = Instant::now();
-        let mut stale = test_session_record(
-            "/tmp/elastos-test-a",
-            Some("page:stale"),
-            BrowserSessionState::Active,
-            now - ACTIVE_HEARTBEAT_STALE_TTL - Duration::from_secs(5),
-            now - ACTIVE_HEARTBEAT_STALE_TTL - Duration::from_secs(5),
-        );
-        stale.stream_cleanup = Some(BrowserStreamCleanup {
-            stream_id: "remote-carrier:stale".to_string(),
-            principal_id: "person:local:test".to_string(),
-        });
-        registry.sessions.insert("stale-active".to_string(), stale);
-        registry.sessions.insert(
-            "fresh-active".to_string(),
-            test_session_record(
-                "/tmp/elastos-test-a",
-                Some("page:fresh"),
-                BrowserSessionState::Active,
-                now,
-                now,
+    #[tokio::test(start_paused = true)]
+    async fn stale_take_preserves_exact_stream_cleanup_across_retry_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:stale-stream-restart";
+        let owner_launch_id = "launch:stale-stream-restart";
+        let stream_cleanup = BrowserStreamCleanup {
+            stream_id: "stream:stale-stream-restart".to_string(),
+            principal_id: principal_id.to_string(),
+        };
+        let reservation =
+            reserve_browser_launch(dir.path(), principal_id, test_lifecycle(owner_launch_id))
+                .await
+                .unwrap();
+        complete_browser_launch(
+            dir.path(),
+            &reservation,
+            test_durable_launch_effect(
+                &reservation,
+                "page:stale-stream-restart",
+                &stream_cleanup.stream_id,
+                Some(stream_cleanup.clone()),
             ),
-        );
-        registry.sessions.insert(
-            "other-scope".to_string(),
-            test_session_record(
-                "/tmp/elastos-test-b",
-                Some("page:other"),
-                BrowserSessionState::Active,
-                now - ACTIVE_HEARTBEAT_STALE_TTL - Duration::from_secs(5),
-                now - ACTIVE_HEARTBEAT_STALE_TTL - Duration::from_secs(5),
-            ),
-        );
+        )
+        .await
+        .unwrap();
 
-        let stale = registry.take_stale_active_pages("/tmp/elastos-test-a", now);
+        tokio::time::advance(ACTIVE_HEARTBEAT_STALE_TTL + Duration::from_millis(1)).await;
+        let stale = take_stale_browser_pages(dir.path()).await.unwrap();
 
         assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].engine_cleanup.page_id, "page:stale");
+        assert_eq!(stale[0].engine_cleanup.page_id, "page:stale-stream-restart");
+        assert_eq!(stale[0].stream_cleanup, Some(stream_cleanup.clone()));
+        assert_eq!(browser_page_session_count(dir.path()).await, 0);
+        assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 1);
+        assert_eq!(browser_stream_cleanup_obligation_count(dir.path()).await, 1);
+
+        release_browser_engine_cleanup_claim(dir.path(), &stale[0].engine_cleanup).await;
+        let scope = browser_session_scope(dir.path());
+        let registry = BROWSER_SESSION_REGISTRY.get().expect("browser registry");
+        let mut registry = registry.lock().await;
+        registry
+            .pending_engine_cleanups
+            .retain(|_, obligation| obligation.scope != scope);
+        registry
+            .pending_stream_cleanups
+            .retain(|key, _| !key.starts_with(&format!("{scope}\n")));
+        registry.loaded_scopes.remove(&scope);
+        drop(registry);
+
+        let recovered = claim_pending_browser_engine_cleanups(dir.path(), usize::MAX).await;
+        assert_eq!(recovered, vec![stale[0].engine_cleanup.clone()]);
         assert_eq!(
-            stale[0]
-                .stream_cleanup
-                .as_ref()
-                .map(|cleanup| cleanup.stream_id.as_str()),
-            Some("remote-carrier:stale")
+            browser_pending_stream_cleanup_for_engine(dir.path(), &recovered[0]).await,
+            Some(stream_cleanup.clone())
         );
-        assert!(!registry.sessions.contains_key("stale-active"));
-        assert!(registry.sessions.contains_key("fresh-active"));
-        assert!(registry.sessions.contains_key("other-scope"));
+        let blocked = reserve_browser_launch(
+            dir.path(),
+            principal_id,
+            test_lifecycle("launch:blocked-during-stale-retry"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(blocked.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(blocked.1.contains("cleanup is pending"));
+
+        forget_browser_engine_cleanup_obligation(dir.path(), &recovered[0])
+            .await
+            .unwrap();
+        let still_blocked = reserve_browser_launch(
+            dir.path(),
+            principal_id,
+            test_lifecycle("launch:blocked-before-stream-terminal"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(still_blocked.0, StatusCode::SERVICE_UNAVAILABLE);
+        forget_browser_stream_cleanup_failure(dir.path(), &stream_cleanup)
+            .await
+            .unwrap();
+        let replacement = reserve_browser_launch(
+            dir.path(),
+            principal_id,
+            test_lifecycle("launch:replacement-after-both-terminal"),
+        )
+        .await
+        .unwrap();
+        release_browser_launch(&replacement).await;
+        BROWSER_SESSION_REGISTRY
+            .get()
+            .expect("browser registry")
+            .lock()
+            .await
+            .loaded_scopes
+            .remove(&scope);
+    }
+
+    #[test]
+    fn durable_reaped_page_tombstones_are_exact_bounded_retained_and_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let start_unix_ms = 1_700_000_000_000_u64;
+        for index in 0..MAX_BROWSER_REAPED_PAGE_TOMBSTONES + 2 {
+            let now_unix_ms = start_unix_ms.saturating_add(index as u64);
+            persist_browser_reaped_page_tombstone(
+                dir.path(),
+                BrowserReapedPageTombstone {
+                    schema: BROWSER_REAPED_PAGE_TOMBSTONE_SCHEMA.to_string(),
+                    page_id: format!("page:reaped-{index}"),
+                    cleanup_id: format!("browser-cleanup:reaped-{index}"),
+                    principal_id: "person:local:reaped".to_string(),
+                    owner_launch_ids: vec!["launch:reaped".to_string()],
+                    browser_instance: Some("browser:0123456789abcdef0123456789abcdef".to_string()),
+                    terminal_kind: "already_absent".to_string(),
+                    reaped_at_unix_ms: now_unix_ms,
+                },
+                now_unix_ms,
+            )
+            .unwrap();
+        }
+
+        let newest = MAX_BROWSER_REAPED_PAGE_TOMBSTONES + 1;
+        let now_unix_ms = start_unix_ms.saturating_add(newest as u64);
+        assert_eq!(
+            read_bounded_browser_json_dir::<BrowserReapedPageTombstone>(
+                dir.path(),
+                &browser_reaped_page_tombstone_dir(dir.path()),
+                MAX_BROWSER_REAPED_PAGE_TOMBSTONES,
+                MAX_BROWSER_REAPED_PAGE_TOMBSTONE_BYTES,
+            )
+            .unwrap()
+            .len(),
+            MAX_BROWSER_REAPED_PAGE_TOMBSTONES
+        );
+        assert!(browser_reaped_page_tombstone_matches_at(
+            dir.path(),
+            "page:reaped-0",
+            "person:local:reaped",
+            "launch:reaped",
+            "browser-cleanup:reaped-0",
+            None,
+            now_unix_ms,
+        )
+        .unwrap()
+        .is_none());
+        assert!(browser_reaped_page_tombstone_matches_at(
+            dir.path(),
+            &format!("page:reaped-{newest}"),
+            "person:local:reaped",
+            "launch:reaped",
+            &format!("browser-cleanup:reaped-{newest}"),
+            None,
+            now_unix_ms,
+        )
+        .unwrap()
+        .is_some());
+        assert!(browser_reaped_page_tombstone_matches_at(
+            dir.path(),
+            &format!("page:reaped-{newest}"),
+            "person:local:reaped",
+            "launch:wrong-owner",
+            &format!("browser-cleanup:reaped-{newest}"),
+            None,
+            now_unix_ms,
+        )
+        .unwrap()
+        .is_none());
+        assert!(browser_reaped_page_tombstone_matches_at(
+            dir.path(),
+            &format!("page:reaped-{newest}"),
+            "person:local:reaped",
+            "launch:refreshed",
+            &format!("browser-cleanup:reaped-{newest}"),
+            Some("browser:fedcba9876543210fedcba9876543210"),
+            now_unix_ms,
+        )
+        .unwrap()
+        .is_none());
+        assert!(browser_reaped_page_tombstone_matches_at(
+            dir.path(),
+            &format!("page:reaped-{newest}"),
+            "person:local:reaped",
+            "launch:refreshed",
+            &format!("browser-cleanup:reaped-{newest}"),
+            Some("browser:0123456789abcdef0123456789abcdef"),
+            now_unix_ms,
+        )
+        .unwrap()
+        .is_some());
+        assert!(browser_reaped_page_tombstone_matches_at(
+            dir.path(),
+            &format!("page:reaped-{newest}"),
+            "person:local:reaped",
+            "launch:unrelated",
+            &format!("browser-cleanup:reaped-{newest}"),
+            Some("browser:0123456789abcdef0123456789abcdef"),
+            now_unix_ms,
+        )
+        .unwrap()
+        .is_none());
+
+        let mut generic_retry = load_fresh_browser_reaped_page_tombstones(dir.path(), now_unix_ms)
+            .unwrap()
+            .into_iter()
+            .find(|receipt| receipt.cleanup_id == format!("browser-cleanup:reaped-{newest}"))
+            .unwrap();
+        generic_retry.owner_launch_ids = vec!["launch:reaped".to_string()];
+        persist_browser_reaped_page_tombstone(dir.path(), generic_retry, now_unix_ms).unwrap();
+        let retained = load_fresh_browser_reaped_page_tombstones(dir.path(), now_unix_ms)
+            .unwrap()
+            .into_iter()
+            .find(|receipt| receipt.cleanup_id == format!("browser-cleanup:reaped-{newest}"))
+            .unwrap();
+        assert_eq!(
+            retained.owner_launch_ids,
+            vec!["launch:reaped".to_string(), "launch:refreshed".to_string()]
+        );
+
+        let delayed_resume_unix_ms = now_unix_ms.saturating_add(
+            BROWSER_REAPED_PAGE_TOMBSTONE_RETENTION_SECS
+                .saturating_sub(1)
+                .saturating_mul(1_000),
+        );
+        assert!(browser_reaped_page_tombstone_matches_at(
+            dir.path(),
+            &format!("page:reaped-{newest}"),
+            "person:local:reaped",
+            "launch:reaped",
+            &format!("browser-cleanup:reaped-{newest}"),
+            None,
+            delayed_resume_unix_ms,
+        )
+        .unwrap()
+        .is_some());
+
+        let expired_unix_ms = now_unix_ms
+            .saturating_add(BROWSER_REAPED_PAGE_TOMBSTONE_RETENTION_SECS.saturating_mul(1_000))
+            .saturating_add(1);
+        assert!(browser_reaped_page_tombstone_matches_at(
+            dir.path(),
+            &format!("page:reaped-{newest}"),
+            "person:local:reaped",
+            "launch:reaped",
+            &format!("browser-cleanup:reaped-{newest}"),
+            None,
+            expired_unix_ms,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            std::fs::read_dir(browser_reaped_page_tombstone_dir(dir.path()))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -3643,7 +4249,7 @@ mod tests {
         .unwrap()
         .unwrap()
         .engine_cleanup;
-        record_browser_engine_cleanup_obligation(dir.path(), cleanup.clone())
+        record_browser_engine_cleanup_obligation(dir.path(), cleanup.clone(), None)
             .await
             .unwrap();
         let ownership_path = browser_ownership_path(dir.path(), &cleanup.cleanup_id);
