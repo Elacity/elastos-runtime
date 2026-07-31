@@ -1295,8 +1295,9 @@ assert(
     browserVmEngineSupervisor.includes("delete env[REQUEST_ENV]") &&
     browserVmEngineSupervisor.includes('path.join(dataDir, "bvm")') &&
     browserVmEngineSupervisor.includes("/tmp/evzs") &&
-    browserVmEngineSupervisor.includes("sessionSuffix") &&
-    browserVmEngineSupervisor.includes("bvm-") &&
+    !browserVmEngineSupervisor.includes("function sessionSuffix") &&
+    !browserVmEngineSupervisor.includes("fs.mkdirSync(sessionDir") &&
+    browserVmEngineSupervisor.includes("Browser VM control isolation session_dir") &&
     browserVmEngineSupervisor.includes("elastos.browser.vm-engine.open/v1") &&
     browserVmEngineSupervisor.includes("chromium_microvm") &&
     browserVmEngineSupervisor.includes("per_launch_vm_target") &&
@@ -1460,10 +1461,11 @@ assert(
     !browserVzEngineSupervisor.includes("DEFAULT_RELAY_PORT") &&
     browserVzEngineSupervisor.includes("DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
     browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
-    browserVzEngineSupervisor.includes("DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
-    browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
-    browserVzEngineSupervisor.includes("probe_guest_control_status") &&
-    browserVzEngineSupervisor.includes("guest control status probe") &&
+    !browserVzEngineSupervisor.includes("DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
+    !browserVzEngineSupervisor.includes("probe_guest_control_status") &&
+    !browserVzEngineSupervisor.includes("probe_guest_control_events") &&
+    !browserVzEngineSupervisor.includes("guest control status probe") &&
+    !browserVzEngineSupervisor.includes("guest control events probe") &&
     browserVzEngineSupervisor.includes("UNIX_SOCKET_PATH_BUDGET") &&
     browserVzEngineSupervisor.includes("validate_unix_socket_path_budget") &&
     browserVzEngineSupervisor.includes("/tmp/evzs") &&
@@ -1577,8 +1579,14 @@ assert(
     browserVmTargetStage.includes("ice-transport-policy") &&
     browserVmTargetStage.includes("elastos_ice_transport_policy") &&
     browserVmTargetStage.includes("confirmed ICE transport policy after TURN setup") &&
+    browserVmTargetStage.includes("_elastos_turn_transport_query") &&
+    browserVmTargetStage.includes("urllib.parse.parse_qs") &&
+    browserVmTargetStage.includes('"turn://%s:%s@%s:%s%s"') &&
+    browserVmTargetStage.includes('get_property("ice-agent")') &&
+    browserVmTargetStage.includes('ice_agent.emit("add-local-ip-address", "127.0.0.1")') &&
     browserVmTargetStage.includes("emitting ICE candidate") &&
-    browserVmTargetStage.includes("browser-vm-selkies-start: ICE config follows") &&
+    !browserVmTargetStage.includes("browser-vm-selkies-start: ICE config follows") &&
+    !browserVmTargetStage.includes("cat /run/elastos/browser-rtc.json") &&
     browserVmTargetStage.includes("ip addr show dev") &&
     browserVmTargetStage.includes("webrtc_remote_display requires at least one turn:/turns:") &&
     browserVmTargetStage.includes("browser-ice-servers.json") &&

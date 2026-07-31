@@ -1197,6 +1197,58 @@ if not spec or not spec.origin:
 
 path = Path(spec.origin)
 text = path.read_text()
+main_path = path.with_name("__main__.py")
+if not main_path.is_file():
+    raise SystemExit("browser-vm-selkies-start: Selkies __main__.py not found")
+main_text = main_path.read_text()
+transport_helper_marker = "\ndef parse_rtc_config(data):\n"
+transport_helper_patch = '''
+def _elastos_turn_transport_query(url):
+    raw_query = urllib.parse.urlsplit(url).query
+    if not raw_query:
+        return ""
+    query = urllib.parse.parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=True,
+    )
+    if set(query) - {"transport"}:
+        raise ValueError("TURN URL contains unsupported query parameters")
+    transports = query.get("transport", [])
+    if not transports:
+        return ""
+    if len(transports) != 1 or transports[0] not in ("udp", "tcp"):
+        raise ValueError("TURN transport must be exactly udp or tcp")
+    return "?transport=" + transports[0]
+'''
+turn_uri_marker = '''                turn_uri = "turn://%s:%s@%s:%s" % (
+                    urllib.parse.quote(turn_user, safe=""),
+                    urllib.parse.quote(turn_password, safe=""),
+                    turn_host,
+                    turn_port
+                )
+'''
+turn_uri_patch = '''                turn_uri = "turn://%s:%s@%s:%s%s" % (
+                    urllib.parse.quote(turn_user, safe=""),
+                    urllib.parse.quote(turn_password, safe=""),
+                    turn_host,
+                    turn_port,
+                    _elastos_turn_transport_query(url)
+                )
+'''
+if "_elastos_turn_transport_query" not in main_text:
+    if transport_helper_marker not in main_text:
+        raise SystemExit("browser-vm-selkies-start: Selkies RTC parser patch target not found")
+    if turn_uri_marker not in main_text:
+        raise SystemExit("browser-vm-selkies-start: Selkies TURN URI patch target not found")
+    main_text = main_text.replace(
+        transport_helper_marker,
+        transport_helper_patch + transport_helper_marker,
+        1,
+    )
+    main_text = main_text.replace(turn_uri_marker, turn_uri_patch, 1)
+if "_elastos_turn_transport_query(url)" not in main_text:
+    raise SystemExit("browser-vm-selkies-start: Selkies TURN transport patch incomplete")
 fraction_needle = "from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC\n    fract = Gst.Fraction(60, 1)"
 fraction_replacement = """from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC
     def _elastos_raw_caps_with_framerate(framerate):
@@ -1272,6 +1324,15 @@ turn_patch = '''        if elastos_ice_transport_policy:
             self.webrtcbin.set_property("ice-transport-policy", policy_value)
             logger.info("confirmed ICE transport policy after TURN setup: %s", elastos_ice_transport_policy)
 '''
+local_address_marker = '        self.pipeline.add(self.webrtcbin)\n'
+local_address_patch = '''        if os.environ.get("ELASTOS_BROWSER_VM_VZ_TRANSPORT", "").strip() == "vsock_v1":
+            self._elastos_vz_ice_agent = self.webrtcbin.get_property("ice-agent")
+            if self._elastos_vz_ice_agent is None:
+                raise GSTWebRTCAppError("VZ ICE agent is unavailable")
+            if not self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1"):
+                raise GSTWebRTCAppError("VZ ICE loopback address was rejected")
+            logger.info("using explicit VZ ICE local address: 127.0.0.1")
+'''
 if "elastos_ice_transport_policy" not in text:
     if marker not in text:
         raise SystemExit("browser-vm-selkies-start: Selkies relay patch target not found")
@@ -1282,6 +1343,17 @@ if "confirmed ICE transport policy after TURN setup" not in text:
     text = text.replace(turn_marker, turn_marker + turn_patch, 1)
 if "confirmed ICE transport policy after TURN setup" not in text:
     raise SystemExit("browser-vm-selkies-start: Selkies relay policy patch incomplete")
+if local_address_patch in text:
+    text = text.replace(local_address_patch, "", 1)
+if local_address_marker not in text:
+    raise SystemExit("browser-vm-selkies-start: Selkies ICE local address patch target not found")
+text = text.replace(
+    local_address_marker,
+    local_address_marker + local_address_patch,
+    1,
+)
+if 'self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1")' not in text:
+    raise SystemExit("browser-vm-selkies-start: Selkies VZ ICE local address patch incomplete")
 ice_log_marker = '        logger.debug("received ICE candidate: %d %s", mlineindex, candidate)\n'
 ice_log_patch = '        logger.info("emitting ICE candidate: %d %s", mlineindex, candidate)\n'
 if ice_log_patch not in text:
@@ -1427,6 +1499,7 @@ if audio_offer_patch not in text:
         raise SystemExit("browser-vm-selkies-start: Selkies split audio offer patch target not found")
     text = text.replace(audio_offer_marker, audio_offer_patch, 1)
 path.write_text(text)
+main_path.write_text(main_text)
 PY
 }
 
@@ -1503,13 +1576,6 @@ configure_static_media_relay_ipv4() {
     busybox ip addr add "${ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4}/${ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX}" dev "$iface" 2>/dev/null || true
   fi
   echo "browser-vm-selkies-start: media relay IPv4 ${ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4}/${ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX} assigned on ${iface}" >&2
-}
-
-log_media_relay_config() {
-  echo "browser-vm-selkies-start: ICE config follows" >&2
-  cat /run/elastos/browser-rtc.json >&2 || true
-  echo "browser-vm-selkies-start: media relay network config follows" >&2
-  cat /run/elastos/browser-media-relay-network.json >&2 || true
 }
 
 /opt/elastos/bin/node <<'NODE'
@@ -1765,7 +1831,6 @@ export ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY
 selkies_checkpoint "ice config written"
 patch_selkies_relay_policy
 selkies_checkpoint "selkies relay policy patched"
-log_media_relay_config
 
 if [ "$ELASTOS_BROWSER_VM_VZ_TRANSPORT" != "vsock_v1" ] && [ "$(cat /run/elastos/browser-ice-servers.json)" != "[]" ]; then
   setup_media_relay_network

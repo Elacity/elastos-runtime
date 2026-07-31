@@ -83,6 +83,27 @@ if (!start.includes(': "${ELASTOS_BROWSER_VM_SELKIES_ENCODER:=openh264enc}"')) t
 if (!start.includes('--encoder="$ELASTOS_BROWSER_VM_SELKIES_ENCODER"')) throw new Error("VM Selkies encoder must be runtime-selected");
 if (start.includes("--encoder=x264enc")) throw new Error("VM Selkies encoder must not be hardcoded to x264enc");
 if (start.includes("x264enc-striped|jpeg")) throw new Error("VM Selkies encoder validation must match Selkies GStreamer");
+if (start.includes("cat /run/elastos/browser-rtc.json")) throw new Error("VM startup must not log private ICE credentials");
+for (const expected of [
+  "_elastos_turn_transport_query",
+  "urllib.parse.parse_qs",
+  'transports[0] not in ("udp", "tcp")',
+  '"turn://%s:%s@%s:%s%s"',
+  "_elastos_turn_transport_query(url)",
+  'self._elastos_vz_ice_agent = self.webrtcbin.get_property("ice-agent")',
+  'self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1")',
+  "using explicit VZ ICE local address",
+]) {
+  if (!start.includes(expected)) {
+    throw new Error(`VM Selkies TURN transport patch is missing ${expected}`);
+  }
+}
+if (
+  start.indexOf('self.pipeline.add(self.webrtcbin)') >
+  start.indexOf('self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1")')
+) {
+  throw new Error("VM Selkies VZ ICE address must be added only after webrtcbin is parented");
+}
 NODE
 
 printf '%s\n' '{"schema":"elastos.browser.vm-target-stage-smoke/v1","ok":true}'

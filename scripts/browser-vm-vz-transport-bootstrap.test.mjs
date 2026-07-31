@@ -120,7 +120,18 @@ test("bootstrap proves loopback-only guest state and owner-only outputs", () => 
       ipv4,
       "Iface\tDestination\tGateway\tFlags\nlo\t0000007F\t00000000\t0001\n",
     );
-    fs.writeFileSync(ipv6, "");
+    fs.writeFileSync(
+      ipv6,
+      [
+        `${"0".repeat(32)} 00 ${"0".repeat(32)} 00 ${"0".repeat(
+          32,
+        )} ffffffff 00000001 00000000 00200200 lo`,
+        `${"0".repeat(31)}1 80 ${"0".repeat(32)} 00 ${"0".repeat(
+          32,
+        )} 00000000 00000002 00000000 80200001 lo`,
+        "",
+      ].join("\n"),
+    );
     assert.deepEqual(
       guestNetworkState({
         netClassPath: netClass,
@@ -130,6 +141,23 @@ test("bootstrap proves loopback-only guest state and owner-only outputs", () => 
       { interfaces: ["lo"], default_route_absent: true },
     );
 
+    fs.writeFileSync(
+      ipv6,
+      `${"0".repeat(32)} 00 ${"0".repeat(32)} 00 ${"0".repeat(
+        32,
+      )} 00000000 00000001 00000000 00000001 lo\n`,
+    );
+    assert.throws(
+      () =>
+        guestNetworkState({
+          netClassPath: netClass,
+          ipv4RoutePath: ipv4,
+          ipv6RoutePath: ipv6,
+        }),
+      /unexpectedly has a default route/,
+    );
+
+    fs.writeFileSync(ipv6, "");
     fs.mkdirSync(path.join(netClass, "eth0"));
     assert.throws(
       () =>

@@ -330,7 +330,16 @@ function guestNetworkState({
     .some((line) => line.trim().split(/\s+/)[1] === "00000000");
   const defaultIpv6 = ipv6Routes
     .split(/\n/)
-    .some((line) => line.trim().split(/\s+/)[0] === "0".repeat(32));
+    .some((line) => {
+      const fields = line.trim().split(/\s+/);
+      if (fields[0] !== "0".repeat(32) || fields[1] !== "00") {
+        return false;
+      }
+      const flags = Number.parseInt(fields[8], 16);
+      const routeIsRejected =
+        Number.isSafeInteger(flags) && (flags & 0x0200) !== 0;
+      return !routeIsRejected;
+    });
   if (defaultIpv4 || defaultIpv6) {
     throw new Error("Browser VZ guest unexpectedly has a default route");
   }
