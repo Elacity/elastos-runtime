@@ -204,7 +204,6 @@ export function createWalletPreferences({
     if (!target || !activeHomeToken || !homeParentOrigin || window.top === window) {
       return;
     }
-    closeDrawers();
     window.top.postMessage({
       type: "home:open-target",
       target,

@@ -56,6 +56,8 @@ mod gateway_home_system;
 mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
 mod gateway_home_token;
+#[path = "gateway_home_wallet_connector.rs"]
+mod gateway_home_wallet_connector;
 #[path = "gateway_inbox.rs"]
 mod gateway_inbox;
 #[path = "gateway_inspect_actions.rs"]
@@ -104,6 +106,7 @@ pub(crate) use gateway_home_token::{
     issue_home_launch_token, issue_home_launch_token_with_context, local_home_launch_token_context,
     set_test_home_launch_auth_data_dir, uuid_like_token,
 };
+use gateway_home_wallet_connector::*;
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
@@ -329,11 +332,6 @@ pub(crate) const WALLET_CAPSULE_ID: &str = "wallet";
 pub(crate) const WALLET_UNISAT_CAPSULE_ID: &str = "wallet-unisat";
 pub(crate) const WALLET_WALLETCONNECT_CAPSULE_ID: &str = "wallet-walletconnect";
 const WALLET_CONNECTOR_CAPSULE_IDS: &[&str] = &[
-    WALLET_METAMASK_CAPSULE_ID,
-    WALLET_UNISAT_CAPSULE_ID,
-    WALLET_WALLETCONNECT_CAPSULE_ID,
-];
-pub(crate) const WALLET_LINK_CAPSULE_IDS: &[&str] = &[
     WALLET_METAMASK_CAPSULE_ID,
     WALLET_UNISAT_CAPSULE_ID,
     WALLET_WALLETCONNECT_CAPSULE_ID,
@@ -787,6 +785,30 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/apps/browser/wallet/approvals/:request_id",
             get(gateway_browser::browser_app_wallet_approval_status)
                 .options(gateway_browser::browser_app_wallet_cors_preflight),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/evm/link/challenge",
+            post(home_wallet_connector_evm_link_challenge),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/evm/link/verify",
+            post(home_wallet_connector_evm_link_verify),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/bitcoin/link/challenge",
+            post(home_wallet_connector_bitcoin_link_challenge),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/bitcoin/link/verify",
+            post(home_wallet_connector_bitcoin_link_verify),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/approvals/:request_id/handoff",
+            post(home_wallet_connector_approval_handoff),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/approvals/:request_id/complete",
+            post(home_wallet_connector_approval_complete),
         )
         .route(
             "/api/apps/:wallet_connector/wallet/approvals",

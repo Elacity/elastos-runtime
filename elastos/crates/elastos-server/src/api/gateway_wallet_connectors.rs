@@ -89,6 +89,9 @@ pub(in crate::api::gateway) async fn wallet_connector_approval_approve(
     headers: HeaderMap,
     Json(input): Json<WalletApprovalApproveRequest>,
 ) -> Response {
+    if let Err(err) = require_capsule_owned_connector_effects(&wallet_connector) {
+        return system_error_response(err);
+    }
     let authority = match require_wallet_connector_launch_authority(
         &state.data_dir,
         &headers,
@@ -129,6 +132,9 @@ pub(in crate::api::gateway) async fn wallet_connector_approval_complete(
     headers: HeaderMap,
     Json(input): Json<WalletApprovalCompleteRequest>,
 ) -> Response {
+    if let Err(err) = require_capsule_owned_connector_effects(&wallet_connector) {
+        return system_error_response(err);
+    }
     let authority = match require_wallet_connector_launch_authority(
         &state.data_dir,
         &headers,
@@ -156,6 +162,18 @@ pub(in crate::api::gateway) async fn wallet_connector_approval_complete(
         }
         Err(err) => system_error_response(err),
     }
+}
+
+fn require_capsule_owned_connector_effects(connector_id: &str) -> anyhow::Result<()> {
+    if connector_id == WALLET_WALLETCONNECT_CAPSULE_ID {
+        return Ok(());
+    }
+    if connector_id == WALLET_METAMASK_CAPSULE_ID || connector_id == WALLET_UNISAT_CAPSULE_ID {
+        anyhow::bail!(
+            "wallet connector injected-wallet effects require the trusted Home host bridge"
+        );
+    }
+    anyhow::bail!("unknown wallet connector capsule")
 }
 
 pub(in crate::api::gateway) fn require_wallet_connector_launch_context(

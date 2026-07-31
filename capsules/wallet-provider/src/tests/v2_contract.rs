@@ -250,7 +250,7 @@ fn wallet_contract_rejects_missing_and_mixed_protocol_versions() {
             create_new: true,
         },
     );
-    for version in [Some("1.0"), Some("2.0"), Some("2.1"), None] {
+    for version in [Some("1.0"), Some("2.0"), Some("2.1"), Some("2.2"), None] {
         let mut value = serde_json::to_value(&request).unwrap();
         match version {
             Some(version) => value["protocol_version"] = json!(version),

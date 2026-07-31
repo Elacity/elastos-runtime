@@ -59,7 +59,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260715a";
+} from "./shell-windows.js?v=home-20260726a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;

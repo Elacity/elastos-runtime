@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 
-pub const WALLET_PROTOCOL_VERSION: &str = "2.2";
+pub const WALLET_PROTOCOL_VERSION: &str = "2.3";
 pub const WALLET_BUS_OPERATION: &str = "wallet_contract";
 pub const WALLET_REQUEST_SCHEMA: &str = "elastos.wallet.provider-request/v2";
 pub const WALLET_RESPONSE_SCHEMA: &str = "elastos.wallet.provider-response/v2";
@@ -1573,7 +1573,7 @@ mod tests {
             (
                 WalletOperationKind::Challenge,
                 WalletProviderOperationV2::Challenge {
-                    domain: "localhost".to_string(),
+                    domain: "http://localhost".to_string(),
                     uri: "http://localhost/apps/home/".to_string(),
                     address: EVM_ADDRESS.to_string(),
                     chain_id: 20,
@@ -1724,7 +1724,7 @@ mod tests {
     #[test]
     fn wire_contract_constants_are_exact() {
         assert_eq!(WALLET_BUS_OPERATION, "wallet_contract");
-        assert_eq!(WALLET_PROTOCOL_VERSION, "2.2");
+        assert_eq!(WALLET_PROTOCOL_VERSION, "2.3");
         assert_eq!(WALLET_REQUEST_SCHEMA, "elastos.wallet.provider-request/v2");
         assert_eq!(
             WALLET_RESPONSE_SCHEMA,
@@ -2291,12 +2291,13 @@ mod tests {
         });
         let value = serde_json::to_value(request).unwrap();
         for (schema, version) in [
-            (None, Some("2.2")),
+            (None, Some("2.3")),
             (Some(WALLET_REQUEST_SCHEMA), None),
-            (Some("elastos.wallet.provider-request/v1"), Some("2.2")),
+            (Some("elastos.wallet.provider-request/v1"), Some("2.3")),
             (Some(WALLET_REQUEST_SCHEMA), Some("1.0")),
             (Some(WALLET_REQUEST_SCHEMA), Some("2.0")),
             (Some(WALLET_REQUEST_SCHEMA), Some("2.1")),
+            (Some(WALLET_REQUEST_SCHEMA), Some("2.2")),
         ] {
             let mut candidate = value.clone();
             match schema {
@@ -2536,12 +2537,13 @@ mod tests {
         }
 
         for (schema, version) in [
-            (None, Some("2.2")),
+            (None, Some("2.3")),
             (Some(WALLET_RESPONSE_SCHEMA), None),
-            (Some("elastos.wallet.provider-response/v1"), Some("2.2")),
+            (Some("elastos.wallet.provider-response/v1"), Some("2.3")),
             (Some(WALLET_RESPONSE_SCHEMA), Some("1.0")),
             (Some(WALLET_RESPONSE_SCHEMA), Some("2.0")),
             (Some(WALLET_RESPONSE_SCHEMA), Some("2.1")),
+            (Some(WALLET_RESPONSE_SCHEMA), Some("2.2")),
         ] {
             let mut candidate = serde_json::to_value(&response).unwrap();
             match schema {

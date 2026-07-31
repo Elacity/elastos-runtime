@@ -3099,6 +3099,14 @@ impl RecordingWalletProvider {
         }
     }
 
+    async fn assert_no_requests(&self) {
+        let requests = self.requests.lock().await;
+        assert!(
+            requests.is_empty(),
+            "request rejected at the Runtime boundary reached Wallet Provider: {requests:?}"
+        );
+    }
+
     async fn assert_v2_operations(
         &self,
         expected_actor: &str,
@@ -4322,6 +4330,7 @@ impl MockWalletProvider {
                         "payload_hash": payload_hash,
                         "signer": signer,
                         "message": format!("ElastOS Wallet Approval\n\nRequest: {request_id}"),
+                        "signature_type": "personal_sign",
                         "status": "awaiting_wallet_signature"
                     })
                 };

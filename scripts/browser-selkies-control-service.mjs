@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import tls from "node:tls";
-import { URL } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 
 const CONFIG_ENV = "ELASTOS_BROWSER_SELKIES_CONTROL_CONFIG";
 const HOSTED_PRODUCT_OPEN_SCHEMA = "elastos.browser.hosted-product.open/v1";
@@ -42,6 +42,229 @@ const WALLET_RUNTIME_POST_URL_FIELDS = {
   transaction: "transaction_url",
   transactionBroadcast: "transaction_broadcast_url",
 };
+
+function walletApprovalError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+export function walletApprovalDeadlineMs(expiresAt, nowMs) {
+  if (!Number.isSafeInteger(expiresAt)) {
+    throw walletApprovalError(
+      "Runtime wallet approval response did not include a valid expiry.",
+      4100,
+    );
+  }
+  const deadlineMs = expiresAt * 1000;
+  if (!Number.isSafeInteger(deadlineMs)) {
+    throw walletApprovalError(
+      "Runtime wallet approval response did not include a valid expiry.",
+      4100,
+    );
+  }
+  if (deadlineMs <= nowMs) {
+    throw walletApprovalError(
+      "Wallet request expired before approval.",
+      4001,
+    );
+  }
+  if (deadlineMs - nowMs > 30 * 60 * 1000) {
+    throw walletApprovalError(
+      "Runtime wallet approval expiry exceeds the maximum wait.",
+      4100,
+    );
+  }
+  return deadlineMs;
+}
+
+function isTerminalWalletApproval(status) {
+  return ["completed", "rejected", "expired"].includes(status?.status);
+}
+
+function walletApprovalStatusTimeoutError() {
+  return walletApprovalError(
+    "Runtime wallet approval status observation timed out.",
+    4100,
+  );
+}
+
+function withWalletApprovalStatusTimeout(promise, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (complete, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      complete(value);
+    };
+    const timer = setTimeout(
+      () => settle(reject, walletApprovalStatusTimeoutError()),
+      timeoutMs,
+    );
+    Promise.resolve(promise).then(
+      (value) => settle(resolve, value),
+      (error) => settle(reject, error),
+    );
+  });
+}
+
+async function observeWalletApprovalStatus(
+  requestId,
+  timeoutMs,
+  { getStatus, withStatusTimeout },
+) {
+  try {
+    return await withStatusTimeout(
+      Promise.resolve().then(() => getStatus(requestId, { timeoutMs })),
+      timeoutMs,
+    );
+  } catch {
+    return null;
+  }
+}
+
+export async function waitForWalletApprovalStatus(
+  requestId,
+  expiresAt,
+  {
+    getStatus,
+    now = Date.now,
+    wait = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+    pollIntervalMs = 1000,
+    statusIoTimeoutMs = 3000,
+    withStatusTimeout = withWalletApprovalStatusTimeout,
+  },
+) {
+  const deadlineMs = walletApprovalDeadlineMs(expiresAt, now());
+  while (now() < deadlineMs) {
+    const status = await observeWalletApprovalStatus(
+      requestId,
+      Math.max(1, Math.min(statusIoTimeoutMs, deadlineMs - now())),
+      { getStatus, withStatusTimeout },
+    );
+    if (isTerminalWalletApproval(status)) {
+      return status;
+    }
+    const remainingMs = deadlineMs - now();
+    if (remainingMs <= 0) {
+      break;
+    }
+    await wait(Math.min(pollIntervalMs, remainingMs));
+  }
+  const finalStatus = await observeWalletApprovalStatus(
+    requestId,
+    statusIoTimeoutMs,
+    { getStatus, withStatusTimeout },
+  );
+  if (isTerminalWalletApproval(finalStatus)) {
+    return finalStatus;
+  }
+  throw walletApprovalError(
+    "Wallet request timed out before approval.",
+    4001,
+  );
+}
+
+export async function waitForWalletApprovalSignature(
+  requestId,
+  expiresAt,
+  options,
+) {
+  const status = await waitForWalletApprovalStatus(
+    requestId,
+    expiresAt,
+    options,
+  );
+  if (status.status === "completed") {
+    if (typeof status.signature === "string" && status.signature.trim() !== "") {
+      return status.signature;
+    }
+    throw walletApprovalError(
+      "Runtime wallet approval completed without a signature.",
+      4100,
+    );
+  }
+  if (status.status === "rejected") {
+    throw walletApprovalError(
+      "Wallet request was rejected in ElastOS Wallet/Inbox.",
+      4001,
+    );
+  }
+  throw walletApprovalError(
+    "Wallet request expired before approval.",
+    4001,
+  );
+}
+
+export async function waitForWalletApprovalTransaction(
+  requestId,
+  expiresAt,
+  { broadcastTransaction, ...options },
+) {
+  const status = await waitForWalletApprovalStatus(
+    requestId,
+    expiresAt,
+    options,
+  );
+  if (status.status === "rejected") {
+    throw walletApprovalError(
+      "Wallet request was rejected in ElastOS Wallet/Inbox.",
+      4001,
+    );
+  }
+  if (status.status === "expired") {
+    throw walletApprovalError(
+      "Wallet request expired before approval.",
+      4001,
+    );
+  }
+  if (
+    typeof status.transaction_hash === "string" &&
+    status.transaction_hash.trim() !== ""
+  ) {
+    return status.transaction_hash;
+  }
+  if (
+    typeof status.signed_transaction !== "string" ||
+    status.signed_transaction.trim() === ""
+  ) {
+    throw walletApprovalError(
+      "Runtime wallet approval completed without a signed transaction.",
+      4100,
+    );
+  }
+  const receipt = await broadcastTransaction(requestId);
+  if (
+    typeof receipt?.transaction_hash !== "string" ||
+    receipt.transaction_hash.trim() === ""
+  ) {
+    throw walletApprovalError(
+      "Runtime transaction broadcast did not return a transaction hash.",
+      4100,
+    );
+  }
+  return receipt.transaction_hash;
+}
+
+export function cacheWalletApprovalPromise(cache, cacheKey, create, onReuse) {
+  const existing = cache.get(cacheKey);
+  if (existing) {
+    onReuse?.(existing);
+    return existing.promise;
+  }
+  const entry = { promise: null, requestSuffix: "" };
+  const pending = Promise.resolve().then(() => create(entry));
+  entry.promise = pending.finally(() => {
+    if (cache.get(cacheKey) === entry) {
+      cache.delete(cacheKey);
+    }
+  });
+  cache.set(cacheKey, entry);
+  return entry.promise;
+}
 
 function serialLogLine(line) {
   const target = process.env.ELASTOS_BROWSER_VM_SERIAL_LOG_DEV || "";
@@ -607,6 +830,16 @@ function walletInitScript(wallet) {
   };
   return `
 (() => {
+      ${walletApprovalError.toString()}
+      ${walletApprovalDeadlineMs.toString()}
+      ${isTerminalWalletApproval.toString()}
+      ${walletApprovalStatusTimeoutError.toString()}
+      ${withWalletApprovalStatusTimeout.toString()}
+      ${observeWalletApprovalStatus.toString()}
+      ${waitForWalletApprovalStatus.toString()}
+      ${waitForWalletApprovalSignature.toString()}
+      ${waitForWalletApprovalTransaction.toString()}
+      ${cacheWalletApprovalPromise.toString()}
       if (!globalThis.__elastosBrowserNavigationPolicyInstalled) {
         Object.defineProperty(globalThis, "__elastosBrowserNavigationPolicyInstalled", {
           value: true,
@@ -720,19 +953,10 @@ function walletInitScript(wallet) {
             ].join("\\n");
         };
         const waitForCachedWalletApproval = (cacheKey, createApproval, options = {}) => {
-          const existing = walletApprovalPending.get(cacheKey);
-          if (existing) {
-            pushWalletDebug("approval_reuse", {
-              kind: String(options.kind || ""),
-              method: String(options.method || ""),
-              request_suffix: existing.requestSuffix || "",
-            });
-            return existing.promise;
-          }
-          const entry = { requestSuffix: "" };
-          const promise = (async () => {
+          return cacheWalletApprovalPromise(walletApprovalPending, cacheKey, async (entry) => {
             const approval = await createApproval();
             const requestId = approval?.approval_request?.request_id;
+            const expiresAt = approval?.approval_request?.expires_at;
             if (!requestId) {
               throw runtimeError(options.missingMessage || "Runtime wallet approval request was not created.");
             }
@@ -742,13 +966,36 @@ function walletInitScript(wallet) {
               method: String(options.method || ""),
               request_suffix: entry.requestSuffix,
             });
-            return waitForApproval(requestId, { transaction: Boolean(options.transaction) });
-          })();
-          entry.promise = promise.finally(() => {
-            walletApprovalPending.delete(cacheKey);
+            const waitOptions = {
+              getStatus: runtimeGetApproval,
+              pollIntervalMs: 1200,
+            };
+            if (!options.transaction) {
+              return waitForWalletApprovalSignature(requestId, expiresAt, waitOptions);
+            }
+            return waitForWalletApprovalTransaction(requestId, expiresAt, {
+              ...waitOptions,
+              broadcastTransaction: async (approvedRequestId) => {
+                const broadcast = await runtimePost("transactionBroadcast", {
+                  request_id: approvedRequestId,
+                });
+                const transactionHash = broadcast?.transaction_hash;
+                if (typeof transactionHash === "string" && transactionHash) {
+                  pushWalletDebug("transaction_broadcast", {
+                    request_id: approvedRequestId,
+                    hash_suffix: transactionHash.slice(-8),
+                  });
+                }
+                return broadcast;
+              },
+            });
+          }, (existing) => {
+            pushWalletDebug("approval_reuse", {
+              kind: String(options.kind || ""),
+              method: String(options.method || ""),
+              request_suffix: existing.requestSuffix || "",
+            });
           });
-          walletApprovalPending.set(cacheKey, entry);
-          return entry.promise;
         };
         Object.defineProperty(globalThis, "__elastosWalletDebugSnapshot", {
           value: () => ({
@@ -762,7 +1009,7 @@ function walletInitScript(wallet) {
           enumerable: false,
           writable: false
         });
-        const runtimeCall = (message = {}) => {
+        const runtimeCall = (message = {}, options = {}) => {
           const bindingName = state.runtimeBinding;
           const resultName = state.runtimeResult;
           const binding = globalThis[bindingName];
@@ -775,13 +1022,17 @@ function walletInitScript(wallet) {
             return Promise.reject(runtimeError("Runtime wallet bridge binding is unavailable for this Browser session."));
           }
           const id = "wallet:" + (++runtimeRequestId);
+          const timeoutMs =
+            Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0
+              ? Math.min(options.timeoutMs, 60000)
+              : 60000;
           pushWalletDebug("runtime_call", { id, action: String(message.action || ""), operation: String(message.operation || "") });
           return new Promise((resolve, reject) => {
             const timer = window.setTimeout(() => {
               runtimePending.delete(id);
               pushWalletDebug("runtime_timeout", { id, action: String(message.action || ""), operation: String(message.operation || "") });
               reject(runtimeError("Runtime wallet bridge request timed out.", 4001));
-            }, 60000);
+            }, timeoutMs);
           runtimePending.set(id, { resolve, reject, timer });
           try {
             binding(JSON.stringify({ id, ...message }));
@@ -905,33 +1156,15 @@ function walletInitScript(wallet) {
       }
       return payload.result;
     };
-    const runtimeGetApproval = async (requestId) => {
-      return runtimeCall({ action: "approvalStatus", request_id: requestId });
-    };
-    const waitForApproval = async (requestId, { transaction = false } = {}) => {
-      const deadline = Date.now() + 5 * 60 * 1000;
-      while (Date.now() < deadline) {
-        const status = await runtimeGetApproval(requestId);
-        if (status?.status === "completed") {
-          if (transaction) {
-            if (status.transaction_hash) return status.transaction_hash;
-            const broadcast = await runtimePost("transactionBroadcast", { request_id: requestId });
-            const transactionHash = broadcast.transaction_hash || status.transaction_hash;
-            if (typeof transactionHash === "string" && transactionHash) {
-              pushWalletDebug("transaction_broadcast", { request_id: requestId, hash_suffix: transactionHash.slice(-8) });
-              return transactionHash;
-            }
-            throw runtimeError("Runtime transaction broadcast completed without a transaction hash.");
-          }
-          if (status.signature) return status.signature;
-          throw runtimeError("Runtime wallet approval completed without a signature.");
-        }
-        if (status?.status === "rejected" || status?.status === "expired") {
-          throw runtimeError("Runtime wallet approval was " + status.status + ".", 4001);
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1200));
-      }
-      throw runtimeError("Runtime wallet approval timed out.", 4001);
+    const runtimeGetApproval = async (requestId, { timeoutMs } = {}) => {
+      return runtimeCall(
+        {
+          action: "approvalStatus",
+          request_id: requestId,
+          timeout_ms: timeoutMs,
+        },
+        { timeoutMs },
+      );
     };
     const pageUrl = () => {
       try { return window.location.href; } catch { return ""; }
@@ -1106,7 +1339,8 @@ function walletInitScript(wallet) {
       }
       if (method === "eth_sendTransaction") {
         const account = selectedEvmAccount();
-        const approval = await runtimePost("transaction", {
+        const cacheKey = walletApprovalCacheKey("transaction", account, method, params);
+        return waitForCachedWalletApproval(cacheKey, () => runtimePost("transaction", {
           method,
           params,
           account_id: account.account_id,
@@ -1114,12 +1348,12 @@ function walletInitScript(wallet) {
           address: account.address,
           page_url: pageUrl(),
           origin: pageOrigin()
+        }), {
+          kind: "transaction",
+          method,
+          transaction: true,
+          missingMessage: "Runtime transaction approval request was not created.",
         });
-        const requestId = approval?.approval_request?.request_id;
-        if (!requestId) {
-          throw runtimeError("Runtime transaction approval request was not created.");
-        }
-        return waitForApproval(requestId, { transaction: true });
       }
     const error = new Error(method + " requires Runtime Wallet/Inbox approval and is not exposed by this hosted Browser adapter yet.");
     error.code = 4100;
@@ -2774,12 +3008,21 @@ function updateWalletRuntimeState(runtime, payload) {
   return next;
 }
 
-async function walletRuntimeFetchJson(runtime, url, { method = "GET", body = null } = {}) {
+async function walletRuntimeFetchJson(
+  runtime,
+  url,
+  { method = "GET", body = null, timeoutMs: requestedTimeoutMs = null } = {},
+) {
   if (!url || !runtime.wallet.home_token) {
     throw walletRuntimeHttpError("Runtime wallet endpoint is unavailable for this Browser session.");
   }
   const target = new URL(url);
-  const timeoutMs = Math.min(runtime.timeoutMs, 30000);
+  const defaultTimeoutMs = Math.min(runtime.timeoutMs, 30000);
+  const hasRequestedTimeout =
+    Number.isSafeInteger(requestedTimeoutMs) && requestedTimeoutMs > 0;
+  const timeoutMs = hasRequestedTimeout
+    ? Math.min(defaultTimeoutMs, requestedTimeoutMs)
+    : defaultTimeoutMs;
   const jsonBody = body == null ? null : JSON.stringify(body);
   let status = 0;
   let text = "";
@@ -2787,7 +3030,14 @@ async function walletRuntimeFetchJson(runtime, url, { method = "GET", body = nul
     if (!runtime.runtimeFetchProxyUrl) {
       throw new Error("Runtime wallet bridge proxy is required for Browser VM sessions.");
     }
-    ({ status, text } = await walletRuntimeFetchViaProxy(runtime, target, method, jsonBody, timeoutMs));
+    ({ status, text } = await walletRuntimeFetchViaProxy(
+      runtime,
+      target,
+      method,
+      jsonBody,
+      timeoutMs,
+      hasRequestedTimeout,
+    ));
   } catch (error) {
     throw walletRuntimeHttpError(
       `Runtime wallet endpoint request failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -2824,7 +3074,14 @@ function walletRuntimeFetchHeaders(runtime, jsonBody) {
   return headers;
 }
 
-function walletRuntimeFetchViaProxy(runtime, target, method, jsonBody, timeoutMs) {
+function walletRuntimeFetchViaProxy(
+  runtime,
+  target,
+  method,
+  jsonBody,
+  timeoutMs,
+  enforceWallClockTimeout = false,
+) {
   if (target.protocol !== "http:") {
     throw new Error("Runtime wallet proxy supports HTTP bridge endpoints only.");
   }
@@ -2835,7 +3092,24 @@ function walletRuntimeFetchViaProxy(runtime, target, method, jsonBody, timeoutMs
     connection: "close",
   };
   return new Promise((resolve, reject) => {
-    const req = http.request(
+    let settled = false;
+    let req;
+    const settle = (complete, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+      }
+      complete(value);
+    };
+    const deadlineTimer = enforceWallClockTimeout
+      ? setTimeout(() => {
+          req?.destroy(new Error("request timed out"));
+        }, timeoutMs)
+      : null;
+    req = http.request(
       {
         host: proxyUrl.hostname === "localhost" ? "127.0.0.1" : proxyUrl.hostname,
         port: Number(proxyUrl.port || 80),
@@ -2847,14 +3121,14 @@ function walletRuntimeFetchViaProxy(runtime, target, method, jsonBody, timeoutMs
       (res) => {
         const chunks = [];
         res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-        res.on("end", () => resolve({
+        res.on("end", () => settle(resolve, {
           status: res.statusCode || 0,
           text: Buffer.concat(chunks).toString("utf8"),
         }));
       },
     );
     req.on("timeout", () => req.destroy(new Error("request timed out")));
-    req.on("error", reject);
+    req.on("error", (error) => settle(reject, error));
     if (jsonBody != null) {
       req.write(jsonBody);
     }
@@ -2885,7 +3159,11 @@ async function dispatchWalletRuntimeBinding(runtime, message) {
       throw walletRuntimeHttpError("Runtime wallet approval request id is invalid.", 4001);
     }
     const base = String(runtime.wallet.approval_status_url || "").replace(/\/+$/, "");
-    return walletRuntimeFetchJson(runtime, `${base}/${encodeURIComponent(requestId)}`);
+    return walletRuntimeFetchJson(
+      runtime,
+      `${base}/${encodeURIComponent(requestId)}`,
+      { timeoutMs: message.timeout_ms },
+    );
   }
   throw walletRuntimeHttpError("Unsupported Runtime wallet bridge action.", 4001);
 }
@@ -4404,4 +4682,9 @@ async function main() {
   });
 }
 
-main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
+}

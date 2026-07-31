@@ -1,5 +1,5 @@
 use super::*;
-use elastos_auth::{normalize_evm_address, validate_evm_address};
+use elastos_auth::{normalize_evm_address, validate_evm_address, validate_siwe_origin_binding};
 use sha2::Digest;
 
 pub(super) struct LinkAccountInput {
@@ -67,8 +67,7 @@ pub(super) struct SignatureRequestInput {
 
 impl ChallengeInput {
     pub(super) fn validate(&self) -> Result<(), String> {
-        validate_domain(&self.domain)?;
-        validate_uri(&self.uri)?;
+        validate_siwe_origin_binding(&self.domain, &self.uri)?;
         validate_evm_address(&self.address)?;
         if self.chain_id == 0 {
             return Err("chain_id must be non-zero".to_string());

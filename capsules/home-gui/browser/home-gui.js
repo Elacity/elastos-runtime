@@ -46,8 +46,9 @@ import {
   renderTaskbar,
   toggleLauncher,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260715a";
+} from "./shell-surface.js?v=home-20260726a";
 import {
+  attachAuthorizedTarget,
   closeWindow,
   cleanupBeforeUnload,
   configureWindowHooks,
@@ -56,7 +57,7 @@ import {
   focusWindow,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260715a";
+} from "./shell-windows.js?v=home-20260726a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -336,6 +337,10 @@ export function closeHomeGuiWindowForToken(homeToken) {
 
 export function openHomeGuiTarget(target, options = {}) {
   return openTarget(target, options);
+}
+
+export function attachAuthorizedHomeGuiTarget(launched) {
+  return attachAuthorizedTarget(launched);
 }
 
 export function relaunchHomeGuiWindowForToken(homeToken) {

@@ -31,7 +31,7 @@ import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260
 import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260523a";
 import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260711b";
 import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260523a";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260522a";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260726b";
 import {
   accountCard,
   copyButton,

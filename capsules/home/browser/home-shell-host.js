@@ -26,6 +26,10 @@ import {
   showHomeUnlock,
   signOutHome,
 } from "./shell-auth.js?v=home-20260715a";
+import {
+  handleHomeWalletConnectorEffect,
+  WALLET_CONNECTOR_EFFECT_TYPE,
+} from "./home-wallet-connector-host.js?v=home-20260715a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -39,6 +43,15 @@ const HOME_CLI_SHELL_ID = "home-cli";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
 const MAX_LAUNCHED_APP_CONTEXTS = 128;
+const HOME_GUI_AUTHORIZED_ATTACHMENT_SCHEMA =
+  "elastos.home.authorized-target-attachment/v1";
+const WALLET_CONNECTOR_TARGET_TITLES = Object.freeze({
+  "wallet-metamask": "MetaMask",
+  "wallet-unisat": "UniSat",
+});
+const WALLET_CONNECTOR_TARGETS = new Set(
+  Object.keys(WALLET_CONNECTOR_TARGET_TITLES),
+);
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
   browser: new Set(["library"]),
@@ -82,6 +95,27 @@ function showHostBootMask() {
 async function switchToHomeGuiAndOpenTarget(context, target, options = {}) {
   await activateDesktopShell(context.homeToken);
   await openTargetFromHomeGui(target, options);
+}
+
+async function launchWalletConnectorFromTrustedSource(context, target) {
+  if (
+    context.kind !== "app-frame" ||
+    context.targetId !== "wallet" ||
+    !WALLET_CONNECTOR_TARGETS.has(target)
+  ) {
+    throw new Error("Home denied the Wallet connector launch");
+  }
+  requireHomeGuiActive("launch Wallet connector");
+  const launched = await launchHomeTarget(target);
+  const descriptor = walletConnectorAttachmentDescriptor(target, launched);
+  requireHomeGuiActive("attach Wallet connector");
+  if (!postToActiveShell({
+    type: "home:gui-command",
+    command: "attach-authorized-target",
+    descriptor,
+  })) {
+    throw new Error("Home GUI did not accept the Wallet connector attachment");
+  }
 }
 
 function enterHostAuthGate() {
@@ -241,7 +275,66 @@ function rememberLaunchedAppContext(launched) {
     targetId: launched.target,
     origin: OPAQUE_CAPSULE_ORIGIN,
     source: null,
+    walletEffectState: {
+      inFlight: false,
+      requestIds: new Set(),
+    },
   });
+}
+
+function walletConnectorAttachmentDescriptor(target, launched) {
+  const route = typeof launched?.route === "string" ? launched.route : "";
+  let resolved;
+  try {
+    resolved = new URL(route, window.location.href);
+  } catch (_error) {
+    throw new Error("Runtime returned an invalid Wallet connector route");
+  }
+  const routeQueryKeys = [...resolved.searchParams.keys()];
+  const routeFragment = new URLSearchParams(resolved.hash.replace(/^#/, ""));
+  const routeFragmentKeys = [...routeFragment.keys()];
+  const homeLaunchToken = routeFragment.get("home_token") || "";
+  if (
+    launched?.target !== target ||
+    launched?.attach_kind !== "iframe" ||
+    (launched?.launch_status && launched.launch_status !== "launched") ||
+    !route ||
+    route.length > 16_384 ||
+    resolved.origin !== window.location.origin ||
+    resolved.username ||
+    resolved.password ||
+    resolved.pathname !== `/apps/${target}/` ||
+    routeQueryKeys.length !== 1 ||
+    routeQueryKeys[0] !== "home_origin" ||
+    resolved.searchParams.get("home_origin") !== window.location.origin ||
+    routeFragmentKeys.length !== 1 ||
+    routeFragmentKeys[0] !== "home_token" ||
+    !homeLaunchToken ||
+    homeLaunchToken !== homeLaunchToken.trim() ||
+    homeLaunchToken.length > 4_096
+  ) {
+    throw new Error("Runtime returned an invalid Wallet connector launch");
+  }
+  return {
+    schema: HOME_GUI_AUTHORIZED_ATTACHMENT_SCHEMA,
+    receipt_id: walletConnectorAttachmentReceiptId(),
+    target,
+    title: WALLET_CONNECTOR_TARGET_TITLES[target],
+    attach_kind: "iframe",
+    route,
+  };
+}
+
+function walletConnectorAttachmentReceiptId() {
+  if (typeof window.crypto?.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  if (typeof window.crypto?.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  throw new Error("Home requires browser crypto for connector attachment isolation");
 }
 
 function activeShellTarget(summary) {
@@ -696,6 +789,9 @@ window.addEventListener("message", (event) => {
   if (data.type === "home:app-ready") {
     return;
   }
+  if (handleHomeWalletConnectorEffect(event, context, data)) {
+    return;
+  }
   if (data.type === "home:launch-target") {
     const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
     const target = typeof data.target === "string" ? data.target.trim() : "";
@@ -920,6 +1016,20 @@ window.addEventListener("message", (event) => {
     console.warn("home ignored unauthorized open-target message", context.targetId, target);
     return;
   }
+  if (
+    context.kind === "app-frame" &&
+    context.targetId === "wallet" &&
+    WALLET_CONNECTOR_TARGETS.has(target)
+  ) {
+    if (!hasExactMessageKeys(data, ["type", "target", "homeToken"])) {
+      console.warn("home ignored malformed Wallet connector launch", target);
+      return;
+    }
+    launchWalletConnectorFromTrustedSource(context, target).catch((error) => {
+      console.error("home Wallet connector launch failed", error);
+    });
+    return;
+  }
   const query = data.query && typeof data.query === "object" ? data.query : {};
   if (context.kind === "shell-frame") {
     if (context.targetId === HOME_GUI_SHELL_ID) {
@@ -945,8 +1055,12 @@ function homeMessageContext(event, data) {
       ? { kind: "home", targetId: HOME_GUI_SHELL_ID }
       : null;
   }
-  const homeToken = typeof data.homeToken === "string" ? data.homeToken.trim() : "";
-  if (!homeToken) {
+  const walletConnectorEffect = data.type === WALLET_CONNECTOR_EFFECT_TYPE;
+  const tokenValue = walletConnectorEffect
+    ? data.connectorToken
+    : data.homeToken;
+  const homeToken = typeof tokenValue === "string" ? tokenValue.trim() : "";
+  if (!homeToken || (walletConnectorEffect && tokenValue !== homeToken)) {
     return null;
   }
   if (activeShellFrame) {
@@ -984,6 +1098,7 @@ function homeMessageContext(event, data) {
     kind: "app-frame",
     targetId: launched.targetId,
     homeToken,
+    walletEffectState: launched.walletEffectState,
   };
 }
 

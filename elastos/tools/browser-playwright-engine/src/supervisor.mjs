@@ -12,6 +12,11 @@ import { fileURLToPath } from "node:url";
 import jpeg from "jpeg-js";
 import { chromium } from "playwright";
 import wrtc from "@roamhq/wrtc";
+import {
+  cacheWalletApprovalPromise,
+  waitForWalletApprovalSignature,
+  waitForWalletApprovalTransaction,
+} from "./wallet-approval.mjs";
 
 const REQUEST_ENV = "ELASTOS_BROWSER_ENGINE_REQUEST";
 const CONFIG_ENV = "ELASTOS_BROWSER_PLAYWRIGHT_ENGINE_CONFIG";
@@ -1192,7 +1197,7 @@ function normalizeWalletBridge(wallet) {
         : null,
     approval_status_url: typeof wallet.approval_status_url === "string" && wallet.approval_status_url.trim() !== "" ? wallet.approval_status_url.trim() : null,
     home_token: typeof wallet.home_token === "string" && wallet.home_token.trim() !== "" ? wallet.home_token.trim() : null,
-    pending_approval_keys: new Set(),
+    pending_approval_keys: new Map(),
   };
 }
 
@@ -1317,15 +1322,8 @@ async function requestRuntimeWalletApproval(wallet, source, method, params, curr
     throw error;
   }
   const approvalKey = walletApprovalKey(method, params, current, pageUrl);
-  if (wallet.pending_approval_keys.has(approvalKey)) {
-    const error = new Error("This wallet request is already waiting in ElastOS Wallet/Inbox.");
-    error.code = 4100;
-    throw error;
-  }
-  wallet.pending_approval_keys.add(approvalKey);
-  let response;
-  try {
-    response = await fetch(wallet.approval_url, {
+  return cacheWalletApprovalPromise(wallet.pending_approval_keys, approvalKey, async () => {
+    const response = await fetch(wallet.approval_url, {
       method: "POST",
       headers: {
         Origin: WALLET_RUNTIME_ORIGIN,
@@ -1342,37 +1340,35 @@ async function requestRuntimeWalletApproval(wallet, source, method, params, curr
         origin: originFromUrl(pageUrl),
       }),
     });
-  } catch (error) {
-    wallet.pending_approval_keys.delete(approvalKey);
-    throw error;
-  }
-  const text = await response.text();
-  let body = null;
-  if (text.trim() !== "") {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = { message: text };
+    const text = await response.text();
+    let body = null;
+    if (text.trim() !== "") {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = { message: text };
+      }
     }
-  }
-  if (!response.ok) {
-    wallet.pending_approval_keys.delete(approvalKey);
-    const error = new Error(body?.message || body?.error || `Runtime wallet approval failed: ${response.status}`);
-    error.code = 4100;
-    throw error;
-  }
-  const requestId = body?.approval_request?.request_id;
-  if (typeof requestId !== "string" || requestId.trim() === "") {
-    wallet.pending_approval_keys.delete(approvalKey);
-    const error = new Error("Runtime wallet approval response did not include a request id.");
-    error.code = 4100;
-    throw error;
-  }
-  try {
-    return await waitForWalletApprovalSignature(wallet, requestId);
-  } finally {
-    wallet.pending_approval_keys.delete(approvalKey);
-  }
+    if (!response.ok) {
+      const error = new Error(body?.message || body?.error || `Runtime wallet approval failed: ${response.status}`);
+      error.code = 4100;
+      throw error;
+    }
+    const requestId = body?.approval_request?.request_id;
+    if (typeof requestId !== "string" || requestId.trim() === "") {
+      const error = new Error("Runtime wallet approval response did not include a request id.");
+      error.code = 4100;
+      throw error;
+    }
+    return waitForWalletApprovalSignature(
+      requestId,
+      body?.approval_request?.expires_at,
+      {
+        getStatus: (approvedRequestId, options) =>
+          fetchWalletApprovalStatus(wallet, approvedRequestId, options),
+      },
+    );
+  });
 }
 
 async function requestRuntimeWalletTransaction(wallet, source, method, params, current) {
@@ -1393,15 +1389,8 @@ async function requestRuntimeWalletTransaction(wallet, source, method, params, c
     throw error;
   }
   const approvalKey = walletApprovalKey(method, params, current, pageUrl);
-  if (wallet.pending_approval_keys.has(approvalKey)) {
-    const error = new Error("This wallet request is already waiting in ElastOS Wallet/Inbox.");
-    error.code = 4100;
-    throw error;
-  }
-  wallet.pending_approval_keys.add(approvalKey);
-  let response;
-  try {
-    response = await fetch(wallet.transaction_url, {
+  return cacheWalletApprovalPromise(wallet.pending_approval_keys, approvalKey, async () => {
+    const response = await fetch(wallet.transaction_url, {
       method: "POST",
       headers: {
         Origin: WALLET_RUNTIME_ORIGIN,
@@ -1418,37 +1407,37 @@ async function requestRuntimeWalletTransaction(wallet, source, method, params, c
         origin: originFromUrl(pageUrl),
       }),
     });
-  } catch (error) {
-    wallet.pending_approval_keys.delete(approvalKey);
-    throw error;
-  }
-  const text = await response.text();
-  let body = null;
-  if (text.trim() !== "") {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = { message: text };
+    const text = await response.text();
+    let body = null;
+    if (text.trim() !== "") {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = { message: text };
+      }
     }
-  }
-  if (!response.ok) {
-    wallet.pending_approval_keys.delete(approvalKey);
-    const error = new Error(body?.message || body?.error || `Runtime wallet transaction approval failed: ${response.status}`);
-    error.code = 4100;
-    throw error;
-  }
-  const requestId = body?.approval_request?.request_id;
-  if (typeof requestId !== "string" || requestId.trim() === "") {
-    wallet.pending_approval_keys.delete(approvalKey);
-    const error = new Error("Runtime wallet transaction approval response did not include a request id.");
-    error.code = 4100;
-    throw error;
-  }
-  try {
-    return await waitForWalletApprovalTransaction(wallet, requestId);
-  } finally {
-    wallet.pending_approval_keys.delete(approvalKey);
-  }
+    if (!response.ok) {
+      const error = new Error(body?.message || body?.error || `Runtime wallet transaction approval failed: ${response.status}`);
+      error.code = 4100;
+      throw error;
+    }
+    const requestId = body?.approval_request?.request_id;
+    if (typeof requestId !== "string" || requestId.trim() === "") {
+      const error = new Error("Runtime wallet transaction approval response did not include a request id.");
+      error.code = 4100;
+      throw error;
+    }
+    return waitForWalletApprovalTransaction(
+      requestId,
+      body?.approval_request?.expires_at,
+      {
+        getStatus: (approvedRequestId, options) =>
+          fetchWalletApprovalStatus(wallet, approvedRequestId, options),
+        broadcastTransaction: (approvedRequestId) =>
+          broadcastWalletTransaction(wallet, approvedRequestId),
+      },
+    );
+  });
 }
 
 function walletApprovalKey(method, params, account, pageUrl) {
@@ -1461,74 +1450,6 @@ function walletApprovalKey(method, params, account, pageUrl) {
       page_url: pageUrl,
     }))
     .digest("hex");
-}
-
-async function waitForWalletApprovalSignature(wallet, requestId) {
-  const deadline = Date.now() + 5 * 60 * 1000;
-  while (Date.now() < deadline) {
-    const status = await fetchWalletApprovalStatus(wallet, requestId);
-    if (status.status === "completed") {
-      if (typeof status.signature !== "string" || status.signature.trim() === "") {
-        const error = new Error("Runtime wallet approval completed without a signature.");
-        error.code = 4100;
-        throw error;
-      }
-      return status.signature;
-    }
-    if (status.status === "rejected") {
-      const error = new Error("Wallet request was rejected in ElastOS Wallet/Inbox.");
-      error.code = 4001;
-      throw error;
-    }
-    if (status.status === "expired") {
-      const error = new Error("Wallet request expired before approval.");
-      error.code = 4001;
-      throw error;
-    }
-    await sleep(1000);
-  }
-  const error = new Error("Wallet request timed out before approval.");
-  error.code = 4001;
-  throw error;
-}
-
-async function waitForWalletApprovalTransaction(wallet, requestId) {
-  const deadline = Date.now() + 5 * 60 * 1000;
-  while (Date.now() < deadline) {
-    const status = await fetchWalletApprovalStatus(wallet, requestId);
-    if (status.status === "completed") {
-      if (typeof status.transaction_hash === "string" && status.transaction_hash.trim() !== "" && !status.signed_transaction) {
-        return status.transaction_hash;
-      }
-      if (typeof status.signed_transaction !== "string" || status.signed_transaction.trim() === "") {
-        const error = new Error("Runtime wallet approval completed without a signed transaction.");
-        error.code = 4100;
-        throw error;
-      }
-      const receipt = await broadcastWalletTransaction(wallet, requestId);
-      const hash = receipt?.transaction_hash;
-      if (typeof hash !== "string" || hash.trim() === "") {
-        const error = new Error("Runtime transaction broadcast did not return a transaction hash.");
-        error.code = 4100;
-        throw error;
-      }
-      return hash;
-    }
-    if (status.status === "rejected") {
-      const error = new Error("Wallet request was rejected in ElastOS Wallet/Inbox.");
-      error.code = 4001;
-      throw error;
-    }
-    if (status.status === "expired") {
-      const error = new Error("Wallet request expired before approval.");
-      error.code = 4001;
-      throw error;
-    }
-    await sleep(1000);
-  }
-  const error = new Error("Wallet request timed out before approval.");
-  error.code = 4001;
-  throw error;
 }
 
 async function broadcastWalletTransaction(wallet, requestId) {
@@ -1558,28 +1479,39 @@ async function broadcastWalletTransaction(wallet, requestId) {
   return body || {};
 }
 
-async function fetchWalletApprovalStatus(wallet, requestId) {
-  const response = await fetch(`${wallet.approval_status_url}/${encodeURIComponent(requestId)}`, {
-    headers: {
-      Origin: WALLET_RUNTIME_ORIGIN,
-      "x-elastos-home-token": wallet.home_token,
-    },
-  });
-  const text = await response.text();
-  let body = null;
-  if (text.trim() !== "") {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = { message: text };
+async function fetchWalletApprovalStatus(
+  wallet,
+  requestId,
+  { timeoutMs = 3000 } = {},
+) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${wallet.approval_status_url}/${encodeURIComponent(requestId)}`, {
+      headers: {
+        Origin: WALLET_RUNTIME_ORIGIN,
+        "x-elastos-home-token": wallet.home_token,
+      },
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let body = null;
+    if (text.trim() !== "") {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = { message: text };
+      }
     }
+    if (!response.ok) {
+      const error = new Error(body?.message || body?.error || `Runtime wallet approval status failed: ${response.status}`);
+      error.code = 4100;
+      throw error;
+    }
+    return body || {};
+  } finally {
+    clearTimeout(timer);
   }
-  if (!response.ok) {
-    const error = new Error(body?.message || body?.error || `Runtime wallet approval status failed: ${response.status}`);
-    error.code = 4100;
-    throw error;
-  }
-  return body || {};
 }
 
 function originFromUrl(value) {

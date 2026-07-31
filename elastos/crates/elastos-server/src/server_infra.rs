@@ -1448,6 +1448,7 @@ mod tests {
         for status in [
             wallet_provider_status("wallet-provider", "2.0"),
             wallet_provider_status("wallet-provider", "2.1"),
+            wallet_provider_status("wallet-provider", "2.2"),
             wallet_provider_status("wallet-provider", "1.0"),
             wallet_provider_status("other-provider", WALLET_PROTOCOL_VERSION),
         ] {

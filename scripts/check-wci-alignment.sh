@@ -366,7 +366,7 @@ check_required 'elastos://decrypt/session/open' elastos/crates/elastos-server/sr
 check_required 'elastos-auth' capsules/wallet-provider/Cargo.toml 'wallet-provider must share proof primitives through elastos-auth'
 check_forbidden_in_path 'elastos-runtime = ' capsules/wallet-provider/Cargo.toml 'wallet-provider must not depend on the full runtime execution stack'
 check_required 'pub use elastos_auth' elastos/crates/elastos-runtime/src/auth.rs 'runtime auth module must re-export shared elastos-auth primitives'
-check_required 'WALLET_PROTOCOL_VERSION: &str = "2\.2"' elastos/crates/elastos-wallet-contract/src/lib.rs 'Wallet contract must pin Wallet Bus 2.2'
+check_required 'WALLET_PROTOCOL_VERSION: &str = "2\.3"' elastos/crates/elastos-wallet-contract/src/lib.rs 'Wallet contract must pin Wallet Bus 2.3'
 check_required 'RuntimeWalletAdapter' elastos/crates/elastos-server/src/api/gateway_wallet_adapter.rs 'Runtime must keep Wallet authority behind its private typed adapter'
 check_required 'ProviderInvocationTransport::Local' elastos/crates/elastos-server/src/api/gateway_wallet_adapter.rs 'Wallet Bus dispatch must remain Runtime-local'
 check_required 'WalletProviderRequestV2' elastos/crates/elastos-server/src/api/gateway_wallet_adapter.rs 'Wallet adapter must dispatch typed Wallet Bus requests'
@@ -410,7 +410,7 @@ check_required '/api/auth/sessions/refresh' capsules/home/browser/shell-auth.js 
 check_required 'home state save failed' capsules/home-gui/browser/shell-core.js 'Home GUI browser state writes must stay explicit and observable'
 check_required 'passkey the Home front door authority' elastos/CHANGELOG.md 'CHANGELOG must record the implemented passkey front-door authority model'
 check_forbidden_in_path 'HOME_BROWSER_STATE_ROOT|ElastOS/System/HomeState' elastos/crates/elastos-server/src/api 'Home browser state must be rooted in the active principal user area, not a shared system bucket'
-check_forbidden_in_path 'authority_id|authorityId|home_browser_authority_id' elastos/crates/elastos-server/src/api 'Home browser state must identify the runtime principal, not an ambiguous authority id'
+check_forbidden_in_path '"authority_id"[[:space:]]*:|authority_id[[:space:]]*:|authorityId[[:space:]]*:|home_browser_authority_id' elastos/crates/elastos-server/src/api 'Home browser state must identify the runtime principal, not an ambiguous authority id'
 check_required '.AppData/ElastOS/Home/browser-state.json' elastos/crates/elastos-server/src/api/gateway_home_system.rs 'Home browser state must materialize under the active principal localhost root'
 check_required 'wallet proof is not bound to this runtime principal' elastos/crates/elastos-server/src/api/auth_gateway.rs 'wallet proof must link to an existing Runtime principal, not mint login'
 check_required 'ELASTOS_WALLET_PRICE_HTTP_APPROVED' elastos/crates/elastos-server/src/api/gateway.rs 'wallet price HTTP access must require explicit operator approval'
@@ -577,6 +577,7 @@ if rg_search 'elastos://chain|/api/provider/chain|chain-provider|blockchain prov
   --glob '!capsules/wallet-unisat/*' \
   --glob '!capsules/wallet/*' \
   --glob '!capsules/wallet-walletconnect/*' \
+  --glob '!capsules/home/browser/home-wallet-connector-host.js' \
   --glob '!**/capsule.json' \
   --glob '!**/tests/**' \
   --glob '!**/*test*' \

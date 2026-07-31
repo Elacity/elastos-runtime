@@ -959,6 +959,7 @@ const server = http.createServer((req, res) => {
         approval_request: {
           request_id: requestId,
           status: "pending",
+          expires_at: Math.floor(Date.now() / 1000) + 600,
         },
         requires_wallet_approval: true,
       }));
@@ -970,6 +971,7 @@ const server = http.createServer((req, res) => {
         approval_request: {
           request_id: "wallet-approval:tx-smoke",
           status: "pending",
+          expires_at: Math.floor(Date.now() / 1000) + 600,
         },
         requires_wallet_approval: true,
       }));

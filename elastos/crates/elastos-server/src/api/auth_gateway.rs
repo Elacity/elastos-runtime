@@ -37,7 +37,6 @@ use super::gateway::{
     is_wallet_connector_capsule_id, issue_home_launch_token_for_auth_grant,
     require_home_launch_token_binding, require_runtime_wallet_authority, runtime_wallet_authority,
     GatewayState, RuntimeWalletAdapter, RuntimeWalletAuthority, HOME_CAPSULE_ID,
-    WALLET_LINK_CAPSULE_IDS,
 };
 
 const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
@@ -2358,7 +2357,7 @@ fn require_auth_home_or_system_context(
     Ok(context)
 }
 
-struct WalletLinkContext {
+pub(in crate::api) struct WalletLinkContext {
     app: String,
     context: super::gateway::HomeLaunchTokenContext,
     authority: RuntimeWalletAuthority,
@@ -2368,22 +2367,40 @@ fn require_wallet_link_context(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> anyhow::Result<WalletLinkContext> {
-    let authority =
-        require_runtime_wallet_authority(&state.data_dir, headers, WALLET_LINK_CAPSULE_IDS)?;
+    let authority = require_runtime_wallet_authority(
+        &state.data_dir,
+        headers,
+        &[super::gateway::WALLET_WALLETCONNECT_CAPSULE_ID],
+    )?;
     let verified = authority.verified_context();
     let app = verified.actor().to_string();
+    verified_wallet_link_context(state, &app, authority)
+}
+
+pub(in crate::api) fn verified_wallet_link_context(
+    state: &GatewayState,
+    app: &str,
+    authority: RuntimeWalletAuthority,
+) -> anyhow::Result<WalletLinkContext> {
+    if !is_wallet_connector_capsule_id(app) {
+        anyhow::bail!("wallet linking requires a dedicated wallet connector capsule");
+    }
+    let verified = authority.verified_context();
+    if verified.actor() != app {
+        anyhow::bail!("wallet connector launch actor mismatch");
+    }
     let context = super::gateway::HomeLaunchTokenContext {
         principal_id: verified.principal_id().to_string(),
         session_id: verified.session_id().to_string(),
         proof_binding_id: verified.proof_binding_id().map(ToString::to_string),
         grant_id: verified.grant_id().to_string(),
     };
-    super::gateway::ensure_wallet_connector_configured(&state.data_dir, &app)?;
+    super::gateway::ensure_wallet_connector_configured(&state.data_dir, app)?;
     if context.proof_binding_id.is_none() {
         anyhow::bail!("missing proof-bound auth session");
     }
     Ok(WalletLinkContext {
-        app,
+        app: app.to_string(),
         context,
         authority,
     })
@@ -2602,18 +2619,29 @@ async fn evm_challenge_inner(
     headers: &HeaderMap,
     input: EvmChallengeRequest,
 ) -> anyhow::Result<EvmChallengeResponse> {
+    let link = require_wallet_link_context(state, headers)?;
+    evm_challenge_for_wallet_link(state, headers, input, link).await
+}
+
+pub(in crate::api) async fn evm_challenge_for_wallet_link(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    input: EvmChallengeRequest,
+    link: WalletLinkContext,
+) -> anyhow::Result<EvmChallengeResponse> {
     let WalletLinkContext {
         context, authority, ..
-    } = require_wallet_link_context(state, headers)?;
+    } = link;
     validate_evm_address(&input.address).map_err(anyhow::Error::msg)?;
     if input.chain_id == 0 {
         anyhow::bail!("chain_id must be non-zero");
     }
 
     let now = crate::auth::now_ts();
-    let domain = request_domain(headers)?;
-    let scheme = request_scheme(&domain);
-    let uri = format!("{scheme}://{domain}/apps/home/");
+    let request_authority = request_domain(headers)?;
+    let scheme = request_scheme(&request_authority);
+    let origin = format!("{scheme}://{request_authority}");
+    let uri = format!("{origin}/apps/home/");
     let resources = vec![
         "elastos://wallet/account/link".to_string(),
         format!("elastos://principal/{}", context.principal_id),
@@ -2622,7 +2650,7 @@ async fn evm_challenge_inner(
         state,
         &authority,
         WalletProviderOperationV2::Challenge {
-            domain,
+            domain: origin,
             uri,
             address: input.address,
             chain_id: input.chain_id,
@@ -2661,11 +2689,20 @@ async fn evm_verify_inner(
     headers: &HeaderMap,
     input: EvmVerifyRequest,
 ) -> anyhow::Result<EvmVerifyResponse> {
+    let link = require_wallet_link_context(state, headers)?;
+    evm_verify_for_wallet_link(state, input, link).await
+}
+
+pub(in crate::api) async fn evm_verify_for_wallet_link(
+    state: &GatewayState,
+    input: EvmVerifyRequest,
+    link: WalletLinkContext,
+) -> anyhow::Result<EvmVerifyResponse> {
     let WalletLinkContext {
         app,
         context,
         authority,
-    } = require_wallet_link_context(state, headers)?;
+    } = link;
     let session_proof_binding_id = context
         .proof_binding_id
         .clone()
@@ -2832,9 +2869,19 @@ async fn btc_challenge_inner(
     headers: &HeaderMap,
     input: BtcChallengeRequest,
 ) -> anyhow::Result<BtcChallengeResponse> {
+    let link = require_wallet_link_context(state, headers)?;
+    btc_challenge_for_wallet_link(state, headers, input, link).await
+}
+
+pub(in crate::api) async fn btc_challenge_for_wallet_link(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    input: BtcChallengeRequest,
+    link: WalletLinkContext,
+) -> anyhow::Result<BtcChallengeResponse> {
     let WalletLinkContext {
         context, authority, ..
-    } = require_wallet_link_context(state, headers)?;
+    } = link;
     let now = crate::auth::now_ts();
     let domain = request_domain(headers)?;
     let scheme = request_scheme(&domain);
@@ -2895,11 +2942,20 @@ async fn btc_verify_inner(
     headers: &HeaderMap,
     input: BtcVerifyRequest,
 ) -> anyhow::Result<BtcVerifyResponse> {
+    let link = require_wallet_link_context(state, headers)?;
+    btc_verify_for_wallet_link(state, input, link).await
+}
+
+pub(in crate::api) async fn btc_verify_for_wallet_link(
+    state: &GatewayState,
+    input: BtcVerifyRequest,
+    link: WalletLinkContext,
+) -> anyhow::Result<BtcVerifyResponse> {
     let WalletLinkContext {
         app,
         context,
         authority,
-    } = require_wallet_link_context(state, headers)?;
+    } = link;
     let session_proof_binding_id = context
         .proof_binding_id
         .clone()
@@ -3251,7 +3307,7 @@ fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyRespons
     http_response
 }
 
-fn auth_error_response(err: anyhow::Error) -> Response {
+pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
     let status = if text.contains("missing")
         || text.contains("invalid")

@@ -67,13 +67,16 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri("/api/auth/evm/challenge")
+                .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token.clone())
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token.clone(),
                         "address": address,
                         "chain_id": 8453
                     })
@@ -88,8 +91,8 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
         .await
         .unwrap();
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
-    let message = challenge_json["message"].as_str().unwrap();
-    assert!(message.contains("elastos.elacitylabs.com wants you to sign in"));
+    let message = challenge_json["challenge"]["message"].as_str().unwrap();
+    assert!(message.contains("https://elastos.elacitylabs.com wants you to sign in"));
     assert!(message.contains("URI: https://elastos.elacitylabs.com/apps/home/"));
     assert!(message.contains("elastos://auth/challenge/"));
     assert!(message.contains("elastos://wallet/account/link"));
@@ -99,13 +102,16 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let verified = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri("/api/auth/evm/verify")
+                .uri("/api/apps/home/wallet-connector/evm/link/verify")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token)
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token,
                         "message": message,
                         "signature": signature,
                     })
@@ -116,27 +122,17 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
         .await
         .unwrap();
     assert_eq!(verified.status(), StatusCode::OK);
-    let verified_cookies: Vec<_> = verified
-        .headers()
-        .get_all(SET_COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .map(str::to_string)
-        .collect();
-    assert!(
-        verified_cookies.is_empty(),
-        "wallet connector verification must not mint a Home session cookie: {verified_cookies:?}"
-    );
     let verified_body = axum::body::to_bytes(verified.into_body(), usize::MAX)
         .await
         .unwrap();
     let verified_json: serde_json::Value = serde_json::from_slice(&verified_body).unwrap();
     assert_eq!(
-        verified_json["proof_binding_id"].as_str().unwrap(),
-        format!("proof:wallet:eip155:8453:{}", address.to_ascii_lowercase())
+        verified_json["schema"],
+        "elastos.home.wallet-connector.effect.result/v1"
     );
-    let session_id = verified_json["session_id"].as_str().unwrap();
-    assert_eq!(session_id, authority.session_id);
+    assert_eq!(verified_json["status"], "linked");
+    assert_eq!(verified_json["connector_id"], WALLET_METAMASK_CAPSULE_ID);
+    assert!(verified_json.get("app_token").is_none());
     assert!(verified_json.get("home_token").is_none());
     assert!(verified_json.get("system_token").is_none());
 
@@ -287,7 +283,10 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
         .oneshot(
             test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
-                .uri(format!("/api/auth/sessions/{session_id}/revoke"))
+                .uri(format!(
+                    "/api/auth/sessions/{}/revoke",
+                    authority.session_id
+                ))
                 .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::empty())
                 .unwrap(),
@@ -406,13 +405,16 @@ async fn test_metamask_connector_token_can_link_evm_wallet() {
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri("/api/auth/evm/challenge")
+                .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token.clone())
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token.clone(),
                         "address": display_address,
                         "chain_id": 8453
                     })
@@ -427,19 +429,22 @@ async fn test_metamask_connector_token_can_link_evm_wallet() {
         .await
         .unwrap();
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
-    let message = challenge_json["message"].as_str().unwrap();
+    let message = challenge_json["challenge"]["message"].as_str().unwrap();
     assert!(message.contains(&format!("Ethereum account:\n{display_address}\n\n")));
     let signature = evm_sign_message(&signing_key, message);
 
     let verified = app
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri("/api/auth/evm/verify")
+                .uri("/api/apps/home/wallet-connector/evm/link/verify")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token)
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token,
                         "message": message,
                         "signature": signature,
                     })
@@ -454,15 +459,8 @@ async fn test_metamask_connector_token_can_link_evm_wallet() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        payload["principal_id"].as_str().unwrap(),
-        authority.principal_id
-    );
-    assert_eq!(
-        payload["proof_binding_id"].as_str().unwrap(),
-        format!("proof:wallet:eip155:8453:{}", address.to_ascii_lowercase())
-    );
-    assert!(payload["app_token"].as_str().unwrap().len() > 40);
+    assert_eq!(payload["status"], "linked");
+    assert_eq!(payload["connector_id"], WALLET_METAMASK_CAPSULE_ID);
     assert!(payload.get("home_token").is_none());
     assert!(payload.get("system_token").is_none());
     wallet_provider
@@ -500,13 +498,16 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
         let challenge = app
             .clone()
             .oneshot(
-                test_browser_request("elastos.elacitylabs.com", "null")
+                test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                     .method("POST")
-                    .uri("/api/auth/evm/challenge")
+                    .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                     .header(CONTENT_TYPE, "application/json")
-                    .header("x-elastos-home-token", connector_token.clone())
+                    .header("x-elastos-home-token", authority.home_token.clone())
                     .body(Body::from(
                         json!({
+                            "schema": "elastos.home.wallet-connector.effect.request/v1",
+                            "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                            "connector_token": connector_token.clone(),
                             "address": display_address,
                             "chain_id": 8453
                         })
@@ -521,19 +522,22 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
             .await
             .unwrap();
         let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
-        let message = challenge_json["message"].as_str().unwrap();
+        let message = challenge_json["challenge"]["message"].as_str().unwrap();
         let signature = evm_sign_message(&signing_key, message);
 
         let verified = app
             .clone()
             .oneshot(
-                test_browser_request("elastos.elacitylabs.com", "null")
+                test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                     .method("POST")
-                    .uri("/api/auth/evm/verify")
+                    .uri("/api/apps/home/wallet-connector/evm/link/verify")
                     .header(CONTENT_TYPE, "application/json")
-                    .header("x-elastos-home-token", connector_token.clone())
+                    .header("x-elastos-home-token", authority.home_token.clone())
                     .body(Body::from(
                         json!({
+                            "schema": "elastos.home.wallet-connector.effect.request/v1",
+                            "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                            "connector_token": connector_token.clone(),
                             "message": message,
                             "signature": signature,
                         })
@@ -651,13 +655,16 @@ async fn test_metamask_connector_token_can_link_erc1271_wallet() {
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri("/api/auth/evm/challenge")
+                .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token.clone())
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token.clone(),
                         "address": contract,
                         "chain_id": 20
                     })
@@ -672,17 +679,20 @@ async fn test_metamask_connector_token_can_link_erc1271_wallet() {
         .await
         .unwrap();
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
-    let message = challenge_json["message"].as_str().unwrap();
+    let message = challenge_json["challenge"]["message"].as_str().unwrap();
 
     let verified = app
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri("/api/auth/evm/verify")
+                .uri("/api/apps/home/wallet-connector/evm/link/verify")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token)
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token,
                         "message": message,
                         "signature": "0x01020304",
                     })
@@ -697,15 +707,8 @@ async fn test_metamask_connector_token_can_link_erc1271_wallet() {
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        payload["principal_id"].as_str().unwrap(),
-        authority.principal_id
-    );
-    assert_eq!(
-        payload["proof_binding_id"].as_str().unwrap(),
-        "proof:wallet:eip155:20:0x00000000000000000000000000000000000000cc"
-    );
-    assert!(payload["app_token"].as_str().unwrap().len() > 40);
+    assert_eq!(payload["status"], "linked");
+    assert_eq!(payload["connector_id"], WALLET_METAMASK_CAPSULE_ID);
     assert!(payload.get("home_token").is_none());
     assert!(payload.get("system_token").is_none());
     wallet_provider
@@ -737,13 +740,16 @@ async fn test_evm_auth_challenge_uses_http_for_loopback_home() {
 
     let response = app
         .oneshot(
-            test_browser_request("127.0.0.1:8090", "null")
+            test_browser_request("127.0.0.1:8090", "http://127.0.0.1:8090")
                 .method("POST")
-                .uri("/api/auth/evm/challenge")
+                .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token)
+                .header("x-elastos-home-token", authority.home_token)
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token,
                         "address": address,
                         "chain_id": 20
                     })
@@ -758,8 +764,8 @@ async fn test_evm_auth_challenge_uses_http_for_loopback_home() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let message = json["message"].as_str().unwrap();
-    assert!(message.contains("127.0.0.1:8090 wants you to sign in"));
+    let message = json["challenge"]["message"].as_str().unwrap();
+    assert!(message.contains("http://127.0.0.1:8090 wants you to sign in"));
     assert!(message.contains("URI: http://127.0.0.1:8090/apps/home/"));
 }
 
@@ -873,13 +879,16 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri("/api/auth/btc/challenge")
+                .uri("/api/apps/home/wallet-connector/bitcoin/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token.clone())
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_UNISAT_CAPSULE_ID,
+                        "connector_token": connector_token.clone(),
                         "address": address,
                         "network": "bitcoin"
                     })
@@ -894,20 +903,24 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
         .await
         .unwrap();
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
-    let message = challenge_json["message"].as_str().unwrap();
+    let message = challenge_json["challenge"]["message"].as_str().unwrap();
 
     let verified = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.elacitylabs.com", "null")
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri("/api/auth/btc/verify")
+                .uri("/api/apps/home/wallet-connector/bitcoin/link/verify")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token)
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_UNISAT_CAPSULE_ID,
+                        "connector_token": connector_token.clone(),
                         "message": message,
                         "signature": "mock-bip322-signature",
+                        "signature_type": "bip322-simple",
                     })
                     .to_string(),
                 ))
@@ -928,7 +941,9 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
         .await
         .unwrap();
     let verified_json: serde_json::Value = serde_json::from_slice(&verified_body).unwrap();
-    assert_eq!(verified_json["principal_id"], authority.principal_id);
+    assert_eq!(verified_json["status"], "linked");
+    assert_eq!(verified_json["connector_id"], WALLET_UNISAT_CAPSULE_ID);
+    assert!(verified_json.get("app_token").is_none());
     wallet_provider
         .assert_v2_operations(
             WALLET_UNISAT_CAPSULE_ID,
@@ -945,10 +960,7 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
         .oneshot(
             test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-unisat/wallet/accounts")
-                .header(
-                    "x-elastos-home-token",
-                    verified_json["app_token"].as_str().unwrap(),
-                )
+                .header("x-elastos-home-token", connector_token)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -982,13 +994,16 @@ async fn test_evm_auth_challenge_is_single_use() {
     let challenge = app
         .clone()
         .oneshot(
-            test_browser_request("elastos.local", "null")
+            test_browser_request("elastos.local", "https://elastos.local")
                 .method("POST")
-                .uri("/api/auth/evm/challenge")
+                .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token.clone())
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token.clone(),
                         "address": address,
                         "chain_id": 20
                     })
@@ -1002,20 +1017,23 @@ async fn test_evm_auth_challenge_is_single_use() {
         .await
         .unwrap();
     let challenge_json: serde_json::Value = serde_json::from_slice(&challenge_body).unwrap();
-    let message = challenge_json["message"].as_str().unwrap();
+    let message = challenge_json["challenge"]["message"].as_str().unwrap();
     let signature = evm_sign_message(&signing_key, message);
 
     for expected_status in [StatusCode::OK, StatusCode::FORBIDDEN] {
         let response = app
             .clone()
             .oneshot(
-                test_browser_request("localhost:61180", "null")
+                test_browser_request("elastos.local", "https://elastos.local")
                     .method("POST")
-                    .uri("/api/auth/evm/verify")
+                    .uri("/api/apps/home/wallet-connector/evm/link/verify")
                     .header(CONTENT_TYPE, "application/json")
-                    .header("x-elastos-home-token", connector_token.clone())
+                    .header("x-elastos-home-token", authority.home_token.clone())
                     .body(Body::from(
                         json!({
+                            "schema": "elastos.home.wallet-connector.effect.request/v1",
+                            "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                            "connector_token": connector_token.clone(),
                             "message": message,
                             "signature": signature,
                         })
@@ -1074,13 +1092,16 @@ async fn test_evm_auth_challenge_requires_wallet_provider() {
 
     let response = app
         .oneshot(
-            test_browser_request("elastos.local", "null")
+            test_browser_request("elastos.local", "https://elastos.local")
                 .method("POST")
-                .uri("/api/auth/evm/challenge")
+                .uri("/api/apps/home/wallet-connector/evm/link/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("x-elastos-home-token", connector_token)
+                .header("x-elastos-home-token", authority.home_token)
                 .body(Body::from(
                     json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token,
                         "address": address,
                         "chain_id": 20
                     })

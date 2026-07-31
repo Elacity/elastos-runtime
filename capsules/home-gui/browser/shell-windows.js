@@ -49,6 +49,14 @@ const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"]);
+const WALLET_CONNECTOR_TARGETS = new Set([
+  "wallet-metamask",
+  "wallet-unisat",
+]);
+const NON_RESTORABLE_SESSION_TARGETS = new Set(WALLET_CONNECTOR_TARGETS);
+const WALLET_CONNECTOR_WINDOW_WIDTH = 480;
+const WALLET_CONNECTOR_WINDOW_HEIGHT = 560;
+const WALLET_CONNECTOR_WINDOW_EDGE_INSET = 24;
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
   "allow-forms",
@@ -139,7 +147,9 @@ function currentWindowRestoreBounds(node) {
 
 function persistedBrowserSessionEntries() {
   return sortWindowEntriesByZOrder(
-    browserWindowEntries(),
+    browserWindowEntries().filter(
+      (entry) => !NON_RESTORABLE_SESSION_TARGETS.has(entry.targetId),
+    ),
   )
     .reverse()
     .slice(0, MAX_SESSION_WINDOWS)
@@ -448,6 +458,11 @@ function removeWindowEntries(entries) {
   const removedActiveWindow = entries.some(
     (entry) => shellState.activeWindowId === entry.id,
   );
+  const returnFocusToWallet = entries.some(
+    (entry) =>
+      shellState.activeWindowId === entry.id &&
+      WALLET_CONNECTOR_TARGETS.has(entry.targetId),
+  );
   for (const entry of entries) {
     cleanupFrameAutoFit(entry.node);
     shellState.windows.delete(entry.id);
@@ -456,7 +471,14 @@ function removeWindowEntries(entries) {
   renderWindowTaskbar();
   if (removedActiveWindow) {
     shellState.activeWindowId = null;
-    focusTopVisibleWindow();
+    const wallet = returnFocusToWallet
+      ? topBrowserWindowEntryForTarget("wallet", { includeHidden: false })
+      : null;
+    if (wallet) {
+      focusWindow(wallet.id);
+    } else {
+      focusTopVisibleWindow();
+    }
   } else {
     requireWindowHooks().refreshLauncherIfVisible();
     persistBrowserSession();
@@ -546,7 +568,17 @@ function renderTargetLaunchError(targetId, error) {
   });
 }
 
-function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
+function createWindow({
+  id,
+  title,
+  x,
+  y,
+  width,
+  height,
+  tone,
+  glyphTarget,
+  maximizeByDefault = true,
+}) {
   const bounds = fitWindowBounds({ x, y, width, height });
   const node = windowTemplate.content.firstElementChild.cloneNode(true);
   node.dataset.windowId = id;
@@ -594,7 +626,7 @@ function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
   attachWindowDrag(node, handle, focusWindow, persistBrowserSession);
   attachWindowResize(node, focusWindow, persistBrowserSession);
 
-  if (shouldOpenMaximizedByDefault()) {
+  if (maximizeByDefault && shouldOpenMaximizedByDefault()) {
     node.dataset.restoreLeft = node.style.left;
     node.dataset.restoreTop = node.style.top;
     node.dataset.restoreWidth = node.style.width;
@@ -723,7 +755,9 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   const launchQuery = targetId === "browser"
     ? withBrowserInstanceQuery({ query: options.query }).query
     : normalizedLaunchQuery(options.query);
-  const launched = await requireWindowHooks().launchTarget(targetId, launchQuery);
+  const launched = options.authorizedLaunch
+    ? { ...options.authorizedLaunch }
+    : await requireWindowHooks().launchTarget(targetId, launchQuery);
   launched.title = canonicalTargetTitle(launched.target, launched.title);
   if (launched.attach_kind !== "iframe") {
     throw new Error(`unsupported attach kind: ${launched.attach_kind || "unknown"}`);
@@ -748,6 +782,7 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     height: windowSpec.height,
     tone: glyphTone(launched.target),
     glyphTarget: launched.target,
+    maximizeByDefault: !WALLET_CONNECTOR_TARGETS.has(launched.target),
   });
   armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
   node.dataset.target = launched.target;
@@ -796,6 +831,13 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     persistBrowserSession();
   }
   return entry;
+}
+
+export function attachAuthorizedTarget(launched) {
+  return launchBrowserTargetWindow(launched?.target, {
+    authorizedLaunch: launched,
+    query: {},
+  });
 }
 
 function launchDidFail(launched) {
@@ -951,6 +993,9 @@ function focusTopVisibleWindow() {
 }
 
 function browserWindowSpec(launched, offset) {
+  if (WALLET_CONNECTOR_TARGETS.has(launched.target)) {
+    return walletConnectorWindowSpec();
+  }
   if (launched.target === SYSTEM_APP_ID) {
     return {
       x: 36,
@@ -980,6 +1025,46 @@ function browserWindowSpec(launched, offset) {
     y: 78 + offset * 22,
     width: 1040,
     height: 720,
+  };
+}
+
+function walletConnectorWindowSpec() {
+  const workspaceRect = desktop.getBoundingClientRect();
+  const workspaceWidth = Math.max(
+    WALLET_CONNECTOR_WINDOW_WIDTH,
+    window.innerWidth - workspaceRect.left,
+  );
+  const leftX = WALLET_CONNECTOR_WINDOW_EDGE_INSET;
+  const rightX = Math.max(
+    WALLET_CONNECTOR_WINDOW_EDGE_INSET,
+    workspaceWidth -
+      WALLET_CONNECTOR_WINDOW_WIDTH -
+      WALLET_CONNECTOR_WINDOW_EDGE_INSET,
+  );
+  const wallet = topBrowserWindowEntryForTarget("wallet", {
+    includeHidden: false,
+  });
+  if (!wallet) {
+    return {
+      x: rightX,
+      y: 72,
+      width: WALLET_CONNECTOR_WINDOW_WIDTH,
+      height: WALLET_CONNECTOR_WINDOW_HEIGHT,
+    };
+  }
+  const walletBounds = currentWindowBounds(wallet.node);
+  const overlapWidth = (x) => Math.max(
+    0,
+    Math.min(
+      x + WALLET_CONNECTOR_WINDOW_WIDTH,
+      walletBounds.x + walletBounds.width,
+    ) - Math.max(x, walletBounds.x),
+  );
+  return {
+    x: overlapWidth(leftX) <= overlapWidth(rightX) ? leftX : rightX,
+    y: walletBounds.y + 28,
+    width: WALLET_CONNECTOR_WINDOW_WIDTH,
+    height: WALLET_CONNECTOR_WINDOW_HEIGHT,
   };
 }
 

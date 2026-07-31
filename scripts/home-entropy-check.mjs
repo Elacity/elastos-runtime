@@ -913,9 +913,18 @@ const homeGuiJs = read("capsules/home-gui/browser/home-gui.js");
 const homeGuiCore = read("capsules/home-gui/browser/shell-core.js");
 const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
 const shellJs = read("capsules/home/browser/home-shell-host.js");
+const homeWalletConnectorHost = read(
+  "capsules/home/browser/home-wallet-connector-host.js",
+);
 const shellAuthJs = read("capsules/home/browser/shell-auth.js");
 const shellCore = read("capsules/home/browser/shell-core.js");
 const shellWindows = read("capsules/home-gui/browser/shell-windows.js");
+const homeWalletConnectorLaunchHeadlessSmoke = read(
+  "scripts/home-wallet-connector-launch-headless-smoke.mjs",
+);
+const walletPreferencesForConnectorContinuity = read(
+  "capsules/wallet/browser/wallet-preferences.js",
+);
 assert(
   (homeGuiJs.match(/export function openHomeGuiTarget\(/g) || []).length === 1,
   "Home GUI must expose one canonical open-target entrypoint",
@@ -1103,6 +1112,7 @@ const gatewayApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_home_system.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_terminal.rs",
   "elastos/crates/elastos-server/src/api/gateway_home_token.rs",
+  "elastos/crates/elastos-server/src/api/gateway_home_wallet_connector.rs",
   "elastos/crates/elastos-server/src/api/gateway_passkey_step_up.rs",
   "elastos/crates/elastos-server/src/api/gateway_inbox.rs",
   "elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs",
@@ -1419,6 +1429,9 @@ const browserSelkiesControlService = read(
 const browserSelkiesControlServiceSmoke = read(
   "scripts/browser-selkies-control-service-smoke.sh",
 );
+const browserWalletApprovalDeadlineSmoke = read(
+  "scripts/browser-wallet-approval-deadline-smoke.mjs",
+);
 const browserSelkiesTargetPreflight = read(
   "scripts/browser-selkies-target-preflight.sh",
 );
@@ -1464,6 +1477,7 @@ const walletProvider = readAll([
   "capsules/wallet-provider/src/crypto.rs",
   "capsules/wallet-provider/src/crypto/bitcoin.rs",
   "capsules/wallet-provider/src/crypto/evm.rs",
+  "capsules/wallet-provider/src/crypto/evm/transaction.rs",
   "capsules/wallet-provider/src/models.rs",
   "capsules/wallet-provider/src/protocol.rs",
   "capsules/wallet-provider/src/storage.rs",
@@ -1545,6 +1559,7 @@ const gbaOpaqueBrowserInput = read("scripts/fixtures/gba-opaque-frame-browser-pr
 const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-proof/server.py");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260715a";
+const homeGuiAssetVersion = "home-20260726a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -1720,6 +1735,92 @@ assert(
 assert(
   shellJs.includes('"home-gui": "visible-target"'),
   "The isolated Home GUI shell may request only Runtime-visible launch targets",
+);
+assert(
+  shellJs.includes(
+    '"wallet": new Set(["wallet-metamask", "wallet-unisat"])',
+  ) &&
+    shellJs.includes("launchWalletConnectorFromTrustedSource(context, target)") &&
+    shellJs.includes('command: "attach-authorized-target"') &&
+    shellJs.includes(
+      'hasExactMessageKeys(data, ["type", "target", "homeToken"])',
+    ),
+  "Wallet connector launches must retain the verified Wallet source and closed target set in trusted Home",
+);
+const walletConnectorLaunchBlock = sourceBlock(
+  shellJs,
+  "async function launchWalletConnectorFromTrustedSource",
+  "trusted Home Wallet connector launch",
+);
+const walletOpenApprovalMethodBlock = sourceBlock(
+  walletPreferencesForConnectorContinuity,
+  "function openApprovalMethod",
+  "Wallet connector window request",
+);
+assert(
+  walletConnectorLaunchBlock.includes(
+    'requireHomeGuiActive("launch Wallet connector")',
+  ) &&
+    !walletConnectorLaunchBlock.includes("activateDesktopShell") &&
+    !walletOpenApprovalMethodBlock.includes("closeDrawers()") &&
+    shellWindows.includes("function walletConnectorWindowSpec()") &&
+    shellWindows.includes("WALLET_CONNECTOR_WINDOW_WIDTH = 480") &&
+    shellWindows.includes("WALLET_CONNECTOR_WINDOW_HEIGHT = 560") &&
+    shellWindows.includes(
+      "maximizeByDefault: !WALLET_CONNECTOR_TARGETS.has(launched.target)",
+    ) &&
+    shellWindows.includes("returnFocusToWallet") &&
+    shellWindows.includes(
+      'topBrowserWindowEntryForTarget("wallet", { includeHidden: false })',
+    ),
+  "Wallet connectors must preserve the existing Wallet and use compact connector-only geometry",
+);
+assert(
+  homeGuiShell.includes(
+    '"elastos.home.authorized-target-attachment/v1"',
+  ) &&
+    homeGuiShell.includes("consumeAuthorizedAttachmentDescriptor(message)") &&
+    homeGuiShell.includes("consumedAuthorizedAttachmentReceipts.has(receiptId)") &&
+    homeGuiJs.includes("attachAuthorizedHomeGuiTarget(launched)") &&
+    shellWindows.includes("NON_RESTORABLE_SESSION_TARGETS") &&
+    shellWindows.includes("authorizedLaunch: launched"),
+  "Home GUI must only attach a bounded one-time host descriptor without persisting or relaunching hidden connectors",
+);
+assert(
+  homeWalletConnectorLaunchHeadlessSmoke.includes(
+    "wallet_launches=${state.launches.wallet}",
+  ) &&
+    homeWalletConnectorLaunchHeadlessSmoke.includes(
+      'state.connectorEffects === 0',
+    ) &&
+    homeWalletConnectorLaunchHeadlessSmoke.includes(
+      "Home GUI accepted a replayed authorized attachment descriptor",
+    ) &&
+    homeWalletConnectorLaunchHeadlessSmoke.includes(
+      "forged, substituted, or wrong-source descriptor",
+    ) &&
+    homeWalletConnectorLaunchHeadlessSmoke.includes(
+      "did not retain distinct Wallet and connector frames",
+    ) &&
+    homeWalletConnectorLaunchHeadlessSmoke.includes(
+      "did not open as a bounded, non-covering connector window",
+    ) &&
+    homeWalletConnectorLaunchHeadlessSmoke.includes(
+      "close did not return focus to the unchanged Wallet",
+    ) &&
+    homeShellRegressionSmoke.includes(
+      "did not receive a distinct deterministic window and frame",
+    ) &&
+    homeShellRegressionSmoke.includes(
+      "did not use bounded non-covering connector geometry",
+    ) &&
+    homeShellRegressionSmoke.includes(
+      "active connector close did not return directly to Wallet focus",
+    ) &&
+    homeShellBridgeSmoke.includes(
+      "intent hid the existing Home GUI windows",
+    ),
+  "Home connector smokes must cover exact launch counts, continuity, geometry, close, provenance/replay, and credential-free UI",
 );
 assert(
   shellJs.includes('"archive-manager": new Set(["library"])'),
@@ -3436,7 +3537,13 @@ assert(
     homeShellBridgeSmoke.includes("isolated Home GUI could not ask Home to launch Browser") &&
     homeShellBridgeSmoke.includes("Home did not return the isolated Browser route to Home GUI") &&
     homeShellBridgeSmoke.includes("Browser frame obtained host passkey authority") &&
-    homeShellBridgeSmoke.includes('passkeyReply?.payload?.homeToken === "system-fresh-token"') &&
+    homeShellBridgeSmoke.includes('passkeyReply?.payload?.stepUpToken === "system-step-up-token"') &&
+    homeShellBridgeSmoke.includes(
+      'systemStepUpBegin?.body?.operation === "auth.full-recovery-bundle.export"',
+    ) &&
+    homeShellBridgeSmoke.includes(
+      'systemStepUpBegin?.body?.request?.label === "Recovery Kit"',
+    ) &&
     homeShellHostContract.includes("The Home DOM is a trusted host surface") &&
     homeShellHostContract.includes("contain desktop, taskbar, launcher, window, or terminal implementation"),
   "Home must keep a host-only DOM and run GUI, CLI, and app documents in authenticated opaque frames",
@@ -4162,6 +4269,9 @@ const walletMetamask = read("capsules/wallet-metamask/browser/index.html");
 const walletMetamaskJs = read("capsules/wallet-metamask/browser/wallet-metamask.js");
 const walletUnisat = read("capsules/wallet-unisat/browser/index.html");
 const walletUnisatJs = read("capsules/wallet-unisat/browser/wallet-unisat.js");
+const walletConnectorTransactionSmoke = read(
+  "scripts/wallet-connector-transaction-smoke.mjs",
+);
 const wallet = read("capsules/wallet/browser/index.html");
 const walletJs = readAll([
   "capsules/wallet/browser/wallet.js",
@@ -4494,12 +4604,12 @@ const inboxInspectorApprovalBoundary = {
     gatewayTests.includes("other_inbox_token.as_str()") &&
     gatewayApi.includes("signed_step_up_is_exact_intent_and_single_use") &&
     gatewayApi.includes("token_rejects_expiry_mixed_schema_and_extra_envelope_fields"),
-  docsDeclareFreshInspectorProof: capsuleInspectorDocs.includes(
-    "fresh same-principal passkey Home token",
-  ) &&
-    capsuleInspectorDocs.includes(
-      "Verifies the fresh passkey Home token belongs to the same principal",
-    ),
+  inboxCarriesExactIntentStepUpToken:
+    inbox.includes("stepUpToken") &&
+    inbox.includes("step_up_token: stepUpToken") &&
+    gatewayInspectActions.includes("consume_passkey_step_up_token(") &&
+    gatewayInspectActions.includes('"inspect.approve"') &&
+    gatewayInspectActions.includes('json!({ "request_id": record.request_id })'),
 };
 assert(
   Object.values(inboxInspectorApprovalBoundary).every(Boolean),
@@ -6614,11 +6724,11 @@ assert(
   "Default wallet selection must live in Wallet provider surfaces, not System Advanced",
 );
 assert(
-  walletProvider.includes("chain_namespace is required") &&
+  walletProvider.includes('validate_opaque_id(&self.chain_namespace, "chain_namespace")') &&
     walletProvider.includes(
       "wallet account does not match requested chain_namespace",
     ) &&
-    gatewayApi.includes('"op": "set_default_account"') &&
+    gatewayApi.includes("WalletProviderOperationV2::SetDefaultAccount") &&
     gatewayTests.includes('"chain_namespace": "eip155:20"'),
   "Wallet signing must be chain-and-intent scoped before resolving a default or explicit account",
 );
@@ -6651,13 +6761,15 @@ assert(
 assert(
   gatewayApi.includes("WALLET_CAPSULE_ID") &&
     gatewayApi.includes("WALLET_WALLETCONNECT_CAPSULE_ID") &&
-    gatewayApi.includes("WALLET_LINK_CAPSULE_IDS") &&
-    gatewayApi.includes("WALLET_WALLETCONNECT_CAPSULE_ID") &&
-    authGatewayApi.includes(
-      '"connector_id": wallet_connector_id_for_wallet_link(&app)?',
-    ) &&
+    gatewayApi.includes("/api/apps/home/wallet-connector/evm/link/challenge") &&
+    gatewayApi.includes("/api/apps/home/wallet-connector/bitcoin/link/challenge") &&
+    gatewayApi.includes("/api/apps/home/wallet-connector/approvals/:request_id/handoff") &&
+    !gatewayApi.includes("WALLET_LINK_CAPSULE_IDS") &&
+    authGatewayApi.includes("&[super::gateway::WALLET_WALLETCONNECT_CAPSULE_ID]") &&
+    authGatewayApi.includes("let _ = wallet_connector_id_for_wallet_link(&app)?") &&
+    authGatewayApi.includes("WalletProviderOperationV2::LinkVerifiedAccount") &&
     !authGatewayApi.includes("app == super::gateway::WALLET_CAPSULE_ID"),
-  "External wallet linking must be owned by dedicated connector capsules instead of Home/System/Wallet manual proof",
+  "Injected wallet linking must use the dual-authority Home bridge while WalletConnect retains its configured connector path",
 );
 assert(
   gatewayApi.includes("/api/apps/:wallet_connector/wallet/approvals") &&
@@ -6793,7 +6905,8 @@ assert(
     walletProvider.includes("external_transaction_result") &&
     walletProvider.includes("awaiting_wallet_transaction") &&
     walletProvider.includes("elastos.wallet.signed_transaction/v1") &&
-    walletMetamaskJs.includes("eth_sendTransaction") &&
+    homeWalletConnectorHost.includes('"eth_sendTransaction"') &&
+    !walletMetamaskJs.includes("eth_sendTransaction") &&
     walletWalletconnectJs.includes("eth_sendTransaction"),
   "Built-in EVM transaction signing must be typed and external transaction completion must stay connector-bound",
 );
@@ -6808,10 +6921,10 @@ assert(
   "Chain-provider wire requests must reject hidden raw transaction and node RPC authority fields at decode time",
 );
 assert(
-  walletProvider.includes("verify_contract_proof") &&
+    walletProvider.includes("verify_contract_proof") &&
     walletProvider.includes("siwe_erc1271") &&
     chainProvider.includes("erc1271_is_valid_signature") &&
-    authGatewayApi.includes("verify_contract_proof"),
+    authGatewayApi.includes("WalletProviderOperationV2::VerifyContractProof"),
   "ERC-1271 wallet proofs must be chain-provider verified before wallet-provider consumes the Runtime challenge",
 );
 assert(
@@ -6845,8 +6958,9 @@ assert(
 assert(
   gatewayApi.includes("/api/auth/btc/challenge") &&
     gatewayApi.includes("/api/auth/btc/verify") &&
-    authGatewayApi.includes('"op": "bitcoin_challenge"') &&
-    authGatewayApi.includes('"op": "verify_bip322_proof"') &&
+    gatewayApi.includes("/api/apps/home/wallet-connector/bitcoin/link/challenge") &&
+    authGatewayApi.includes("WalletProviderOperationV2::BitcoinChallenge") &&
+    authGatewayApi.includes("WalletProviderOperationV2::VerifyBip322Proof") &&
     gatewayTests.includes(
       "test_btc_wallet_link_rejects_system_token_without_connector",
     ) &&
@@ -9067,6 +9181,63 @@ assert(
     browserPlanningSurface.includes("browser-hosted-product-wallet-smoke.sh"),
   "Hosted Browser product path must prove the remote Chromium page receives the constrained Runtime-mediated EIP-1193 bridge while duplicate signature prompts coalesce and signing routes through Wallet/Inbox approval",
 );
+
+assert(
+  browserSelkiesControlService.includes(
+    "approval?.approval_request?.expires_at",
+  ) &&
+    read(
+      "elastos/tools/browser-playwright-engine/src/supervisor.mjs",
+    ).includes("body?.approval_request?.expires_at") &&
+    browserSelkiesControlService.includes("walletApprovalDeadlineMs") &&
+    read(
+      "elastos/tools/browser-playwright-engine/src/wallet-approval.mjs",
+    ).includes("walletApprovalDeadlineMs") &&
+    browserSelkiesControlService.includes("30 * 60 * 1000") &&
+    read(
+      "elastos/tools/browser-playwright-engine/src/wallet-approval.mjs",
+    ).includes("30 * 60 * 1000") &&
+    browserSelkiesControlService.includes(
+      "withWalletApprovalStatusTimeout",
+    ) &&
+    read(
+      "elastos/tools/browser-playwright-engine/src/wallet-approval.mjs",
+    ).includes("withWalletApprovalStatusTimeout") &&
+    browserSelkiesControlService.includes("statusIoTimeoutMs = 3000") &&
+    read(
+      "elastos/tools/browser-playwright-engine/src/wallet-approval.mjs",
+    ).includes("statusIoTimeoutMs = 3000") &&
+    browserSelkiesControlService.includes("timeout_ms: timeoutMs") &&
+    browserSelkiesControlService.includes("enforceWallClockTimeout") &&
+    browserSelkiesControlService.includes("? setTimeout(() =>") &&
+    read(
+      "elastos/tools/browser-playwright-engine/src/supervisor.mjs",
+    ).includes("new AbortController()") &&
+    !browserSelkiesControlService.includes(
+      "Date.now() + 5 * 60 * 1000",
+    ) &&
+    !read(
+      "elastos/tools/browser-playwright-engine/src/supervisor.mjs",
+    ).includes("Date.now() + 5 * 60 * 1000") &&
+    browserWalletApprovalDeadlineSmoke.includes("after-five-minutes") &&
+    browserWalletApprovalDeadlineSmoke.includes("provider-expiry") &&
+    browserWalletApprovalDeadlineSmoke.includes("final-status-race") &&
+    browserWalletApprovalDeadlineSmoke.includes("already-broadcast") &&
+    browserWalletApprovalDeadlineSmoke.includes("exact-request") &&
+    browserWalletApprovalDeadlineSmoke.includes("hanging-status") &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "transient-exact-request",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "deadline-final-observation-failure",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "baseline_assertions: baselineAssertions",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes("real_sleep_ms: 0"),
+  "Home must retain deterministic proof that both trusted Browser adapters bound status I/O and keep exact-request caches through transient failures",
+);
+
 assert(
   browserHostedProductGlideWalletSmoke.includes("https://glidefinance.io/") &&
     browserHostedProductGlideWalletSmoke.includes("Connect Wallet") &&
@@ -9632,18 +9803,56 @@ assert(
   "MetaMask connector UI must avoid redundant wallet copy and manual refresh chrome",
 );
 assert(
-  walletMetamaskJs.includes("selectedMetaMaskProvider") &&
-    walletMetamaskJs.includes("eth_requestAccounts") &&
-    walletMetamaskJs.includes("personal_sign") &&
-    !walletMetamaskJs.includes("wallet-refresh"),
-  "MetaMask connector must own the injected-wallet interaction without stale refresh controls",
+  shellJs.includes("handleHomeWalletConnectorEffect(event, context, data)") &&
+    shellJs.includes("data.type === WALLET_CONNECTOR_EFFECT_TYPE") &&
+    shellJs.includes("walletEffectState") &&
+    homeWalletConnectorHost.includes(
+      'export const WALLET_CONNECTOR_EFFECT_TYPE = "home:wallet-connector-effect"',
+    ) &&
+    homeWalletConnectorHost.includes(
+      'export const WALLET_CONNECTOR_EFFECT_SCHEMA = "elastos.home.wallet-connector-effect/v1"',
+    ) &&
+    homeWalletConnectorHost.includes("hasExactKeys(data, [") &&
+    homeWalletConnectorHost.includes("state.inFlight || state.requestIds.has(requestId)") &&
+    homeWalletConnectorHost.includes("MAX_EFFECT_REQUESTS_PER_FRAME") &&
+    homeWalletConnectorHost.includes("context.targetId") &&
+    homeWalletConnectorHost.includes("data.connectorToken !== context.homeToken") &&
+    homeWalletConnectorHost.includes("data.requestId !== requestId") &&
+    homeWalletConnectorHost.includes("data.connectorId !== connectorId") &&
+    homeWalletConnectorHost.includes("connector_token: connectorToken") &&
+    homeWalletConnectorHost.includes("selectMetaMaskCompatibleProvider()") &&
+    homeWalletConnectorHost.includes("Injected wallet provider identities conflict.") &&
+    homeShellBridgeSmoke.includes("invalid Home wallet messages reached Runtime or an injected provider") &&
+    homeShellBridgeSmoke.includes("wallet connector bridge opened an extra browser window") &&
+    walletConnectorTransactionSmoke.includes('authorityTransport: "fragment"') &&
+    walletConnectorTransactionSmoke.includes('effectOwner: "home-host"'),
+  "Home wallet connector effects must use one exact, bounded, replay-safe, dual-token host bridge",
 );
 assert(
-  walletMetamaskJs.includes("/api/auth/evm/challenge") &&
-    walletMetamaskJs.includes("/api/auth/evm/verify") &&
-    walletMetamaskJs.includes("/api/apps/wallet-metamask/wallet/accounts") &&
-    walletMetamaskJs.includes("/api/apps/wallet-metamask/wallet/approvals"),
-  "MetaMask connector must use runtime wallet-link, account, and approval routes",
+  walletMetamaskJs.includes('HOST_EFFECT_TYPE = "home:wallet-connector-effect"') &&
+    walletMetamaskJs.includes('HOST_EFFECT_SCHEMA = "elastos.home.wallet-connector-effect/v1"') &&
+    walletMetamaskJs.includes('requestHomeWalletEffect({ kind: "link" })') &&
+    walletMetamaskJs.includes('{ kind: "approve", approvalRequestId }') &&
+    !walletMetamaskJs.includes("eth_requestAccounts") &&
+    !walletMetamaskJs.includes('method: "personal_sign"') &&
+    !walletMetamaskJs.includes("eth_sendTransaction") &&
+    !walletMetamaskJs.includes("window.ethereum") &&
+    !walletMetamaskJs.includes("eip6963") &&
+    !walletMetamaskJs.includes("wallet-refresh"),
+  "Opaque MetaMask connector UI must project only the closed Home-host effect bridge",
+);
+assert(
+  walletMetamaskJs.includes(`/api/apps/\${CONNECTOR_ID}/wallet/accounts`) &&
+    walletMetamaskJs.includes(`/api/apps/\${CONNECTOR_ID}/wallet/approvals`) &&
+    !walletMetamaskJs.includes("/api/auth/evm/") &&
+    !walletMetamaskJs.includes("/wallet/approvals/${") &&
+    homeWalletConnectorHost.includes('const METAMASK_RDNS = "io.metamask"') &&
+    homeWalletConnectorHost.includes('const BRAVE_RDNS = "com.brave.wallet"') &&
+    homeWalletConnectorHost.includes('"eth_requestAccounts"') &&
+    homeWalletConnectorHost.includes('"personal_sign"') &&
+    homeWalletConnectorHost.includes('"eth_signTypedData_v4"') &&
+    homeWalletConnectorHost.includes('"eth_sendTransaction"'),
+  "Home must own exact MetaMask/Brave provider selection and only Runtime-implied EVM effects",
 );
 assert(
   walletMetamaskJs.includes("navigator.clipboard.writeText") &&
@@ -9651,10 +9860,10 @@ assert(
   "MetaMask connector must show copyable full linked wallet accounts",
 );
 assert(
-  walletMetamaskJs.includes("isManagedWalletRequest") &&
+    walletMetamaskJs.includes("isManagedWalletRequest") &&
     walletMetamaskJs.includes("managed_btc_p2wpkh") &&
     walletMetamaskJs.includes("isMetaMaskSignableRequest") &&
-    walletMetamaskJs.includes('intent !== "bitcoin_bip322_proof"'),
+    walletMetamaskJs.includes('!== "bitcoin_bip322_proof"'),
   "MetaMask connector must not show built-in or Bitcoin BIP-322 requests as MetaMask-signable requests",
 );
 assert(
@@ -9666,18 +9875,23 @@ assert(
 );
 assert(
   walletUnisatJs.includes('CONNECTOR_ID = "wallet-unisat"') &&
-    walletUnisatJs.includes("candidateWindow.unisat") &&
-    walletUnisatJs.includes("openTopLevelConnector") &&
-    walletUnisat.includes('id="wallet-open-popup"') &&
-    walletUnisatJs.includes('signMessage(message, "bip322-simple")') &&
-    walletUnisatJs.includes('signMessage(message, "ecdsa")') &&
-    walletUnisatJs.includes("bitcoinAddressType") &&
+    walletUnisatJs.includes('HOST_EFFECT_TYPE = "home:wallet-connector-effect"') &&
+    walletUnisatJs.includes('requestHomeWalletEffect({ kind: "link" })') &&
+    walletUnisatJs.includes('{ kind: "approve", approvalRequestId }') &&
     walletUnisatJs.includes("bitcoin_signed_message") &&
-    walletUnisatJs.includes("/api/auth/btc/challenge") &&
-    walletUnisatJs.includes("/api/auth/btc/verify") &&
+    !walletUnisatJs.includes("window.unisat") &&
+    !walletUnisatJs.includes("signMessage(") &&
+    !walletUnisatJs.includes("window.open") &&
+    !walletUnisatJs.includes("openTopLevelConnector") &&
+    !walletUnisat.includes('id="wallet-open-popup"') &&
+    !walletUnisatJs.includes("/api/auth/btc/") &&
     walletUnisatJs.includes(`/api/apps/\${CONNECTOR_ID}/wallet/accounts`) &&
-    walletUnisatJs.includes(`/api/apps/\${CONNECTOR_ID}/wallet/approvals`),
-  "UniSat connector must own BIP-322 browser wallet signing while using runtime wallet-link and approval routes only",
+    walletUnisatJs.includes(`/api/apps/\${CONNECTOR_ID}/wallet/approvals`) &&
+    homeWalletConnectorHost.includes("window.unisat") &&
+    homeWalletConnectorHost.includes('provider.signMessage(message, "bip322-simple")') &&
+    homeWalletConnectorHost.includes('provider.signMessage(message, "ecdsa")') &&
+    homeWalletConnectorHost.includes("bitcoinAddressType"),
+  "Opaque UniSat UI must use the closed Home host without a popup or direct injected-provider path",
 );
 assert(
   !walletJs.includes("/api/auth/btc/challenge") &&
@@ -9688,7 +9902,7 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet.js?v=wallet-20260711c") &&
+  wallet.includes("wallet.js?v=wallet-20260726b") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
     wallet.includes("data-wallet-create-account") &&
@@ -9798,7 +10012,7 @@ assert(
     walletJs.includes("/api/apps/wallet/wallet/default") &&
     walletJs.includes("openRenameAccount") &&
     walletJs.includes('method: "PUT"') &&
-    gatewayApi.includes('"op": "rename_account"') &&
+    gatewayApi.includes("WalletProviderOperationV2::RenameAccount") &&
     gatewayTests.includes("test_wallet_app_can_rename_account") &&
     walletProvider.includes("RenameAccount") &&
     walletProvider.includes("rename_account"),
@@ -9818,7 +10032,7 @@ assert(
   "Wallet account recovery and deletion must be explicit runtime-backed actions, with passkey-protected importable Wallet recovery key export instead of fake seed phrase copy",
 );
 assert(
-  walletProvider.includes("ExportManagedSecret") &&
+  walletProvider.includes("ExportManagedRecoveryKey") &&
     walletProvider.includes("elastos.wallet.recovery-key/v1") &&
     gatewayApi.includes(
       "/api/apps/wallet/wallet/accounts/:account_id/recovery-key",

@@ -1,3 +1,9 @@
+const CONNECTOR_ID = "wallet-metamask";
+const HOST_EFFECT_TYPE = "home:wallet-connector-effect";
+const HOST_EFFECT_SCHEMA = "elastos.home.wallet-connector-effect/v1";
+const HOST_RESULT_TYPE = "home:wallet-connector-effect-result";
+const HOST_RESULT_SCHEMA = "elastos.home.wallet-connector-effect-result/v1";
+const HOST_EFFECT_TIMEOUT_MS = 60_000;
 const connectButton = document.querySelector("#wallet-connect");
 const statusNode = document.querySelector("#wallet-status");
 const stateNode = document.querySelector("#wallet-state");
@@ -5,7 +11,8 @@ const accountsNode = document.querySelector("#wallet-accounts");
 const requestsNode = document.querySelector("#wallet-requests");
 const frameHomeToken = readLaunchToken();
 const homeOrigin = readQueryParam("home_origin");
-const discoveredWalletProviders = [];
+let hostEffectInFlight = false;
+let hostRequestSequence = 0;
 
 if (frameHomeToken && homeOrigin && window.top !== window) {
   window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeOrigin);
@@ -14,103 +21,28 @@ if (frameHomeToken && homeOrigin && window.top !== window) {
 boot();
 
 function boot() {
-  configureMetaMaskDiscovery();
-  if (connectButton) {
-    connectButton.addEventListener("click", onConnect);
-  }
-  if (accountsNode) {
-    accountsNode.addEventListener("click", onAccountClick);
-  }
-  if (requestsNode) {
-    requestsNode.addEventListener("click", onRequestClick);
-  }
+  connectButton?.addEventListener("click", onConnect);
+  accountsNode?.addEventListener("click", onAccountClick);
+  requestsNode?.addEventListener("click", onRequestClick);
   setState("0 linked");
   refreshWalletState().catch((error) => {
-    showStatus(String(error.message || error), "error");
+    showStatus(errorMessage(error), "error");
   });
-}
-
-function configureMetaMaskDiscovery() {
-  window.addEventListener("eip6963:announceProvider", (event) => {
-    const detail = event && event.detail;
-    const provider = detail && detail.provider;
-    if (!provider || typeof provider.request !== "function") {
-      return;
-    }
-    if (!discoveredWalletProviders.some((entry) => entry.provider === provider)) {
-      discoveredWalletProviders.push({ info: detail.info || {}, provider });
-    }
-  });
-  window.dispatchEvent(new Event("eip6963:requestProvider"));
 }
 
 async function onConnect() {
-  const provider = metaMaskProvider();
-  if (!provider) {
-    showStatus("No compatible wallet found.", "error");
-    return;
-  }
   setButtonBusy(connectButton, true);
-  showStatus("Approve in your wallet.", "muted");
+  showStatus("Approve in MetaMask or Brave Wallet.", "muted");
   try {
-    const { address, chainId } = await connectProvider(provider);
-    const challenge = await fetchJson("/api/auth/evm/challenge", {
-      method: "POST",
-      headers: shellHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ address, chain_id: chainId }),
-    });
-    const signer = await currentProviderAddress(provider);
-    ensureSameAddress(signer, address, "Wallet account changed before signing.");
-    const signature = await provider.request({
-      method: "personal_sign",
-      params: [challenge.message, signer],
-    });
-    await fetchJson("/api/auth/evm/verify", {
-      method: "POST",
-      headers: shellHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ message: challenge.message, signature }),
-    });
+    await requestHomeWalletEffect({ kind: "link" });
     showStatus("Approval method added.", "success");
     notifyHomeSummaryChanged();
     await refreshWalletState();
   } catch (error) {
-    showStatus(String(error.message || error), "error");
+    showStatus(errorMessage(error), "error");
   } finally {
     setButtonBusy(connectButton, false);
   }
-}
-
-async function connectProvider(provider) {
-  const accounts = await provider.request({ method: "eth_requestAccounts" });
-  const address = Array.isArray(accounts) && accounts[0] ? String(accounts[0]) : "";
-  if (!address) {
-    throw new Error("Wallet returned no account.");
-  }
-  const chainHex = await provider.request({ method: "eth_chainId" });
-  const chainId = Number.parseInt(String(chainHex), 16);
-  if (!Number.isFinite(chainId) || chainId <= 0) {
-    throw new Error("Wallet returned an invalid chain.");
-  }
-  return { address, chainId };
-}
-
-async function currentProviderAddress(provider) {
-  const accounts = await provider.request({ method: "eth_accounts" });
-  const address = Array.isArray(accounts) && accounts[0] ? String(accounts[0]) : "";
-  if (!address) {
-    throw new Error("Wallet has no selected account.");
-  }
-  return address;
-}
-
-function ensureSameAddress(actual, expected, message) {
-  if (normalizeAddress(actual) !== normalizeAddress(expected)) {
-    throw new Error(message);
-  }
-}
-
-function normalizeAddress(address) {
-  return readText(address).toLowerCase();
 }
 
 async function refreshWalletState() {
@@ -121,26 +53,20 @@ async function refreshWalletState() {
     return;
   }
   const [accountSummary, requestSummary] = await Promise.all([
-    fetchJson("/api/apps/wallet-metamask/wallet/accounts", {
+    fetchJson(`/api/apps/${CONNECTOR_ID}/wallet/accounts`, {
       headers: shellHeaders(),
     }),
-    fetchJson("/api/apps/wallet-metamask/wallet/approvals", {
+    fetchJson(`/api/apps/${CONNECTOR_ID}/wallet/approvals`, {
       headers: shellHeaders(),
     }),
   ]);
-  const accounts = Array.isArray(accountSummary && accountSummary.accounts)
-    ? accountSummary.accounts
-    : [];
-  const requests = Array.isArray(requestSummary && requestSummary.approval_requests)
+  const accounts = Array.isArray(accountSummary?.accounts) ? accountSummary.accounts : [];
+  const requests = Array.isArray(requestSummary?.approval_requests)
     ? requestSummary.approval_requests
     : [];
   renderAccounts(accounts);
   renderRequests(requests);
-  if (accounts.length > 0) {
-    setState(`${accounts.length} linked`);
-  } else {
-    setState("0 linked");
-  }
+  setState(accounts.length > 0 ? `${accounts.length} linked` : "0 linked");
 }
 
 function renderAccounts(accounts) {
@@ -149,10 +75,7 @@ function renderAccounts(accounts) {
   }
   accountsNode.replaceChildren();
   if (accounts.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "wallet-empty";
-    empty.textContent = "No connected accounts.";
-    accountsNode.append(empty);
+    accountsNode.append(emptyNode("No connected accounts."));
     return;
   }
   for (const account of accounts) {
@@ -163,27 +86,21 @@ function renderAccounts(accounts) {
 function accountCard(account) {
   const card = document.createElement("div");
   card.className = "wallet-account";
-
   const main = document.createElement("div");
   main.className = "wallet-account-main";
-
   const title = document.createElement("strong");
-  title.textContent = `Connected wallet · ${chainLabel(account.chain_namespace)}`;
-
+  title.textContent = `Connected wallet · ${chainLabel(account?.chain_namespace)}`;
   const address = document.createElement("code");
-  const addressText = readText(account.address);
+  const addressText = readText(account?.address);
   address.className = "wallet-address";
   address.textContent = addressText || "Unknown address";
-
   main.append(title, address);
-
   const copy = document.createElement("button");
   copy.className = "wallet-button wallet-button-secondary wallet-copy-button";
   copy.type = "button";
   copy.textContent = "Copy";
   copy.dataset.walletCopyAddress = addressText;
   copy.disabled = !addressText;
-
   card.append(main, copy);
   return card;
 }
@@ -193,17 +110,14 @@ function renderRequests(requests) {
     return;
   }
   requestsNode.replaceChildren();
-  const externalRequests = requests.filter((request) => (
+  const connectorRequests = requests.filter((request) => (
     !isManagedWalletRequest(request) && isMetaMaskSignableRequest(request)
   ));
-  if (externalRequests.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "wallet-empty";
-    empty.textContent = "No approval requests.";
-    requestsNode.append(empty);
+  if (connectorRequests.length === 0) {
+    requestsNode.append(emptyNode("No approval requests."));
     return;
   }
-  for (const request of externalRequests) {
+  for (const request of connectorRequests) {
     requestsNode.append(requestCard(request));
   }
 }
@@ -211,40 +125,32 @@ function renderRequests(requests) {
 function requestCard(request) {
   const card = document.createElement("div");
   card.className = "wallet-request";
-
   const main = document.createElement("div");
   main.className = "wallet-request-main";
-
   const title = document.createElement("strong");
-  title.textContent = walletIntentLabel(request.intent);
-
+  title.textContent = walletIntentLabel(request?.intent);
   const meta = document.createElement("span");
-  const capsule = readText(request.capsule_id) || "capsule";
-  const address = shortAddress(request.address);
+  const capsule = readText(request?.capsule_id) || "capsule";
+  const address = shortAddress(request?.address);
   meta.textContent = address ? `${capsule} - ${address}` : capsule;
-
   const reason = document.createElement("small");
-  reason.textContent = readText(request.reason) || readText(request.resource) || "Approval requested.";
-
+  reason.textContent = readText(request?.reason)
+    || readText(request?.resource)
+    || "Approval requested.";
   main.append(title, meta, reason);
-
   const sign = document.createElement("button");
   sign.className = "wallet-button";
   sign.type = "button";
   sign.textContent = "Review";
-  sign.dataset.walletRequestSign = readText(request.request_id);
-
+  sign.dataset.walletRequestSign = readText(request?.request_id);
   card.append(main, sign);
   return card;
 }
 
 async function onAccountClick(event) {
-  const button = event.target && event.target.closest("[data-wallet-copy-address]");
-  if (!button) {
-    return;
-  }
-  const address = readText(button.dataset.walletCopyAddress);
-  if (!address) {
+  const button = event.target?.closest?.("[data-wallet-copy-address]");
+  const address = readText(button?.dataset?.walletCopyAddress);
+  if (!button || !address) {
     return;
   }
   setButtonBusy(button, true);
@@ -252,203 +158,141 @@ async function onAccountClick(event) {
     await copyText(address);
     showStatus("Address copied.", "success");
   } catch (error) {
-    showStatus(String(error.message || error), "error");
+    showStatus(errorMessage(error), "error");
   } finally {
     setButtonBusy(button, false);
   }
 }
 
 async function onRequestClick(event) {
-  const button = event.target && event.target.closest("[data-wallet-request-sign]");
-  if (!button) {
-    return;
-  }
-  const requestId = readText(button.dataset.walletRequestSign);
-  if (!requestId) {
-    return;
-  }
-  const provider = metaMaskProvider();
-  if (!provider) {
-    showStatus("No compatible wallet found.", "error");
+  const button = event.target?.closest?.("[data-wallet-request-sign]");
+  const approvalRequestId = readText(button?.dataset?.walletRequestSign);
+  if (!button || !approvalRequestId) {
     return;
   }
   setButtonBusy(button, true);
   showStatus("Preparing request.", "muted");
   try {
-    const handoffSummary = await fetchJson(`/api/apps/wallet-metamask/wallet/approvals/${encodeURIComponent(requestId)}/approve`, {
-      method: "POST",
-      headers: shellHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ reason: "Approved in wallet" }),
-    });
-    const handoff = handoffSummary && handoffSummary.handoff;
-    const signer = readText(handoff && handoff.signer);
-    const payloadHash = readText(handoff && handoff.payload_hash);
-    if (!signer || !payloadHash) {
-      throw new Error("Wallet handoff is incomplete.");
-    }
-    if (readText(handoff.intent) === "transaction_intent") {
-      const transaction = handoff.transaction && typeof handoff.transaction === "object"
-        ? handoff.transaction
-        : null;
-      if (!transaction || !readText(transaction.chainId)) {
-        throw new Error("Wallet transaction handoff is incomplete.");
-      }
-      await ensureProviderChain(provider, readText(transaction.chainId));
-      const activeSigner = await currentProviderAddress(provider);
-      ensureSameAddress(activeSigner, signer, "Switch to the linked account before approving.");
-      showStatus("Approve transaction in your wallet.", "muted");
-      const transactionHash = await provider.request({
-        method: "eth_sendTransaction",
-        params: [transaction],
-      });
-      await fetchJson(`/api/apps/wallet-metamask/wallet/approvals/${encodeURIComponent(requestId)}/complete`, {
-        method: "POST",
-        headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ payload_hash: payloadHash, transaction_hash: transactionHash, signer: activeSigner }),
-      });
-      showStatus("Transaction sent.", "success");
-    } else {
-      const message = readText(handoff && handoff.message);
-      if (!message) {
-        throw new Error("Wallet signature handoff is incomplete.");
-      }
-      const activeSigner = await currentProviderAddress(provider);
-      ensureSameAddress(activeSigner, signer, "Switch to the linked account before signing.");
-      showStatus("Approve in your wallet.", "muted");
-      const signature = await provider.request({
-        method: "personal_sign",
-        params: [message, activeSigner],
-      });
-      await fetchJson(`/api/apps/wallet-metamask/wallet/approvals/${encodeURIComponent(requestId)}/complete`, {
-        method: "POST",
-        headers: shellHeaders({ "content-type": "application/json" }),
-        body: JSON.stringify({ payload_hash: payloadHash, signature, signer: activeSigner }),
-      });
-      showStatus("Request signed.", "success");
-    }
+    const result = await requestHomeWalletEffect({ kind: "approve", approvalRequestId });
+    showStatus(
+      result.effect === "transaction" ? "Transaction sent." : "Request signed.",
+      "success",
+    );
     notifyHomeSummaryChanged();
     await refreshWalletState();
   } catch (error) {
-    showStatus(String(error.message || error), "error");
+    showStatus(errorMessage(error), "error");
   } finally {
     setButtonBusy(button, false);
   }
 }
 
-async function ensureProviderChain(provider, chainId) {
-  const targetChainId = normalizeChainId(chainId);
-  const active = normalizeChainId(await provider.request({ method: "eth_chainId" }));
-  if (active === targetChainId) {
-    return;
+function requestHomeWalletEffect(action) {
+  if (!frameHomeToken || !homeOrigin || window.top === window) {
+    return Promise.reject(new Error("Open this approval method from Wallet."));
   }
-  try {
-    await provider.request({
-      method: "wallet_switchEthereumChain",
-      params: [{ chainId: targetChainId }],
-    });
-  } catch (error) {
-    if (!isUnknownChainError(error)) {
-      throw error;
-    }
-    const chain = await ethereumChainConfig(targetChainId);
-    if (!chain) {
-      throw error;
-    }
-    await provider.request({
-      method: "wallet_addEthereumChain",
-      params: [chain],
-    });
+  if (hostEffectInFlight) {
+    return Promise.reject(new Error("A wallet request is already active."));
   }
-  const current = normalizeChainId(await provider.request({ method: "eth_chainId" }));
-  if (current !== targetChainId) {
-    throw new Error(`Switch to ${chainLabel(`eip155:${Number.parseInt(targetChainId, 16)}`)} before approving.`);
-  }
-}
-
-function normalizeChainId(value) {
-  const text = readText(value).toLowerCase();
-  if (/^0x[0-9a-f]+$/.test(text)) {
-    return text;
-  }
-  const number = Number.parseInt(text, 10);
-  if (!Number.isFinite(number) || number <= 0) {
-    throw new Error("Wallet returned an invalid chain.");
-  }
-  return `0x${number.toString(16)}`;
-}
-
-function isUnknownChainError(error) {
-  return Number(error && error.code) === 4902
-    || String(error && error.message || "").toLowerCase().includes("unrecognized chain")
-    || String(error && error.message || "").toLowerCase().includes("unknown chain");
-}
-
-async function ethereumChainConfig(chainId) {
-  const config = await fetchJson("/api/apps/wallet-metamask/wallet/config", {
-    headers: shellHeaders(),
+  const requestId = nextHostRequestId();
+  hostEffectInFlight = true;
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      finish();
+      reject(new Error("Wallet request timed out."));
+    }, HOST_EFFECT_TIMEOUT_MS);
+    const finish = () => {
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", onMessage);
+      hostEffectInFlight = false;
+    };
+    const onMessage = (event) => {
+      const data = event.data;
+      if (
+        event.source !== window.top
+        || event.origin !== homeOrigin
+        || data?.type !== HOST_RESULT_TYPE
+        || data.schema !== HOST_RESULT_SCHEMA
+        || data.requestId !== requestId
+        || data.connectorId !== CONNECTOR_ID
+      ) {
+        return;
+      }
+      const hasResult = hasExactKeys(data, [
+        "type",
+        "schema",
+        "requestId",
+        "connectorId",
+        "result",
+      ]);
+      const hasError = hasExactKeys(data, [
+        "type",
+        "schema",
+        "requestId",
+        "connectorId",
+        "error",
+      ]);
+      if (!hasResult && !hasError) {
+        return;
+      }
+      finish();
+      if (hasError) {
+        reject(new Error(readText(data.error) || "Wallet request failed."));
+        return;
+      }
+      const expectedResultKeys = action.kind === "link" ? ["status"] : ["status", "effect"];
+      if (
+        !hasExactKeys(data.result, expectedResultKeys)
+        || data.result.status !== (action.kind === "link" ? "linked" : "completed")
+        || (
+          action.kind === "approve"
+          && !["signature", "transaction"].includes(data.result.effect)
+        )
+      ) {
+        reject(new Error("Home returned an invalid wallet result."));
+        return;
+      }
+      resolve(data.result);
+    };
+    window.addEventListener("message", onMessage);
+    window.top.postMessage({
+      type: HOST_EFFECT_TYPE,
+      schema: HOST_EFFECT_SCHEMA,
+      requestId,
+      connectorId: CONNECTOR_ID,
+      connectorToken: frameHomeToken,
+      action,
+    }, homeOrigin);
   });
-  const chains = Array.isArray(config && config.evm_chains) ? config.evm_chains : [];
-  return chains.find((chain) => normalizeChainId(chain && chain.chainId) === normalizeChainId(chainId)) || null;
 }
 
-function metaMaskProvider() {
-  const discovered = selectedMetaMaskProvider(discoveredWalletProviders);
-  if (discovered) {
-    return discovered;
-  }
-  if (window.ethereum && typeof window.ethereum.request === "function") {
-    return selectedMetaMaskProvider(
-      Array.isArray(window.ethereum.providers)
-        ? window.ethereum.providers.map((provider) => ({ info: {}, provider }))
-        : [{ info: {}, provider: window.ethereum }],
-    );
-  }
-  return null;
-}
-
-function selectedMetaMaskProvider(entries) {
-  const list = Array.isArray(entries) ? entries : [];
-  const metamask = list.find(({ info, provider }) => {
-    const rdns = readText(info && info.rdns).toLowerCase();
-    return Boolean(provider && provider.isMetaMask) || rdns.includes("metamask");
-  });
-  if (metamask && metamask.provider && typeof metamask.provider.request === "function") {
-    return metamask.provider;
-  }
-  return null;
+function nextHostRequestId() {
+  hostRequestSequence += 1;
+  const random = typeof window.crypto?.randomUUID === "function"
+    ? window.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${hostRequestSequence}`;
+  return `wallet-effect:${random}`;
 }
 
 function walletIntentLabel(intent) {
   switch (readText(intent)) {
-    case "auth_challenge":
-      return "Sign in";
-    case "capability_grant":
-      return "Grant access";
-    case "credential":
-      return "Issue credential";
-    case "publish_envelope":
-      return "Publish";
-    case "transaction_intent":
-      return "Transaction";
-    case "bitcoin_bip322_proof":
-      return "Bitcoin approval";
-    case "revocation":
-      return "Revoke";
-    default:
-      return "Wallet request";
+    case "auth_challenge": return "Sign in";
+    case "browser_personal_sign": return "Sign message";
+    case "browser_typed_data_sign": return "Sign typed data";
+    case "capability_grant": return "Grant access";
+    case "credential": return "Issue credential";
+    case "publish_envelope": return "Publish";
+    case "transaction_intent": return "Transaction";
+    case "revocation": return "Revoke";
+    default: return "Wallet request";
   }
 }
 
 function chainLabel(value) {
   switch (readText(value)) {
-    case "bip122:000000000019d6689c085ae165831e93":
-      return "Bitcoin";
-    case "eip155:1":
-      return "Ethereum";
-    case "eip155:20":
-      return "Elastos Smart Chain";
-    case "eip155:8453":
-      return "Base";
+    case "eip155:1": return "Ethereum";
+    case "eip155:20": return "Elastos Smart Chain";
+    case "eip155:8453": return "Base";
     default: {
       const chainId = readText(value).replace(/^eip155:/, "");
       return chainId ? `EVM ${chainId}` : "EVM";
@@ -457,25 +301,18 @@ function chainLabel(value) {
 }
 
 function isManagedWalletRequest(request) {
-  const proofType = readText(request && request.proof_type);
-  return proofType === "managed_evm" || proofType === "managed_btc_p2wpkh";
+  return ["managed_evm", "managed_btc_p2wpkh"].includes(readText(request?.proof_type));
 }
 
 function isMetaMaskSignableRequest(request) {
-  const connectorId = readText(request && request.connector_id);
-  const intent = readText(request && request.intent);
-  const proofType = readText(request && request.proof_type);
-  return connectorId === "wallet-metamask"
-    && intent !== "bitcoin_bip322_proof"
-    && (proofType === "siwe" || proofType === "siwe_erc1271");
+  return readText(request?.connector_id) === CONNECTOR_ID
+    && readText(request?.intent) !== "bitcoin_bip322_proof"
+    && ["siwe", "siwe_erc1271"].includes(readText(request?.proof_type));
 }
 
 async function copyText(value) {
   const text = readText(value);
-  if (!text) {
-    throw new Error("Nothing to copy.");
-  }
-  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+  if (!text || typeof navigator.clipboard?.writeText !== "function") {
     throw new Error("Clipboard is unavailable.");
   }
   await navigator.clipboard.writeText(text);
@@ -485,37 +322,39 @@ async function fetchJson(url, init) {
   const response = await fetch(url, init);
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
-    const suffix = detail.trim() ? ` ${detail.trim()}` : ` ${response.statusText}`;
-    throw new Error(`request failed: ${response.status}${suffix}`);
+    throw new Error(`request failed: ${response.status}${detail.trim() ? ` ${detail.trim()}` : ""}`);
   }
   return response.json();
 }
 
 function shellHeaders(extra = {}) {
-  return {
-    ...extra,
-    "x-elastos-home-token": frameHomeToken,
-  };
+  return { ...extra, "x-elastos-home-token": frameHomeToken };
 }
 
 function notifyHomeSummaryChanged() {
-  if (!frameHomeToken || !homeOrigin || window.top === window) {
-    return;
+  if (frameHomeToken && homeOrigin && window.top !== window) {
+    window.top.postMessage({ type: "home:refresh-summary", homeToken: frameHomeToken }, homeOrigin);
   }
-  window.top.postMessage({
-    type: "home:refresh-summary",
-    homeToken: frameHomeToken,
-  }, homeOrigin);
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
 }
 
 function readQueryParam(name) {
-  const value = new URLSearchParams(window.location.search).get(name);
-  return typeof value === "string" ? value.trim() : "";
+  return readText(new URLSearchParams(window.location.search).get(name));
 }
 
 function readLaunchToken() {
-  const value = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token");
-  return typeof value === "string" ? value.trim() : "";
+  return readText(
+    new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token"),
+  );
 }
 
 function readText(value) {
@@ -524,30 +363,32 @@ function readText(value) {
 
 function shortAddress(value) {
   const address = readText(value);
-  if (address.length <= 14) {
-    return address;
-  }
-  return `${address.slice(0, 6)}...${address.slice(-4)}`;
+  return address.length <= 14 ? address : `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function emptyNode(message) {
+  const empty = document.createElement("div");
+  empty.className = "wallet-empty";
+  empty.textContent = message;
+  return empty;
 }
 
 function setState(message) {
-  if (stateNode) {
-    stateNode.textContent = message;
-  }
+  if (stateNode) stateNode.textContent = message;
 }
 
 function showStatus(message, tone) {
-  if (!statusNode) {
-    return;
-  }
+  if (!statusNode) return;
   const text = readText(message);
-  statusNode.hidden = text.length === 0;
+  statusNode.hidden = !text;
   statusNode.textContent = text;
   statusNode.dataset.tone = tone || "muted";
 }
 
 function setButtonBusy(button, busy) {
-  if (button) {
-    button.disabled = Boolean(busy);
-  }
+  if (button) button.disabled = Boolean(busy);
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error || "Wallet request failed.");
 }

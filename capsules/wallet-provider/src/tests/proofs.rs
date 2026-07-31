@@ -13,7 +13,7 @@ fn challenge_and_verify_evm_proof() {
         "person:local:test",
         "wallet",
         WalletProviderOperationV2::Challenge {
-            domain: "elastos.local".into(),
+            domain: "http://elastos.local".into(),
             uri: "http://elastos.local/apps/home/".into(),
             address: address.clone(),
             chain_id: 20,
@@ -370,7 +370,7 @@ fn production_decoder_rejects_replayed_erc1271_proof() {
         "person:local:test",
         "wallet",
         WalletProviderOperationV2::Challenge {
-            domain: "elastos.local".into(),
+            domain: "http://elastos.local".into(),
             uri: "http://elastos.local/apps/home/".into(),
             address: contract.into(),
             chain_id: 20,
@@ -427,7 +427,7 @@ fn erc1271_contract_proof_fails_closed_without_consuming_challenge() {
         "person:local:test",
         "wallet",
         WalletProviderOperationV2::Challenge {
-            domain: "elastos.local".into(),
+            domain: "http://elastos.local".into(),
             uri: "http://elastos.local/apps/home/".into(),
             address: contract.into(),
             chain_id: 20,
@@ -493,7 +493,7 @@ fn production_decoder_rejects_replayed_eoa_proof() {
         "person:local:test",
         "wallet",
         WalletProviderOperationV2::Challenge {
-            domain: "elastos.local".into(),
+            domain: "http://elastos.local".into(),
             uri: "http://elastos.local/apps/home/".into(),
             address,
             chain_id: 20,
@@ -541,7 +541,7 @@ fn proof_challenge_rejects_tampered_chain() {
         "person:local:test",
         "wallet",
         WalletProviderOperationV2::Challenge {
-            domain: "elastos.local".into(),
+            domain: "http://elastos.local".into(),
             uri: "http://elastos.local/apps/home/".into(),
             address,
             chain_id: 20,
@@ -581,7 +581,7 @@ fn proof_challenge_rejects_expired_challenge() {
         "person:local:test",
         "wallet",
         WalletProviderOperationV2::Challenge {
-            domain: "elastos.local".into(),
+            domain: "http://elastos.local".into(),
             uri: "http://elastos.local/apps/home/".into(),
             address,
             chain_id: 20,
@@ -621,7 +621,7 @@ fn proof_challenge_rejects_invalid_runtime_origin() {
         "person:local:test",
         "wallet",
         WalletProviderOperationV2::Challenge {
-            domain: "evil.example/path".into(),
+            domain: "https://evil.example/path".into(),
             uri: "https://elastos.local/apps/home/".into(),
             address,
             chain_id: 20,

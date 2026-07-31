@@ -146,6 +146,49 @@ window. It does not receive another capsule's authority token. App-to-app work
 remains a Runtime-gated intent and, for off-box effects, follows the provider and
 Carrier path described in [Capsule Interface Contract](CAPSULE_INTERFACE_CONTRACT.md).
 
+### Injected wallet connector effects
+
+MetaMask/Brave and UniSat browser-extension effects terminate in the trusted
+Home host because opaque connector frames cannot receive top-level injected
+providers. This function is a closed browser edge adapter, not a shell and not
+an additional source of shell authority. It does not change the authority of
+`home`, `home-gui`, or `home-cli`. The only connector-to-Home request is
+`home:wallet-connector-effect` with schema
+`elastos.home.wallet-connector-effect/v1`, an exact bounded request id, the
+connector id and launch token, and one closed action:
+
+- `{ "kind": "link" }`; or
+- `{ "kind": "approve", "approvalRequestId": "<exact Runtime id>" }`.
+
+Home accepts that message only from the registered connector WindowProxy with
+`Origin: null`, the exact connector target and launch token, and the exact
+message/action schema. Each frame has one in-flight effect and a bounded set of
+consumed request ids; concurrent and replayed requests fail closed. Replies
+carry only a bounded status result or error to the same source window. Connector
+frames cannot supply a provider method, signing message, chain transaction,
+Runtime authority, or arbitrary provider parameters.
+
+The Home host discovers MetaMask through exact EIP-6963 `io.metamask`
+announcements, falls back to exact `com.brave.wallet`, and rejects conflicting,
+ambiguous, or over-limit provider discovery. UniSat is read only from the
+top-level host. Home asks these providers to perform only the fixed link or
+typed approval effect selected by Runtime; the opaque connector frames never
+receive `window.ethereum`, `window.unisat`, provider objects, signatures, or
+transaction payloads. EIP-6963 `rdns` values make provider selection
+deterministic, but they are self-asserted announcement metadata, not
+cryptographic extension authentication. Runtime verification of the issued
+challenge, returned signature, selected account, and completion receipt remains
+authoritative.
+
+The matching Runtime endpoints require two independently validated launch-token
+v4 authorities: Home's exact same-origin authority and the carried connector
+token. They must bind the same principal, session, proof, and grant, while the
+connector token must name the exact connector resource and executable actor
+authorized by Home. Runtime issues link challenges and typed approval handoffs,
+then verifies or completes them through the existing private Wallet Bus
+lifecycle. No Home message is a generic wallet RPC surface, and WalletConnect's
+configured connector path remains unchanged.
+
 ## Passkeys And Sign-Out
 
 Runtime owns principals, passkey records, session grants, revocation, and audit.
@@ -180,6 +223,7 @@ node scripts/home-shell-bridge-smoke.mjs
 node scripts/home-shell-system-switch-smoke.mjs
 node scripts/home-shell-switchback-recovery-smoke.mjs
 node scripts/home-cli-browser-smoke.mjs
+node scripts/wallet-connector-transaction-smoke.mjs
 node scripts/home-entropy-check.mjs
 node scripts/home-shell-objective-audit.mjs
 (cd elastos && cargo test -p elastos-server test_home_launch -- --nocapture)

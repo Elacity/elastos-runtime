@@ -99,7 +99,7 @@ are not capsule-visible provider resources. The generic Wallet provider surface
 contains only read-only `elastos://wallet/meta/status`. Browser product routes
 validate signed launch-token v4 authority and invoke typed
 `WalletProviderOperationV2` requests through the private Runtime-local Wallet
-Bus 2.2 adapter. Chain reads and transaction effects remain typed
+Bus 2.3 adapter. Chain reads and transaction effects remain typed
 `chain-provider` operations.
 
 Exit providers should be pluggable:
@@ -973,9 +973,14 @@ receive only the final transaction hash. Runtime submits the Wallet approval as
 a typed `RequestApproval` through the private Wallet Bus; the approval resource
 shown to the user remains the chain effect:
 `elastos://chain/<network>/broadcast_transaction`. External EVM accounts use
-connector handoff after Wallet/Inbox approval: the connector capsule receives
-the typed transaction request, asks the external wallet to send it, then
-completes the Runtime request with the returned transaction hash. Raw signing,
+connector handoff after Wallet/Inbox approval. For injected MetaMask/Brave, the
+opaque connector capsule sends only the exact approval request id through the
+closed Home wallet-effect message. Runtime validates matching launch-token v4
+Home and connector authorities and returns a typed handoff to the trusted
+top-level Home host; Home performs only the fixed provider effect and completes
+the existing Wallet Bus request. The connector frame receives status, not the
+transaction, signing message, provider object, signature, or transaction hash.
+Configured WalletConnect retains its connector-owned adapter path. Raw signing,
 raw transaction broadcast, connector SDK objects, and private keys remain
 unavailable to web pages. Approved message and typed-data signature requests
 resolve back to the page only after Wallet/Inbox approval and managed or
@@ -987,6 +992,14 @@ EIP-1193 provider, verifies `eth_requestAccounts`, verifies the initial ESC
 chain (`0x14`), switches to Base (`0x2105`), and verifies the selected account
 tracks the active chain. This complements connector-level transaction smokes; it
 does not expose connector SDKs or raw wallet RPC to the page.
+
+`scripts/wallet-connector-transaction-smoke.mjs` is the connector-level
+authority proof. It checks that MetaMask/Brave and UniSat frames remain opaque,
+carry their launch token through the Home message, and cannot submit arbitrary
+methods, messages, or transaction payloads. The Home shell bridge smoke covers
+exact WindowProxy/origin/token/connector binding, bounded replay and
+single-flight behavior, exact EIP-6963 selection, and no extra connector
+window. WalletConnect is checked separately on its unchanged configured path.
 
 `scripts/browser-glide-wallet-smoke.sh` is the dapp compatibility proof for the
 current objective. It opens `https://glidefinance.io/` through the Browser

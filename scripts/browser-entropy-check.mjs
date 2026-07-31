@@ -87,6 +87,9 @@ const browserEngineSupervisor = read(
 const browserPlaywrightEngine = read(
   "elastos/tools/browser-playwright-engine/src/supervisor.mjs",
 );
+const browserPlaywrightWalletApproval = read(
+  "elastos/tools/browser-playwright-engine/src/wallet-approval.mjs",
+);
 const browserLocalExit = read("elastos/tools/browser-local-exit/src/main.rs");
 const browserRuntimeProxySmoke = read("scripts/browser-runtime-proxy-smoke.sh");
 const browserNativeOperatorConfig = read(
@@ -114,6 +117,9 @@ const browserSelkiesControlService = read(
 );
 const browserSelkiesControlServiceSmoke = read(
   "scripts/browser-selkies-control-service-smoke.sh",
+);
+const browserWalletApprovalDeadlineSmoke = read(
+  "scripts/browser-wallet-approval-deadline-smoke.mjs",
 );
 const browserSelkiesRuntimeExitTarget = read(
   "scripts/browser-selkies-runtime-exit-target.sh",
@@ -680,11 +686,11 @@ assert(
     browserSelkiesControlService.includes("request_suffix") &&
     !browserSelkiesControlService.includes("runtimePost(state.approvalUrl") &&
     browserSelkiesControlService.includes(
-      "if (status.transaction_hash) return status.transaction_hash",
+      'typeof status.transaction_hash === "string"',
     ) &&
     browserSelkiesControlService.includes('runtimePost("transactionBroadcast"') &&
     browserSelkiesControlService.includes(
-      "Runtime transaction broadcast completed without a transaction hash.",
+      "Runtime transaction broadcast did not return a transaction hash.",
     ) &&
     browserSelkiesControlService.includes("transaction_broadcast") &&
     !browserSelkiesControlService.includes("bridgeUrl:") &&
@@ -694,7 +700,7 @@ assert(
     !browserSelkiesControlService.includes("transactionBroadcastUrl:") &&
     !browserSelkiesControlService.includes("approvalStatusUrl:") &&
     !browserSelkiesControlService.includes("runtimePost(state.transactionBroadcastUrl") &&
-    browserSelkiesControlService.includes("waitForApproval") &&
+    browserSelkiesControlService.includes("waitForWalletApprovalStatus") &&
     browserSelkiesControlService.includes(
       "__elastosBrowserNavigationPolicyInstalled",
     ) &&
@@ -721,6 +727,57 @@ assert(
     browserCapsuleDoc.includes("Playwright proof remains a") &&
     browserCapsuleDoc.includes("diagnostic/account-chain/personal-sign surface"),
   "Hosted Browser wallet bridge must be fail-present, coalesce duplicate in-flight signature approvals, and expose modern injected-wallet discovery, Runtime approval routing, and permission compatibility without giving pages raw wallet or node authority",
+);
+
+assert(
+  browserSelkiesControlService.includes(
+    "approval?.approval_request?.expires_at",
+  ) &&
+    browserPlaywrightEngine.includes(
+      "body?.approval_request?.expires_at",
+    ) &&
+    browserSelkiesControlService.includes("walletApprovalDeadlineMs") &&
+    browserPlaywrightWalletApproval.includes("walletApprovalDeadlineMs") &&
+    browserSelkiesControlService.includes("30 * 60 * 1000") &&
+    browserPlaywrightWalletApproval.includes("30 * 60 * 1000") &&
+    browserSelkiesControlService.includes(
+      "withWalletApprovalStatusTimeout",
+    ) &&
+    browserPlaywrightWalletApproval.includes(
+      "withWalletApprovalStatusTimeout",
+    ) &&
+    browserSelkiesControlService.includes("statusIoTimeoutMs = 3000") &&
+    browserPlaywrightWalletApproval.includes("statusIoTimeoutMs = 3000") &&
+    browserSelkiesControlService.includes("observeWalletApprovalStatus") &&
+    browserPlaywrightWalletApproval.includes("observeWalletApprovalStatus") &&
+    browserSelkiesControlService.includes("timeout_ms: timeoutMs") &&
+    browserSelkiesControlService.includes("enforceWallClockTimeout") &&
+    browserSelkiesControlService.includes("? setTimeout(() =>") &&
+    browserPlaywrightEngine.includes("new AbortController()") &&
+    browserPlaywrightEngine.includes("signal: controller.signal") &&
+    !browserSelkiesControlService.includes(
+      "Date.now() + 5 * 60 * 1000",
+    ) &&
+    !browserPlaywrightEngine.includes(
+      "Date.now() + 5 * 60 * 1000",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes("after-five-minutes") &&
+    browserWalletApprovalDeadlineSmoke.includes("provider-expiry") &&
+    browserWalletApprovalDeadlineSmoke.includes("final-status-race") &&
+    browserWalletApprovalDeadlineSmoke.includes("already-broadcast") &&
+    browserWalletApprovalDeadlineSmoke.includes("exact-request") &&
+    browserWalletApprovalDeadlineSmoke.includes("hanging-status") &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "transient-exact-request",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "deadline-final-observation-failure",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "baseline_assertions: baselineAssertions",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes("real_sleep_ms: 0"),
+  "Trusted Browser adapters must use bounded status I/O through Runtime expiry while retaining exact-request caches across indeterminate observations",
 );
 
 assert(
