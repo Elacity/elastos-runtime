@@ -7,6 +7,7 @@ import {
   waitForWalletApprovalStatus as waitForSelkiesStatus,
   waitForWalletApprovalTransaction as waitForSelkiesTransaction,
   walletApprovalDeadlineMs as selkiesDeadlineMs,
+  walletRuntimeErrorCodeForStatus,
 } from "./browser-selkies-control-service.mjs";
 import {
   cacheWalletApprovalPromise as cachePlaywrightApproval,
@@ -526,6 +527,9 @@ assert.equal(
   671,
   "the accepted ESP-06A deterministic suite assertion count changed",
 );
+assert.equal(walletRuntimeErrorCodeForStatus(400), 4001);
+assert.equal(walletRuntimeErrorCodeForStatus(504), -32603);
+assert.equal(walletRuntimeErrorCodeForStatus(503), 4100);
 
 await verifyStatusIoRepair("selkies", {
   waitStatus: waitForSelkiesStatus,

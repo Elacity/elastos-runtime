@@ -2927,6 +2927,211 @@ async fn test_browser_wallet_approval_routes_allow_remote_page_preflight() {
         .is_some_and(|value| value.contains("x-elastos-home-token")));
 }
 
+struct DelayedFirstRawProvider {
+    inner: Arc<dyn Provider>,
+    calls: std::sync::atomic::AtomicUsize,
+    delay: std::time::Duration,
+    late_result_observed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DelayedFirstRawProvider {
+    fn new(inner: Arc<dyn Provider>) -> Self {
+        Self {
+            inner,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            delay: std::time::Duration::from_millis(250),
+            late_result_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for DelayedFirstRawProvider {
+    async fn handle(&self, request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        self.inner.handle(request).await
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        self.inner.schemes()
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0 {
+            return self.inner.send_raw(request).await;
+        }
+        let inner = Arc::clone(&self.inner);
+        let request = request.clone();
+        let delay = self.delay;
+        let late_result_observed = Arc::clone(&self.late_result_observed);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = inner.send_raw(&request).await;
+            late_result_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = sender.send(result);
+        });
+        receiver
+            .await
+            .map_err(|_| ProviderError::Provider("delayed provider result was discarded".into()))?
+    }
+}
+
+async fn browser_wallet_read_timeout_test_state(
+    cache_dir: &std::path::Path,
+    wallet_provider: Arc<dyn Provider>,
+    chain_provider: Arc<dyn Provider>,
+) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("wallet", wallet_provider)
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider("chain", chain_provider)
+        .await
+        .unwrap();
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
+async fn browser_eth_call(app: axum::Router, token: &str, address: &str) -> (StatusCode, String) {
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/wallet/read")
+                .header("x-elastos-home-token", token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "method": "eth_call",
+                        "params": [{
+                            "to": "0x2222222222222222222222222222222222222222",
+                            "data": "0x70a082310000000000000000000000001111111111111111111111111111111111111111"
+                        }, "latest"],
+                        "chain_namespace": "eip155:20",
+                        "address": address,
+                        "page_url": "https://ela.city/",
+                        "origin": "https://ela.city"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let address = "0x1111111111111111111111111111111111111111";
+    let account_id = format!("wallet:eip155:20:{address}");
+    let wallet: Arc<dyn Provider> = Arc::new(MockWalletProvider {
+        challenges: TokioMutex::default(),
+        bitcoin_challenges: TokioMutex::default(),
+        accounts: TokioMutex::new(vec![json!({
+            "account_id": account_id,
+            "principal_id": authority.principal_id,
+            "proof_binding_id": "proof:wallet:managed:eip155:20:0x1111111111111111111111111111111111111111",
+            "chain_namespace": "eip155:20",
+            "address": address,
+            "proof_type": "managed_evm",
+            "signing_available": true,
+            "label": "Spending",
+            "linked_at": crate::auth::now_ts()
+        })]),
+        approvals: TokioMutex::default(),
+        defaults: TokioMutex::default(),
+    });
+    let chain: Arc<dyn Provider> = Arc::new(MockChainProvider);
+    let delayed = Arc::new(DelayedFirstRawProvider::new(if delay_wallet_refresh {
+        Arc::clone(&wallet)
+    } else {
+        Arc::clone(&chain)
+    }));
+    let late_result_observed = Arc::clone(&delayed.late_result_observed);
+    let (wallet, chain): (Arc<dyn Provider>, Arc<dyn Provider>) = if delay_wallet_refresh {
+        (delayed, chain)
+    } else {
+        (wallet, delayed)
+    };
+    let app =
+        gateway_router(browser_wallet_read_timeout_test_state(dir.path(), wallet, chain).await);
+
+    let started = std::time::Instant::now();
+    let (first_status, first_body) = browser_eth_call(app.clone(), &browser_token, address).await;
+    assert_eq!(first_status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(first_body, "Browser wallet read timed out");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+    let (second_status, second_body) = browser_eth_call(app.clone(), &browser_token, address).await;
+    assert_eq!(second_status, StatusCode::OK, "{second_body}");
+    let second_payload: serde_json::Value = serde_json::from_str(&second_body).unwrap();
+    assert_eq!(second_payload["method"], "eth_call");
+    assert_eq!(
+        second_payload["result"],
+        "0x0000000000000000000000000000000000000000000000000000000000000042"
+    );
+    assert!(
+        !late_result_observed.load(std::sync::atomic::Ordering::SeqCst),
+        "the second read waited for the first provider result"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !late_result_observed.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    let events = auth_state
+        .audit
+        .iter()
+        .filter(|event| event.event_type.starts_with("browser.chain_read."))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].event_type, "browser.chain_read.requested");
+    assert_eq!(events[1].event_type, "browser.chain_read.completed");
+    assert_eq!(events[1].result, "denied");
+    assert_eq!(events[0].challenge_id, events[1].challenge_id);
+    assert_eq!(events[2].event_type, "browser.chain_read.requested");
+    assert_eq!(events[3].event_type, "browser.chain_read.completed");
+    assert_eq!(events[3].result, "allowed");
+    assert_eq!(events[2].challenge_id, events[3].challenge_id);
+    assert_ne!(events[0].challenge_id, events[2].challenge_id);
+}
+
+#[tokio::test]
+async fn test_browser_wallet_read_timeout_does_not_poison_wallet_refresh() {
+    verify_browser_wallet_read_timeout_boundary(true).await;
+}
+
+#[tokio::test]
+async fn test_browser_wallet_read_timeout_does_not_poison_chain_dispatch() {
+    verify_browser_wallet_read_timeout_boundary(false).await;
+}
+
 #[tokio::test]
 async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_approval() {
     let dir = tempfile::tempdir().unwrap();

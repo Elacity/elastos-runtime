@@ -2,6 +2,11 @@
 
 use super::*;
 
+#[cfg(not(test))]
+const BROWSER_WALLET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(test)]
+const BROWSER_WALLET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub(super) async fn browser_wallet_read(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
@@ -24,7 +29,17 @@ pub(super) async fn browser_wallet_read(
             decision: "standing_read_policy",
         },
     )?;
-    let result = browser_wallet_read_inner(state, authority, &input).await;
+    let result = tokio::time::timeout(
+        BROWSER_WALLET_READ_TIMEOUT,
+        browser_wallet_read_inner(state, authority, &input),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "Browser wallet read timed out".to_string(),
+        ))
+    });
     let (event_type, result_label, decision) = match &result {
         Ok(_) => (
             "browser.chain_read.completed",

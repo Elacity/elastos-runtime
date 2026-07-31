@@ -2956,6 +2956,16 @@ function walletRuntimeHttpError(message, code = 4100) {
   return error;
 }
 
+export function walletRuntimeErrorCodeForStatus(status) {
+  if (status === 400) {
+    return 4001;
+  }
+  if (status === 504) {
+    return -32603;
+  }
+  return 4100;
+}
+
 function runtimeFetchProxyOrigin(proxyUrl) {
   if (!proxyUrl) {
     return null;
@@ -3057,7 +3067,7 @@ async function walletRuntimeFetchJson(
       typeof payload === "string"
         ? payload
         : payload?.message || payload?.error || "Runtime wallet request failed.",
-      status === 400 ? 4001 : 4100,
+      walletRuntimeErrorCodeForStatus(status),
     );
   }
   return payload;
