@@ -3,7 +3,15 @@ use super::*;
 #[tokio::test]
 async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(library_test_state(dir.path()).await);
+    let state = library_test_state(dir.path()).await;
+    write_test_viewer_capsule(
+        dir.path(),
+        "gba-substitute",
+        GBA_EMULATOR_CAPSULE_ID,
+        "substitute.gba",
+        "Substitute ROM",
+    );
+    let app = gateway_router(state);
 
     let launched = app
         .clone()
@@ -41,9 +49,75 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
         .find_map(|(key, value)| (key == "home_token").then(|| value.into_owned()))
         .unwrap();
     let content = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/viewers/gba-emulator/content/gba-ucity")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(content.status(), StatusCode::OK);
+
+    let save_uri = "/api/viewers/gba-emulator/storage/gba-ucity/save/rom-id.sav";
+    let saved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(save_uri)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token.clone())
+                .body(Body::from("uCity save bytes"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::NO_CONTENT);
+
+    let restored = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(save_uri)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(restored.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"uCity save bytes");
+
+    let viewer_substitution = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/viewers/gba-emulator/storage/gba-emulator/save/rom-id.sav")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer_substitution.status(), StatusCode::UNAUTHORIZED);
+
+    let resource_substitution = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/viewers/gba-emulator/storage/gba-substitute/save/rom-id.sav")
                 .header(HOST, "localhost:61180")
                 .header("origin", "null")
                 .header("x-elastos-home-token", token)
@@ -52,7 +126,85 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
         )
         .await
         .unwrap();
-    assert_eq!(content.status(), StatusCode::OK);
+    assert_eq!(resource_substitution.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn selected_gba_content_token_rejects_resource_substitution() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = library_test_state(dir.path()).await;
+    write_test_viewer_capsule(
+        dir.path(),
+        "gba-substitute",
+        GBA_EMULATOR_CAPSULE_ID,
+        "substitute.gba",
+        "Substitute ROM",
+    );
+    let app = gateway_router(state);
+    let token = issue_home_projection_launch_token_with_context(
+        dir.path(),
+        "gba-ucity",
+        GBA_EMULATOR_CAPSULE_ID,
+        &local_home_launch_token_context(dir.path()).unwrap(),
+    )
+    .unwrap();
+
+    let library = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/viewers/gba-emulator/library")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(library.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(library.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let library: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = library["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["capsule"], "gba-ucity");
+
+    let selected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/viewers/gba-emulator/content/gba-ucity")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::OK);
+
+    let substituted = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/viewers/gba-emulator/content/gba-substitute")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(substituted.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(substituted.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8(body.to_vec())
+        .unwrap()
+        .contains("projection authority mismatch"));
 }
 
 #[tokio::test]

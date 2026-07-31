@@ -1080,7 +1080,7 @@ elastos-runtime/                        # Repo root
 ├── scripts/                            # Dev convenience scripts
 │   ├── chat.sh                         # P2P chat launcher
 │   ├── gba-demo-smoke.sh               # Portable engine, viewer routes, and lifecycle proof
-│   ├── gba-linux-browser-smoke.sh       # Disposable Linux Chromium render/input/audio/save proof
+│   ├── gba-opaque-frame-browser-smoke.sh # Disposable opaque-frame render/input/audio/save proof
 │   ├── home-demo-local.sh              # Local Home demo launcher
 │   ├── home-smoke.sh                   # Home browser smoke test
 │   └── share-demo.sh                   # Content sharing demo

@@ -98,7 +98,7 @@ complete product Browser.
 | RS-06 | Full-screen chat microVM works | `scripts/chat-demo-local-smoke.sh` on KVM hosts; installed-path proof is manual on this line | source-local KVM proof if applicable | `elastos setup --profile chat`, then direct packaged chat | same as installed x86_64 |
 | RS-07 | MyWebSite is useful | covered partly by Home frontdoor smokes and site command tests | staged preview opens, `Go public`/ephemeral exposure gives a URL when installed, and any surfaced Home action is truthful | same as seed node on installed path | same as installed x86_64 |
 | RS-08 | Documents and Library are useful | `scripts/home-camofox-smoke.sh`, `cargo test -p elastos-server --lib documents -- --nocapture` | create/save/publish a document, then open it from Library | same as seed node on installed Home | same as installed x86_64 |
-| RS-09 | Runtime-backed GBA works | `scripts/gba-demo-smoke.sh`; `scripts/gba-linux-browser-smoke.sh` in Linux Chromium | verify uCity and Library `.gba` launch, video/input/audio, save persistence, and cleanup | disposable Linux Chromium proof plus installed conditional demo profile | same capsule artifact as installed x86_64 |
+| RS-09 | Runtime-backed GBA works | `scripts/gba-demo-smoke.sh`; `scripts/gba-opaque-frame-browser-smoke.sh` in disposable Chromium | verify uCity and Library `.gba` launch, opaque-frame origin, video/input/audio, save persistence, and cleanup | disposable Chromium proof plus installed conditional demo profile | same capsule artifact as installed x86_64 |
 | RS-10 | Updates surface is honest | `scripts/public-install-operator-smoke.sh`; after publish, rerun it with `ELASTOS_PUBLISHER_GATEWAY=<url>` | `elastos update --check`, verify source/runtime state | CLI update status is truthful; compare any surfaced Home/System update action only if visible | same as installed x86_64 |
 | RS-11 | Sovereign room sync works | exact local cross-runtime room gateway tests | seed room, pair both runtimes, verify join/leave before and after chat, then exchange a room message and one attachment | same with one other installed runtime | same as installed x86_64 |
 | RS-12 | Operator remote control works | `scripts/public-install-operator-smoke.sh` and exact local operator two-node test | allow the controller DID on the target, then run remote `node status`, `node room`, and `node update --check` | act as controller or target | same as installed x86_64 |
@@ -300,8 +300,8 @@ Automatic:
 ```bash
 cd <repo-root>
 bash scripts/gba-demo-smoke.sh
-# On a Linux Chromium target with no product-state mutation:
-bash scripts/gba-linux-browser-smoke.sh
+# In disposable Chromium with no product-state mutation:
+bash scripts/gba-opaque-frame-browser-smoke.sh
 ```
 
 Manual:

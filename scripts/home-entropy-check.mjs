@@ -1538,8 +1538,10 @@ assert(
 const debugPolicy = read("DEBUG.md");
 const gbaDemoSmoke = read("scripts/gba-demo-smoke.sh");
 const gbaLiveSmoke = read("scripts/gba-live-smoke.mjs");
-const gbaLinuxBrowserSmoke = read("scripts/gba-linux-browser-smoke.sh");
-const gbaLinuxBrowserProof = read("scripts/fixtures/gba-linux-browser-proof/proof.js");
+const gbaOpaqueBrowserSmoke = read("scripts/gba-opaque-frame-browser-smoke.sh");
+const gbaOpaqueBrowserProof = read("scripts/fixtures/gba-opaque-frame-browser-proof/proof.js");
+const gbaOpaqueBrowserInput = read("scripts/fixtures/gba-opaque-frame-browser-proof/cdp-input.mjs");
+const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-proof/server.py");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260715a";
 for (const [file, source] of [
@@ -6035,21 +6037,25 @@ assert(
   gbaJs.includes('await import("./mgba.js")') &&
     gbaJs.includes("/api/viewers/${VIEWER_ID}/content/") &&
     gbaJs.includes('raw: "true"') &&
-    gbaJs.includes("/storage/${VIEWER_ID}/save/") &&
-    gbaJs.includes("/storage/${VIEWER_ID}/state/") &&
-    gbaJs.includes("engine.resumeAudio()") &&
+    gbaJs.includes("request?.capsule || VIEWER_ID") &&
+    gbaJs.includes("/storage/${encodeURIComponent(capsule)}/save/") &&
+    gbaJs.includes("/storage/${encodeURIComponent(activeStorageCapsule)}/state/") &&
+    !gbaJs.includes("resumeAudio") &&
+    !gbaJs.includes("crossOriginIsolated") &&
+    !gbaJs.includes("SharedArrayBuffer") &&
+    !gbaJs.includes("typeof Worker") &&
     gbaJs.includes("navigator.getGamepads") &&
     gbaJs.includes('window.addEventListener("pagehide"') &&
     !gbaJs.includes("/api/apps/gba-emulator/sessions") &&
     !gbaJs.includes("new AudioContext"),
-  "GBA must lazily load one portable engine and keep ROM/save authority on generic Runtime viewer routes",
+  "GBA must lazily load one portable engine and keep ROM/save authority bound to Runtime viewer projections",
 );
 assert(
   gbaInputJs.includes("export const BUTTON_BITS") &&
     gbaInputJs.includes("export function gamepadMask") &&
     gbaProjectionSmoke.includes('from "../capsules/gba-emulator/browser/gba-input.js"') &&
     gbaProjectionSmoke.includes(
-      "portable=1 lazy=1 imports=${imports.length} keyboard=ok touch=ok gamepad=ok runtime_io=ok",
+      "portable=1 lazy=1 threads=none imports=${imports.length} keyboard=ok touch=ok gamepad=ok runtime_io=ok",
     ),
   "GBA input mapping and portable-engine boundary must remain covered",
 );
@@ -6057,7 +6063,7 @@ assert(
   fileExists("capsules/gba-emulator/browser/mgba.js") &&
     fileExists("capsules/gba-emulator/browser/mgba.wasm") &&
     gba.includes("connect-src 'self'") &&
-    gba.includes("worker-src 'self'"),
+    gba.includes("worker-src 'none'"),
   "GBA must carry its pinned portable engine and constrain it to same-origin Runtime I/O",
 );
 const gbaProductTruth = [
@@ -6085,6 +6091,7 @@ assert(
     gatewayApi.includes("issue_home_projection_launch_token_with_context") &&
     gatewayApi.includes("issue_home_projection_launch_token_with_intent") &&
     gatewayTests.includes("home_content_launch_uses_the_bound_gba_viewer_without_compute") &&
+    gatewayTests.includes("selected_gba_content_token_rejects_resource_substitution") &&
     libraryMenuSmoke.includes('message?.target === "gba-emulator"') &&
     libraryMenuSmoke.includes('message?.query?.objectUri?.endsWith("/Game.gba")') &&
     !fileExists("scripts/gba.sh") &&
@@ -6092,13 +6099,21 @@ assert(
   "GBA must have one portable content-viewer path with authorization, persistence, and gateway proof",
 );
 assert(
-  gbaLinuxBrowserSmoke.includes("--remote-debugging-port=9222") &&
-    gbaLinuxBrowserSmoke.includes("cleanup=ephemeral") &&
-    gbaLinuxBrowserSmoke.includes("save_bytes=") &&
-    gbaLinuxBrowserProof.includes('new KeyboardEvent("keydown"') &&
-    gbaLinuxBrowserProof.includes('new PointerEvent("pointerdown"') &&
-    gbaLinuxBrowserProof.includes('sessionStorage.setItem("gba-linux-proof-phase", "reload")'),
-  "GBA must keep reproducible Linux Chromium render, input, audio, save/reload, and cleanup proof",
+  gbaOpaqueBrowserSmoke.includes("--remote-debugging-port=0") &&
+    gbaOpaqueBrowserSmoke.includes("MAP * ~NOTFOUND") &&
+    gbaOpaqueBrowserSmoke.includes("topology=opaque-frame") &&
+    gbaOpaqueBrowserSmoke.includes("cleanup=ephemeral") &&
+    gbaOpaqueBrowserProof.includes("crossOriginIsolated") &&
+    gbaOpaqueBrowserProof.includes("typeof SharedArrayBuffer") &&
+    gbaOpaqueBrowserProof.includes("proveRenderContinuity") &&
+    gbaOpaqueBrowserProof.includes("proveAudioOutput") &&
+    gbaOpaqueBrowserProof.includes("location.reload()") &&
+    gbaOpaqueBrowserInput.includes('send("Input.dispatchKeyEvent"') &&
+    gbaOpaqueBrowserServer.includes(
+      'sandbox="allow-scripts allow-forms allow-pointer-lock allow-modals"',
+    ) &&
+    gbaOpaqueBrowserServer.includes('frame.hasAttribute("credentialless")'),
+  "GBA must keep reproducible opaque-frame Chromium isolation, render, trusted input, audio, save/reload, and cleanup proof",
 );
 assert(
   !system.includes("<dt>Overlay</dt>"),

@@ -49,6 +49,7 @@ let inputFrame = 0;
 let saveTimer = 0;
 let activeSaveName = "";
 let activeRomId = "";
+let activeStorageCapsule = VIEWER_ID;
 const touchPointers = new Map();
 
 function launchHeaders() {
@@ -109,13 +110,9 @@ function withTimeout(promise, timeoutMs, message) {
 }
 
 function assertPortableEngineSupport() {
-  if (typeof WebAssembly !== "object" || typeof Worker !== "function") {
+  if (typeof WebAssembly !== "object") {
     throw new Error("This browser cannot run the GBA engine.");
   }
-  if (!window.crossOriginIsolated || typeof SharedArrayBuffer !== "function") {
-    throw new Error("This browser does not provide isolated WebAssembly threads.");
-  }
-  new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
 }
 
 function ensureDirectory(path) {
@@ -202,8 +199,12 @@ async function sha256Hex(bytes) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function saveUrl(name) {
-  return `/api/viewers/${VIEWER_ID}/storage/${VIEWER_ID}/save/${encodeURIComponent(name)}`;
+function storageCapsuleForRequest(request) {
+  return request?.capsule || VIEWER_ID;
+}
+
+function saveUrl(name, capsule = activeStorageCapsule) {
+  return `/api/viewers/${VIEWER_ID}/storage/${encodeURIComponent(capsule)}/save/${encodeURIComponent(name)}`;
 }
 
 function stateName(slot) {
@@ -211,15 +212,15 @@ function stateName(slot) {
 }
 
 function stateUrl(slot) {
-  return `/api/viewers/${VIEWER_ID}/storage/${VIEWER_ID}/state/${encodeURIComponent(stateName(slot))}`;
+  return `/api/viewers/${VIEWER_ID}/storage/${encodeURIComponent(activeStorageCapsule)}/state/${encodeURIComponent(stateName(slot))}`;
 }
 
 function statePath(slot) {
   return `/data/states/${stateName(slot)}`;
 }
 
-async function restoreSave(name) {
-  const response = await fetch(saveUrl(name), { headers: launchHeaders() });
+async function restoreSave(name, capsule) {
+  const response = await fetch(saveUrl(name, capsule), { headers: launchHeaders() });
   if (response.status === 404) return null;
   if (!response.ok) throw new Error(`Saved game data is unavailable (${response.status}).`);
   return new Uint8Array(await response.arrayBuffer());
@@ -313,13 +314,15 @@ async function openGame(request, title = "GBA Emulator") {
   const romPath = `/data/games/${romId}.gba`;
   const saveName = `${romId}.sav`;
   const savePath = `/data/saves/${saveName}`;
-  const saved = await restoreSave(saveName);
+  const storageCapsule = storageCapsuleForRequest(request);
+  const saved = await restoreSave(saveName, storageCapsule);
   if (saved?.length) module.FS.writeFile(savePath, saved);
   module.FS.writeFile(romPath, bytes);
   if (!module.loadGame(romPath, savePath)) throw new Error("The GBA engine rejected this game.");
 
   activeSaveName = saveName;
   activeRomId = romId;
+  activeStorageCapsule = storageCapsule;
   gameLoaded = true;
   paused = false;
   fastForward = false;
@@ -453,7 +456,6 @@ function bindInput() {
 
 async function enableSound() {
   if (!engine || !gameLoaded || soundEnabled) return;
-  engine.resumeAudio();
   engine.setVolume(Number(volume.value) / 100);
   soundEnabled = true;
 }

@@ -8,6 +8,9 @@
   "author": "elastos",
   "entrypoint": "ucity.gba",
   "viewer": "gba-emulator",
+  "permissions": {
+    "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/ucity/*"]
+  },
   "interfaces": [
     {
       "id": "elastos.content.asset",

@@ -138,10 +138,11 @@ the public repository.
   `capsule.local.memfs.v1` boundary. The product artifact imports only that
   local module and its bundled Emscripten environment.
 - `scripts/gba-demo-smoke.sh` proves manifest, Runtime route, authorization,
-  storage, input-map, and artifact invariants. `scripts/gba-linux-browser-smoke.sh`
-  proves the same capsule assets in disposable Linux Chromium: rendered
-  canvas, trusted keyboard and audio input, on-screen controls, 32 KiB save,
-  reload/restore, and process/container cleanup.
+  storage, input-map, and artifact invariants.
+  `scripts/gba-opaque-frame-browser-smoke.sh` proves the same capsule assets in
+  disposable Chromium: opaque `Origin: null` topology, parent DOM denial,
+  changing nonzero framebuffer writes, trusted keyboard input, nonzero emulator
+  audio output, on-screen controls, save/reload persistence, and process cleanup.
 - Installed macOS proof covers uCity and Library `.gba` launch, moving frames,
   keyboard/on-screen input, user-enabled audio, save/reload, source-installed-
   served artifact parity, and view cleanup. GBA remains outside the default
