@@ -366,12 +366,13 @@ assertNoForbidden(browserJs, "Browser UI", [
 ]);
 
 assert(
-  browserJs.includes("normalizeUrl") &&
+    browserJs.includes("normalizeUrl") &&
     browserJs.includes("streamTargetForUrl") &&
-    browserJs.includes("browserInstanceId") &&
-    browserJs.includes(
-      "elastos.browser.current_page_id:${browserInstanceId}",
-    ) &&
+    browserJs.includes("recoverableRuntimePage") &&
+    browserJs.includes("elastos.browser.cleanup-handle/v1") &&
+    browserJs.includes("elastos.browser.close-request/v2") &&
+    !browserJs.includes("runtime_close") &&
+    !browserJs.includes("sessionStorage") &&
     browserJs.includes("Only http and https addresses") &&
     browserJs.includes("/api/apps/browser/open") &&
     browserJs.includes("/api/apps/browser/summary") &&
@@ -397,10 +398,18 @@ assert(
 assert(
   browserJs.includes("isMissingRuntimePageError") &&
     browserJs.includes("scheduleRemoteReconnect") &&
-    browserJs.includes("function scheduleRemoteReconnect(message, { retry = true } = {})") &&
-    browserRemoteDisplay.includes('onRecoveryRequired(message, { retry: false })') &&
+    browserJs.includes("RUNTIME_OWNED_PAGE_FAILURE_KINDS") &&
+    browserJs.includes("runtimePageCleanup.fail") &&
+    browserJs.includes("scheduleRemoteReplacementAfterTerminal") &&
+    browserJs.includes(
+      "Runtime cleanup is pending; the existing page remains owned and no replacement will open until Runtime confirms a terminal close.",
+    ) &&
+    browserRemoteDisplay.includes('"no_first_frame" ? "no_first_frame" : "signaling"') &&
+    browserRemoteDisplay.includes(
+      "Runtime must close this session before another Browser Engine or Exit Node can open.",
+    ) &&
+    !browserRemoteDisplay.includes("Refresh Browser") &&
     browserJs.includes("recoverMissingRuntimePage") &&
-    browserJs.includes("Browser session heartbeat was lost.") &&
     browserJs.includes("Browser session reconnected.") &&
     browserJs.includes("track.addEventListener(\"mute\"") &&
     browserJs.includes("track.addEventListener(\"ended\"") &&
@@ -485,6 +494,15 @@ assert(
 
 assert(
   browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
+    browserEngineAdapter.includes(
+      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0"',
+    ) &&
+    browserEngineAdapter.includes(
+      "elastos.browser.engine-cleanup-binding/v2",
+    ) &&
+    browserEngineAdapter.includes(
+      "elastos.browser.engine-cleanup-result/v2",
+    ) &&
     browserEngineAdapter.includes("elastos.adapter-ipc/v1") &&
     browserEngineAdapter.includes("runtime_stream_path") &&
     browserEngineAdapter.includes("elastos.browser.engine.launch-request/v1") &&
@@ -625,6 +643,20 @@ assert(
     gatewayBrowserApi.includes("claim_pending_browser_engine_cleanups") &&
     gatewayBrowserApi.includes("record_browser_engine_cleanup_obligation") &&
     gatewayBrowserApi.includes("browser_terminal_close_receipt") &&
+    gatewayBrowserApi.includes("BrowserCleanupHandle") &&
+    gatewayBrowserApi.includes("BrowserDurableOwnership") &&
+    gatewayBrowserApi.includes("write_browser_durable_ownership") &&
+    gatewayBrowserApi.includes("secure_browser_lifecycle_dir") &&
+    gatewayBrowserApi.includes("claim_pending_browser_stream_cleanups") &&
+    gatewayBrowserApi.includes("browser_page_cleanup_for_principal") &&
+    gatewayBrowserApi.includes("require_browser_engine_provider_binding") &&
+    gatewayBrowserApi.includes(
+      "no replacement page may open before terminal provider closure",
+    ) &&
+    browserJs.includes("elastos.browser.cleanup-handle/v1") &&
+    browserJs.includes("elastos.browser.close-request/v2") &&
+    !browserJs.includes("engine_protocol_version") &&
+    !browserJs.includes("runtime_close") &&
     gatewayBrowserRouteTests.includes(
       "test_browser_async_duplicate_open_coalesces_by_verified_launch_owner",
     ) &&
@@ -633,6 +665,18 @@ assert(
     ) &&
     gatewayBrowserRouteTests.includes(
       "test_browser_close_transport_and_exit_failures_retry_independent_cleanup_obligations",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_no_first_frame_cleanup_retries_exact_effect_without_replacement",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_pending_cleanup_rejects_foreign_authority_and_effect_substitution",
+    ) &&
+    gatewayBrowserApi.includes(
+      "runtime_restart_recovers_exact_durable_cleanup_ownership",
+    ) &&
+    gatewayBrowserApi.includes(
+      "status_reads_preserve_90_second_launch_and_four_hour_active_owner",
     ) &&
     homeBrowserRestoredLifecycleHeadlessSmoke.includes(
       "fixture_duplicate_open=1",
@@ -644,12 +688,15 @@ assert(
       "state.browserOpenEffects === 1",
     ) &&
     homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserCleanupEffects === 1",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
       "state.browserPageCount === 1",
     ) &&
     homeBrowserRestoredLifecycleHeadlessSmoke.includes(
       "state.browserVmCount === 1",
     ),
-  "Browser lifecycle must coalesce matching pending/completed owner intent, enforce the exact verified owner on job/page routes, retain engine cleanup separately from Exit cleanup, and keep a real Home-refresh regression",
+  "Browser lifecycle must coalesce matching pending/completed owner intent, retain an exact provider/engine/stream cleanup binding after the active route retires, reject substituted authority or effects, block replacement before terminal closure, and keep a real Home-refresh regression",
 );
 
 assert(
@@ -1295,7 +1342,8 @@ assert(
     browserVmControlServicePersistentSmoke.includes("failed guest close did not force terminal VM retirement") &&
     browserVmControlServicePersistentSmoke.includes("wrong single-page persistent status") &&
     browserVmControlServicePersistentSmoke.includes("fake-invalid-persistent-vm-launcher") &&
-    browserVmControlServicePersistentSmoke.includes("idle keepalive retained a VM without explicit reuse opt-in") &&
+    browserVmControlServicePersistentSmoke.includes("terminal cleanup proof was incomplete") &&
+    browserVmControlServicePersistentSmoke.includes("same-profile route change reused a terminally closed VM control socket") &&
     browserVmControlServicePersistentSmoke.includes("different principal/profile launch did not terminate the previous idle VM") &&
     browserVmControlServicePersistentSmoke.includes('"reuse_idle_vms": True') &&
     browserVmControlServicePersistentSmoke.includes("Browser VM launcher output is not JSON") &&
@@ -1732,7 +1780,9 @@ assert(
     ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260726a") &&
+    browser.includes("browser.js?v=browser-20260727a") &&
+    !browser.includes("browser.js?v=browser-20260726b") &&
+    !browser.includes("browser.js?v=browser-20260726a") &&
     !browser.includes("browser.js?v=browser-20260725a") &&
     !browser.includes("browser.js?v=browser-20260724a") &&
     !browser.includes("browser.js?v=browser-20260711c") &&
@@ -1749,8 +1799,8 @@ assert(
   browserJs.includes("function resetBrowserProfile") &&
     browserJs.includes("/api/apps/browser/profile/reset") &&
     browserJs.includes("Reset Browser cookies, local storage, history, and cache for this account?") &&
-    browserJs.includes("await closeRuntimePage(activePage)") &&
-    browserJs.includes("await closeRuntimePage(stalePage)") &&
+    browserJs.includes("await closeRuntimePage(activePage, {") &&
+    browserJs.includes("await closeRuntimePage(stalePage, {") &&
     browserJs.includes("publishRuntimePageForHost(null)") &&
     browserJs.includes("Browser profile reset. Open the address again.") &&
     !browserJs.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
@@ -1788,7 +1838,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260724a") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260724a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260711h") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260629a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260627a") &&
@@ -1811,7 +1862,10 @@ assert(
     browserJs.includes('displaySession.media_transport === "runtime_relay" ? "relay" : "all"') &&
     browserJs.includes("iceTransportPolicy,") &&
     browserJs.includes("The Browser Engine is running, but the secure display connection is not ready.") &&
-    browserJs.includes("Refresh Browser, or choose another Browser Engine or Exit Node.") &&
+    browserJs.includes(
+      "Runtime must close this session before another Browser Engine or Exit Node can open.",
+    ) &&
+    !browserRemoteDisplay.includes("Refresh Browser") &&
     browserJs.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
     browserJs.includes("createRuntimePageCleanupController") &&
     browserJs.includes("sameRuntimePageOwner") &&
@@ -1831,6 +1885,11 @@ const finalizeRuntimePageCloseBlock = sourceBlock(
   "function finalizeRuntimePageClose(owner)",
   "Browser terminal close finalizer",
 );
+const failRuntimeOwnedPageBlock = sourceBlock(
+  browserMain,
+  "async function failRuntimeOwnedPage(",
+  "Browser Runtime-owned failure cleanup",
+);
 assert(
   releaseRuntimePageForUnloadBlock.includes("stopPageStatusPolling();") &&
     releaseRuntimePageForUnloadBlock.includes("stopPageHeartbeat();") &&
@@ -1839,6 +1898,9 @@ assert(
     !releaseRuntimePageForUnloadBlock.includes("currentPage = null") &&
     !releaseRuntimePageForUnloadBlock.includes("publishRuntimePageForHost(null)") &&
     !releaseRuntimePageForUnloadBlock.includes("closeRemoteDisplay()") &&
+    failRuntimeOwnedPageBlock.includes("closeRemoteDisplay();") &&
+    !failRuntimeOwnedPageBlock.includes("currentPage = null") &&
+    !failRuntimeOwnedPageBlock.includes("publishRuntimePageForHost(null)") &&
     finalizeRuntimePageCloseBlock.includes("currentPage = null;") &&
     finalizeRuntimePageCloseBlock.includes("currentPageGeneration = 0;") &&
     finalizeRuntimePageCloseBlock.includes("currentBrowserEngineId = \"\";") &&
@@ -1846,9 +1908,9 @@ assert(
     finalizeRuntimePageCloseBlock.includes("publishRuntimePageForHost(null);") &&
     finalizeRuntimePageCloseBlock.includes("closeRemoteDisplay();") &&
     (browserMain.match(/currentPage = null;/g) || []).length === 2 &&
-    (browserMain.match(/publishRuntimePageForHost\(null\);/g) || []).length === 2 &&
-    (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 1,
-  "Browser unload must retain Runtime ownership; only a Runtime-proven terminal close may clear the exact page generation, identities, persistence, or display",
+    (browserMain.match(/publishRuntimePageForHost\(null\);/g) || []).length === 1 &&
+    (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 2,
+  "Browser unload and post-ownership failure cleanup must retain Runtime ownership; only a Runtime-proven terminal close may clear the exact page generation, identities, or persistence",
 );
 
 assert(

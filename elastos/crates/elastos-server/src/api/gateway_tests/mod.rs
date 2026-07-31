@@ -332,6 +332,126 @@ async fn browser_engine_attached_test_state(cache_dir: &std::path::Path) -> Gate
     browser_engine_attached_test_state_with_relay(cache_dir, None).await
 }
 
+async fn browser_engine_reconciliation_test_state(
+    cache_dir: &std::path::Path,
+    failure: MockDispatchedBrowserLaunchFailure,
+) -> (
+    GatewayState,
+    Arc<TokioMutex<Vec<serde_json::Value>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "exit",
+            Arc::new(MockAttachedExitProvider {
+                relay_ipc_path: None,
+                stream_id: mock_attached_stream_id(cache_dir),
+            }),
+        )
+        .await
+        .unwrap();
+    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let reconciliation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    registry
+        .register_sub_provider(
+            "browser-engine",
+            Arc::new(MockReconciliatingBrowserEngineProvider {
+                failure,
+                effect: TokioMutex::new(None),
+                launch_calls: std::sync::atomic::AtomicUsize::new(0),
+                close_calls: close_calls.clone(),
+                reconciliation_calls: reconciliation_calls.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    (
+        GatewayState {
+            provider_registry: Some(registry),
+            identity_manager: Arc::new(std::sync::OnceLock::new()),
+            cache_dir: cache_dir.to_path_buf(),
+            data_dir: cache_dir.to_path_buf(),
+        },
+        close_calls,
+        reconciliation_calls,
+    )
+}
+
+async fn browser_engine_retrying_close_test_state(
+    cache_dir: &std::path::Path,
+    engine_close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    failure: MockBrowserEngineCloseFailure,
+    engine_close_failures: usize,
+    exit_close: Option<(Arc<TokioMutex<Vec<serde_json::Value>>>, usize)>,
+    ownership: Option<Arc<MockBrowserOwnershipCounts>>,
+) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    if let Some((close_calls, close_failures)) = exit_close {
+        let provider: Arc<dyn Provider> = match ownership.as_ref() {
+            Some(ownership) => Arc::new(
+                MockRemoteCarrierExitProvider::with_close_failures_and_ownership(
+                    close_calls,
+                    close_failures,
+                    ownership.clone(),
+                ),
+            ),
+            None => Arc::new(MockRemoteCarrierExitProvider::with_close_failures(
+                close_calls,
+                close_failures,
+            )),
+        };
+        registry
+            .register_sub_provider("exit", provider)
+            .await
+            .unwrap();
+    } else {
+        registry
+            .register_sub_provider(
+                "exit",
+                Arc::new(MockAttachedExitProvider {
+                    relay_ipc_path: None,
+                    stream_id: mock_attached_stream_id(cache_dir),
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let engine_provider: Arc<dyn Provider> = match ownership {
+        Some(ownership) => Arc::new(MockRetryingBrowserEngineProvider::with_ownership(
+            engine_close_calls,
+            failure,
+            engine_close_failures,
+            ownership,
+        )),
+        None => Arc::new(MockRetryingBrowserEngineProvider::new(
+            engine_close_calls,
+            failure,
+            engine_close_failures,
+        )),
+    };
+    registry
+        .register_sub_provider("browser-engine", engine_provider)
+        .await
+        .unwrap();
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
 async fn browser_engine_policy_blocked_test_state(cache_dir: &std::path::Path) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());

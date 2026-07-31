@@ -38,6 +38,9 @@ Interaction contract for the Home host:
 - unlock and sign-out stay in the host plus Runtime auth endpoints
 - active-shell selection is resolved from Runtime state, not local UI state
 - shell mounting uses a host-owned root iframe plus launch-token validation
+- the top-level host retains one cryptographically random, bounded browser
+  profile correlation and hands it only to the exact active `home-gui` frame
+  after its opaque-origin, source, target, and launch token are accepted
 - both shells and ordinary app frames use opaque browser origins on the same
   hostname; only the Home host
   holds the explicit authority used to mint their launch tokens
@@ -45,6 +48,8 @@ Interaction contract for the Home host:
 - `home` must not contain desktop/taskbar/window/launcher templates or behavior
 - GUI sessions, desktop shortcuts, taskbar state, and app-window placement belong to
   `home-gui`
+- the browser profile correlation grants no authority and never replaces the
+  encrypted principal-scoped Runtime Home state
 
 See:
 - [../../TASKS.md](../../TASKS.md)

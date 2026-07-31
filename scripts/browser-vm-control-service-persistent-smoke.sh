@@ -94,6 +94,10 @@ function pageResult(pageLaunch) {
     kind: "per_launch_vm_target",
     session_dir: "/tmp/elastos-browser-vm-sessions/vm-persistent-smoke",
   },
+  process: {
+    pid: process.pid,
+    stream_bridge_pid: null,
+  },
   display_session: {
     schema: "elastos.browser.display-session/v1",
     session_id: `display:${pageLaunch.stream_id}`,
@@ -181,6 +185,12 @@ const server = http.createServer(async (req, res) => {
     const closeMatch = url.pathname.match(/^\/pages\/([^/]+)\/close$/);
     if (req.method === "POST" && closeMatch) {
       const closePageId = decodeURIComponent(closeMatch[1]);
+      const failPath = `${proofDir}/fail-next-guest-close`;
+      if (fs.existsSync(failPath)) {
+        fs.unlinkSync(failPath);
+        sendJson(res, 404, { error: "browser page not found during close" });
+        return;
+      }
       pages.delete(closePageId);
       fs.writeFileSync(`${proofDir}/${closePageId.replace(/[^A-Za-z0-9_-]/g, "_")}.closed`, "ok\n");
       sendJson(res, 200, { schema: "elastos.browser.close-result/v1", page_id: closePageId, closed: true });
@@ -371,6 +381,7 @@ function openBody(streamId, overrides = {}) {
       engine: "chromium_microvm",
       url: "https://example.com/",
       stream_id: streamId,
+      lifecycle_generation: `sha256:${streamId}`,
       target: "tls://example.com:443",
       principal_id: overrides.principalId || "person:local:vm-persistent-smoke",
       profile,
@@ -392,14 +403,53 @@ function openBody(streamId, overrides = {}) {
   };
 }
 
+function cleanupBinding(page) {
+  return {
+    schema: "elastos.browser.engine-cleanup-binding/v2",
+    page_id: page.page_id,
+    generation: `sha256:${page.stream_id}`,
+    stream_id: page.stream_id,
+    adapter: page.adapter,
+    engine: page.engine,
+    display_mode: "webrtc_remote_display",
+    guarantee_level: "mechanism_microvm",
+    principal_id: page.stream_id.includes("principal-b")
+      ? "person:local:vm-persistent-smoke-b"
+      : "person:local:vm-persistent-smoke",
+    control_socket_path: page.control_socket_path,
+    shutdown_socket_path: socketPath,
+    isolated_session: true,
+    isolation: page.isolation,
+    process: page.process,
+  };
+}
+
+function shutdownBody(page) {
+  return {
+    page_id: page.page_id,
+    runtime_cleanup: cleanupBinding(page),
+    force_retire_vm: true,
+  };
+}
+
 (async () => {
   const launch = await request("POST", "/pages", openBody("stream:vm-persistent-smoke"));
   if (launch.schema !== "elastos.browser.engine.supervisor-result/v1") throw new Error("wrong launch schema");
   if (launch.isolation?.kind !== "per_launch_vm_target") throw new Error("wrong isolation kind");
 
-  const reused = await request("POST", "/pages", openBody("stream:vm-persistent-smoke"));
-  if (reused.page_id !== launch.page_id) throw new Error("same stream launch was not idempotent");
-  if (reused.stream_id !== launch.stream_id) throw new Error("same stream launch returned wrong stream");
+  const replay = await requestRaw("POST", "/pages", openBody("stream:vm-persistent-smoke"));
+  if (replay.statusCode !== 400 || !String(replay.body.error || "").includes("identity already exist")) {
+    throw new Error(`completed lifecycle identity replay did not fail closed: ${JSON.stringify(replay)}`);
+  }
+  const afterReplay = await request("GET", "/status");
+  if (
+    afterReplay.active_pages !== 1 ||
+    afterReplay.active_vms !== 1 ||
+    afterReplay.page_ids?.[0] !== launch.page_id ||
+    afterReplay.active_stream_ids?.[0] !== launch.stream_id
+  ) {
+    throw new Error(`completed replay changed the healthy owner: ${JSON.stringify(afterReplay)}`);
+  }
 
   const pageStatus = await request("GET", `/pages/${encodeURIComponent(launch.page_id)}/status`);
   if (pageStatus.page_id !== launch.page_id || pageStatus.actual_url !== "https://example.com/" || pageStatus.direct_network !== false) {
@@ -420,22 +470,20 @@ function openBody(streamId, overrides = {}) {
     throw new Error(`outer VM control did not proxy guest page input: ${JSON.stringify(pageInput)}`);
   }
 
-  fs.writeFileSync(`${proofDir}/fail-next-guest-open`, "fail\n");
-  const failedGuestOpen = await requestRaw("POST", "/pages", openBody("stream:vm-persistent-failed-guest-smoke"));
-  if (failedGuestOpen.statusCode !== 400) throw new Error(`expected failed guest open 400, got ${failedGuestOpen.statusCode}`);
-  if (!String(failedGuestOpen.body.error || "").includes("guest open intentionally failed")) {
-    throw new Error(`wrong guest open error: ${JSON.stringify(failedGuestOpen.body)}`);
+  const launchCleanup = shutdownBody(launch);
+  const shutdownLaunch = await request("POST", "/shutdown", launchCleanup);
+  if (
+    shutdownLaunch.schema !== "elastos.browser.supervisor-cleanup-result/v2" ||
+    shutdownLaunch.terminal !== true ||
+    Object.values(shutdownLaunch.effects || {}).some((value) => value !== true)
+  ) {
+    throw new Error(`explicit close did not prove exact terminal cleanup: ${JSON.stringify(shutdownLaunch)}`);
   }
-  const afterFailedGuestOpen = await request("GET", "/status");
-  if (afterFailedGuestOpen.active_pages !== 0 || afterFailedGuestOpen.active_vms !== 0 || afterFailedGuestOpen.warm_vms !== 0 || afterFailedGuestOpen.pending_launches !== 0) {
-    throw new Error(`failed guest open leaked service state: ${JSON.stringify(afterFailedGuestOpen)}`);
-  }
-
   const second = await request("POST", "/pages", openBody("stream:vm-persistent-second-smoke"));
   if (second.page_id === launch.page_id) throw new Error("second stream reused first page id");
   if (second.stream_id !== "stream:vm-persistent-second-smoke") throw new Error("second stream launch returned wrong stream");
   if (second.engine !== "chromium_microvm") throw new Error("second stream lost VM supervisor identity");
-  if (second.control_socket_path === launch.control_socket_path) throw new Error("failed warm VM reuse was not retired before the next launch");
+  if (second.control_socket_path === launch.control_socket_path) throw new Error("terminal cleanup reused the retired VM control socket");
 
   const status = await request("GET", "/status");
   if (status.active_pages !== 1 || status.max_active_pages !== 1 || status.capacity_available !== false) {
@@ -444,14 +492,20 @@ function openBody(streamId, overrides = {}) {
   if (status.active_vms !== 1) throw new Error(`same-profile replacement must keep one active VM: ${JSON.stringify(status)}`);
   if (status.hibernation_mode !== "vz_save_restore") throw new Error(`persistent smoke should report hibernation mode: ${JSON.stringify(status)}`);
 
-  const shutdownSecond = await request("POST", "/shutdown", { page_id: second.page_id });
-  if (shutdownSecond.schema !== "elastos.browser.vm-engine.shutdown/v1" || shutdownSecond.ok !== true) throw new Error("second shutdown failed");
-  if (shutdownSecond.warm_vm_retained !== true || shutdownSecond.idle_keepalive_ms !== 2000) {
-    throw new Error(`shutdown did not retain an idle warm VM: ${JSON.stringify(shutdownSecond)}`);
+  const shutdownSecond = await request(
+    "POST",
+    "/shutdown",
+    shutdownBody(second),
+  );
+  if (
+    shutdownSecond.schema !== "elastos.browser.supervisor-cleanup-result/v2" ||
+    shutdownSecond.terminal !== true
+  ) {
+    throw new Error(`second shutdown did not return terminal proof: ${JSON.stringify(shutdownSecond)}`);
   }
   const warmStatus = await request("GET", "/status");
-  if (warmStatus.active_pages !== 0 || warmStatus.active_vms !== 1 || warmStatus.warm_vms !== 1 || warmStatus.capacity_available !== true) {
-    throw new Error(`closed page did not leave one idle warm VM: ${JSON.stringify(warmStatus)}`);
+  if (warmStatus.active_pages !== 0 || warmStatus.active_vms !== 0 || warmStatus.warm_vms !== 0 || warmStatus.capacity_available !== true) {
+    throw new Error(`closed page retained VM ownership: ${JSON.stringify(warmStatus)}`);
   }
   if (warmStatus.idle_vm_keepalive_ms !== 2000) {
     throw new Error(`status did not expose idle VM keepalive: ${JSON.stringify(warmStatus)}`);
@@ -462,17 +516,16 @@ function openBody(streamId, overrides = {}) {
   if (warmStatus.hibernation_mode !== "vz_save_restore") {
     throw new Error(`warm VM status did not expose hibernation mode: ${JSON.stringify(warmStatus)}`);
   }
-  const warmLifecycle = warmStatus.lifecycle?.sessions?.find((session) => session.warm_vm === true);
-  if (!warmLifecycle || warmLifecycle.phase !== "HIBERNATED") {
-    throw new Error(`warm VM lifecycle did not expose hibernated phase: ${JSON.stringify(warmStatus.lifecycle)}`);
+  if ((warmStatus.lifecycle?.sessions || []).length !== 0) {
+    throw new Error(`terminal cleanup retained lifecycle sessions: ${JSON.stringify(warmStatus.lifecycle)}`);
   }
 
   const routeChanged = await request("POST", "/pages", openBody("remote-carrier:seed-node-linux:seed-smoke:1"));
   if (routeChanged.stream_id !== "remote-carrier:seed-node-linux:seed-smoke:1") {
     throw new Error(`route-change launch returned wrong stream: ${JSON.stringify(routeChanged)}`);
   }
-  if (routeChanged.control_socket_path !== second.control_socket_path) {
-    throw new Error("same-profile route change did not reuse the warm VM control socket");
+  if (routeChanged.control_socket_path === second.control_socket_path) {
+    throw new Error("same-profile route change reused a terminally closed VM control socket");
   }
   const routeStatus = await request("GET", "/status");
   if (routeStatus.active_pages !== 1 || routeStatus.active_vms !== 1 || routeStatus.warm_vms !== 0) {
@@ -482,16 +535,20 @@ function openBody(streamId, overrides = {}) {
   if (!routeLifecycle || routeLifecycle.phase !== "ACTIVE_SESSION" || !String(routeLifecycle.exit_id || "").startsWith("remote-carrier:sha256:")) {
     throw new Error(`same-profile route change did not expose the remote exit as page routing state: ${JSON.stringify(routeStatus.lifecycle)}`);
   }
-  const shutdownRouteChanged = await request("POST", "/shutdown", { page_id: routeChanged.page_id });
-  if (shutdownRouteChanged.schema !== "elastos.browser.vm-engine.shutdown/v1" || shutdownRouteChanged.ok !== true) {
-    throw new Error("route-changed shutdown failed");
-  }
-  if (shutdownRouteChanged.warm_vm_retained !== true) {
-    throw new Error(`route-changed shutdown did not retain the warm VM: ${JSON.stringify(shutdownRouteChanged)}`);
+  const shutdownRouteChanged = await request(
+    "POST",
+    "/shutdown",
+    shutdownBody(routeChanged),
+  );
+  if (
+    shutdownRouteChanged.schema !== "elastos.browser.supervisor-cleanup-result/v2" ||
+    shutdownRouteChanged.terminal !== true
+  ) {
+    throw new Error(`route-changed shutdown did not prove terminal cleanup: ${JSON.stringify(shutdownRouteChanged)}`);
   }
   const afterRouteWarmStatus = await request("GET", "/status");
-  if (afterRouteWarmStatus.active_pages !== 0 || afterRouteWarmStatus.active_vms !== 1 || afterRouteWarmStatus.warm_vms !== 1) {
-    throw new Error(`route-changed shutdown did not leave one reusable warm VM: ${JSON.stringify(afterRouteWarmStatus)}`);
+  if (afterRouteWarmStatus.active_pages !== 0 || afterRouteWarmStatus.active_vms !== 0 || afterRouteWarmStatus.warm_vms !== 0) {
+    throw new Error(`route-changed shutdown retained VM state: ${JSON.stringify(afterRouteWarmStatus)}`);
   }
 
   const principalChanged = await request("POST", "/pages", openBody("stream:vm-persistent-principal-b-smoke", {
@@ -513,12 +570,16 @@ function openBody(streamId, overrides = {}) {
   if (!fs.existsSync(retiredProofPath)) {
     throw new Error("different principal/profile launch did not terminate the previous idle VM");
   }
-  const shutdownPrincipalChanged = await request("POST", "/shutdown", { page_id: principalChanged.page_id });
-  if (shutdownPrincipalChanged.schema !== "elastos.browser.vm-engine.shutdown/v1" || shutdownPrincipalChanged.ok !== true) {
-    throw new Error("principal-changed shutdown failed");
-  }
-  if (shutdownPrincipalChanged.warm_vm_retained !== true) {
-    throw new Error(`principal-changed shutdown did not retain an idle warm VM: ${JSON.stringify(shutdownPrincipalChanged)}`);
+  const shutdownPrincipalChanged = await request(
+    "POST",
+    "/shutdown",
+    shutdownBody(principalChanged),
+  );
+  if (
+    shutdownPrincipalChanged.schema !== "elastos.browser.supervisor-cleanup-result/v2" ||
+    shutdownPrincipalChanged.terminal !== true
+  ) {
+    throw new Error(`principal-changed shutdown did not prove terminal cleanup: ${JSON.stringify(shutdownPrincipalChanged)}`);
   }
 
   await new Promise((resolve) => setTimeout(resolve, 2600));
@@ -526,26 +587,46 @@ function openBody(streamId, overrides = {}) {
   if (idleStatus.active_pages !== 0 || idleStatus.active_vms !== 0 || idleStatus.warm_vms !== 0) {
     throw new Error(`idle VM keepalive did not expire cleanly: ${JSON.stringify(idleStatus)}`);
   }
+
+  const closeFailurePage = await request(
+    "POST",
+    "/pages",
+    openBody("stream:vm-persistent-close-failure-smoke"),
+  );
+  fs.writeFileSync(`${proofDir}/fail-next-guest-close`, "fail\n");
+  const closeFailureCleanup = shutdownBody(closeFailurePage);
+  const forcedClose = await request("POST", "/shutdown", closeFailureCleanup);
+  if (
+    forcedClose.schema !== "elastos.browser.supervisor-cleanup-result/v2" ||
+    forcedClose.terminal !== true ||
+    forcedClose.forced_vm_retirement !== true
+  ) {
+    throw new Error(`failed guest close did not force terminal VM retirement: ${JSON.stringify(forcedClose)}`);
+  }
+  const afterForcedClose = await request("GET", "/status");
+  if (
+    afterForcedClose.active_pages !== 0 ||
+    afterForcedClose.active_vms !== 0 ||
+    afterForcedClose.warm_vms !== 0
+  ) {
+    throw new Error(`failed guest close leaked reusable state: ${JSON.stringify(afterForcedClose)}`);
+  }
+  const staleClose = await request("POST", "/shutdown", closeFailureCleanup);
+  if (
+    staleClose.schema !== "elastos.browser.supervisor-cleanup-result/v2" ||
+    staleClose.terminal !== true ||
+    staleClose.already_absent !== true
+  ) {
+    throw new Error(`typed already-absent close did not remain terminal: ${JSON.stringify(staleClose)}`);
+  }
 })().catch((error) => {
   console.error(error);
   process.exit(1);
 });
 NODE
 
-if ! grep -q '"event":"launch_failed".*"stream_id":"stream:vm-persistent-failed-guest-smoke".*"reused_vm":true' "$tmp_dir/service.err"; then
-  cat "$tmp_dir/service.err" >&2 || true
-  echo "failed shared-VM guest open did not emit a reused_vm launch_failed event" >&2
-  exit 1
-fi
-
-if ! grep -q '"event":"warm_vm_retired_after_reuse_failure".*"stream_id":"stream:vm-persistent-failed-guest-smoke"' "$tmp_dir/service.err"; then
-  cat "$tmp_dir/service.err" >&2 || true
-  echo "failed shared-VM guest open did not retire the idle warm VM" >&2
-  exit 1
-fi
-
 if [[ ! -f "$proof_dir/stream_vm-persistent-second-smoke.started" ]]; then
-  echo "same-profile second page did not spawn a fresh persistent launcher after failed warm VM reuse" >&2
+  echo "same-profile second page did not spawn a fresh persistent launcher after terminal cleanup" >&2
   exit 1
 fi
 
@@ -600,18 +681,236 @@ for suffix in stream_vm-persistent-principal-b-smoke; do
   }
 done
 
+for suffix in stream_vm-persistent-close-failure-smoke; do
+  proof_path="$proof_dir/${suffix}.json"
+  for _ in {1..100}; do
+    [[ -f "$proof_path" ]] && break
+    sleep 0.05
+  done
+  [[ -f "$proof_path" ]] || {
+    echo "failed close did not terminate persistent launcher for $suffix" >&2
+    exit 1
+  }
+done
+
 PROOF_DIR="$proof_dir" "$node_bin" - <<'NODE'
 const fs = require("node:fs");
 for (const [file, streamId] of [
   ["stream_vm-persistent-smoke.json", "stream:vm-persistent-smoke"],
   ["stream_vm-persistent-second-smoke.json", "stream:vm-persistent-second-smoke"],
   ["stream_vm-persistent-principal-b-smoke.json", "stream:vm-persistent-principal-b-smoke"],
+  ["stream_vm-persistent-close-failure-smoke.json", "stream:vm-persistent-close-failure-smoke"],
 ]) {
   const proof = JSON.parse(fs.readFileSync(`${process.env.PROOF_DIR}/${file}`, "utf8"));
   if (proof.schema !== "elastos.browser.vm-persistent-launcher-proof/v1") throw new Error("wrong proof schema");
   if (proof.terminated !== true) throw new Error("persistent launcher was not terminated");
   if (proof.stream_id !== streamId) throw new Error("wrong stream id");
 }
+NODE
+
+kill "$service_pid" >/dev/null 2>&1 || true
+wait "$service_pid" 2>/dev/null || true
+service_pid=""
+
+reuse_failure_control_socket="$tmp_dir/browser-vm-control-reuse-failure.sock"
+reuse_failure_proof_dir="$tmp_dir/p-reuse-failure"
+mkdir -p "$reuse_failure_proof_dir"
+
+reuse_failure_config_json="$(python3 - <<PY
+import json
+print(json.dumps({
+    "schema": "elastos.browser.vm-control-service.config/v1",
+    "control_socket_path": "$reuse_failure_control_socket",
+    "launcher_program": "$fake_launcher",
+    "persistent_launcher": True,
+    "max_active_pages": 2,
+    "idle_vm_keepalive_ms": 2000,
+    "reuse_idle_vms": True,
+    "launch_timeout_ms": 30000,
+    "shutdown_timeout_ms": 5000,
+}))
+PY
+)"
+
+ELASTOS_BROWSER_VM_CONTROL_SERVICE_CONFIG="$reuse_failure_config_json" \
+PERSISTENT_LAUNCHER_PROOF_DIR="$reuse_failure_proof_dir" \
+  "$node_bin" "$repo_root/scripts/browser-vm-control-service.mjs" > "$tmp_dir/service-reuse-failure.out" 2> "$tmp_dir/service-reuse-failure.err" &
+service_pid="$!"
+
+for _ in {1..100}; do
+  [[ -S "$reuse_failure_control_socket" ]] && break
+  sleep 0.05
+done
+if [[ ! -S "$reuse_failure_control_socket" ]]; then
+  cat "$tmp_dir/service-reuse-failure.err" >&2 || true
+  exit 1
+fi
+
+CONTROL_SOCKET="$reuse_failure_control_socket" \
+PROOF_DIR="$reuse_failure_proof_dir" \
+  "$node_bin" - <<'NODE'
+const fs = require("node:fs");
+const http = require("node:http");
+const socketPath = process.env.CONTROL_SOCKET;
+const proofDir = process.env.PROOF_DIR;
+
+function requestRaw(method, path, body) {
+  const bytes = body ? Buffer.from(JSON.stringify(body)) : Buffer.alloc(0);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      socketPath,
+      path,
+      method,
+      headers: {
+        "content-type": "application/json",
+        "content-length": bytes.length,
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        resolve({ statusCode: res.statusCode, body: parsed });
+      });
+    });
+    req.on("error", reject);
+    req.end(bytes);
+  });
+}
+
+async function request(method, path, body) {
+  const response = await requestRaw(method, path, body);
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(response.body.error || response.body.message || `status ${response.statusCode}`);
+  }
+  return response.body;
+}
+
+const profile = {
+  schema: "elastos.browser.profile/v1",
+  scope: "active_principal",
+  storage: "principal_owned_profile_disk",
+  storage_posture: "principal_owned_reset_scoped_unprotected",
+  protected_storage: false,
+  encrypted: false,
+  recoverable: false,
+  recovery: "not_recovery_kit_packaged",
+  uri: "localhost://Users/0123456789ab/BrowserProfiles/default/profile.ext4",
+  public_uri: "localhost://Users/self/BrowserProfiles/default/profile.ext4",
+  profile_key: "profile-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  disk_path: "/tmp/elastos-browser-profile-reuse-failure/BrowserProfiles/default/profile.ext4",
+  reset: "whole_profile",
+};
+
+const openBody = (streamId) => ({
+  schema: "elastos.browser.vm-engine.open/v1",
+  launch_request: {
+    schema: "elastos.browser.engine.launch-request/v1",
+    adapter: "browser-vm-product",
+    engine: "chromium_microvm",
+    url: "https://example.com/",
+    stream_id: streamId,
+    lifecycle_generation: `sha256:${streamId}`,
+    target: "tls://example.com:443",
+    principal_id: "person:local:vm-persistent-reuse-failure",
+    profile,
+    network_mode: "runtime_net_only",
+    direct_network: false,
+    wallet_injection: false,
+    display_mode: "webrtc_remote_display",
+    guarantee_level: "mechanism_microvm",
+  },
+  requirements: {
+    substrate: "microvm",
+    display_mode: "webrtc_remote_display",
+    guarantee_level: "mechanism_microvm",
+    backend_class: "product_compositor",
+    network_mode: "runtime_net_only",
+    direct_network: false,
+  },
+  profile,
+});
+
+const reconcile = (streamId) =>
+  request("POST", "/launches/reconcile", {
+    schema: "elastos.browser.vm-control-service.reconcile-launch/v1",
+    lifecycle_generation: `sha256:${streamId}`,
+    stream_id: streamId,
+  });
+
+const cleanupBody = (page) => ({
+  page_id: page.page_id,
+  force_retire_vm: true,
+  runtime_cleanup: {
+    schema: "elastos.browser.engine-cleanup-binding/v2",
+    page_id: page.page_id,
+    generation: `sha256:${page.stream_id}`,
+    stream_id: page.stream_id,
+    adapter: page.adapter,
+    engine: page.engine,
+    display_mode: "webrtc_remote_display",
+    guarantee_level: "mechanism_microvm",
+    principal_id: "person:local:vm-persistent-reuse-failure",
+    control_socket_path: page.control_socket_path,
+    shutdown_socket_path: socketPath,
+    isolated_session: true,
+    isolation: page.isolation,
+    process: page.process,
+  },
+});
+
+(async () => {
+  const first = await request(
+    "POST",
+    "/pages",
+    openBody("stream:vm-reuse-failure-owner"),
+  );
+  fs.writeFileSync(`${proofDir}/fail-next-guest-open`, "fail\n");
+  const failed = await requestRaw(
+    "POST",
+    "/pages",
+    openBody("stream:vm-reuse-failure-pending"),
+  );
+  if (
+    failed.statusCode !== 400 ||
+    !String(failed.body.error || "").includes("guest open intentionally failed")
+  ) {
+    throw new Error(`reused guest-open failure changed: ${JSON.stringify(failed)}`);
+  }
+  const pending = await reconcile("stream:vm-reuse-failure-pending");
+  if (
+    pending.state !== "cleanup_pending" ||
+    pending.effects?.page_acquired !== null ||
+    pending.effects?.vm_acquired !== null
+  ) {
+    throw new Error(`unreaped reused failure was not retained: ${JSON.stringify(pending)}`);
+  }
+  const stillOwned = await request("GET", "/status");
+  if (stillOwned.active_pages !== 1 || stillOwned.active_vms !== 1) {
+    throw new Error(`cleanup failure disturbed the healthy page owner: ${JSON.stringify(stillOwned)}`);
+  }
+  await request("POST", "/shutdown", cleanupBody(first));
+  const terminal = await reconcile("stream:vm-reuse-failure-pending");
+  if (
+    terminal.state !== "terminal_post_effect_cleanup" ||
+    terminal.effects?.page_acquired !== true ||
+    terminal.effects?.vm_acquired !== true
+  ) {
+    throw new Error(`exact VM reap did not terminally settle reused failure: ${JSON.stringify(terminal)}`);
+  }
+  const replacement = await request(
+    "POST",
+    "/pages",
+    openBody("stream:vm-reuse-failure-replacement"),
+  );
+  if (replacement.stream_id !== "stream:vm-reuse-failure-replacement") {
+    throw new Error(`replacement remained blocked after terminal proof: ${JSON.stringify(replacement)}`);
+  }
+  await request("POST", "/shutdown", cleanupBody(replacement));
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
 NODE
 
 kill "$service_pid" >/dev/null 2>&1 || true
@@ -707,6 +1006,7 @@ function openBody(streamId) {
       engine: "chromium_microvm",
       url: "https://example.com/",
       stream_id: streamId,
+      lifecycle_generation: `sha256:${streamId}`,
       target: "tls://example.com:443",
       principal_id: "person:local:vm-persistent-no-reuse-smoke",
       profile,
@@ -728,11 +1028,38 @@ function openBody(streamId) {
   };
 }
 
+function shutdownBody(page) {
+  return {
+    page_id: page.page_id,
+    runtime_cleanup: {
+      schema: "elastos.browser.engine-cleanup-binding/v2",
+      page_id: page.page_id,
+      generation: `sha256:${page.stream_id}`,
+      stream_id: page.stream_id,
+      adapter: page.adapter,
+      engine: page.engine,
+      display_mode: "webrtc_remote_display",
+      guarantee_level: "mechanism_microvm",
+      principal_id: "person:local:vm-persistent-no-reuse-smoke",
+      control_socket_path: page.control_socket_path,
+      shutdown_socket_path: socketPath,
+      isolated_session: true,
+      isolation: page.isolation,
+      process: page.process,
+    },
+    force_retire_vm: true,
+  };
+}
+
 (async () => {
   const launch = await request("POST", "/pages", openBody("stream:vm-no-reuse-smoke"));
-  const shutdown = await request("POST", "/shutdown", { page_id: launch.page_id });
-  if (shutdown.warm_vm_retained === true) {
-    throw new Error(`idle keepalive retained a VM without explicit reuse opt-in: ${JSON.stringify(shutdown)}`);
+  const shutdown = await request("POST", "/shutdown", shutdownBody(launch));
+  if (
+    shutdown.schema !== "elastos.browser.supervisor-cleanup-result/v2" ||
+    shutdown.terminal !== true ||
+    Object.values(shutdown.effects || {}).some((value) => value !== true)
+  ) {
+    throw new Error(`terminal cleanup proof was incomplete: ${JSON.stringify(shutdown)}`);
   }
   const status = await request("GET", "/status");
   if (status.active_pages !== 0 || status.active_vms !== 0 || status.warm_vms !== 0) {
@@ -846,6 +1173,7 @@ function request(method, path, body) {
       engine: "chromium_microvm",
       url: "https://example.com/",
       stream_id: "stream:vm-persistent-invalid-smoke",
+      lifecycle_generation: "sha256:vm-persistent-invalid-smoke",
       target: "tls://example.com:443",
       network_mode: "runtime_net_only",
       direct_network: false,
@@ -865,6 +1193,17 @@ function request(method, path, body) {
   if (response.statusCode !== 400) throw new Error(`expected 400, got ${response.statusCode}`);
   if (!String(response.body.error || "").includes("Browser VM launcher output is not JSON")) {
     throw new Error(`wrong error: ${JSON.stringify(response.body)}`);
+  }
+  const reconciliation = await request("POST", "/launches/reconcile", {
+    schema: "elastos.browser.vm-control-service.reconcile-launch/v1",
+    lifecycle_generation: "sha256:vm-persistent-invalid-smoke",
+    stream_id: "stream:vm-persistent-invalid-smoke",
+  });
+  if (
+    reconciliation.statusCode !== 200 ||
+    reconciliation.body.state !== "terminal_post_effect_cleanup"
+  ) {
+    throw new Error(`invalid launcher was released before exact reap: ${JSON.stringify(reconciliation)}`);
   }
 })().catch((error) => {
   console.error(error);
@@ -966,6 +1305,7 @@ function request(method, path, body) {
       engine: "chromium_microvm",
       url: "https://example.com/",
       stream_id: "stream:vm-persistent-timeout-smoke",
+      lifecycle_generation: "sha256:vm-persistent-timeout-smoke",
       target: "tls://example.com:443",
       network_mode: "runtime_net_only",
       direct_network: false,
@@ -989,6 +1329,17 @@ function request(method, path, body) {
   }
   if (!error.includes("stage=open_guest_page_start")) {
     throw new Error(`timeout error did not include launcher stderr: ${JSON.stringify(response.body)}`);
+  }
+  const reconciliation = await request("POST", "/launches/reconcile", {
+    schema: "elastos.browser.vm-control-service.reconcile-launch/v1",
+    lifecycle_generation: "sha256:vm-persistent-timeout-smoke",
+    stream_id: "stream:vm-persistent-timeout-smoke",
+  });
+  if (
+    reconciliation.statusCode !== 200 ||
+    reconciliation.body.state !== "terminal_post_effect_cleanup"
+  ) {
+    throw new Error(`timed-out launcher was released before exact reap: ${JSON.stringify(reconciliation)}`);
   }
 })().catch((error) => {
   console.error(error);
@@ -1075,6 +1426,7 @@ function openBody() {
       engine: "chromium_microvm",
       url: "https://example.com/",
       stream_id: "stream:vm-persistent-abort-smoke",
+      lifecycle_generation: "sha256:vm-persistent-abort-smoke",
       target: "tls://example.com:443",
       network_mode: "runtime_net_only",
       direct_network: false,
@@ -1108,6 +1460,37 @@ function getStatus() {
     });
     req.on("error", reject);
     req.end();
+  });
+}
+
+function reconcile() {
+  const bytes = Buffer.from(JSON.stringify({
+    schema: "elastos.browser.vm-control-service.reconcile-launch/v1",
+    lifecycle_generation: "sha256:vm-persistent-abort-smoke",
+    stream_id: "stream:vm-persistent-abort-smoke",
+  }));
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      socketPath,
+      path: "/launches/reconcile",
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": bytes.length,
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    req.on("error", reject);
+    req.end(bytes);
   });
 }
 
@@ -1150,6 +1533,10 @@ async function waitForFile(file, label) {
   req.destroy(new Error("client canceled launch"));
   const settled = await waitForStatus((status) => status.pending_launches === 0, "pending launch did not clear after client cancel");
   if (settled.active_pages !== 0) throw new Error(`aborted launch left active pages: ${JSON.stringify(settled)}`);
+  const reconciliation = await reconcile();
+  if (reconciliation.state !== "terminal_post_effect_cleanup") {
+    throw new Error(`canceled launcher was released before exact reap: ${JSON.stringify(reconciliation)}`);
+  }
 })().catch((error) => {
   console.error(error);
   process.exit(1);

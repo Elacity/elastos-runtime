@@ -45,7 +45,7 @@ import {
   desktopObjectEntryId,
   desktopObjectByEntryId,
   desktopEntryExists,
-} from "./shell-core.js?v=home-20260715a";
+} from "./shell-core.js?v=home-20260725a";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,

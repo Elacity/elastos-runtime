@@ -7476,6 +7476,12 @@ assert(
 );
 assert(
   browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
+    browserEngineAdapter.includes(
+      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0"',
+    ) &&
+    browserEngineAdapter.includes(
+      "elastos.browser.engine-cleanup-binding/v2",
+    ) &&
     browserEngineAdapter.includes("elastos.adapter-ipc/v1") &&
     browserEngineAdapter.includes("runtime_stream_path") &&
     browserEngineAdapter.includes("elastos.browser.engine.launch-request/v1") &&
@@ -7494,6 +7500,8 @@ assert(
     browserEngineAdapter.includes("direct_network") &&
     browserEngineAdapter.includes("wallet_injection") &&
     serverInfra.includes("ELASTOS_BROWSER_ENGINE_ADAPTER_CONFIG") &&
+    serverInfra.includes("start_browser_engine_provider") &&
+    serverInfra.includes("BROWSER_ENGINE_PROVIDER_STATUS_TIMEOUT") &&
     gatewayBrowserApi.includes("browser_engine_summary") &&
     gatewayBrowserRouteTests.includes(
       "test_browser_app_summary_reports_registered_engine_adapter_status",
@@ -9603,10 +9611,12 @@ assert(
     shellWindows.includes('const launchQuery = targetId === "browser"') &&
     shellWindows.includes("withBrowserInstanceQuery({ query: options.query }).query") &&
     shellWindows.includes("query: restoredWindow.query") &&
-    browserJs.includes("const stalePage = previousPage ? null : rememberedRuntimePage();") &&
-    browserJs.includes("await closeRuntimePage(stalePage);") &&
+    browserJs.includes("const stalePage = previousPage ? null : recoverableRuntimePage();") &&
+    browserJs.includes("await closeRuntimePage(stalePage, {") &&
+    browserJs.includes("elastos.browser.cleanup-handle/v1") &&
+    !browserJs.includes("sessionStorage") &&
     !browserJs.includes("__elastosBrowserReleaseRuntimePage"),
-  "Home must persist Browser window launch query/browser_instance across restore and Browser must not clear remembered runtime page ids before stale-page cleanup runs",
+  "Home must persist Browser window launch query/browser_instance across restore while Browser recovers opaque Runtime cleanup ownership without frame-local session storage",
 );
 assert(
   read("scripts/browser-youtube-acceptance-smoke.sh").includes("dQw4w9WgXcQ") &&

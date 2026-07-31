@@ -1,8 +1,36 @@
 use super::gateway_browser::{
-    browser_close_reconciled_receipt, browser_provider_resource_call, provider_response_data,
-    provider_response_error_message,
+    browser_provider_resource_call, browser_terminal_close_receipt, provider_response_data,
+    provider_response_error_message, BrowserEngineCleanup,
+};
+use crate::api::browser_engine_protocol::{
+    BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+    BROWSER_ENGINE_PROTOCOL_VERSION,
 };
 use serde_json::json;
+
+fn test_browser_engine_cleanup(page_id: &str) -> BrowserEngineCleanup {
+    BrowserEngineCleanup {
+        cleanup_id: "browser-cleanup:test".to_string(),
+        page_id: page_id.to_string(),
+        principal_id: "person:local:test".to_string(),
+        owner_launch_id: "launch:test".to_string(),
+        generation: "sha256:test-generation".to_string(),
+        engine_route_provider: "mock-browser-route".to_string(),
+        engine_provider: "browser-engine-adapter".to_string(),
+        engine_protocol_version: BROWSER_ENGINE_PROTOCOL_VERSION.to_string(),
+        engine_adapter: "mock-adapter".to_string(),
+        engine: "mock-engine".to_string(),
+        stream_id: "stream:test".to_string(),
+        provider_cleanup: json!({
+            "schema": BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
+            page_id: page_id.to_string(),
+            "generation": "sha256:test-generation",
+            "adapter": "mock-adapter",
+            "engine": "mock-engine",
+            "stream_id": "stream:test",
+        }),
+    }
+}
 
 #[test]
 fn test_provider_response_data_unwraps_nested_provider_envelopes() {
@@ -40,37 +68,54 @@ fn test_provider_response_error_message_unwraps_nested_provider_errors() {
 }
 
 #[test]
-fn test_browser_close_reconciles_missing_page_control_session() {
-    let receipt = browser_close_reconciled_receipt(
-        "page:already-gone",
-        "engine_process_unavailable: Browser page has no page-scoped engine control session",
-    )
-    .expect("missing page-scoped control should be reconciled for close");
-
-    assert_eq!(receipt["schema"], "elastos.browser.close-result/v1");
-    assert_eq!(receipt["page_id"], "page:already-gone");
-    assert_eq!(receipt["closed"], true);
-    assert_eq!(receipt["already_closed"], true);
-    assert_eq!(receipt["reconciled"], true);
-    assert_eq!(
-        receipt["cleanup"]["schema"],
-        "elastos.browser.runtime-session-cleanup/v1"
-    );
-    assert_eq!(receipt["cleanup"]["ok"], true);
+fn test_browser_close_requires_exact_typed_terminal_cleanup_proof() {
+    let cleanup = test_browser_engine_cleanup("page:typed-terminal");
+    let receipt = json!({
+        "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+        "page_id": cleanup.page_id,
+        "generation": cleanup.generation,
+        "binding": cleanup.provider_cleanup,
+        "terminal": true,
+        "effects": {
+            "page_absent": true,
+            "child_absent": true,
+            "vm_absent": true,
+            "route_absent": true,
+            "socket_absent": true,
+        }
+    });
+    assert!(browser_terminal_close_receipt(&cleanup, receipt).is_ok());
 }
 
 #[test]
-fn test_browser_close_reconciliation_rejects_unrelated_engine_errors() {
-    assert!(browser_close_reconciled_receipt(
-        "page:still-unknown",
-        "engine_process_unavailable: timed out waiting for browser control response",
-    )
-    .is_none());
-    assert!(browser_close_reconciled_receipt(
-        "page:still-unknown",
-        "display_session_unavailable: webrtc_remote_display is unavailable",
-    )
-    .is_none());
+fn test_browser_close_rejects_absent_or_substituted_terminal_proof() {
+    let cleanup = test_browser_engine_cleanup("page:still-owned");
+    for receipt in [
+        json!({
+            "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+            "page_id": cleanup.page_id,
+            "generation": cleanup.generation,
+            "binding": cleanup.provider_cleanup,
+            "terminal": false,
+            "effects": {}
+        }),
+        json!({
+            "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+            "page_id": cleanup.page_id,
+            "generation": "sha256:substituted",
+            "binding": cleanup.provider_cleanup,
+            "terminal": true,
+            "effects": {
+                "page_absent": true,
+                "child_absent": true,
+                "vm_absent": true,
+                "route_absent": true,
+                "socket_absent": true,
+            }
+        }),
+    ] {
+        assert!(browser_terminal_close_receipt(&cleanup, receipt).is_err());
+    }
 }
 
 #[test]

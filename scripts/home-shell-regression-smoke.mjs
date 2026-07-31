@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260715a";
+const moduleVersion = "home-20260725a";
 const savedStatePatches = [];
 const requests = [];
 
@@ -52,6 +52,14 @@ class FakeElement {
     child.parentElement = this;
     return child;
   }
+
+  cloneNode() {
+    return new FakeElement(`${this.selector}:clone`, false);
+  }
+
+  addEventListener() {}
+
+  removeEventListener() {}
 
   replaceChildren(...children) {
     this.children = children;
@@ -266,6 +274,61 @@ assert(
   restored,
 );
 
+const restoredBrowserLaunches = [];
+shellWindows.configureWindowHooks({
+  clearIdentitySurface: () => {},
+  hideLauncher: () => {},
+  refreshLauncherIfVisible: () => {},
+  renderDesktop: () => {},
+  renderTaskbar: () => {},
+  updateTaskbarState: () => {},
+  launchTarget: async (target, query) => {
+    restoredBrowserLaunches.push({ target, query: { ...query } });
+    return {
+      target,
+      title: "Browser",
+      route: `/apps/browser/?browser_instance=${encodeURIComponent(query.browser_instance)}`,
+      attach_kind: "iframe",
+      launch_status: "launched",
+    };
+  },
+});
+shellCore.shellState.currentSummary = summary;
+shellCore.shellState.browserContextId = "browser:0123456789abcdef0123456789abcdef";
+shellCore.shellState.homeBrowserState.session = {
+  browser_context_id: shellCore.shellState.browserContextId,
+  root_shell: "home-gui",
+  windows: [{
+    target: "browser",
+    active: true,
+    query: {
+      browser_instance: "browser:restored-refresh-regression",
+      url: "https://ela.city/",
+    },
+  }],
+};
+await shellWindows.restoreShellSession();
+assert(
+  restoredBrowserLaunches.length === 1,
+  "one persisted Browser descriptor did not produce exactly one Browser shell launch",
+  restoredBrowserLaunches,
+);
+assert(
+  shellCore.shellState.windows.size === 1 &&
+    [...shellCore.shellState.windows.values()][0]?.targetId === "browser",
+  "one persisted Browser descriptor did not produce exactly one Browser shell",
+  [...shellCore.shellState.windows.values()],
+);
+assert(
+  restoredBrowserLaunches[0].query.browser_instance ===
+    "browser:restored-refresh-regression",
+  "Home refresh changed the persisted Browser window identity",
+  restoredBrowserLaunches,
+);
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+shellCore.shellState.homeBrowserState.session = null;
+
 function windowModel(entry) {
   const frame = entry.node.querySelector(".window-frame");
   const rect = entry.node.getBoundingClientRect();
@@ -403,6 +466,141 @@ assert(
 );
 shellWindows.closeWindow(backgroundConnector.id);
 shellWindows.closeWindow(continuityWallet.id);
+shellCore.shellState.windows.clear();
+shellCore.shellState.activeWindowId = null;
+
+function sessionWindow(id, targetId, {
+  x,
+  y,
+  width,
+  height,
+  restoreX,
+  restoreY,
+  restoreWidth,
+  restoreHeight,
+  zIndex,
+  hidden = false,
+  query = {},
+}) {
+  const node = new FakeElement(`#${id}`);
+  node.style.left = `${x}px`;
+  node.style.top = `${y}px`;
+  node.style.width = `${width}px`;
+  node.style.height = `${height}px`;
+  node.style.zIndex = String(zIndex);
+  node.dataset.restoreLeft = String(restoreX);
+  node.dataset.restoreTop = String(restoreY);
+  node.dataset.restoreWidth = String(restoreWidth);
+  node.dataset.restoreHeight = String(restoreHeight);
+  if (hidden) node.classList.add("hidden");
+  return {
+    id,
+    kind: "browser",
+    targetId,
+    node,
+    launchQuery: query,
+  };
+}
+
+shellCore.shellState.windows.clear();
+const lowerWindow = sessionWindow("window-lower", "browser", {
+  x: 14,
+  y: 26,
+  width: 720,
+  height: 510,
+  restoreX: 10,
+  restoreY: 20,
+  restoreWidth: 700,
+  restoreHeight: 500,
+  zIndex: 101,
+  query: { url: "https://example.com/lower" },
+});
+const minimizedWindow = sessionWindow("window-minimized", "system", {
+  x: 40,
+  y: 52,
+  width: 900,
+  height: 620,
+  restoreX: 36,
+  restoreY: 44,
+  restoreWidth: 880,
+  restoreHeight: 600,
+  zIndex: 102,
+  hidden: true,
+});
+const activeWindow = sessionWindow("window-active", "browser", {
+  x: 86,
+  y: 98,
+  width: 1080,
+  height: 700,
+  restoreX: 80,
+  restoreY: 90,
+  restoreWidth: 1040,
+  restoreHeight: 680,
+  zIndex: 103,
+  query: { url: "https://example.com/active" },
+});
+for (const entry of [lowerWindow, minimizedWindow, activeWindow]) {
+  shellCore.shellState.windows.set(entry.id, entry);
+}
+shellCore.shellState.activeWindowId = activeWindow.id;
+const exactSnapshot = shellWindows.snapshotBrowserSession();
+assert(
+  exactSnapshot.root_shell === "home-gui",
+  "saved window session lost its root-shell owner",
+  exactSnapshot,
+);
+assert(
+  exactSnapshot.windows.map((entry) => entry.query?.url || entry.target).join("|") ===
+    "https://example.com/lower|system|https://example.com/active",
+  "saved window session lost bottom-to-top z-order",
+  exactSnapshot,
+);
+assert(
+  exactSnapshot.windows[0].x === 14 &&
+    exactSnapshot.windows[0].y === 26 &&
+    exactSnapshot.windows[0].width === 720 &&
+    exactSnapshot.windows[0].height === 510 &&
+    exactSnapshot.windows[0].restoreX === 10 &&
+    exactSnapshot.windows[0].restoreY === 20 &&
+    exactSnapshot.windows[0].restoreWidth === 700 &&
+    exactSnapshot.windows[0].restoreHeight === 500,
+  "saved window session lost exact geometry",
+  exactSnapshot.windows[0],
+);
+assert(
+  exactSnapshot.windows[1].hidden === true &&
+    exactSnapshot.windows[2].active === true,
+  "saved window session lost minimized or active state",
+  exactSnapshot,
+);
+const exactRestored = shellWindows.normalizeRestorableSession(summary, exactSnapshot, {
+  rootShell: "home-gui",
+});
+assert(
+  exactRestored.length === 3 &&
+    exactRestored[0].x === 14 &&
+    exactRestored[0].y === 26 &&
+    exactRestored[0].width === 720 &&
+    exactRestored[0].height === 510 &&
+    exactRestored[1].hidden === true &&
+    exactRestored[2].active === true,
+  "window session did not round-trip exact geometry, minimization, active state, and z-order",
+  exactRestored,
+);
+shellCore.shellState.windows.delete(minimizedWindow.id);
+const afterExplicitClose = shellWindows.snapshotBrowserSession();
+assert(
+  !afterExplicitClose.windows.some((entry) => entry.target === "system"),
+  "explicitly closed window remained in the saved session",
+  afterExplicitClose,
+);
+assert(
+  !shellWindows.normalizeRestorableSession(summary, afterExplicitClose, {
+    rootShell: "home-gui",
+  }).some((entry) => entry.target === "system"),
+  "explicitly closed window was restored",
+  afterExplicitClose,
+);
 shellCore.shellState.windows.clear();
 shellCore.shellState.activeWindowId = null;
 

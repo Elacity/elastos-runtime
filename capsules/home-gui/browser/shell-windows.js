@@ -16,10 +16,9 @@ import {
   saveShellLayoutState,
   loadShellSessionState,
   saveShellSessionState,
-  clearShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260715a";
+} from "./shell-core.js?v=home-20260725a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,7 +29,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260715a";
+} from "./shell-window-geometry.js?v=home-20260725a";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -180,13 +179,14 @@ function persistBrowserSession() {
   if (shellState.restoringSession) {
     return;
   }
-  const rootShell = currentRootShellSessionId();
-  const windows = persistedBrowserSessionEntries();
-  if (windows.length === 0) {
-    saveShellSessionState({ root_shell: rootShell, windows: [] });
-    return;
-  }
-  saveShellSessionState({ root_shell: rootShell, windows });
+  saveShellSessionState(snapshotBrowserSession());
+}
+
+export function snapshotBrowserSession() {
+  return {
+    root_shell: currentRootShellSessionId(),
+    windows: persistedBrowserSessionEntries(),
+  };
 }
 
 function storedSessionRootShell(storedSession) {
@@ -707,7 +707,15 @@ function nextBrowserInstanceId() {
   if (window.crypto && typeof window.crypto.randomUUID === "function") {
     return `browser:${window.crypto.randomUUID()}`;
   }
-  return `browser:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+  if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return `browser:${Array.from(
+      bytes,
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("")}`;
+  }
+  throw new Error("Home GUI requires browser crypto for window isolation");
 }
 
 export function showDesktopHome() {
@@ -1187,7 +1195,6 @@ export async function restoreShellSession() {
     { rootShell: currentRootShellSessionId() },
   );
   if (restoredWindows.length === 0) {
-    clearShellSessionState();
     return;
   }
 
@@ -1216,7 +1223,6 @@ export async function restoreShellSession() {
   shellState.restoringSession = false;
 
   if (restoredEntries.length === 0) {
-    clearShellSessionState();
     return;
   }
 

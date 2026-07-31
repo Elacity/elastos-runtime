@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260715a";
+const moduleVersion = "home-20260725a";
 const requests = [];
 const injectedProviderCalls = [];
 let extraWindowOpenCount = 0;
@@ -325,7 +325,15 @@ globalThis.window = {
   unisat: unisatProvider,
   atob: globalThis.atob,
   btoa: globalThis.btoa,
-  crypto: { randomUUID: () => "home-shell-bridge-smoke" },
+  crypto: {
+    randomUUID: () => "home-shell-bridge-smoke",
+    getRandomValues(bytes) {
+      bytes.forEach((_value, index) => {
+        bytes[index] = 160 + index;
+      });
+      return bytes;
+    },
+  },
   location: { href: "http://localhost:61180/apps/home/", origin: "http://localhost:61180" },
   localStorage: {
     getItem: (key) => localStorageValues.get(key) || null,
@@ -1312,10 +1320,73 @@ assert(
 );
 assert(extraWindowOpenCount === 0, "wallet connector bridge opened an extra browser window");
 
+const shellMessageCountBeforeReady = shellMessages.length;
+sendChildMessage("http://localhost:61180", shellFrameWindow, {
+  type: "home:shell-ready",
+  homeToken: "gui-token",
+});
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:shell-ready",
+  homeToken: "wrong-token",
+});
+sendChildMessage("null", { postMessage() {} }, {
+  type: "home:shell-ready",
+  homeToken: "gui-token",
+});
+assert(
+  !shellMessages.slice(shellMessageCountBeforeReady).some(
+    (message) => message.payload?.type === "home:shell-context",
+  ),
+  "Home handed a browser correlation to an unaccepted shell-ready sender",
+  shellMessages.slice(shellMessageCountBeforeReady),
+);
 sendChildMessage("null", shellFrameWindow, {
   type: "home:shell-ready",
   homeToken: "gui-token",
 });
+const acceptedReadyMessages = shellMessages.slice(shellMessageCountBeforeReady);
+const shellContextMessage = acceptedReadyMessages.find(
+  (message) => message.payload?.type === "home:shell-context",
+);
+const shellSummaryMessage = acceptedReadyMessages.find(
+  (message) => message.payload?.type === "home:shell-summary",
+);
+assert(
+  shellContextMessage?.origin === "*" &&
+    /^browser:[0-9a-f]{32}$/.test(shellContextMessage.payload.browserContextId),
+  "accepted Home GUI ready did not receive the exact bounded host correlation",
+  acceptedReadyMessages,
+);
+assert(
+  acceptedReadyMessages.indexOf(shellContextMessage) <
+    acceptedReadyMessages.indexOf(shellSummaryMessage),
+  "Home must bind the GUI correlation before sending the restorable summary",
+  acceptedReadyMessages,
+);
+assert(
+  Object.keys(shellContextMessage.payload).sort().join(",") ===
+    "browserContextId,type",
+  "Home correlation handoff carried authority or Runtime summary facts",
+  shellContextMessage,
+);
+assert(
+  localStorageValues.get("elastos.home.browser-context-id") ===
+    shellContextMessage.payload.browserContextId,
+  "Home did not durably retain its browser-profile correlation",
+  Object.fromEntries(localStorageValues),
+);
+const firstBrowserContextId = shellContextMessage.payload.browserContextId;
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:shell-ready",
+  homeToken: "gui-token",
+});
+assert(
+  shellMessages
+    .filter((message) => message.payload?.type === "home:shell-context")
+    .every((message) => message.payload.browserContextId === firstBrowserContextId),
+  "same Home browser profile regenerated its correlation",
+  shellMessages.filter((message) => message.payload?.type === "home:shell-context"),
+);
 sendChildMessage("null", shellFrameWindow, {
   type: "home:launch-target",
   requestId: "launch-browser",

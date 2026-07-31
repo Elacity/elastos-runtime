@@ -41,7 +41,7 @@ const DESKTOP_ICON_GAP_X = 96;
 const DESKTOP_ICON_GAP_Y = 104;
 const DEFAULT_DESKTOP_LAYOUT_WIDTH = 1280;
 const DEFAULT_DESKTOP_LAYOUT_HEIGHT = 720;
-const HOME_BROWSER_CONTEXT_KEY = "elastos.home.browser-context-id";
+const HOME_BROWSER_CONTEXT_PATTERN = /^browser:[0-9a-f]{32}$/;
 export const WINDOW_MIN_WIDTH = 320;
 export const WINDOW_MIN_HEIGHT = 220;
 export const WINDOW_SNAP_THRESHOLD = 28;
@@ -50,9 +50,9 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260715a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260725a", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260715a", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260725a", import.meta.url).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -80,7 +80,7 @@ export const shellState = {
   homeEventsSource: null,
   homeEventsStreamFailed: false,
   sessionRefreshTimer: null,
-  browserContextId: ensureBrowserContextId(),
+  browserContextId: "",
   contextMenuOpen: false,
   currentSummary: null,
   homeBrowserState: {
@@ -446,6 +446,9 @@ export function saveShellLayoutState() {
 }
 
 export function loadShellSessionState() {
+  if (!hasHomeBrowserContextId()) {
+    return null;
+  }
   const session = shellState.homeBrowserState.session;
   if (!session || typeof session !== "object") {
     return null;
@@ -454,15 +457,14 @@ export function loadShellSessionState() {
 }
 
 export function saveShellSessionState(session) {
+  if (!hasHomeBrowserContextId()) {
+    return false;
+  }
   shellState.homeBrowserState.session = session && typeof session === "object"
     ? { ...session, browser_context_id: shellState.browserContextId }
     : null;
   saveHomeBrowserState({ session: shellState.homeBrowserState.session });
-}
-
-export function clearShellSessionState() {
-  shellState.homeBrowserState.session = null;
-  saveHomeBrowserState({ session: null });
+  return true;
 }
 
 export function initializeRecentTargets(summary) {
@@ -499,31 +501,23 @@ function normalizeRecentTargets(targetIds, summary) {
   return normalized;
 }
 
-function ensureBrowserContextId() {
-  try {
-    const stored = window.localStorage?.getItem(HOME_BROWSER_CONTEXT_KEY);
-    if (typeof stored === "string" && stored.startsWith("browser:")) {
-      return stored;
-    }
-    const next = newBrowserContextId();
-    window.localStorage?.setItem(HOME_BROWSER_CONTEXT_KEY, next);
-    return next;
-  } catch (_error) {
-    return newBrowserContextId();
-  }
+export function isHomeBrowserContextId(value) {
+  return typeof value === "string" && HOME_BROWSER_CONTEXT_PATTERN.test(value);
 }
 
-function newBrowserContextId() {
-  if (window.crypto?.randomUUID) {
-    return `browser:${window.crypto.randomUUID()}`;
+export function acceptHomeBrowserContextId(value) {
+  if (!isHomeBrowserContextId(value)) {
+    return false;
   }
-  if (window.crypto?.getRandomValues) {
-    const bytes = new Uint8Array(16);
-    window.crypto.getRandomValues(bytes);
-    const token = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-    return `browser:${token}`;
+  if (shellState.browserContextId && shellState.browserContextId !== value) {
+    return false;
   }
-  throw new Error("Home requires browser crypto for session isolation");
+  shellState.browserContextId = value;
+  return true;
+}
+
+export function hasHomeBrowserContextId() {
+  return isHomeBrowserContextId(shellState.browserContextId);
 }
 
 export function rememberRecentTarget(targetId) {

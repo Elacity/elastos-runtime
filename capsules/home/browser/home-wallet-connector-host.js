@@ -1,4 +1,4 @@
-import { fetchJson } from "./shell-core.js?v=home-20260715a";
+import { fetchJson } from "./shell-core.js?v=home-20260725a";
 
 export const WALLET_CONNECTOR_EFFECT_TYPE = "home:wallet-connector-effect";
 export const WALLET_CONNECTOR_EFFECT_SCHEMA = "elastos.home.wallet-connector-effect/v1";

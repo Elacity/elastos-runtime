@@ -20,12 +20,12 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260715a";
+} from "./shell-core.js?v=home-20260725a";
 import {
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260715a";
+} from "./shell-chrome.js?v=home-20260725a";
 import {
   clearDesktopSelection,
   continueTargetDrag,

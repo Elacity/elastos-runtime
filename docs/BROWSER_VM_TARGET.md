@@ -253,15 +253,68 @@ control socket by default so the Browser VM supervisor has a single launch
 target instead of relying on ambient shell state.
 
 `scripts/browser-vm-control-service.mjs` is the local Unix-socket control-plane
-contract. It serves `GET /status`, `POST /pages`, and `POST /shutdown`, accepts
-only `chromium_microvm` launch requests, and delegates actual VM launch to an
-explicit operator launcher program. The service validates the returned
+contract. It serves `GET /status`, `POST /pages`, page-scoped `POST /shutdown`,
+identity-bound `POST /launches/reconcile`, and an identity-bound
+service-shutdown route, accepts only `chromium_microvm` launch requests, and
+delegates actual VM launch to an explicit operator launcher program. Prewarm
+and page launch calculate one canonical
+control-service fingerprint; per-invocation prewarm, open-request, and
+shutdown-request flags are excluded. A mismatched generation is replaceable
+only while status proves that it owns no active pages, active or warm VMs, or
+pending launches. An absent socket permits startup; an existing socket whose
+status is unavailable, timed out, malformed, or foreign remains untouched and
+blocks startup. Idle replacement uses an exact fingerprint-and-start-time-bound
+service shutdown and waits for the owned socket to disappear before starting a
+successor. An owner-only startup lock serializes this check. Lock acquisition
+is fail closed: an existing regular lock is never renamed or removed
+automatically, even when its recorded process is absent or its contents are
+incomplete. An operator may remove a stale lock only after separately proving
+its exact ownership and identity. This avoids a check/rename race, and no
+launcher has authority to unlink or replace an unverified lock or control
+socket.
+
+The service validates the returned
 `elastos.browser.engine.supervisor-result/v1` before handing it to Runtime.
 It supports one-shot launchers and persistent launchers. Persistent launchers
 are required for Apple VZ because the process that owns `VZVirtualMachine` must
 stay alive for the VM lifetime; `/shutdown` terminates that launcher after the
-page closes. It is not a hosted-browser fallback; without a real VM launcher
-behind it, it is only a contract endpoint.
+page closes. SIGTERM and SIGINT stop new launches, cancel pending launches,
+terminate and reap every launcher child owned by that service, and only then
+remove the service socket. It is not a hosted-browser fallback; without a real
+VM launcher behind it, it is only a contract endpoint.
+
+Launch reconciliation is a bounded control-plane obligation, not a process or
+path heuristic. The service writes at most 128 exact generation/stream records
+to a `0600`, current-user-owned journal adjacent to its control socket.
+Only `did_not_act` and `terminal_post_effect_cleanup` records are evictable.
+`cleanup_pending` and `effect_acquired` records retain capacity until exact
+cleanup is terminal; when all 128 slots are unresolved, a new launch is
+rejected before guest-open dispatch or launcher spawn.
+Pre-dispatch validation and capacity failures retain `did_not_act`;
+`cleanup_pending` is committed synchronously only immediately before the guest
+open request or launcher spawn can act. Malformed output, typed launcher
+failure, timeout, cancellation, and guest-open failure become
+`terminal_post_effect_cleanup` only after the exact owned launcher or VM is
+reaped. If another healthy page prevents VM retirement, or exact termination
+fails, the record remains `cleanup_pending`; retiring that same VM later
+settles its attached failed opens terminally. Timeout and cancellation reserve
+their result before signaling the child, so the child-exit event cannot replace
+the requested outcome with a timing-dependent error.
+
+An acquired page persists its exact Runtime cleanup binding with the
+generation/stream record. Cleanup transitions that record to
+`cleanup_pending` before acting and retains the in-memory page/VM owner until
+the shutdown hook, launcher child, control socket, page route, and VM absence
+are proven. A failed cleanup remains retryable under the same binding.
+
+On control-service restart, durable `did_not_act` and terminal records remain
+available to `POST /launches/reconcile`. A formerly acquired effect reloads as
+`cleanup_pending`; an exact cleanup request cannot become terminal merely
+because the new process has empty page/VM maps. The request must match the
+persisted cleanup binding, and every bound process and socket must be absent.
+A surviving or otherwise unprovable resource remains pending. Runtime owns the
+separate stream cleanup obligation and clears the full lifecycle only after
+both the engine receipt and stream cleanup are terminal.
 
 ## Artifact Preflight
 
@@ -490,6 +543,11 @@ IndexedDB, service workers, history, and other Chromium profile state live under
 `/var/lib/elastos/browser-profile-disk/profiles/<profile-key>`.
 If the required profile disk is missing or cannot be mounted/formatted, the
 Browser VM fails closed instead of falling back to an ephemeral profile.
+The VZ launcher also holds non-blocking kernel lifetime locks on the principal
+profile disk and on any shared writable rootfs or hibernation state. A second VM
+cannot attach those resources: launch returns the typed `resources_in_use`
+outcome. Kernel ownership releases the lock automatically if the launcher dies;
+PID files are not lifecycle authority.
 
 New disks are sparse ext4 files. The default size is 2048 MiB and can be adjusted with
 `ELASTOS_BROWSER_VM_PROFILE_DISK_MIB`. Resetting profile state is a
@@ -505,3 +563,16 @@ IndexedDB, service workers, history, or downloads are encrypted or recoverable.
 Runtime Browser profile descriptors and reset receipts must declare
 `storage_posture=principal_owned_reset_scoped_unprotected`,
 `protected_storage=false`, `encrypted=false`, and `recoverable=false`.
+
+Browser open failures carry `elastos.browser.open-outcome/v1`. Runtime reports
+`terminal_pre_effect_failure` after dispatch only when the exact lifecycle
+generation and stream have an independent `did_not_act` proof.
+Transport loss, malformed or unsafe success replies, and post-launch validation
+failures are reconciled against that same identity. An exact recovered effect
+is closed through its typed cleanup binding; an exact terminal proof reports
+`terminal_post_effect_cleanup`. If neither an effect nor no-effect can be
+proved, Runtime durably retains the stream and launch ownership as
+`cleanup_pending`, reports page and VM acquisition as indeterminate, and blocks
+replacement until reconciliation completes. Browser UI renders these states
+directly and does not infer lifecycle ownership from process-error text or claim
+a missing terminal page close for an indeterminate or pre-effect failure.

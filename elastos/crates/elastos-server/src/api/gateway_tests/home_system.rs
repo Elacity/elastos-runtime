@@ -5670,6 +5670,187 @@ async fn test_home_browser_state_is_encrypted_for_protected_principal_root() {
 }
 
 #[tokio::test]
+async fn test_home_browser_state_isolated_by_verified_principal() {
+    let dir = tempfile::tempdir().unwrap();
+    let admin = passkey_authority_with_name_role(
+        dir.path(),
+        Some("admin"),
+        crate::auth::RuntimePrincipalRole::Admin,
+    );
+    let guest = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let admin_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &admin.principal_id);
+    let guest_protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &guest.principal_id);
+    let app = gateway_router(test_state(dir.path()));
+    let context_id = "browser:000102030405060708090a0b0c0d0e0f";
+
+    let (status, updated) = home_test_post_json(
+        &app,
+        "/api/apps/home/state",
+        &admin.home_token,
+        "http://localhost:61180",
+        json!({
+            "session": {
+                "browser_context_id": context_id,
+                "root_shell": "home-gui",
+                "windows": [{ "target": "system", "active": true }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["principal_id"], admin.principal_id);
+    assert_eq!(updated["session"]["browser_context_id"], context_id);
+
+    let guest_state_path = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        &format!(
+            "{}/.AppData/ElastOS/Home/browser-state.json",
+            guest_protection.localhost_root
+        ),
+    )
+    .unwrap();
+    assert!(!guest_state_path.exists());
+    let (status, guest_state) = home_test_get_json(
+        &app,
+        "/api/apps/home/state",
+        &guest.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(guest_state["principal_id"], guest.principal_id);
+    assert!(guest_state["session"].is_null());
+    assert!(!guest_state_path.exists());
+
+    let (status, admin_state) = home_test_get_json(
+        &app,
+        "/api/apps/home/state",
+        &admin.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(admin_state["principal_id"], admin.principal_id);
+    assert_eq!(admin_state["session"]["browser_context_id"], context_id);
+    let admin_state_path = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        &format!(
+            "{}/.AppData/ElastOS/Home/browser-state.json",
+            admin_protection.localhost_root
+        ),
+    )
+    .unwrap();
+    assert!(admin_state_path.is_file());
+}
+
+#[tokio::test]
+async fn test_home_browser_state_read_fallbacks_do_not_overwrite_protected_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let localhost_root = protection.localhost_root;
+    let object_uri = format!("{localhost_root}/.AppData/ElastOS/Home/browser-state.json");
+    let state_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &object_uri).unwrap();
+    let app = gateway_router(test_state(dir.path()));
+
+    assert!(!state_path.exists());
+    let (status, missing) = home_test_get_json(
+        &app,
+        "/api/apps/home/state",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(missing["layout"].is_null());
+    assert!(missing["session"].is_null());
+    assert!(!state_path.exists());
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+
+    let cases = [
+        ("malformed", b"{not-json".to_vec()),
+        (
+            "stale-shape",
+            serde_json::to_vec(&json!({
+                "schema": "elastos.home.browser-state/v1",
+                "localhost_root": localhost_root,
+                "session": { "windows": [{ "target": "system" }] }
+            }))
+            .unwrap(),
+        ),
+        (
+            "unsupported-schema",
+            serde_json::to_vec(&json!({
+                "schema": "elastos.home.browser-state/v0",
+                "principal_id": authority.principal_id,
+                "localhost_root": localhost_root,
+                "session": { "windows": [{ "target": "system" }] }
+            }))
+            .unwrap(),
+        ),
+        (
+            "principal-mismatch",
+            serde_json::to_vec(&json!({
+                "schema": "elastos.home.browser-state/v1",
+                "principal_id": "principal:foreign",
+                "localhost_root": localhost_root,
+                "session": { "windows": [{ "target": "system" }] }
+            }))
+            .unwrap(),
+        ),
+        (
+            "root-mismatch",
+            serde_json::to_vec(&json!({
+                "schema": "elastos.home.browser-state/v1",
+                "principal_id": authority.principal_id,
+                "localhost_root": "localhost://Users/foreign",
+                "session": { "windows": [{ "target": "system" }] }
+            }))
+            .unwrap(),
+        ),
+    ];
+    for (name, bytes) in cases {
+        crate::auth::write_principal_root_object(
+            dir.path(),
+            &authority.principal_id,
+            &localhost_root,
+            &object_uri,
+            &state_path,
+            &bytes,
+        )
+        .unwrap();
+        let protected_before = std::fs::read(&state_path).unwrap();
+        let (status, fallback) = home_test_get_json(
+            &app,
+            "/api/apps/home/state",
+            &authority.home_token,
+            "http://localhost:61180",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        assert!(fallback["layout"].is_null(), "{name}");
+        assert!(fallback["session"].is_null(), "{name}");
+        assert!(
+            fallback["recent_targets"].as_array().unwrap().is_empty(),
+            "{name}"
+        );
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            protected_before,
+            "{name} read must not rewrite protected state"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_home_browser_state_accepts_trusted_shells_only() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("shell-state"));
@@ -5835,6 +6016,7 @@ async fn test_home_browser_state_recovers_from_malformed_saved_state() {
         ),
     )
     .unwrap();
+    let malformed_before = std::fs::read(&state_path).unwrap();
 
     let app = gateway_router(test_state(dir.path()));
     let loaded = app
@@ -5859,6 +6041,7 @@ async fn test_home_browser_state_recovers_from_malformed_saved_state() {
     );
     assert!(loaded_json["layout"].is_null());
     assert!(loaded_json["recent_targets"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read(&state_path).unwrap(), malformed_before);
 
     let summary = app
         .clone()
@@ -5872,6 +6055,7 @@ async fn test_home_browser_state_recovers_from_malformed_saved_state() {
         .await
         .unwrap();
     assert_eq!(summary.status(), StatusCode::OK);
+    assert_eq!(std::fs::read(&state_path).unwrap(), malformed_before);
 
     let updated = app
         .oneshot(
@@ -5930,6 +6114,7 @@ async fn test_home_browser_state_resets_plaintext_for_protected_principal_root()
         .unwrap(),
     )
     .unwrap();
+    let plaintext_before = std::fs::read(&state_path).unwrap();
 
     let loaded = app
         .clone()
@@ -5953,6 +6138,7 @@ async fn test_home_browser_state_resets_plaintext_for_protected_principal_root()
     );
     assert!(loaded_json["layout"].is_null());
     assert!(loaded_json["recent_targets"].as_array().unwrap().is_empty());
+    assert_eq!(std::fs::read(&state_path).unwrap(), plaintext_before);
 
     let summary = app
         .clone()
@@ -5966,6 +6152,7 @@ async fn test_home_browser_state_resets_plaintext_for_protected_principal_root()
         .await
         .unwrap();
     assert_eq!(summary.status(), StatusCode::OK);
+    assert_eq!(std::fs::read(&state_path).unwrap(), plaintext_before);
 
     let updated = app
         .oneshot(

@@ -1,4 +1,4 @@
-import { collectWebrtcStats } from "./browser-status.js?v=browser-20260711c";
+import { collectWebrtcStats } from "./browser-status.js?v=browser-20260725a";
 import {
   normalizeDisplayIceServers,
   normalizeEngineCandidate,
@@ -218,12 +218,12 @@ export function createBrowserRemoteDisplay({
     return false;
   }
 
-  async function recover(message) {
+  async function recover(message, options = {}) {
     if (failureStarted) {
       return;
     }
     failureStarted = true;
-    await onRecoveryRequired(message);
+    await onRecoveryRequired(message, options);
   }
 
   function remoteDisplayFailureMessage(nextPeerConnection, reason) {
@@ -251,8 +251,32 @@ export function createBrowserRemoteDisplay({
         ? "Choose a Browser Engine and Exit Node that provide a shared secure display route."
         : debugMetrics
         ? `Diagnostics: engine candidates=${engineCandidates}, browser candidates=${browserCandidates}, last browser candidate=${browserCandidateSummary}.`
-        : "Refresh Browser, or choose another Browser Engine or Exit Node.",
+        : "Runtime must close this session before another Browser Engine or Exit Node can open.",
     ].join(" ");
+  }
+
+  function malformedDisplayResponse(message) {
+    const error = new Error(message);
+    error.runtimeOwnedFailureKind = "malformed_response";
+    return error;
+  }
+
+  function signalingFailure(message) {
+    const error = new Error(message);
+    error.runtimeOwnedFailureKind = "signaling";
+    return error;
+  }
+
+  function requireSignalAck(response, expectedType) {
+    if (
+      response?.schema !== "elastos.browser.webrtc-signal-ack/v1" ||
+      response?.type !== expectedType
+    ) {
+      throw malformedDisplayResponse(
+        "Browser display signaling returned an invalid response.",
+      );
+    }
+    return response;
   }
 
   function summarizeBrowserCandidate(candidate) {
@@ -309,9 +333,13 @@ export function createBrowserRemoteDisplay({
       sticky: true,
     });
     updateMetrics(getLastPageStatus() || {});
-    if (reason === "no_first_frame") {
-      onRecoveryRequired(message, { retry: false });
-    }
+    Promise.resolve(
+      onRecoveryRequired(message, {
+        failureKind:
+          reason === "no_first_frame" ? "no_first_frame" : "signaling",
+        retry: reason !== "no_first_frame",
+      }),
+    ).catch(() => {});
   }
 
   function startFrameWatch(nextPeerConnection) {
@@ -351,7 +379,9 @@ export function createBrowserRemoteDisplay({
         nextPeerConnection === peerConnection &&
         getCurrentDisplayMode() === "webrtc_remote_display"
       ) {
-        recover(`Browser display ${reason}; reconnecting.`).catch(() => {});
+        recover(`Browser display ${reason}; reconnecting.`, {
+          failureKind: "signaling",
+        }).catch(() => {});
       }
     }, reason === "failed" || reason === "closed" ? 250 : WEBRTC_DISCONNECT_GRACE_MS);
   }
@@ -439,13 +469,20 @@ export function createBrowserRemoteDisplay({
     if (!nextPeerConnection || !payload || typeof payload !== "object") {
       return;
     }
+    if (payload.candidates != null && !Array.isArray(payload.candidates)) {
+      throw malformedDisplayResponse(
+        "Browser display signaling returned invalid candidates.",
+      );
+    }
     const candidates = Array.isArray(payload.candidates)
       ? payload.candidates
       : [];
     for (const candidate of candidates) {
       const normalized = normalizeEngineCandidate(candidate);
       if (!normalized) {
-        continue;
+        throw malformedDisplayResponse(
+          "Browser display signaling returned an invalid candidate.",
+        );
       }
       if (nextPeerConnection === peerConnection) {
         engineCandidateCount += 1;
@@ -472,7 +509,7 @@ export function createBrowserRemoteDisplay({
       audioOffer?.type !== "offer" ||
       !audioOffer?.sdp
     ) {
-      throw new Error("Browser audio could not connect.");
+      throw malformedDisplayResponse("Browser audio could not connect.");
     }
     audioOfferSummary = summarizeSdp(audioOffer.sdp);
     const nextAudioPeerConnection = new RTCPeerConnection({
@@ -501,7 +538,16 @@ export function createBrowserRemoteDisplay({
               channel: "audio",
             },
       });
-      await applyEngineRemoteSignalsTo(nextAudioPeerConnection, signalResponse);
+      if (signalResponse?.accepted === false) {
+        throw signalingFailure("Browser audio signaling was rejected.");
+      }
+      await applyEngineRemoteSignalsTo(
+        nextAudioPeerConnection,
+        requireSignalAck(
+          signalResponse,
+          candidate ? "candidate" : "end_of_candidates",
+        ),
+      );
     };
     const sendAudioCandidate = async (candidate) => {
       if (!canSignalAudioCandidates) {
@@ -525,7 +571,12 @@ export function createBrowserRemoteDisplay({
       }
       audioCandidatePollTimer = window.setTimeout(() => {
         signalAudioCandidate(null)
-          .catch(() => {})
+          .catch((error) => {
+            recover(friendlyOpenError(error), {
+              failureKind:
+                error.runtimeOwnedFailureKind || "signaling",
+            }).catch(() => {});
+          })
           .finally(() => pollAudioEngineCandidates(remaining - 1));
       }, WEBRTC_ENGINE_CANDIDATE_POLL_MS);
     };
@@ -548,13 +599,17 @@ export function createBrowserRemoteDisplay({
         audioBrowserCandidateCount += 1;
         lastAudioBrowserCandidateSummary = summarizeBrowserCandidate(normalized);
         sendAudioCandidate(normalized).catch((error) => {
-          showStatus(friendlyOpenError(error), { sticky: true });
+          recover(friendlyOpenError(error), {
+            failureKind: error.runtimeOwnedFailureKind || "signaling",
+          }).catch(() => {});
         });
         return;
       }
       audioNullCandidateEventCount += 1;
       sendAudioCandidate(null).catch((error) => {
-        showStatus(friendlyOpenError(error), { sticky: true });
+        recover(friendlyOpenError(error), {
+          failureKind: error.runtimeOwnedFailureKind || "signaling",
+        }).catch(() => {});
       });
     });
     nextAudioPeerConnection.addEventListener("track", (event) => {
@@ -584,12 +639,7 @@ export function createBrowserRemoteDisplay({
         sdp: stripTrickleCandidatesFromSdp(nextAudioPeerConnection.localDescription.sdp),
       },
     });
-    if (
-      ack?.schema !== "elastos.browser.webrtc-signal-ack/v1" ||
-      ack?.type !== "answer"
-    ) {
-      throw new Error("Browser audio could not connect.");
-    }
+    requireSignalAck(ack, "answer");
     await applyEngineRemoteSignalsTo(nextAudioPeerConnection, ack);
     canSignalAudioCandidates = true;
     for (const candidate of queuedAudioCandidates.splice(0)) {
@@ -605,20 +655,16 @@ export function createBrowserRemoteDisplay({
       );
     }
     if (displaySession?.schema !== "elastos.browser.display-session/v1") {
-      throw new Error(
-        "Browser display could not connect.",
-      );
+      throw malformedDisplayResponse("Browser display could not connect.");
     }
     if (displaySession.mode !== "webrtc_remote_display") {
-      throw new Error(
-        "Browser display is not ready.",
-      );
+      throw malformedDisplayResponse("Browser display is not ready.");
     }
     if (
       typeof displaySession.signaling_url !== "string" ||
       !displaySession.signaling_url.startsWith("/api/apps/browser/pages/")
     ) {
-      throw new Error(
+      throw malformedDisplayResponse(
         "Browser display could not establish a secure connection.",
       );
     }
@@ -804,17 +850,12 @@ export function createBrowserRemoteDisplay({
               type: "end_of_candidates",
             },
       });
-      if (
-        candidate &&
-        signalResponse?.accepted === false &&
-        signalResponse?.reason
-      ) {
-        showStatus(
-          "Browser display connection was rejected.",
-          {
-            sticky: true,
-          },
-        );
+      requireSignalAck(
+        signalResponse,
+        candidate ? "candidate" : "end_of_candidates",
+      );
+      if (signalResponse?.accepted === false) {
+        throw signalingFailure("Browser display signaling was rejected.");
       }
       await applyEngineRemoteSignals(signalResponse);
     };
@@ -840,7 +881,12 @@ export function createBrowserRemoteDisplay({
       }
       candidatePollTimer = window.setTimeout(() => {
         signalCandidate(null)
-          .catch(() => {})
+          .catch((error) => {
+            recover(friendlyOpenError(error), {
+              failureKind:
+                error.runtimeOwnedFailureKind || "signaling",
+            }).catch(() => {});
+          })
           .finally(() => pollEngineCandidates(remaining - 1));
       }, WEBRTC_ENGINE_CANDIDATE_POLL_MS);
     };
@@ -855,12 +901,16 @@ export function createBrowserRemoteDisplay({
         browserCandidateCount += 1;
         lastBrowserCandidateSummary = summarizeBrowserCandidate(normalized);
         sendCandidate(normalized).catch((error) => {
-          showStatus(friendlyOpenError(error), { sticky: true });
+          recover(friendlyOpenError(error), {
+            failureKind: error.runtimeOwnedFailureKind || "signaling",
+          }).catch(() => {});
         });
         return;
       }
       sendCandidate(null).catch((error) => {
-        showStatus(friendlyOpenError(error), { sticky: true });
+        recover(friendlyOpenError(error), {
+          failureKind: error.runtimeOwnedFailureKind || "signaling",
+        }).catch(() => {});
       });
     });
 
@@ -871,9 +921,7 @@ export function createBrowserRemoteDisplay({
         initialOffer?.type !== "offer" ||
         !initialOffer?.sdp
       ) {
-        throw new Error(
-          "Browser display could not connect.",
-        );
+        throw malformedDisplayResponse("Browser display could not connect.");
       }
       await nextPeerConnection.setRemoteDescription({
         type: "offer",
@@ -891,14 +939,7 @@ export function createBrowserRemoteDisplay({
           ),
         },
       });
-      if (
-        ack?.schema !== "elastos.browser.webrtc-signal-ack/v1" ||
-        ack?.type !== "answer"
-      ) {
-        throw new Error(
-          "Browser display could not connect.",
-        );
-      }
+      requireSignalAck(ack, "answer");
       await applyEngineRemoteSignals(ack);
     } else {
       const offer = await nextPeerConnection.createOffer();
@@ -917,9 +958,7 @@ export function createBrowserRemoteDisplay({
         answer?.type !== "answer" ||
         !answer?.sdp
       ) {
-        throw new Error(
-          "Browser display could not connect.",
-        );
+        throw malformedDisplayResponse("Browser display could not connect.");
       }
       await nextPeerConnection.setRemoteDescription({
         type: "answer",

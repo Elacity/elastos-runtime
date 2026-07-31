@@ -28,6 +28,9 @@ if [[ -z "$node_bin" ]]; then
 fi
 export ELASTOS_NODE_BIN="$node_bin"
 launcher_pid_file="$tmp_dir/fake-launcher.pids"
+foreign_server_pid=""
+foreign_target_pid=""
+unresponsive_server_pid=""
 
 cleanup() {
   local service_pid=""
@@ -65,6 +68,15 @@ cleanup() {
       [[ "$pid" == "$$" ]] && continue
       kill -KILL "$pid" >/dev/null 2>&1 || true
     done
+  fi
+  if [[ -n "$foreign_server_pid" ]]; then
+    kill "$foreign_server_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$foreign_target_pid" ]]; then
+    kill "$foreign_target_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$unresponsive_server_pid" ]]; then
+    kill "$unresponsive_server_pid" >/dev/null 2>&1 || true
   fi
   rm -rf "$tmp_dir"
 }
@@ -127,6 +139,10 @@ console.log(JSON.stringify({
     kind: "per_launch_vm_target",
     session_dir: "/tmp/elastos-browser-vm-autostart-smoke",
   },
+  process: {
+    pid: process.pid,
+    stream_bridge_pid: null,
+  },
   display_session: {
     schema: "elastos.browser.display-session/v1",
     session_id: `display:${launch.stream_id}`,
@@ -167,6 +183,7 @@ console.log(JSON.stringify({
   adapter: "browser-vm-product",
   engine: "chromium_microvm",
   stream_id: "stream:vm-autostart-smoke",
+  lifecycle_generation: "sha256:stream:vm-autostart-smoke",
   url: "https://ela.city/",
   network_mode: "runtime_net_only",
   direct_network: false,
@@ -197,6 +214,108 @@ console.log(JSON.stringify({
 NODE
 )"
 
+request_json_two="$(BASE_REQUEST="$request_json" NEXT_STREAM="stream:vm-autostart-smoke-two" "$node_bin" -e '
+const request = JSON.parse(process.env.BASE_REQUEST);
+request.stream_id = process.env.NEXT_STREAM;
+request.lifecycle_generation = `sha256:${request.stream_id}`;
+process.stdout.write(JSON.stringify(request));
+')"
+request_json_three="$(BASE_REQUEST="$request_json" NEXT_STREAM="stream:vm-autostart-smoke-three" "$node_bin" -e '
+const request = JSON.parse(process.env.BASE_REQUEST);
+request.stream_id = process.env.NEXT_STREAM;
+request.lifecycle_generation = `sha256:${request.stream_id}`;
+process.stdout.write(JSON.stringify(request));
+')"
+
+startup_lock="${control_socket}.start.lock"
+printf '%s\n' '{}' > "$startup_lock"
+python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-30, time.time()-30))' "$startup_lock"
+
+close_page() {
+  local result_file="$1"
+  local cleanup_body
+  cleanup_body="$("$node_bin" - <<'NODE' "$result_file" "$control_socket"
+const fs = require("node:fs");
+const [resultPath, shutdownSocketPath] = process.argv.slice(2);
+const page = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+process.stdout.write(JSON.stringify({
+  page_id: page.page_id,
+  force_retire_vm: true,
+  runtime_cleanup: {
+    schema: "elastos.browser.engine-cleanup-binding/v2",
+    page_id: page.page_id,
+    generation: `sha256:${page.stream_id}`,
+    stream_id: page.stream_id,
+    adapter: page.adapter,
+    engine: page.engine,
+    display_mode: "webrtc_remote_display",
+    guarantee_level: "mechanism_microvm",
+    principal_id: null,
+    control_socket_path: page.control_socket_path,
+    shutdown_socket_path: shutdownSocketPath,
+    isolated_session: true,
+    isolation: page.isolation,
+    process: page.process,
+  },
+}));
+NODE
+)"
+  curl --fail --unix-socket "$control_socket" -sS --max-time 3 \
+    -H 'Content-Type: application/json' \
+    -d "$cleanup_body" \
+    http://localhost/shutdown >/dev/null
+}
+
+startup_lock_identity="$tmp_dir/startup-lock-identity.json"
+"$node_bin" - <<'NODE' "$startup_lock" "$startup_lock_identity"
+const fs = require("node:fs");
+const [lockPath, identityPath] = process.argv.slice(2);
+const stat = fs.lstatSync(lockPath);
+fs.writeFileSync(identityPath, JSON.stringify({
+  dev: stat.dev,
+  ino: stat.ino,
+  contents: fs.readFileSync(lockPath, "utf8"),
+}));
+NODE
+
+set +e
+ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE="1" \
+ELASTOS_BROWSER_VM_CONTROL_SOCKET="$control_socket" \
+ELASTOS_BROWSER_VM_CONTROL_SERVICE="$tmp_dir/control-service" \
+ELASTOS_BROWSER_VM_CONTROL_LAUNCHER="$tmp_dir/fake-vz-launcher" \
+ELASTOS_BROWSER_VM_CONTROL_LOG="$control_log" \
+ELASTOS_BROWSER_VM_DATA_DIR="$data_dir" \
+ELASTOS_BROWSER_VM_ROOT="$vm_root" \
+ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE="$launcher_pid_file" \
+ELASTOS_BROWSER_VM_PLATFORM="darwin-arm64" \
+ELASTOS_BROWSER_VM_CONTROL_MAX_ACTIVE_PAGES="1" \
+ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS="45000" \
+ELASTOS_BROWSER_VM_ICE_SERVERS_JSON='[{"urls":["turn:192.0.2.10:3478?transport=udp"],"username":"first-turn","credential":"first-secret"}]' \
+  "$node_bin" "$repo_root/scripts/browser-vm-engine-supervisor.mjs" \
+    > "$tmp_dir/prewarm-blocked.json" 2> "$tmp_dir/prewarm-blocked.err"
+blocked_status=$?
+set -e
+if [[ "$blocked_status" -eq 0 ]] ||
+   ! grep -q '"code":"control_service_startup_busy"' "$tmp_dir/prewarm-blocked.err"; then
+  cat "$tmp_dir/prewarm-blocked.err" >&2 || true
+  echo "existing startup lock did not fail closed" >&2
+  exit 1
+fi
+"$node_bin" - <<'NODE' "$startup_lock" "$startup_lock_identity"
+const fs = require("node:fs");
+const [lockPath, identityPath] = process.argv.slice(2);
+const expected = JSON.parse(fs.readFileSync(identityPath, "utf8"));
+const stat = fs.lstatSync(lockPath);
+if (
+  stat.dev !== expected.dev ||
+  stat.ino !== expected.ino ||
+  fs.readFileSync(lockPath, "utf8") !== expected.contents
+) {
+  throw new Error("fail-closed startup changed the existing lock identity");
+}
+NODE
+rm -f "$startup_lock"
+
 ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE="1" \
 ELASTOS_BROWSER_VM_CONTROL_SOCKET="$control_socket" \
 ELASTOS_BROWSER_VM_CONTROL_SERVICE="$tmp_dir/control-service" \
@@ -210,6 +329,10 @@ ELASTOS_BROWSER_VM_CONTROL_MAX_ACTIVE_PAGES="1" \
 ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS="45000" \
 ELASTOS_BROWSER_VM_ICE_SERVERS_JSON='[{"urls":["turn:192.0.2.10:3478?transport=udp"],"username":"first-turn","credential":"first-secret"}]' \
   "$node_bin" "$repo_root/scripts/browser-vm-engine-supervisor.mjs" > "$tmp_dir/prewarm.json"
+if [[ -e "$startup_lock" ]]; then
+  echo "startup lock was not released after successful acquisition" >&2
+  exit 1
+fi
 
 "$node_bin" - <<'NODE' "$tmp_dir/prewarm.json" "$control_socket"
 const fs = require("node:fs");
@@ -243,10 +366,11 @@ status_one="$tmp_dir/status-one.json"
 curl --unix-socket "$control_socket" -sS --max-time 3 \
   http://localhost/status > "$status_one"
 
-"$node_bin" - <<'NODE' "$tmp_dir/result.json" "$control_log" "$control_socket" "$status_one"
+"$node_bin" - <<'NODE' "$tmp_dir/result.json" "$control_log" "$control_socket" "$status_one" "$tmp_dir/prewarm.json"
 const fs = require("node:fs");
-const [resultPath, logPath, socketPath, statusPath] = process.argv.slice(2);
+const [resultPath, logPath, socketPath, statusPath, prewarmPath] = process.argv.slice(2);
 const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+const prewarm = JSON.parse(fs.readFileSync(prewarmPath, "utf8"));
 if (result.schema !== "elastos.browser.engine.supervisor-result/v1") throw new Error("wrong result schema");
 if (result.page_id !== "page:vm-autostart-smoke") throw new Error("wrong page id");
 if (result.engine !== "chromium_microvm") throw new Error("wrong engine");
@@ -261,18 +385,62 @@ if (!Number.isFinite(Number(status.uptime_ms)) || Number(status.uptime_ms) < 0) 
 if (!/^[0-9a-f]{64}$/.test(status.config_fingerprint || "")) throw new Error("control service status must expose config fingerprint");
 if (status.idle_vm_keepalive_ms !== 45000) throw new Error("control service status must expose idle VM keepalive");
 if (status.hibernation_mode !== "off") throw new Error("control service status must expose hibernation mode");
+if (status.pid !== prewarm.control_status?.pid) throw new Error("real launch replaced the canonical prewarmed control service");
 const log = fs.readFileSync(logPath, "utf8");
 if (!log.includes("elastos.browser.vm-control-service.ready/v1")) throw new Error("control service did not start");
 if (!log.includes("\"event\":\"launch_ready\"")) throw new Error("control service did not launch page");
 NODE
 
-curl --unix-socket "$control_socket" -sS --max-time 3 \
-  -H 'Content-Type: application/json' \
-  -d '{"page_id":"page:vm-autostart-smoke"}' \
-  http://localhost/shutdown >/dev/null
+set +e
+printf '%s\n' "$request_json_two" | \
+  ELASTOS_BROWSER_ENGINE_REQUEST="$request_json_two" \
+  ELASTOS_BROWSER_VM_CONTROL_SOCKET="$control_socket" \
+  ELASTOS_BROWSER_VM_CONTROL_SERVICE="$tmp_dir/control-service" \
+  ELASTOS_BROWSER_VM_CONTROL_LAUNCHER="$tmp_dir/fake-vz-launcher" \
+  ELASTOS_BROWSER_VM_CONTROL_LOG="$control_log" \
+  ELASTOS_BROWSER_VM_DATA_DIR="$data_dir" \
+  ELASTOS_BROWSER_VM_ROOT="$vm_root" \
+  ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE="$launcher_pid_file" \
+  ELASTOS_BROWSER_VM_PLATFORM="darwin-arm64" \
+  ELASTOS_BROWSER_VM_CONTROL_MAX_ACTIVE_PAGES="1" \
+  ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS="45000" \
+  ELASTOS_BROWSER_VM_ICE_SERVERS_JSON='[{"urls":["turn:192.0.2.20:3478?transport=udp"],"username":"second-turn","credential":"second-secret"}]' \
+  "$node_bin" "$repo_root/scripts/browser-vm-engine-supervisor.mjs" \
+  > "$tmp_dir/active-replacement.out" 2> "$tmp_dir/active-replacement.err"
+active_replacement_status="$?"
+set -e
+if [[ "$active_replacement_status" -eq 0 ]]; then
+  echo "mismatched control service was replaced while it owned an active VM" >&2
+  exit 1
+fi
+"$node_bin" - <<'NODE' "$tmp_dir/active-replacement.err" "$status_one" "$control_socket"
+const fs = require("node:fs");
+const http = require("node:http");
+const [errorPath, statusPath, socketPath] = process.argv.slice(2);
+const lines = fs.readFileSync(errorPath, "utf8").trim().split(/\r?\n/);
+const error = JSON.parse(lines.at(-1));
+if (error.schema !== "elastos.browser.engine.launch-error/v1" || error.code !== "resources_in_use") {
+  throw new Error(`active replacement did not return typed resources_in_use: ${JSON.stringify(error)}`);
+}
+const expected = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+const request = http.request({ socketPath, path: "/status", method: "GET" }, (response) => {
+  const chunks = [];
+  response.on("data", (chunk) => chunks.push(chunk));
+  response.on("end", () => {
+    const current = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (current.pid !== expected.pid || current.active_pages !== 1) {
+      throw new Error(`active generation changed during replacement rejection: ${JSON.stringify(current)}`);
+    }
+  });
+});
+request.on("error", (error) => { throw error; });
+request.end();
+NODE
 
-printf '%s\n' "$request_json" | \
-  ELASTOS_BROWSER_ENGINE_REQUEST="$request_json" \
+close_page "$tmp_dir/result.json"
+
+printf '%s\n' "$request_json_two" | \
+  ELASTOS_BROWSER_ENGINE_REQUEST="$request_json_two" \
   ELASTOS_BROWSER_VM_CONTROL_SOCKET="$control_socket" \
   ELASTOS_BROWSER_VM_CONTROL_SERVICE="$tmp_dir/control-service" \
   ELASTOS_BROWSER_VM_CONTROL_LAUNCHER="$tmp_dir/fake-vz-launcher" \
@@ -307,15 +475,12 @@ if (statusOne.pid === statusTwo.pid) {
 }
 NODE
 
-curl --unix-socket "$control_socket" -sS --max-time 3 \
-  -H 'Content-Type: application/json' \
-  -d '{"page_id":"page:vm-autostart-smoke"}' \
-  http://localhost/shutdown >/dev/null
+close_page "$tmp_dir/result-two.json"
 
 printf '%s\n' '# source-home wrapper revision for stale-process proof' >> "$tmp_dir/control-service"
 
-printf '%s\n' "$request_json" | \
-  ELASTOS_BROWSER_ENGINE_REQUEST="$request_json" \
+printf '%s\n' "$request_json_three" | \
+  ELASTOS_BROWSER_ENGINE_REQUEST="$request_json_three" \
   ELASTOS_BROWSER_VM_CONTROL_SOCKET="$control_socket" \
   ELASTOS_BROWSER_VM_CONTROL_SERVICE="$tmp_dir/control-service" \
   ELASTOS_BROWSER_VM_CONTROL_LAUNCHER="$tmp_dir/fake-vz-launcher" \
@@ -345,5 +510,160 @@ if (statusTwo.pid === statusThree.pid) {
   throw new Error("changed VM control helper contents must replace the stale control service process");
 }
 NODE
+
+close_page "$tmp_dir/result-three.json"
+service_pid_three="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$status_three")"
+kill -TERM "$service_pid_three"
+for _ in {1..100}; do
+  [[ ! -S "$control_socket" ]] && break
+  sleep 0.05
+done
+if [[ -S "$control_socket" ]]; then
+  echo "owned control service did not remove its socket during shutdown" >&2
+  exit 1
+fi
+
+sleep 30 &
+foreign_target_pid="$!"
+cat > "$tmp_dir/foreign-control-service.mjs" <<'NODE'
+import fs from "node:fs";
+import http from "node:http";
+const socketPath = process.env.FOREIGN_CONTROL_SOCKET;
+try { fs.unlinkSync(socketPath); } catch {}
+const server = http.createServer((request, response) => {
+  if (request.method === "GET" && request.url === "/status") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      schema: "elastos.browser.vm-control-service.status/v1",
+      ok: true,
+      pid: Number(process.env.FOREIGN_TARGET_PID),
+      started_at: "2026-07-27T00:00:00.000Z",
+      config_fingerprint: "f".repeat(64),
+      active_pages: 0,
+      active_vms: 0,
+      warm_vms: 0,
+      pending_launches: 0,
+    }));
+    return;
+  }
+  response.writeHead(404, { "content-type": "application/json" });
+  response.end(JSON.stringify({ error: "foreign service has no owned shutdown contract" }));
+});
+server.listen(socketPath);
+NODE
+FOREIGN_CONTROL_SOCKET="$control_socket" FOREIGN_TARGET_PID="$foreign_target_pid" \
+  "$node_bin" "$tmp_dir/foreign-control-service.mjs" &
+foreign_server_pid="$!"
+for _ in {1..100}; do
+  [[ -S "$control_socket" ]] && break
+  sleep 0.05
+done
+if [[ ! -S "$control_socket" ]]; then
+  echo "foreign substitution fixture did not create its socket" >&2
+  exit 1
+fi
+
+set +e
+printf '%s\n' "$request_json" | \
+  ELASTOS_BROWSER_ENGINE_REQUEST="$request_json" \
+  ELASTOS_BROWSER_VM_CONTROL_SOCKET="$control_socket" \
+  ELASTOS_BROWSER_VM_CONTROL_SERVICE="$tmp_dir/control-service" \
+  ELASTOS_BROWSER_VM_CONTROL_LAUNCHER="$tmp_dir/fake-vz-launcher" \
+  ELASTOS_BROWSER_VM_CONTROL_LOG="$control_log" \
+  ELASTOS_BROWSER_VM_DATA_DIR="$data_dir" \
+  ELASTOS_BROWSER_VM_ROOT="$vm_root" \
+  ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE="$launcher_pid_file" \
+  ELASTOS_BROWSER_VM_PLATFORM="darwin-arm64" \
+  ELASTOS_BROWSER_VM_CONTROL_MAX_ACTIVE_PAGES="1" \
+  ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS="45000" \
+  ELASTOS_BROWSER_VM_ICE_SERVERS_JSON='[{"urls":["turn:192.0.2.20:3478?transport=udp"],"username":"second-turn","credential":"second-secret"}]' \
+  "$node_bin" "$repo_root/scripts/browser-vm-engine-supervisor.mjs" \
+  > "$tmp_dir/foreign-substitution.out" 2> "$tmp_dir/foreign-substitution.err"
+foreign_substitution_status="$?"
+set -e
+if [[ "$foreign_substitution_status" -eq 0 ]]; then
+  echo "foreign control-service substitution was accepted" >&2
+  exit 1
+fi
+"$node_bin" - <<'NODE' "$tmp_dir/foreign-substitution.err"
+const fs = require("node:fs");
+const lines = fs.readFileSync(process.argv[2], "utf8").trim().split(/\r?\n/);
+const error = JSON.parse(lines.at(-1));
+if (
+  error.schema !== "elastos.browser.engine.launch-error/v1" ||
+  error.code !== "control_service_substitution"
+) {
+  throw new Error(`foreign substitution did not fail with a typed rejection: ${JSON.stringify(error)}`);
+}
+NODE
+if ! kill -0 "$foreign_target_pid" >/dev/null 2>&1; then
+  echo "foreign status PID was signaled during substitution rejection" >&2
+  exit 1
+fi
+if ! kill -0 "$foreign_server_pid" >/dev/null 2>&1 || [[ ! -S "$control_socket" ]]; then
+  echo "foreign control socket was unlinked or replaced" >&2
+  exit 1
+fi
+
+kill "$foreign_server_pid"
+wait "$foreign_server_pid" 2>/dev/null || true
+foreign_server_pid=""
+rm "$control_socket"
+
+cat > "$tmp_dir/unresponsive-control-service.mjs" <<'NODE'
+import net from "node:net";
+const server = net.createServer((socket) => {
+  socket.on("error", () => {});
+});
+server.listen(process.env.UNRESPONSIVE_CONTROL_SOCKET);
+NODE
+UNRESPONSIVE_CONTROL_SOCKET="$control_socket" \
+  "$node_bin" "$tmp_dir/unresponsive-control-service.mjs" &
+unresponsive_server_pid="$!"
+for _ in {1..100}; do
+  [[ -S "$control_socket" ]] && break
+  sleep 0.05
+done
+if [[ ! -S "$control_socket" ]]; then
+  echo "unresponsive control-service fixture did not create its socket" >&2
+  exit 1
+fi
+
+set +e
+printf '%s\n' "$request_json" | \
+  ELASTOS_BROWSER_ENGINE_REQUEST="$request_json" \
+  ELASTOS_BROWSER_VM_CONTROL_SOCKET="$control_socket" \
+  ELASTOS_BROWSER_VM_CONTROL_SERVICE="$tmp_dir/control-service" \
+  ELASTOS_BROWSER_VM_CONTROL_LAUNCHER="$tmp_dir/fake-vz-launcher" \
+  ELASTOS_BROWSER_VM_CONTROL_LOG="$control_log" \
+  ELASTOS_BROWSER_VM_DATA_DIR="$data_dir" \
+  ELASTOS_BROWSER_VM_ROOT="$vm_root" \
+  ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE="$launcher_pid_file" \
+  ELASTOS_BROWSER_VM_PLATFORM="darwin-arm64" \
+  ELASTOS_BROWSER_VM_CONTROL_MAX_ACTIVE_PAGES="1" \
+  ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS="45000" \
+  "$node_bin" "$repo_root/scripts/browser-vm-engine-supervisor.mjs" \
+  > "$tmp_dir/unresponsive.out" 2> "$tmp_dir/unresponsive.err"
+unresponsive_status="$?"
+set -e
+if [[ "$unresponsive_status" -eq 0 ]]; then
+  echo "unresponsive control-service substitution was accepted" >&2
+  exit 1
+fi
+"$node_bin" - <<'NODE' "$tmp_dir/unresponsive.err"
+const fs = require("node:fs");
+const lines = fs.readFileSync(process.argv[2], "utf8").trim().split(/\r?\n/);
+const error = JSON.parse(lines.at(-1));
+if (
+  error.schema !== "elastos.browser.engine.launch-error/v1" ||
+  error.code !== "control_service_unverified"
+) {
+  throw new Error(`unresponsive service did not fail closed: ${JSON.stringify(error)}`);
+}
+NODE
+if ! kill -0 "$unresponsive_server_pid" >/dev/null 2>&1 || [[ ! -S "$control_socket" ]]; then
+  echo "unresponsive control socket was unlinked or replaced" >&2
+  exit 1
+fi
 
 printf '%s\n' '{"schema":"elastos.browser.vm-engine-supervisor-autostart-smoke/v1","ok":true}'

@@ -2238,6 +2238,7 @@ async fn home_realtime_snapshot(
     let browser_sessions = super::gateway_browser::browser_gateway_session_status(
         &state.data_dir,
         &context.principal_id,
+        None,
     )
     .await;
     let desktop_signature = home_desktop_events_signature(state, context).await;

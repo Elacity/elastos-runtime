@@ -1854,9 +1854,68 @@ impl Provider for MockMalformedNetProvider {
 
 struct MockExitProvider;
 struct MockMalformedExitProvider;
+#[derive(Default)]
+struct MockBrowserOwnershipCounts {
+    launches: std::sync::atomic::AtomicUsize,
+    first_video_frames: std::sync::atomic::AtomicUsize,
+    active_pages: std::sync::atomic::AtomicUsize,
+    active_vms: std::sync::atomic::AtomicUsize,
+    active_streams: std::sync::atomic::AtomicUsize,
+    active_routes: std::sync::atomic::AtomicUsize,
+}
+
+impl MockBrowserOwnershipCounts {
+    fn observe_launch(&self) {
+        use std::sync::atomic::Ordering;
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        self.active_pages.fetch_add(1, Ordering::SeqCst);
+        self.active_vms.fetch_add(1, Ordering::SeqCst);
+        self.active_routes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn observe_terminal_close(&self) {
+        use std::sync::atomic::Ordering;
+        for count in [&self.active_pages, &self.active_vms, &self.active_routes] {
+            let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_sub(1)
+            });
+        }
+    }
+
+    fn observe_stream_open(&self) {
+        self.active_streams
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn observe_stream_close(&self) {
+        let _ = self.active_streams.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |value| value.checked_sub(1),
+        );
+    }
+
+    fn snapshot(&self) -> (usize, usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.launches.load(Ordering::SeqCst),
+            self.active_pages.load(Ordering::SeqCst),
+            self.active_vms.load(Ordering::SeqCst),
+            self.active_streams.load(Ordering::SeqCst),
+            self.active_routes.load(Ordering::SeqCst),
+        )
+    }
+
+    fn first_video_frame_count(&self) -> usize {
+        self.first_video_frames
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 struct MockRemoteCarrierExitProvider {
     close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
     close_failures_remaining: Arc<TokioMutex<usize>>,
+    ownership: Option<Arc<MockBrowserOwnershipCounts>>,
 }
 
 impl MockRemoteCarrierExitProvider {
@@ -1867,6 +1926,19 @@ impl MockRemoteCarrierExitProvider {
         Self {
             close_calls,
             close_failures_remaining: Arc::new(TokioMutex::new(failures)),
+            ownership: None,
+        }
+    }
+
+    fn with_close_failures_and_ownership(
+        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+        failures: usize,
+        ownership: Arc<MockBrowserOwnershipCounts>,
+    ) -> Self {
+        Self {
+            close_calls,
+            close_failures_remaining: Arc::new(TokioMutex::new(failures)),
+            ownership: Some(ownership),
         }
     }
 }
@@ -2008,6 +2080,9 @@ impl Provider for MockRemoteCarrierExitProvider {
                     "message": "simulated remote Carrier Exit close_stream failure"
                 }));
             }
+            if let Some(ownership) = &self.ownership {
+                ownership.observe_stream_close();
+            }
             return Ok(json!({
                 "status": "ok",
                 "data": {
@@ -2042,6 +2117,9 @@ impl Provider for MockRemoteCarrierExitProvider {
                 })
                 .map(|nonce| format!("remote-carrier:mock:test:{nonce}"))
                 .unwrap_or_else(|| "remote-carrier:mock:test".to_string());
+            if let Some(ownership) = &self.ownership {
+                ownership.observe_stream_open();
+            }
             return Ok(json!({
                 "status": "ok",
                 "data": {
@@ -2234,6 +2312,69 @@ struct MockBrowserEngineProvider;
 struct MockRejectingBrowserEngineProvider;
 struct MockMalformedBrowserEngineProvider;
 
+#[derive(Clone, Copy)]
+enum MockDispatchedBrowserLaunchFailure {
+    ResponseLoss,
+    MalformedSuccess,
+    PendingThenTerminal,
+    DidNotActResourcesInUse,
+}
+
+struct MockReconciliatingBrowserEngineProvider {
+    failure: MockDispatchedBrowserLaunchFailure,
+    effect: TokioMutex<Option<serde_json::Value>>,
+    launch_calls: std::sync::atomic::AtomicUsize,
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    reconciliation_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum MockBrowserEngineCloseFailure {
+    Transport,
+    Adapter,
+    AlreadyClosed,
+}
+
+struct MockRetryingBrowserEngineProvider {
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_failures_remaining: std::sync::atomic::AtomicUsize,
+    failure: MockBrowserEngineCloseFailure,
+    ownership: Option<Arc<MockBrowserOwnershipCounts>>,
+}
+
+struct MockForeignIdentityBrowserEngineProvider {
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+}
+
+impl MockRetryingBrowserEngineProvider {
+    fn new(
+        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+        failure: MockBrowserEngineCloseFailure,
+        close_failures: usize,
+    ) -> Self {
+        Self {
+            close_calls,
+            close_failures_remaining: std::sync::atomic::AtomicUsize::new(close_failures),
+            failure,
+            ownership: None,
+        }
+    }
+
+    fn with_ownership(
+        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+        failure: MockBrowserEngineCloseFailure,
+        close_failures: usize,
+        ownership: Arc<MockBrowserOwnershipCounts>,
+    ) -> Self {
+        Self {
+            close_calls,
+            close_failures_remaining: std::sync::atomic::AtomicUsize::new(close_failures),
+            failure,
+            ownership: Some(ownership),
+        }
+    }
+}
+
 fn mock_browser_launch_page_id(request: &serde_json::Value) -> String {
     let url = request
         .get("url")
@@ -2261,6 +2402,30 @@ fn mock_browser_requested_page_id(request: &serde_json::Value) -> String {
         .to_string()
 }
 
+fn mock_browser_terminal_cleanup_response(request: &serde_json::Value) -> serde_json::Value {
+    let binding = request
+        .get("runtime_cleanup")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    json!({
+        "status": "ok",
+        "data": {
+            "schema": "elastos.browser.engine-cleanup-result/v2",
+            "page_id": binding.get("page_id").cloned().unwrap_or(serde_json::Value::Null),
+            "generation": binding.get("generation").cloned().unwrap_or(serde_json::Value::Null),
+            "binding": binding,
+            "terminal": true,
+            "effects": {
+                "page_absent": true,
+                "child_absent": true,
+                "vm_absent": true,
+                "route_absent": true,
+                "socket_absent": true
+            }
+        }
+    })
+}
+
 #[async_trait::async_trait]
 impl Provider for MockBrowserEngineProvider {
     async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
@@ -2285,6 +2450,23 @@ impl Provider for MockBrowserEngineProvider {
             .get("principal_id")
             .and_then(|value| value.as_str())
             .is_some());
+        if request.get("op").and_then(|value| value.as_str()) == Some("status")
+            && request.get("lifecycle_generation").is_some()
+        {
+            return Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                    "state": "did_not_act",
+                    "lifecycle_generation": request["lifecycle_generation"],
+                    "stream_id": request["stream_id"],
+                    "effects": {
+                        "page_acquired": false,
+                        "vm_acquired": false,
+                    },
+                }
+            }));
+        }
         if request.get("op").and_then(|value| value.as_str()) == Some("launch") {
             let profile = request
                 .get("profile")
@@ -2436,20 +2618,49 @@ impl Provider for MockBrowserEngineProvider {
                     "message": "Browser Engine Adapter has reached its active session limit (1)"
                 }));
             }
+            if request
+                .get("url")
+                .and_then(|value| value.as_str())
+                .is_some_and(|url| url.contains("resources-in-use.invalid"))
+            {
+                return Ok(json!({
+                    "status": "error",
+                    "code": "resources_in_use",
+                    "message": "Browser profile disk is already attached to an active VM"
+                }));
+            }
             let page_id = mock_browser_launch_page_id(request);
             let adapter = request
                 .get("adapter_id")
                 .and_then(|value| value.as_str())
                 .unwrap_or("mock-browser-engine");
+            let generation = request
+                .get("lifecycle_generation")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let stream_id = stream_session
+                .get("stream_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
             return Ok(json!({
                 "status": "ok",
                 "data": {
                     "schema": "elastos.browser.engine.page/v1",
+                    "provider": "browser-engine-adapter",
+                    "protocol_version": "2.0",
                     "page_id": page_id,
                     "adapter": adapter,
                     "engine": "selkies_gstreamer",
                     "url": request.get("url").cloned().unwrap_or_else(|| json!("")),
-                    "stream_id": stream_session.get("stream_id").cloned().unwrap_or_else(|| json!("")),
+                    "stream_id": stream_id,
+                    "runtime_cleanup": {
+                        "schema": "elastos.browser.engine-cleanup-binding/v2",
+                        "page_id": page_id,
+                        "generation": generation,
+                        "stream_id": stream_id,
+                        "adapter": adapter,
+                        "engine": "selkies_gstreamer"
+                    },
                     "network_mode": "runtime_net_only",
                     "direct_network": false,
                     "wallet_injection": false,
@@ -2574,14 +2785,7 @@ impl Provider for MockBrowserEngineProvider {
                     "message": "simulated unreconciled close failure"
                 }));
             }
-            return Ok(json!({
-                "status": "ok",
-                "data": {
-                    "schema": "elastos.browser.close-result/v1",
-                    "page_id": page_id,
-                    "closed": true
-                }
-            }));
+            return Ok(mock_browser_terminal_cleanup_response(request));
         }
         if request.get("op").and_then(|value| value.as_str()) == Some("webrtc_signal") {
             let page_id = mock_browser_requested_page_id(request);
@@ -2643,6 +2847,7 @@ impl Provider for MockBrowserEngineProvider {
             "status": "ok",
             "data": {
                 "provider": "browser-engine-adapter",
+                "protocol_version": "2.0",
                 "status": "configured",
                 "adapter_count": 1,
                 "adapters": [{
@@ -2664,6 +2869,274 @@ impl Provider for MockBrowserEngineProvider {
                 "supported_display_modes": ["webrtc_remote_display"],
                 "supported_guarantee_levels": ["operator_rbi"],
                 "operations": ["status", "launch", "attach_stream", "page_status", "diagnostics", "input", "webrtc_signal", "close_page"]
+            }
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockReconciliatingBrowserEngineProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock reconciling browser engine only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-browser-engine"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("launch") => {
+                let launch_call = self
+                    .launch_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse
+                ) {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "resources_in_use",
+                        "message": "simulated Browser VM resource lease conflict",
+                    }));
+                }
+                if (matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::PendingThenTerminal
+                ) && launch_call == 0)
+                {
+                    return Err(ProviderError::Provider(
+                        "simulated browser-engine provider crash during launch".to_string(),
+                    ));
+                }
+                let response = <MockBrowserEngineProvider as Provider>::send_raw(
+                    &MockBrowserEngineProvider,
+                    request,
+                )
+                .await?;
+                let effect = response
+                    .get("data")
+                    .cloned()
+                    .expect("mock launch effect");
+                *self.effect.lock().await = Some(effect);
+                match self.failure {
+                    MockDispatchedBrowserLaunchFailure::ResponseLoss => {
+                        Err(ProviderError::Provider(
+                            "simulated browser-engine launch response loss".to_string(),
+                        ))
+                    }
+                    MockDispatchedBrowserLaunchFailure::MalformedSuccess => Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.page/v1",
+                            "provider": "browser-engine-adapter",
+                            "protocol_version": "2.0",
+                            "page_id": "unsafe page id",
+                        }
+                    })),
+                    MockDispatchedBrowserLaunchFailure::PendingThenTerminal => Ok(response),
+                    MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse => unreachable!(),
+                }
+            }
+            Some("status") if request.get("lifecycle_generation").is_some() => {
+                let reconciliation_call = self
+                    .reconciliation_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse
+                ) {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "did_not_act",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "effects": {
+                                "page_acquired": false,
+                                "vm_acquired": false,
+                            },
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::PendingThenTerminal
+                ) {
+                    if reconciliation_call < 2 {
+                        return Ok(json!({
+                            "status": "ok",
+                            "data": {
+                                "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                                "state": "cleanup_pending",
+                                "lifecycle_generation": request["lifecycle_generation"],
+                                "stream_id": request["stream_id"],
+                            }
+                        }));
+                    }
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "terminal_post_effect_cleanup",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "effects": {
+                                "page_acquired": true,
+                                "vm_acquired": true,
+                            },
+                        }
+                    }));
+                }
+                if let Some(effect) = self.effect.lock().await.clone() {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "effect_acquired",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "effect": effect,
+                        }
+                    }));
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                        "state": "cleanup_pending",
+                        "lifecycle_generation": request["lifecycle_generation"],
+                        "stream_id": request["stream_id"],
+                    }
+                }))
+            }
+            Some("close_page") => {
+                self.close_calls.lock().await.push(request.clone());
+                *self.effect.lock().await = None;
+                Ok(mock_browser_terminal_cleanup_response(request))
+            }
+            _ => {
+                <MockBrowserEngineProvider as Provider>::send_raw(
+                    &MockBrowserEngineProvider,
+                    request,
+                )
+                .await
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockRetryingBrowserEngineProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock retrying browser engine only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-retrying-browser-engine"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("op").and_then(|value| value.as_str()) == Some("launch") {
+            let response =
+                <MockBrowserEngineProvider as Provider>::send_raw(&MockBrowserEngineProvider, request)
+                    .await?;
+            if response.get("status").and_then(|value| value.as_str()) == Some("ok") {
+                if let Some(ownership) = &self.ownership {
+                    ownership.observe_launch();
+                }
+            }
+            return Ok(response);
+        }
+        if request.get("op").and_then(|value| value.as_str()) == Some("close_page") {
+            self.close_calls.lock().await.push(request.clone());
+            let should_fail = self
+                .close_failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok();
+            if should_fail {
+                return match self.failure {
+                    MockBrowserEngineCloseFailure::Transport => Err(ProviderError::Provider(
+                        "simulated browser-engine close transport failure".to_string(),
+                    )),
+                    MockBrowserEngineCloseFailure::Adapter => Ok(json!({
+                        "status": "error",
+                        "code": "engine_close_indeterminate",
+                        "message": "simulated adapter close failure"
+                    })),
+                    MockBrowserEngineCloseFailure::AlreadyClosed => {
+                        Ok(mock_browser_terminal_cleanup_response(request))
+                    }
+                };
+            }
+            let response =
+                <MockBrowserEngineProvider as Provider>::send_raw(&MockBrowserEngineProvider, request)
+                    .await?;
+            if response.get("status").and_then(|value| value.as_str()) == Some("ok") {
+                if let Some(ownership) = &self.ownership {
+                    ownership.observe_terminal_close();
+                }
+            }
+            return Ok(response);
+        }
+        <MockBrowserEngineProvider as Provider>::send_raw(&MockBrowserEngineProvider, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockForeignIdentityBrowserEngineProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock foreign-identity browser engine only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-retrying-browser-engine"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("op").and_then(|value| value.as_str()) == Some("close_page") {
+            self.close_calls.lock().await.push(request.clone());
+        }
+        Ok(json!({
+            "status": "ok",
+            "data": {
+                "provider": "foreign-browser-engine",
+                "protocol_version": "9.9",
+                "status": "configured",
+                "direct_network": false,
+                "wallet_injection": false
             }
         }))
     }
@@ -2694,6 +3167,19 @@ impl Provider for MockRejectingBrowserEngineProvider {
                 "status": "error",
                 "code": "display_session_unavailable",
                 "message": "Browser Engine Adapter rejected launch after stream reservation"
+            })),
+            Some("status") if request.get("lifecycle_generation").is_some() => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                    "state": "did_not_act",
+                    "lifecycle_generation": request["lifecycle_generation"],
+                    "stream_id": request["stream_id"],
+                    "effects": {
+                        "page_acquired": false,
+                        "vm_acquired": false,
+                    },
+                }
             })),
             Some("status") => Ok(json!({
                 "status": "ok",

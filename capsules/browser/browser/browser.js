@@ -1,8 +1,3 @@
-import {
-  localBrowserInstanceId,
-  publishRuntimePageForHost as publishRuntimePageForHostForKey,
-  rememberedRuntimePage as rememberedRuntimePageForKey,
-} from "./browser-history.js?v=browser-20260520e";
 import { createBrowserLocationController } from "./browser-location.js?v=browser-20260523b";
 import {
   DEFAULT_URL,
@@ -22,7 +17,7 @@ import {
   createRuntimePageCleanupController,
   runtimePageOwner,
   sameRuntimePageOwner,
-} from "./browser-page-cleanup.js?v=browser-20260725a";
+} from "./browser-page-cleanup.js?v=browser-20260727a";
 import { selkiesMessagesForInput } from "./browser-input.js?v=browser-20260520e";
 import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260725b";
 import {
@@ -32,7 +27,7 @@ import {
   isMissingRuntimePageError,
   requestedDisplayMode,
 } from "./browser-status.js?v=browser-20260725a";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260724a";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260727a";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -60,9 +55,6 @@ const launchToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).
 const homeParentOrigin = params.get("home_origin") || "";
 const debugMetrics =
   params.get("debug") === "1" || params.get("metrics") === "1";
-const browserInstanceId =
-  params.get("browser_instance") || localBrowserInstanceId();
-const RUNTIME_PAGE_STORAGE_KEY = `elastos.browser.current_page_id:${browserInstanceId}`;
 const { fetchJson } = createRuntimeApi({ launchToken });
 const homeClipboard = createHomeClipboardClient({
   targetId: "browser",
@@ -244,12 +236,29 @@ function stopPageHeartbeat() {
   pageHeartbeatTimer = 0;
 }
 
-function rememberedRuntimePage() {
-  return rememberedRuntimePageForKey(RUNTIME_PAGE_STORAGE_KEY);
+function recoverableRuntimePage(summary = browserSummary) {
+  const recovery = summary?.sessions?.recoverable_page;
+  if (
+    recovery?.schema !== "elastos.browser.recoverable-page/v1" ||
+    !["active", "cleanup_pending"].includes(recovery.state) ||
+    typeof recovery.page_id !== "string" ||
+    recovery.cleanup?.schema !== "elastos.browser.cleanup-handle/v1" ||
+    typeof recovery.cleanup.id !== "string"
+  ) {
+    return null;
+  }
+  return {
+    ...(recovery.engine_page && typeof recovery.engine_page === "object"
+      ? recovery.engine_page
+      : {}),
+    page_id: recovery.page_id,
+    runtime_cleanup: recovery.cleanup,
+    recovery_state: recovery.state,
+  };
 }
 
 function publishRuntimePageForHost(page = currentPage) {
-  publishRuntimePageForHostForKey(RUNTIME_PAGE_STORAGE_KEY, page);
+  window.__elastosBrowserCurrentPageId = page?.page_id || "";
 }
 
 function currentRuntimePageOwner() {
@@ -270,15 +279,6 @@ function finalizeRuntimePageClose(owner) {
     updateNavState();
     return true;
   }
-  const rememberedPage = rememberedRuntimePage();
-  if (
-    !currentPage &&
-    owner.generation === 0 &&
-    rememberedPage?.page_id === owner.page_id
-  ) {
-    publishRuntimePageForHost(null);
-    return true;
-  }
   return false;
 }
 
@@ -289,10 +289,37 @@ const runtimePageCleanup = createRuntimePageCleanupController({
       {
         method: "POST",
         signal,
+        body: {
+          schema: "elastos.browser.close-request/v2",
+          cleanup_id: owner.runtime_cleanup.id,
+        },
       },
     ),
-  onTerminal: (owner) => {
+  onPending: (owner, _outcome, failure) => {
+    if (failure && sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
+      showStatus(
+        `${runtimeOwnedFailureSummary(failure.kind)} Runtime cleanup is pending; the existing page remains owned and no replacement will open until Runtime confirms a terminal close.`,
+        { sticky: true },
+      );
+    }
+  },
+  onTerminal: (owner, _outcome, failure) => {
     const applied = finalizeRuntimePageClose(owner);
+    if (applied && failure && !unloadCleanupStarted) {
+      if (
+        failure.retry &&
+        remoteReconnectAttempt < REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS
+      ) {
+        remoteReconnectAttempt += 1;
+        scheduleRemoteReplacementAfterTerminal();
+      } else {
+        showStatus(
+          "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
+          { sticky: true },
+        );
+      }
+      return;
+    }
     if (
       applied &&
       Number(runtimePageCleanup.status(owner)?.attempts || 0) > 1 &&
@@ -312,10 +339,65 @@ async function closeRuntimePage(
     generation =
       page === currentPage ? currentPageGeneration : 0,
     schedule = true,
+    explicitRetry = false,
   } = {},
 ) {
   const owner = runtimePageOwner(page, generation);
-  return runtimePageCleanup.reconcile(owner, { schedule });
+  if (page?.page_id && !owner) {
+    return {
+      state: "pending",
+      page_id: String(page.page_id),
+      generation: Number(generation || 0),
+      reason: "invalid_runtime_cleanup_handle",
+    };
+  }
+  return runtimePageCleanup.reconcile(owner, {
+    schedule,
+    newWindow: explicitRetry,
+  });
+}
+
+function runtimeOwnedFailureSummary(kind) {
+  if (kind === "display_status") {
+    return "Browser display status failed.";
+  }
+  if (kind === "malformed_response") {
+    return "Browser received an invalid Runtime display response.";
+  }
+  if (kind === "timeout") {
+    return "Browser display timed out.";
+  }
+  if (kind === "no_first_frame") {
+    return "The Browser Engine started, but no video frame arrived.";
+  }
+  return "Browser display signaling failed.";
+}
+
+async function failRuntimeOwnedPage(kind, message, options) {
+  options = options || {};
+  const retry = options.retry !== false;
+  const owner = currentRuntimePageOwner();
+  if (!owner) {
+    return {
+      state: "terminal",
+      page_id: "",
+      generation: 0,
+      terminal_kind: "no_page",
+    };
+  }
+  stopRemoteReconnect();
+  stopPageStatusPolling();
+  stopPageHeartbeat();
+  closeRemoteDisplay();
+  showStatus(
+    `${runtimeOwnedFailureSummary(kind)} Runtime cleanup is pending; the existing page remains owned and no replacement will open until Runtime confirms a terminal close.`,
+    { sticky: true },
+  );
+  return runtimePageCleanup.fail(owner, {
+    kind,
+    message,
+    retry,
+  });
 }
 
 function cleanupPendingError(outcome) {
@@ -349,46 +431,41 @@ function remoteReconnectUrl() {
   );
 }
 
-function scheduleRemoteReconnect(message, { retry = true } = {}) {
+function scheduleRemoteReconnect(
+  message,
+  { failureKind = "signaling", retry = true } = {},
+) {
   if (unloadCleanupStarted || relaunchRequested) {
-    return;
+    return Promise.resolve();
   }
-  if (!retry || remoteReconnectAttempt >= REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS) {
-    const failedPage = currentPage;
-    const failedGeneration = currentPageGeneration;
-    const mediaRouteUnavailable = /no secure display relay candidate|shared secure display route/i.test(message);
-    showStatus(
-      `${message} ${
-        mediaRouteUnavailable
-          ? "No automatic display retry was attempted."
-          : "The Browser Engine started, but video did not become ready."
-      } Runtime cleanup is pending; the current page remains owned and no replacement will open until Runtime confirms a terminal close.`,
-      { sticky: true },
-    );
-    closeRuntimePage(failedPage, { generation: failedGeneration })
-      .then((outcome) => {
-        if (outcome?.state === "terminal") {
-          showStatus(
-            "Runtime confirmed the failed Browser session closed. Refresh Browser to retry.",
-            { sticky: true },
-          );
-        }
-      })
-      .catch(() => {});
-    return;
-  }
+  return failRuntimeOwnedPage(failureKind, message, {
+    retry:
+      retry &&
+      remoteReconnectAttempt < REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS,
+  });
+}
+
+function scheduleRemoteReplacementAfterTerminal() {
   if (remoteReconnectInFlight || remoteReconnectTimer) {
     return;
   }
   const nextUrl = remoteReconnectUrl();
-  const delay = Math.min(30_000, 1_000 * (2 ** Math.min(remoteReconnectAttempt, 5)));
+  const delay = Math.min(
+    30_000,
+    1_000 * 2 ** Math.min(Math.max(remoteReconnectAttempt - 1, 0), 5),
+  );
   showStatus(
-    `${message} Reconnecting ${nextUrl}${delay > 1000 ? ` in ${Math.round(delay / 1000)}s` : ""}.`,
+    `Runtime cleanup is terminal. Reconnecting ${nextUrl}${delay > 1000 ? ` in ${Math.round(delay / 1000)}s` : ""}.`,
     { sticky: true },
   );
   remoteReconnectTimer = window.setTimeout(async () => {
     remoteReconnectTimer = 0;
-    if (unloadCleanupStarted || relaunchRequested) {
+    if (
+      unloadCleanupStarted ||
+      relaunchRequested ||
+      currentPage?.page_id ||
+      document.body.dataset.loading === "true"
+    ) {
       return;
     }
     remoteReconnectInFlight = true;
@@ -401,7 +478,6 @@ function scheduleRemoteReconnect(message, { retry = true } = {}) {
         remoteReconnectAttempt = 0;
         showStatus("Browser session reconnected.");
       } else {
-        remoteReconnectAttempt += 1;
         showStatus(
           "Browser session reopened, but video is still waiting. One recovery attempt has been used.",
           { sticky: true },
@@ -409,16 +485,11 @@ function scheduleRemoteReconnect(message, { retry = true } = {}) {
       }
     } catch (error) {
       if (!isAuthoritySessionError(error)) {
-        remoteReconnectAttempt += 1;
         remoteReconnectInFlight = false;
-        if (remoteReconnectAttempt >= REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS) {
-          showStatus(
-            `${friendlyOpenError(error)} Browser display recovery stopped after one attempt.`,
-            { sticky: true },
-          );
-        } else {
-          scheduleRemoteReconnect(friendlyOpenError(error));
-        }
+        showStatus(
+          `${friendlyOpenError(error)} Browser display recovery stopped after one attempt.`,
+          { sticky: true },
+        );
       }
     } finally {
       remoteReconnectInFlight = false;
@@ -430,7 +501,7 @@ function recoverMissingRuntimePage(error, message) {
   if (!isMissingRuntimePageError(error)) {
     return false;
   }
-  scheduleRemoteReconnect(message);
+  scheduleRemoteReconnect(message, { failureKind: "display_status" });
   return true;
 }
 
@@ -505,13 +576,18 @@ async function fetchPageStatus({
     `/api/apps/browser/pages/${encodeURIComponent(currentPage.page_id)}/status${query}`,
     { method: "GET" },
   );
-  if (status?.schema !== "elastos.browser.page-status/v1") {
-    throw new Error("Browser could not read the page status.");
+  if (
+    status?.schema !== "elastos.browser.page-status/v1" ||
+    status.page_id !== currentPage.page_id
+  ) {
+    const error = new Error("Browser could not read the page status.");
+    error.runtimeOwnedFailureKind = "malformed_response";
+    throw error;
   }
   if (status.direct_network !== false) {
-    throw new Error(
-      "Browser reported an unsafe network setup.",
-    );
+    const error = new Error("Browser reported an unsafe network setup.");
+    error.runtimeOwnedFailureKind = "malformed_response";
+    throw error;
   }
   lastPageStatus = status;
   syncViewFromResponse(status);
@@ -641,13 +717,10 @@ function schedulePageStatusRefresh({
       try {
         await fetchPageStatus({ history, forceAddress });
       } catch (error) {
-        if (isMissingRuntimePageError(error)) {
-          scheduleRemoteReconnect("Browser session was released.");
-          return;
-        }
-        if (debugMetrics) {
-          showStatus(friendlyOpenError(error), { sticky: true });
-        }
+        await failRuntimeOwnedPage(
+          error.runtimeOwnedFailureKind || "display_status",
+          friendlyOpenError(error),
+        );
       }
     }, nextDelay);
     return timer;
@@ -671,15 +744,15 @@ function startPageStatusPolling() {
     try {
       await fetchPageStatus({ fast: true });
     } catch (error) {
-      if (isMissingRuntimePageError(error)) {
-        scheduleRemoteReconnect("Browser session was released.");
-        return;
-      }
-      if (debugMetrics) {
-        showStatus(friendlyOpenError(error), { sticky: true });
-      }
+      await failRuntimeOwnedPage(
+        error.runtimeOwnedFailureKind || "display_status",
+        friendlyOpenError(error),
+      );
     } finally {
-      if (currentPage) {
+      if (
+        currentPage &&
+        !runtimePageCleanup.status(currentRuntimePageOwner())?.failure
+      ) {
         pageStatusTimer = window.setTimeout(poll, PAGE_STATUS_INTERVAL_MS);
       }
     }
@@ -699,15 +772,15 @@ function startPageHeartbeat() {
         { method: "POST" },
       );
     } catch (error) {
-      if (isMissingRuntimePageError(error)) {
-        scheduleRemoteReconnect("Browser session heartbeat was lost.");
-        return;
-      }
-      if (debugMetrics) {
-        showStatus(friendlyOpenError(error), { sticky: true });
-      }
+      await failRuntimeOwnedPage(
+        error.runtimeOwnedFailureKind || "display_status",
+        friendlyOpenError(error),
+      );
     } finally {
-      if (currentPage) {
+      if (
+        currentPage &&
+        !runtimePageCleanup.status(currentRuntimePageOwner())?.failure
+      ) {
         pageHeartbeatTimer = window.setTimeout(beat, PAGE_HEARTBEAT_INTERVAL_MS);
       }
     }
@@ -1289,12 +1362,13 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
   showStatus(`Opening ${visibleAddress} using ${engineLabel} and ${exitLabel}...`, {
     sticky: true,
   });
+  let openedOwner = null;
   try {
     const { displayMode, guaranteeLevel } = await launchContractForOpen();
     const previousPage = currentPage;
     const previousGeneration = currentPageGeneration;
     const previousOwner = runtimePageOwner(previousPage, previousGeneration);
-    const stalePage = previousPage ? null : rememberedRuntimePage();
+    const stalePage = previousPage ? null : recoverableRuntimePage();
     if (previousPage?.page_id || stalePage?.page_id) {
       showStatus(
         isExitSwitch
@@ -1307,9 +1381,12 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
     }
     const previousClose = await closeRuntimePage(previousPage, {
       generation: previousGeneration,
+      explicitRetry: !reconnect,
     });
     requireTerminalRuntimePageCloseOutcome(previousClose);
-    const staleClose = await closeRuntimePage(stalePage);
+    const staleClose = await closeRuntimePage(stalePage, {
+      explicitRetry: !reconnect,
+    });
     requireTerminalRuntimePageCloseOutcome(staleClose);
     const ownerAfterClose = currentRuntimePageOwner();
     if (
@@ -1356,18 +1433,28 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
     const page = response?.engine_page;
     if (
       response?.schema !== "elastos.browser.open-result/v1" ||
-      page?.schema !== "elastos.browser.engine.page/v1"
+      page?.schema !== "elastos.browser.engine.page/v1" ||
+      response?.runtime_cleanup?.schema !==
+        "elastos.browser.cleanup-handle/v1"
     ) {
       throw new Error("Browser did not open the page.");
+    }
+    const openedPage = {
+      ...page,
+      runtime_cleanup: response.runtime_cleanup,
+    };
+    if (!runtimePageOwner(openedPage, nextPageGeneration)?.runtime_cleanup) {
+      throw new Error("Browser did not return an opaque Runtime cleanup handle.");
     }
     if (remoteExitId && response?.stream_session?.backend !== remoteExitId) {
       throw new Error("Browser could not use the selected Exit Node.");
     }
-    currentPage = page;
+    currentPage = openedPage;
     currentPageGeneration = nextPageGeneration++;
+    openedOwner = currentRuntimePageOwner();
     currentBrowserEngineId = browserEngineId;
     currentRemoteExitId = remoteExitId;
-    publishRuntimePageForHost(page);
+    publishRuntimePageForHost(currentPage);
     currentDisplayMode = page.display_session?.mode || "";
     syncDisplayInputFromSession(page.display_session);
     currentView = page.view || viewFromDisplaySession(page.display_session);
@@ -1394,6 +1481,22 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
       });
     }
   } catch (error) {
+    if (
+      openedOwner &&
+      sameRuntimePageOwner(currentRuntimePageOwner(), openedOwner)
+    ) {
+      const outcome = await failRuntimeOwnedPage(
+        error.runtimeOwnedFailureKind || "signaling",
+        friendlyOpenError(error),
+        { retry: !reconnect },
+      );
+      if (outcome?.state !== "terminal") {
+        throw cleanupPendingError(outcome);
+      }
+      throw new Error(
+        "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
+      );
+    }
     if (isAuthoritySessionError(error) && requestHomeRelaunch(friendlyOpenError(error))) {
       return;
     }
@@ -1575,7 +1678,7 @@ async function resetBrowserProfile() {
   const activePage = currentPage;
   const activeGeneration = currentPageGeneration;
   const activeOwner = runtimePageOwner(activePage, activeGeneration);
-  const rememberedPage = rememberedRuntimePage();
+  const rememberedPage = recoverableRuntimePage();
   const stalePage =
     rememberedPage?.page_id && rememberedPage.page_id !== activePage?.page_id
       ? rememberedPage
@@ -1584,9 +1687,13 @@ async function resetBrowserProfile() {
   showStatus("Closing Browser page before profile reset...", { sticky: true });
   stopRemoteReconnect();
   try {
-    const activeClose = await closeRuntimePage(activePage);
+    const activeClose = await closeRuntimePage(activePage, {
+      explicitRetry: true,
+    });
     requireTerminalRuntimePageCloseOutcome(activeClose);
-    const staleClose = await closeRuntimePage(stalePage);
+    const staleClose = await closeRuntimePage(stalePage, {
+      explicitRetry: true,
+    });
     requireTerminalRuntimePageCloseOutcome(staleClose);
     const ownerAfterClose = currentRuntimePageOwner();
     if (ownerAfterClose && !sameRuntimePageOwner(ownerAfterClose, activeOwner)) {

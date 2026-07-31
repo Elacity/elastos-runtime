@@ -8,6 +8,9 @@ use elastos_runtime::provider::{
     ProviderInvocation, ProviderInvocationTransport, ProviderTransfer,
 };
 use elastos_runtime::{capability, content, namespace, primitives, provider, session};
+use elastos_server::api::browser_engine_protocol::{
+    BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
+};
 use elastos_server::content::ContentProvider;
 use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
@@ -39,7 +42,85 @@ const CONTENT_REPAIR_SCHEDULER_DEFAULT_INTERVAL_SECS: u64 = 15 * 60;
 const CONTENT_REPAIR_SCHEDULER_DEFAULT_LIMIT: u64 = 10;
 const CONTENT_REPAIR_SCHEDULER_DEFAULT_MAX_ATTEMPTS: u64 = 3;
 const CONTENT_REPAIR_SCHEDULER_DEFAULT_FAILURE_BUDGET: u64 = 5;
+const BROWSER_ENGINE_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn request_browser_engine_provider_status(
+    bridge: &provider::ProviderBridge,
+    status_timeout: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    tokio::time::timeout(
+        status_timeout,
+        bridge.send_raw(&serde_json::json!({"op": "status"})),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("browser-engine-adapter status request timed out"))?
+    .map_err(|err| anyhow::anyhow!("browser-engine-adapter status request failed: {err}"))
+}
+
+async fn start_browser_engine_provider(
+    registry: &provider::ProviderRegistry,
+    bridge: Arc<provider::ProviderBridge>,
+    status_timeout: Duration,
+) -> anyhow::Result<()> {
+    let startup = async {
+        let status = request_browser_engine_provider_status(&bridge, status_timeout).await?;
+        require_browser_engine_provider_status(&status)?;
+        let browser_engine_provider: Arc<dyn provider::Provider> = Arc::new(
+            provider::CapsuleProvider::with_scheme(bridge.clone(), "browser-engine"),
+        );
+        register_browser_engine_provider(registry, browser_engine_provider).await
+    }
+    .await;
+    if let Err(startup_error) = startup {
+        if let Err(shutdown_error) = bridge.shutdown().await {
+            return Err(anyhow::anyhow!(
+                "{startup_error}; browser-engine-adapter shutdown/reap also failed: {shutdown_error}"
+            ));
+        }
+        return Err(startup_error);
+    }
+    Ok(())
+}
+
+fn require_browser_engine_provider_status(status: &serde_json::Value) -> anyhow::Result<()> {
+    if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        anyhow::bail!("browser-engine-adapter status request did not succeed");
+    }
+    let data = status
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("browser-engine-adapter status is missing data"))?;
+    if data.get("provider").and_then(serde_json::Value::as_str) != Some(BROWSER_ENGINE_PROVIDER_ID)
+    {
+        anyhow::bail!("browser-engine-adapter status has an unsupported provider identity");
+    }
+    if data
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(BROWSER_ENGINE_PROTOCOL_VERSION)
+    {
+        anyhow::bail!("browser-engine-adapter status has an unsupported protocol version");
+    }
+    Ok(())
+}
+
+async fn register_browser_engine_provider(
+    registry: &provider::ProviderRegistry,
+    browser_engine_provider: Arc<dyn provider::Provider>,
+) -> anyhow::Result<()> {
+    if registry
+        .registration_for_uri("elastos://browser-engine/status")
+        .await
+        .is_some()
+    {
+        anyhow::bail!("failed to register Browser Engine provider: route already registered");
+    }
+    registry
+        .register_sub_provider("browser-engine", browser_engine_provider)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to register Browser Engine provider: {err}"))
+}
 
 async fn request_wallet_provider_v2_status(
     bridge: &provider::ProviderBridge,
@@ -707,19 +788,21 @@ async fn setup_server_infrastructure_impl(
             };
             match provider::ProviderBridge::spawn(&path, browser_engine_config).await {
                 Ok(bridge) => {
-                    let browser_engine_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "browser-engine"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("browser-engine", browser_engine_provider)
-                        .await
+                    let bridge = Arc::new(bridge);
+                    match start_browser_engine_provider(
+                        &provider_registry,
+                        bridge,
+                        BROWSER_ENGINE_PROVIDER_STATUS_TIMEOUT,
+                    )
+                    .await
                     {
-                        tracing::warn!(
-                            "Failed to register elastos://browser-engine sub-provider: {}",
-                            e
-                        );
+                        Ok(()) => {
+                            tracing::info!("browser-engine-adapter capsule from {}", path.display())
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to start browser-engine-adapter: {}", e)
+                        }
                     }
-                    tracing::info!("browser-engine-adapter capsule from {}", path.display());
                 }
                 Err(e) => tracing::warn!("Failed to spawn browser-engine-adapter: {}", e),
             }
@@ -1373,7 +1456,7 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn test_wallet_provider_bridge(
+    fn test_provider_bridge(
         status: serde_json::Value,
         response_delay: Duration,
     ) -> (
@@ -1413,7 +1496,7 @@ mod tests {
         (bridge, provider)
     }
 
-    fn wallet_provider_status(provider_id: &str, protocol_version: &str) -> serde_json::Value {
+    fn provider_status(provider_id: &str, protocol_version: &str) -> serde_json::Value {
         serde_json::json!({
             "status": "ok",
             "data": {
@@ -1424,10 +1507,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_engine_startup_registers_only_exact_identity_and_version() {
+        let registry = provider::ProviderRegistry::new();
+        let (bridge, provider) = test_provider_bridge(
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_PROTOCOL_VERSION),
+            Duration::ZERO,
+        );
+        start_browser_engine_provider(&registry, bridge, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let registration = registry
+            .registration_for_uri("elastos://browser-engine/status")
+            .await
+            .unwrap();
+        assert_eq!(registration.route, "browser-engine");
+        assert_eq!(registration.provider, "capsule-provider");
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn browser_engine_startup_reaps_old_or_mixed_version_before_launch() {
+        for status in [
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, "1.0"),
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, "2.1"),
+            provider_status("other-provider", BROWSER_ENGINE_PROTOCOL_VERSION),
+        ] {
+            let registry = provider::ProviderRegistry::new();
+            let (bridge, provider) = test_provider_bridge(status, Duration::ZERO);
+            let error = start_browser_engine_provider(&registry, bridge, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("unsupported"));
+            assert!(registry
+                .registration_for_uri("elastos://browser-engine/launch")
+                .await
+                .is_none());
+            let requests = provider.await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["op"], "status");
+            assert_eq!(requests[1]["op"], "shutdown");
+            assert!(!requests.iter().any(|request| request["op"] == "launch"));
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_engine_startup_reaps_failed_or_malformed_status() {
+        for status in [
+            serde_json::json!({"status": "error"}),
+            serde_json::json!({"status": "ok", "data": []}),
+            serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "provider": BROWSER_ENGINE_PROVIDER_ID,
+                }
+            }),
+        ] {
+            let registry = provider::ProviderRegistry::new();
+            let (bridge, provider) = test_provider_bridge(status, Duration::ZERO);
+            start_browser_engine_provider(&registry, bridge, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(registry
+                .registration_for_uri("elastos://browser-engine/status")
+                .await
+                .is_none());
+            let requests = provider.await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["op"], "status");
+            assert_eq!(requests[1]["op"], "shutdown");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn browser_engine_status_probe_completes_within_its_bound() {
+        let (bridge, provider) = test_provider_bridge(
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_PROTOCOL_VERSION),
+            Duration::from_millis(20),
+        );
+        let started = tokio::time::Instant::now();
+        let error = request_browser_engine_provider_status(&bridge, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(started.elapsed(), Duration::from_millis(5));
+        provider.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn browser_engine_startup_reaps_provider_that_does_not_answer_in_time() {
+        let registry = provider::ProviderRegistry::new();
+        let (bridge, provider) = test_provider_bridge(
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_PROTOCOL_VERSION),
+            Duration::from_millis(20),
+        );
+        let error = start_browser_engine_provider(&registry, bridge, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(registry
+            .registration_for_uri("elastos://browser-engine/status")
+            .await
+            .is_none());
+        let requests = provider.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["op"], "status");
+        assert_eq!(requests[1]["op"], "shutdown");
+    }
+
+    #[tokio::test]
+    async fn browser_engine_startup_reaps_provider_when_registration_fails() {
+        let registry = provider::ProviderRegistry::new();
+        let (first_bridge, first_provider) = test_provider_bridge(
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_PROTOCOL_VERSION),
+            Duration::ZERO,
+        );
+        start_browser_engine_provider(&registry, first_bridge, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let (second_bridge, second_provider) = test_provider_bridge(
+            provider_status(BROWSER_ENGINE_PROVIDER_ID, BROWSER_ENGINE_PROTOCOL_VERSION),
+            Duration::ZERO,
+        );
+        let error = start_browser_engine_provider(&registry, second_bridge, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed to register"));
+
+        let requests = second_provider.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["op"], "status");
+        assert_eq!(requests[1]["op"], "shutdown");
+        first_provider.abort();
+    }
+
+    #[tokio::test]
     async fn wallet_provider_v2_startup_registers_only_exact_identity_and_version() {
         let registry = provider::ProviderRegistry::new();
-        let (bridge, provider) = test_wallet_provider_bridge(
-            wallet_provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
+        let (bridge, provider) = test_provider_bridge(
+            provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
             Duration::ZERO,
         );
         start_wallet_provider_v2(&registry, bridge, Duration::from_secs(1))
@@ -1446,14 +1669,14 @@ mod tests {
     #[tokio::test]
     async fn wallet_provider_v2_startup_reaps_identity_or_version_mismatch() {
         for status in [
-            wallet_provider_status("wallet-provider", "2.0"),
-            wallet_provider_status("wallet-provider", "2.1"),
-            wallet_provider_status("wallet-provider", "2.2"),
-            wallet_provider_status("wallet-provider", "1.0"),
-            wallet_provider_status("other-provider", WALLET_PROTOCOL_VERSION),
+            provider_status("wallet-provider", "2.0"),
+            provider_status("wallet-provider", "2.1"),
+            provider_status("wallet-provider", "2.2"),
+            provider_status("wallet-provider", "1.0"),
+            provider_status("other-provider", WALLET_PROTOCOL_VERSION),
         ] {
             let registry = provider::ProviderRegistry::new();
-            let (bridge, provider) = test_wallet_provider_bridge(status, Duration::ZERO);
+            let (bridge, provider) = test_provider_bridge(status, Duration::ZERO);
             let error = start_wallet_provider_v2(&registry, bridge, Duration::from_secs(1))
                 .await
                 .unwrap_err();
@@ -1476,7 +1699,7 @@ mod tests {
             serde_json::json!({"status": "ok", "data": []}),
         ] {
             let registry = provider::ProviderRegistry::new();
-            let (bridge, provider) = test_wallet_provider_bridge(status, Duration::ZERO);
+            let (bridge, provider) = test_provider_bridge(status, Duration::ZERO);
             start_wallet_provider_v2(&registry, bridge, Duration::from_secs(1))
                 .await
                 .unwrap_err();
@@ -1493,8 +1716,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wallet_provider_v2_status_probe_completes_within_its_bound() {
-        let (bridge, provider) = test_wallet_provider_bridge(
-            wallet_provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
+        let (bridge, provider) = test_provider_bridge(
+            provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
             Duration::from_millis(20),
         );
         let started = tokio::time::Instant::now();
@@ -1510,8 +1733,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wallet_provider_v2_startup_reaps_provider_that_does_not_answer_in_time() {
         let registry = provider::ProviderRegistry::new();
-        let (bridge, provider) = test_wallet_provider_bridge(
-            wallet_provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
+        let (bridge, provider) = test_provider_bridge(
+            provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
             Duration::from_millis(20),
         );
         let error = start_wallet_provider_v2(&registry, bridge, Duration::from_millis(5))

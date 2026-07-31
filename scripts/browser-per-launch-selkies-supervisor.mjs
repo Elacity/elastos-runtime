@@ -370,6 +370,10 @@ async function main() {
       kind: "per_launch_selkies_target",
       session_dir: outDir,
     };
+    result.process = {
+      pid: target.pid,
+      stream_bridge_pid: null,
+    };
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {
     killProcessGroup(target);

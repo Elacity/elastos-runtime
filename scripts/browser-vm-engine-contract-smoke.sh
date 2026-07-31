@@ -48,7 +48,26 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === "POST" && req.url === "/shutdown") {
-    json(res, 200, { schema: "elastos.browser.vm-engine.shutdown/v1", ok: true });
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      const binding = body.runtime_cleanup;
+      json(res, 200, {
+        schema: "elastos.browser.supervisor-cleanup-result/v2",
+        page_id: binding.page_id,
+        generation: binding.generation,
+        binding,
+        terminal: true,
+        effects: {
+          page_absent: true,
+          child_absent: true,
+          vm_absent: true,
+          route_absent: true,
+          socket_absent: true,
+        },
+      });
+    });
     return;
   }
   if (req.method !== "POST" || req.url !== "/pages") {
@@ -85,6 +104,10 @@ const server = http.createServer((req, res) => {
         schema: "elastos.browser.engine.isolation/v1",
         kind: "per_launch_vm_target",
         session_dir: "/tmp/elastos-browser-vm-sessions/vm-contract-smoke",
+      },
+      process: {
+        pid: process.pid,
+        stream_bridge_pid: null,
       },
       display_session: {
         schema: "elastos.browser.display-session/v1",
@@ -130,7 +153,7 @@ done
 cargo build --quiet --manifest-path capsules/browser-engine-adapter/Cargo.toml
 adapter_bin="${CARGO_TARGET_DIR:-capsules/browser-engine-adapter/target}/debug/browser-engine-adapter"
 
-request_json="$(CONFIG_PATH="$tmp_dir/config/browser-engine-adapter.json" "$node_bin" - <<'NODE'
+request_json="$(CONFIG_PATH="$tmp_dir/config/browser-engine-adapter.json" CONTROL_SOCKET="$control_socket" CONTROL_PROCESS_PID="$service_pid" "$node_bin" - <<'NODE'
 const fs = require("node:fs");
 const config = JSON.parse(fs.readFileSync(process.env.CONFIG_PATH, "utf8"));
 const streamSession = {
@@ -166,6 +189,7 @@ console.log(JSON.stringify({
   op: "launch",
   url: "https://example.com/",
   stream_session: streamSession,
+  lifecycle_generation: "sha256:vm-contract-smoke",
   profile: browserProfile,
   principal_id: "person:local:browser-vm-contract-smoke",
   reason: "verify Browser VM engine contract",
@@ -177,6 +201,29 @@ console.log(JSON.stringify({
   op: "close_page",
   page_id: "page:vm-contract-smoke",
   principal_id: "person:local:browser-vm-contract-smoke",
+  runtime_cleanup: {
+    schema: "elastos.browser.engine-cleanup-binding/v2",
+    page_id: "page:vm-contract-smoke",
+    generation: "sha256:vm-contract-smoke",
+    stream_id: "stream:vm-contract-smoke",
+    adapter: "browser-vm-product",
+    engine: "chromium_microvm",
+    display_mode: "webrtc_remote_display",
+    guarantee_level: "mechanism_microvm",
+    principal_id: "person:local:browser-vm-contract-smoke",
+    control_socket_path: process.env.CONTROL_SOCKET,
+    shutdown_socket_path: process.env.CONTROL_SOCKET,
+    isolated_session: true,
+    isolation: {
+      schema: "elastos.browser.engine.isolation/v1",
+      kind: "per_launch_vm_target",
+      session_dir: "/tmp/elastos-browser-vm-sessions/vm-contract-smoke",
+    },
+    process: {
+      pid: Number(process.env.CONTROL_PROCESS_PID),
+      stream_bridge_pid: null,
+    },
+  },
 }));
 console.log(JSON.stringify({ op: "shutdown" }));
 NODE
@@ -199,9 +246,11 @@ if (launch.data.direct_network !== false || launch.data.wallet_injection !== fal
 if (launch.data.engine_control !== "page_scoped") throw new Error("VM control is not page-scoped");
 if (launch.data.isolated_engine_session !== true) throw new Error("VM session is not isolated");
 if (launch.data.isolation?.kind !== "per_launch_vm_target") throw new Error("VM isolation proof is missing");
-const close = lines.find((line) => line.status === "ok" && line.data?.schema === "elastos.browser.close-result/v1");
+const close = lines.find((line) => line.status === "ok" && line.data?.schema === "elastos.browser.engine-cleanup-result/v2");
 if (!close) throw new Error("missing close result");
-if (close.data.shutdown?.schema !== "elastos.browser.vm-engine.shutdown/v1") throw new Error("close did not use VM shutdown contract");
+if (close.data.terminal !== true || Object.values(close.data.effects || {}).some((value) => value !== true)) {
+  throw new Error("close did not return exact terminal VM cleanup proof");
+}
 NODE
 
 printf '%s\n' '{"schema":"elastos.browser.vm-engine-contract-smoke/v1","ok":true}'

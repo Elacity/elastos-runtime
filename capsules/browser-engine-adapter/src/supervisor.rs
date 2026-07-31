@@ -4,17 +4,63 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Debug)]
+pub(super) struct SupervisorLaunchError {
+    pub(super) code: String,
+    pub(super) message: String,
+}
+
+impl SupervisorLaunchError {
+    fn process(message: impl Into<String>) -> Self {
+        Self {
+            code: "engine_process_unavailable".to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TypedSupervisorLaunchError {
+    schema: String,
+    code: String,
+    message: String,
+}
+
+fn supervisor_launch_error(
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> SupervisorLaunchError {
+    if let Some(error) = stderr
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<TypedSupervisorLaunchError>(line).ok())
+        .filter(|error| error.schema == "elastos.browser.engine.launch-error/v1")
+    {
+        return SupervisorLaunchError {
+            code: error.code,
+            message: error.message,
+        };
+    }
+    SupervisorLaunchError::process(format!(
+        "browser engine supervisor exited with status {}; {}",
+        status,
+        stderr.trim()
+    ))
+}
+
 pub(super) fn run_supervisor_launch(
     supervisor: &EngineSupervisorConfig,
     adapter: &AdapterConfig,
     context: &LaunchContext<'_>,
-) -> Result<SupervisorLaunchResult, String> {
+    lifecycle_generation: &str,
+) -> Result<SupervisorLaunchResult, SupervisorLaunchError> {
     let request = json!({
         "schema": "elastos.browser.engine.launch-request/v1",
         "adapter": &adapter.id,
         "engine": adapter.kind,
         "url": context.url,
         "stream_id": &context.stream_session.stream_id,
+        "lifecycle_generation": lifecycle_generation,
         "target": &context.stream_session.target,
         "principal_id": &context.principal_id,
         "profile": &context.profile,
@@ -37,7 +83,7 @@ pub(super) fn run_supervisor_launch(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| SupervisorLaunchError::process(err.to_string()))?;
     let deadline = Instant::now() + Duration::from_millis(supervisor.timeout_ms);
     let status = loop {
         match child.try_wait() {
@@ -45,10 +91,12 @@ pub(super) fn run_supervisor_launch(
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("browser engine supervisor timed out".to_string());
+                return Err(SupervisorLaunchError::process(
+                    "browser engine supervisor timed out",
+                ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(SupervisorLaunchError::process(err.to_string())),
         }
     };
     let mut stdout = String::new();
@@ -60,14 +108,11 @@ pub(super) fn run_supervisor_launch(
         let _ = pipe.read_to_string(&mut stderr);
     }
     if !status.success() {
-        return Err(format!(
-            "browser engine supervisor exited with status {}; {}",
-            status,
-            stderr.trim()
-        ));
+        return Err(supervisor_launch_error(status, &stderr));
     }
-    let result = serde_json::from_str::<SupervisorLaunchResult>(stdout.trim())
-        .map_err(|err| format!("invalid browser engine supervisor output: {err}"))?;
+    let result = serde_json::from_str::<SupervisorLaunchResult>(stdout.trim()).map_err(|err| {
+        SupervisorLaunchError::process(format!("invalid browser engine supervisor output: {err}"))
+    })?;
     Ok(result)
 }
 
@@ -127,6 +172,35 @@ pub(super) fn supervisor_control_json(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, String> {
+    supervisor_control_json_inner(socket_path, method, path, body, None, None)
+}
+
+pub(super) fn supervisor_control_json_bounded(
+    socket_path: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    timeout: Duration,
+    max_response_bytes: usize,
+) -> Result<Value, String> {
+    supervisor_control_json_inner(
+        socket_path,
+        method,
+        path,
+        body,
+        Some(timeout),
+        Some(max_response_bytes),
+    )
+}
+
+fn supervisor_control_json_inner(
+    socket_path: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    timeout: Option<Duration>,
+    max_response_bytes: Option<usize>,
+) -> Result<Value, String> {
     validate_control_socket_path(socket_path)?;
     let body_bytes = body
         .map(|body| serde_json::to_vec(&body).map_err(|err| err.to_string()))
@@ -134,6 +208,12 @@ pub(super) fn supervisor_control_json(
         .unwrap_or_default();
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path)
         .map_err(|err| format!("browser engine control socket unavailable: {err}"))?;
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|err| format!("browser engine control read timeout setup failed: {err}"))?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|err| format!("browser engine control write timeout setup failed: {err}"))?;
     write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: browser-engine\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -147,24 +227,44 @@ pub(super) fn supervisor_control_json(
     }
     stream.flush().map_err(|err| err.to_string())?;
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|err| err.to_string())?;
+    if let Some(max_response_bytes) = max_response_bytes {
+        stream
+            .take(max_response_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut response)
+            .map_err(|err| err.to_string())?;
+        if response.len() > max_response_bytes {
+            return Err("browser engine control response exceeded its byte limit".to_string());
+        }
+    } else {
+        stream
+            .read_to_end(&mut response)
+            .map_err(|err| err.to_string())?;
+    }
     parse_http_json_response(&response)
 }
 
-pub(super) fn cleanup_isolated_session(session: &PageControlSession) -> Result<Value, String> {
+pub(super) fn cleanup_isolated_session(
+    session: &PageControlSession,
+    binding: &EngineCleanupBinding,
+) -> Result<Value, String> {
     let session_dir = session
         .isolation_session_dir
         .as_deref()
         .ok_or_else(|| "isolated browser session did not report a session directory".to_string())?;
     if session.isolation_kind.as_deref() == Some("per_launch_vm_target") {
-        return cleanup_vm_engine_session(session_dir);
+        return Err(
+            "Browser VM cleanup requires a typed terminal receipt from its control supervisor"
+                .to_string(),
+        );
     }
-    cleanup_selkies_session(session_dir, &session.socket_path)
+    cleanup_selkies_session(session_dir, &session.socket_path, binding)
 }
 
-fn cleanup_selkies_session(session_dir: &str, socket_path: &str) -> Result<Value, String> {
+fn cleanup_selkies_session(
+    session_dir: &str,
+    socket_path: &str,
+    binding: &EngineCleanupBinding,
+) -> Result<Value, String> {
     validate_isolated_session_dir(session_dir)?;
 
     let mut actions = Vec::new();
@@ -199,10 +299,31 @@ fn cleanup_selkies_session(session_dir: &str, socket_path: &str) -> Result<Value
 
     let _ = fs::remove_file(socket_path);
 
+    if std::path::Path::new(socket_path).exists() {
+        return Err("isolated Browser control socket still exists after cleanup".to_string());
+    }
+    if !cleanup_processes_are_absent(binding.process.as_ref()) {
+        return Err("isolated Browser child process is still active after cleanup".to_string());
+    }
+
     Ok(json!({
-        "schema": "elastos.browser.isolated-session-cleanup/v1",
-        "session_dir": session_dir,
-        "actions": actions,
+        "schema": BROWSER_SUPERVISOR_CLEANUP_RESULT_SCHEMA,
+        "page_id": binding.page_id,
+        "generation": binding.generation,
+        "binding": binding,
+        "terminal": true,
+        "effects": {
+            "page_absent": true,
+            "child_absent": true,
+            "vm_absent": true,
+            "route_absent": true,
+            "socket_absent": true,
+        },
+        "cleanup": {
+            "schema": "elastos.browser.isolated-session-cleanup/v1",
+            "session_dir": session_dir,
+            "actions": actions,
+        }
     }))
 }
 
@@ -217,23 +338,22 @@ fn validate_isolated_session_dir(session_dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cleanup_vm_engine_session(session_dir: &str) -> Result<Value, String> {
-    if !(session_dir.starts_with("/tmp/elastos-browser-vm-sessions/")
-        || session_dir.starts_with("/tmp/evzl/"))
-        || session_dir.contains(['\0', '\r', '\n'])
-        || session_dir.contains("/../")
-        || session_dir.ends_with("/..")
-    {
-        return Err("invalid Browser VM session directory".to_string());
-    }
-    Ok(json!({
-        "schema": "elastos.browser.isolated-session-cleanup/v1",
-        "session_dir": session_dir,
-        "actions": [{
-            "action": "vm_session_cleanup_delegated_to_control_shutdown",
-            "ok": true,
-        }],
-    }))
+fn cleanup_processes_are_absent(process: Option<&Value>) -> bool {
+    let Some(process) = process.and_then(Value::as_object) else {
+        return false;
+    };
+    let pids = ["pid", "stream_bridge_pid"]
+        .into_iter()
+        .filter_map(|key| process.get(key).and_then(Value::as_u64))
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    !pids.is_empty()
+        && pids.into_iter().all(|pid| {
+            !Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        })
 }
 
 fn read_target_container_name(session_dir: &str) -> Result<Option<String>, String> {
@@ -296,7 +416,7 @@ pub(super) fn parse_http_json_response(response: &[u8]) -> Result<Value, String>
 pub(super) fn validate_supervisor_result(
     result: &SupervisorLaunchResult,
     adapter: &AdapterConfig,
-    stream_session: &StreamSessionReceipt,
+    expected_stream_id: &str,
     expected_display_mode: BrowserDisplayMode,
 ) -> Result<(), String> {
     if result.schema != "elastos.browser.engine.supervisor-result/v1" {
@@ -311,7 +431,7 @@ pub(super) fn validate_supervisor_result(
     if result.engine != adapter.kind {
         return Err("browser engine supervisor engine mismatch".to_string());
     }
-    if result.stream_id != stream_session.stream_id {
+    if result.stream_id != expected_stream_id {
         return Err("browser engine supervisor stream_id mismatch".to_string());
     }
     if result.network_mode != AdapterNetworkMode::RuntimeNetOnly {
@@ -365,6 +485,32 @@ pub(super) fn validate_supervisor_result(
                         .to_string(),
                 );
             }
+        }
+    }
+    if result.isolated_session {
+        let Some(process) = result.process.as_ref().and_then(Value::as_object) else {
+            return Err(
+                "isolated Browser supervisor result omitted exact child process ownership"
+                    .to_string(),
+            );
+        };
+        let pid = process.get("pid").and_then(Value::as_u64).unwrap_or(0);
+        if pid == 0 || pid > u32::MAX as u64 {
+            return Err(
+                "isolated Browser supervisor result returned invalid child process ownership"
+                    .to_string(),
+            );
+        }
+        let stream_bridge_pid = process
+            .get("stream_bridge_pid")
+            .filter(|value| !value.is_null())
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if stream_bridge_pid > u32::MAX as u64 {
+            return Err(
+                "isolated Browser supervisor result returned invalid stream child ownership"
+                    .to_string(),
+            );
         }
     }
     validate_display_session(&result.display_session, expected_display_mode)?;

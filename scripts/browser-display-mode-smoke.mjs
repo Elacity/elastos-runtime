@@ -82,9 +82,9 @@ const sanitizedErrorTextSource = extractFunction(
   browserSource,
   "sanitizedErrorText",
 );
-const browserLaunchFailureSummarySource = extractFunction(
+const runtimeOpenOutcomeSource = extractFunction(
   browserSource,
-  "browserLaunchFailureSummary",
+  "runtimeOpenOutcome",
 );
 const isAuthoritySessionErrorSource = extractFunction(
   browserSource,
@@ -163,17 +163,28 @@ expectError("display=unsupported", "Unsupported Browser display mode");
   const script = new vm.Script(`
     ${isAuthoritySessionErrorSource}
     ${sanitizedErrorTextSource}
-    ${browserLaunchFailureSummarySource}
+    ${runtimeOpenOutcomeSource}
     ${friendlyOpenErrorSource}
     friendlyOpenError({
-      status: 400,
-      message: "browser engine supervisor exited with status exit status: 1; Browser VM persistent launcher exited before readiness with 0:\\n\\u001b[32m INFO\\u001b[0m browser-vz-engine-supervisor stage=open_guest_page_start"
+      status: 503,
+      message: "browser engine supervisor exited with status exit status: 1",
+      payload: {
+        outcome: {
+          schema: "elastos.browser.open-outcome/v1",
+          state: "terminal_pre_effect_failure",
+          effects: {
+            page_acquired: false,
+            vm_acquired: false,
+            stream_acquired: false
+          }
+        }
+      }
     });
   `);
   const message = script.runInNewContext({});
   assert(
-    message === "Browser Engine failed to start cleanly. Runtime did not provide a terminal close result, so Browser cannot claim the session closed.",
-    `Browser launch failures must be sanitized, got ${message}`,
+    message === "Browser Engine failed to start cleanly. No Browser page or VM was acquired.",
+    `Browser launch failures must use their structured Runtime outcome, got ${message}`,
   );
 }
 
@@ -369,12 +380,15 @@ assert(
     browserSource.includes("The Browser Engine is running, but the secure display connection is not ready.") &&
     browserSource.includes("this device has no secure display relay candidate") &&
     browserSource.includes("shared secure display route") &&
-    browserSource.includes("Refresh Browser, or choose another Browser Engine or Exit Node.") &&
+    browserSource.includes("No Browser page or VM was acquired.") &&
+    browserSource.includes(
+      "Runtime cleanup is pending for the acquired Browser session.",
+    ) &&
     browserSource.includes('const iceTransportPolicy =') &&
     browserSource.includes('displaySession.media_transport === "runtime_relay" ? "relay" : "all"') &&
     browserSource.includes("iceTransportPolicy,") &&
     browserSource.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
-    browserSource.includes('onRecoveryRequired(message, { retry: false })') &&
+    browserSource.includes("await onRecoveryRequired(message, options)") &&
     browserSource.includes("createRuntimePageCleanupController") &&
     browserSource.includes("Runtime cleanup is pending") &&
     browserSource.includes("Runtime confirmed the failed Browser session closed") &&

@@ -9,7 +9,11 @@ import {
   showHomeGuiDesktop,
   syncHomeGuiProjection,
 } from "./home-gui.js?v=home-20260726a";
-import { setHomeGuiLaunchToken } from "./shell-core.js?v=home-20260715a";
+import {
+  acceptHomeBrowserContextId,
+  hasHomeBrowserContextId,
+  setHomeGuiLaunchToken,
+} from "./shell-core.js?v=home-20260725a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -36,8 +40,18 @@ route.hash = "";
 window.history.replaceState(null, "", `${route.pathname}${route.search}`);
 
 function requestId() {
-  return window.crypto?.randomUUID?.()
-    || `home-gui-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return `home-gui-${Array.from(
+      bytes,
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("")}`;
+  }
+  throw new Error("Home GUI requires browser crypto for request isolation");
 }
 
 function postToHome(message) {
@@ -86,11 +100,20 @@ async function applySummary(summary, options = {}) {
     homeGuiWasMounted: previous !== null,
     ...options,
   });
-  if (!restoredSession && summary?.authority?.signed_in === true) {
-    restoredSession = true;
-    await restoreHomeGuiSession();
-  }
+  await restoreSessionWhenReady();
   document.body.dataset.homeStatus = "ready";
+}
+
+async function restoreSessionWhenReady() {
+  if (
+    restoredSession ||
+    currentSummary?.authority?.signed_in !== true ||
+    !hasHomeBrowserContextId()
+  ) {
+    return;
+  }
+  restoredSession = true;
+  await restoreHomeGuiSession();
 }
 
 function handleGuiCommand(message) {
@@ -205,6 +228,15 @@ window.addEventListener("message", (event) => {
   }
   const message = event.data && typeof event.data === "object" ? event.data : null;
   if (!message) {
+    return;
+  }
+  if (message.type === "home:shell-context") {
+    if (acceptHomeBrowserContextId(message.browserContextId)) {
+      restoreSessionWhenReady().catch((error) => {
+        document.body.dataset.homeStatus = "error";
+        console.error("home-gui session restore failed", error);
+      });
+    }
     return;
   }
   if (message.type === "home:shell-response") {

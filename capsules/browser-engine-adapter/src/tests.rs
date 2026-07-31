@@ -10,6 +10,62 @@ fn error_code(response: Response) -> String {
         .to_string()
 }
 
+fn cleanup_binding_for(provider: &BrowserEngineAdapter, page_id: &str) -> EngineCleanupBinding {
+    engine_cleanup_binding(
+        page_id,
+        provider
+            .page_control_sessions
+            .get(page_id)
+            .expect("test page control session"),
+    )
+}
+
+fn typed_supervisor_cleanup_receipt(request: &str) -> String {
+    let body = request
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .expect("test cleanup request body");
+    let request: serde_json::Value =
+        serde_json::from_str(body).expect("typed cleanup request JSON");
+    let binding = request
+        .get("runtime_cleanup")
+        .cloned()
+        .expect("Runtime cleanup binding");
+    serde_json::to_string(&json!({
+        "schema": BROWSER_SUPERVISOR_CLEANUP_RESULT_SCHEMA,
+        "page_id": binding["page_id"],
+        "generation": binding["generation"],
+        "binding": binding,
+        "terminal": true,
+        "effects": {
+            "page_absent": true,
+            "child_absent": true,
+            "vm_absent": true,
+            "route_absent": true,
+            "socket_absent": true
+        }
+    }))
+    .unwrap()
+}
+
+fn http_request_is_complete(request: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(request);
+    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        })
+        .unwrap_or(0);
+    body.len() >= content_length
+}
+
 fn stream_receipt(byte_transport: &str) -> StreamSessionReceipt {
     StreamSessionReceipt {
         schema: "elastos.exit.stream-session/v1".to_string(),
@@ -94,6 +150,29 @@ fn spawn_status_socket_requests(body: Value, request_count: usize) -> String {
     path
 }
 
+fn spawn_unresponsive_status_socket() -> String {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = format!(
+        "/tmp/elastos-browser-engine-adapter-unresponsive-{}-{suffix}.sock",
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("unresponsive test socket should bind");
+    let socket_path = path.clone();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0_u8; 2048];
+            let _ = stream.read(&mut buffer);
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        let _ = std::fs::remove_file(socket_path);
+    });
+    path
+}
+
 fn proof_adapter_config() -> Value {
     json!({
         "adapters": [{
@@ -110,9 +189,43 @@ fn status_is_unavailable_without_configured_adapter() {
     let response =
         serde_json::to_value(provider.status(Some("person:local:test".to_string()))).unwrap();
     assert_eq!(response["status"], "ok");
+    assert_eq!(
+        response["data"]["protocol_version"],
+        BROWSER_ENGINE_PROTOCOL_VERSION
+    );
     assert_eq!(response["data"]["status"], "unavailable");
     assert_eq!(response["data"]["direct_network"], false);
     assert_eq!(response["data"]["wallet_injection"], false);
+}
+
+#[test]
+fn protocol_v2_rejects_old_launch_before_dispatching_any_effect() {
+    let provider = BrowserEngineAdapter::new();
+    let old_launch = json!({
+        "op": "launch",
+        "url": "https://glidefinance.io/",
+        "stream_session": {
+            "schema": "elastos.exit.stream-session/v1",
+            "stream_id": "stream:proof:test",
+            "target": "tls://glidefinance.io:443",
+            "byte_transport": "adapter_ipc",
+            "adapter_ipc": {
+                "schema": "elastos.adapter-ipc/v1",
+                "kind": "unix_socket",
+                "path": "/tmp/elastos-browser-stream.sock",
+                "stream_id": "stream:proof:test",
+                "runtime_stream_path": "/tmp/elastos-runtime-stream.sock"
+            }
+        },
+        "profile": test_browser_profile(),
+        "display_mode": "webrtc_remote_display",
+        "guarantee_level": "operator_rbi"
+    });
+
+    let error = decode_request(&old_launch.to_string()).unwrap_err();
+
+    assert!(error.to_string().contains("lifecycle_generation"));
+    assert!(provider.page_control_sessions.is_empty());
 }
 
 #[test]
@@ -598,6 +711,47 @@ fn supervisor_launch_clears_configured_prewarm_flag() {
 }
 
 #[test]
+fn supervisor_launch_preserves_typed_resources_in_use_failure() {
+    let mut provider = BrowserEngineAdapter::new();
+    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.launch-error/v1","code":"resources_in_use","message":"Browser profile disk is already attached to an active VM"}' >&2; exit 23"#;
+    let init = provider.init(json!({
+        "adapters": [{
+            "id": "mac-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/sh",
+                "args": ["-c", script],
+                "timeout_ms": 2000
+            }
+        }]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    let stream = stream_receipt("adapter_ipc");
+    let response = serde_json::to_value(provider.launch_with_viewport(LaunchContext {
+        url: "https://glidefinance.io/",
+        stream_session: &stream,
+        profile: test_browser_profile(),
+        adapter_id: Some("mac-vm-product".to_string()),
+        principal_id: Some("person:local:test".to_string()),
+        reason: Some("open browser page".to_string()),
+        wallet: json!({}),
+        viewport: None,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::MechanismMicrovm,
+    }))
+    .unwrap();
+
+    assert_eq!(response["status"], "error");
+    assert_eq!(response["code"], "resources_in_use");
+    assert_eq!(
+        response["message"],
+        "Browser profile disk is already attached to an active VM"
+    );
+}
+
+#[test]
 fn native_adapter_can_declare_webrtc_display_mode() {
     let mut provider = BrowserEngineAdapter::new();
     let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:webrtc-proof","adapter":"linux-chromium-headless","engine":"chromium_headless","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"input":"runtime_route","audio":false,"video":true,"signaling_url":"/api/apps/browser/pages/page%3Awebrtc-proof/webrtc"}}'"#;
@@ -729,7 +883,7 @@ fn webrtc_product_compositor_can_advertise_audio() {
 #[test]
 fn supervisor_launch_registers_page_scoped_control_session() {
     let mut provider = BrowserEngineAdapter::new();
-    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:isolated-product","adapter":"hosted-product","engine":"selkies_gstreamer","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"control_socket_path":"/tmp/elastos-browser-isolated-product.sock","isolated_session":true,"isolation":{"schema":"elastos.browser.engine.isolation/v1","kind":"per_launch_selkies_target","session_dir":"/tmp/elastos-browser-sessions/test"},"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"input":"datachannel","width":1280,"height":720,"display_backend":"selkies_gstreamer_webrtc","backend_class":"product_compositor","audio":true,"video":true,"signaling_url":"/api/apps/browser/pages/page%3Aisolated-product/webrtc"}}'"#;
+    let script = r#"printf '%s\n' '{"schema":"elastos.browser.engine.supervisor-result/v1","page_id":"page:isolated-product","adapter":"hosted-product","engine":"selkies_gstreamer","stream_id":"stream:proof:test","network_mode":"runtime_net_only","direct_network":false,"wallet_injection":false,"control_socket_path":"/tmp/elastos-browser-isolated-product.sock","isolated_session":true,"isolation":{"schema":"elastos.browser.engine.isolation/v1","kind":"per_launch_selkies_target","session_dir":"/tmp/elastos-browser-sessions/test"},"process":{"pid":42,"stream_bridge_pid":null},"display_session":{"schema":"elastos.browser.display-session/v1","session_id":"display:stream:proof:test","mode":"webrtc_remote_display","network_mode":"runtime_net_only","direct_network":false,"input":"datachannel","width":1280,"height":720,"display_backend":"selkies_gstreamer_webrtc","backend_class":"product_compositor","audio":true,"video":true,"signaling_url":"/api/apps/browser/pages/page%3Aisolated-product/webrtc"}}'"#;
     let init = provider.init(json!({
         "adapters": [{
             "id": "hosted-product",
@@ -808,6 +962,7 @@ fn launch_fails_closed_when_session_capacity_is_full() {
             "kind": "per_launch_selkies_target",
             "session_dir": "/tmp/elastos-browser-sessions/capacity-a"
         },
+        "process": {"pid": 42, "stream_bridge_pid": null},
         "display_session": {
             "schema": "elastos.browser.display-session/v1",
             "session_id": "display:stream:proof:test",
@@ -965,6 +1120,7 @@ fn launch_reaps_stale_isolated_vm_session_before_capacity_check() {
             "kind": "per_launch_vm_target",
             "session_dir": "/tmp/elastos-browser-vm-sessions/capacity-reaped"
         },
+        "process": {"pid": 42, "stream_bridge_pid": null},
         "display_session": {
             "schema": "elastos.browser.display-session/v1",
             "session_id": "display:stream:proof:test",
@@ -1005,6 +1161,8 @@ fn launch_reaps_stale_isolated_vm_session_before_capacity_check() {
     provider.page_control_sessions.insert(
         "page:stale-vm".to_string(),
         PageControlSession {
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
             socket_path: control_socket_path.clone(),
             shutdown_socket_path: Some(control_socket_path),
             adapter_id: "mac-vm-product".to_string(),
@@ -1015,6 +1173,7 @@ fn launch_reaps_stale_isolated_vm_session_before_capacity_check() {
             isolated_session: true,
             isolation_session_dir: Some("/tmp/elastos-browser-vm-sessions/stale-vm".to_string()),
             isolation_kind: Some("per_launch_vm_target".to_string()),
+            process: None,
         },
     );
 
@@ -1046,6 +1205,8 @@ fn status_reaps_isolated_vm_session_when_control_socket_is_gone() {
     provider.page_control_sessions.insert(
         "page:dead-vm".to_string(),
         PageControlSession {
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
             socket_path: format!(
                 "/tmp/elastos-browser-vm-dead-{}-{}.sock",
                 std::process::id(),
@@ -1063,6 +1224,7 @@ fn status_reaps_isolated_vm_session_when_control_socket_is_gone() {
             isolated_session: true,
             isolation_session_dir: Some("/tmp/elastos-browser-vm-sessions/dead-vm".to_string()),
             isolation_kind: Some("per_launch_vm_target".to_string()),
+            process: None,
         },
     );
 
@@ -1072,6 +1234,275 @@ fn status_reaps_isolated_vm_session_when_control_socket_is_gone() {
     assert_eq!(status["data"]["stale_sessions_reaped"], 1);
     assert_eq!(status["data"]["active_sessions"], 0);
     assert!(provider.page_control_sessions.is_empty());
+}
+
+#[test]
+fn launch_reconciliation_recovers_exact_control_service_effect_after_provider_restart() {
+    let generation = "sha256:provider-restart-reconciliation";
+    let stream_id = "stream:provider-restart-reconciliation";
+    let control_socket = spawn_status_socket(json!({
+        "schema": "elastos.browser.vm-control-service.launch-reconciliation/v1",
+        "state": "effect_acquired",
+        "launch": {
+            "adapter": "browser-vm-product",
+            "engine": "chromium_microvm",
+            "lifecycle_generation": generation,
+            "stream_id": stream_id,
+            "principal_id": "person:local:test",
+            "display_mode": "webrtc_remote_display",
+            "guarantee_level": "mechanism_microvm"
+        },
+        "effects": {
+            "page_acquired": true,
+            "vm_acquired": true
+        },
+        "supervisor_result": {
+            "schema": "elastos.browser.engine.supervisor-result/v1",
+            "page_id": "page:provider-restart-reconciliation",
+            "adapter": "browser-vm-product",
+            "engine": "chromium_microvm",
+            "stream_id": stream_id,
+            "network_mode": "runtime_net_only",
+            "direct_network": false,
+            "wallet_injection": false,
+            "control_socket_path": "/tmp/elastos-browser-provider-restart-guest.sock",
+            "isolated_session": true,
+            "isolation": {
+                "schema": "elastos.browser.engine.isolation/v1",
+                "kind": "per_launch_vm_target",
+                "session_dir": "/tmp/elastos-browser-provider-restart-session"
+            },
+            "process": {
+                "pid": 42,
+                "stream_bridge_pid": null
+            },
+            "display_session": {
+                "schema": "elastos.browser.display-session/v1",
+                "session_id": "display:provider-restart-reconciliation",
+                "mode": "webrtc_remote_display",
+                "network_mode": "runtime_net_only",
+                "direct_network": false,
+                "input": "datachannel",
+                "width": 1280,
+                "height": 720,
+                "display_backend": "vm_selkies_gstreamer_webrtc",
+                "backend_class": "product_compositor",
+                "media_transport": "runtime_relay",
+                "audio": true,
+                "video": true,
+                "signaling_url": "/api/apps/browser/pages/page%3Aprovider-restart-reconciliation/webrtc"
+            }
+        }
+    }));
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(json!({
+        "adapters": [{
+            "id": "browser-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/false",
+                "timeout_ms": 2000,
+                "control_socket_path": control_socket
+            }
+        }]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+    assert!(provider.page_control_sessions.is_empty());
+
+    let response = serde_json::to_value(provider.reconcile_launch(
+        Some("person:local:test".to_string()),
+        generation,
+        stream_id,
+    ))
+    .unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["state"], "effect_acquired");
+    assert_eq!(
+        response["data"]["effect"]["page_id"],
+        "page:provider-restart-reconciliation"
+    );
+    assert_eq!(
+        response["data"]["effect"]["runtime_cleanup"]["generation"],
+        generation
+    );
+    assert_eq!(
+        response["data"]["effect"]["runtime_cleanup"]["stream_id"],
+        stream_id
+    );
+    assert!(provider
+        .page_control_sessions
+        .contains_key("page:provider-restart-reconciliation"));
+}
+
+#[test]
+fn launch_reconciliation_did_not_act_requires_every_control_service() {
+    let generation = "sha256:all-services-proof";
+    let stream_id = "stream:all-services-proof";
+    let did_not_act = spawn_status_socket(json!({
+        "schema": "elastos.browser.vm-control-service.launch-reconciliation/v1",
+        "state": "did_not_act",
+        "launch": {
+            "lifecycle_generation": generation,
+            "stream_id": stream_id
+        },
+        "effects": {
+            "page_acquired": false,
+            "vm_acquired": false
+        }
+    }));
+    let indeterminate = spawn_status_socket(json!({
+        "schema": "elastos.browser.vm-control-service.launch-reconciliation/v1",
+        "state": "indeterminate",
+        "launch": {
+            "lifecycle_generation": generation,
+            "stream_id": stream_id
+        }
+    }));
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(json!({
+        "adapters": [
+            {
+                "id": "browser-vm-a",
+                "kind": "chromium_microvm",
+                "display_modes": ["webrtc_remote_display"],
+                "supervisor": {
+                    "program": "/bin/false",
+                    "timeout_ms": 2000,
+                    "control_socket_path": did_not_act
+                }
+            },
+            {
+                "id": "browser-vm-b",
+                "kind": "chromium_microvm",
+                "display_modes": ["webrtc_remote_display"],
+                "supervisor": {
+                    "program": "/bin/false",
+                    "timeout_ms": 2000,
+                    "control_socket_path": indeterminate
+                }
+            }
+        ]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    let response =
+        serde_json::to_value(provider.reconcile_launch(None, generation, stream_id)).unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["state"], "cleanup_pending");
+}
+
+#[test]
+fn launch_reconciliation_accepts_exact_unanimous_did_not_act_proof() {
+    let generation = "sha256:did-not-act-proof";
+    let stream_id = "stream:did-not-act-proof";
+    let control_socket = spawn_status_socket(json!({
+        "schema": "elastos.browser.vm-control-service.launch-reconciliation/v1",
+        "state": "did_not_act",
+        "launch": {
+            "lifecycle_generation": generation,
+            "stream_id": stream_id
+        },
+        "effects": {
+            "page_acquired": false,
+            "vm_acquired": false
+        }
+    }));
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(json!({
+        "adapters": [{
+            "id": "browser-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/false",
+                "timeout_ms": 2000,
+                "control_socket_path": control_socket
+            }
+        }]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    let response =
+        serde_json::to_value(provider.reconcile_launch(None, generation, stream_id)).unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["state"], "did_not_act");
+    assert_eq!(response["data"]["effects"]["page_acquired"], false);
+    assert_eq!(response["data"]["effects"]["vm_acquired"], false);
+}
+
+#[test]
+fn launch_reconciliation_accepts_restart_persistent_terminal_cleanup_proof() {
+    let generation = "sha256:restart-terminal-proof";
+    let stream_id = "stream:restart-terminal-proof";
+    let control_socket = spawn_status_socket(json!({
+        "schema": "elastos.browser.vm-control-service.launch-reconciliation/v1",
+        "state": "terminal_post_effect_cleanup",
+        "launch": {
+            "lifecycle_generation": generation,
+            "stream_id": stream_id
+        },
+        "effects": {
+            "page_acquired": true,
+            "vm_acquired": true
+        }
+    }));
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(json!({
+        "adapters": [{
+            "id": "browser-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/false",
+                "timeout_ms": 2000,
+                "control_socket_path": control_socket
+            }
+        }]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    let response =
+        serde_json::to_value(provider.reconcile_launch(None, generation, stream_id)).unwrap();
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["state"], "terminal_post_effect_cleanup");
+    assert_eq!(response["data"]["effects"]["page_acquired"], true);
+    assert_eq!(response["data"]["effects"]["vm_acquired"], true);
+}
+
+#[test]
+fn launch_reconciliation_is_bounded_when_control_service_is_unresponsive() {
+    let control_socket = spawn_unresponsive_status_socket();
+    let mut provider = BrowserEngineAdapter::new();
+    let init = provider.init(json!({
+        "adapters": [{
+            "id": "browser-vm-product",
+            "kind": "chromium_microvm",
+            "display_modes": ["webrtc_remote_display"],
+            "supervisor": {
+                "program": "/bin/false",
+                "timeout_ms": 2000,
+                "control_socket_path": control_socket
+            }
+        }]
+    }));
+    assert_eq!(serde_json::to_value(init).unwrap()["status"], "ok");
+
+    let started = Instant::now();
+    let response = serde_json::to_value(provider.reconcile_launch(
+        None,
+        "sha256:unresponsive-reconciliation",
+        "stream:unresponsive-reconciliation",
+    ))
+    .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["data"]["state"], "cleanup_pending");
 }
 
 #[test]
@@ -1126,11 +1557,99 @@ fn page_operations_fail_without_page_scoped_control_session() {
 }
 
 #[test]
+fn close_page_missing_adapter_map_with_live_child_remains_indeterminate() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("5")
+        .spawn()
+        .expect("test child");
+    let socket_path = format!(
+        "/tmp/elastos-browser-missing-map-{}-{}.sock",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let binding = EngineCleanupBinding {
+        schema: BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA.to_string(),
+        page_id: "page:missing-map-live-child".to_string(),
+        generation: "sha256:missing-map-live-child".to_string(),
+        stream_id: "stream:missing-map-live-child".to_string(),
+        adapter: "hosted-product".to_string(),
+        engine: AdapterKind::SelkiesGstreamer,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+        principal_id: Some("person:local:test".to_string()),
+        control_socket_path: socket_path,
+        shutdown_socket_path: None,
+        isolated_session: false,
+        isolation: None,
+        process: Some(json!({"pid": child.id(), "stream_bridge_pid": null})),
+    };
+    let mut provider = BrowserEngineAdapter::new();
+
+    assert_eq!(
+        error_code(provider.close_page(
+            "page:missing-map-live-child",
+            Some("person:local:test".to_string()),
+            binding,
+        )),
+        "engine_process_unavailable"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "missing adapter state must not synthesize terminal child cleanup"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn exact_typed_already_absent_supervisor_proof_is_terminal() {
+    let session = PageControlSession {
+        generation: "sha256:typed-absent".to_string(),
+        stream_id: "stream:typed-absent".to_string(),
+        socket_path: "/tmp/elastos-browser-typed-absent.sock".to_string(),
+        shutdown_socket_path: None,
+        adapter_id: "hosted-product".to_string(),
+        principal_id: Some("person:local:test".to_string()),
+        engine: AdapterKind::SelkiesGstreamer,
+        display_mode: BrowserDisplayMode::WebrtcRemoteDisplay,
+        guarantee_level: BrowserGuaranteeLevel::OperatorRbi,
+        isolated_session: false,
+        isolation_session_dir: None,
+        isolation_kind: None,
+        process: None,
+    };
+    let binding = engine_cleanup_binding("page:typed-absent", &session);
+    let receipt = json!({
+        "schema": BROWSER_SUPERVISOR_CLEANUP_RESULT_SCHEMA,
+        "page_id": binding.page_id,
+        "generation": binding.generation,
+        "binding": binding,
+        "terminal": true,
+        "effects": {
+            "page_absent": true,
+            "child_absent": true,
+            "vm_absent": true,
+            "route_absent": true,
+            "socket_absent": true
+        }
+    });
+
+    let terminal = engine_terminal_cleanup_result(&binding, receipt).unwrap();
+    assert_eq!(terminal["schema"], BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA);
+    assert_eq!(terminal["terminal"], true);
+}
+
+#[test]
 fn page_operations_reject_mismatched_principal() {
     let mut provider = BrowserEngineAdapter::new();
     provider.page_control_sessions.insert(
         "page:owned".to_string(),
         PageControlSession {
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
             socket_path: "/tmp/elastos-browser-owned-unused.sock".to_string(),
             shutdown_socket_path: None,
             adapter_id: "hosted-product".to_string(),
@@ -1141,6 +1660,7 @@ fn page_operations_reject_mismatched_principal() {
             isolated_session: false,
             isolation_session_dir: None,
             isolation_kind: None,
+            process: None,
         },
     );
 
@@ -1170,8 +1690,9 @@ fn page_operations_reject_mismatched_principal() {
         )),
         "page_not_found"
     );
+    let cleanup = cleanup_binding_for(&provider, "page:owned");
     assert_eq!(
-        error_code(provider.close_page("page:owned", other)),
+        error_code(provider.close_page("page:owned", other, cleanup)),
         "page_not_found"
     );
     assert!(provider.page_control_sessions.contains_key("page:owned"));
@@ -1185,6 +1706,8 @@ fn close_page_retains_non_isolated_session_when_close_fails() {
     provider.page_control_sessions.insert(
         "page:retry-close".to_string(),
         PageControlSession {
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
             socket_path: socket_path.to_string(),
             shutdown_socket_path: None,
             adapter_id: "hosted-product".to_string(),
@@ -1195,11 +1718,17 @@ fn close_page_retains_non_isolated_session_when_close_fails() {
             isolated_session: false,
             isolation_session_dir: None,
             isolation_kind: None,
+            process: None,
         },
     );
 
+    let cleanup = cleanup_binding_for(&provider, "page:retry-close");
     assert_eq!(
-        error_code(provider.close_page("page:retry-close", Some("person:local:test".to_string()),)),
+        error_code(provider.close_page(
+            "page:retry-close",
+            Some("person:local:test".to_string()),
+            cleanup,
+        )),
         "engine_process_unavailable"
     );
     assert!(provider
@@ -1215,6 +1744,8 @@ fn close_page_retains_isolated_session_when_shutdown_and_cleanup_fail() {
     provider.page_control_sessions.insert(
         "page:retry-isolated-close".to_string(),
         PageControlSession {
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
             socket_path: socket_path.to_string(),
             shutdown_socket_path: Some(socket_path.to_string()),
             adapter_id: "hosted-product".to_string(),
@@ -1225,13 +1756,16 @@ fn close_page_retains_isolated_session_when_shutdown_and_cleanup_fail() {
             isolated_session: true,
             isolation_session_dir: Some("/tmp/not-an-elastos-browser-session".to_string()),
             isolation_kind: Some("per_launch_selkies_target".to_string()),
+            process: None,
         },
     );
 
+    let cleanup = cleanup_binding_for(&provider, "page:retry-isolated-close");
     assert_eq!(
         error_code(provider.close_page(
             "page:retry-isolated-close",
             Some("person:local:test".to_string()),
+            cleanup,
         )),
         "engine_process_unavailable"
     );
@@ -1261,6 +1795,8 @@ fn page_status_includes_redacted_engine_identity() {
     provider.page_control_sessions.insert(
         "page:browser-vm-status".to_string(),
         PageControlSession {
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
             socket_path: status_socket,
             shutdown_socket_path: None,
             adapter_id: "browser-vm-product".to_string(),
@@ -1271,6 +1807,7 @@ fn page_status_includes_redacted_engine_identity() {
             isolated_session: true,
             isolation_session_dir: Some("/tmp/elastos-browser-vm-sessions/status".to_string()),
             isolation_kind: Some("per_launch_vm_target".to_string()),
+            process: None,
         },
     );
 
@@ -1315,9 +1852,19 @@ fn isolated_close_uses_target_shutdown_contract() {
         move || {
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 1024];
-                let size = stream.read(&mut request).unwrap();
-                let request = String::from_utf8_lossy(&request[..size]);
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 256];
+                loop {
+                    let size = stream.read(&mut buffer).unwrap_or(0);
+                    if size == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..size]);
+                    if http_request_is_complete(&request) {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
                 if !request.starts_with("POST /shutdown HTTP/1.1") {
                     let body = r#"{"schema":"elastos.browser.test-probe/v1","ok":true}"#;
                     write!(
@@ -1329,7 +1876,7 @@ fn isolated_close_uses_target_shutdown_contract() {
                     .unwrap();
                     continue;
                 }
-                let body = r#"{"schema":"elastos.browser.selkies-control.shutdown/v1","ok":true}"#;
+                let body = typed_supervisor_cleanup_receipt(&request);
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -1348,6 +1895,8 @@ fn isolated_close_uses_target_shutdown_contract() {
     provider.page_control_sessions.insert(
         "page:isolated-close".to_string(),
         PageControlSession {
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
             socket_path: socket_path.clone(),
             shutdown_socket_path: None,
             adapter_id: "hosted-product".to_string(),
@@ -1360,24 +1909,24 @@ fn isolated_close_uses_target_shutdown_contract() {
                 "/tmp/elastos-browser-sessions/stream_isolated-close-test".to_string(),
             ),
             isolation_kind: Some("per_launch_selkies_target".to_string()),
+            process: None,
         },
     );
 
-    let response = serde_json::to_value(
-        provider.close_page("page:isolated-close", Some("person:local:test".to_string())),
-    )
+    let cleanup = cleanup_binding_for(&provider, "page:isolated-close");
+    let response = serde_json::to_value(provider.close_page(
+        "page:isolated-close",
+        Some("person:local:test".to_string()),
+        cleanup,
+    ))
     .unwrap();
     assert_eq!(response["status"], "ok");
     assert_eq!(
         response["data"]["schema"],
-        "elastos.browser.close-result/v1"
+        BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA
     );
-    assert_eq!(response["data"]["closed"], true);
-    assert_eq!(response["data"]["isolated_session"], true);
-    assert_eq!(
-        response["data"]["shutdown"]["schema"],
-        "elastos.browser.selkies-control.shutdown/v1"
-    );
+    assert_eq!(response["data"]["terminal"], true);
+    assert_eq!(response["data"]["effects"]["child_absent"], true);
     handle.join().unwrap();
 }
 
@@ -1413,17 +1962,14 @@ fn vm_isolated_close_uses_global_shutdown_socket() {
                     break;
                 }
                 request.extend_from_slice(&buffer[..size]);
-                let request_text = String::from_utf8_lossy(&request);
-                if request_text.contains("\r\n\r\n")
-                    && request_text.contains("\"page_id\":\"page:browser-vm-close\"")
-                {
+                if http_request_is_complete(&request) {
                     break;
                 }
             }
             let request = String::from_utf8_lossy(&request);
             assert!(request.starts_with("POST /shutdown HTTP/1.1"));
             assert!(request.contains("\"page_id\":\"page:browser-vm-close\""));
-            let body = r#"{"schema":"elastos.browser.vm-engine.shutdown/v1","ok":true}"#;
+            let body = typed_supervisor_cleanup_receipt(&request);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -1439,6 +1985,8 @@ fn vm_isolated_close_uses_global_shutdown_socket() {
     provider.page_control_sessions.insert(
         "page:browser-vm-close".to_string(),
         PageControlSession {
+            generation: "sha256:test-generation".to_string(),
+            stream_id: "stream:proof:test".to_string(),
             socket_path: "/tmp/elastos-browser-vm-page-control-not-used.sock".to_string(),
             shutdown_socket_path: Some(socket_path),
             adapter_id: "browser-vm-product".to_string(),
@@ -1449,20 +1997,20 @@ fn vm_isolated_close_uses_global_shutdown_socket() {
             isolated_session: true,
             isolation_session_dir: Some("/tmp/evzl/bvm-vm-close-test".to_string()),
             isolation_kind: Some("per_launch_vm_target".to_string()),
+            process: None,
         },
     );
 
+    let cleanup = cleanup_binding_for(&provider, "page:browser-vm-close");
     let response = serde_json::to_value(provider.close_page(
         "page:browser-vm-close",
         Some("person:local:test".to_string()),
+        cleanup,
     ))
     .unwrap();
     assert_eq!(response["status"], "ok");
-    assert_eq!(response["data"]["closed"], true);
-    assert_eq!(
-        response["data"]["shutdown"]["schema"],
-        "elastos.browser.vm-engine.shutdown/v1"
-    );
+    assert_eq!(response["data"]["terminal"], true);
+    assert_eq!(response["data"]["effects"]["vm_absent"], true);
     handle.join().unwrap();
 }
 
@@ -1504,6 +2052,7 @@ fn supervisor_accepts_vm_isolation_kind() {
             kind: "per_launch_vm_target".to_string(),
             session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
         }),
+        process: Some(json!({"pid": 42, "stream_bridge_pid": null})),
     };
     let adapter = AdapterConfig {
         id: "browser-vm-product".to_string(),
@@ -1516,7 +2065,7 @@ fn supervisor_accepts_vm_isolation_kind() {
     validate_supervisor_result(
         &result,
         &adapter,
-        &stream_receipt("adapter_ipc"),
+        "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
     )
     .unwrap();
@@ -1560,6 +2109,7 @@ fn supervisor_rejects_video_only_vm_product_display() {
             kind: "per_launch_vm_target".to_string(),
             session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
         }),
+        process: Some(json!({"pid": 42, "stream_bridge_pid": null})),
     };
     let adapter = AdapterConfig {
         id: "browser-vm-product".to_string(),
@@ -1572,7 +2122,7 @@ fn supervisor_rejects_video_only_vm_product_display() {
     let err = validate_supervisor_result(
         &result,
         &adapter,
-        &stream_receipt("adapter_ipc"),
+        "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
     )
     .unwrap_err();
@@ -1620,6 +2170,7 @@ fn supervisor_rejects_vm_product_display_without_video() {
             kind: "per_launch_vm_target".to_string(),
             session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
         }),
+        process: Some(json!({"pid": 42, "stream_bridge_pid": null})),
     };
     let adapter = AdapterConfig {
         id: "browser-vm-product".to_string(),
@@ -1632,7 +2183,7 @@ fn supervisor_rejects_vm_product_display_without_video() {
     let err = validate_supervisor_result(
         &result,
         &adapter,
-        &stream_receipt("adapter_ipc"),
+        "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
     )
     .unwrap_err();
@@ -1681,6 +2232,7 @@ fn supervisor_rejects_non_relay_vm_media_transport() {
             kind: "per_launch_vm_target".to_string(),
             session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
         }),
+        process: Some(json!({"pid": 42, "stream_bridge_pid": null})),
     };
     let adapter = AdapterConfig {
         id: "browser-vm-product".to_string(),
@@ -1693,7 +2245,7 @@ fn supervisor_rejects_non_relay_vm_media_transport() {
     let err = validate_supervisor_result(
         &result,
         &adapter,
-        &stream_receipt("adapter_ipc"),
+        "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
     )
     .unwrap_err();
@@ -1740,6 +2292,7 @@ fn vm_isolation_requires_runtime_relay_media_transport() {
             kind: "per_launch_vm_target".to_string(),
             session_dir: "/tmp/elastos-browser-vm-sessions/test".to_string(),
         }),
+        process: Some(json!({"pid": 42, "stream_bridge_pid": null})),
     };
     let adapter = AdapterConfig {
         id: "browser-vm-product".to_string(),
@@ -1752,7 +2305,7 @@ fn vm_isolation_requires_runtime_relay_media_transport() {
     let err = validate_supervisor_result(
         &result,
         &adapter,
-        &stream_receipt("adapter_ipc"),
+        "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
     )
     .unwrap_err();
@@ -1914,6 +2467,7 @@ fn native_surface_supervisor_result_requires_view_geometry() {
         control_socket_path: None,
         isolated_session: false,
         isolation: None,
+        process: None,
     };
     let adapter = AdapterConfig {
         id: "linux-cef".to_string(),
@@ -1926,7 +2480,7 @@ fn native_surface_supervisor_result_requires_view_geometry() {
     let err = validate_supervisor_result(
         &result,
         &adapter,
-        &stream_receipt("adapter_ipc"),
+        "stream:proof:test",
         BrowserDisplayMode::NativeSurface,
     )
     .unwrap_err();

@@ -292,6 +292,16 @@ pub(in crate::api::gateway) fn validate_browser_engine_page(
             "browser-engine provider did not return an elastos.browser.engine.page/v1 receipt"
         );
     }
+    if page.get("provider").and_then(|value| value.as_str()) != Some(BROWSER_ENGINE_PROVIDER_ID)
+        || page
+            .get("protocol_version")
+            .and_then(|value| value.as_str())
+            != Some(BROWSER_ENGINE_PROTOCOL_VERSION)
+    {
+        anyhow::bail!(
+            "browser-engine provider returned an unsupported provider identity or protocol version"
+        );
+    }
     if page.get("direct_network").and_then(|value| value.as_bool()) != Some(false) {
         anyhow::bail!("browser-engine provider attempted to report direct network authority");
     }
@@ -376,6 +386,8 @@ fn browser_visible_engine_page(page: &serde_json::Value) -> serde_json::Value {
     let mut visible = serde_json::Map::new();
     for key in [
         "schema",
+        "provider",
+        "protocol_version",
         "page_id",
         "adapter",
         "engine",
@@ -566,6 +578,8 @@ mod tests {
     ) -> serde_json::Value {
         json!({
             "schema": "elastos.browser.engine.page/v1",
+            "provider": "browser-engine-adapter",
+            "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
             "page_id": "page:test",
             "adapter": "test-adapter",
             "engine": "contract_proof",

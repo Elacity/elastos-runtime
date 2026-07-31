@@ -1,7 +1,7 @@
 use super::*;
 use crate::api::gateway::gateway_browser::{
     browser_lifecycle_hash, complete_browser_launch, release_browser_page_for_principal,
-    reserve_browser_launch, BrowserLaunchLifecycle,
+    reserve_browser_launch, BrowserLaunchEffect, BrowserLaunchLifecycle,
 };
 
 #[tokio::test]
@@ -138,15 +138,39 @@ async fn browser_profile_reset_refuses_live_principal_session() {
         dir.path(),
         &context.principal_id,
         BrowserLaunchLifecycle {
+            owner_launch_id: "launch:profile-reset-test".to_string(),
             url: "https://example.com/".to_string(),
             exit_id: "local-runtime".to_string(),
+            engine_route_provider: "mock-browser-engine".to_string(),
             profile_key_hash: browser_lifecycle_hash("profile-test"),
             vm_key_hash: browser_lifecycle_hash("vm-test"),
         },
     )
     .await
     .unwrap();
-    complete_browser_launch(&reservation, "profile-reset-live-page", None).await;
+    complete_browser_launch(
+        dir.path(),
+        &reservation,
+        BrowserLaunchEffect {
+            page_id: "profile-reset-live-page".to_string(),
+            engine_provider: "browser-engine-adapter".to_string(),
+            engine_protocol_version: "2.0".to_string(),
+            engine_adapter: "mock-adapter".to_string(),
+            engine: "mock-engine".to_string(),
+            provider_cleanup: serde_json::json!({
+                "schema": "elastos.browser.engine-cleanup-binding/v2",
+                "page_id": "profile-reset-live-page",
+                "generation": reservation.generation(),
+                "stream_id": "stream:profile-reset",
+                "adapter": "mock-adapter",
+                "engine": "mock-engine",
+            }),
+            browser_page: serde_json::json!({"page_id": "profile-reset-live-page"}),
+            stream_cleanup: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let app = gateway_router(test_state(dir.path()));
     let token = issue_home_launch_token(dir.path(), BROWSER_CAPSULE_ID).unwrap();
@@ -168,6 +192,7 @@ async fn browser_profile_reset_refuses_live_principal_session() {
         dir.path(),
         "profile-reset-live-page",
         &context.principal_id,
+        "launch:profile-reset-test",
     )
     .await;
 }

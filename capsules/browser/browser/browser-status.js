@@ -30,13 +30,31 @@ function sanitizedErrorText(error) {
     .slice(0, 420);
 }
 
-function browserLaunchFailureSummary(text) {
+export function runtimeOpenOutcome(error) {
+  const outcome = error?.payload?.outcome;
+  const effects = outcome?.effects;
+  const indeterminateLaunch =
+    outcome?.state === "cleanup_pending" &&
+    outcome?.ownership === "launch_reconciliation_pending" &&
+    effects?.page_acquired === null &&
+    effects?.vm_acquired === null &&
+    effects?.stream_acquired === true;
   if (
-    /browser engine supervisor exited|Browser VM persistent launcher exited|browser-vz-engine-supervisor|remote VZ supervisor/i.test(text)
+    outcome?.schema !== "elastos.browser.open-outcome/v1" ||
+    ![
+      "terminal_pre_effect_failure",
+      "terminal_post_effect_cleanup",
+      "cleanup_pending",
+    ].includes(outcome.state) ||
+    !effects ||
+    (!indeterminateLaunch &&
+      (typeof effects.page_acquired !== "boolean" ||
+        typeof effects.vm_acquired !== "boolean" ||
+        typeof effects.stream_acquired !== "boolean"))
   ) {
-    return "Browser Engine failed to start cleanly. The failed session was closed; refresh Browser, or choose another Browser Engine.";
+    return null;
   }
-  return "";
+  return outcome;
 }
 
 export function friendlyOpenError(error) {
@@ -44,9 +62,24 @@ export function friendlyOpenError(error) {
   if (isAuthoritySessionError(error)) {
     return "Browser session expired. Reopening from Home...";
   }
-  const launchFailure = browserLaunchFailureSummary(text);
-  if (launchFailure) {
-    return launchFailure;
+  const outcome = runtimeOpenOutcome(error);
+  if (outcome?.state === "terminal_pre_effect_failure") {
+    return "Browser Engine failed to start cleanly. No Browser page or VM was acquired.";
+  }
+  if (outcome?.state === "terminal_post_effect_cleanup") {
+    return "Browser Engine failed to start cleanly. Runtime confirmed the acquired Browser effects were closed.";
+  }
+  if (outcome?.state === "cleanup_pending") {
+    if (outcome.ownership === "launch_reconciliation_pending") {
+      return "Browser Engine returned no safe launch result. Runtime retained ownership and is reconciling before another Browser session can start.";
+    }
+    if (
+      outcome.effects.page_acquired === true ||
+      outcome.effects.vm_acquired === true
+    ) {
+      return "Browser Engine failed to start cleanly. Runtime cleanup is pending for the acquired Browser session.";
+    }
+    return "Browser Engine failed to start cleanly. Runtime is finishing cleanup; no Browser page or VM remains acquired.";
   }
   if (error.status === 403) {
     return "This page was blocked by your Exit Node settings.";

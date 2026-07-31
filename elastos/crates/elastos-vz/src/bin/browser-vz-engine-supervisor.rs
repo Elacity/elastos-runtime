@@ -1,9 +1,9 @@
 use std::fmt::Write as _;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -46,7 +46,8 @@ const DISPLAY_WIDTH_BOOT_ARG: &str = "elastos.browser_width";
 const DISPLAY_HEIGHT_BOOT_ARG: &str = "elastos.browser_height";
 const DEFAULT_HIBERNATION_MAX_ENTRIES: u32 = 4;
 const DEFAULT_HIBERNATION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-const HIBERNATION_LEASE_PREFIX: &str = ".active-";
+const HIBERNATION_LIFETIME_LOCK: &str = ".lifetime.lock";
+const DISK_LIFETIME_LOCK_SUFFIX: &str = ".lifetime.lock";
 const VM_ICE_ENV_KEYS: [&str; 8] = [
     "ELASTOS_BROWSER_VM_ICE_SERVER",
     "ELASTOS_BROWSER_VM_ICE_SERVERS_JSON",
@@ -134,8 +135,8 @@ async fn run() -> Result<(), String> {
         );
     }
     append_browser_display_boot_args(&mut boot_args, launch)?;
-    let (profile_key, profile_disk_path) = prepare_browser_profile_disk(&request)?;
-    append_browser_profile_boot_arg(&mut boot_args, &profile_key);
+    let profile_disk = prepare_browser_profile_disk(&request)?;
+    append_browser_profile_boot_arg(&mut boot_args, &profile_disk.profile_key);
 
     fs::create_dir_all(&paths.session_dir).map_err(|err| err.to_string())?;
     fs::create_dir_all(&paths.state_dir).map_err(|err| err.to_string())?;
@@ -143,17 +144,17 @@ async fn run() -> Result<(), String> {
     let hibernation = BrowserVmHibernation::from_env(
         &paths,
         launch,
-        &profile_key,
-        &profile_disk_path,
+        &profile_disk.profile_key,
+        &profile_disk.path,
         &boot_args,
     )?;
-    let launch_rootfs_path = prepare_launch_rootfs(&paths, hibernation.as_ref())?;
+    let launch_rootfs = prepare_launch_rootfs(&paths, hibernation.as_ref())?;
     trace_stage(
         "prepared_rootfs",
         format!(
             "base={} launch={}",
             paths.rootfs_path.display(),
-            launch_rootfs_path.display()
+            launch_rootfs.path.display()
         ),
     );
 
@@ -174,7 +175,7 @@ async fn run() -> Result<(), String> {
         vm_id: format!("browser-vm-{}", uuid::Uuid::new_v4()),
         kernel_path: paths.kernel_path.clone(),
         boot_args,
-        rootfs_path: launch_rootfs_path,
+        rootfs_path: launch_rootfs.path.clone(),
         rootfs_readonly: false,
         mem_size_mib: paths.memory_mib,
         vcpu_count: paths.vcpu_count,
@@ -186,7 +187,7 @@ async fn run() -> Result<(), String> {
         carrier_socket_path: None,
         initramfs_path: paths.initramfs_path.clone(),
     };
-    vm_config.data_disk_path = Some(profile_disk_path);
+    vm_config.data_disk_path = Some(profile_disk.path.clone());
 
     trace_stage(
         "load_vm_start",
@@ -640,6 +641,85 @@ impl LaunchPaths {
 }
 
 #[derive(Debug)]
+struct LifetimeFileLock {
+    _path: PathBuf,
+    file: File,
+}
+
+impl Drop for LifetimeFileLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+impl LifetimeFileLock {
+    fn acquire_lock_file(path: &Path, resource: &str) -> Result<Self, String> {
+        Self::acquire(path, path, resource)
+    }
+
+    fn acquire_disk_sidecar(disk_path: &Path, resource: &str) -> Result<Self, String> {
+        Self::acquire(&disk_lifetime_lock_path(disk_path), disk_path, resource)
+    }
+
+    fn acquire(lock_path: &Path, resource_path: &Path, resource: &str) -> Result<Self, String> {
+        let file = open_lifetime_lock(lock_path, true)?;
+        match try_lock_exclusive(&file)? {
+            true => Ok(Self {
+                _path: lock_path.to_path_buf(),
+                file,
+            }),
+            false => Err(resources_in_use_error(resource, resource_path)),
+        }
+    }
+}
+
+fn disk_lifetime_lock_path(disk_path: &Path) -> PathBuf {
+    let mut lock_path = disk_path.as_os_str().to_os_string();
+    lock_path.push(DISK_LIFETIME_LOCK_SUFFIX);
+    PathBuf::from(lock_path)
+}
+
+fn open_lifetime_lock(path: &Path, create: bool) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if create {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        options.create(true).mode(0o600);
+    }
+    let file = options.open(path).map_err(|err| err.to_string())?;
+    if create {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(file)
+}
+
+fn try_lock_exclusive(file: &File) -> Result<bool, String> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    Err(error.to_string())
+}
+
+fn resources_in_use_error(resource: &str, path: &Path) -> String {
+    json!({
+        "schema": "elastos.browser.engine.launch-error/v1",
+        "code": "resources_in_use",
+        "message": format!("{resource} is already attached to an active Browser VM"),
+        "resource": resource,
+        "path": path,
+    })
+    .to_string()
+}
+
+#[derive(Debug)]
 struct BrowserVmHibernation {
     key: String,
     state_dir: PathBuf,
@@ -652,33 +732,18 @@ struct BrowserVmHibernation {
 
 #[derive(Debug)]
 struct HibernationLease {
-    path: PathBuf,
+    _lock: LifetimeFileLock,
 }
 
 impl HibernationLease {
     fn acquire(state_dir: &Path) -> Result<Self, String> {
         fs::create_dir_all(state_dir).map_err(|err| err.to_string())?;
-        let path = state_dir.join(format!(
-            "{HIBERNATION_LEASE_PREFIX}{}-{}",
-            process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        fs::write(
-            &path,
-            format!(
-                "pid={}\ncreated_at_unix_secs={}\n",
-                process::id(),
-                current_unix_seconds()
-            ),
-        )
-        .map_err(|err| err.to_string())?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for HibernationLease {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        Ok(Self {
+            _lock: LifetimeFileLock::acquire_lock_file(
+                &state_dir.join(HIBERNATION_LIFETIME_LOCK),
+                "shared Browser VZ hibernation state",
+            )?,
+        })
     }
 }
 
@@ -907,36 +972,17 @@ fn hibernation_entry_last_modified(path: &Path) -> Result<SystemTime, String> {
 }
 
 fn hibernation_entry_has_live_lease(path: &Path) -> Result<bool, String> {
-    for lease in fs::read_dir(path).map_err(|err| err.to_string())? {
-        let lease = lease.map_err(|err| err.to_string())?;
-        let name = lease.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(suffix) = name.strip_prefix(HIBERNATION_LEASE_PREFIX) else {
-            continue;
-        };
-        let pid = suffix
-            .split_once('-')
-            .and_then(|(pid, _)| pid.parse::<u32>().ok());
-        if pid.is_some_and(process_is_alive) {
-            return Ok(true);
-        }
-        match fs::remove_file(lease.path()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.to_string()),
-        }
+    let lock_path = path.join(HIBERNATION_LIFETIME_LOCK);
+    let file = match open_lifetime_lock(&lock_path, false) {
+        Ok(file) => file,
+        Err(_) if !lock_path.exists() => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let acquired = try_lock_exclusive(&file)?;
+    if acquired {
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
     }
-    Ok(false)
-}
-
-fn process_is_alive(pid: u32) -> bool {
-    if pid == 0 || pid > libc::pid_t::MAX as u32 {
-        return false;
-    }
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    Ok(!acquired)
 }
 
 fn remove_hibernation_cache_entry(path: &Path) -> Result<(), String> {
@@ -1093,10 +1139,16 @@ fn validate_unix_socket_path_budget(label: &str, path: &Path) -> Result<(), Stri
     Ok(())
 }
 
+#[derive(Debug)]
+struct PreparedLaunchRootfs {
+    path: PathBuf,
+    _lock: Option<LifetimeFileLock>,
+}
+
 fn prepare_launch_rootfs(
     paths: &LaunchPaths,
     hibernation: Option<&BrowserVmHibernation>,
-) -> Result<PathBuf, String> {
+) -> Result<PreparedLaunchRootfs, String> {
     if let Some(hibernation) = hibernation {
         if !hibernation.launch_rootfs_path.exists() {
             if hibernation.state_path.exists() {
@@ -1113,13 +1165,22 @@ fn prepare_launch_rootfs(
                 },
             )?;
         }
-        return Ok(hibernation.launch_rootfs_path.clone());
+        return Ok(PreparedLaunchRootfs {
+            path: hibernation.launch_rootfs_path.clone(),
+            _lock: None,
+        });
     }
     if std::env::var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH")
         .map(|value| value == "0" || value.eq_ignore_ascii_case("false"))
         .unwrap_or(false)
     {
-        return Ok(paths.rootfs_path.clone());
+        return Ok(PreparedLaunchRootfs {
+            path: paths.rootfs_path.clone(),
+            _lock: Some(LifetimeFileLock::acquire_disk_sidecar(
+                &paths.rootfs_path,
+                "shared writable Browser VZ rootfs",
+            )?),
+        });
     }
 
     let launch_rootfs = paths.session_dir.join("rootfs.ext4");
@@ -1131,7 +1192,10 @@ fn prepare_launch_rootfs(
             err
         )
     })?;
-    Ok(launch_rootfs)
+    Ok(PreparedLaunchRootfs {
+        path: launch_rootfs,
+        _lock: None,
+    })
 }
 
 fn clone_or_copy_file(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -1220,14 +1284,28 @@ fn profile_disk_from_request(request: &Value) -> Result<(String, PathBuf), Strin
     Ok((profile_key.to_string(), disk_path))
 }
 
-fn prepare_browser_profile_disk(request: &Value) -> Result<(String, PathBuf), String> {
+#[derive(Debug)]
+struct PreparedBrowserProfileDisk {
+    profile_key: String,
+    path: PathBuf,
+    _lock: LifetimeFileLock,
+}
+
+fn prepare_browser_profile_disk(request: &Value) -> Result<PreparedBrowserProfileDisk, String> {
     let (profile_key, disk_path) = profile_disk_from_request(request)?;
     if let Some(parent) = disk_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("create Browser profile disk root failed: {err}"))?;
     }
     ensure_sparse_profile_disk(&disk_path)?;
-    Ok((profile_key, disk_path))
+    Ok(PreparedBrowserProfileDisk {
+        profile_key,
+        _lock: LifetimeFileLock::acquire_disk_sidecar(
+            &disk_path,
+            "principal Browser profile disk",
+        )?,
+        path: disk_path,
+    })
 }
 
 fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str) {
@@ -1238,9 +1316,9 @@ fn append_browser_profile_boot_arg(boot_args: &mut String, profile_key: &str) {
 
 #[cfg(test)]
 fn attach_browser_profile_disk(vm_config: &mut VmConfig, request: &Value) -> Result<(), String> {
-    let (profile_key, disk_path) = prepare_browser_profile_disk(request)?;
-    vm_config.data_disk_path = Some(disk_path);
-    append_browser_profile_boot_arg(&mut vm_config.boot_args, &profile_key);
+    let profile_disk = prepare_browser_profile_disk(request)?;
+    vm_config.data_disk_path = Some(profile_disk.path);
+    append_browser_profile_boot_arg(&mut vm_config.boot_args, &profile_disk.profile_key);
     Ok(())
 }
 
@@ -2325,6 +2403,7 @@ async fn wait_for_shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead as _;
     use std::os::fd::{FromRawFd, IntoRawFd};
     use std::sync::{mpsc, Mutex};
 
@@ -2658,6 +2737,53 @@ mod tests {
     }
 
     #[test]
+    fn principal_profile_disk_rejects_a_second_vm_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk_path = tmp
+            .path()
+            .join("Users/0123456789ab/BrowserProfiles/default/profile.ext4");
+        let request = json!({
+            "profile": {
+                "schema": "elastos.browser.profile/v1",
+                "scope": "active_principal",
+                "storage": "principal_owned_profile_disk",
+                "storage_posture": "principal_owned_reset_scoped_unprotected",
+                "protected_storage": false,
+                "encrypted": false,
+                "recoverable": false,
+                "recovery": "not_recovery_kit_packaged",
+                "uri": "localhost://Users/0123456789ab/BrowserProfiles/default/profile.ext4",
+                "public_uri": "localhost://Users/self/BrowserProfiles/default/profile.ext4",
+                "profile_key": "profile-99bb2b58175e1e062cd2fb6b1b00feec63d169f520dd0a8cfe7230517cfc43e4",
+                "disk_path": disk_path,
+                "reset": "whole_profile"
+            }
+        });
+        let owner = prepare_browser_profile_disk(&request).unwrap();
+        let lock_path = disk_lifetime_lock_path(&disk_path);
+        assert_eq!(
+            lock_path,
+            PathBuf::from(format!(
+                "{}{}",
+                disk_path.display(),
+                DISK_LIFETIME_LOCK_SUFFIX
+            ))
+        );
+        assert_eq!(fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o600);
+        assert_disk_inode_is_unlocked(&disk_path);
+
+        let error = prepare_browser_profile_disk(&request).unwrap_err();
+        let typed: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(typed["schema"], "elastos.browser.engine.launch-error/v1");
+        assert_eq!(typed["code"], "resources_in_use");
+        assert_eq!(typed["resource"], "principal Browser profile disk");
+        assert_eq!(typed["path"], disk_path.to_string_lossy().as_ref());
+
+        drop(owner);
+        prepare_browser_profile_disk(&request).unwrap();
+    }
+
+    #[test]
     fn bridge_propagates_runtime_eof_to_guest_and_exits() {
         let (mut guest_client, guest_bridge) = UnixStream::pair().unwrap();
         let (runtime_bridge, mut runtime_client) = UnixStream::pair().unwrap();
@@ -2833,10 +2959,53 @@ mod tests {
 
             let launch_rootfs = prepare_launch_rootfs(&paths, Some(&hibernation)).unwrap();
 
-            assert_eq!(launch_rootfs, hibernation.launch_rootfs_path);
+            assert_eq!(launch_rootfs.path, hibernation.launch_rootfs_path);
             assert!(hibernation.launch_rootfs_path.is_file());
             assert!(!hibernation.state_path.exists());
         });
+    }
+
+    #[test]
+    fn shared_writable_rootfs_rejects_a_second_vm_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _restore = EnvVarRestore::capture("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH");
+        std::env::set_var("ELASTOS_BROWSER_VM_ROOTFS_PER_LAUNCH", "0");
+        let (paths, _) = hibernation_fixture_paths(tmp.path());
+        let owner = prepare_launch_rootfs(&paths, None).unwrap();
+        let lock_path = disk_lifetime_lock_path(&paths.rootfs_path);
+        assert_eq!(
+            lock_path,
+            PathBuf::from(format!(
+                "{}{}",
+                paths.rootfs_path.display(),
+                DISK_LIFETIME_LOCK_SUFFIX
+            ))
+        );
+        assert_eq!(fs::metadata(&lock_path).unwrap().mode() & 0o777, 0o600);
+        assert_disk_inode_is_unlocked(&paths.rootfs_path);
+
+        let error = prepare_launch_rootfs(&paths, None).unwrap_err();
+        let typed: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(typed["code"], "resources_in_use");
+        assert_eq!(typed["resource"], "shared writable Browser VZ rootfs");
+        assert_eq!(typed["path"], paths.rootfs_path.to_string_lossy().as_ref());
+
+        drop(owner);
+        prepare_launch_rootfs(&paths, None).unwrap();
+    }
+
+    fn assert_disk_inode_is_unlocked(disk_path: &Path) {
+        let disk = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(disk_path)
+            .unwrap();
+        assert!(
+            try_lock_exclusive(&disk).unwrap(),
+            "disk inode should remain available to Virtualization.framework"
+        );
+        assert_eq!(unsafe { libc::flock(disk.as_raw_fd(), libc::LOCK_UN) }, 0);
     }
 
     #[test]
@@ -2882,15 +3051,16 @@ mod tests {
     }
 
     #[test]
-    fn hibernation_lease_is_removed_when_owner_drops() {
+    fn hibernation_lifetime_lock_rejects_a_second_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().join("state");
         let lease = HibernationLease::acquire(&state_dir).unwrap();
-        let lease_path = lease.path.clone();
 
-        assert!(lease_path.is_file());
+        let error = HibernationLease::acquire(&state_dir).unwrap_err();
+        let typed: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(typed["code"], "resources_in_use");
         drop(lease);
-        assert!(!lease_path.exists());
+        HibernationLease::acquire(&state_dir).unwrap();
     }
 
     #[test]
@@ -2903,16 +3073,7 @@ mod tests {
         }
         let current = entries[5].clone();
         let live = entries[4].clone();
-        fs::write(
-            live.join(format!("{HIBERNATION_LEASE_PREFIX}{}-test", process::id())),
-            b"active",
-        )
-        .unwrap();
-        fs::write(
-            entries[0].join(format!("{HIBERNATION_LEASE_PREFIX}4294967295-stale")),
-            b"stale",
-        )
-        .unwrap();
+        let _live_lease = HibernationLease::acquire(&live).unwrap();
 
         let removed = prune_hibernation_cache_at(
             &root,
@@ -2927,6 +3088,54 @@ mod tests {
         assert!(current.is_dir());
         assert!(live.is_dir());
         assert_eq!(hibernation_cache_entries(&root).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn lifetime_lock_child_process() {
+        let Some(path) = std::env::var_os("ELASTOS_TEST_LIFETIME_LOCK_PATH") else {
+            return;
+        };
+        let _lock =
+            LifetimeFileLock::acquire_lock_file(Path::new(&path), "test Browser VM resource")
+                .unwrap();
+        println!("ELASTOS_TEST_LIFETIME_LOCK_READY");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn kernel_lifetime_lock_releases_after_owner_process_death() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("owner-death.lock");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("lifetime_lock_child_process")
+            .arg("--nocapture")
+            .env("ELASTOS_TEST_LIFETIME_LOCK_PATH", &lock_path)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let mut ready = false;
+        for _ in 0..20 {
+            let Some(line) = lines.next() else {
+                break;
+            };
+            if line.unwrap().contains("ELASTOS_TEST_LIFETIME_LOCK_READY") {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "lock-owner child did not acquire its lifetime lock");
+        let error = LifetimeFileLock::acquire_lock_file(&lock_path, "test Browser VM resource")
+            .unwrap_err();
+        let typed: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(typed["code"], "resources_in_use");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        LifetimeFileLock::acquire_lock_file(&lock_path, "test Browser VM resource").unwrap();
     }
 
     #[test]

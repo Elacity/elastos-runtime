@@ -24,6 +24,19 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
+const BROWSER_ENGINE_PROVIDER_ID: &str = "browser-engine-adapter";
+const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0";
+const BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA: &str = "elastos.browser.engine-cleanup-binding/v2";
+const BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA: &str = "elastos.browser.engine-cleanup-result/v2";
+const BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA: &str =
+    "elastos.browser.engine.launch-reconciliation/v1";
+const BROWSER_ENGINE_RECONCILIATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+const BROWSER_ENGINE_RECONCILIATION_TOTAL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+const MAX_BROWSER_ENGINE_RECONCILIATION_RESPONSE_BYTES: usize = 64 * 1024;
+const BROWSER_SUPERVISOR_CLEANUP_RESULT_SCHEMA: &str =
+    "elastos.browser.supervisor-cleanup-result/v2";
 const MAX_SUPERVISOR_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Debug, Deserialize)]
@@ -36,10 +49,15 @@ enum Request {
     Status {
         #[serde(default)]
         principal_id: Option<String>,
+        #[serde(default)]
+        lifecycle_generation: Option<String>,
+        #[serde(default)]
+        stream_id: Option<String>,
     },
     Launch {
         url: String,
-        stream_session: StreamSessionReceipt,
+        stream_session: Box<StreamSessionReceipt>,
+        lifecycle_generation: String,
         profile: BrowserProfileDescriptor,
         #[serde(default)]
         adapter_id: Option<String>,
@@ -62,6 +80,7 @@ enum Request {
     },
     ClosePage {
         page_id: String,
+        runtime_cleanup: EngineCleanupBinding,
         #[serde(default)]
         principal_id: Option<String>,
     },
@@ -128,8 +147,33 @@ struct BrowserEngineAdapter {
     max_active_sessions: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct EngineCleanupBinding {
+    schema: String,
+    page_id: String,
+    generation: String,
+    stream_id: String,
+    adapter: String,
+    engine: AdapterKind,
+    display_mode: BrowserDisplayMode,
+    guarantee_level: BrowserGuaranteeLevel,
+    #[serde(default)]
+    principal_id: Option<String>,
+    control_socket_path: String,
+    #[serde(default)]
+    shutdown_socket_path: Option<String>,
+    isolated_session: bool,
+    #[serde(default)]
+    isolation: Option<SupervisorIsolation>,
+    #[serde(default)]
+    process: Option<Value>,
+}
+
 #[derive(Debug, Clone)]
 struct PageControlSession {
+    generation: String,
+    stream_id: String,
     socket_path: String,
     shutdown_socket_path: Option<String>,
     adapter_id: String,
@@ -140,6 +184,147 @@ struct PageControlSession {
     isolated_session: bool,
     isolation_session_dir: Option<String>,
     isolation_kind: Option<String>,
+    process: Option<Value>,
+}
+
+fn engine_cleanup_binding(page_id: &str, session: &PageControlSession) -> EngineCleanupBinding {
+    EngineCleanupBinding {
+        schema: BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA.to_string(),
+        page_id: page_id.to_string(),
+        generation: session.generation.clone(),
+        stream_id: session.stream_id.clone(),
+        adapter: session.adapter_id.clone(),
+        engine: session.engine,
+        display_mode: session.display_mode,
+        guarantee_level: session.guarantee_level,
+        principal_id: session.principal_id.clone(),
+        control_socket_path: session.socket_path.clone(),
+        shutdown_socket_path: session.shutdown_socket_path.clone(),
+        isolated_session: session.isolated_session,
+        isolation: session
+            .isolation_session_dir
+            .as_ref()
+            .zip(session.isolation_kind.as_ref())
+            .map(|(session_dir, kind)| SupervisorIsolation {
+                schema: "elastos.browser.engine.isolation/v1".to_string(),
+                kind: kind.clone(),
+                session_dir: session_dir.clone(),
+            }),
+        process: session.process.clone(),
+    }
+}
+
+fn page_control_session_from_cleanup(
+    binding: &EngineCleanupBinding,
+) -> Result<PageControlSession, String> {
+    validate_engine_cleanup_binding(binding)?;
+    Ok(PageControlSession {
+        generation: binding.generation.clone(),
+        stream_id: binding.stream_id.clone(),
+        socket_path: binding.control_socket_path.clone(),
+        shutdown_socket_path: binding.shutdown_socket_path.clone(),
+        adapter_id: binding.adapter.clone(),
+        principal_id: binding.principal_id.clone(),
+        engine: binding.engine,
+        display_mode: binding.display_mode,
+        guarantee_level: binding.guarantee_level,
+        isolated_session: binding.isolated_session,
+        isolation_session_dir: binding
+            .isolation
+            .as_ref()
+            .map(|isolation| isolation.session_dir.clone()),
+        isolation_kind: binding
+            .isolation
+            .as_ref()
+            .map(|isolation| isolation.kind.clone()),
+        process: binding.process.clone(),
+    })
+}
+
+fn validate_engine_cleanup_binding(binding: &EngineCleanupBinding) -> Result<(), String> {
+    if binding.schema != BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA
+        || !is_safe_id(&binding.page_id)
+        || binding.page_id.len() > 256
+        || !is_safe_id(&binding.generation)
+        || binding.generation.len() > 256
+        || !is_safe_id(&binding.stream_id)
+        || binding.stream_id.len() > 256
+        || !is_safe_id(&binding.adapter)
+        || binding.adapter.len() > 256
+    {
+        return Err("invalid Runtime Browser cleanup binding".to_string());
+    }
+    validate_control_socket_path(&binding.control_socket_path)?;
+    if let Some(path) = &binding.shutdown_socket_path {
+        validate_control_socket_path(path)?;
+    }
+    if binding.isolated_session != binding.isolation.is_some() {
+        return Err("Browser cleanup isolation binding is inconsistent".to_string());
+    }
+    if let Some(isolation) = &binding.isolation {
+        if isolation.schema != "elastos.browser.engine.isolation/v1"
+            || !matches!(
+                isolation.kind.as_str(),
+                "per_launch_selkies_target" | "per_launch_vm_target"
+            )
+            || !isolation.session_dir.starts_with('/')
+            || isolation.session_dir.contains(['\0', '\r', '\n'])
+        {
+            return Err("invalid Runtime Browser cleanup isolation binding".to_string());
+        }
+    }
+    if serde_json::to_vec(binding).map_or(true, |bytes| bytes.len() > 16 * 1024) {
+        return Err("Runtime Browser cleanup binding is too large".to_string());
+    }
+    Ok(())
+}
+
+fn engine_terminal_cleanup_result(
+    binding: &EngineCleanupBinding,
+    supervisor_receipt: Value,
+) -> Result<Value, String> {
+    if supervisor_receipt.get("schema").and_then(Value::as_str)
+        != Some(BROWSER_SUPERVISOR_CLEANUP_RESULT_SCHEMA)
+        || supervisor_receipt.get("page_id").and_then(Value::as_str)
+            != Some(binding.page_id.as_str())
+        || supervisor_receipt.get("generation").and_then(Value::as_str)
+            != Some(binding.generation.as_str())
+        || supervisor_receipt.get("binding")
+            != Some(&serde_json::to_value(binding).unwrap_or(Value::Null))
+        || supervisor_receipt.get("terminal").and_then(Value::as_bool) != Some(true)
+        || supervisor_receipt
+            .pointer("/effects/page_absent")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || supervisor_receipt
+            .pointer("/effects/child_absent")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || supervisor_receipt
+            .pointer("/effects/vm_absent")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || supervisor_receipt
+            .pointer("/effects/route_absent")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || supervisor_receipt
+            .pointer("/effects/socket_absent")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(
+            "Browser supervisor did not return an exact typed terminal cleanup receipt".to_string(),
+        );
+    }
+    Ok(json!({
+        "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+        "page_id": binding.page_id,
+        "generation": binding.generation,
+        "binding": binding,
+        "terminal": true,
+        "effects": supervisor_receipt["effects"],
+    }))
 }
 
 struct LaunchContext<'a> {
@@ -167,10 +352,15 @@ impl BrowserEngineAdapter {
     fn handle(&mut self, request: Request) -> Response {
         match request {
             Request::Init { config } => self.init(config),
-            Request::Status { principal_id } => self.status(principal_id),
+            Request::Status {
+                principal_id,
+                lifecycle_generation,
+                stream_id,
+            } => self.status_request(principal_id, lifecycle_generation, stream_id),
             Request::Launch {
                 url,
                 stream_session,
+                lifecycle_generation,
                 profile,
                 adapter_id,
                 principal_id,
@@ -179,18 +369,21 @@ impl BrowserEngineAdapter {
                 viewport,
                 display_mode,
                 guarantee_level,
-            } => self.launch_with_viewport(LaunchContext {
-                url: &url,
-                stream_session: &stream_session,
-                profile,
-                adapter_id,
-                principal_id,
-                reason,
-                wallet,
-                viewport,
-                display_mode,
-                guarantee_level,
-            }),
+            } => self.launch_with_generation(
+                LaunchContext {
+                    url: &url,
+                    stream_session: &stream_session,
+                    profile,
+                    adapter_id,
+                    principal_id,
+                    reason,
+                    wallet,
+                    viewport,
+                    display_mode,
+                    guarantee_level,
+                },
+                &lifecycle_generation,
+            ),
             Request::AttachStream {
                 page_id,
                 stream_session,
@@ -198,8 +391,9 @@ impl BrowserEngineAdapter {
             } => self.attach_stream(&page_id, &stream_session, principal_id),
             Request::ClosePage {
                 page_id,
+                runtime_cleanup,
                 principal_id,
-            } => self.close_page(&page_id, principal_id),
+            } => self.close_page(&page_id, principal_id, runtime_cleanup),
             Request::PageStatus {
                 page_id,
                 principal_id,
@@ -262,8 +456,8 @@ impl BrowserEngineAdapter {
             }
         }
         Response::ok(json!({
-            "provider": "browser-engine-adapter",
-            "protocol_version": "1.0",
+            "provider": BROWSER_ENGINE_PROVIDER_ID,
+            "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
             "adapter_count": self.adapters.len(),
             "active_sessions": self.page_control_sessions.len(),
             "max_active_sessions": self.max_active_sessions,
@@ -273,11 +467,30 @@ impl BrowserEngineAdapter {
         }))
     }
 
+    fn status_request(
+        &mut self,
+        principal_id: Option<String>,
+        lifecycle_generation: Option<String>,
+        stream_id: Option<String>,
+    ) -> Response {
+        if lifecycle_generation.is_some() || stream_id.is_some() {
+            let (Some(lifecycle_generation), Some(stream_id)) = (lifecycle_generation, stream_id)
+            else {
+                return Response::error(
+                    "invalid_request",
+                    "Browser launch reconciliation requires lifecycle_generation and stream_id",
+                );
+            };
+            return self.reconcile_launch(principal_id, &lifecycle_generation, &stream_id);
+        }
+        self.status(principal_id)
+    }
+
     fn status(&mut self, principal_id: Option<String>) -> Response {
         let stale_sessions_reaped = self.reconcile_page_control_sessions();
         Response::ok(json!({
-            "provider": "browser-engine-adapter",
-            "protocol_version": "1.0",
+            "provider": BROWSER_ENGINE_PROVIDER_ID,
+            "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
             "status": if self.adapters.is_empty() { "unavailable" } else { "configured" },
             "principal_id": principal_id,
             "adapter_count": self.adapters.len(),
@@ -294,6 +507,329 @@ impl BrowserEngineAdapter {
             "supported_display_modes": self.supported_display_modes(),
             "supported_guarantee_levels": self.supported_guarantee_levels(),
             "operations": ["status", "launch", "attach_stream", "close_page", "page_status", "diagnostics", "input", "webrtc_signal"],
+        }))
+    }
+
+    fn reconcile_launch(
+        &mut self,
+        principal_id: Option<String>,
+        lifecycle_generation: &str,
+        stream_id: &str,
+    ) -> Response {
+        if !is_safe_id(lifecycle_generation)
+            || lifecycle_generation.len() > 256
+            || !is_safe_id(stream_id)
+            || stream_id.len() > 256
+        {
+            return Response::error(
+                "invalid_request",
+                "Browser launch reconciliation identity is invalid",
+            );
+        }
+
+        let exact_sessions = self
+            .page_control_sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.generation == lifecycle_generation && session.stream_id == stream_id
+            })
+            .collect::<Vec<_>>();
+        if exact_sessions.len() > 1 {
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "cleanup_pending",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "reason": "provider has multiple effects for one lifecycle identity",
+            }));
+        }
+        if let Some((page_id, session)) = exact_sessions.into_iter().next() {
+            if !page_control_session_principal_matches(session, principal_id.as_deref()) {
+                return Response::error(
+                    "cleanup_binding_mismatch",
+                    "Browser launch reconciliation principal changed",
+                );
+            }
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "effect_acquired",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "effect": {
+                    "provider": BROWSER_ENGINE_PROVIDER_ID,
+                    "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
+                    "page_id": page_id,
+                    "adapter": session.adapter_id,
+                    "engine": session.engine,
+                    "stream_id": session.stream_id,
+                    "runtime_cleanup": engine_cleanup_binding(page_id, session),
+                },
+            }));
+        }
+        if self.page_control_sessions.values().any(|session| {
+            session.generation == lifecycle_generation || session.stream_id == stream_id
+        }) {
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "cleanup_pending",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "reason": "provider lifecycle identity conflict",
+            }));
+        }
+
+        let mut control_services = BTreeMap::<String, Vec<AdapterConfig>>::new();
+        for adapter in self.adapters.clone() {
+            if let Some(control_socket_path) = adapter
+                .supervisor
+                .as_ref()
+                .and_then(|supervisor| supervisor.control_socket_path.as_ref())
+            {
+                control_services
+                    .entry(control_socket_path.clone())
+                    .or_default()
+                    .push(adapter);
+            }
+        }
+        let mut every_control_service_proved_terminal = !control_services.is_empty();
+        let mut terminal_effects = None::<(bool, bool)>;
+        let reconciliation_deadline =
+            std::time::Instant::now() + BROWSER_ENGINE_RECONCILIATION_TOTAL_TIMEOUT;
+        for (control_socket_path, adapters) in control_services {
+            let remaining =
+                reconciliation_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                every_control_service_proved_terminal = false;
+                break;
+            }
+            let Ok(reconciliation) = supervisor_control_json_bounded(
+                &control_socket_path,
+                "POST",
+                "/launches/reconcile",
+                Some(json!({
+                    "schema": "elastos.browser.vm-control-service.reconcile-launch/v1",
+                    "lifecycle_generation": lifecycle_generation,
+                    "stream_id": stream_id,
+                })),
+                BROWSER_ENGINE_RECONCILIATION_TIMEOUT.min(remaining),
+                MAX_BROWSER_ENGINE_RECONCILIATION_RESPONSE_BYTES,
+            ) else {
+                every_control_service_proved_terminal = false;
+                continue;
+            };
+            if reconciliation.get("schema").and_then(Value::as_str)
+                != Some("elastos.browser.vm-control-service.launch-reconciliation/v1")
+                || reconciliation
+                    .get("launch")
+                    .and_then(|value| value.get("lifecycle_generation"))
+                    .and_then(Value::as_str)
+                    != Some(lifecycle_generation)
+                || reconciliation
+                    .get("launch")
+                    .and_then(|value| value.get("stream_id"))
+                    .and_then(Value::as_str)
+                    != Some(stream_id)
+            {
+                every_control_service_proved_terminal = false;
+                continue;
+            }
+            match reconciliation.get("state").and_then(Value::as_str) {
+                Some("did_not_act") => {
+                    let effects = reconciliation.get("effects");
+                    if effects
+                        .and_then(|effects| effects.get("page_acquired"))
+                        .and_then(Value::as_bool)
+                        != Some(false)
+                        || effects
+                            .and_then(|effects| effects.get("vm_acquired"))
+                            .and_then(Value::as_bool)
+                            != Some(false)
+                    {
+                        every_control_service_proved_terminal = false;
+                    }
+                    continue;
+                }
+                Some("terminal_post_effect_cleanup") => {
+                    let effects = reconciliation.get("effects");
+                    let Some(page_acquired) = effects
+                        .and_then(|effects| effects.get("page_acquired"))
+                        .and_then(Value::as_bool)
+                    else {
+                        every_control_service_proved_terminal = false;
+                        continue;
+                    };
+                    let Some(vm_acquired) = effects
+                        .and_then(|effects| effects.get("vm_acquired"))
+                        .and_then(Value::as_bool)
+                    else {
+                        every_control_service_proved_terminal = false;
+                        continue;
+                    };
+                    let aggregate = terminal_effects.get_or_insert((false, false));
+                    aggregate.0 |= page_acquired;
+                    aggregate.1 |= vm_acquired;
+                    continue;
+                }
+                Some("cleanup_pending") => {
+                    every_control_service_proved_terminal = false;
+                    continue;
+                }
+                Some("effect_acquired") => {}
+                _ => {
+                    every_control_service_proved_terminal = false;
+                    continue;
+                }
+            }
+
+            let Some(launch) = reconciliation.get("launch") else {
+                every_control_service_proved_terminal = false;
+                continue;
+            };
+            let Some(adapter_id) = launch.get("adapter").and_then(Value::as_str) else {
+                every_control_service_proved_terminal = false;
+                continue;
+            };
+            let Some(adapter) = adapters.iter().find(|adapter| adapter.id == adapter_id) else {
+                every_control_service_proved_terminal = false;
+                continue;
+            };
+            let recovered_principal = launch
+                .get("principal_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if principal_id.as_deref() != recovered_principal.as_deref()
+                || launch.get("engine").and_then(Value::as_str)
+                    != serde_json::to_value(adapter.kind)
+                        .ok()
+                        .as_ref()
+                        .and_then(Value::as_str)
+            {
+                every_control_service_proved_terminal = false;
+                continue;
+            }
+            let Ok(display_mode) = serde_json::from_value::<BrowserDisplayMode>(
+                launch.get("display_mode").cloned().unwrap_or(Value::Null),
+            ) else {
+                every_control_service_proved_terminal = false;
+                continue;
+            };
+            let Ok(guarantee_level) = serde_json::from_value::<BrowserGuaranteeLevel>(
+                launch
+                    .get("guarantee_level")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ) else {
+                every_control_service_proved_terminal = false;
+                continue;
+            };
+            let Ok(result) = serde_json::from_value::<SupervisorLaunchResult>(
+                reconciliation
+                    .get("supervisor_result")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ) else {
+                every_control_service_proved_terminal = false;
+                continue;
+            };
+            if validate_supervisor_result(&result, adapter, stream_id, display_mode).is_err() {
+                every_control_service_proved_terminal = false;
+                continue;
+            }
+            let recovered_control_socket = result
+                .control_socket_path
+                .clone()
+                .or_else(|| Some(control_socket_path.clone()));
+            let Some(recovered_control_socket) = recovered_control_socket else {
+                every_control_service_proved_terminal = false;
+                continue;
+            };
+            if validate_control_socket_path(&recovered_control_socket).is_err() {
+                every_control_service_proved_terminal = false;
+                continue;
+            }
+            let shutdown_socket_path = (result
+                .isolation
+                .as_ref()
+                .map(|isolation| isolation.kind.as_str())
+                == Some("per_launch_vm_target"))
+            .then(|| control_socket_path.clone());
+            let page_id = result.page_id.clone();
+            self.page_control_sessions.insert(
+                page_id.clone(),
+                PageControlSession {
+                    generation: lifecycle_generation.to_string(),
+                    stream_id: stream_id.to_string(),
+                    socket_path: recovered_control_socket,
+                    shutdown_socket_path,
+                    adapter_id: adapter.id.clone(),
+                    principal_id: recovered_principal,
+                    engine: adapter.kind,
+                    display_mode,
+                    guarantee_level,
+                    isolated_session: result.isolated_session,
+                    isolation_session_dir: result
+                        .isolation
+                        .as_ref()
+                        .map(|isolation| isolation.session_dir.clone()),
+                    isolation_kind: result
+                        .isolation
+                        .as_ref()
+                        .map(|isolation| isolation.kind.clone()),
+                    process: result.process.clone(),
+                },
+            );
+            let session = self
+                .page_control_sessions
+                .get(&page_id)
+                .expect("reconciled Browser page session");
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "effect_acquired",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "effect": {
+                    "provider": BROWSER_ENGINE_PROVIDER_ID,
+                    "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
+                    "page_id": page_id,
+                    "adapter": session.adapter_id,
+                    "engine": session.engine,
+                    "stream_id": session.stream_id,
+                    "runtime_cleanup": engine_cleanup_binding(&page_id, session),
+                },
+            }));
+        }
+
+        if every_control_service_proved_terminal {
+            if let Some((page_acquired, vm_acquired)) = terminal_effects {
+                return Response::ok(json!({
+                    "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                    "state": "terminal_post_effect_cleanup",
+                    "lifecycle_generation": lifecycle_generation,
+                    "stream_id": stream_id,
+                    "effects": {
+                        "page_acquired": page_acquired,
+                        "vm_acquired": vm_acquired,
+                    },
+                }));
+            }
+            return Response::ok(json!({
+                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                "state": "did_not_act",
+                "lifecycle_generation": lifecycle_generation,
+                "stream_id": stream_id,
+                "effects": {
+                    "page_acquired": false,
+                    "vm_acquired": false,
+                },
+            }));
+        }
+
+        Response::ok(json!({
+            "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+            "state": "cleanup_pending",
+            "lifecycle_generation": lifecycle_generation,
+            "stream_id": stream_id,
+            "reason": "no exact provider or control-service launch proof is currently available",
         }))
     }
 
@@ -339,7 +875,22 @@ impl BrowserEngineAdapter {
         })
     }
 
+    #[cfg(test)]
     fn launch_with_viewport(&mut self, context: LaunchContext<'_>) -> Response {
+        self.launch_with_generation(context, "sha256:test-lifecycle-generation")
+    }
+
+    fn launch_with_generation(
+        &mut self,
+        context: LaunchContext<'_>,
+        lifecycle_generation: &str,
+    ) -> Response {
+        if !is_safe_id(lifecycle_generation) || lifecycle_generation.len() > 256 {
+            return Response::error(
+                "invalid_request",
+                "lifecycle_generation must be a bounded safe Runtime identifier",
+            );
+        }
         if let Some(adapter_id) = context
             .adapter_id
             .as_deref()
@@ -408,7 +959,7 @@ impl BrowserEngineAdapter {
             );
         }
         if adapter.kind != AdapterKind::ContractProof {
-            return self.launch_with_supervisor(&adapter, context);
+            return self.launch_with_supervisor(&adapter, context, lifecycle_generation);
         }
         let page_id = stable_page_id(context.url, &context.stream_session.stream_id);
         let view = context.viewport.map(|viewport| {
@@ -421,6 +972,8 @@ impl BrowserEngineAdapter {
         });
         Response::ok(json!({
             "schema": "elastos.browser.engine.page/v1",
+            "provider": BROWSER_ENGINE_PROVIDER_ID,
+            "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
             "page_id": page_id,
             "adapter": adapter.id,
             "engine": adapter.kind,
@@ -441,6 +994,7 @@ impl BrowserEngineAdapter {
         &mut self,
         adapter: &AdapterConfig,
         context: LaunchContext<'_>,
+        lifecycle_generation: &str,
     ) -> Response {
         let Some(supervisor) = &adapter.supervisor else {
             return Response::error(
@@ -448,14 +1002,15 @@ impl BrowserEngineAdapter {
                 "Native Browser Engine Adapter requires an operator-approved supervisor",
             );
         };
-        let result = match run_supervisor_launch(supervisor, adapter, &context) {
-            Ok(result) => result,
-            Err(err) => return Response::error("engine_process_unavailable", err),
-        };
+        let result =
+            match run_supervisor_launch(supervisor, adapter, &context, lifecycle_generation) {
+                Ok(result) => result,
+                Err(err) => return Response::error(&err.code, err.message),
+            };
         if let Err(err) = validate_supervisor_result(
             &result,
             adapter,
-            context.stream_session,
+            &context.stream_session.stream_id,
             context.display_mode,
         ) {
             return Response::error("invalid_supervisor_result", err);
@@ -487,6 +1042,8 @@ impl BrowserEngineAdapter {
             self.page_control_sessions.insert(
                 result.page_id.clone(),
                 PageControlSession {
+                    generation: lifecycle_generation.to_string(),
+                    stream_id: context.stream_session.stream_id.clone(),
                     socket_path: socket_path.clone(),
                     shutdown_socket_path,
                     adapter_id: adapter.id.clone(),
@@ -503,11 +1060,18 @@ impl BrowserEngineAdapter {
                         .isolation
                         .as_ref()
                         .map(|isolation| isolation.kind.clone()),
+                    process: result.process.clone(),
                 },
             );
         }
+        let runtime_cleanup = self
+            .page_control_sessions
+            .get(&result.page_id)
+            .map(|session| engine_cleanup_binding(&result.page_id, session));
         Response::ok(json!({
             "schema": "elastos.browser.engine.page/v1",
+            "provider": BROWSER_ENGINE_PROVIDER_ID,
+            "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
             "page_id": result.page_id,
             "adapter": adapter.id,
             "engine": adapter.kind,
@@ -527,6 +1091,7 @@ impl BrowserEngineAdapter {
             "engine_control": if control_socket_path.is_some() { "page_scoped" } else { "unavailable" },
             "isolated_engine_session": result.isolated_session,
             "isolation": result.isolation,
+            "runtime_cleanup": runtime_cleanup,
         }))
     }
 
@@ -562,17 +1127,35 @@ impl BrowserEngineAdapter {
         }))
     }
 
-    fn close_page(&mut self, page_id: &str, principal_id: Option<String>) -> Response {
+    fn close_page(
+        &mut self,
+        page_id: &str,
+        principal_id: Option<String>,
+        runtime_cleanup: EngineCleanupBinding,
+    ) -> Response {
         if !is_safe_id(page_id) {
             return Response::error("invalid_request", "page_id must be a safe identifier");
         }
-        let Some(session) = self.page_control_sessions.get(page_id) else {
-            return Response::error(
-                "engine_process_unavailable",
-                "Browser page has no page-scoped engine control session",
-            );
+        if runtime_cleanup.page_id != page_id {
+            return Response::error("invalid_request", "Browser cleanup page binding changed");
+        }
+        let bound_session = match page_control_session_from_cleanup(&runtime_cleanup) {
+            Ok(session) => session,
+            Err(err) => return Response::error("invalid_request", err),
         };
-        if !page_control_session_principal_matches(session, principal_id.as_deref()) {
+        let session = match self.page_control_sessions.get(page_id) {
+            Some(session) => {
+                if engine_cleanup_binding(page_id, session) != runtime_cleanup {
+                    return Response::error(
+                        "cleanup_binding_mismatch",
+                        "Browser cleanup binding does not match the active provider effect",
+                    );
+                }
+                session.clone()
+            }
+            None => bound_session,
+        };
+        if !page_control_session_principal_matches(&session, principal_id.as_deref()) {
             return Response::error("page_not_found", "browser page not found");
         }
         if session.isolated_session {
@@ -587,31 +1170,55 @@ impl BrowserEngineAdapter {
                 Some(json!({
                     "page_id": page_id,
                     "principal_id": principal_id,
+                    "runtime_cleanup": runtime_cleanup,
+                    "force_retire_vm": true,
                 })),
             );
             return match shutdown_result {
                 Ok(data) => {
-                    self.page_control_sessions.remove(page_id);
-                    Response::ok(json!({
-                        "schema": "elastos.browser.close-result/v1",
-                        "page_id": page_id,
-                        "closed": true,
-                        "isolated_session": true,
-                        "shutdown": data,
-                    }))
-                }
-                Err(err) => match cleanup_isolated_session(session) {
-                    Ok(data) => {
-                        self.page_control_sessions.remove(page_id);
-                        Response::ok(json!({
-                            "schema": "elastos.browser.close-result/v1",
-                            "page_id": page_id,
-                            "closed": true,
-                            "isolated_session": true,
-                            "control_error": err,
-                            "cleanup": data,
-                        }))
+                    match engine_terminal_cleanup_result(&runtime_cleanup, data) {
+                        Ok(terminal) => {
+                            self.page_control_sessions.remove(page_id);
+                            Response::ok(terminal)
+                        }
+                        Err(proof_err) => {
+                            match cleanup_isolated_session(&session, &runtime_cleanup) {
+                            Ok(data) => match engine_terminal_cleanup_result(
+                                &runtime_cleanup,
+                                data,
+                            ) {
+                                Ok(terminal) => {
+                                    self.page_control_sessions.remove(page_id);
+                                    Response::ok(terminal)
+                                }
+                                Err(cleanup_err) => Response::error(
+                                    "engine_close_indeterminate",
+                                    format!(
+                                        "{proof_err}; deterministic cleanup proof invalid: {cleanup_err}"
+                                    ),
+                                ),
+                            },
+                            Err(cleanup_err) => Response::error(
+                                "engine_close_indeterminate",
+                                format!(
+                                    "{proof_err}; deterministic cleanup failed: {cleanup_err}"
+                                ),
+                            ),
+                        }
+                        }
                     }
+                }
+                Err(err) => match cleanup_isolated_session(&session, &runtime_cleanup) {
+                    Ok(data) => match engine_terminal_cleanup_result(&runtime_cleanup, data) {
+                        Ok(terminal) => {
+                            self.page_control_sessions.remove(page_id);
+                            Response::ok(terminal)
+                        }
+                        Err(cleanup_err) => Response::error(
+                            "engine_close_indeterminate",
+                            format!("{err}; cleanup proof invalid: {cleanup_err}"),
+                        ),
+                    },
                     Err(cleanup_err) => Response::error(
                         "engine_process_unavailable",
                         format!("{err}; cleanup failed: {cleanup_err}"),
@@ -623,6 +1230,7 @@ impl BrowserEngineAdapter {
         let body = json!({
             "page_id": page_id,
             "principal_id": principal_id,
+            "runtime_cleanup": runtime_cleanup,
         });
         let close_result = match supervisor_control_json(
             &socket_path,
@@ -633,8 +1241,12 @@ impl BrowserEngineAdapter {
             Ok(data) => data,
             Err(err) => return Response::error("engine_process_unavailable", err),
         };
+        let terminal = match engine_terminal_cleanup_result(&runtime_cleanup, close_result) {
+            Ok(result) => result,
+            Err(err) => return Response::error("engine_close_indeterminate", err),
+        };
         self.page_control_sessions.remove(page_id);
-        Response::ok(close_result)
+        Response::ok(terminal)
     }
 
     fn page_status(&self, page_id: &str, principal_id: Option<String>) -> Response {
@@ -788,9 +1400,8 @@ impl BrowserEngineAdapter {
         let stale_page_ids = self
             .page_control_sessions
             .iter()
-            .filter_map(|(page_id, session)| {
-                Self::page_control_session_is_stale(page_id, session).then(|| page_id.clone())
-            })
+            .filter(|(page_id, session)| Self::page_control_session_is_stale(page_id, session))
+            .map(|(page_id, _)| page_id.clone())
             .collect::<Vec<_>>();
         let stale_count = stale_page_ids.len();
         for page_id in stale_page_ids {
@@ -1142,9 +1753,11 @@ struct SupervisorLaunchResult {
     isolated_session: bool,
     #[serde(default)]
     isolation: Option<SupervisorIsolation>,
+    #[serde(default)]
+    process: Option<Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SupervisorIsolation {
     schema: String,
@@ -1156,6 +1769,10 @@ struct SupervisorIsolation {
 #[serde(rename_all = "snake_case")]
 enum AdapterIpcKind {
     UnixSocket,
+}
+
+fn decode_request(line: &str) -> Result<Request, serde_json::Error> {
+    serde_json::from_str(line)
 }
 
 fn main() {
@@ -1171,7 +1788,7 @@ fn main() {
     for line in stdin.lock().lines() {
         let response = match line {
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => match serde_json::from_str::<Request>(&line) {
+            Ok(line) => match decode_request(&line) {
                 Ok(Request::Shutdown) => {
                     let response = Response::empty_ok();
                     let _ = write_response(&mut stdout, &response);

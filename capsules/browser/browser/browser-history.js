@@ -1,33 +1,3 @@
-export function localBrowserInstanceId() {
-  if (window.crypto && typeof window.crypto.randomUUID === "function") {
-    return `browser:${window.crypto.randomUUID()}`;
-  }
-  return `browser:${Date.now()}:${Math.random().toString(16).slice(2)}`;
-}
-
-export function rememberedRuntimePage(storageKey) {
-  try {
-    const pageId = window.sessionStorage.getItem(storageKey);
-    return pageId ? { page_id: pageId } : null;
-  } catch {
-    return null;
-  }
-}
-
-export function publishRuntimePageForHost(storageKey, page) {
-  const pageId = page?.page_id || "";
-  window.__elastosBrowserCurrentPageId = pageId;
-  try {
-    if (pageId) {
-      window.sessionStorage.setItem(storageKey, pageId);
-    } else {
-      window.sessionStorage.removeItem(storageKey);
-    }
-  } catch {
-    // Session storage can be blocked by the embedding environment; in-memory cleanup still runs.
-  }
-}
-
 export function commitHistoryState({ entries, index }, url, mode) {
   if (mode === "none") {
     return { entries, index };
