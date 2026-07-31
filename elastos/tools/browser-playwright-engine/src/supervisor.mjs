@@ -22,6 +22,7 @@ const WEBRTC_MAX_FRAMERATE = 30;
 const SCREENCAST_JPEG_QUALITY = 95;
 const DISPLAY_BACKEND = "cdp_screencast_i420";
 const DISPLAY_BACKEND_CLASS = "proof_surface";
+const WALLET_RUNTIME_ORIGIN = "null";
 
 const __filename = fileURLToPath(import.meta.url);
 const { RTCVideoSource, rgbaToI420 } = wrtc.nonstandard;
@@ -1263,6 +1264,7 @@ async function requestRuntimeWalletRead(wallet, source, method, params, current)
   const response = await fetch(wallet.read_url, {
     method: "POST",
     headers: {
+      Origin: WALLET_RUNTIME_ORIGIN,
       "content-type": "application/json",
       "x-elastos-home-token": wallet.home_token,
     },
@@ -1326,6 +1328,7 @@ async function requestRuntimeWalletApproval(wallet, source, method, params, curr
     response = await fetch(wallet.approval_url, {
       method: "POST",
       headers: {
+        Origin: WALLET_RUNTIME_ORIGIN,
         "content-type": "application/json",
         "x-elastos-home-token": wallet.home_token,
       },
@@ -1401,6 +1404,7 @@ async function requestRuntimeWalletTransaction(wallet, source, method, params, c
     response = await fetch(wallet.transaction_url, {
       method: "POST",
       headers: {
+        Origin: WALLET_RUNTIME_ORIGIN,
         "content-type": "application/json",
         "x-elastos-home-token": wallet.home_token,
       },
@@ -1531,6 +1535,7 @@ async function broadcastWalletTransaction(wallet, requestId) {
   const response = await fetch(wallet.transaction_broadcast_url, {
     method: "POST",
     headers: {
+      Origin: WALLET_RUNTIME_ORIGIN,
       "content-type": "application/json",
       "x-elastos-home-token": wallet.home_token,
     },
@@ -1556,6 +1561,7 @@ async function broadcastWalletTransaction(wallet, requestId) {
 async function fetchWalletApprovalStatus(wallet, requestId) {
   const response = await fetch(`${wallet.approval_status_url}/${encodeURIComponent(requestId)}`, {
     headers: {
+      Origin: WALLET_RUNTIME_ORIGIN,
       "x-elastos-home-token": wallet.home_token,
     },
   });

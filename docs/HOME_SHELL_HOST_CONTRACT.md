@@ -60,11 +60,22 @@ the gateway's narrow `Origin: null` CORS policy; unrelated web origins remain
 denied.
 
 Runtime-generated browser routes carry a scoped launch token in the URL
-fragment. The fragment is removed from visible history after bootstrap and is
-never sent as an HTTP referrer. Runtime binds the token to the principal,
-session, grant, target capsule, and expected browser origin. Browser API calls
-must present matching Host, Origin, and Referer context. A Home session cookie
-alone cannot mint an app token.
+fragment. Its contract is `elastos.home.launch-token/v4`. The fragment is
+removed from visible history after bootstrap and is never sent as an HTTP
+referrer. Runtime signs the v4 payload under the matching
+`elastos.home.launch.v4` domain, including a collision-resistant launch id, the
+selected resource, executable actor, authorizing actor, principal, session,
+proof binding, grant, issue/expiry times, non-delegation flag, and any exact
+operation/request digest. A direct launch uses the executable actor as its
+authorizing actor. A Home-created child launch records `home` as the authorizing
+actor and cannot delegate again. A viewer is therefore the actor for selected
+content, not a replacement identity for that content. Browser API calls from
+capsules require one valid Host and exactly
+`Origin: null`; direct Home calls require same-origin browser provenance from an
+exact destination Origin or Referer, or `Sec-Fetch-Site: same-origin`. Internal
+shell launch-grant transfer uses a separate non-browser validation path. Runtime
+rejects missing or conflicting provenance, v2, v3, mixed-shape, expired, and
+substituted tokens. A Home session cookie alone cannot mint an app token.
 
 The Home session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` on HTTPS.
 Capsule responses use CSP, referrer, content-type, and resource-policy headers

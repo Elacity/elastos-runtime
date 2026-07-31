@@ -7,7 +7,7 @@ async fn test_documents_provider_routes_require_home_launch_token() {
 
     let denied = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/summary")
                 .header(CONTENT_TYPE, "application/json")
@@ -27,7 +27,7 @@ async fn test_inbox_routes_require_home_token_and_return_notifications() {
     let denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .body(Body::empty())
                 .unwrap(),
@@ -40,7 +40,7 @@ async fn test_inbox_routes_require_home_token_and_return_notifications() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -59,7 +59,7 @@ async fn test_inbox_routes_require_home_token_and_return_notifications() {
 
     let bad_action = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", token)
@@ -81,7 +81,7 @@ async fn test_documents_provider_round_trip() {
     let created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/create")
                 .header("x-elastos-home-token", token.clone())
@@ -109,7 +109,7 @@ async fn test_documents_provider_round_trip() {
     let saved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/save")
                 .header("x-elastos-home-token", token.clone())
@@ -131,7 +131,7 @@ async fn test_documents_provider_round_trip() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/summary")
                 .header("x-elastos-home-token", token.clone())
@@ -160,7 +160,7 @@ async fn test_documents_provider_round_trip() {
     let fetched = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/get")
                 .header("x-elastos-home-token", token.clone())
@@ -193,7 +193,7 @@ async fn test_documents_provider_round_trip() {
     let deleted = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/delete")
                 .header("x-elastos-home-token", token.clone())
@@ -217,7 +217,7 @@ async fn test_documents_provider_round_trip() {
 
     let summary_after_delete = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/summary")
                 .header("x-elastos-home-token", token)
@@ -259,7 +259,7 @@ async fn test_documents_provider_scopes_documents_to_launch_principal() {
     let admin_created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/create")
                 .header("x-elastos-home-token", admin_token.clone())
@@ -286,7 +286,7 @@ async fn test_documents_provider_scopes_documents_to_launch_principal() {
     let guest_created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/create")
                 .header("x-elastos-home-token", guest_token.clone())
@@ -314,7 +314,7 @@ async fn test_documents_provider_scopes_documents_to_launch_principal() {
     let admin_summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/summary")
                 .header("x-elastos-home-token", admin_token.clone())
@@ -338,7 +338,7 @@ async fn test_documents_provider_scopes_documents_to_launch_principal() {
 
     let guest_fetch_admin = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/get")
                 .header("x-elastos-home-token", guest_token)
@@ -373,7 +373,7 @@ async fn test_library_home_token_can_read_documents_provider_summary() {
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/summary")
                 .header("x-elastos-home-token", token)
@@ -400,7 +400,7 @@ async fn test_library_home_token_cannot_mutate_documents_provider() {
 
     let denied = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/documents/create")
                 .header("x-elastos-home-token", token)
@@ -450,7 +450,7 @@ async fn test_viewer_gateway_routes_list_and_serve_viewer_bound_capsules() {
     let denied_library = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/viewers/gba-emulator/library")
                 .body(Body::empty())
                 .unwrap(),
@@ -462,7 +462,7 @@ async fn test_viewer_gateway_routes_list_and_serve_viewer_bound_capsules() {
     let library = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/viewers/gba-emulator/library")
                 .header("x-elastos-home-token", home_token.clone())
                 .body(Body::empty())
@@ -486,11 +486,17 @@ async fn test_viewer_gateway_routes_list_and_serve_viewer_bound_capsules() {
     assert!(capsules.contains(&"gba-ucity"));
     assert_eq!(payload["items"][0]["entrypoint"], "demo.gba");
 
-    let rom_home_token = issue_home_launch_token(dir.path(), "demo-rom").unwrap();
+    let rom_home_token = issue_home_projection_launch_token_with_context(
+        dir.path(),
+        "demo-rom",
+        GBA_EMULATOR_CAPSULE_ID,
+        &local_home_launch_token_context(dir.path()).unwrap(),
+    )
+    .unwrap();
     let rom_library = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/viewers/gba-emulator/library")
                 .header("x-elastos-home-token", rom_home_token.clone())
                 .body(Body::empty())
@@ -514,7 +520,7 @@ async fn test_viewer_gateway_routes_list_and_serve_viewer_bound_capsules() {
     let content = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/viewers/gba-emulator/content/demo-rom")
                 .header("x-elastos-home-token", rom_home_token)
                 .body(Body::empty())
@@ -535,11 +541,17 @@ async fn test_viewer_gateway_routes_list_and_serve_viewer_bound_capsules() {
         .unwrap();
     assert_eq!(&body[..], b"rom-data");
 
-    let wrong_viewer_token = issue_home_launch_token(dir.path(), "other-rom").unwrap();
+    let wrong_viewer_token = issue_home_projection_launch_token_with_context(
+        dir.path(),
+        "other-rom",
+        "other-viewer",
+        &local_home_launch_token_context(dir.path()).unwrap(),
+    )
+    .unwrap();
     let wrong_viewer = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/viewers/gba-emulator/content/other-rom")
                 .header("x-elastos-home-token", wrong_viewer_token)
                 .body(Body::empty())
@@ -547,11 +559,11 @@ async fn test_viewer_gateway_routes_list_and_serve_viewer_bound_capsules() {
         )
         .await
         .unwrap();
-    assert_eq!(wrong_viewer.status(), StatusCode::NOT_FOUND);
+    assert_eq!(wrong_viewer.status(), StatusCode::UNAUTHORIZED);
 
     let non_viewer = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/viewers/documents/library")
                 .header("x-elastos-home-token", home_token)
                 .body(Body::empty())
@@ -579,7 +591,7 @@ async fn test_viewer_gateway_storage_routes_require_home_token_and_round_trip_by
     let unauthorized = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri("/api/viewers/gba-emulator/storage/demo-rom/state/demo.ss1")
                 .body(Body::from("save-state"))
@@ -592,7 +604,7 @@ async fn test_viewer_gateway_storage_routes_require_home_token_and_round_trip_by
     let put = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri("/api/viewers/gba-emulator/storage/demo-rom/state/demo.ss1")
                 .header("x-elastos-home-token", home_token.clone())
@@ -605,7 +617,7 @@ async fn test_viewer_gateway_storage_routes_require_home_token_and_round_trip_by
 
     let get = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/viewers/gba-emulator/storage/demo-rom/state/demo.ss1")
                 .header("x-elastos-home-token", home_token)
                 .body(Body::empty())
@@ -647,7 +659,7 @@ async fn test_viewer_gateway_storage_scopes_users_self_to_launch_principal() {
     let admin_put = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri(storage_uri)
                 .header("x-elastos-home-token", admin_token.clone())
@@ -661,7 +673,7 @@ async fn test_viewer_gateway_storage_scopes_users_self_to_launch_principal() {
     let guest_put = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri(storage_uri)
                 .header("x-elastos-home-token", guest_token.clone())
@@ -675,7 +687,7 @@ async fn test_viewer_gateway_storage_scopes_users_self_to_launch_principal() {
     let admin_get = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(storage_uri)
                 .header("x-elastos-home-token", admin_token)
                 .body(Body::empty())
@@ -691,7 +703,7 @@ async fn test_viewer_gateway_storage_scopes_users_self_to_launch_principal() {
 
     let guest_get = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(storage_uri)
                 .header("x-elastos-home-token", guest_token)
                 .body(Body::empty())

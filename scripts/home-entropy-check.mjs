@@ -3557,7 +3557,7 @@ assert(
 );
 assert(
   gatewayApi.includes(
-    '"launch_grant": issue_home_launch_token_with_context(data_dir, capsule_name, context)?',
+    '"launch_grant": issue_home_projection_launch_token_with_context(',
   ) &&
     !gatewayApi.includes('"principal_id": context.principal_id.as_str()') &&
     apiRoutes.includes("principal_launch_accepts_home_launch_grant") &&
@@ -4237,9 +4237,15 @@ const auditChainBoundary = {
     runtimeAuth.includes("audit chain anchor signer is not the Runtime identity") &&
     runtimeAuth.includes("audit chain state signer is not the Runtime identity"),
   unchainedHistoryFailsClosed: runtimeAuth.includes("unchained audit history is unsupported") &&
-    runtimeAuth.includes("audit chain activation record is required"),
+    runtimeAuth.includes("unchained auth state is unsupported") &&
+    runtimeAuth.includes("fresh data root") &&
+    runtimeAuth.includes("audit chain state is required after activation"),
   regressionCoverage: runtimeAuth.includes("audit_chain_rejects_foreign_signers_for_every_artifact") &&
-    runtimeAuth.includes("audit_chain_activation_is_fail_closed"),
+    runtimeAuth.includes("audit_chain_activation_recovers_and_rejects_signed_state_rollback") &&
+    runtimeAuth.includes("audit_chain_activation_advances_after_an_interrupted_checkpoint_publish") &&
+    runtimeAuth.includes("audit_chain_activation_rejects_same_sequence_substitution") &&
+    runtimeAuth.includes("retained_audit_chain_requires_its_signed_anchor") &&
+    runtimeAuth.includes("legacy_unchained_authority_is_rejected_before_expiry_pruning"),
 };
 assert(
   Object.values(auditChainBoundary).every(Boolean),
@@ -6075,7 +6081,9 @@ assert(
     gbaDemoSmoke.includes("gateway_tests::gba") &&
     gbaLiveSmoke.includes("/api/viewers/gba-emulator/content/gba-ucity") &&
     gbaLiveSmoke.includes("/storage/gba-emulator/save/") &&
-    gatewayApi.includes("let authority_target = target_summary") &&
+    gatewayApi.includes("let executable_actor = target_summary") &&
+    gatewayApi.includes("issue_home_projection_launch_token_with_context") &&
+    gatewayApi.includes("issue_home_projection_launch_token_with_intent") &&
     gatewayTests.includes("home_content_launch_uses_the_bound_gba_viewer_without_compute") &&
     libraryMenuSmoke.includes('message?.target === "gba-emulator"') &&
     libraryMenuSmoke.includes('message?.query?.objectUri?.endsWith("/Game.gba")') &&
@@ -9465,6 +9473,39 @@ assert(
   Object.values(iframeOriginBoundary).every(Boolean),
   "Home app frames must use opaque sandbox isolation without DNS or ambient Home authority",
   iframeOriginBoundary,
+);
+const launchAuthorityBoundary = {
+  versionedContract:
+    gatewayApi.includes('const HOME_LAUNCH_TOKEN_DOMAIN: &str = "elastos.home.launch.v4"') &&
+    gatewayApi.includes('const HOME_LAUNCH_TOKEN_SCHEMA: &str = "elastos.home.launch-token/v4"') &&
+    gatewayApi.includes('const HOME_LAUNCH_CONTEXT_SCHEMA: &str = "elastos.runtime.browser-launch/v1"'),
+  exactLaunchBinding:
+    gatewayApi.includes("selected_resource: String") &&
+    gatewayApi.includes("executable_actor: String") &&
+    gatewayApi.includes("authority_actor: String") &&
+    gatewayApi.includes("app == &envelope.payload.launch_context.authority_actor") &&
+    gatewayApi.includes("valid_home_launch_id") &&
+    gatewayApi.includes("proofless home launch token is not exact Runtime-local device authority"),
+  strictBrowserBoundary:
+    gatewayApi.includes("require_capsule_browser_origin") &&
+    gatewayApi.includes("require_exact_home_browser_origin") &&
+    gatewayApi.includes("conflicting Home launch-token authorities") &&
+    gatewayApi.includes("internal launch transfer must not carry browser provenance"),
+  regressionCoverage:
+    gatewayApi.includes("projection_token_binds_resource_actor_and_unique_launch") &&
+    gatewayApi.includes("launch_token_rejects_expiry_stale_schema_and_mixed_shape") &&
+    gatewayApi.includes("launch_token_requires_exact_session_authority_and_origin") &&
+    gatewayTests.includes("selected_gba_content_token_rejects_resource_substitution"),
+  documented:
+    homeShellHostContract.includes("elastos.home.launch-token/v4") &&
+    homeShellHostContract.includes("elastos.home.launch.v4") &&
+    homeShellHostContract.includes("authorizing actor") &&
+    homeShellHostContract.includes("same-origin browser provenance"),
+};
+assert(
+  Object.values(launchAuthorityBoundary).every(Boolean),
+  "Launch authority must remain versioned, collision-resistant, exact-context-bound, and browser-origin-scoped",
+  launchAuthorityBoundary,
 );
 const homeLaunchSource = sourceBlock(
   gatewayApi,

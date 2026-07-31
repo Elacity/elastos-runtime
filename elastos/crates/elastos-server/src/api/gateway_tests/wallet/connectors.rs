@@ -11,7 +11,7 @@ async fn test_wallet_connector_route_requires_connector_launch_token() {
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-metamask/wallet/approvals")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())
@@ -33,7 +33,7 @@ async fn test_wallet_connector_route_rejects_unknown_connector_capsule() {
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-unknown/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -61,7 +61,7 @@ async fn test_walletconnect_connector_requires_pinned_config() {
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-walletconnect/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -93,7 +93,7 @@ async fn test_walletconnect_connector_accepts_pinned_config() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-walletconnect/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -123,7 +123,7 @@ async fn test_walletconnect_connector_config_returns_pinned_sdk_contract() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-walletconnect/wallet/config")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -167,7 +167,7 @@ async fn test_wallet_summary_reports_walletconnect_available_only_when_pinned() 
     let without_config = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -193,7 +193,7 @@ async fn test_wallet_summary_reports_walletconnect_available_only_when_pinned() 
 
     let with_config = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -225,7 +225,7 @@ async fn test_metamask_connector_config_returns_runtime_evm_chain_metadata() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-metamask/wallet/config")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -315,7 +315,7 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-metamask/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -387,7 +387,7 @@ async fn test_wallet_connector_approvals_are_scoped_to_connector() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-metamask/wallet/approvals")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -450,7 +450,7 @@ async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-unisat/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -505,7 +505,7 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/approvals/wallet-approval%3Abitcoin/approve")
                 .header("x-elastos-home-token", token.clone())
@@ -526,7 +526,7 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
 
     let completed = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/approvals/wallet-approval%3Abitcoin/complete")
                 .header("x-elastos-home-token", token)
@@ -580,7 +580,7 @@ async fn test_metamask_connector_approves_external_wallet_request_with_handoff()
 
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(
                     "/api/apps/wallet-metamask/wallet/approvals/wallet-approval%3Aexternal/approve",
@@ -669,7 +669,7 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(
                     "/api/apps/wallet-metamask/wallet/approvals/wallet-approval%3Aexternal/approve",
@@ -685,7 +685,7 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
 
     let completed = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet-metamask/wallet/approvals/wallet-approval%3Aexternal/complete")
                 .header("x-elastos-home-token", token)

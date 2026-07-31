@@ -8,7 +8,7 @@ async fn test_home_token_cannot_read_chain_provider() {
 
     let denied = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/provider/chain/networks")
                 .header("x-elastos-home-token", token)
@@ -34,7 +34,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let local_state = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token.clone())
@@ -63,11 +63,10 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let challenge = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", connector_token.clone())
                 .body(Body::from(
                     json!({
@@ -96,11 +95,10 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let verified = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/evm/verify")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", connector_token)
                 .body(Body::from(
                     json!({
@@ -141,7 +139,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::empty())
@@ -193,7 +191,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let wallet_state = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token.clone())
@@ -223,10 +221,9 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let launch_system = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"system"}"#))
@@ -243,7 +240,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let system_summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/summary")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())
@@ -279,7 +276,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let revoked = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri(format!("/api/auth/sessions/{session_id}/revoke"))
                 .header("x-elastos-home-token", authority.home_token.clone())
@@ -292,7 +289,7 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
 
     let standard = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token)
                 .body(Body::empty())
@@ -319,11 +316,14 @@ async fn test_auth_session_revoke_rejects_other_principal_home_and_system_tokens
         crate::auth::RuntimePrincipalRole::Guest,
     );
 
-    for token in [guest.home_token.clone(), guest.system_token.clone()] {
+    for (token, origin) in [
+        (guest.home_token.clone(), "http://localhost:61180"),
+        (guest.system_token.clone(), "null"),
+    ] {
         let rejected = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", origin)
                     .method("POST")
                     .uri(format!("/api/auth/sessions/{}/revoke", admin.session_id))
                     .header("x-elastos-home-token", token)
@@ -355,7 +355,7 @@ async fn test_auth_session_revoke_allows_admin_to_revoke_guest_session() {
 
     let revoked = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/auth/sessions/{}/revoke", guest.session_id))
                 .header("x-elastos-home-token", admin.system_token)
@@ -393,11 +393,10 @@ async fn test_metamask_connector_token_can_link_evm_wallet() {
     let challenge = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", connector_token.clone())
                 .body(Body::from(
                     json!({
@@ -421,11 +420,10 @@ async fn test_metamask_connector_token_can_link_evm_wallet() {
 
     let verified = app
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/evm/verify")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", connector_token)
                 .body(Body::from(
                     json!({
@@ -474,11 +472,10 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
         let challenge = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("elastos.elacitylabs.com", "null")
                     .method("POST")
                     .uri("/api/auth/evm/challenge")
                     .header(CONTENT_TYPE, "application/json")
-                    .header("host", "elastos.elacitylabs.com")
                     .header("x-elastos-home-token", connector_token.clone())
                     .body(Body::from(
                         json!({
@@ -502,11 +499,10 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
         let verified = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("elastos.elacitylabs.com", "null")
                     .method("POST")
                     .uri("/api/auth/evm/verify")
                     .header(CONTENT_TYPE, "application/json")
-                    .header("host", "elastos.elacitylabs.com")
                     .header("x-elastos-home-token", connector_token.clone())
                     .body(Body::from(
                         json!({
@@ -526,7 +522,7 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", wallet_token.clone())
                 .body(Body::empty())
@@ -560,7 +556,7 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
     let deleted = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("DELETE")
                 .uri(format!("/api/apps/wallet/wallet/accounts/{encoded}"))
                 .header("x-elastos-home-token", wallet_token.clone())
@@ -577,7 +573,7 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
 
     let refreshed = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", wallet_token)
                 .body(Body::empty())
@@ -618,11 +614,10 @@ async fn test_metamask_connector_token_can_link_erc1271_wallet() {
     let challenge = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", connector_token.clone())
                 .body(Body::from(
                     json!({
@@ -644,11 +639,10 @@ async fn test_metamask_connector_token_can_link_erc1271_wallet() {
 
     let verified = app
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/evm/verify")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", connector_token)
                 .body(Body::from(
                     json!({
@@ -691,11 +685,10 @@ async fn test_evm_auth_challenge_uses_http_for_loopback_home() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("127.0.0.1:8090", "null")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "127.0.0.1:8090")
                 .header("x-elastos-home-token", connector_token)
                 .body(Body::from(
                     json!({
@@ -728,11 +721,10 @@ async fn test_evm_wallet_link_rejects_system_token_without_connector() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.local", "null")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.local")
                 .header("x-elastos-home-token", authority.system_token)
                 .body(Body::from(
                     json!({
@@ -756,11 +748,10 @@ async fn test_btc_wallet_link_rejects_system_token_without_connector() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.local", "null")
                 .method("POST")
                 .uri("/api/auth/btc/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.local")
                 .header("x-elastos-home-token", authority.system_token)
                 .body(Body::from(
                     json!({
@@ -787,11 +778,10 @@ async fn test_wallet_token_cannot_link_bip322_account() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/btc/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", wallet_token.clone())
                 .body(Body::from(
                     json!({
@@ -827,11 +817,10 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
     let challenge = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/btc/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", connector_token.clone())
                 .body(Body::from(
                     json!({
@@ -854,11 +843,10 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
     let verified = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "null")
                 .method("POST")
                 .uri("/api/auth/btc/verify")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.elacitylabs.com")
                 .header("x-elastos-home-token", connector_token)
                 .body(Body::from(
                     json!({
@@ -888,7 +876,7 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-unisat/wallet/accounts")
                 .header(
                     "x-elastos-home-token",
@@ -924,11 +912,10 @@ async fn test_evm_auth_challenge_is_single_use() {
     let challenge = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.local", "null")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.local")
                 .header("x-elastos-home-token", connector_token.clone())
                 .body(Body::from(
                     json!({
@@ -952,7 +939,7 @@ async fn test_evm_auth_challenge_is_single_use() {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/auth/evm/verify")
                     .header(CONTENT_TYPE, "application/json")
@@ -1014,11 +1001,10 @@ async fn test_evm_auth_challenge_requires_wallet_provider() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.local", "null")
                 .method("POST")
                 .uri("/api/auth/evm/challenge")
                 .header(CONTENT_TYPE, "application/json")
-                .header("host", "elastos.local")
                 .header("x-elastos-home-token", connector_token)
                 .body(Body::from(
                     json!({

@@ -10,7 +10,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
     let created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", token.clone())
@@ -58,7 +58,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
     let sent = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/send")
                 .header("x-elastos-home-token", token.clone())
@@ -98,7 +98,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())

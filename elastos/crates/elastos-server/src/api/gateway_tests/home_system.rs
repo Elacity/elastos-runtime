@@ -28,13 +28,13 @@ async fn home_test_get_json(
     app: &axum::Router,
     uri: &str,
     token: &str,
+    origin: &'static str,
 ) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", origin)
                 .uri(uri)
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -53,15 +53,15 @@ async fn home_test_post_json(
     app: &axum::Router,
     uri: &str,
     token: &str,
+    origin: &'static str,
     payload: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", origin)
                 .method("POST")
                 .uri(uri)
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(payload.to_string()))
@@ -135,7 +135,7 @@ async fn test_home_static_route_serves_browser_surface() {
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/apps/home/")
                 .body(Body::empty())
                 .unwrap(),
@@ -295,6 +295,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home-cli/terminal/sessions")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -308,6 +310,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home-cli/terminal/sessions")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
@@ -322,6 +326,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home-cli/terminal/sessions")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", cli_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -416,6 +422,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri(resize_url)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", cli_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -445,6 +453,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri(intent_url)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -468,6 +478,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri(intent_url)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", cli_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -490,6 +502,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri(intent_url)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", cli_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -514,6 +528,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri(intent_url)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", cli_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -551,6 +567,8 @@ async fn test_home_cli_terminal_stream_requires_cli_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri(close_url)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", cli_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
@@ -645,7 +663,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/mkdir")
                 .header("x-elastos-home-token", library_token.as_str())
@@ -666,7 +684,7 @@ async fn test_home_summary_reports_identity_and_launch_targets() {
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -866,7 +884,7 @@ async fn test_services_summary_requires_services_token_and_reports_browser_exit(
     let denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/services/summary")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .body(Body::empty())
@@ -879,7 +897,7 @@ async fn test_services_summary_requires_services_token_and_reports_browser_exit(
     let ok = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/services/summary")
                 .header(
                     "x-elastos-home-token",
@@ -912,7 +930,7 @@ async fn test_services_summary_requires_services_token_and_reports_browser_exit(
 
     let enabled = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header(
@@ -973,7 +991,7 @@ async fn test_services_summary_projects_configured_remote_exit_without_ticket() 
     let ok = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/services/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -1016,7 +1034,7 @@ async fn test_services_summary_projects_configured_remote_exit_without_ticket() 
 
     let remove = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header("x-elastos-home-token", token)
@@ -1054,7 +1072,7 @@ async fn test_services_selection_state_is_principal_scoped() {
     let admin_enabled = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header("x-elastos-home-token", admin_token.clone())
@@ -1071,7 +1089,7 @@ async fn test_services_selection_state_is_principal_scoped() {
     let guest_default = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/services/summary")
                 .header("x-elastos-home-token", guest_token.clone())
                 .body(Body::empty())
@@ -1089,7 +1107,7 @@ async fn test_services_selection_state_is_principal_scoped() {
     let guest_saved_empty = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header("x-elastos-home-token", guest_token)
@@ -1105,7 +1123,7 @@ async fn test_services_selection_state_is_principal_scoped() {
 
     let admin_still_enabled = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/services/summary")
                 .header("x-elastos-home-token", admin_token)
                 .body(Body::empty())
@@ -1134,7 +1152,7 @@ async fn test_home_summary_ignores_services_state_left_unencrypted_before_root_p
     let selected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header("x-elastos-home-token", services_token)
@@ -1152,7 +1170,7 @@ async fn test_home_summary_ignores_services_state_left_unencrypted_before_root_p
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token)
                 .body(Body::empty())
@@ -1192,7 +1210,7 @@ async fn test_home_summary_ignores_invalid_protected_services_state() {
     let app = gateway_router(test_state(dir.path()));
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token)
                 .body(Body::empty())
@@ -1236,7 +1254,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     ] {
         let response = app
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/system/identity/profile-card")
                     .header("x-elastos-home-token", token)
@@ -1304,7 +1322,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     let right_shared = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header("x-elastos-home-token", right_services_token)
@@ -1323,7 +1341,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     let left_services = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/services/summary")
                 .header("x-elastos-home-token", left_services_token.clone())
                 .body(Body::empty())
@@ -1348,7 +1366,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     let requested = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header("x-elastos-home-token", left_services_token.clone())
@@ -1376,7 +1394,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     let inbox = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", right_inbox_token.clone())
                 .body(Body::empty())
@@ -1410,7 +1428,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     let approved = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", right_inbox_token.clone())
@@ -1433,7 +1451,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
 
     let inbox_after = right_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", right_inbox_token)
                 .body(Body::empty())
@@ -1453,7 +1471,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
 
     let left_summary_after = left_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/services/summary")
                 .header("x-elastos-home-token", left_services_token)
                 .body(Body::empty())
@@ -1558,7 +1576,7 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
     let left_services = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/services/summary")
                 .header("x-elastos-home-token", left_services_token.clone())
                 .body(Body::empty())
@@ -1587,7 +1605,7 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
     let requested = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header("x-elastos-home-token", left_services_token.clone())
@@ -1618,7 +1636,7 @@ async fn test_services_remote_exit_request_local_only_does_not_save_requested_st
 
     let left_services_after = left_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/services/summary")
                 .header("x-elastos-home-token", left_services_token)
                 .body(Body::empty())
@@ -1719,7 +1737,7 @@ async fn test_home_summary_reports_people_contacts_from_accepted_conversation_me
     let resp = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -1802,7 +1820,7 @@ async fn test_home_summary_reports_people_contacts_from_accepted_conversation_me
         .to_string();
     let grant_required_selection = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/services/offers")
                 .header(
@@ -1900,11 +1918,10 @@ async fn test_people_invite_create_returns_conversation_join_link() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/invites/create")
                 .header("x-elastos-home-token", authority.people_token.as_str())
-                .header("host", "localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1932,7 +1949,7 @@ async fn test_people_discovery_toggle_persists_in_home_summary() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery")
                 .header("x-elastos-home-token", token.as_str())
@@ -1960,7 +1977,7 @@ async fn test_people_discovery_toggle_persists_in_home_summary() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", home_token.as_str())
                 .body(Body::empty())
@@ -2013,7 +2030,7 @@ async fn test_people_discovery_expired_visibility_reports_off_and_refresh_does_n
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", home_token.as_str())
                 .body(Body::empty())
@@ -2036,7 +2053,7 @@ async fn test_people_discovery_expired_visibility_reports_off_and_refresh_does_n
 
     let refresh = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", token.as_str())
@@ -2076,7 +2093,7 @@ async fn test_people_discovery_refresh_finds_visible_peer() {
     let left_enable = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2090,7 +2107,7 @@ async fn test_people_discovery_refresh_finds_visible_peer() {
 
     let right_enable = right_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery")
                 .header("x-elastos-home-token", right_token.as_str())
@@ -2104,7 +2121,7 @@ async fn test_people_discovery_refresh_finds_visible_peer() {
 
     let left_refresh = left_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2140,7 +2157,7 @@ async fn test_people_discovery_refresh_waits_for_pending_peer_capability() {
     let enable = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery")
                 .header("x-elastos-home-token", token.as_str())
@@ -2154,7 +2171,7 @@ async fn test_people_discovery_refresh_waits_for_pending_peer_capability() {
 
     let refresh = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", token.as_str())
@@ -2197,7 +2214,7 @@ async fn test_people_discovery_refresh_joins_configured_peer_ticket() {
     let enable = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery")
                 .header("x-elastos-home-token", token.as_str())
@@ -2211,7 +2228,7 @@ async fn test_people_discovery_refresh_joins_configured_peer_ticket() {
 
     let refresh = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", token.as_str())
@@ -2255,7 +2272,7 @@ async fn test_people_discovery_refresh_reuses_recent_join_and_presence() {
     let enable = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery")
                 .header("x-elastos-home-token", token.as_str())
@@ -2270,7 +2287,7 @@ async fn test_people_discovery_refresh_reuses_recent_join_and_presence() {
 
     let refresh = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", token.as_str())
@@ -2394,7 +2411,7 @@ async fn test_people_discovery_request_send_failure_does_not_save_requested_stat
     ] {
         let response = app
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/people/discovery")
                     .header("x-elastos-home-token", token)
@@ -2410,7 +2427,7 @@ async fn test_people_discovery_request_send_failure_does_not_save_requested_stat
     let left_refresh = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2427,7 +2444,7 @@ async fn test_people_discovery_request_send_failure_does_not_save_requested_stat
         .push(r#""kind":"request""#.to_string());
     let request = left_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/requests")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2473,7 +2490,7 @@ async fn test_people_discovery_accept_send_failure_does_not_save_joined_state() 
     ] {
         let response = app
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/people/discovery")
                     .header("x-elastos-home-token", token)
@@ -2489,7 +2506,7 @@ async fn test_people_discovery_accept_send_failure_does_not_save_joined_state() 
     let left_refresh = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2502,7 +2519,7 @@ async fn test_people_discovery_accept_send_failure_does_not_save_joined_state() 
 
     let left_request = left_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/requests")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2524,7 +2541,7 @@ async fn test_people_discovery_accept_send_failure_does_not_save_joined_state() 
     let right_refresh = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", right_token.as_str())
@@ -2547,7 +2564,7 @@ async fn test_people_discovery_accept_send_failure_does_not_save_joined_state() 
         .push(r#""kind":"acceptance""#.to_string());
     let right_accept = right_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/people/discovery/requests/{}/accept",
@@ -2649,7 +2666,7 @@ async fn test_people_discovery_join_send_failure_does_not_save_joined_state() {
         .push(request_id.clone());
     let join = left_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/people/discovery/requests/{}/join",
@@ -2700,7 +2717,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
     ] {
         let response = app
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/people/discovery")
                     .header("x-elastos-home-token", token)
@@ -2716,7 +2733,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
     let left_refresh = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2730,7 +2747,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
     let left_request = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/requests")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2752,7 +2769,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
     let right_refresh = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", right_token.as_str())
@@ -2773,7 +2790,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
     let right_accept = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/people/discovery/requests/{}/accept",
@@ -2797,7 +2814,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
     let right_summary = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", right_home_token.as_str())
                 .body(Body::empty())
@@ -2821,7 +2838,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
     let left_refresh = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2841,7 +2858,7 @@ async fn test_people_discovery_request_accept_without_passkey_handle() {
 
     let left_summary = left_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", left_home_token.as_str())
                 .body(Body::empty())
@@ -2910,7 +2927,7 @@ async fn test_people_discovery_request_accept_is_idempotent_for_active_member() 
     ] {
         let response = app
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/people/discovery")
                     .header("x-elastos-home-token", token)
@@ -2926,7 +2943,7 @@ async fn test_people_discovery_request_accept_is_idempotent_for_active_member() 
     let left_refresh = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2940,7 +2957,7 @@ async fn test_people_discovery_request_accept_is_idempotent_for_active_member() 
     let left_request = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/requests")
                 .header("x-elastos-home-token", left_token.as_str())
@@ -2962,7 +2979,7 @@ async fn test_people_discovery_request_accept_is_idempotent_for_active_member() 
     let right_refresh = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", right_token.as_str())
@@ -2983,7 +3000,7 @@ async fn test_people_discovery_request_accept_is_idempotent_for_active_member() 
     let right_accept = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/people/discovery/requests/{}/accept",
@@ -3007,7 +3024,7 @@ async fn test_people_discovery_request_accept_is_idempotent_for_active_member() 
     let repeated_accept = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/people/discovery/requests/{}/accept",
@@ -3056,7 +3073,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     ] {
         let response = app
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/system/identity/profile-card")
                     .header("x-elastos-home-token", token)
@@ -3075,7 +3092,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     ] {
         let response = app
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/people/discovery")
                     .header("x-elastos-home-token", token)
@@ -3091,7 +3108,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     let left_refresh = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", left_authority.people_token.as_str())
@@ -3105,7 +3122,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     let left_request = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/requests")
                 .header("x-elastos-home-token", left_authority.people_token.as_str())
@@ -3130,7 +3147,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     let right_refresh = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header(
@@ -3155,7 +3172,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     let right_accept = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/people/discovery/requests/{}/accept",
@@ -3182,7 +3199,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     let right_summary = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", right_authority.home_token.as_str())
                 .body(Body::empty())
@@ -3207,7 +3224,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     let left_refresh = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header("x-elastos-home-token", left_authority.people_token.as_str())
@@ -3233,7 +3250,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     let left_summary = left_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", left_authority.home_token.as_str())
                 .body(Body::empty())
@@ -3258,7 +3275,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
     let right_refresh = right_app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/discovery/refresh")
                 .header(
@@ -3286,7 +3303,7 @@ async fn test_people_discovery_request_accept_contact_round_trip() {
 
     let right_summary = right_app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", right_authority.home_token.as_str())
                 .body(Body::empty())
@@ -3349,11 +3366,10 @@ async fn test_people_invite_create_allows_conversation_member_when_user_invites_
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/invites/create")
                 .header("x-elastos-home-token", authority.people_token.as_str())
-                .header("host", "localhost:61180")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3426,7 +3442,7 @@ async fn test_people_contact_remove_hides_accepted_conversation_contact_locally(
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/people/contacts/remove")
                 .header("x-elastos-home-token", authority.people_token.as_str())
@@ -3462,7 +3478,7 @@ async fn test_people_contact_remove_hides_accepted_conversation_contact_locally(
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -3488,7 +3504,7 @@ async fn test_home_events_long_poll_returns_cursor_and_keepalive() {
     let first = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/events?wait_ms=0")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -3513,7 +3529,7 @@ async fn test_home_events_long_poll_returns_cursor_and_keepalive() {
     let cursor = first_json["cursor"].as_str().unwrap();
     let second = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri(format!("/api/apps/home/events?wait_ms=0&cursor={cursor}"))
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -3552,7 +3568,7 @@ async fn test_home_events_stream_requires_home_authority_and_serves_sse() {
 
     let authorized = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/events/stream")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -3616,7 +3632,7 @@ async fn test_home_summary_and_events_include_browser_wallet_approvals() {
     let before = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/events?wait_ms=0")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -3634,7 +3650,7 @@ async fn test_home_summary_and_events_include_browser_wallet_approvals() {
     let request = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/request-transaction")
                 .header("x-elastos-home-token", browser_token)
@@ -3659,7 +3675,7 @@ async fn test_home_summary_and_events_include_browser_wallet_approvals() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -3680,7 +3696,7 @@ async fn test_home_summary_and_events_include_browser_wallet_approvals() {
 
     let events = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri(format!("/api/apps/home/events?wait_ms=0&cursor={cursor}"))
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -3718,7 +3734,7 @@ async fn test_system_updates_home_background_image() {
     let updated = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/appearance/background-image")
                 .header("x-elastos-home-token", admin.system_token.clone())
@@ -3745,7 +3761,7 @@ async fn test_system_updates_home_background_image() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", admin.home_token.clone())
                 .body(Body::empty())
@@ -3774,7 +3790,7 @@ async fn test_system_updates_home_background_image() {
     let overlay = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/appearance/background-overlay")
                 .header("x-elastos-home-token", admin.system_token.clone())
@@ -3801,7 +3817,7 @@ async fn test_system_updates_home_background_image() {
     let guest_summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", guest.home_token.clone())
                 .body(Body::empty())
@@ -3824,7 +3840,7 @@ async fn test_system_updates_home_background_image() {
     let guest_updated = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/appearance/background-image")
                 .header("x-elastos-home-token", guest.system_token.clone())
@@ -3839,7 +3855,7 @@ async fn test_system_updates_home_background_image() {
     let image = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/appearance/background-image")
                 .header("x-elastos-home-token", admin.home_token.clone())
                 .body(Body::empty())
@@ -3863,7 +3879,7 @@ async fn test_system_updates_home_background_image() {
     let guest_image = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/appearance/background-image")
                 .header("x-elastos-home-token", guest.home_token.clone())
                 .body(Body::empty())
@@ -3913,7 +3929,7 @@ async fn test_system_updates_home_background_image() {
     let oversized = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/appearance/background-image")
                 .header("x-elastos-home-token", admin.system_token.clone())
@@ -3935,7 +3951,7 @@ async fn test_system_updates_home_background_image() {
     let reset = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("DELETE")
                 .uri("/api/apps/system/appearance/background-image")
                 .header("x-elastos-home-token", admin.system_token)
@@ -3954,7 +3970,7 @@ async fn test_system_updates_home_background_image() {
     let missing_image = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/appearance/background-image")
                 .header("x-elastos-home-token", admin.home_token)
                 .body(Body::empty())
@@ -3966,7 +3982,7 @@ async fn test_system_updates_home_background_image() {
 
     let guest_image_after_admin_reset = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/appearance/background-image")
                 .header("x-elastos-home-token", guest.home_token)
                 .body(Body::empty())
@@ -3986,7 +4002,7 @@ async fn test_home_runtime_ensure_reuses_running_runtime() {
     let app = gateway_router(test_state(dir.path()));
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/runtime/ensure")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
@@ -4027,7 +4043,7 @@ async fn test_system_summary_reports_identity_and_app_id() {
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/summary")
                 .header("x-elastos-home-token", authority.system_token.as_str())
                 .body(Body::empty())
@@ -4096,7 +4112,7 @@ async fn test_system_summary_reports_trusted_source_update_policy() {
     let authority = passkey_authority_with_name(dir.path(), Some("anders"));
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/summary")
                 .header("x-elastos-home-token", authority.system_token.as_str())
                 .body(Body::empty())
@@ -4150,7 +4166,7 @@ async fn test_system_guest_registration_requires_admin_passkey() {
     let denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/access/guest-registration")
                 .header("x-elastos-home-token", local_system_token)
@@ -4165,7 +4181,7 @@ async fn test_system_guest_registration_requires_admin_passkey() {
     let guest_denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/access/guest-registration")
                 .header("x-elastos-home-token", guest.system_token)
@@ -4180,7 +4196,7 @@ async fn test_system_guest_registration_requires_admin_passkey() {
     let enabled = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/access/guest-registration")
                 .header("x-elastos-home-token", authority.system_token.clone())
@@ -4200,7 +4216,7 @@ async fn test_system_guest_registration_requires_admin_passkey() {
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/summary")
                 .header("x-elastos-home-token", authority.system_token)
                 .body(Body::empty())
@@ -4301,6 +4317,8 @@ async fn test_system_handle_update_rejects_proofless_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/system/identity/handle")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", system_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"handle":"anders"}"#))
@@ -4332,6 +4350,8 @@ async fn test_system_handle_derives_from_passkey_principal() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/system/summary")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", authority.system_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
@@ -4351,6 +4371,8 @@ async fn test_system_handle_derives_from_passkey_principal() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/system/identity/handle")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", authority.system_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"handle":"Anders Admin"}"#))
@@ -4379,6 +4401,8 @@ async fn test_system_handle_derives_from_passkey_principal() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/system/summary")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", authority.system_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
@@ -4403,6 +4427,8 @@ async fn test_system_handle_derives_from_passkey_principal() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -4422,6 +4448,8 @@ async fn test_system_handle_derives_from_passkey_principal() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", chat_token)
                 .body(Body::empty())
                 .unwrap(),
@@ -4450,6 +4478,8 @@ async fn test_people_profile_card_update_uses_people_launch_token() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/people/profile-card")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", authority.people_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"handle":"People Name"}"#))
@@ -4469,6 +4499,9 @@ async fn test_people_profile_card_update_uses_people_launch_token() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/home/summary")
+                .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
@@ -4497,6 +4530,8 @@ async fn test_people_summary_requires_people_launch_token() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/people/summary")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
@@ -4509,6 +4544,8 @@ async fn test_people_summary_requires_people_launch_token() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/people/summary")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", authority.people_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
@@ -4594,6 +4631,8 @@ async fn test_home_launch_validates_shell_targets() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -4619,6 +4658,8 @@ async fn test_home_launch_validates_shell_targets() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"library"}"#))
@@ -4645,6 +4686,8 @@ async fn test_home_launch_validates_shell_targets() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"projection-app"}"#))
@@ -4669,6 +4712,8 @@ async fn test_home_launch_validates_shell_targets() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"wallet-metamask"}"#))
@@ -4691,8 +4736,10 @@ async fn test_home_launch_validates_shell_targets() {
                 Request::builder()
                     .method("POST")
                     .uri("/api/apps/home/launch")
-                    .header(HOST, "localhost:61180")
-                    .header("x-elastos-home-token", home_app_token(dir.path()))
+               .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
+                .header("x-elastos-home-token", home_app_token(dir.path()))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"target":"documents","query":{"doc":"did:key:z6ExampleDoc","view":"read"}}"#,
@@ -4717,8 +4764,10 @@ async fn test_home_launch_validates_shell_targets() {
                 Request::builder()
                     .method("POST")
                     .uri("/api/apps/home/launch")
-                    .header(HOST, "localhost:61180")
-                    .header("x-elastos-home-token", home_app_token(dir.path()))
+               .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
+                .header("x-elastos-home-token", home_app_token(dir.path()))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"target":"documents","query":{"cid":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi","uri":"elastos://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi","view":"read"}}"#,
@@ -4752,7 +4801,9 @@ async fn test_home_launch_validates_shell_targets() {
             Request::builder()
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
+               .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -4781,6 +4832,8 @@ async fn test_home_launch_validates_shell_targets() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"gba-ucity"}"#))
@@ -4811,6 +4864,8 @@ async fn test_home_launch_validates_shell_targets() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"missing-shell-target"}"#))
@@ -4884,7 +4939,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -4941,7 +4996,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let manifest_shell_update = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", manifest_shell_token)
@@ -4965,7 +5020,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let app_rejected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", authority.home_token.as_str())
@@ -4984,6 +5039,8 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"home-cli"}"#))
@@ -5001,7 +5058,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let shell_summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", home_cli_token.as_str())
                 .body(Body::empty())
@@ -5024,7 +5081,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let catalog = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/capsules/catalog")
                 .header("x-elastos-home-token", home_cli_token.as_str())
                 .body(Body::empty())
@@ -5037,7 +5094,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let interfaces = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/capsules/interfaces")
                 .header("x-elastos-home-token", home_cli_token.as_str())
                 .body(Body::empty())
@@ -5076,6 +5133,8 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"regular-app"}"#))
@@ -5092,7 +5151,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let catalog_rejected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/capsules/catalog")
                 .header("x-elastos-home-token", regular_token)
                 .body(Body::empty())
@@ -5105,7 +5164,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let selected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", home_cli_token.as_str())
@@ -5125,7 +5184,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let selected_from_shell = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", home_cli_token.as_str())
                 .body(Body::empty())
@@ -5143,7 +5202,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let selected_gui_from_shell = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", home_cli_token.as_str())
@@ -5166,7 +5225,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let selected_from_system = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", authority.system_token.as_str())
@@ -5186,7 +5245,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let selected_cli_from_system = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", authority.system_token.as_str())
@@ -5206,7 +5265,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -5224,7 +5283,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let cookie_summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header(
                     COOKIE,
@@ -5246,7 +5305,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
     let cookie_active_shell_write_rejected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header(
@@ -5266,7 +5325,7 @@ async fn test_home_active_shell_uses_catalog_shell_candidates() {
 
     let cookie_active_shell = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/active-shell")
                 .header(
                     COOKIE,
@@ -5293,8 +5352,13 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
     let app = gateway_router(state);
     let authority = passkey_authority_with_name(dir.path(), Some("shell-parity"));
 
-    let (status, gui_before) =
-        home_test_get_json(&app, "/api/apps/home/summary", &authority.home_token).await;
+    let (status, gui_before) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(gui_before["active_shell"]["active"], HOME_GUI_SHELL_ID);
     let shared_before = home_shell_shared_facts(&gui_before);
@@ -5312,6 +5376,7 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
         &app,
         "/api/apps/home/launch",
         &authority.home_token,
+        "http://localhost:61180",
         json!({ "target": HOME_CLI_CAPSULE_ID_FOR_TEST }),
     )
     .await;
@@ -5324,7 +5389,7 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
     let cli_token = launch_token_from_route(failed_launch["route"].as_str().unwrap()).unwrap();
 
     let (status, cli_after_failure) =
-        home_test_get_json(&app, "/api/apps/home/summary", &cli_token).await;
+        home_test_get_json(&app, "/api/apps/home/summary", &cli_token, "null").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         home_shell_shared_facts(&cli_after_failure),
@@ -5336,19 +5401,30 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
         "a failed shell launch changed the active shell"
     );
 
-    let (status, gui_catalog) =
-        home_test_get_json(&app, "/api/capsules/catalog", &authority.home_token).await;
+    let (status, gui_catalog) = home_test_get_json(
+        &app,
+        "/api/capsules/catalog",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    let (status, cli_catalog) = home_test_get_json(&app, "/api/capsules/catalog", &cli_token).await;
+    let (status, cli_catalog) =
+        home_test_get_json(&app, "/api/capsules/catalog", &cli_token, "null").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(gui_catalog, cli_catalog);
     assert_eq!(gui_catalog, gui_before["capsule_catalog"]);
 
-    let (status, gui_interfaces) =
-        home_test_get_json(&app, "/api/capsules/interfaces", &authority.home_token).await;
+    let (status, gui_interfaces) = home_test_get_json(
+        &app,
+        "/api/capsules/interfaces",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let (status, cli_interfaces) =
-        home_test_get_json(&app, "/api/capsules/interfaces", &cli_token).await;
+        home_test_get_json(&app, "/api/capsules/interfaces", &cli_token, "null").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(gui_interfaces, cli_interfaces);
     assert_eq!(gui_interfaces, gui_before["capsule_interfaces"]);
@@ -5357,17 +5433,23 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
         &app,
         "/api/apps/home/active-shell",
         &cli_token,
+        "null",
         json!({ "active": HOME_CLI_CAPSULE_ID_FOR_TEST }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(selected_cli["active"], HOME_CLI_CAPSULE_ID_FOR_TEST);
 
-    let (status, gui_after_switch) =
-        home_test_get_json(&app, "/api/apps/home/summary", &authority.home_token).await;
+    let (status, gui_after_switch) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let (status, cli_after_switch) =
-        home_test_get_json(&app, "/api/apps/home/summary", &cli_token).await;
+        home_test_get_json(&app, "/api/apps/home/summary", &cli_token, "null").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(gui_after_switch["active_shell"]["active"], "home-cli");
     assert_eq!(cli_after_switch["active_shell"]["active"], "home-cli");
@@ -5394,13 +5476,19 @@ async fn test_home_shell_switch_preserves_runtime_facts_and_recovers_after_launc
         &app,
         "/api/apps/home/active-shell",
         &cli_token,
+        "null",
         json!({ "active": HOME_GUI_SHELL_ID }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(selected_gui["active"], HOME_GUI_SHELL_ID);
-    let (status, gui_after_switchback) =
-        home_test_get_json(&app, "/api/apps/home/summary", &authority.home_token).await;
+    let (status, gui_after_switchback) = home_test_get_json(
+        &app,
+        "/api/apps/home/summary",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         gui_after_switchback["active_shell"]["active"],
@@ -5451,7 +5539,7 @@ async fn test_home_active_shell_repairs_saved_home_state_but_rejects_home_update
     let migrated = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .body(Body::empty())
@@ -5484,7 +5572,7 @@ async fn test_home_active_shell_repairs_saved_home_state_but_rejects_home_update
     let home_write_rejected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", authority.home_token.as_str())
@@ -5501,7 +5589,7 @@ async fn test_home_active_shell_repairs_saved_home_state_but_rejects_home_update
 
     let invalid_update = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/active-shell")
                 .header("x-elastos-home-token", authority.home_token.as_str())
@@ -5528,7 +5616,7 @@ async fn test_home_browser_state_is_encrypted_for_protected_principal_root() {
     let updated = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token.clone())
@@ -5562,7 +5650,7 @@ async fn test_home_browser_state_is_encrypted_for_protected_principal_root() {
 
     let loaded = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token)
                 .body(Body::empty())
@@ -5585,19 +5673,22 @@ async fn test_home_browser_state_is_encrypted_for_protected_principal_root() {
 async fn test_home_browser_state_accepts_trusted_shells_only() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority_with_name(dir.path(), Some("shell-state"));
-    let home_gui_token =
-        launch_token_for_authority_context(dir.path(), HOME_GUI_SHELL_ID, &authority);
+    let home_gui_token = authority.home_token.clone();
     let home_cli_token =
-        launch_token_for_authority_context(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &authority);
+        app_token_for_authority(dir.path(), HOME_CLI_CAPSULE_ID_FOR_TEST, &authority);
     let system_token = authority.system_token.clone();
     let regular_token = launch_token_for_authority_context(dir.path(), "regular-app", &authority);
     let app = gateway_router(test_state(dir.path()));
 
-    for token in [&home_gui_token, &home_cli_token] {
+    for (token, origin) in [
+        (&home_gui_token, "http://localhost:61180"),
+        (&home_cli_token, "null"),
+    ] {
         let (status, updated) = home_test_post_json(
             &app,
             "/api/apps/home/state",
             token,
+            origin,
             json!({
                 "layout": { "desktopIconsVisible": false },
                 "session": { "windows": [] },
@@ -5608,7 +5699,8 @@ async fn test_home_browser_state_accepts_trusted_shells_only() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(updated["layout"]["desktopIconsVisible"], false);
 
-        let (status, loaded) = home_test_get_json(&app, "/api/apps/home/state", token).await;
+        let (status, loaded) =
+            home_test_get_json(&app, "/api/apps/home/state", token, origin).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(loaded["principal_id"], authority.principal_id);
     }
@@ -5617,9 +5709,8 @@ async fn test_home_browser_state_accepts_trusted_shells_only() {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .uri("/api/apps/home/state")
-                    .header(HOST, "localhost:61180")
                     .header("x-elastos-home-token", token)
                     .body(Body::empty())
                     .unwrap(),
@@ -5664,7 +5755,7 @@ async fn test_home_browser_state_drops_unknown_targets() {
     let updated = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token.clone())
@@ -5749,7 +5840,7 @@ async fn test_home_browser_state_recovers_from_malformed_saved_state() {
     let loaded = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::empty())
@@ -5772,7 +5863,7 @@ async fn test_home_browser_state_recovers_from_malformed_saved_state() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::empty())
@@ -5784,7 +5875,7 @@ async fn test_home_browser_state_recovers_from_malformed_saved_state() {
 
     let updated = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token)
@@ -5843,7 +5934,7 @@ async fn test_home_browser_state_resets_plaintext_for_protected_principal_root()
     let loaded = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::empty())
@@ -5866,7 +5957,7 @@ async fn test_home_browser_state_resets_plaintext_for_protected_principal_root()
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", authority.home_token.clone())
                 .body(Body::empty())
@@ -5878,7 +5969,7 @@ async fn test_home_browser_state_resets_plaintext_for_protected_principal_root()
 
     let updated = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/state")
                 .header("x-elastos-home-token", authority.home_token)
@@ -5915,6 +6006,8 @@ async fn test_home_launch_starts_system_capsule_and_reports_runtime() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"system"}"#))
@@ -5938,6 +6031,8 @@ async fn test_home_launch_starts_system_capsule_and_reports_runtime() {
         .oneshot(
             Request::builder()
                 .uri("/api/apps/system/summary")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())
                 .unwrap(),
@@ -5974,6 +6069,8 @@ async fn test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity(
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -6002,7 +6099,7 @@ async fn test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity(
         .expect("runtime launch request includes signed launch_grant");
     let mut headers = HeaderMap::new();
     headers.insert("x-elastos-home-token", launch_grant.parse().unwrap());
-    let (_, grant_context) = require_home_launch_token_for_any_app_context(
+    let grant_context = require_internal_shell_launch_grant_for_any_context(
         dir.path(),
         &headers,
         &[CHAT_ROOM_CAPSULE_ID],
@@ -6014,6 +6111,8 @@ async fn test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity(
         .oneshot(
             Request::builder()
                 .uri("/api/apps/system/summary")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", authority.system_token.as_str())
                 .body(Body::empty())
                 .unwrap(),
@@ -6073,6 +6172,8 @@ async fn test_home_launch_rejects_source_wasi_materialization() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"test-wasm-viewer"}"#))
@@ -6114,6 +6215,8 @@ async fn test_home_launch_reports_system_launch_failure_when_runtime_cannot_star
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"system"}"#))
@@ -6138,6 +6241,8 @@ async fn test_home_launch_reports_system_launch_failure_when_runtime_cannot_star
         .oneshot(
             Request::builder()
                 .uri("/api/apps/system/summary")
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())
                 .unwrap(),

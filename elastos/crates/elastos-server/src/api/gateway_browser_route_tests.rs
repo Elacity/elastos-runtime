@@ -3,7 +3,7 @@ use super::*;
 async fn open_mock_browser_page(app: axum::Router, token: &str, reason: &str) -> String {
     let open = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -42,7 +42,7 @@ async fn test_browser_app_summary_declares_fail_closed_engine_adapter() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -105,7 +105,7 @@ async fn test_browser_app_summary_reports_registered_net_and_exit_status() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -138,7 +138,7 @@ async fn test_browser_app_summary_reports_remote_carrier_exit_policy_without_aut
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -195,7 +195,7 @@ async fn test_browser_app_summary_reports_registered_engine_adapter_status() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -252,7 +252,7 @@ async fn test_browser_app_summary_rejects_missing_authority_status_proofs() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -297,7 +297,7 @@ async fn test_browser_open_fails_closed_without_attached_engine_transport() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -326,7 +326,7 @@ async fn test_browser_open_requires_explicit_launch_contract() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -355,7 +355,7 @@ async fn test_browser_open_rejects_mismatched_launch_contract() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -384,7 +384,7 @@ async fn test_browser_open_rejects_unsafe_remote_exit_id() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -413,7 +413,7 @@ async fn test_browser_open_rejects_unsafe_engine_adapter_id() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -443,7 +443,7 @@ async fn test_browser_open_rejects_non_http_urls() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -472,7 +472,7 @@ async fn test_browser_open_returns_forbidden_when_exit_policy_blocks_host() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -510,7 +510,7 @@ async fn test_browser_open_attaches_runtime_stream_for_remote_carrier_exit() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -569,7 +569,7 @@ async fn test_browser_open_attaches_runtime_stream_for_remote_carrier_exit() {
 
     let close = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{page_id}/close"))
                 .header("x-elastos-home-token", token)
@@ -604,7 +604,7 @@ async fn test_browser_close_stream_failure_keeps_remote_exit_session_retryable()
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -627,7 +627,7 @@ async fn test_browser_close_stream_failure_keeps_remote_exit_session_retryable()
     let failed_close = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{page_id}/close"))
                 .header("x-elastos-home-token", token.clone())
@@ -651,7 +651,7 @@ async fn test_browser_close_stream_failure_keeps_remote_exit_session_retryable()
     let status_after_failed_close = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!("/api/apps/browser/pages/{page_id}/status"))
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -664,7 +664,7 @@ async fn test_browser_close_stream_failure_keeps_remote_exit_session_retryable()
     let retry_close = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{page_id}/close"))
                 .header("x-elastos-home-token", token.clone())
@@ -682,7 +682,7 @@ async fn test_browser_close_stream_failure_keeps_remote_exit_session_retryable()
 
     let status_after_retry_close = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!("/api/apps/browser/pages/{page_id}/status"))
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -709,7 +709,7 @@ async fn test_browser_open_failure_closes_remote_carrier_stream_reservation() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -750,7 +750,7 @@ async fn test_browser_open_failure_retries_pending_remote_exit_cleanup() {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/browser/open")
                     .header("x-elastos-home-token", token.clone())
@@ -782,7 +782,7 @@ async fn test_browser_open_launches_engine_with_attached_stream_receipt() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -845,7 +845,7 @@ async fn test_browser_open_launches_engine_with_attached_stream_receipt() {
 
     let heartbeat_response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{page_id}/heartbeat"))
                 .header("x-elastos-home-token", token)
@@ -910,7 +910,7 @@ async fn test_browser_async_open_returns_job_and_polls_same_principal_result() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -941,7 +941,7 @@ async fn test_browser_async_open_returns_job_and_polls_same_principal_result() {
     let blocked = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!("/api/apps/browser/open/{open_id}"))
                 .header("x-elastos-home-token", other_token)
                 .body(Body::empty())
@@ -956,7 +956,7 @@ async fn test_browser_async_open_returns_job_and_polls_same_principal_result() {
         let status_response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .uri(format!("/api/apps/browser/open/{open_id}"))
                     .header("x-elastos-home-token", token.clone())
                     .body(Body::empty())
@@ -999,7 +999,7 @@ async fn test_browser_open_launches_selected_engine_adapter() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -1032,7 +1032,7 @@ async fn test_browser_session_capacity_tracks_open_heartbeat_and_close() {
     let before_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -1050,7 +1050,7 @@ async fn test_browser_session_capacity_tracks_open_heartbeat_and_close() {
     let open_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -1072,7 +1072,7 @@ async fn test_browser_session_capacity_tracks_open_heartbeat_and_close() {
     let after_open_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -1095,7 +1095,7 @@ async fn test_browser_session_capacity_tracks_open_heartbeat_and_close() {
     let heartbeat_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{page_id}/heartbeat"))
                 .header("x-elastos-home-token", token.clone())
@@ -1109,7 +1109,7 @@ async fn test_browser_session_capacity_tracks_open_heartbeat_and_close() {
     let close_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{page_id}/close"))
                 .header("x-elastos-home-token", token.clone())
@@ -1122,7 +1122,7 @@ async fn test_browser_session_capacity_tracks_open_heartbeat_and_close() {
 
     let after_close_response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -1149,7 +1149,7 @@ async fn test_browser_profile_reset_refuses_route_open_live_page() {
     let open_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -1171,7 +1171,7 @@ async fn test_browser_profile_reset_refuses_route_open_live_page() {
     let reset_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/profile/reset")
                 .header("x-elastos-home-token", token.clone())
@@ -1189,7 +1189,7 @@ async fn test_browser_profile_reset_refuses_route_open_live_page() {
 
     let close_response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{page_id}/close"))
                 .header("x-elastos-home-token", token)
@@ -1218,7 +1218,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
     let first_open_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -1247,7 +1247,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
     let second_open_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -1289,7 +1289,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
     let after_open_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -1353,7 +1353,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
     let first_heartbeat_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{first_page_id}/heartbeat"))
                 .header("x-elastos-home-token", token.clone())
@@ -1380,7 +1380,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
     let second_heartbeat_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/browser/pages/{second_page_id}/heartbeat"
@@ -1410,7 +1410,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
     let first_close_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{first_page_id}/close"))
                 .header("x-elastos-home-token", token.clone())
@@ -1431,7 +1431,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
     let second_close_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{second_page_id}/close"))
                 .header("x-elastos-home-token", token.clone())
@@ -1451,7 +1451,7 @@ async fn test_browser_session_capacity_tracks_multiple_pages_for_principal() {
 
     let after_all_close_response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -1479,7 +1479,7 @@ async fn test_browser_open_fails_closed_when_display_session_unavailable() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -1508,7 +1508,7 @@ async fn test_browser_open_reports_engine_capacity_unavailable() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -1560,7 +1560,7 @@ async fn test_browser_personal_sign_queues_wallet_inbox_approval() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/request-signature")
                 .header("x-elastos-home-token", browser_token)
@@ -1600,7 +1600,7 @@ async fn test_browser_personal_sign_queues_wallet_inbox_approval() {
 
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
                 .body(Body::empty())
@@ -1664,7 +1664,7 @@ async fn test_browser_typed_data_sign_queues_wallet_inbox_approval() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/request-signature")
                 .header("x-elastos-home-token", browser_token)
@@ -1701,7 +1701,7 @@ async fn test_browser_typed_data_sign_queues_wallet_inbox_approval() {
 
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
                 .body(Body::empty())
@@ -1795,7 +1795,7 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
     let block_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/read")
                 .header("x-elastos-home-token", browser_token.clone())
@@ -1832,7 +1832,7 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
     let balance_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/read")
                 .header("x-elastos-home-token", browser_token.clone())
@@ -1864,7 +1864,7 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
     let call_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/read")
                 .header("x-elastos-home-token", browser_token.clone())
@@ -1902,7 +1902,7 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
     let estimate_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/read")
                 .header("x-elastos-home-token", browser_token.clone())
@@ -2000,7 +2000,7 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/browser/wallet/read")
                     .header("x-elastos-home-token", browser_token.clone())
@@ -2038,7 +2038,7 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
 
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
                 .body(Body::empty())
@@ -2117,7 +2117,7 @@ async fn test_browser_eth_send_transaction_queues_wallet_inbox_approval() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/request-transaction")
                 .header("x-elastos-home-token", browser_token)
@@ -2166,7 +2166,7 @@ async fn test_browser_eth_send_transaction_queues_wallet_inbox_approval() {
 
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
                 .body(Body::empty())
@@ -2215,7 +2215,7 @@ async fn test_browser_eth_send_transaction_allows_external_connector_approval() 
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/request-transaction")
                 .header("x-elastos-home-token", browser_token)
@@ -2298,7 +2298,7 @@ async fn test_browser_wallet_approval_status_returns_completed_signature() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/wallet/approvals/wallet-approval%3Abrowser")
                 .header("x-elastos-home-token", browser_token)
                 .body(Body::empty())
@@ -2361,7 +2361,7 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
     let status_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/wallet/approvals/wallet-approval%3Abrowser-tx")
                 .header("x-elastos-home-token", browser_token.clone())
                 .body(Body::empty())
@@ -2381,7 +2381,7 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
     let broadcast_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/broadcast-transaction")
                 .header("x-elastos-home-token", browser_token.clone())
@@ -2409,7 +2409,7 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
     let recorded_status = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/wallet/approvals/wallet-approval%3Abrowser-tx")
                 .header("x-elastos-home-token", browser_token.clone())
                 .body(Body::empty())
@@ -2429,7 +2429,7 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
 
     let second_broadcast_response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/broadcast-transaction")
                 .header("x-elastos-home-token", browser_token)
@@ -2494,7 +2494,7 @@ async fn test_browser_transaction_broadcast_record_failure_does_not_rebroadcast_
     let first_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/broadcast-transaction")
                 .header("x-elastos-home-token", browser_token.clone())
@@ -2518,7 +2518,7 @@ async fn test_browser_transaction_broadcast_record_failure_does_not_rebroadcast_
 
     let retry_response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/wallet/broadcast-transaction")
                 .header("x-elastos-home-token", browser_token)
@@ -2576,7 +2576,7 @@ async fn test_browser_completed_external_transaction_returns_hash_without_broadc
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/browser/wallet/approvals/wallet-approval%3Abrowser-external-tx")
                 .header("x-elastos-home-token", browser_token)
                 .body(Body::empty())
@@ -2604,7 +2604,7 @@ async fn test_browser_page_runtime_routes_are_runtime_scoped() {
     let open = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token.clone())
@@ -2627,7 +2627,7 @@ async fn test_browser_page_runtime_routes_are_runtime_scoped() {
     let status = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/status"))
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -2663,7 +2663,7 @@ async fn test_browser_page_runtime_routes_are_runtime_scoped() {
     let diagnostics = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!(
                     "/api/apps/browser/pages/{encoded_page_id}/diagnostics"
                 ))
@@ -2695,7 +2695,7 @@ async fn test_browser_page_runtime_routes_are_runtime_scoped() {
     let input = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/input"))
                 .header("x-elastos-home-token", token.clone())
@@ -2717,7 +2717,7 @@ async fn test_browser_page_runtime_routes_are_runtime_scoped() {
     let close = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/close"))
                 .header("x-elastos-home-token", token.clone())
@@ -2737,7 +2737,7 @@ async fn test_browser_page_runtime_routes_are_runtime_scoped() {
 
     let input_after_close = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/input"))
                 .header("x-elastos-home-token", token)
@@ -2769,7 +2769,7 @@ async fn test_browser_page_routes_require_page_owner() {
     let status = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/status"))
                 .header("x-elastos-home-token", other_token.clone())
                 .body(Body::empty())
@@ -2782,7 +2782,7 @@ async fn test_browser_page_routes_require_page_owner() {
     let diagnostics = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!(
                     "/api/apps/browser/pages/{encoded_page_id}/diagnostics"
                 ))
@@ -2797,7 +2797,7 @@ async fn test_browser_page_routes_require_page_owner() {
     let heartbeat = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/browser/pages/{encoded_page_id}/heartbeat"
@@ -2813,7 +2813,7 @@ async fn test_browser_page_routes_require_page_owner() {
     let input = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/input"))
                 .header("x-elastos-home-token", other_token.clone())
@@ -2828,7 +2828,7 @@ async fn test_browser_page_routes_require_page_owner() {
     let webrtc = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/webrtc"))
                 .header("x-elastos-home-token", other_token.clone())
@@ -2845,7 +2845,7 @@ async fn test_browser_page_routes_require_page_owner() {
     let close = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/close"))
                 .header("x-elastos-home-token", other_token)
@@ -2859,7 +2859,7 @@ async fn test_browser_page_routes_require_page_owner() {
     let owner_status = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/status"))
                 .header("x-elastos-home-token", owner_token.clone())
                 .body(Body::empty())
@@ -2871,7 +2871,7 @@ async fn test_browser_page_routes_require_page_owner() {
 
     let owner_close = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/close"))
                 .header("x-elastos-home-token", owner_token)
@@ -2895,7 +2895,7 @@ async fn test_browser_close_failure_keeps_runtime_page_session_retryable() {
     let close = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/close"))
                 .header("x-elastos-home-token", token.clone())
@@ -2908,7 +2908,7 @@ async fn test_browser_close_failure_keeps_runtime_page_session_retryable() {
 
     let status_after_failed_close = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/status"))
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -2928,7 +2928,7 @@ async fn test_browser_webrtc_signal_requires_open_page() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/pages/page%3Amock-browser-engine/webrtc")
                 .header("x-elastos-home-token", token)
@@ -2960,7 +2960,7 @@ async fn test_browser_webrtc_signal_is_runtime_scoped() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/webrtc"))
                 .header("x-elastos-home-token", token)
@@ -2999,7 +2999,7 @@ async fn test_browser_webrtc_offer_rejects_embedded_candidates() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/webrtc"))
                 .header("x-elastos-home-token", token)
@@ -3031,7 +3031,7 @@ async fn test_browser_webrtc_answer_signal_is_runtime_scoped() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/webrtc"))
                 .header("x-elastos-home-token", token)
@@ -3066,7 +3066,7 @@ async fn test_browser_webrtc_candidate_signal_is_runtime_scoped() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/webrtc"))
                 .header("x-elastos-home-token", token.clone())
@@ -3088,7 +3088,7 @@ async fn test_browser_webrtc_candidate_signal_is_runtime_scoped() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/webrtc"))
                 .header("x-elastos-home-token", token)
@@ -3119,7 +3119,7 @@ async fn test_browser_webrtc_signal_preserves_provider_error() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/browser/pages/{encoded_page_id}/webrtc"))
                 .header("x-elastos-home-token", token)
@@ -3150,7 +3150,7 @@ async fn test_browser_open_runtime_stream_socket_accepts_and_closes_fail_closed(
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -3238,7 +3238,7 @@ async fn test_browser_open_runtime_stream_relays_to_exit_ipc_without_host_networ
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/open")
                 .header("x-elastos-home-token", token)
@@ -3323,7 +3323,7 @@ async fn test_browser_net_provider_fails_closed_without_adapter_provider() {
     let forbidden = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/net/http")
                 .header("x-elastos-home-token", system_token)
@@ -3337,7 +3337,7 @@ async fn test_browser_net_provider_fails_closed_without_adapter_provider() {
 
     let unavailable = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/net/http")
                 .header("x-elastos-home-token", browser_token)
@@ -3364,7 +3364,7 @@ async fn test_browser_net_provider_error_status_maps_to_fail_closed_http() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/net/http")
                 .header("x-elastos-home-token", browser_token)
@@ -3394,7 +3394,7 @@ async fn test_browser_net_http_hands_validated_request_to_internal_exit_provider
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/net/http")
                 .header("x-elastos-home-token", browser_token)
@@ -3430,7 +3430,7 @@ async fn test_browser_net_stream_provider_route_is_disabled() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/net/stream")
                 .header("x-elastos-home-token", browser_token)
@@ -3466,7 +3466,7 @@ async fn test_raw_browser_engine_and_exit_provider_proxy_routes_are_unavailable(
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri(route)
                     .header("x-elastos-home-token", browser_token.clone())

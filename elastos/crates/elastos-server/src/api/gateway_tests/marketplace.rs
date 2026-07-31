@@ -8,7 +8,7 @@ async fn test_marketplace_catalog_route_is_registered_and_auth_gated() {
     let denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/capsules/catalog")
                 .body(Body::empty())
                 .unwrap(),
@@ -21,7 +21,7 @@ async fn test_marketplace_catalog_route_is_registered_and_auth_gated() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/capsules/catalog")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -47,7 +47,7 @@ async fn test_marketplace_catalog_route_is_registered_and_auth_gated() {
 
     let marketplace_scoped_response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/marketplace/catalog")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())

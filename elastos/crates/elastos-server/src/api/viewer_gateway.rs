@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::gateway::{
-    content_type, require_home_launch_token_for_any, require_home_launch_token_for_any_context,
-    viewer_object_shell_description, viewer_object_shell_title, GatewayState,
-    HomeLaunchTokenContext,
+    content_type, require_home_projection_launch_token_context,
+    require_home_viewer_launch_token_context, viewer_object_shell_description,
+    viewer_object_shell_title, GatewayState, HomeLaunchTokenContext,
 };
 
 #[derive(Debug, Serialize)]
@@ -85,15 +85,16 @@ pub async fn viewer_library_summary(
     if !super::browser_capsules::is_viewer_capsule(&state.data_dir, &viewer) {
         return (StatusCode::NOT_FOUND, "viewer capsule not found").into_response();
     }
-    let token_app = match require_viewer_library_launch_token(&state.data_dir, &headers, &viewer) {
-        Ok(token_app) => token_app,
-        Err(err) => return viewer_error_response(err),
-    };
+    let (selected_resource, _context) =
+        match require_viewer_library_launch_context(&state.data_dir, &headers, &viewer) {
+            Ok(required) => required,
+            Err(err) => return viewer_error_response(err),
+        };
 
     Json(ViewerLibraryResponse {
         items: super::browser_capsules::list_viewer_bound_capsules(&state.data_dir, &viewer)
             .into_iter()
-            .filter(|capsule| token_app == viewer || capsule.name == token_app)
+            .filter(|capsule| selected_resource == viewer || capsule.name == selected_resource)
             .map(|capsule| ViewerLibraryItem {
                 title: viewer_object_shell_title(&capsule.name, capsule.description.as_deref()),
                 description: viewer_object_shell_description(
@@ -565,7 +566,7 @@ fn require_library_object_viewer_context(
     if !super::browser_capsules::is_viewer_capsule(data_dir, &viewer) {
         anyhow::bail!("viewer capsule not found");
     }
-    require_home_launch_token_for_any_context(data_dir, headers, &[viewer.as_str()])
+    require_viewer_library_launch_context(data_dir, headers, &viewer).map(|(_, context)| context)
 }
 
 fn require_documents_viewer_context(
@@ -577,7 +578,7 @@ fn require_documents_viewer_context(
     if viewer != "documents" || !super::browser_capsules::is_viewer_capsule(data_dir, &viewer) {
         anyhow::bail!("viewer capsule not found");
     }
-    require_home_launch_token_for_any_context(data_dir, headers, &[viewer.as_str()])
+    require_viewer_library_launch_context(data_dir, headers, &viewer).map(|(_, context)| context)
 }
 
 fn append_viewer_library_audit(
@@ -617,19 +618,24 @@ struct ViewerStorageTarget {
     object_uri: String,
 }
 
-fn require_viewer_library_launch_token(
+fn require_viewer_library_launch_context(
     data_dir: &FsPath,
     headers: &HeaderMap,
     viewer: &str,
-) -> anyhow::Result<String> {
-    let mut allowed_apps = vec![viewer.to_string()];
-    allowed_apps.extend(
-        super::browser_capsules::list_viewer_bound_capsules(data_dir, viewer)
-            .into_iter()
-            .map(|capsule| capsule.name),
-    );
-    let allowed_app_refs = allowed_apps.iter().map(String::as_str).collect::<Vec<_>>();
-    require_home_launch_token_for_any(data_dir, headers, &allowed_app_refs)
+) -> anyhow::Result<(String, HomeLaunchTokenContext)> {
+    let (selected_resource, context) =
+        require_home_viewer_launch_token_context(data_dir, headers, viewer)?;
+    if selected_resource != viewer
+        && super::browser_capsules::resolve_viewer_bound_capsule(
+            data_dir,
+            &selected_resource,
+            viewer,
+        )
+        .is_none()
+    {
+        anyhow::bail!("selected resource is not bound to the executable viewer");
+    }
+    Ok((selected_resource, context))
 }
 
 fn require_viewer_bound_launch_token_context(
@@ -638,10 +644,21 @@ fn require_viewer_bound_launch_token_context(
     viewer: &str,
     capsule: &str,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
-    super::gateway::require_home_launch_token_for_any_context(data_dir, headers, &[capsule])
-        .or_else(|_| {
-            super::gateway::require_home_launch_token_for_any_context(data_dir, headers, &[viewer])
-        })
+    match require_home_projection_launch_token_context(data_dir, headers, capsule, viewer) {
+        Ok(context) => Ok(context),
+        Err(exact_error) => {
+            let (selected_resource, context) =
+                require_viewer_library_launch_context(data_dir, headers, viewer)?;
+            if selected_resource == viewer
+                && super::browser_capsules::resolve_viewer_bound_capsule(data_dir, capsule, viewer)
+                    .is_some()
+            {
+                Ok(context)
+            } else {
+                Err(exact_error)
+            }
+        }
+    }
 }
 
 fn viewer_storage_target(

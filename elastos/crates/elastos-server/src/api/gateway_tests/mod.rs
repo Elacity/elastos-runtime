@@ -33,6 +33,17 @@ const TEST_CIDV0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
 const TEST_CIDV1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 const GBA_EMULATOR_CAPSULE_ID: &str = "gba-emulator";
 
+fn test_browser_request(host: &'static str, origin: &'static str) -> axum::http::request::Builder {
+    let request = Request::builder()
+        .header(HOST, host)
+        .header("origin", origin);
+    if origin == "null" {
+        request
+    } else {
+        request.header("sec-fetch-site", "same-origin")
+    }
+}
+
 fn test_launch_token_from_route(route: &str) -> String {
     let route = url::Url::parse("http://localhost")
         .unwrap()

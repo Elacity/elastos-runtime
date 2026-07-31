@@ -60,7 +60,7 @@ async fn test_full_recovery_bundle_prevents_admin_exporting_guest_root() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/recovery/full-export")
                 .header("x-elastos-home-token", admin.system_token)
@@ -100,7 +100,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     let create_account = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", wallet_token.as_str())
@@ -142,7 +142,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     let export = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/recovery/full-export")
                 .header("x-elastos-home-token", authority.system_token.as_str())
@@ -190,7 +190,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     let delete = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("DELETE")
                 .uri(format!("/api/apps/wallet/wallet/accounts/{account_id}"))
                 .header("x-elastos-home-token", wallet_token.as_str())
@@ -207,7 +207,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
     let import = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/recovery/full-import")
                 .header("x-elastos-home-token", authority.system_token.as_str())
@@ -239,7 +239,7 @@ async fn test_full_recovery_bundle_exports_and_restores_wallet_keys() {
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", wallet_token.as_str())
                 .body(Body::empty())
@@ -275,7 +275,7 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
     let create_account = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", original_wallet_token.as_str())
@@ -309,7 +309,7 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
     let export = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/recovery/full-export")
                 .header("x-elastos-home-token", original.system_token.as_str())
@@ -347,7 +347,7 @@ async fn test_full_recovery_bundle_recovers_existing_account_under_new_passkey()
     let import = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/auth/recovery/full-import")
                 .header("x-elastos-home-token", replacement.system_token.as_str())

@@ -31,7 +31,7 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -61,7 +61,7 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let missing_fresh_token = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", token.clone())
@@ -92,7 +92,7 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     );
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", token.clone())
@@ -169,7 +169,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let managed = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/managed")
                 .header("x-elastos-home-token", system_token.clone())
@@ -190,7 +190,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let default_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/default")
                 .header("x-elastos-home-token", system_token.clone())
@@ -229,7 +229,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let home = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", home_token)
                 .body(Body::empty())
@@ -251,7 +251,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let inbox = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token.clone())
                 .body(Body::empty())
@@ -287,7 +287,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/wallet/wallet/managed-approvals/{}/approve",
@@ -315,7 +315,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
 
     let approvals = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/wallet/approvals")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())
@@ -367,7 +367,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let managed = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/managed")
                 .header("x-elastos-home-token", system_token.clone())
@@ -394,7 +394,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let default_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/default")
                 .header("x-elastos-home-token", system_token.clone())
@@ -461,7 +461,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let home = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", home_token)
                 .body(Body::empty())
@@ -487,7 +487,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let inbox = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token.clone())
                 .body(Body::empty())
@@ -518,7 +518,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/wallet/wallet/managed-approvals/{}/approve",
@@ -546,7 +546,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
 
     let approvals = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/wallet/approvals")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())

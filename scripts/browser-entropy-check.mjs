@@ -666,6 +666,13 @@ assert(
     browserSelkiesControlService.includes("eth_sendTransaction") &&
     browserSelkiesControlService.includes("Runtime.addBinding") &&
     browserSelkiesControlService.includes("__elastosBrowserWalletRuntime") &&
+    browserSelkiesControlService.includes('const WALLET_RUNTIME_ORIGIN = "null"') &&
+    browserSelkiesControlService.includes("Origin: WALLET_RUNTIME_ORIGIN") &&
+    browserPlaywrightEngine.includes('const WALLET_RUNTIME_ORIGIN = "null"') &&
+    (browserPlaywrightEngine.match(/Origin: WALLET_RUNTIME_ORIGIN/g) || []).length === 5 &&
+    browserSelkiesControlServiceSmoke.includes('origin: req.headers.origin || ""') &&
+    browserSelkiesControlServiceSmoke.includes('req.headers.origin !== "null"') &&
+    browserSelkiesControlServiceSmoke.includes('request.origin !== "null"') &&
     browserSelkiesControlService.includes('runtimePost("approval"') &&
     browserSelkiesControlService.includes("walletApprovalPending") &&
     browserSelkiesControlService.includes("waitForCachedWalletApproval") &&

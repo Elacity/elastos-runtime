@@ -30,7 +30,7 @@ async fn test_system_token_can_review_and_reject_wallet_approvals() {
     let approvals = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/wallet/approvals")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -52,7 +52,7 @@ async fn test_system_token_can_review_and_reject_wallet_approvals() {
 
     let rejected = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Atest/reject")
                 .header("x-elastos-home-token", token)
@@ -84,7 +84,7 @@ async fn test_system_can_create_managed_wallet_account() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/managed")
                 .header("x-elastos-home-token", token)
@@ -142,7 +142,7 @@ async fn test_wallet_app_can_create_and_summarize_accounts() {
     let created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", token.clone())
@@ -157,7 +157,7 @@ async fn test_wallet_app_can_create_and_summarize_accounts() {
     let extra = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", token.clone())
@@ -173,7 +173,7 @@ async fn test_wallet_app_can_create_and_summarize_accounts() {
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -220,7 +220,7 @@ async fn test_wallet_transaction_default_also_drives_browser_connect_default() {
     let created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", token.clone())
@@ -242,7 +242,7 @@ async fn test_wallet_transaction_default_also_drives_browser_connect_default() {
     let updated = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/default")
                 .header("x-elastos-home-token", token.clone())
@@ -292,7 +292,7 @@ async fn test_wallet_app_can_delete_managed_account() {
     let created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", token.clone())
@@ -322,7 +322,7 @@ async fn test_wallet_app_can_delete_managed_account() {
     let missing_fresh = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("DELETE")
                 .uri(format!("/api/apps/wallet/wallet/accounts/{encoded}"))
                 .header("x-elastos-home-token", token.clone())
@@ -344,7 +344,7 @@ async fn test_wallet_app_can_delete_managed_account() {
     let deleted = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("DELETE")
                 .uri(format!("/api/apps/wallet/wallet/accounts/{encoded}"))
                 .header("x-elastos-home-token", token.clone())
@@ -366,7 +366,7 @@ async fn test_wallet_app_can_delete_managed_account() {
 
     let summary = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -392,7 +392,7 @@ async fn test_wallet_app_can_rename_account() {
     let created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", token.clone())
@@ -421,7 +421,7 @@ async fn test_wallet_app_can_rename_account() {
 
     let renamed = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri(format!("/api/apps/wallet/wallet/accounts/{encoded}"))
                 .header("x-elastos-home-token", token)
@@ -458,7 +458,7 @@ async fn test_wallet_recovery_key_requires_fresh_passkey_home_token() {
     let created = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/managed")
                 .header("x-elastos-home-token", wallet_token.clone())
@@ -487,7 +487,7 @@ async fn test_wallet_recovery_key_requires_fresh_passkey_home_token() {
     let rejected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/wallet/wallet/accounts/{encoded}/recovery-key"
@@ -517,7 +517,7 @@ async fn test_wallet_recovery_key_requires_fresh_passkey_home_token() {
     let mismatched = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/wallet/wallet/accounts/{encoded}/recovery-key"
@@ -538,7 +538,7 @@ async fn test_wallet_recovery_key_requires_fresh_passkey_home_token() {
 
     let exported = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/wallet/wallet/accounts/{encoded}/recovery-key"
@@ -587,7 +587,7 @@ async fn test_wallet_recovery_key_import_requires_fresh_passkey_home_token() {
     let rejected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/accounts/import-recovery-key")
                 .header("x-elastos-home-token", wallet_token.clone())
@@ -619,7 +619,7 @@ async fn test_wallet_recovery_key_import_requires_fresh_passkey_home_token() {
     );
     let imported = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/accounts/import-recovery-key")
                 .header("x-elastos-home-token", wallet_token.clone())

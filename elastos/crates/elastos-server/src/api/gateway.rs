@@ -85,15 +85,17 @@ pub(super) use gateway_home_token::{
     consume_fresh_passkey_home_token, home_launch_auth_data_dir, home_launch_token_header,
     home_session_clear_cookie_header, home_session_cookie_header_for_token,
     issue_home_launch_token_for_auth_grant, issue_home_launch_token_with_context,
-    issue_home_launch_token_with_intent, require_home_launch_token,
-    require_home_launch_token_context, require_home_launch_token_for_any,
-    require_home_launch_token_for_any_app_context, require_home_launch_token_for_any_context,
-    require_home_token, require_home_token_context, HomeLaunchTokenContext,
+    issue_home_projection_launch_token_with_context,
+    issue_home_projection_launch_token_with_intent, require_home_launch_token,
+    require_home_launch_token_context, require_home_launch_token_for_any_app_context,
+    require_home_launch_token_for_any_context, require_home_projection_launch_token_context,
+    require_home_token, require_home_token_context, require_home_viewer_launch_token_context,
+    require_internal_shell_launch_grant_for_any_context, HomeLaunchTokenContext,
 };
 #[cfg(test)]
 pub(crate) use gateway_home_token::{
-    issue_home_launch_token, local_home_launch_token_context, set_test_home_launch_auth_data_dir,
-    uuid_like_token,
+    issue_home_launch_token, issue_home_launch_token_with_intent, local_home_launch_token_context,
+    set_test_home_launch_auth_data_dir, uuid_like_token,
 };
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
@@ -153,7 +155,7 @@ pub(crate) const ROOM_SESSION_COOKIE: &str = "room-session";
 pub(crate) const BROWSER_SESSION_COOKIE: &str = "browser-session";
 pub(crate) const HOME_SESSION_COOKIE: &str = "home-session";
 const ROOM_SYNC_CONSUMER_ID: &str = "room-sync";
-const HOME_LAUNCH_TOKEN_DOMAIN: &str = "elastos.home.launch.v1";
+const HOME_LAUNCH_TOKEN_DOMAIN: &str = "elastos.home.launch.v4";
 const HOME_LAUNCH_TOKEN_TTL_SECS: u64 = 12 * 60 * 60;
 const HOME_BROWSER_STATE_SCHEMA: &str = "elastos.home.browser-state/v1";
 const HOME_BROWSER_STATE_MAX_BYTES: usize = 64 * 1024;

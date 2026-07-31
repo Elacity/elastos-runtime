@@ -27,7 +27,7 @@ async fn test_system_can_select_default_wallet_without_exposing_connector_author
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/default")
                 .header("x-elastos-home-token", token.clone())
@@ -80,7 +80,7 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     let missing_fresh_token = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Amanaged/approve")
                 .header("x-elastos-home-token", token.clone())
@@ -109,7 +109,7 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     );
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Amanaged/approve")
                 .header("x-elastos-home-token", token.clone())
@@ -172,7 +172,7 @@ async fn test_system_does_not_approve_external_wallet_request() {
     );
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Aexternal/approve")
                 .header("x-elastos-home-token", token.clone())

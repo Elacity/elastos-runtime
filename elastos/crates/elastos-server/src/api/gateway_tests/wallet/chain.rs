@@ -9,7 +9,7 @@ async fn test_system_token_can_read_chain_provider_status() {
     let networks = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/chain/networks")
                 .header("x-elastos-home-token", token.clone())
@@ -33,7 +33,7 @@ async fn test_system_token_can_read_chain_provider_status() {
     let status = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/chain/status")
                 .header("x-elastos-home-token", token.clone())
@@ -54,7 +54,7 @@ async fn test_system_token_can_read_chain_provider_status() {
     let sync_health = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/chain/sync_health")
                 .header("x-elastos-home-token", token.clone())
@@ -76,7 +76,7 @@ async fn test_system_token_can_read_chain_provider_status() {
     let lifecycle = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/chain/node_lifecycle")
                 .header("x-elastos-home-token", token.clone())
@@ -98,7 +98,7 @@ async fn test_system_token_can_read_chain_provider_status() {
 
     let start = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/chain/node_lifecycle")
                 .header("x-elastos-home-token", token)
@@ -154,7 +154,7 @@ async fn test_wallet_token_can_read_chain_provider_balance() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/chain/balance")
                 .header("x-elastos-home-token", token)
@@ -187,7 +187,7 @@ async fn test_gateway_blocks_chain_proof_prepare_and_broadcast_routes() {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri(format!("/api/provider/chain/{op}"))
                     .header("x-elastos-home-token", token.clone())

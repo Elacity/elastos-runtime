@@ -905,9 +905,15 @@ const server = http.createServer((req, res) => {
       url: target.href,
       pathname: target.pathname,
       host: req.headers.host || "",
+      origin: req.headers.origin || "",
       token: req.headers["x-elastos-home-token"] || "",
       body: bodyText ? JSON.parse(bodyText) : null,
     });
+    if (req.headers.origin !== "null") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "Runtime wallet request requires exact Origin: null" }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     if (req.method === "GET" && target.pathname === "/api/apps/browser/wallet/bridge") {
       res.end(JSON.stringify({
@@ -1542,9 +1548,13 @@ for (const expected of [
 ' "$tmp_dir/fake-cdp-ready.json.init-script"
 for _ in {1..100}; do
   proxy_request_count="$(wc -l <"$tmp_dir/fake-runtime-proxy-requests.jsonl" | tr -d ' ')"
-  [[ "$proxy_request_count" -ge 10 ]] && break
+  [[ "$proxy_request_count" -ge 8 ]] && break
   sleep 0.02
 done
+if [[ "$proxy_request_count" -lt 8 ]]; then
+  echo "Runtime wallet proxy received only $proxy_request_count requests; expected at least 8" >&2
+  exit 1
+fi
 "$node_bin" -e '
 const fs = require("fs");
 const lines = fs.readFileSync(process.argv[1], "utf8").trim().split(/\n/).filter(Boolean);
@@ -1562,6 +1572,9 @@ for (const path of [
   }
 }
 for (const request of requests) {
+  if (request.origin !== "null") {
+    throw new Error(`Runtime wallet proxy request did not carry exact Origin: null: ${JSON.stringify(request)}`);
+  }
   if (request.token !== "wallet-token-smoke") {
     throw new Error(`Runtime wallet proxy request lost Home token: ${JSON.stringify(request)}`);
   }

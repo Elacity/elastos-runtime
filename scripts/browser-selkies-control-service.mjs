@@ -35,6 +35,7 @@ const MAX_WEBSOCKET_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024;
 const WALLET_RUNTIME_BINDING = "__elastosBrowserWalletRuntime";
 const WALLET_RUNTIME_RESULT = "__elastosBrowserWalletRuntimeResult";
+const WALLET_RUNTIME_ORIGIN = "null";
 const WALLET_RUNTIME_POST_URL_FIELDS = {
   approval: "approval_url",
   read: "read_url",
@@ -2813,6 +2814,7 @@ async function walletRuntimeFetchJson(runtime, url, { method = "GET", body = nul
 
 function walletRuntimeFetchHeaders(runtime, jsonBody) {
   const headers = {
+    Origin: WALLET_RUNTIME_ORIGIN,
     "content-type": "application/json",
     "x-elastos-home-token": runtime.wallet.home_token,
   };

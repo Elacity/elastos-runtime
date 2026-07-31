@@ -12,6 +12,8 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
                 .method("POST")
                 .uri("/api/apps/home/launch")
                 .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"gba-ucity"}"#))
@@ -19,10 +21,11 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
         )
         .await
         .unwrap();
-    assert_eq!(launched.status(), StatusCode::OK);
+    let status = launched.status();
     let body = axum::body::to_bytes(launched.into_body(), usize::MAX)
         .await
         .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let launch: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(launch["route"].as_str().is_some_and(
         |route| route.contains("/apps/gba-emulator/") && route.contains("capsule=gba-ucity")
@@ -88,6 +91,8 @@ async fn gba_viewer_reads_only_compatible_library_objects_as_raw_bytes() {
                 .uri(format!(
                     "/api/viewers/gba-emulator/library-object?uri={gba_uri}&raw=true"
                 ))
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
                 .unwrap(),
@@ -110,6 +115,8 @@ async fn gba_viewer_reads_only_compatible_library_objects_as_raw_bytes() {
                 .uri(format!(
                     "/api/viewers/gba-emulator/library-object?uri={unsupported_uri}&raw=true"
                 ))
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
                 .unwrap(),
@@ -132,6 +139,8 @@ async fn gba_viewer_save_storage_is_scoped_to_the_launch_principal() {
             Request::builder()
                 .method("PUT")
                 .uri(save_uri)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::from("save bytes"))
                 .unwrap(),
@@ -144,6 +153,8 @@ async fn gba_viewer_save_storage_is_scoped_to_the_launch_principal() {
         .oneshot(
             Request::builder()
                 .uri(save_uri)
+                .header(HOST, "localhost:61180")
+                .header("origin", "null")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
                 .unwrap(),

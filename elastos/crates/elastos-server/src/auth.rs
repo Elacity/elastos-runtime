@@ -2,12 +2,13 @@
 
 use std::{
     fs::{File, OpenOptions},
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -40,8 +41,8 @@ const AUDIT_CHAIN_STATE_SCHEMA: &str = "elastos.audit.chain-state/v1";
 const AUDIT_CHAIN_STATE_DOMAIN: &str = "elastos.audit.chain-state.v1";
 const AUDIT_CHAIN_ANCHOR_SCHEMA: &str = "elastos.audit.chain-anchor/v1";
 const AUDIT_CHAIN_ANCHOR_DOMAIN: &str = "elastos.audit.chain-anchor.v1";
-const AUDIT_CHAIN_ACTIVATION_SCHEMA: &str = "elastos.audit.chain-activation/v1";
-const AUDIT_CHAIN_ACTIVATION_DOMAIN: &str = "elastos.audit.chain-activation.v1";
+const AUDIT_CHAIN_ACTIVATION_SCHEMA: &str = "elastos.audit.chain-activation/v2";
+const AUDIT_CHAIN_ACTIVATION_DOMAIN: &str = "elastos.audit.chain-activation.v2";
 const AUDIT_RETENTION_LIMIT: usize = 512;
 const RECOVERY_DESCRIPTOR_SCHEMA: &str = "elastos.principal.root-descriptor/v1";
 const PRINCIPAL_ROOT_OBJECT_SCHEMA: &str = "elastos.principal-root.object/v1";
@@ -50,9 +51,14 @@ pub const PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED: &str =
 const PRINCIPAL_ROOT_OBJECT_AAD_DOMAIN: &str = "elastos.principal-root.object.v1";
 
 static AUTH_STATE_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static AUDIT_CHAIN_ACTIVATION_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn auth_state_mutation_lock() -> &'static Mutex<()> {
     AUTH_STATE_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn audit_chain_activation_mutation_lock() -> &'static Mutex<()> {
+    AUDIT_CHAIN_ACTIVATION_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,10 +148,23 @@ pub struct AuditChainAnchorV1 {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuditChainCheckpointV1 {
+    head_sequence: u64,
+    head_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AuditChainActivationV1 {
+#[serde(deny_unknown_fields)]
+struct AuditChainActivationV2 {
     schema: String,
     activated_at: u64,
+    checkpoint: AuditChainCheckpointV1,
     signer_did: String,
     signature: String,
 }
@@ -206,18 +225,78 @@ fn auth_state_lock_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
     auth_state_path(data_dir).map(|path| path.with_file_name(format!("{AUTH_STATE_FILE}.lock")))
 }
 
+fn audit_chain_activation_lock_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    audit_chain_activation_path(data_dir)
+        .map(|path| path.with_file_name(format!("{AUDIT_CHAIN_REQUIRED_FILE}.lock")))
+}
+
+fn open_new_secret_file(path: &Path) -> anyhow::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .with_context(|| format!("failed to create secret state file {path:?}"))
+}
+
+fn ensure_regular_auth_parent(data_dir: &Path, parent: &Path) -> anyhow::Result<()> {
+    let relative = parent
+        .strip_prefix(data_dir)
+        .map_err(|_| anyhow!("auth state path escaped its data root"))?;
+    let mut current = data_dir.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("failed to create auth state path {current:?}"))?;
+                std::fs::symlink_metadata(&current).with_context(|| {
+                    format!("failed to inspect created auth state path {current:?}")
+                })?
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect auth state path {current:?}"));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("auth state path must use regular non-symlink directories");
+        }
+    }
+    Ok(())
+}
+
+fn open_regular_lock_file(path: &Path, label: &str) -> anyhow::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {label} lock {path:?}"))?;
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("{label} lock must be a regular non-symlink file");
+    }
+    set_secret_file_permissions(path)?;
+    Ok(file)
+}
+
 fn open_auth_state_lock(data_dir: &Path) -> anyhow::Result<File> {
     let path = auth_state_lock_path(data_dir)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_regular_auth_parent(data_dir, parent)?;
     }
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("failed to open auth state lock {path:?}"))
+    open_regular_lock_file(&path, "auth state")
+}
+
+fn open_audit_chain_activation_lock(data_dir: &Path) -> anyhow::Result<File> {
+    let path = audit_chain_activation_lock_path(data_dir)?;
+    if let Some(parent) = path.parent() {
+        ensure_regular_auth_parent(data_dir, parent)?;
+    }
+    open_regular_lock_file(&path, "audit activation")
 }
 
 fn lock_auth_state_file(file: &File) -> anyhow::Result<()> {
@@ -259,6 +338,7 @@ fn mutate_auth_state<T>(
     lock_auth_state_file(&lock_file)?;
     let result = (|| {
         let mut state = load_auth_state(data_dir)?;
+        ensure_audit_chain_state(data_dir, &mut state)?;
         let value = mutation(&mut state)?;
         save_auth_state(data_dir, &state)?;
         Ok(value)
@@ -310,19 +390,46 @@ fn set_secret_file_permissions(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn audit_chain_activation_payload(activated_at: u64) -> anyhow::Result<Vec<u8>> {
+fn audit_chain_checkpoint(state: &AuthState) -> anyhow::Result<Option<AuditChainCheckpointV1>> {
+    let Some(chain_state) = state.audit_chain_state.as_ref() else {
+        return Ok(None);
+    };
+    let (anchor_sequence, anchor_hash) = match state.audit_chain_anchor.as_ref() {
+        Some(anchor) => (Some(anchor.sequence), Some(anchor.chain_hash.clone())),
+        None => (None, None),
+    };
+    Ok(Some(AuditChainCheckpointV1 {
+        head_sequence: chain_state.head_sequence,
+        head_hash: chain_state.head_hash.clone(),
+        anchor_sequence,
+        anchor_hash,
+    }))
+}
+
+fn audit_chain_activation_payload(
+    activated_at: u64,
+    checkpoint: &AuditChainCheckpointV1,
+) -> anyhow::Result<Vec<u8>> {
     Ok(serde_json::to_vec(&serde_json::json!({
         "schema": AUDIT_CHAIN_ACTIVATION_SCHEMA,
         "activated_at": activated_at,
+        "checkpoint": checkpoint,
     }))?)
 }
 
-fn load_audit_chain_activation(data_dir: &Path) -> anyhow::Result<Option<AuditChainActivationV1>> {
+fn load_audit_chain_activation_unlocked(
+    data_dir: &Path,
+) -> anyhow::Result<Option<AuditChainActivationV2>> {
     let path = audit_chain_activation_path(data_dir)?;
-    if !path.is_file() {
-        return Ok(None);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect audit chain activation record"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("audit chain activation record must be a regular non-symlink file");
     }
-    let activation: AuditChainActivationV1 = serde_json::from_slice(&std::fs::read(&path)?)
+    let activation: AuditChainActivationV2 = serde_json::from_slice(&std::fs::read(&path)?)
         .with_context(|| format!("failed to parse audit chain activation record {path:?}"))?;
     if activation.schema != AUDIT_CHAIN_ACTIVATION_SCHEMA {
         anyhow::bail!("unsupported audit chain activation schema");
@@ -334,77 +441,203 @@ fn load_audit_chain_activation(data_dir: &Path) -> anyhow::Result<Option<AuditCh
     crate::crypto::verify_domain_separated_signature(
         &activation.signer_did,
         AUDIT_CHAIN_ACTIVATION_DOMAIN,
-        &audit_chain_activation_payload(activation.activated_at)?,
+        &audit_chain_activation_payload(activation.activated_at, &activation.checkpoint)?,
         &activation.signature,
     )
     .context("audit chain activation signature is invalid")?;
     Ok(Some(activation))
 }
 
-fn persist_audit_chain_activation(data_dir: &Path, activated_at: u64) -> anyhow::Result<()> {
-    if let Some(existing) = load_audit_chain_activation(data_dir)? {
-        if existing.activated_at != activated_at {
-            anyhow::bail!("audit chain activation changed unexpectedly");
-        }
-        return Ok(());
+fn with_audit_chain_activation_lock<T>(
+    data_dir: &Path,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _guard = audit_chain_activation_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("audit activation lock poisoned"))?;
+    let lock_file = open_audit_chain_activation_lock(data_dir)?;
+    lock_auth_state_file(&lock_file)?;
+    let result = operation();
+    let unlock = unlock_auth_state_file(&lock_file);
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
     }
+}
+
+#[cfg(test)]
+fn load_audit_chain_activation(data_dir: &Path) -> anyhow::Result<Option<AuditChainActivationV2>> {
+    with_audit_chain_activation_lock(data_dir, || load_audit_chain_activation_unlocked(data_dir))
+}
+
+fn persist_audit_chain_activation_unlocked(
+    data_dir: &Path,
+    activated_at: u64,
+    checkpoint: &AuditChainCheckpointV1,
+) -> anyhow::Result<()> {
     let path = audit_chain_activation_path(data_dir)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_regular_auth_parent(data_dir, parent)?;
     }
     let (signing_key, signer_did) = elastos_identity::load_or_create_did(data_dir)?;
     let (signature, _) = crate::crypto::domain_separated_sign(
         &signing_key,
         AUDIT_CHAIN_ACTIVATION_DOMAIN,
-        &audit_chain_activation_payload(activated_at)?,
+        &audit_chain_activation_payload(activated_at, checkpoint)?,
     );
-    let activation = AuditChainActivationV1 {
+    let activation = AuditChainActivationV2 {
         schema: AUDIT_CHAIN_ACTIVATION_SCHEMA.to_string(),
         activated_at,
+        checkpoint: checkpoint.clone(),
         signer_did,
         signature,
     };
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&temp, serde_json::to_vec_pretty(&activation)?)?;
-    set_secret_file_permissions(&temp)?;
-    std::fs::rename(temp, path)?;
+    write_secret_json_atomic(&path, &activation)
+}
+
+fn validate_checkpoint_progress(
+    current: &AuditChainCheckpointV1,
+    next: &AuditChainCheckpointV1,
+) -> anyhow::Result<bool> {
+    if next.head_sequence < current.head_sequence {
+        anyhow::bail!("audit chain rollback detected by the activation checkpoint");
+    }
+    if next.head_sequence == current.head_sequence {
+        if next != current {
+            anyhow::bail!(
+                "audit chain truncation or substitution detected by the activation checkpoint"
+            );
+        }
+        return Ok(false);
+    }
+    match (current.anchor_sequence, next.anchor_sequence) {
+        (Some(_), None) => anyhow::bail!("retained audit chain anchor rollback detected"),
+        (Some(current_sequence), Some(next_sequence)) if next_sequence < current_sequence => {
+            anyhow::bail!("retained audit chain anchor rollback detected")
+        }
+        (Some(current_sequence), Some(next_sequence))
+            if next_sequence == current_sequence && current.anchor_hash != next.anchor_hash =>
+        {
+            anyhow::bail!("retained audit chain anchor substitution detected")
+        }
+        _ => {}
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
-pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
-    let state = load_auth_state_unverified(data_dir)?.unwrap_or_default();
-    let activation = load_audit_chain_activation(data_dir)?;
-    match (state.audit_chain_state.as_ref(), activation.as_ref()) {
-        (Some(chain_state), Some(activation)) => {
-            if chain_state.activated_at != activation.activated_at {
-                anyhow::bail!("audit chain state does not match its activation record");
-            }
-        }
-        (Some(_), None) => {
-            anyhow::bail!("audit chain activation record is required");
-        }
-        (None, Some(_)) => {
-            anyhow::bail!("audit chain state is required after activation");
-        }
-        (None, None)
-            if !state.audit.is_empty()
-                || !state.audit_chain.is_empty()
-                || state.audit_chain_anchor.is_some() =>
-        {
-            anyhow::bail!(
-                "unchained audit history is unsupported; delete the Runtime auth state or restore a valid anchored audit chain"
-            );
-        }
-        (None, None) => {}
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn write_secret_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("secret state path has no file name"))?;
+    let temp = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        unique
+    ));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = open_new_secret_file(&temp)?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        set_secret_file_permissions(path)?;
+        sync_parent_directory(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
-    verify_audit_chain(data_dir, &state)?;
-    Ok(state)
+    result
+}
+
+pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
+    with_audit_chain_activation_lock(data_dir, || {
+        let stored_state = load_auth_state_unverified(data_dir)?;
+        let state_was_present = stored_state.is_some();
+        let mut state = stored_state.unwrap_or_default();
+        let activation = load_audit_chain_activation_unlocked(data_dir)?;
+        match (state.audit_chain_state.as_ref(), activation.as_ref()) {
+            (Some(chain_state), Some(activation)) => {
+                verify_audit_chain(data_dir, &state)?;
+                if chain_state.activated_at != activation.activated_at {
+                    anyhow::bail!("audit chain state does not match its activation record");
+                }
+                let checkpoint = audit_chain_checkpoint(&state)?
+                    .expect("audit chain state must produce a checkpoint");
+                if validate_checkpoint_progress(&activation.checkpoint, &checkpoint)? {
+                    persist_audit_chain_activation_unlocked(
+                        data_dir,
+                        chain_state.activated_at,
+                        &checkpoint,
+                    )?;
+                }
+            }
+            (Some(chain_state), None) => {
+                verify_audit_chain(data_dir, &state)
+                    .context("cannot recover audit activation from invalid signed chain state")?;
+                let checkpoint = audit_chain_checkpoint(&state)?
+                    .expect("audit chain state must produce a checkpoint");
+                persist_audit_chain_activation_unlocked(
+                    data_dir,
+                    chain_state.activated_at,
+                    &checkpoint,
+                )?;
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("audit chain state is required after activation");
+            }
+            (None, None) if state_was_present && auth_state_requires_audit_chain(&state) => {
+                anyhow::bail!(
+                    "unchained auth state is unsupported; preserve and back up the existing data root, then use a fresh data root; no automatic migration or offline migration script is provided"
+                );
+            }
+            (None, None) => {}
+        }
+        verify_audit_chain(data_dir, &state)?;
+        prune_auth_state(&mut state, now_ts());
+        Ok(state)
+    })
+}
+
+fn auth_state_requires_audit_chain(state: &AuthState) -> bool {
+    !state.challenges.is_empty()
+        || !state.principals.is_empty()
+        || !state.sessions.is_empty()
+        || !state.principal_root_protections.is_empty()
+        || !state.audit.is_empty()
+        || !state.audit_chain.is_empty()
+        || state.audit_chain_anchor.is_some()
+        || state.guest_registration_enabled
 }
 
 fn load_auth_state_unverified(data_dir: &Path) -> anyhow::Result<Option<AuthState>> {
     let path = auth_state_path(data_dir)?;
-    if !path.is_file() {
-        return Ok(None);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect auth state"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("auth state must be a regular non-symlink file");
     }
     let bytes = std::fs::read(&path).with_context(|| format!("failed to read {path:?}"))?;
     let mut state: AuthState = serde_json::from_slice(&bytes)
@@ -413,7 +646,6 @@ fn load_auth_state_unverified(data_dir: &Path) -> anyhow::Result<Option<AuthStat
         anyhow::bail!("unsupported auth state schema");
     }
     normalize_principal_records(&mut state);
-    prune_auth_state(&mut state, now_ts());
     Ok(Some(state))
 }
 
@@ -422,25 +654,49 @@ pub fn verify_auth_audit_chain_ready(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
-    let path = auth_state_path(data_dir)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let temp = path.with_file_name(format!(
-        "{AUTH_STATE_FILE}.{}.{}.tmp",
-        std::process::id(),
-        unique
-    ));
-    std::fs::write(&temp, serde_json::to_vec_pretty(state)?)?;
-    std::fs::rename(temp, path)?;
-    if let Some(chain_state) = state.audit_chain_state.as_ref() {
-        persist_audit_chain_activation(data_dir, chain_state.activated_at)?;
-    }
-    Ok(())
+    with_audit_chain_activation_lock(data_dir, || {
+        verify_audit_chain(data_dir, state)?;
+        let path = auth_state_path(data_dir)?;
+        if let Some(parent) = path.parent() {
+            ensure_regular_auth_parent(data_dir, parent)?;
+        }
+        let activation = load_audit_chain_activation_unlocked(data_dir)?;
+        let checkpoint = audit_chain_checkpoint(state)?;
+        match (
+            activation.as_ref(),
+            state.audit_chain_state.as_ref(),
+            checkpoint.as_ref(),
+        ) {
+            (Some(_), None, None) => {
+                anyhow::bail!(
+                    "audit chain rollback detected: chain state was removed after activation"
+                )
+            }
+            (Some(activation), Some(chain_state), Some(checkpoint)) => {
+                if activation.activated_at != chain_state.activated_at {
+                    anyhow::bail!("audit chain activation changed unexpectedly");
+                }
+                validate_checkpoint_progress(&activation.checkpoint, checkpoint)?;
+            }
+            _ => {}
+        }
+        write_secret_json_atomic(&path, state)?;
+        if let (Some(chain_state), Some(checkpoint)) =
+            (state.audit_chain_state.as_ref(), checkpoint.as_ref())
+        {
+            let should_persist = activation
+                .as_ref()
+                .is_none_or(|activation| activation.checkpoint != *checkpoint);
+            if should_persist {
+                persist_audit_chain_activation_unlocked(
+                    data_dir,
+                    chain_state.activated_at,
+                    checkpoint,
+                )?;
+            }
+        }
+        Ok(())
+    })
 }
 
 pub fn store_challenge(data_dir: &Path, challenge: AuthChallengeV1) -> anyhow::Result<()> {
@@ -1298,7 +1554,7 @@ fn ensure_audit_chain_state(data_dir: &Path, state: &mut AuthState) -> anyhow::R
         || state.audit_chain_anchor.is_some()
     {
         anyhow::bail!(
-            "unchained audit history is unsupported; delete the Runtime auth state or restore a valid anchored audit chain"
+            "unchained audit history is unsupported; preserve and back up the existing data root, then use a fresh data root or restore a valid anchored audit chain"
         );
     }
     state.audit_chain_state = Some(sign_audit_chain_state(
@@ -2239,7 +2495,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_chain_activation_is_fail_closed() {
+    fn audit_chain_activation_recovers_and_rejects_signed_state_rollback() {
         let data_dir = tempfile::tempdir().unwrap();
         append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
 
@@ -2247,27 +2503,74 @@ mod tests {
         let marker = std::fs::read(&marker_path).unwrap();
 
         std::fs::remove_file(&marker_path).unwrap();
-        let err = verify_auth_audit_chain_ready(data_dir.path()).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("audit chain activation record is required"));
-        std::fs::write(&marker_path, marker).unwrap();
+        verify_auth_audit_chain_ready(data_dir.path()).unwrap();
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker);
 
-        let mut tampered = load_auth_state(data_dir.path()).unwrap();
-        tampered.audit_chain.clear();
-        save_auth_state(data_dir.path(), &tampered).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let first_state = std::fs::read(&auth_path).unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(2)).unwrap();
+        std::fs::write(&auth_path, first_state).unwrap();
+
         let err = load_auth_state(data_dir.path()).unwrap_err().to_string();
-        assert!(err.contains("does not match the persisted chain head"));
+        assert!(err.contains("audit chain rollback detected"));
+    }
 
-        let mut unchained = tampered;
-        unchained.audit_chain_state = None;
-        unchained.audit_chain_anchor = None;
-        std::fs::remove_file(&marker_path).unwrap();
-        save_auth_state(data_dir.path(), &unchained).unwrap();
-        let err = load_auth_state(data_dir.path()).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unchained audit history is unsupported"));
+    #[test]
+    fn audit_chain_activation_advances_after_an_interrupted_checkpoint_publish() {
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
+
+        let marker_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let stale_marker = std::fs::read(&marker_path).unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(2)).unwrap();
+        let advanced_marker = std::fs::read(&marker_path).unwrap();
+        assert_ne!(stale_marker, advanced_marker);
+
+        std::fs::write(&marker_path, stale_marker).unwrap();
+        verify_auth_audit_chain_ready(data_dir.path()).unwrap();
+        assert_eq!(std::fs::read(&marker_path).unwrap(), advanced_marker);
+    }
+
+    #[test]
+    fn audit_chain_activation_rejects_same_sequence_substitution() {
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
+        let activated_at = load_auth_state(data_dir.path())
+            .unwrap()
+            .audit_chain_state
+            .unwrap()
+            .activated_at;
+
+        let mut substituted = AuthState::default();
+        substituted.audit_chain_state =
+            Some(sign_audit_chain_state(data_dir.path(), activated_at, None).unwrap());
+        let mut event = test_audit_event(1);
+        event.reason = "substituted-at-the-same-sequence".to_string();
+        let event = sign_audit_event(data_dir.path(), event).unwrap();
+        push_audit_event(data_dir.path(), &mut substituted, event).unwrap();
+        std::fs::write(
+            auth_state_path(data_dir.path()).unwrap(),
+            serde_json::to_vec_pretty(&substituted).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(error.contains("truncation or substitution detected"));
+    }
+
+    #[test]
+    fn first_authority_write_activates_the_signed_audit_checkpoint() {
+        let data_dir = tempfile::tempdir().unwrap();
+        upsert_principal_for_binding(data_dir.path(), passkey_binding(1, 10, 10), 10).unwrap();
+
+        let state = load_auth_state(data_dir.path()).unwrap();
+        let activation = load_audit_chain_activation(data_dir.path())
+            .unwrap()
+            .unwrap();
+        let chain_state = state.audit_chain_state.as_ref().unwrap();
+        assert_eq!(activation.activated_at, chain_state.activated_at);
+        assert_eq!(activation.checkpoint.head_sequence, 0);
+        assert_eq!(activation.checkpoint.head_hash, AUDIT_CHAIN_GENESIS);
     }
 
     #[test]
@@ -2283,14 +2586,12 @@ mod tests {
             sign_audit_chain_state(data_dir.path(), activated_at, state.audit_chain.last())
                 .unwrap(),
         );
-        save_auth_state(data_dir.path(), &state).unwrap();
-        let state = load_auth_state(data_dir.path()).unwrap();
         let foreign_dir = tempfile::tempdir().unwrap();
         let (_, foreign_did) = elastos_identity::load_or_create_did(foreign_dir.path()).unwrap();
 
         let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
         let activation_bytes = std::fs::read(&activation_path).unwrap();
-        let mut foreign_activation: AuditChainActivationV1 =
+        let mut foreign_activation: AuditChainActivationV2 =
             serde_json::from_slice(&activation_bytes).unwrap();
         foreign_activation.signer_did = foreign_did.clone();
         std::fs::write(
@@ -2340,11 +2641,13 @@ mod tests {
     #[test]
     fn retained_audit_chain_requires_its_signed_anchor() {
         let data_dir = tempfile::tempdir().unwrap();
+        let mut state = AuthState::default();
+        ensure_audit_chain_state(data_dir.path(), &mut state).unwrap();
+        save_auth_state(data_dir.path(), &state).unwrap();
         for index in 1..=3 {
-            append_audit_event(data_dir.path(), test_audit_event(index)).unwrap();
+            let event = sign_audit_event(data_dir.path(), test_audit_event(index)).unwrap();
+            push_audit_event(data_dir.path(), &mut state, event).unwrap();
         }
-
-        let mut state = load_auth_state(data_dir.path()).unwrap();
         retain_audit_tail(data_dir.path(), &mut state, 2).unwrap();
         let activated_at = state.audit_chain_state.as_ref().unwrap().activated_at;
         state.audit_chain_state = Some(
@@ -2367,9 +2670,92 @@ mod tests {
             sign_audit_chain_state(data_dir.path(), activated_at, truncated.audit_chain.last())
                 .unwrap(),
         );
-        save_auth_state(data_dir.path(), &truncated).unwrap();
-        let err = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        let err = save_auth_state(data_dir.path(), &truncated)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not continue from its retained anchor"));
+    }
+
+    #[test]
+    fn legacy_unchained_authority_is_rejected_before_expiry_pruning() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut legacy = AuthState::default();
+        legacy.challenges.push(StoredAuthChallenge {
+            challenge: AuthChallengeV1 {
+                schema: AuthChallengeV1::SCHEMA.to_string(),
+                challenge_id: "challenge:legacy-expired".to_string(),
+                domain: "localhost".to_string(),
+                uri: "http://localhost/apps/home/".to_string(),
+                statement: "Sign in to ElastOS Runtime.".to_string(),
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                chain_id: 20,
+                nonce: "legacy-expired".to_string(),
+                issued_at: 0,
+                expires_at: 1,
+                resources: vec!["elastos://auth/challenge/legacy-expired".to_string()],
+            },
+            consumed_at: None,
+        });
+        let path = auth_state_path(data_dir.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let err = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(err.contains("unchained auth state is unsupported"));
+        assert!(err.contains("fresh data root"));
+        assert!(err.contains("no automatic migration"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_secret_files_are_private_and_symlink_paths_fail_closed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
+        for path in [
+            auth_state_path(data_dir.path()).unwrap(),
+            audit_chain_activation_path(data_dir.path()).unwrap(),
+            auth_state_lock_path(data_dir.path()).unwrap(),
+            audit_chain_activation_lock_path(data_dir.path()).unwrap(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let marker = audit_chain_activation_path(data_dir.path()).unwrap();
+        let target = marker.with_file_name("attacker-activation.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        symlink(&target, &marker).unwrap();
+        let error = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(error.contains("regular non-symlink file"));
+
+        let poisoned_data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let relative_auth_parent = auth_state_path(poisoned_data_dir.path())
+            .unwrap()
+            .parent()
+            .unwrap()
+            .strip_prefix(poisoned_data_dir.path())
+            .unwrap()
+            .to_path_buf();
+        let first_component = relative_auth_parent
+            .components()
+            .next()
+            .expect("auth path must be below the data root");
+        symlink(
+            outside.path(),
+            poisoned_data_dir.path().join(first_component.as_os_str()),
+        )
+        .unwrap();
+        let error = append_audit_event(poisoned_data_dir.path(), test_audit_event(1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("regular non-symlink directories"));
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[test]

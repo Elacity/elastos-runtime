@@ -147,7 +147,7 @@ async fn inspect_gateway_is_system_read_only() {
     let denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/capsules")
                 .header(CONTENT_TYPE, "application/json")
@@ -162,7 +162,7 @@ async fn inspect_gateway_is_system_read_only() {
     let non_system = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/capsules")
                 .header("x-elastos-home-token", library_token)
@@ -178,7 +178,7 @@ async fn inspect_gateway_is_system_read_only() {
     let ok = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/plan")
                 .header("x-elastos-home-token", system_token.clone())
@@ -212,7 +212,7 @@ async fn inspect_gateway_is_system_read_only() {
     let direct_dispatch = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/dispatch_approved")
                 .header("x-elastos-home-token", system_token.clone())
@@ -228,7 +228,7 @@ async fn inspect_gateway_is_system_read_only() {
 
     let revoke = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/revoke")
                 .header("x-elastos-home-token", system_token)
@@ -252,7 +252,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     let requested = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/request_act")
                 .header("x-elastos-home-token", system_token.clone())
@@ -305,7 +305,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     let inbox = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -345,7 +345,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     let system_approval_attempt = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", system_token)
@@ -363,7 +363,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     let missing_fresh_proof = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -393,7 +393,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -446,7 +446,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     let after_approve_inbox = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -540,7 +540,7 @@ async fn inspect_action_requires_inbox_approval_before_dispatch() {
     let approved_again = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -567,7 +567,7 @@ async fn inspect_action_rejects_stale_fresh_passkey_before_dispatch() {
     let requested = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/request_act")
                 .header("x-elastos-home-token", authority.system_token.clone())
@@ -591,7 +591,7 @@ async fn inspect_action_rejects_stale_fresh_passkey_before_dispatch() {
         .unwrap();
     let rejected = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -625,7 +625,7 @@ async fn inspect_action_audits_approved_dispatch_failure() {
     let requested = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/request_act")
                 .header("x-elastos-home-token", system_token)
@@ -654,7 +654,7 @@ async fn inspect_action_audits_approved_dispatch_failure() {
     );
     let failed = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -716,7 +716,7 @@ async fn inspect_action_rejects_runtime_metadata_before_inbox() {
     let rejected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/request_act")
                 .header("x-elastos-home-token", system_token)
@@ -739,7 +739,7 @@ async fn inspect_action_rejects_runtime_metadata_before_inbox() {
     let inbox_token = issue_home_launch_token(dir.path(), INBOX_CAPSULE_ID).unwrap();
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
@@ -772,7 +772,7 @@ async fn inspect_action_rejects_raw_carrier_route_metadata_before_inbox() {
         let rejected = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/provider/inspect/request_act")
                     .header("x-elastos-home-token", system_token.clone())
@@ -804,7 +804,7 @@ async fn inspect_action_rejects_raw_carrier_route_metadata_before_inbox() {
     let inbox_token = issue_home_launch_token(dir.path(), INBOX_CAPSULE_ID).unwrap();
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
@@ -837,7 +837,7 @@ async fn inspect_action_rejects_stale_authority_plan_before_dispatch() {
     let requested = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/request_act")
                 .header("x-elastos-home-token", system_token)
@@ -889,7 +889,7 @@ async fn inspect_action_rejects_stale_authority_plan_before_dispatch() {
     let stale = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -912,7 +912,7 @@ async fn inspect_action_rejects_stale_authority_plan_before_dispatch() {
 
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
@@ -949,7 +949,7 @@ async fn inspect_action_rejects_changed_request_binding_before_dispatch() {
     let requested = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/request_act")
                 .header("x-elastos-home-token", system_token)
@@ -981,7 +981,7 @@ async fn inspect_action_rejects_changed_request_binding_before_dispatch() {
     let changed = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", inbox_token.clone())
@@ -1004,7 +1004,7 @@ async fn inspect_action_rejects_changed_request_binding_before_dispatch() {
 
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
@@ -1055,7 +1055,7 @@ async fn esp_inspect_action_rejects_every_mutated_binding_field_before_dispatch(
             let requested = app
                 .clone()
                 .oneshot(
-                    Request::builder()
+                    test_browser_request("localhost:61180", "null")
                         .method("POST")
                         .uri("/api/provider/inspect/request_act")
                         .header("x-elastos-home-token", authority.system_token.clone())
@@ -1093,7 +1093,7 @@ async fn esp_inspect_action_rejects_every_mutated_binding_field_before_dispatch(
             let rejected = app
                 .clone()
                 .oneshot(
-                    Request::builder()
+                    test_browser_request("localhost:61180", "null")
                         .method("POST")
                         .uri("/api/apps/inbox/actions")
                         .header("x-elastos-home-token", inbox_token.clone())
@@ -1128,7 +1128,7 @@ async fn inspect_action_duplicate_requests_keep_distinct_pending_records() {
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/provider/inspect/request_act")
                     .header("x-elastos-home-token", system_token.clone())
@@ -1153,7 +1153,7 @@ async fn inspect_action_duplicate_requests_keep_distinct_pending_records() {
     let inbox_token = issue_home_launch_token(dir.path(), INBOX_CAPSULE_ID).unwrap();
     let inbox = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token)
@@ -1192,7 +1192,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
     let requested = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/request_act")
                 .header("x-elastos-home-token", requester.system_token.clone())
@@ -1215,7 +1215,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
     let other_inbox = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", other_inbox_token.clone())
@@ -1252,7 +1252,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
         let rejected = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/apps/inbox/actions")
                     .header("x-elastos-home-token", other_inbox_token.clone())
@@ -1275,7 +1275,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
     let requester_inbox = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", requester_inbox_token.clone())
@@ -1309,7 +1309,7 @@ async fn inspect_action_requests_are_principal_scoped_in_inbox_and_approval() {
     );
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", requester_inbox_token.clone())
@@ -1336,7 +1336,7 @@ async fn inspect_action_can_be_denied_without_dispatch() {
     let requested = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/request_act")
                 .header("x-elastos-home-token", system_token)
@@ -1358,7 +1358,7 @@ async fn inspect_action_can_be_denied_without_dispatch() {
     let inbox_token = issue_home_launch_token(dir.path(), INBOX_CAPSULE_ID).unwrap();
     let denied = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", inbox_token)

@@ -507,6 +507,8 @@ fn intent_token_for_app_context(
     request: &serde_json::Value,
 ) -> String {
     let mut headers = HeaderMap::new();
+    headers.insert(HOST, HeaderValue::from_static("localhost:61180"));
+    headers.insert("origin", HeaderValue::from_static("null"));
     headers.insert(
         "x-elastos-home-token",
         HeaderValue::from_str(app_token).unwrap(),

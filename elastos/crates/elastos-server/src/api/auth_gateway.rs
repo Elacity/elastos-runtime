@@ -2938,6 +2938,24 @@ mod tests {
             "x-elastos-home-token",
             HeaderValue::from_str(token).unwrap(),
         );
+        headers.insert("host", HeaderValue::from_static("localhost:61180"));
+        let payload: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(token)
+                .expect("decode test launch token"),
+        )
+        .expect("parse test launch token");
+        let actor = payload["payload"]["launch_context"]["executable_actor"]
+            .as_str()
+            .expect("test launch token actor");
+        headers.insert(
+            "origin",
+            if actor == HOME_CAPSULE_ID {
+                HeaderValue::from_static("http://localhost:61180")
+            } else {
+                HeaderValue::from_static("null")
+            },
+        );
         headers
     }
 
@@ -2951,6 +2969,8 @@ mod tests {
             ))
             .unwrap(),
         );
+        headers.insert("host", HeaderValue::from_static("localhost:61180"));
+        headers.insert("origin", HeaderValue::from_static("http://localhost:61180"));
         headers
     }
 
@@ -3850,6 +3870,10 @@ mod tests {
                 .unwrap();
         let mut headers = home_token_headers(&current.home_token);
         headers.insert("host", HeaderValue::from_static("elastos.elacitylabs.com"));
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://elastos.elacitylabs.com"),
+        );
 
         let bundle_principal_id = kit.principal_id.clone();
         let bundle_localhost_root = kit.localhost_root.clone();
@@ -4294,6 +4318,10 @@ mod tests {
         .unwrap();
         let mut headers = home_session_cookie_headers(&grant.home_token);
         headers.insert("host", HeaderValue::from_static("elastos.elacitylabs.com"));
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://elastos.elacitylabs.com"),
+        );
 
         let response = sign_out_session(State(state), headers).await;
         let cookies: Vec<_> = response

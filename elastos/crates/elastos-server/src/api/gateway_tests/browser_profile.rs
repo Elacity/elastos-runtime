@@ -33,7 +33,7 @@ async fn browser_profile_reset_removes_only_principal_profile_disk() {
     let token = issue_home_launch_token(dir.path(), BROWSER_CAPSULE_ID).unwrap();
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/profile/reset")
                 .header("x-elastos-home-token", token)
@@ -95,7 +95,7 @@ async fn browser_profile_reset_requires_browser_launch_token() {
     let missing_token = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/profile/reset")
                 .body(Body::empty())
@@ -109,7 +109,7 @@ async fn browser_profile_reset_requires_browser_launch_token() {
     let system_token = issue_home_launch_token(dir.path(), SYSTEM_CAPSULE_ID).unwrap();
     let wrong_app = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/profile/reset")
                 .header("x-elastos-home-token", system_token)
@@ -152,7 +152,7 @@ async fn browser_profile_reset_refuses_live_principal_session() {
     let token = issue_home_launch_token(dir.path(), BROWSER_CAPSULE_ID).unwrap();
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/browser/profile/reset")
                 .header("x-elastos-home-token", token)

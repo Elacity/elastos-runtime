@@ -12,7 +12,7 @@ async fn post_library(
 ) -> (StatusCode, serde_json::Value) {
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/provider/object/{op}"))
                 .header("x-elastos-home-token", token)
@@ -43,7 +43,7 @@ async fn put_library_upload(
     let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri(format!("/api/provider/object/upload?uri={encoded_uri}"))
                 .header("x-elastos-home-token", token)
@@ -73,7 +73,7 @@ async fn post_library_upload_start(
 ) -> (StatusCode, serde_json::Value) {
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/upload/start")
                 .header("x-elastos-home-token", token)
@@ -104,7 +104,7 @@ async fn put_library_upload_chunk(
 ) -> (StatusCode, serde_json::Value) {
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri(format!("/api/provider/object/upload/{upload_id}/chunk"))
                 .header("x-elastos-home-token", token)
@@ -134,7 +134,7 @@ async fn post_library_upload_finish(
 ) -> (StatusCode, HeaderMap, serde_json::Value) {
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/provider/object/upload/{upload_id}/finish"))
                 .header("x-elastos-home-token", token)
@@ -171,7 +171,7 @@ async fn get_library_download_with_range(
     range: Option<&str>,
 ) -> (StatusCode, HeaderMap, Vec<u8>) {
     let encoded_uri = uri.replace(':', "%3A").replace('/', "%2F");
-    let mut request = Request::builder()
+    let mut request = test_browser_request("localhost:61180", "null")
         .method("GET")
         .uri(format!(
             "/api/provider/object/download/raw?uri={encoded_uri}"
@@ -220,7 +220,7 @@ async fn get_library_download_many_with_archive(
     let query = query_parts.join("&");
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!("/api/provider/object/download/raw?{query}"))
                 .header("x-elastos-home-token", token)
@@ -274,7 +274,7 @@ async fn test_library_provider_requires_library_token() {
     let denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/roots")
                 .header(CONTENT_TYPE, "application/json")
@@ -288,7 +288,7 @@ async fn test_library_provider_requires_library_token() {
     let documents_token = issue_home_launch_token(dir.path(), DOCUMENTS_CAPSULE_ID).unwrap();
     let rejected = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/roots")
                 .header("x-elastos-home-token", documents_token)
@@ -329,7 +329,7 @@ async fn test_library_download_route_requires_library_token_and_streams_download
     let denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!(
                     "/api/provider/object/download/raw?uri={encoded_uri}"
@@ -431,7 +431,7 @@ async fn test_library_upload_route_requires_library_token_and_writes_raw_body() 
     let denied = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri(format!("/api/provider/object/upload?uri={encoded_uri}"))
                 .header(CONTENT_TYPE, "text/plain")
@@ -445,7 +445,7 @@ async fn test_library_upload_route_requires_library_token_and_writes_raw_body() 
     let rejected = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri(format!("/api/provider/object/upload?uri={encoded_uri}"))
                 .header("x-elastos-home-token", documents_token)
@@ -630,7 +630,7 @@ async fn test_documents_viewer_route_can_read_and_save_library_file_only() {
     let direct_read = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/read")
                 .header("x-elastos-home-token", documents_token.clone())
@@ -650,7 +650,7 @@ async fn test_documents_viewer_route_can_read_and_save_library_file_only() {
     let read = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!(
                     "/api/viewers/documents/library-object?uri={encoded_uri}"
@@ -675,7 +675,7 @@ async fn test_documents_viewer_route_can_read_and_save_library_file_only() {
     let save = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("PUT")
                 .uri(format!(
                     "/api/viewers/documents/library-object?uri={encoded_uri}"
@@ -710,7 +710,7 @@ async fn test_library_provider_rejects_unknown_operation() {
 
     let rejected = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/raw_host_path")
                 .header("x-elastos-home-token", token)
@@ -739,7 +739,7 @@ async fn test_gateway_provider_proxy_rejects_predeclared_runtime_metadata() {
         let rejected = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_browser_request("localhost:61180", "null")
                     .method("POST")
                     .uri("/api/provider/object/roots")
                     .header("x-elastos-home-token", token.clone())
@@ -1558,7 +1558,7 @@ async fn test_library_provider_marks_generic_archive_families_policy_gated() {
     let direct_read = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/read")
                 .header("x-elastos-home-token", archive_token.clone())
@@ -1578,7 +1578,7 @@ async fn test_library_provider_marks_generic_archive_families_policy_gated() {
     let viewer_stat = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!(
                     "/api/viewers/archive-manager/library-object?uri={encoded_uri}&stat_only=true"
@@ -1603,7 +1603,7 @@ async fn test_library_provider_marks_generic_archive_families_policy_gated() {
     let viewer_read = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!(
                     "/api/viewers/archive-manager/library-object?uri={encoded_uri}"
@@ -2490,7 +2490,7 @@ async fn test_library_provider_lists_supported_archive_entries_through_viewer_ro
     let direct_entries = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/archive_entries")
                 .header("x-elastos-home-token", archive_token.clone())
@@ -2510,7 +2510,7 @@ async fn test_library_provider_lists_supported_archive_entries_through_viewer_ro
     let direct_preview = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/archive_preview_entry")
                 .header("x-elastos-home-token", archive_token.clone())
@@ -2531,7 +2531,7 @@ async fn test_library_provider_lists_supported_archive_entries_through_viewer_ro
     let direct_roots = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/roots")
                 .header("x-elastos-home-token", archive_token.clone())
@@ -2546,7 +2546,7 @@ async fn test_library_provider_lists_supported_archive_entries_through_viewer_ro
     let viewer_entries = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!(
                     "/api/viewers/archive-manager/library-object?uri={encoded_zip_uri}&entries=true"
@@ -2581,7 +2581,7 @@ async fn test_library_provider_lists_supported_archive_entries_through_viewer_ro
     let viewer_preview = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!(
                     "/api/viewers/archive-manager/library-object?uri={encoded_zip_uri}&preview_entry=Nested%2Fdeep.txt"
@@ -2619,7 +2619,7 @@ async fn test_library_provider_lists_supported_archive_entries_through_viewer_ro
     let viewer_roots = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri("/api/viewers/archive-manager/library-roots")
                 .header("x-elastos-home-token", archive_token)
@@ -2926,7 +2926,7 @@ async fn test_library_provider_selectively_extracts_archive_entries_through_view
     let direct_extract = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/object/archive_extract_entries")
                 .header("x-elastos-home-token", archive_token.clone())
@@ -2948,7 +2948,7 @@ async fn test_library_provider_selectively_extracts_archive_entries_through_view
     let viewer_extract = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/viewers/archive-manager/library-object?uri={encoded_zip_uri}"
@@ -3429,7 +3429,7 @@ async fn test_library_gateway_lists_external_webspace_archive_entries_without_re
     let viewer_entries = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!(
                     "/api/viewers/archive-manager/library-object?uri={encoded_uri}&entries=true"
@@ -3477,7 +3477,7 @@ async fn test_library_gateway_lists_external_webspace_archive_entries_without_re
     let viewer_preview = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("GET")
                 .uri(format!(
                     "/api/viewers/archive-manager/library-object?uri={encoded_uri}&preview_entry=Nested%2Fdeep.txt"
@@ -3570,7 +3570,7 @@ async fn test_library_gateway_imports_external_webspace_archive_entries_to_local
     let viewer_extract = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/viewers/archive-manager/library-object?uri={encoded_source_uri}"
@@ -4421,7 +4421,7 @@ async fn test_library_provider_events_stream_requires_library_token_and_serves_s
     let unauthorized = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/provider/object/events/stream")
                 .body(Body::empty())
                 .unwrap(),
@@ -4433,7 +4433,7 @@ async fn test_library_provider_events_stream_requires_library_token_and_serves_s
     let query_authority = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri(format!(
                     "/api/provider/object/events/stream?home_token={token}"
                 ))
@@ -4446,7 +4446,7 @@ async fn test_library_provider_events_stream_requires_library_token_and_serves_s
 
     let authorized = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/provider/object/events/stream")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())

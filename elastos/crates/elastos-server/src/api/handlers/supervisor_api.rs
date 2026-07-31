@@ -240,7 +240,7 @@ fn supervisor_launch_principal_from_input(
         )
     })?;
     headers.insert("x-elastos-home-token", header_value);
-    let context = crate::api::gateway::require_home_launch_token_for_any_context(
+    let context = crate::api::gateway::require_internal_shell_launch_grant_for_any_context(
         data_dir,
         &headers,
         &[input.name.as_str()],
@@ -361,12 +361,7 @@ mod tests {
     #[test]
     fn supervisor_launch_accepts_signed_launch_grant() {
         let dir = tempfile::tempdir().unwrap();
-        let context = crate::api::gateway::HomeLaunchTokenContext {
-            principal_id: "person:local:alice".to_string(),
-            session_id: "session:alice".to_string(),
-            proof_binding_id: None,
-            grant_id: "grant:alice".to_string(),
-        };
+        let context = crate::api::gateway::local_home_launch_token_context(dir.path()).unwrap();
         let grant =
             crate::api::gateway::issue_home_launch_token_with_context(dir.path(), "chat", &context)
                 .unwrap();
@@ -377,18 +372,13 @@ mod tests {
 
         let principal = supervisor_launch_principal_from_input(Some(dir.path()), &input).unwrap();
 
-        assert_eq!(principal.as_deref(), Some("person:local:alice"));
+        assert_eq!(principal.as_deref(), Some(context.principal_id.as_str()));
     }
 
     #[test]
     fn supervisor_launch_rejects_wrong_app_grant() {
         let dir = tempfile::tempdir().unwrap();
-        let context = crate::api::gateway::HomeLaunchTokenContext {
-            principal_id: "person:local:alice".to_string(),
-            session_id: "session:alice".to_string(),
-            proof_binding_id: None,
-            grant_id: "grant:alice".to_string(),
-        };
+        let context = crate::api::gateway::local_home_launch_token_context(dir.path()).unwrap();
         let grant = crate::api::gateway::issue_home_launch_token_with_context(
             dir.path(),
             "documents",
