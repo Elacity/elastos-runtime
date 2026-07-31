@@ -40,6 +40,9 @@ import {
   setBusy,
   textNode,
 } from "./wallet-render.js?v=wallet-20260711c";
+import {
+  createHomeClipboardClient,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
 const statusNode = document.querySelector("#wallet-status");
 const homeParentOrigin = readHomeOrigin();
@@ -60,9 +63,12 @@ const modalNode = document.querySelector("#wallet-modal");
 const activityNode = document.querySelector("#wallet-activity");
 
 let activeHomeToken = readLaunchToken();
-if (activeHomeToken && homeParentOrigin && window.top !== window) {
-  window.top.postMessage({ type: "home:app-ready", homeToken: activeHomeToken }, homeParentOrigin);
-}
+const homeClipboard = createHomeClipboardClient({
+  targetId: "wallet",
+  homeOrigin: homeParentOrigin,
+  homeToken: activeHomeToken,
+});
+homeClipboard.start();
 let currentAccounts = [];
 let currentDefaults = [];
 let currentBalanceRows = [];
@@ -628,13 +634,10 @@ function clearAccountSelection() {
   renderAll();
 }
 
-async function copyText(value) {
+async function copyText(value, purpose = "wallet.address") {
   const text = readText(value);
   if (!text) {
     throw new Error("Nothing to copy.");
   }
-  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
-    throw new Error("Clipboard is unavailable.");
-  }
-  await navigator.clipboard.writeText(text);
+  await homeClipboard.writeText(text, { purpose });
 }

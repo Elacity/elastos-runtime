@@ -1,3 +1,7 @@
+import {
+  createHomeClipboardClient,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+
 const CONNECTOR_ID = "wallet-unisat";
 const BITCOIN_CHAIN_NAMESPACE = "bip122:000000000019d6689c085ae165831e93";
 const HOST_EFFECT_TYPE = "home:wallet-connector-effect";
@@ -15,9 +19,12 @@ const homeOrigin = readQueryParam("home_origin");
 let hostEffectInFlight = false;
 let hostRequestSequence = 0;
 
-if (frameHomeToken && homeOrigin && window.top !== window) {
-  window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeOrigin);
-}
+const homeClipboard = createHomeClipboardClient({
+  targetId: CONNECTOR_ID,
+  homeOrigin,
+  homeToken: frameHomeToken,
+});
+homeClipboard.start();
 
 boot();
 
@@ -276,10 +283,10 @@ function isUniSatSignableRequest(request) {
 
 async function copyText(value) {
   const text = readText(value);
-  if (!text || typeof navigator.clipboard?.writeText !== "function") {
+  if (!text) {
     throw new Error("Clipboard is unavailable.");
   }
-  await navigator.clipboard.writeText(text);
+  await homeClipboard.writeText(text, { purpose: "wallet.address" });
 }
 
 async function fetchJson(url, init) {

@@ -16,7 +16,7 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260715a";
+} from "./shell-core.js?v=home-20260725a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -25,11 +25,18 @@ import {
   requestPasskeyStepUp,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260715a";
+} from "./shell-auth.js?v=home-20260725a";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-20260715a";
+} from "./home-wallet-connector-host.js?v=home-20260725a";
+import {
+  createHomeClipboardFrameState,
+  createHomeClipboardHost,
+  createHomeClipboardPrompt,
+  homeClipboardTargetSupported,
+} from "./home-clipboard-host.js?v=home-20260726a";
+import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260725a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -75,6 +82,16 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
 });
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
+const homeClipboardPrompt = createHomeClipboardPrompt({
+  root: document.querySelector("#home-clipboard-prompt"),
+  title: document.querySelector("#home-clipboard-title"),
+  copy: document.querySelector("#home-clipboard-copy"),
+  allowButton: document.querySelector("#home-clipboard-allow"),
+  cancelButton: document.querySelector("#home-clipboard-cancel"),
+});
+const homeClipboardHost = createHomeClipboardHost({
+  prompt: homeClipboardPrompt,
+});
 
 function hideHostBootMask() {
   if (!homeShellBootMask) {
@@ -118,6 +135,23 @@ async function launchWalletConnectorFromTrustedSource(context, target) {
   }
 }
 
+function retireLaunchedAppContext(homeToken) {
+  const context = launchedAppContexts.get(homeToken);
+  if (!context) {
+    return false;
+  }
+  homeClipboardHost.retireFrame(context.clipboardState);
+  launchedAppContexts.delete(homeToken);
+  return true;
+}
+
+function clearLaunchedAppContexts() {
+  for (const context of launchedAppContexts.values()) {
+    homeClipboardHost.retireFrame(context.clipboardState);
+  }
+  launchedAppContexts.clear();
+}
+
 function enterHostAuthGate() {
   shellState.activeShellRootLaunchSeq += 1;
   shellState.activeShellRootTarget = "";
@@ -125,7 +159,7 @@ function enterHostAuthGate() {
   rememberActiveShellHint(HOME_GUI_SHELL_ID);
   document.body.dataset.homeShell = "resolving";
   document.body.dataset.homeGui = "dormant";
-  launchedAppContexts.clear();
+  clearLaunchedAppContexts();
   if (activeShellRoot) {
     activeShellRoot.hidden = true;
     activeShellRoot.dataset.target = "";
@@ -191,13 +225,13 @@ async function openTargetFromHomeGui(target, options = {}) {
 async function closeHomeGuiWindow(homeToken) {
   requireHomeGuiActive("close window");
   postToActiveShell({ type: "home:gui-command", command: "close-window", homeToken });
-  launchedAppContexts.delete(homeToken);
+  retireLaunchedAppContext(homeToken);
 }
 
 async function relaunchHomeGuiTarget(homeToken) {
   requireHomeGuiActive("relaunch window");
   postToActiveShell({ type: "home:gui-command", command: "relaunch-window", homeToken });
-  launchedAppContexts.delete(homeToken);
+  retireLaunchedAppContext(homeToken);
 }
 
 async function deliverMessageToHomeGuiTargetFrame(target, payload) {
@@ -269,12 +303,17 @@ function rememberLaunchedAppContext(launched) {
     throw new Error("Runtime returned an incomplete isolated launch");
   }
   while (launchedAppContexts.size >= MAX_LAUNCHED_APP_CONTEXTS) {
-    launchedAppContexts.delete(launchedAppContexts.keys().next().value);
+    retireLaunchedAppContext(launchedAppContexts.keys().next().value);
   }
   launchedAppContexts.set(token, {
     targetId: launched.target,
     origin: OPAQUE_CAPSULE_ORIGIN,
+    parentOrigin: window.location.origin,
     source: null,
+    clipboardState:
+      homeClipboardTargetSupported(launched.target)
+        ? createHomeClipboardFrameState()
+        : null,
     walletEffectState: {
       inFlight: false,
       requestIds: new Set(),
@@ -389,6 +428,7 @@ function preclaimActiveShellSwitch(active) {
   if (!target) {
     return false;
   }
+  clearLaunchedAppContexts();
   shellState.activeShellRootLaunchSeq += 1;
   showHostBootMask();
   hideShellHostRecovery();
@@ -589,6 +629,7 @@ async function signOutFromShellHostRecovery() {
     shellHostRecoverySignOutButton.disabled = true;
   }
   try {
+    clearLaunchedAppContexts();
     await signOutHome();
     reloadHomeShellHost();
   } catch (error) {
@@ -607,6 +648,7 @@ async function signOutFromShellHostRecovery() {
 async function signOutFromRootShell() {
   document.body.dataset.homeStatus = "booting";
   try {
+    clearLaunchedAppContexts();
     await signOutHome();
     reloadHomeShellHost();
   } catch (error) {
@@ -619,6 +661,7 @@ async function signOutFromRootShell() {
 }
 
 function clearActiveShellRoot({ resetHint = false } = {}) {
+  clearLaunchedAppContexts();
   if (resetHint) {
     rememberActiveShellHint(HOME_GUI_SHELL_ID);
   }
@@ -698,6 +741,7 @@ async function syncActiveShellRoot(summary, options = {}) {
   shellState.activeShellRootLaunchSeq = launchSeq;
   shellState.activeShellRootTarget = target;
   shellState.activeShellRootRoute = "";
+  clearLaunchedAppContexts();
   if (activeShellFrame) {
     activeShellFrame.removeAttribute("src");
     activeShellFrame.dataset.route = "";
@@ -781,12 +825,41 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (data.type === "home:shell-ready") {
-    if (context.kind === "shell-frame" && shellState.currentSummary) {
-      postToActiveShell({ type: "home:shell-summary", summary: shellState.currentSummary });
+    if (context.kind === "shell-frame") {
+      if (context.targetId === HOME_GUI_SHELL_ID) {
+        let browserContextId = "";
+        try {
+          browserContextId = loadOrCreateHomeBrowserContextId(
+            window.localStorage,
+            window.crypto,
+          );
+        } catch (_error) {
+          browserContextId = "";
+        }
+        if (browserContextId) {
+          postToActiveShell({
+            type: "home:shell-context",
+            browserContextId,
+          });
+        }
+      }
+      if (shellState.currentSummary) {
+        postToActiveShell({ type: "home:shell-summary", summary: shellState.currentSummary });
+      }
     }
     return;
   }
   if (data.type === "home:app-ready") {
+    if (
+      context.kind === "app-frame" &&
+      context.clipboardState &&
+      hasExactMessageKeys(data, ["type", "homeToken"])
+    ) {
+      homeClipboardHost.resetFrame(context.clipboardState, context);
+    }
+    return;
+  }
+  if (homeClipboardHost.handle(event, context, data)) {
     return;
   }
   if (handleHomeWalletConnectorEffect(event, context, data)) {
@@ -1090,14 +1163,25 @@ function homeMessageContext(event, data) {
   if (!launched || launched.origin !== event.origin) {
     return null;
   }
-  if (launched.source && launched.source !== event.source) {
+  if (!launched.source) {
+    if (
+      data.type !== "home:app-ready" ||
+      !hasExactMessageKeys(data, ["type", "homeToken"])
+    ) {
+      return null;
+    }
+    launched.source = event.source;
+  } else if (launched.source !== event.source) {
     return null;
   }
-  launched.source = event.source;
   return {
     kind: "app-frame",
     targetId: launched.targetId,
     homeToken,
+    origin: launched.origin,
+    parentOrigin: launched.parentOrigin,
+    source: launched.source,
+    clipboardState: launched.clipboardState,
     walletEffectState: launched.walletEffectState,
   };
 }

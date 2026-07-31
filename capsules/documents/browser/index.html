@@ -1134,7 +1134,11 @@ a {
   </div>
 </div>
 
-<script>
+<script type="module">
+import {
+  createHomeClipboardClient,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+
 const state = {
   homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
   initialDocDid: new URLSearchParams(window.location.search).get("doc") || "",
@@ -1157,9 +1161,12 @@ const state = {
   pendingChatAttachmentId: "",
 };
 const homeOrigin = new URLSearchParams(window.location.search).get("home_origin") || "";
-if (state.homeToken && homeOrigin && window.top !== window) {
-  window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeOrigin);
-}
+const homeClipboard = createHomeClipboardClient({
+  targetId: "documents",
+  homeOrigin,
+  homeToken: state.homeToken,
+});
+homeClipboard.start();
 
 const elements = {
   documentsShell: document.getElementById("documents-shell"),
@@ -1540,10 +1547,7 @@ function setPublishedUri(uri) {
 }
 
 async function copyTextToClipboard(text) {
-  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
-    throw new Error("Clipboard unavailable.");
-  }
-  await navigator.clipboard.writeText(text);
+  await homeClipboard.writeText(text, { purpose: "resource.uri" });
 }
 
 async function copyPublishedUri(uri) {

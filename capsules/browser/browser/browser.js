@@ -12,20 +12,27 @@ import {
   sameBrowserStreamTarget,
   visibleAddressForUrl,
 } from "./browser-runtime-api.js?v=browser-20260627b";
-import { createBrowserClipboardBridge } from "./browser-clipboard.js?v=browser-20260711c";
 import {
-  selkiesMessagesForInput,
-  utf8FromBase64,
-} from "./browser-input.js?v=browser-20260520e";
-import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260711c";
+  createBrowserClipboardBridge,
+} from "./browser-clipboard.js?v=browser-20260725b";
+import {
+  createHomeClipboardClient,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+import {
+  createRuntimePageCleanupController,
+  runtimePageOwner,
+  sameRuntimePageOwner,
+} from "./browser-page-cleanup.js?v=browser-20260725a";
+import { selkiesMessagesForInput } from "./browser-input.js?v=browser-20260520e";
+import { bindBrowserInputSurface } from "./browser-input-surface.js?v=browser-20260725b";
 import {
   browserMetricsText,
   friendlyOpenError,
   isAuthoritySessionError,
   isMissingRuntimePageError,
   requestedDisplayMode,
-} from "./browser-status.js?v=browser-20260711c";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260711h";
+} from "./browser-status.js?v=browser-20260725a";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260724a";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -51,15 +58,18 @@ const DEFAULT_ENGINE_SUMMARY = "Use the best Browser Engine available.";
 const params = new URLSearchParams(window.location.search);
 const launchToken = new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "";
 const homeParentOrigin = params.get("home_origin") || "";
-if (launchToken && homeParentOrigin && window.top !== window) {
-  window.top.postMessage({ type: "home:app-ready", homeToken: launchToken }, homeParentOrigin);
-}
 const debugMetrics =
   params.get("debug") === "1" || params.get("metrics") === "1";
 const browserInstanceId =
   params.get("browser_instance") || localBrowserInstanceId();
 const RUNTIME_PAGE_STORAGE_KEY = `elastos.browser.current_page_id:${browserInstanceId}`;
-const { fetchJson, homeHeaders } = createRuntimeApi({ launchToken });
+const { fetchJson } = createRuntimeApi({ launchToken });
+const homeClipboard = createHomeClipboardClient({
+  targetId: "browser",
+  homeOrigin: homeParentOrigin,
+  homeToken: launchToken,
+});
+homeClipboard.start();
 
 const form = document.querySelector("#browser-form");
 const addressInput = document.querySelector("#browser-url");
@@ -82,6 +92,8 @@ const renderEmpty = document.querySelector("#browser-render-empty");
 const metricsNode = document.querySelector("#browser-metrics");
 
 let currentPage = null;
+let currentPageGeneration = 0;
+let nextPageGeneration = 1;
 let currentView = null;
 let currentDisplayMode = "";
 let currentDisplayInput = "runtime_route";
@@ -147,7 +159,7 @@ function showStatus(message, { sticky = false } = {}) {
   textNode.className = "browser-status-message";
   textNode.textContent = message;
   statusNode.append(textNode);
-  const canCopy = Boolean(sticky && message && navigator.clipboard?.writeText);
+  const canCopy = Boolean(sticky && message && homeClipboard.canRequest());
   statusNode.dataset.copyable = canCopy ? "true" : "false";
   if (canCopy) {
     const copyButton = document.createElement("button");
@@ -159,7 +171,7 @@ function showStatus(message, { sticky = false } = {}) {
       event.preventDefault();
       event.stopPropagation();
       try {
-        await navigator.clipboard.writeText(message);
+        await homeClipboard.writeText(message);
         copyButton.textContent = "Copied";
       } catch {
         copyButton.textContent = "Copy failed";
@@ -232,24 +244,93 @@ function stopPageHeartbeat() {
   pageHeartbeatTimer = 0;
 }
 
-async function closeRuntimePage(page = currentPage) {
-  if (!page?.page_id) {
-    return;
-  }
-  await fetchJson(
-    `/api/apps/browser/pages/${encodeURIComponent(page.page_id)}/close`,
-    {
-      method: "POST",
-    },
-  ).catch(() => {});
-}
-
 function rememberedRuntimePage() {
   return rememberedRuntimePageForKey(RUNTIME_PAGE_STORAGE_KEY);
 }
 
 function publishRuntimePageForHost(page = currentPage) {
   publishRuntimePageForHostForKey(RUNTIME_PAGE_STORAGE_KEY, page);
+}
+
+function currentRuntimePageOwner() {
+  return runtimePageOwner(currentPage, currentPageGeneration);
+}
+
+function finalizeRuntimePageClose(owner) {
+  if (sameRuntimePageOwner(currentRuntimePageOwner(), owner)) {
+    currentPage = null;
+    currentPageGeneration = 0;
+    currentBrowserEngineId = "";
+    currentRemoteExitId = "";
+    publishRuntimePageForHost(null);
+    stopPageStatusPolling();
+    stopPageHeartbeat();
+    closeRemoteDisplay();
+    updateMetricsNode(null);
+    updateNavState();
+    return true;
+  }
+  const rememberedPage = rememberedRuntimePage();
+  if (
+    !currentPage &&
+    owner.generation === 0 &&
+    rememberedPage?.page_id === owner.page_id
+  ) {
+    publishRuntimePageForHost(null);
+    return true;
+  }
+  return false;
+}
+
+const runtimePageCleanup = createRuntimePageCleanupController({
+  closePage: (owner, { signal }) =>
+    fetchJson(
+      `/api/apps/browser/pages/${encodeURIComponent(owner.page_id)}/close`,
+      {
+        method: "POST",
+        signal,
+      },
+    ),
+  onTerminal: (owner) => {
+    const applied = finalizeRuntimePageClose(owner);
+    if (
+      applied &&
+      Number(runtimePageCleanup.status(owner)?.attempts || 0) > 1 &&
+      !unloadCleanupStarted
+    ) {
+      showStatus(
+        "Runtime confirmed the Browser session closed after cleanup reconciliation. Refresh Browser to open a new session.",
+        { sticky: true },
+      );
+    }
+  },
+});
+
+async function closeRuntimePage(
+  page = currentPage,
+  {
+    generation =
+      page === currentPage ? currentPageGeneration : 0,
+    schedule = true,
+  } = {},
+) {
+  const owner = runtimePageOwner(page, generation);
+  return runtimePageCleanup.reconcile(owner, { schedule });
+}
+
+function cleanupPendingError(outcome) {
+  const error = new Error(
+    "Browser cleanup is pending. Runtime has not confirmed a terminal close; the existing page is retained and no replacement will open.",
+  );
+  error.cleanupOutcome = outcome;
+  return error;
+}
+
+function requireTerminalRuntimePageCloseOutcome(outcome) {
+  if (outcome?.state !== "terminal") {
+    throw cleanupPendingError(outcome);
+  }
+  return outcome;
 }
 
 function stopRemoteReconnect() {
@@ -274,21 +355,26 @@ function scheduleRemoteReconnect(message, { retry = true } = {}) {
   }
   if (!retry || remoteReconnectAttempt >= REMOTE_DISPLAY_RECOVERY_MAX_ATTEMPTS) {
     const failedPage = currentPage;
+    const failedGeneration = currentPageGeneration;
     const mediaRouteUnavailable = /no secure display relay candidate|shared secure display route/i.test(message);
-    currentPage = null;
-    currentBrowserEngineId = "";
-    currentRemoteExitId = "";
-    publishRuntimePageForHost(null);
-    stopPageStatusPolling();
-    stopPageHeartbeat();
-    closeRemoteDisplay();
-    closeRuntimePage(failedPage).catch(() => {});
     showStatus(
-      mediaRouteUnavailable
-        ? `${message} The stuck Browser session was closed. No automatic retry was attempted.`
-        : `${message} The Browser Engine started, but video did not become ready. The stuck Browser session was closed; refresh Browser to retry.`,
+      `${message} ${
+        mediaRouteUnavailable
+          ? "No automatic display retry was attempted."
+          : "The Browser Engine started, but video did not become ready."
+      } Runtime cleanup is pending; the current page remains owned and no replacement will open until Runtime confirms a terminal close.`,
       { sticky: true },
     );
+    closeRuntimePage(failedPage, { generation: failedGeneration })
+      .then((outcome) => {
+        if (outcome?.state === "terminal") {
+          showStatus(
+            "Runtime confirmed the failed Browser session closed. Refresh Browser to retry.",
+            { sticky: true },
+          );
+        }
+      })
+      .catch(() => {});
     return;
   }
   if (remoteReconnectInFlight || remoteReconnectTimer) {
@@ -353,18 +439,9 @@ function releaseRuntimePageForUnload() {
     return;
   }
   unloadCleanupStarted = true;
-  const pageId = currentPage?.page_id;
-  if (pageId) {
-    fetch(`/api/apps/browser/pages/${encodeURIComponent(pageId)}/close`, {
-      method: "POST",
-      headers: homeHeaders(false),
-      keepalive: true,
-    }).catch(() => {});
-  }
-  publishRuntimePageForHost(null);
+  homeClipboard.teardown();
   stopPageStatusPolling();
   stopPageHeartbeat();
-  closeRemoteDisplay();
   resizeObserver.disconnect();
 }
 
@@ -817,12 +894,15 @@ const {
   copyRemoteClipboardToHost,
   handleRemoteInputChannelMessage,
   pasteHostClipboardIntoRemote,
+  teardownRemoteClipboard,
 } = createBrowserClipboardBridge({
+  cancelHostClipboardRequestFn: homeClipboard.cancel,
+  createClipboardRequestIdFn: homeClipboard.newRequestId,
   friendlyOpenError,
   getCurrentPage: () => currentPage,
   sendBrowserInput,
   showStatus,
-  utf8FromBase64,
+  writeHostClipboardTextFn: homeClipboard.writeText,
 });
 
 window.addEventListener("message", (event) => {
@@ -845,6 +925,7 @@ remoteDisplay = createBrowserRemoteDisplay({
   getCurrentDisplayMode: () => currentDisplayMode,
   getLastPageStatus: () => lastPageStatus,
   handleRemoteInputChannelMessage,
+  handleRemoteInputChannelTeardown: teardownRemoteClipboard,
   onRecoveryRequired: scheduleRemoteReconnect,
   remoteVideo,
   renderEmpty,
@@ -1204,9 +1285,6 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
     window.clearTimeout(remoteReconnectTimer);
     remoteReconnectTimer = 0;
   }
-  lastRequestedUrl = nextUrl;
-  clearAddressDraft();
-  setCurrentUrl(nextUrl, { blur: true });
   setLoading(true);
   showStatus(`Opening ${visibleAddress} using ${engineLabel} and ${exitLabel}...`, {
     sticky: true,
@@ -1214,12 +1292,9 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
   try {
     const { displayMode, guaranteeLevel } = await launchContractForOpen();
     const previousPage = currentPage;
+    const previousGeneration = currentPageGeneration;
+    const previousOwner = runtimePageOwner(previousPage, previousGeneration);
     const stalePage = previousPage ? null : rememberedRuntimePage();
-    closeRemoteDisplay();
-    stopPageStatusPolling();
-    stopPageHeartbeat();
-    currentPage = null;
-    publishRuntimePageForHost(null);
     if (previousPage?.page_id || stalePage?.page_id) {
       showStatus(
         isExitSwitch
@@ -1230,8 +1305,32 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
         { sticky: true },
       );
     }
-    await closeRuntimePage(previousPage);
-    await closeRuntimePage(stalePage);
+    const previousClose = await closeRuntimePage(previousPage, {
+      generation: previousGeneration,
+    });
+    requireTerminalRuntimePageCloseOutcome(previousClose);
+    const staleClose = await closeRuntimePage(stalePage);
+    requireTerminalRuntimePageCloseOutcome(staleClose);
+    const ownerAfterClose = currentRuntimePageOwner();
+    if (
+      ownerAfterClose &&
+      !sameRuntimePageOwner(ownerAfterClose, previousOwner)
+    ) {
+      throw new Error(
+        "Browser ownership changed while cleanup was pending. No replacement page was opened.",
+      );
+    }
+    if (currentPage?.page_id) {
+      throw cleanupPendingError({
+        state: "pending",
+        page_id: currentPage.page_id,
+        generation: currentPageGeneration,
+        reason: "ownership_retained",
+      });
+    }
+    lastRequestedUrl = nextUrl;
+    clearAddressDraft();
+    setCurrentUrl(nextUrl, { blur: true });
     showStatus(`Opening ${engineLabel} with ${exitLabel}...`, {
       sticky: true,
     });
@@ -1265,6 +1364,7 @@ async function requestRuntimeOpen(value, { history = "push", reconnect = false }
       throw new Error("Browser could not use the selected Exit Node.");
     }
     currentPage = page;
+    currentPageGeneration = nextPageGeneration++;
     currentBrowserEngineId = browserEngineId;
     currentRemoteExitId = remoteExitId;
     publishRuntimePageForHost(page);
@@ -1473,6 +1573,8 @@ async function resetBrowserProfile() {
     return;
   }
   const activePage = currentPage;
+  const activeGeneration = currentPageGeneration;
+  const activeOwner = runtimePageOwner(activePage, activeGeneration);
   const rememberedPage = rememberedRuntimePage();
   const stalePage =
     rememberedPage?.page_id && rememberedPage.page_id !== activePage?.page_id
@@ -1480,18 +1582,26 @@ async function resetBrowserProfile() {
       : null;
   setLoading(true);
   showStatus("Closing Browser page before profile reset...", { sticky: true });
-  closeRemoteDisplay();
   stopRemoteReconnect();
-  stopPageStatusPolling();
-  stopPageHeartbeat();
-  currentPage = null;
-  currentBrowserEngineId = "";
-  currentRemoteExitId = "";
-  publishRuntimePageForHost(null);
-  updateNavState();
   try {
-    await closeRuntimePage(activePage);
-    await closeRuntimePage(stalePage);
+    const activeClose = await closeRuntimePage(activePage);
+    requireTerminalRuntimePageCloseOutcome(activeClose);
+    const staleClose = await closeRuntimePage(stalePage);
+    requireTerminalRuntimePageCloseOutcome(staleClose);
+    const ownerAfterClose = currentRuntimePageOwner();
+    if (ownerAfterClose && !sameRuntimePageOwner(ownerAfterClose, activeOwner)) {
+      throw new Error(
+        "Browser ownership changed while cleanup was pending. The profile was not reset.",
+      );
+    }
+    if (currentPage?.page_id) {
+      throw cleanupPendingError({
+        state: "pending",
+        page_id: currentPage.page_id,
+        generation: currentPageGeneration,
+        reason: "ownership_retained",
+      });
+    }
     const response = await fetchJson("/api/apps/browser/profile/reset", {
       method: "POST",
     });
@@ -1521,6 +1631,7 @@ bindBrowserInputSurface({
   getCurrentView: () => currentView,
   keyboardCapture,
   pasteHostClipboardIntoRemote,
+  readHostClipboardText: homeClipboard.readText,
   remoteVideo,
   renderPanel,
   sendBrowserInput,

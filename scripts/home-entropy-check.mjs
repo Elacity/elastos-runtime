@@ -659,6 +659,9 @@ const activeUiFiles = [
   "capsules/home/browser/index.html",
   "capsules/home/browser/style.css",
   "capsules/home/browser/home-shell-host.js",
+  "capsules/home/browser/home-clipboard-host.js",
+  "capsules/home/browser/home-clipboard-client.js",
+  "capsules/home/browser/home-clipboard-protocol.js",
   "capsules/home/browser/service-worker.js",
   "capsules/home-gui/browser/home-gui.js",
   "capsules/home-gui/browser/shell-surface.js",
@@ -913,6 +916,16 @@ const homeGuiJs = read("capsules/home-gui/browser/home-gui.js");
 const homeGuiCore = read("capsules/home-gui/browser/shell-core.js");
 const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
 const shellJs = read("capsules/home/browser/home-shell-host.js");
+const homeBrowserContext = read("capsules/home/browser/home-browser-context.js");
+const homeClipboardHost = read(
+  "capsules/home/browser/home-clipboard-host.js",
+);
+const homeClipboardClient = read(
+  "capsules/home/browser/home-clipboard-client.js",
+);
+const homeClipboardProtocol = read(
+  "capsules/home/browser/home-clipboard-protocol.js",
+);
 const homeWalletConnectorHost = read(
   "capsules/home/browser/home-wallet-connector-host.js",
 );
@@ -924,6 +937,12 @@ const homeWalletConnectorLaunchHeadlessSmoke = read(
 );
 const walletPreferencesForConnectorContinuity = read(
   "capsules/wallet/browser/wallet-preferences.js",
+);
+const homeClipboardHeadlessSmoke = read(
+  "scripts/home-clipboard-headless-smoke.mjs",
+);
+const homeClipboardSourceGate = read(
+  "scripts/home-clipboard-source-gate.mjs",
 );
 assert(
   (homeGuiJs.match(/export function openHomeGuiTarget\(/g) || []).length === 1,
@@ -1066,6 +1085,13 @@ const homeShellRecoverySmoke = read("scripts/home-shell-recovery-smoke.mjs");
 const homeShellSwitchbackRecoverySmoke = read("scripts/home-shell-switchback-recovery-smoke.mjs");
 const homeShellSystemSwitchSmoke = read("scripts/home-shell-system-switch-smoke.mjs");
 const homeShellRegressionSmoke = read("scripts/home-shell-regression-smoke.mjs");
+const homeBrowserContextSmoke = read("scripts/home-browser-context-smoke.mjs");
+const homeBrowserContextOpaqueSmoke = read(
+  "scripts/home-browser-context-opaque-frame-smoke.sh",
+);
+const homeBrowserContextOpaqueServer = read(
+  "scripts/fixtures/home-browser-context-opaque-frame-proof/server.py",
+);
 const servicesCapsule = read("capsules/services/capsule.json");
 const peopleCapsule = read("capsules/people/capsule.json");
 const peopleIndex = read("capsules/people/browser/index.html");
@@ -1558,7 +1584,8 @@ const gbaOpaqueBrowserProof = read("scripts/fixtures/gba-opaque-frame-browser-pr
 const gbaOpaqueBrowserInput = read("scripts/fixtures/gba-opaque-frame-browser-proof/cdp-input.mjs");
 const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-proof/server.py");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260715a";
+const homeAssetVersion = "home-20260725a";
+const homeClipboardAssetVersion = "home-20260726a";
 const homeGuiAssetVersion = "home-20260726a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
@@ -1836,17 +1863,18 @@ assert(
   "Home must allow GBA to open Library and Library to return compatible ROMs while keeping both directions source-gated",
 );
 assert(
-  shellIndex.includes(`home-shell-host.js?v=${homeAssetVersion}`),
+  shellIndex.includes(`home-shell-host.js?v=${homeClipboardAssetVersion}`),
   "Home entry module must cache-bust after shell browser changes",
 );
 assert(
-  shellIndex.includes(`style.css?v=${homeAssetVersion}`),
+  shellIndex.includes(`style.css?v=${homeClipboardAssetVersion}`),
   "Home stylesheet must cache-bust after shell browser changes",
 );
 assert(
   !shellIndex.includes(`/apps/home-gui/style.css?v=${homeAssetVersion}`) &&
     homeGuiIndex.includes(`./style.css?v=${homeAssetVersion}`) &&
-    homeGuiIndex.includes(`./home-gui-shell.js?v=${homeAssetVersion}`),
+    homeGuiIndex.includes(`./home-gui-shell.js?v=${homeGuiAssetVersion}`) &&
+    homeGuiShell.includes(`./home-gui.js?v=${homeGuiAssetVersion}`),
   "Home GUI must own its document, stylesheet, and entry module on its isolated capsule origin",
 );
 assert(
@@ -1861,6 +1889,16 @@ assert(
   "Home home-shell-host.js must import the current shell-core module instance",
 );
 assert(
+  shellJs.includes(`home-browser-context.js?v=${homeAssetVersion}`),
+  "Home host must import the current browser-profile correlation module",
+);
+assert(
+  shellJs.includes(
+    `home-clipboard-host.js?v=${homeClipboardAssetVersion}`,
+  ),
+  "Home host must import the current canonical Clipboard edge",
+);
+assert(
   !shellJs.includes("shell-surface.js"),
   "Home shell host must not statically import GUI shell-surface",
 );
@@ -1870,8 +1908,8 @@ assert(
 );
 assert(
   homeGuiJs.includes(`./shell-core.js?v=${homeAssetVersion}`) &&
-    homeGuiJs.includes(`./shell-surface.js?v=${homeAssetVersion}`) &&
-    homeGuiJs.includes(`./shell-windows.js?v=${homeAssetVersion}`),
+    homeGuiJs.includes(`./shell-surface.js?v=${homeGuiAssetVersion}`) &&
+    homeGuiJs.includes(`./shell-windows.js?v=${homeGuiAssetVersion}`),
   "Home home-gui facade must import the current GUI surface/window module instances",
 );
 assert(
@@ -1879,7 +1917,7 @@ assert(
   "Home shell-surface must import the home-gui-owned shell-core module instance",
 );
 assert(
-  shellSurface.includes(`./shell-windows.js?v=${homeAssetVersion}`),
+  shellSurface.includes(`./shell-windows.js?v=${homeGuiAssetVersion}`),
   "Home shell-surface must import the home-gui-owned shell-windows module",
 );
 assert(
@@ -1924,10 +1962,55 @@ assert(
   "Home iframes must allow autoplay and fullscreen through the allow policy without deprecated allowfullscreen",
 );
 assert(
-  shellWindows.includes('const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"]') &&
-    shellWindows.includes('launched?.target === "browser"') &&
-    shellWindows.includes("tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS)"),
-  "Home must grant clipboard-read/write explicitly and only to the Browser iframe",
+  !shellWindows.includes("BROWSER_IFRAME_ALLOW_EXTRAS") &&
+    !shellWindows.includes('"clipboard-read"') &&
+    !shellWindows.includes('"clipboard-write"') &&
+    shellJs.includes("createHomeClipboardHost") &&
+    shellJs.includes("homeClipboardHost.handle(event, context, data)") &&
+    shellJs.includes("clearLaunchedAppContexts()") &&
+    homeClipboardHost.includes("await prompt.request") &&
+    homeClipboardHost.includes("await clipboard.readText()") &&
+    homeClipboardHost.includes("await clipboard.writeText(clipboardText)") &&
+    homeClipboardHost.includes("context.targetId") &&
+    !homeClipboardHost.includes("data.targetId") &&
+    shellJs.includes("homeClipboardHost.resetFrame(context.clipboardState, context)") &&
+    homeClipboardHost.includes("MAX_HOME_CLIPBOARD_REPLAY_IDS = 64") &&
+    homeClipboardHost.includes("HOME_CLIPBOARD_TIMEOUT_MS = 15_000") &&
+    homeClipboardHost.includes(
+      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+    ) &&
+    homeClipboardClient.includes(
+      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+    ) &&
+    homeClipboardProtocol.includes(
+      "MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES = 65_536",
+    ) &&
+    homeClipboardProtocol.includes('"browser.text"') &&
+    homeClipboardProtocol.includes('"wallet.address"') &&
+    homeClipboardProtocol.includes('"wallet.recovery-key"') &&
+    homeClipboardProtocol.includes('"resource.identifier"') &&
+    homeClipboardProtocol.includes('"resource.uri"') &&
+    homeClipboardProtocol.includes(
+      "Object.hasOwn(HOME_CLIPBOARD_TARGET_PURPOSE_POLICY, targetId)",
+    ) &&
+    homeClipboardProtocol.includes("Object.hasOwn(targetPolicy, purpose)") &&
+    homeClipboardProtocol.includes("text.length > policy.maxUtf8Bytes") &&
+    homeClipboardClient.includes("createHomeClipboardClient") &&
+    homeClipboardClient.includes("home:app-ready") &&
+    homeShellHostContract.includes("### First-party Clipboard edge") &&
+    homeShellHostContract.includes("not an ESP") &&
+    homeShellHostContract.includes("never persists,") &&
+    homeShellHostContract.includes("logs, audits") &&
+    homeShellHostContract.includes(
+      "node scripts/home-clipboard-headless-smoke.mjs",
+    ) &&
+    homeClipboardHeadlessSmoke.includes(
+      "elastos.home.clipboard-headless-smoke/v1",
+    ) &&
+    homeClipboardSourceGate.includes(
+      "Only the trusted top-level Home Clipboard host may access navigator.clipboard",
+    ),
+  "Home must own one bounded, visible-user-action first-party Clipboard edge while opaque capsule frames receive no Clipboard permission",
 );
 assert(
     shellJs.includes('const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
@@ -1979,12 +2062,19 @@ const persistSessionBlock = sourceBlock(
   "function persistBrowserSession()",
   "Home browser session persistence",
 );
+const snapshotSessionBlock = sourceBlock(
+  shellWindows,
+  "export function snapshotBrowserSession()",
+  "Home browser session snapshot",
+);
 assert(
-  persistSessionBlock.includes("saveShellSessionState({ root_shell: rootShell, windows: [] });"),
+  persistSessionBlock.includes("saveShellSessionState(snapshotBrowserSession())") &&
+    snapshotSessionBlock.includes("root_shell: currentRootShellSessionId()") &&
+    snapshotSessionBlock.includes("windows: persistedBrowserSessionEntries()"),
   "Home must persist an explicit empty session after the last window closes",
 );
 assert(
-  persistSessionBlock.includes("root_shell: rootShell") &&
+  snapshotSessionBlock.includes("root_shell: currentRootShellSessionId()") &&
     shellWindows.includes("function currentRootShellSessionId()") &&
     shellWindows.includes("storedSessionRootShell(storedSession)") &&
     shellWindows.includes("{ rootShell: currentRootShellSessionId() }"),
@@ -4291,6 +4381,7 @@ const walletJs = readAll([
 const walletStyle = read("capsules/wallet/browser/style.css");
 const browserManifest = read("capsules/browser/capsule.json");
 const browser = read("capsules/browser/browser/index.html");
+const browserMain = read("capsules/browser/browser/browser.js");
 const browserJs = readAll([
   "capsules/browser/browser/browser.js",
   "capsules/browser/browser/browser-clipboard.js",
@@ -4298,16 +4389,29 @@ const browserJs = readAll([
   "capsules/browser/browser/browser-input.js",
   "capsules/browser/browser/browser-input-surface.js",
   "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-page-cleanup.js",
   "capsules/browser/browser/browser-remote-display.js",
   "capsules/browser/browser/browser-runtime-api.js",
   "capsules/browser/browser/browser-status.js",
   "capsules/browser/browser/browser-webrtc.js",
 ]);
 const browserStyle = read("capsules/browser/browser/style.css");
+const browserUnloadReleaseBlock = sourceBlock(
+  browserMain,
+  "function releaseRuntimePageForUnload()",
+  "Browser unload release",
+);
 assert(
   browserJs.includes('window.addEventListener("beforeunload"') &&
     browserJs.includes('window.addEventListener("pagehide", releaseRuntimePageForUnload)') &&
-    browserJs.includes("keepalive: true") &&
+    browserUnloadReleaseBlock.includes("stopPageStatusPolling();") &&
+    browserUnloadReleaseBlock.includes("stopPageHeartbeat();") &&
+    browserUnloadReleaseBlock.includes("resizeObserver.disconnect();") &&
+    !browserUnloadReleaseBlock.includes("closeRuntimePage(") &&
+    !browserUnloadReleaseBlock.includes("publishRuntimePageForHost(null)") &&
+    !browserUnloadReleaseBlock.includes("closeRemoteDisplay()") &&
+    browserJs.includes("createRuntimePageCleanupController") &&
+    browserJs.includes("requireTerminalRuntimePageCloseOutcome") &&
     !browserJs.includes("__elastosBrowserReleaseRuntimePage") &&
     !shellWindows.includes("__elastosBrowserReleaseRuntimePage") &&
     browserJs.includes("window.__elastosBrowserCurrentPageId") &&
@@ -4316,7 +4420,7 @@ assert(
     gatewayBrowserRouteTests.includes(
       '.uri(format!("/api/apps/browser/pages/{page_id}/close"))',
     ),
-  "Browser must own unload cleanup through the authenticated Runtime close route without exposing a same-origin function hook to Home",
+  "Browser unload must retain the authenticated Runtime owner for terminal reconciliation before replacement, without exposing a same-origin function hook to Home",
 );
 const walletWalletconnect = read("capsules/wallet-walletconnect/browser/index.html");
 const walletWalletconnectJs = read(
@@ -4420,8 +4524,10 @@ assert(
   "Documents published URI must be copied from the toolbar action row",
 );
 assert(
-  documents.includes("navigator.clipboard.writeText"),
-  "Documents Copy link must write the elastos:// URI to the clipboard",
+  documents.includes("createHomeClipboardClient") &&
+    documents.includes('{ purpose: "resource.uri" }') &&
+    !documents.includes("navigator.clipboard"),
+  "Documents Copy link must route its resource URI through trusted Home Clipboard",
 );
 assert(
   !documents.includes("Open elastos://"),
@@ -5040,7 +5146,19 @@ assert(
     libraryDialog.includes("Published Link") &&
     libraryDialog.includes("publishedCid(object)") &&
     libraryDialog.includes("propertiesVisibilitySummary") &&
-    libraryDialog.includes("copyableValue(identity.contentId") &&
+    libraryDialog.includes(
+      '["Content ID", copyableValue(identity.contentId, "content ID", "resource.identifier")]',
+    ) &&
+    libraryDialog.includes(
+      '["Published CID", copyableValue(identity.publishedId, "published CID", "resource.identifier")]',
+    ) &&
+    libraryDialog.includes(
+      '["Head", copyableValue(identity.headId, "object head", "resource.identifier")]',
+    ) &&
+    libraryDialog.includes(
+      '["Resolver Target", copyableValue(identity.resolverTarget, "resolver target", "resource.identifier")]',
+    ) &&
+    libraryDialog.includes("data-copy-purpose") &&
     libraryDialog.includes("data-prop-copy") &&
     libraryDialog.includes("props-copy-btn") &&
     libraryDialog.includes("item-prop-badge") &&
@@ -5066,8 +5184,12 @@ assert(
     objectProviderImpl.includes("fn raw_sha256_cid(") &&
     objectProviderImpl.includes("\"current_cid\"") &&
     libraryApp.includes("publishedCid(object)") &&
-    libraryApp.includes("Copy Published Link") &&
     libraryApp.includes("Copy Content CID") &&
+    libraryApp.includes("Copy Published Link") &&
+    libraryApp.includes('purpose: "resource.identifier"') &&
+    libraryApp.includes('{ purpose: "resource.uri" }') &&
+    libraryActions.includes('purpose === "resource.identifier"') &&
+    libraryActions.includes('purpose === "resource.uri"') &&
     libraryActions.includes("publishedCid(object)") &&
     libraryMenuSmoke.includes("SMOKE_LOCAL_CONTENT_CID") &&
     libraryMenuSmoke.includes("SMOKE_PUBLISHED_CID"),
@@ -6024,7 +6146,7 @@ assert(
 );
 assert(
   libraryIndex.includes('rel="stylesheet" href="library.css"') &&
-    libraryIndex.includes('type="module" src="src/app.js?v=library-20260711d"') &&
+  libraryIndex.includes('type="module" src="src/app.js?v=library-20260726a"') &&
     !libraryIndex.includes("<style>") &&
     !libraryIndex.includes("function renderContent"),
   "Library index must stay a static shell with CSS and app code split out",
@@ -6478,22 +6600,73 @@ assert(
   "Home shell must keep signed sessions fresh on long-lived desktops",
 );
 assert(
-  homeGuiCore.includes("HOME_BROWSER_CONTEXT_KEY") &&
-    homeGuiCore.includes("browser_context_id"),
-  "Home open-window restore must be bound to a browser-context id so clearing site data cannot replay stale windows",
+  homeBrowserContext.includes(
+    'HOME_BROWSER_CONTEXT_STORAGE_KEY = "elastos.home.browser-context-id"',
+  ) &&
+    homeBrowserContext.includes("HOME_BROWSER_CONTEXT_PATTERN = /^browser:[0-9a-f]{32}$/") &&
+    homeBrowserContext.includes("cryptoSource.getRandomValues(bytes)") &&
+    !homeBrowserContext.includes("randomUUID") &&
+    !homeBrowserContext.includes("Math.random"),
+  "Trusted Home must own one exact 128-bit browser-profile correlation with no weak fallback",
 );
 assert(
-  homeGuiCore.includes("newBrowserContextId") &&
-    homeGuiCore.includes("getRandomValues") &&
-    !homeGuiCore.includes("Math.random()"),
-  "Home browser context ids must use browser crypto instead of random fallback ids",
+  shellJs.includes('data.type === "home:shell-ready"') &&
+    shellJs.includes("context.targetId === HOME_GUI_SHELL_ID") &&
+    shellJs.includes("loadOrCreateHomeBrowserContextId(") &&
+    shellJs.includes('type: "home:shell-context"') &&
+    homeShellBridgeSmoke.includes(
+      "Home handed a browser correlation to an unaccepted shell-ready sender",
+    ) &&
+    homeShellBridgeSmoke.includes(
+      "Home correlation handoff carried authority or Runtime summary facts",
+    ),
+  "Home must hand correlation only to the exact accepted active GUI ready sender and outside Runtime facts",
+);
+assert(
+  homeGuiCore.includes("HOME_BROWSER_CONTEXT_PATTERN = /^browser:[0-9a-f]{32}$/") &&
+    homeGuiCore.includes("acceptHomeBrowserContextId") &&
+    homeGuiCore.includes("hasHomeBrowserContextId") &&
+    homeGuiCore.includes("browser_context_id") &&
+    homeGuiCore.includes("if (!hasHomeBrowserContextId())") &&
+    homeGuiShell.includes('message.type === "home:shell-context"') &&
+    homeGuiShell.includes("event.source !== window.parent || event.origin !== homeOrigin") &&
+    !homeGuiCore.includes("localStorage") &&
+    !homeGuiShell.includes("localStorage") &&
+    !homeGuiCore.includes("Math.random") &&
+    !homeGuiShell.includes("Math.random") &&
+    !shellWindows.includes("Math.random"),
+  "Opaque Home GUI must accept one exact checked host correlation with no browser-storage or random fallback",
+);
+assert(
+  homeBrowserContextSmoke.includes("assertions > 0") &&
+    homeBrowserContextSmoke.includes(
+      "Home GUI restored a session before accepting the host correlation",
+    ) &&
+    homeBrowserContextSmoke.includes(
+      "another top-level host correlation restored this GUI session",
+    ) &&
+    homeBrowserContextOpaqueSmoke.includes("--headless=new") &&
+    homeBrowserContextOpaqueSmoke.includes('f"checks={len(required)}') &&
+    homeBrowserContextOpaqueServer.includes('sandbox="allow-scripts allow-forms allow-pointer-lock allow-modals"') &&
+    homeBrowserContextOpaqueServer.includes("window.location.reload()") &&
+    homeBrowserContextOpaqueServer.includes("local_storage_unavailable"),
+  "Home browser-profile correlation must have deterministic and real opaque-frame reload proof",
 );
 assert(
   shellWindows.includes("seenTargets") &&
     shellWindows.includes("seenTargets.has(targetId)") &&
+    shellWindows.includes("export function snapshotBrowserSession()") &&
+    !shellWindows.includes("clearShellSessionState") &&
     homeShellRegressionSmoke.includes("rootless GUI session restored without explicit shell ownership") &&
-    homeShellRegressionSmoke.includes("CLI-owned overlay session restored into Home GUI"),
-  "Home session restore must de-dupe targets and reject sessions owned by a different root shell",
+    homeShellRegressionSmoke.includes("CLI-owned overlay session restored into Home GUI") &&
+    homeShellRegressionSmoke.includes(
+      "window session did not round-trip exact geometry, minimization, active state, and z-order",
+    ) &&
+    homeShellRegressionSmoke.includes(
+      "one persisted Browser descriptor did not produce exactly one Browser shell launch",
+    ) &&
+    homeShellRegressionSmoke.includes("explicitly closed window was restored"),
+  "Home session restore must preserve exact window state, reject cross-shell state, and avoid read-time cleanup writes",
 );
 assert(
   protectedHomeStateSmoke.includes("home_browser_state"),
@@ -9855,9 +10028,11 @@ assert(
   "Home must own exact MetaMask/Brave provider selection and only Runtime-implied EVM effects",
 );
 assert(
-  walletMetamaskJs.includes("navigator.clipboard.writeText") &&
+  walletMetamaskJs.includes("createHomeClipboardClient") &&
+    walletMetamaskJs.includes('{ purpose: "wallet.address" }') &&
+    !walletMetamaskJs.includes("navigator.clipboard") &&
     walletMetamask.includes("Connected accounts"),
-  "MetaMask connector must show copyable full linked wallet accounts",
+  "MetaMask connector must show linked wallet accounts copied only through trusted Home",
 );
 assert(
     walletMetamaskJs.includes("isManagedWalletRequest") &&

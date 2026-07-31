@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260715a";
+const moduleVersion = "home-20260725a";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-gui"],
@@ -20,6 +20,11 @@ const hostStaticSelectors = new Set([
   "#home-unlock-secondary",
   "#home-unlock-status",
   "#home-unlock-title",
+  "#home-clipboard-prompt",
+  "#home-clipboard-title",
+  "#home-clipboard-copy",
+  "#home-clipboard-allow",
+  "#home-clipboard-cancel",
   "#shell-host-recovery",
   "#shell-host-recovery-copy",
   "#shell-host-recovery-detail",
@@ -303,6 +308,7 @@ elementForSelector("#active-shell-root").hidden = true;
 elementForSelector("#active-shell-frame").hidden = true;
 elementForSelector("#shell-host-recovery").hidden = true;
 elementForSelector("#shell-host-recovery-detail").hidden = true;
+elementForSelector("#home-clipboard-prompt").hidden = true;
 elementForSelector("#home-unlock").hidden = true;
 
 globalThis.fetch = async (url, init = {}) => {

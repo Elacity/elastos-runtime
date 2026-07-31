@@ -77,7 +77,6 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
   "allow-top-navigation-to-custom-protocols",
 ];
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
-const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
 const pendingWindowLaunches = new Set();
 
 function iframeSandboxForLaunch(launched) {
@@ -94,12 +93,8 @@ function iframeSandboxForLaunch(launched) {
   return tokens.join(" ");
 }
 
-function iframeAllowForLaunch(launched) {
-  const tokens = [...COMMON_IFRAME_ALLOW];
-  if (launched?.target === "browser") {
-    tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS);
-  }
-  return tokens.join("; ");
+function iframeAllowForLaunch() {
+  return COMMON_IFRAME_ALLOW.join("; ");
 }
 
 export function configureWindowHooks(nextHooks) {

@@ -10,10 +10,13 @@ const repoRoot = new URL("../", import.meta.url);
 const browserSource = [
   "capsules/browser/browser/browser.js",
   "capsules/browser/browser/browser-clipboard.js",
+  "capsules/home/browser/home-clipboard-client.js",
+  "capsules/home/browser/home-clipboard-protocol.js",
   "capsules/browser/browser/browser-history.js",
   "capsules/browser/browser/browser-input-surface.js",
   "capsules/browser/browser/browser-input.js",
   "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-page-cleanup.js",
   "capsules/browser/browser/browser-remote-display.js",
   "capsules/browser/browser/browser-runtime-api.js",
   "capsules/browser/browser/browser-status.js",
@@ -28,6 +31,17 @@ const browserStyle = fs.readFileSync(
 );
 const homeGuiWindowsSource = fs.readFileSync(
   new URL("capsules/home-gui/browser/shell-windows.js", repoRoot),
+  "utf8",
+);
+const homeClipboardHostSource = fs.readFileSync(
+  new URL(
+    "capsules/home/browser/home-clipboard-host.js",
+    repoRoot,
+  ),
+  "utf8",
+);
+const homeShellHostSource = fs.readFileSync(
+  new URL("capsules/home/browser/home-shell-host.js", repoRoot),
   "utf8",
 );
 const homeShellWindowGeometrySource = fs.readFileSync(
@@ -158,7 +172,7 @@ expectError("display=unsupported", "Unsupported Browser display mode");
   `);
   const message = script.runInNewContext({});
   assert(
-    message === "Browser Engine failed to start cleanly. The failed session was closed; refresh Browser, or choose another Browser Engine.",
+    message === "Browser Engine failed to start cleanly. Runtime did not provide a terminal close result, so Browser cannot claim the session closed.",
     `Browser launch failures must be sanitized, got ${message}`,
   );
 }
@@ -361,8 +375,11 @@ assert(
     browserSource.includes("iceTransportPolicy,") &&
     browserSource.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
     browserSource.includes('onRecoveryRequired(message, { retry: false })') &&
-    browserSource.includes("The stuck Browser session was closed"),
-  "Browser product launch must not silently fall back from WebRTC to image polling, leave stuck Browser sessions, or expose relay internals to users",
+    browserSource.includes("createRuntimePageCleanupController") &&
+    browserSource.includes("Runtime cleanup is pending") &&
+    browserSource.includes("Runtime confirmed the failed Browser session closed") &&
+    !browserSource.includes("The stuck Browser session was closed"),
+  "Browser product launch must not silently fall back from WebRTC to image polling, discard Runtime ownership before terminal cleanup, or expose relay internals to users",
 );
 
 {
@@ -457,11 +474,19 @@ assert(
 );
 assert(
   homeGuiWindowsSource.includes("function iframeAllowForLaunch") &&
-    homeGuiWindowsSource.includes('launched?.target === "browser"') &&
-    homeGuiWindowsSource.includes('"clipboard-read"') &&
-    homeGuiWindowsSource.includes('"clipboard-write"') &&
-    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"'),
-  "Home must grant clipboard-read/write only through the Browser iframe allow policy so remote paste can read the host clipboard",
+    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"') &&
+    !homeGuiWindowsSource.includes('"clipboard-read"') &&
+    !homeGuiWindowsSource.includes('"clipboard-write"') &&
+    !browserSource.includes("navigator.clipboard") &&
+    !browserSource.includes("execCommand") &&
+    browserSource.includes("createHomeClipboardClient") &&
+    browserSource.includes("pendingRemoteCopy") &&
+    browserSource.includes('getData("text/plain")') &&
+    homeShellHostSource.includes("createHomeClipboardHost") &&
+    homeClipboardHostSource.includes("await prompt.request") &&
+    homeClipboardHostSource.includes("await clipboard.readText()") &&
+    homeClipboardHostSource.includes("await clipboard.writeText(clipboardText)"),
+  "Browser Clipboard must cross one visible-user-action trusted Home edge while the opaque Browser frame has no Clipboard permission or compatibility fallback",
 );
 
 console.log(

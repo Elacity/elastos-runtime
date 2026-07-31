@@ -194,8 +194,9 @@ check_forbidden_in_path() {
   local pattern="$1"
   local path="$2"
   local label="$3"
+  shift 3
   local search_status=0
-  rg_search "$pattern" "$path" >"$tmp" 2>/dev/null || search_status=$?
+  rg_search "$pattern" "$path" "$@" >"$tmp" 2>/dev/null || search_status=$?
   if [[ "$search_status" -eq 0 ]]; then
     echo "[alignment] forbidden pattern found: $label"
     cat "$tmp"
@@ -449,7 +450,7 @@ check_required 'wallet-connector-transaction-smoke\.mjs' docs/BROWSER_CAPSULE.md
 check_required 'eth_sendTransaction' scripts/wallet-connector-transaction-smoke.mjs 'connector smoke must prove external transaction submission'
 check_required 'wallet_addEthereumChain' scripts/wallet-connector-transaction-smoke.mjs 'connector smoke must prove known-chain add handling'
 check_required 'transaction_hash' scripts/wallet-connector-transaction-smoke.mjs 'connector smoke must prove transaction-hash-only Runtime completion'
-check_forbidden_in_path 'fallback|frame preview|showing Runtime frame preview' capsules/browser 'Browser UI must not silently downgrade to fallback frame previews'
+check_forbidden_in_path 'fallback|frame preview|showing Runtime frame preview' capsules/browser 'Browser UI must not silently downgrade to fallback frame previews' --glob '!*.test.mjs'
 check_forbidden_in_path 'fallback|showing Runtime frame preview' capsules/browser-engine-adapter 'Browser Engine Adapter must fail closed instead of fallback display modes'
 check_forbidden_in_path 'fallback|showing Runtime frame preview' elastos/tools/browser-playwright-engine/src 'Browser proof engine must not present fallback display paths as normal browsing'
 check_required 'cdp_screencast_i420' elastos/tools/browser-playwright-engine/src/supervisor.mjs 'Playwright proof backend must identify itself as CDP screencast, not final compositor'

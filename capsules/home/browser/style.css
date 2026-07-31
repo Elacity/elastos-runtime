@@ -250,6 +250,81 @@ img {
   color: #ff8f8f;
 }
 
+.home-clipboard-prompt {
+  position: fixed;
+  inset: 0;
+  z-index: 210000;
+  display: grid;
+  place-items: center;
+  padding: max(18px, env(safe-area-inset-top, 0)) 18px max(18px, env(safe-area-inset-bottom, 0));
+  background: rgba(0, 0, 0, 0.68);
+  backdrop-filter: blur(5px);
+}
+
+.home-clipboard-prompt[hidden] {
+  display: none;
+}
+
+.home-clipboard-card {
+  width: min(390px, 100%);
+  padding: 26px 28px 28px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 18px;
+  background: #1c1c1e;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.62);
+  text-align: center;
+}
+
+.home-clipboard-eyebrow {
+  margin: 0 0 10px;
+  color: var(--brand-strong);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.home-clipboard-card h1 {
+  margin: 0;
+  font-size: 28px;
+  line-height: 1.08;
+}
+
+.home-clipboard-card > p:not(.home-clipboard-eyebrow) {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.home-clipboard-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 24px;
+}
+
+.home-clipboard-button {
+  min-height: 42px;
+  padding: 0 18px;
+  border-radius: 999px;
+  background: var(--brand);
+  color: #161616;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.home-clipboard-button-secondary {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+}
+
+.home-clipboard-button:focus-visible {
+  outline: 2px solid var(--brand-focus);
+  outline-offset: 3px;
+}
+
 @media (max-width: 720px) {
   .home-unlock-card,
   .home-unlock[data-mode="prompt"] .home-unlock-card {

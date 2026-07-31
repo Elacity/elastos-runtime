@@ -55,6 +55,7 @@ function assertNoForbidden(source, label, forbidden) {
 const browserManifest = read("capsules/browser/capsule.json");
 const browserCapsuleManifest = JSON.parse(browserManifest);
 const browser = read("capsules/browser/browser/index.html");
+const browserMain = read("capsules/browser/browser/browser.js");
 const browserJs = readAll([
   "capsules/browser/browser/browser.js",
   "capsules/browser/browser/browser-clipboard.js",
@@ -62,6 +63,7 @@ const browserJs = readAll([
   "capsules/browser/browser/browser-input.js",
   "capsules/browser/browser/browser-input-surface.js",
   "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-page-cleanup.js",
   "capsules/browser/browser/browser-remote-display.js",
   "capsules/browser/browser/browser-runtime-api.js",
   "capsules/browser/browser/browser-status.js",
@@ -71,6 +73,20 @@ const browserInputSurface = read("capsules/browser/browser/browser-input-surface
 const browserRemoteDisplay = read("capsules/browser/browser/browser-remote-display.js");
 const browserStyle = read("capsules/browser/browser/style.css");
 const homeGuiWindowsSource = read("capsules/home-gui/browser/shell-windows.js");
+const homeClipboardHost = read(
+  "capsules/home/browser/home-clipboard-host.js",
+);
+const homeClipboardClient = read(
+  "capsules/home/browser/home-clipboard-client.js",
+);
+const homeClipboardProtocol = read(
+  "capsules/home/browser/home-clipboard-protocol.js",
+);
+const homeShellHostSource = read("capsules/home/browser/home-shell-host.js");
+const homeShellHostContract = read("docs/HOME_SHELL_HOST_CONTRACT.md");
+const homeClipboardHeadlessSmoke = read(
+  "scripts/home-clipboard-headless-smoke.mjs",
+);
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
 const browserEngineAdapter = readAll([
@@ -244,12 +260,19 @@ const gatewayBrowserApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_browser.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_engine.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_response.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_sessions.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_stream.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_validation.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_wallet.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_wallet_bridge.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_wallet_reads.rs",
 ]);
+const gatewayBrowserRouteTests = read(
+  "elastos/crates/elastos-server/src/api/gateway_browser_route_tests.rs",
+);
+const homeBrowserRestoredLifecycleHeadlessSmoke = read(
+  "scripts/home-browser-restored-lifecycle-headless-smoke.mjs",
+);
 const browserProfileResetRoute = sourceBlock(
   gatewayBrowserApi,
   "pub(super) async fn browser_app_profile_reset",
@@ -575,6 +598,9 @@ assert(
   gatewayBrowserApi.includes("BrowserProviderResourceCall") &&
     gatewayBrowserApi.includes("BrowserOpenRequest") &&
     gatewayBrowserApi.includes("browser_app_open") &&
+    gatewayBrowserApi.includes("owner_launch_id") &&
+    gatewayBrowserApi.includes("BrowserOpenJobReservation") &&
+    gatewayBrowserApi.includes("Browser lifecycle is already active or launching for this verified launch") &&
     gatewayBrowserApi.includes("browser.open.requested") &&
     gatewayBrowserApi.includes("browser.open.completed") &&
     gatewayBrowserApi.includes("browser.chain_read.requested") &&
@@ -589,6 +615,41 @@ assert(
     !gatewayApi.includes("fn create_browser_wallet_transaction_request(") &&
     !gatewayApi.includes("fn browser_engine_summary("),
   "Browser DTOs, provider-envelope helpers, and wallet bridge flows must stay out of the shared gateway module",
+);
+
+assert(
+  gatewayBrowserApi.includes("browser_open_job_for_owner") &&
+    gatewayBrowserApi.includes("job.owner_launch_id == owner_launch_id") &&
+    gatewayBrowserApi.includes("Browser lifecycle already owns a different open intent") &&
+    gatewayBrowserApi.includes("pending_engine_cleanups") &&
+    gatewayBrowserApi.includes("claim_pending_browser_engine_cleanups") &&
+    gatewayBrowserApi.includes("record_browser_engine_cleanup_obligation") &&
+    gatewayBrowserApi.includes("browser_terminal_close_receipt") &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_async_duplicate_open_coalesces_by_verified_launch_owner",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_open_job_and_page_routes_require_exact_verified_launch_owner",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_close_transport_and_exit_failures_retry_independent_cleanup_obligations",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "fixture_duplicate_open=1",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserOpenRequests === 2",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserOpenEffects === 1",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserPageCount === 1",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserVmCount === 1",
+    ),
+  "Browser lifecycle must coalesce matching pending/completed owner intent, enforce the exact verified owner on job/page routes, retain engine cleanup separately from Exit cleanup, and keep a real Home-refresh regression",
 );
 
 assert(
@@ -1215,22 +1276,23 @@ assert(
     browserVmControlService.includes("persistent_launcher") &&
     browserVmControlService.includes("runPersistentProgram") &&
     browserVmControlService.includes("terminatePersistentLauncher") &&
-    browserVmControlService.includes("sameLaunchIdentity") &&
+    !browserVmControlService.includes("sameLaunchIdentity") &&
+    !browserVmControlService.includes("launch_replacing") &&
     browserVmControlService.includes("reuse_idle_vms") &&
     browserVmControlService.includes("idleVmReuseEnabled") &&
     browserVmControlService.includes("idle_vm_reuse_disabled_retired") &&
     browserVmControlService.includes("retireNonReusableIdleVmsForSinglePageRuntime") &&
     browserVmControlService.includes("single_active_page_non_reusable_profile") &&
     browserVmControlService.includes("max_active_pages") &&
-    browserVmControlService.includes("launch_reused") &&
-    browserVmControlService.includes('reason: "same_stream"') &&
     browserVmControlService.includes("Browser VM active page capacity reached") &&
+    browserVmControlService.includes("page_close_forced_vm_retirement") &&
     browserVmControlService.includes("per_launch_vm_target") &&
     browserVmControlServiceSmoke.includes("elastos.browser.vm-control-service-smoke/v1") &&
-    browserVmControlServiceSmoke.includes("second stream did not launch the new URL") &&
-    browserVmControlServiceSmoke.includes("single-page replacement did not preserve one active page") &&
+    browserVmControlServiceSmoke.includes("capacity conflict changed the healthy owner") &&
+    browserVmControlServiceSmoke.includes("explicit close did not permit the next lifecycle") &&
     browserVmControlServicePersistentSmoke.includes("elastos.browser.vm-control-service-persistent-smoke/v1") &&
-    browserVmControlServicePersistentSmoke.includes("same stream launch was not idempotent") &&
+    browserVmControlServicePersistentSmoke.includes("completed replay changed the healthy owner") &&
+    browserVmControlServicePersistentSmoke.includes("failed guest close did not force terminal VM retirement") &&
     browserVmControlServicePersistentSmoke.includes("wrong single-page persistent status") &&
     browserVmControlServicePersistentSmoke.includes("fake-invalid-persistent-vm-launcher") &&
     browserVmControlServicePersistentSmoke.includes("idle keepalive retained a VM without explicit reuse opt-in") &&
@@ -1615,22 +1677,72 @@ assert(
 );
 assert(
   homeGuiWindowsSource.includes("function iframeAllowForLaunch") &&
-    homeGuiWindowsSource.includes('launched?.target === "browser"') &&
-    homeGuiWindowsSource.includes('"clipboard-read"') &&
-    homeGuiWindowsSource.includes('"clipboard-write"') &&
-    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"'),
-  "Home Browser iframe must explicitly grant clipboard-read/write so render-surface paste can use the Runtime clipboard bridge",
+    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"') &&
+    !homeGuiWindowsSource.includes('"clipboard-read"') &&
+    !homeGuiWindowsSource.includes('"clipboard-write"') &&
+    homeShellHostSource.includes("createHomeClipboardHost") &&
+    homeShellHostSource.includes("homeClipboardHost.handle(event, context, data)") &&
+    homeClipboardHost.includes("await clipboard.readText()") &&
+    homeClipboardHost.includes("await clipboard.writeText(clipboardText)") &&
+    homeClipboardHost.includes("await prompt.request") &&
+    homeClipboardHost.includes("context.targetId") &&
+    !homeClipboardHost.includes("data.targetId") &&
+    homeShellHostSource.includes(
+      "homeClipboardHost.resetFrame(context.clipboardState, context)",
+    ) &&
+    homeClipboardHost.includes(
+      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+    ) &&
+    homeClipboardClient.includes(
+      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+    ) &&
+    homeClipboardProtocol.includes(
+      "MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES = 65_536",
+    ),
+  "Only the visible trusted Home host may perform bounded Browser Clipboard reads or writes; the opaque Browser iframe must receive no Clipboard permission",
 );
 
 assert(
   browserJs.includes("browser-status-copy") &&
     browserJs.includes("Copy Browser status message") &&
-    browserJs.includes("navigator.clipboard.writeText(message)") &&
+    browserJs.includes("await homeClipboard.writeText(message)") &&
+    browserJs.includes("homeClipboard.canRequest()") &&
+    browserJs.includes("createHomeClipboardClient") &&
+    homeClipboardClient.includes("createHomeClipboardClient") &&
+    browserJs.includes("MAX_CLIPBOARD_TEXT_UTF8_BYTES = 65_536") &&
+    browserJs.includes("MAX_CLIPBOARD_ENCODED_BYTES") &&
+    browserJs.includes("MAX_CLIPBOARD_ENCODED_CHUNK_BYTES") &&
+    browserJs.includes("MAX_CLIPBOARD_CHUNK_COUNT") &&
+    browserJs.includes("CLIPBOARD_ASSEMBLY_TIMEOUT_MS") &&
+    browserJs.includes("CLIPBOARD_COPY_INTENT_TIMEOUT_MS") &&
+    browserJs.includes("pendingRemoteCopy") &&
+    browserJs.includes("readHostClipboardText()") &&
+    browserJs.includes('getData("text/plain")') &&
+    browserJs.includes("teardownRemoteClipboard") &&
+    browserJs.includes("homeClipboard.teardown()") &&
+    !browserJs.includes("navigator.clipboard") &&
+    !browserJs.includes("execCommand") &&
+    !browserJs.includes("isOpaqueClipboardFrame") &&
+    browserRemoteDisplay.includes("handleRemoteInputChannelTeardown();") &&
+    browserRemoteDisplay.includes(
+      'inputChannel.addEventListener("close", teardownBoundInputChannel)',
+    ) &&
+    browserRemoteDisplay.includes(
+      'inputChannel.addEventListener("error", teardownBoundInputChannel)',
+    ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260711c") &&
-    !browser.includes("browser.js?v=browser-20260629b"),
-  "Browser sticky status/errors must be copyable so live product failures can produce actionable evidence",
+    browser.includes("browser.js?v=browser-20260726a") &&
+    !browser.includes("browser.js?v=browser-20260725a") &&
+    !browser.includes("browser.js?v=browser-20260724a") &&
+    !browser.includes("browser.js?v=browser-20260711c") &&
+    homeShellHostContract.includes("### First-party Clipboard edge") &&
+    homeShellHostContract.includes("not an ESP") &&
+    homeShellHostContract.includes("Unsolicited remote Clipboard messages cannot change the") &&
+    homeClipboardHeadlessSmoke.includes(
+      "elastos.home.clipboard-headless-smoke/v1",
+    ),
+  "Browser Clipboard must use the closed trusted-Home edge, bind guest content to explicit local intent, preserve strict bounds and teardown, and contain no opaque-frame Clipboard fallback",
 );
 
 assert(
@@ -1660,8 +1772,10 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-status.js?v=browser-20260711c") &&
-    browserRemoteDisplay.includes("browser-status.js?v=browser-20260711c") &&
+  browserJs.includes("browser-status.js?v=browser-20260725a") &&
+    browserRemoteDisplay.includes("browser-status.js?v=browser-20260725a") &&
+    !browserJs.includes("browser-status.js?v=browser-20260711c") &&
+    !browserRemoteDisplay.includes("browser-status.js?v=browser-20260711c") &&
     !browserJs.includes("browser-status.js?v=browser-20260626e") &&
     !browserRemoteDisplay.includes("browser-status.js?v=browser-20260626e") &&
     !browserJs.includes("browser-status.js?v=browser-20260616c") &&
@@ -1674,7 +1788,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260711h") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260724a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260711h") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260629a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260627a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260618b") &&
@@ -1698,8 +1813,42 @@ assert(
     browserJs.includes("The Browser Engine is running, but the secure display connection is not ready.") &&
     browserJs.includes("Refresh Browser, or choose another Browser Engine or Exit Node.") &&
     browserJs.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
-    browserJs.includes("The stuck Browser session was closed"),
-  "Browser WebRTC must use relay-only ICE for runtime_relay sessions, poll late engine candidates, and recover without downgrading display modes or exposing relay internals to users",
+    browserJs.includes("createRuntimePageCleanupController") &&
+    browserJs.includes("sameRuntimePageOwner") &&
+    browserJs.includes("Runtime cleanup is pending") &&
+    browserJs.includes("Runtime confirmed the failed Browser session closed") &&
+    !browserJs.includes("The stuck Browser session was closed"),
+  "Browser WebRTC must use relay-only ICE for runtime_relay sessions, poll late engine candidates, and retain exact Runtime page ownership until terminal cleanup without downgrading display modes or exposing relay internals to users",
+);
+
+const releaseRuntimePageForUnloadBlock = sourceBlock(
+  browserMain,
+  "function releaseRuntimePageForUnload()",
+  "Browser unload release",
+);
+const finalizeRuntimePageCloseBlock = sourceBlock(
+  browserMain,
+  "function finalizeRuntimePageClose(owner)",
+  "Browser terminal close finalizer",
+);
+assert(
+  releaseRuntimePageForUnloadBlock.includes("stopPageStatusPolling();") &&
+    releaseRuntimePageForUnloadBlock.includes("stopPageHeartbeat();") &&
+    releaseRuntimePageForUnloadBlock.includes("resizeObserver.disconnect();") &&
+    !releaseRuntimePageForUnloadBlock.includes("closeRuntimePage(") &&
+    !releaseRuntimePageForUnloadBlock.includes("currentPage = null") &&
+    !releaseRuntimePageForUnloadBlock.includes("publishRuntimePageForHost(null)") &&
+    !releaseRuntimePageForUnloadBlock.includes("closeRemoteDisplay()") &&
+    finalizeRuntimePageCloseBlock.includes("currentPage = null;") &&
+    finalizeRuntimePageCloseBlock.includes("currentPageGeneration = 0;") &&
+    finalizeRuntimePageCloseBlock.includes("currentBrowserEngineId = \"\";") &&
+    finalizeRuntimePageCloseBlock.includes("currentRemoteExitId = \"\";") &&
+    finalizeRuntimePageCloseBlock.includes("publishRuntimePageForHost(null);") &&
+    finalizeRuntimePageCloseBlock.includes("closeRemoteDisplay();") &&
+    (browserMain.match(/currentPage = null;/g) || []).length === 2 &&
+    (browserMain.match(/publishRuntimePageForHost\(null\);/g) || []).length === 2 &&
+    (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 1,
+  "Browser unload must retain Runtime ownership; only a Runtime-proven terminal close may clear the exact page generation, identities, persistence, or display",
 );
 
 assert(
@@ -1732,7 +1881,8 @@ assert(
 );
 
 assert(
-    browserJs.includes("browser-input-surface.js?v=browser-20260711c") &&
+    browserJs.includes("browser-input-surface.js?v=browser-20260725b") &&
+    !browserJs.includes("browser-input-surface.js?v=browser-20260711c") &&
     browserInputSurface.includes('renderPanel.addEventListener("click"') &&
     !browserJs.includes('renderImage.addEventListener("click"') &&
     browserInputSurface.includes('remoteVideo.addEventListener("click"') &&

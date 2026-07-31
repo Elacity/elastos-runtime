@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 
@@ -7,6 +8,19 @@ const TX_HASH = `0x${"aa".repeat(32)}`;
 const PAYLOAD_HASH = `0x${"bb".repeat(32)}`;
 const HOME_ORIGIN = "https://elastos.elacitylabs.com";
 const CONNECTOR_TOKEN = "test-connector-token";
+const homeClipboardClientUrl = pathToFileURL(
+  resolve("capsules/home/browser/home-clipboard-client.js"),
+).href;
+
+async function importConnectorFixture(path) {
+  const source = readFileSync(resolve(path), "utf8").replace(
+    '"/apps/home/home-clipboard-client.js?v=home-20260726a"',
+    JSON.stringify(homeClipboardClientUrl),
+  );
+  return import(
+    `data:text/javascript;base64,${Buffer.from(source).toString("base64")}#${Date.now()}`
+  );
+}
 
 class FakeElement {
   constructor(tagName, id = "") {
@@ -393,8 +407,8 @@ async function runMetaMaskHostBridgeSmoke() {
     throw new Error(`unexpected Runtime endpoint: ${url}`);
   };
 
-  await import(
-    `${pathToFileURL(resolve("capsules/wallet-metamask/browser/wallet-metamask.js")).href}?smoke=${Date.now()}`
+  await importConnectorFixture(
+    "capsules/wallet-metamask/browser/wallet-metamask.js",
   );
   await new Promise((resolveTick) => setImmediate(resolveTick));
   const requestRoot = document.querySelector("#wallet-requests");
@@ -500,8 +514,8 @@ async function runWalletConnectSmoke() {
     }
     throw new Error(`unexpected Runtime endpoint: ${url}`);
   };
-  await import(
-    `${pathToFileURL(resolve("capsules/wallet-walletconnect/browser/wallet-walletconnect.js")).href}?smoke=${Date.now()}`
+  await importConnectorFixture(
+    "capsules/wallet-walletconnect/browser/wallet-walletconnect.js",
   );
   await new Promise((resolveTick) => setImmediate(resolveTick));
   const requestRoot = document.querySelector("#wallet-requests");

@@ -10,11 +10,11 @@
     <meta name="apple-mobile-web-app-title" content="ElastOS Home" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Home · ElastOS</title>
-    <script src="./home-boot-hint.js?v=home-20260715a"></script>
-    <link rel="manifest" href="./manifest.webmanifest?v=home-20260715a" />
+    <script src="./home-boot-hint.js?v=home-20260725a"></script>
+    <link rel="manifest" href="./manifest.webmanifest?v=home-20260725a" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
-    <link rel="stylesheet" href="./style.css?v=home-20260715a" />
+    <link rel="stylesheet" href="./style.css?v=home-20260726a" />
   </head>
   <body data-home-status="booting" data-home-shell="resolving" data-home-gui="resolving">
     <div class="home-host-shell">
@@ -82,8 +82,41 @@
           <p id="home-unlock-status" class="home-unlock-status" data-tone="muted" role="status">One moment.</p>
         </div>
       </section>
+
+      <section
+        id="home-clipboard-prompt"
+        class="home-clipboard-prompt"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="home-clipboard-title"
+        aria-describedby="home-clipboard-copy"
+        aria-hidden="true"
+        hidden
+      >
+        <div class="home-clipboard-card">
+          <p class="home-clipboard-eyebrow">ElastOS Clipboard</p>
+          <h1 id="home-clipboard-title">Clipboard request</h1>
+          <p id="home-clipboard-copy"></p>
+          <div class="home-clipboard-actions">
+            <button
+              id="home-clipboard-allow"
+              class="home-clipboard-button"
+              type="button"
+            >
+              Continue
+            </button>
+            <button
+              id="home-clipboard-cancel"
+              class="home-clipboard-button home-clipboard-button-secondary"
+              type="button"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      </section>
     </div>
 
-    <script type="module" src="./home-shell-host.js?v=home-20260715a"></script>
+    <script type="module" src="./home-shell-host.js?v=home-20260726a"></script>
   </body>
 </html>

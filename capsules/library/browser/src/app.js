@@ -33,6 +33,9 @@ import {
   visibleObjectsForState,
 } from "./state.js";
 import { createLibraryUploads } from "./uploads.js";
+import {
+  createHomeClipboardClient,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
     const viewPreferences = new Map();
     const viewPreferenceStore = {
@@ -46,9 +49,12 @@ import { createLibraryUploads } from "./uploads.js";
       perfTarget: (window.__libraryPerf = window.__libraryPerf || {}),
     });
     const homeOrigin = queryParams.get("home_origin") || "";
-    if (state.homeToken && homeOrigin && window.top !== window) {
-      window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeOrigin);
-    }
+    const homeClipboard = createHomeClipboardClient({
+      targetId: "library",
+      homeOrigin,
+      homeToken: state.homeToken,
+    });
+    homeClipboard.start();
     const {
       providerApi: runtimeProviderApi,
       uploadObject,
@@ -307,6 +313,12 @@ import { createLibraryUploads } from "./uploads.js";
       startCreateObject,
       state,
       uploadObject,
+      writeResourceIdentifier: (identifier) =>
+        homeClipboard.writeText(identifier, {
+          purpose: "resource.identifier",
+        }),
+      writeResourceUri: (uri) =>
+        homeClipboard.writeText(uri, { purpose: "resource.uri" }),
     }));
 
     function isAttachMode() {
@@ -850,7 +862,14 @@ import { createLibraryUploads } from "./uploads.js";
       const localContentCid = contentCid(object);
       const publicCid = publishedCid(object);
       if (localContentCid) {
-        actions.push(menuAction("Copy Content CID", () => copyText(localContentCid, "content CID")));
+        actions.push(
+          menuAction("Copy Content CID", () =>
+            copyText(
+              localContentCid,
+              "content CID",
+              "resource.identifier",
+            )),
+        );
       }
       if (object.published && publicCid) {
         actions.push(menuAction("Copy Published Link", () => copyText("elastos://" + publicCid, "published link")));

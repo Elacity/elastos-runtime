@@ -19,6 +19,7 @@ export function createBrowserRemoteDisplay({
   getCurrentDisplayMode,
   getLastPageStatus,
   handleRemoteInputChannelMessage,
+  handleRemoteInputChannelTeardown = () => {},
   onRecoveryRequired,
   remoteVideo,
   renderEmpty,
@@ -130,6 +131,7 @@ export function createBrowserRemoteDisplay({
   }
 
   function close() {
+    handleRemoteInputChannelTeardown();
     trackReady = false;
     failureStarted = false;
     remoteAudioExpected = false;
@@ -372,7 +374,15 @@ export function createBrowserRemoteDisplay({
     if (!inputChannel) {
       return;
     }
+    const boundInputChannel = inputChannel;
+    const teardownBoundInputChannel = () => {
+      if (inputChannel === boundInputChannel) {
+        handleRemoteInputChannelTeardown();
+      }
+    };
     inputChannel.addEventListener("message", handleRemoteInputChannelMessage);
+    inputChannel.addEventListener("close", teardownBoundInputChannel);
+    inputChannel.addEventListener("error", teardownBoundInputChannel);
     if (inputChannel.readyState === "open") {
       scheduleViewportResize({ force: true });
       return;

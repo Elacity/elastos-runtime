@@ -1,3 +1,7 @@
+import {
+  createHomeClipboardClient,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+
 const CONNECTOR_ID = "wallet-walletconnect";
 const connectButton = document.querySelector("#wallet-connect");
 const statusNode = document.querySelector("#wallet-status");
@@ -9,9 +13,12 @@ const homeOrigin = readQueryParam("home_origin");
 
 let walletProvider = null;
 
-if (frameHomeToken && homeOrigin && window.top !== window) {
-  window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeOrigin);
-}
+const homeClipboard = createHomeClipboardClient({
+  targetId: CONNECTOR_ID,
+  homeOrigin,
+  homeToken: frameHomeToken,
+});
+homeClipboard.start();
 
 boot();
 
@@ -446,10 +453,7 @@ async function copyText(value) {
   if (!text) {
     throw new Error("Nothing to copy.");
   }
-  if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
-    throw new Error("Clipboard is unavailable.");
-  }
-  await navigator.clipboard.writeText(text);
+  await homeClipboard.writeText(text, { purpose: "wallet.address" });
 }
 
 async function fetchJson(url, init) {

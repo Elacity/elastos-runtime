@@ -235,7 +235,7 @@ export function createWalletAccountActions({
       flowStaticRow("Address", shortAddress(account.address)),
     ];
     const copy = modalButton("Copy key", async (button) => {
-      await copyText(recoveryKeyText);
+      await copyText(recoveryKeyText, "wallet.recovery-key");
       pulseCopied(button);
     });
     openFlowModal("Recovery key", "Keep this private.", [note, key, ...details], [

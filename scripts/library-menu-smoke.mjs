@@ -17,6 +17,46 @@ function browserAssetRoot(capsuleName) {
 
 const capsuleRoot = browserAssetRoot("library");
 const archiveManagerRoot = browserAssetRoot("archive-manager");
+const homeClipboardClientFixture = `
+export function createHomeClipboardClient({ targetId } = {}) {
+  let started = false;
+  return {
+    start() {
+      started = targetId === "library";
+      return started;
+    },
+    canRequest() {
+      return started;
+    },
+    async writeText(text, { purpose } = {}) {
+      const resourceUri =
+        /^[A-Za-z][A-Za-z0-9+.-]{0,31}:[^\\u0000-\\u0020\\u007f]+$/.test(text);
+      const resourceIdentifier =
+        typeof text === "string" &&
+        text.length <= 2048 &&
+        /^[A-Za-z0-9][A-Za-z0-9._~:/?#@!$&'()*+,;=%\\[\\]-]*$/.test(text);
+      if (
+        !started ||
+        typeof text !== "string" ||
+        !(
+          (purpose === "resource.uri" && resourceUri) ||
+          (purpose === "resource.identifier" && resourceIdentifier)
+        )
+      ) {
+        throw new Error("Test Home Clipboard denied unsupported resource data");
+      }
+      globalThis.__clipboardText = text;
+      globalThis.__clipboardPurposes =
+        globalThis.__clipboardPurposes || [];
+      globalThis.__clipboardPurposes.push(purpose);
+      return true;
+    },
+    teardown() {
+      started = false;
+    },
+  };
+}
+`;
 const token = "library-menu-smoke-token";
 const principalRoot = "localhost://Users/smoke";
 const desktopUri = `${principalRoot}/Desktop`;
@@ -659,6 +699,11 @@ async function readRawBody(req) {
 
 async function serveStatic(req, res) {
   const url = new URL(req.url, "http://127.0.0.1");
+  if (url.pathname === "/apps/home/home-clipboard-client.js") {
+    res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+    res.end(homeClipboardClientFixture);
+    return;
+  }
   const root = url.pathname.startsWith("/apps/archive-manager/")
     ? archiveManagerRoot
     : capsuleRoot;
@@ -1112,7 +1157,7 @@ function createServer() {
   </style>
 </head>
 <body>
-  <iframe id="library-frame" src="/apps/library/?home_token=${encodeURIComponent(token)}"></iframe>
+  <iframe id="library-frame" src="/apps/library/#home_token=${encodeURIComponent(token)}"></iframe>
   <script>
     window.__shellMessages = [];
     window.addEventListener("message", (event) => {
@@ -1662,14 +1707,37 @@ async function run() {
   try {
     context = await browser.newContext({ acceptDownloads: true });
     const page = await context.newPage();
+    const pageErrors = [];
+    const consoleErrors = [];
+    const failedRequests = [];
     page.on("pageerror", (error) => {
-      throw error;
+      pageErrors.push(String(error?.stack || error));
+    });
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        consoleErrors.push(message.text());
+      }
+    });
+    page.on("requestfailed", (request) => {
+      failedRequests.push({
+        url: request.url(),
+        error: request.failure()?.errorText || "",
+      });
+    });
+    page.on("response", (response) => {
+      if (response.status() >= 400) {
+        failedRequests.push({
+          url: response.url(),
+          error: `HTTP ${response.status()}`,
+        });
+      }
     });
     await page.addInitScript(() => {
       window.__promptCalls = 0;
       window.__promptQueue = [];
       window.__confirmCalls = 0;
       window.__clipboardText = "";
+      window.__clipboardPurposes = [];
       window.prompt = () => {
         window.__promptCalls += 1;
         return window.__promptQueue.length ? window.__promptQueue.shift() : null;
@@ -1678,17 +1746,21 @@ async function run() {
         window.__confirmCalls += 1;
         return true;
       };
-      Object.defineProperty(navigator, "clipboard", {
-        configurable: true,
-        value: {
-          writeText: async (value) => {
-            window.__clipboardText = String(value);
-          },
-        },
-      });
     });
-    await page.goto(`http://127.0.0.1:${port}/apps/library/?home_token=${encodeURIComponent(token)}`);
-    await page.locator(".item").filter({ hasText: "Readme.md" }).first().waitFor();
+    await page.goto(
+      `http://127.0.0.1:${port}/apps/library/#home_token=${encodeURIComponent(token)}`,
+    );
+    try {
+      await page.locator(".item").filter({ hasText: "Readme.md" }).first().waitFor();
+    } catch (error) {
+      throw new Error(
+        `Library did not boot: ${String(error)}\n${JSON.stringify(
+          { pageErrors, consoleErrors, failedRequests },
+          null,
+          2,
+        )}`,
+      );
+    }
 
     for (const label of ["Home", "Desktop", "Documents", "Pictures", "Videos", "Downloads", "Public", "Trash", "Spaces"]) {
       await page.locator(".place").filter({ hasText: label }).first().click();
@@ -1855,7 +1927,19 @@ async function run() {
     await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Content ID" }).first().waitFor();
     await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Resolver Target" }).first().waitFor();
     await page.locator('.item-props-tab-content-selected[data-tab="technical"]').filter({ hasText: "Public Folder Policy" }).first().waitFor();
-    await page.locator('.props-copy-btn[title="Copy content ID"]').first().waitFor();
+    const contentIdCopy = page.locator(
+      '.props-copy-btn[title="Copy content ID"]',
+    ).first();
+    await contentIdCopy.waitFor();
+    await contentIdCopy.click();
+    await page.waitForFunction(() =>
+      window.__clipboardPurposes?.at(-1) === "resource.identifier"
+    );
+    assert(
+      await page.evaluate(() => window.__clipboardText) ===
+        SMOKE_LOCAL_CONTENT_CID,
+      "Technical Content ID must use the identifier Clipboard purpose",
+    );
     await page.locator(".properties-window-actions [data-dialog-close]").click();
 
     await page.locator(".place").filter({ hasText: "Public" }).first().click();
@@ -2265,6 +2349,11 @@ async function run() {
       await page.evaluate(() => window.__clipboardText) === `elastos://${SMOKE_PUBLISHED_CID}`,
       "Share receipt Copy Link must copy the published elastos:// link",
     );
+    assert(
+      await page.evaluate(() => window.__clipboardPurposes.at(-1)) ===
+        "resource.uri",
+      "Share receipt must use the resource URI Clipboard purpose",
+    );
     await page.locator("[data-dialog-close]").click();
 
     await openItemMenu(page, "Guide.md");
@@ -2293,14 +2382,25 @@ async function run() {
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Copy Content CID");
     assert(
-      await page.evaluate(() => window.__clipboardText) === SMOKE_LOCAL_CONTENT_CID,
-      "Copy Content CID must write the current file-byte CID to clipboard",
+      await page.evaluate(() => window.__clipboardText) ===
+        SMOKE_LOCAL_CONTENT_CID,
+      "Copy Content CID must preserve the current technical identifier",
+    );
+    assert(
+      await page.evaluate(() => window.__clipboardPurposes.at(-1)) ===
+        "resource.identifier",
+      "Copy Content CID must use the identifier Clipboard purpose",
     );
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Copy Published Link");
     assert(
       await page.evaluate(() => window.__clipboardText) === `elastos://${SMOKE_PUBLISHED_CID}`,
       "Copy Published Link must write the elastos:// link to clipboard",
+    );
+    assert(
+      await page.evaluate(() => window.__clipboardPurposes.at(-1)) ===
+        "resource.uri",
+      "Copy Published Link must use the resource URI Clipboard purpose",
     );
     await openItemMenu(page, "Guide.md");
     await clickMenu(page, "Unpublish");
@@ -2410,7 +2510,9 @@ async function run() {
     await page.evaluate(() => {
       window.__shellMessages = [];
     });
-    await libraryFrame.goto(`http://127.0.0.1:${port}/apps/library/?home_token=${encodeURIComponent(token)}&mode=attach&returnTarget=browser`);
+    await libraryFrame.goto(
+      `http://127.0.0.1:${port}/apps/library/?mode=attach&returnTarget=browser#home_token=${encodeURIComponent(token)}`,
+    );
     await libraryFrame.locator("#picker-action-button").filter({ hasText: "Select for Browser" }).first().waitFor();
     await libraryFrame.locator("#status-text").filter({ hasText: "Choose an item for Browser." }).first().waitFor();
     const browserAttachRows = await openItemMenu(libraryFrame, "Viewer.md");
@@ -2430,7 +2532,9 @@ async function run() {
     await page.evaluate(() => {
       window.__shellMessages = [];
     });
-    await libraryFrame.goto(`http://127.0.0.1:${port}/apps/library/?home_token=${encodeURIComponent(token)}&mode=archive-open&returnTarget=archive-manager`);
+    await libraryFrame.goto(
+      `http://127.0.0.1:${port}/apps/library/?mode=archive-open&returnTarget=archive-manager#home_token=${encodeURIComponent(token)}`,
+    );
     await libraryFrame.locator("#picker-action-button").filter({ hasText: "Open in Archive" }).first().waitFor();
     await libraryFrame.waitForFunction(() => document.querySelector("#status-text")?.classList.contains("hidden"));
     const pickerZipItem = libraryFrame.locator(".item").filter({ hasText: "Loose.zip" }).first();
@@ -2446,7 +2550,7 @@ async function run() {
 
     const archivePage = await context.newPage();
     await archivePage.goto(
-      `http://127.0.0.1:${port}/apps/archive-manager/?home_token=${encodeURIComponent(token)}&objectUri=${encodeURIComponent(`${documentsUri}/Portable.zip`)}&name=Portable.zip`,
+      `http://127.0.0.1:${port}/apps/archive-manager/?objectUri=${encodeURIComponent(`${documentsUri}/Portable.zip`)}&name=Portable.zip#home_token=${encodeURIComponent(token)}`,
     );
     await archivePage.locator("#entry-list").filter({ hasText: "Nested/deep.txt" }).first().waitFor();
     await archivePage.locator("#entry-list").filter({ hasText: "../escape.txt" }).first().waitFor();
@@ -2467,7 +2571,7 @@ async function run() {
     await archivePage.close();
     const archiveBlankPage = await context.newPage();
     await archiveBlankPage.goto(
-      `http://127.0.0.1:${port}/apps/archive-manager/?home_token=${encodeURIComponent(token)}`,
+      `http://127.0.0.1:${port}/apps/archive-manager/#home_token=${encodeURIComponent(token)}`,
     );
     await archiveBlankPage.locator("#open-existing-archive").click();
     await archiveBlankPage.waitForURL((url) =>
@@ -2477,7 +2581,7 @@ async function run() {
     );
     await archiveBlankPage.locator("#picker-action-button").filter({ hasText: "Open in Archive" }).first().waitFor();
     await archiveBlankPage.goto(
-      `http://127.0.0.1:${port}/apps/archive-manager/?home_token=${encodeURIComponent(token)}`,
+      `http://127.0.0.1:${port}/apps/archive-manager/#home_token=${encodeURIComponent(token)}`,
     );
     await archiveBlankPage.locator("#make-new-archive").click();
     await archiveBlankPage.waitForURL((url) =>
@@ -2489,7 +2593,7 @@ async function run() {
     await archiveBlankPage.close();
     const archiveMessagePage = await context.newPage();
     await archiveMessagePage.goto(
-      `http://127.0.0.1:${port}/apps/archive-manager/?home_token=${encodeURIComponent(token)}`,
+      `http://127.0.0.1:${port}/apps/archive-manager/#home_token=${encodeURIComponent(token)}`,
     );
     await archiveMessagePage.evaluate((uri) => {
       window.postMessage({
