@@ -26,7 +26,7 @@ pub(super) struct SetDefaultAccountInput {
     pub(super) account_id: String,
 }
 
-pub(super) struct ImportManagedSecretInput {
+pub(super) struct ImportManagedRecoveryKeyInput {
     pub(super) principal_id: String,
     pub(super) recovery_key: Value,
     pub(super) label: Option<String>,
@@ -50,14 +50,16 @@ pub(super) struct BitcoinChallengeInput {
 
 pub(super) struct SignatureRequestInput {
     pub(super) principal_id: String,
-    pub(super) account_id: Option<String>,
-    pub(super) chain_namespace: Option<String>,
+    pub(super) session_id: String,
+    pub(super) launch_id: String,
+    pub(super) account_id: String,
+    pub(super) chain_namespace: String,
     pub(super) intent: String,
-    pub(super) capsule_id: String,
+    pub(super) requested_by_actor: String,
     pub(super) resource: String,
     pub(super) reason: String,
     pub(super) payload: Value,
-    pub(super) expires_at: Option<u64>,
+    pub(super) expires_at: u64,
 }
 
 impl ChallengeInput {
@@ -89,18 +91,14 @@ impl BitcoinChallengeInput {
 }
 
 impl SignatureRequestInput {
-    pub(super) fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self, now: u64) -> Result<(), String> {
         validate_opaque_id(&self.principal_id, "principal_id")?;
-        let chain_namespace = self
-            .chain_namespace
-            .as_deref()
-            .ok_or_else(|| "chain_namespace is required".to_string())?;
-        validate_opaque_id(chain_namespace, "chain_namespace")?;
-        if let Some(account_id) = self.account_id.as_deref() {
-            validate_opaque_id(account_id, "account_id")?;
-        }
+        validate_opaque_id(&self.session_id, "session_id")?;
+        validate_opaque_id(&self.launch_id, "launch_id")?;
+        validate_opaque_id(&self.account_id, "account_id")?;
+        validate_opaque_id(&self.chain_namespace, "chain_namespace")?;
         validate_signing_intent(&self.intent)?;
-        validate_opaque_id(&self.capsule_id, "capsule_id")?;
+        validate_opaque_id(&self.requested_by_actor, "requested_by_actor")?;
         validate_resource(&self.resource)?;
         validate_reason(&self.reason)?;
         let payload =
@@ -108,6 +106,14 @@ impl SignatureRequestInput {
         if payload.is_empty() || payload.len() > MAX_APPROVAL_PAYLOAD_BYTES {
             return Err(format!(
                 "payload must be 1-{MAX_APPROVAL_PAYLOAD_BYTES} bytes"
+            ));
+        }
+        if self.expires_at <= now {
+            return Err("approval expires_at must be in the future".to_string());
+        }
+        if self.expires_at > now.saturating_add(MAX_APPROVAL_REQUEST_TTL_SECS) {
+            return Err(format!(
+                "approval lifetime exceeds {MAX_APPROVAL_REQUEST_TTL_SECS} seconds"
             ));
         }
         Ok(())
@@ -158,7 +164,7 @@ impl SetDefaultAccountInput {
     }
 }
 
-impl ImportManagedSecretInput {
+impl ImportManagedRecoveryKeyInput {
     pub(super) fn validate(&self) -> Result<(), String> {
         validate_opaque_id(&self.principal_id, "principal_id")?;
         if let Some(label) = &self.label {
@@ -341,16 +347,6 @@ pub(super) fn validate_signature(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn approval_expires_at(input: Option<u64>, now: u64) -> u64 {
-    match input {
-        Some(expires_at) if expires_at > now => {
-            let max = now.saturating_add(MAX_APPROVAL_REQUEST_TTL_SECS);
-            expires_at.min(max)
-        }
-        _ => now.saturating_add(APPROVAL_REQUEST_TTL_SECS),
-    }
-}
-
 pub(super) fn value_hash(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     bytes_hash(&bytes)
@@ -377,10 +373,6 @@ pub(super) fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-pub(super) fn default_bitcoin_network() -> String {
-    "bitcoin".to_string()
 }
 
 pub(super) fn random_hex(bytes_len: usize) -> String {

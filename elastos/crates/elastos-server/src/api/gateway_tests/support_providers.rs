@@ -2750,6 +2750,488 @@ impl Provider for MockWalletProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("op").and_then(|value| value.as_str()) == Some(WALLET_BUS_OPERATION) {
+            let request_bytes = serde_json::to_vec(request.get("request").ok_or_else(|| {
+                ProviderError::Provider("missing Wallet Bus v2 request".into())
+            })?)
+            .map_err(|err| ProviderError::Provider(err.to_string()))?;
+            let wallet_request = WalletProviderRequestV2::decode_at(
+                &request_bytes,
+                crate::auth::now_ts(),
+            )
+            .map_err(|err| ProviderError::Provider(err.to_string()))?;
+            let legacy_request = match &wallet_request.operation {
+                WalletProviderOperationV2::ListAccounts { include_revoked } => json!({
+                    "op": "accounts",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "include_revoked": include_revoked,
+                }),
+                WalletProviderOperationV2::CreateManagedAccount {
+                    chain_namespace,
+                    label,
+                    create_new,
+                } => json!({
+                    "op": "create_managed_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "chain_namespace": chain_namespace,
+                    "label": label,
+                    "create_new": create_new,
+                }),
+                WalletProviderOperationV2::RevokeAccount { account_id } => json!({
+                    "op": "revoke_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "account_id": account_id,
+                }),
+                WalletProviderOperationV2::RenameAccount { account_id, label } => json!({
+                    "op": "rename_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "account_id": account_id,
+                    "label": label,
+                }),
+                WalletProviderOperationV2::SetDefaultAccount {
+                    chain_namespace,
+                    intent,
+                    account_id,
+                } => json!({
+                    "op": "set_default_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "chain_namespace": chain_namespace,
+                    "intent": intent,
+                    "account_id": account_id,
+                }),
+                WalletProviderOperationV2::Challenge {
+                    domain,
+                    uri,
+                    address,
+                    chain_id,
+                    resources,
+                } => json!({
+                    "op": "challenge",
+                    "domain": domain,
+                    "uri": uri,
+                    "address": address,
+                    "chain_id": chain_id,
+                    "resources": resources,
+                }),
+                WalletProviderOperationV2::BitcoinChallenge {
+                    domain,
+                    uri,
+                    address,
+                    network,
+                    resources,
+                } => json!({
+                    "op": "bitcoin_challenge",
+                    "domain": domain,
+                    "uri": uri,
+                    "address": address,
+                    "network": network.as_str(),
+                    "resources": resources,
+                }),
+                WalletProviderOperationV2::VerifyProof { message, signature } => json!({
+                    "op": "verify_proof",
+                    "message": message,
+                    "signature": signature,
+                }),
+                WalletProviderOperationV2::VerifyContractProof {
+                    message,
+                    signature,
+                    evidence,
+                } => json!({
+                    "op": "verify_contract_proof",
+                    "message": message,
+                    "signature": signature,
+                    "erc1271_proof": evidence,
+                }),
+                WalletProviderOperationV2::VerifyBip322Proof {
+                    message,
+                    signature,
+                    signature_type,
+                    public_key,
+                } => json!({
+                    "op": "verify_bip322_proof",
+                    "message": message,
+                    "signature": signature,
+                    "signature_type": signature_type,
+                    "public_key": public_key,
+                }),
+                WalletProviderOperationV2::LinkVerifiedAccount {
+                    proof_binding_id,
+                    chain_namespace,
+                    address,
+                    proof_type,
+                    ..
+                } => json!({
+                    "op": "link_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "proof_binding_id": proof_binding_id,
+                    "chain_namespace": chain_namespace,
+                    "address": address,
+                    "proof_type": proof_type,
+                    "connector_id": wallet_request.authority.actor,
+                }),
+                WalletProviderOperationV2::RequestApproval {
+                    account_id,
+                    chain_namespace,
+                    intent,
+                    resource,
+                    reason,
+                    payload,
+                    expires_at,
+                } => json!({
+                    "op": "request_signature",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "session_id": wallet_request.authority.session_id,
+                    "launch_id": wallet_request.authority.launch_id,
+                    "account_id": account_id,
+                    "chain_namespace": chain_namespace,
+                    "intent": intent,
+                    "capsule_id": wallet_request.authority.actor,
+                    "resource": resource,
+                    "reason": reason,
+                    "payload": payload,
+                    "expires_at": expires_at,
+                }),
+                WalletProviderOperationV2::ListApprovals { include_resolved } => json!({
+                    "op": "approval_requests",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "include_resolved": include_resolved,
+                }),
+                WalletProviderOperationV2::RejectApproval { request_id, reason } => json!({
+                    "op": "reject_approval",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "request_id": request_id,
+                    "reason": reason,
+                }),
+                WalletProviderOperationV2::ApproveAndSignManaged { request_id, reason } => json!({
+                    "op": "approve_and_sign_managed",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "request_id": request_id,
+                    "reason": reason,
+                }),
+                WalletProviderOperationV2::ApproveConnectorHandoff { request_id, reason } => json!({
+                    "op": "approve_approval",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "request_id": request_id,
+                    "reason": reason,
+                }),
+                WalletProviderOperationV2::CompleteConnectorHandoff {
+                    request_id,
+                    payload_hash,
+                    signature,
+                    signature_type,
+                    public_key,
+                    signer,
+                    transaction_hash,
+                } => json!({
+                    "op": "complete_approval",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "request_id": request_id,
+                    "connector_id": wallet_request.authority.actor,
+                    "payload_hash": payload_hash,
+                    "signature": signature,
+                    "signature_type": signature_type,
+                    "public_key": public_key,
+                    "signer": signer,
+                    "transaction_hash": transaction_hash,
+                }),
+                _ => {
+                    let response = WalletProviderResponseV2::for_request(
+                        &wallet_request,
+                        WalletResultV2::Error {
+                            code: "unsupported_operation".to_string(),
+                            message: "mock Wallet Bus v2 supports migrated account operations and wallet-link ceremonies".to_string(),
+                        },
+                    );
+                    return Ok(json!({"status": "ok", "data": response}));
+                }
+            };
+            let legacy_response = self.send_legacy_raw(&legacy_request).await?;
+            let result = match legacy_response.get("status").and_then(Value::as_str) {
+                Some("ok") => WalletResultV2::Ok {
+                    data: legacy_response.get("data").cloned().unwrap_or(Value::Null),
+                },
+                Some("error") => WalletResultV2::Error {
+                    code: legacy_response
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("provider_error")
+                        .to_string(),
+                    message: legacy_response
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("mock Wallet provider rejected the request")
+                        .to_string(),
+                },
+                _ => {
+                    return Err(ProviderError::Provider(
+                        "mock Wallet provider returned malformed response".into(),
+                    ));
+                }
+            };
+            return Ok(json!({
+                "status": "ok",
+                "data": WalletProviderResponseV2::for_request(&wallet_request, result),
+            }));
+        }
+
+        self.send_legacy_raw(request).await
+    }
+}
+
+#[derive(Default)]
+struct RecordingWalletProvider {
+    provider: MockWalletProvider,
+    requests: TokioMutex<Vec<serde_json::Value>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for RecordingWalletProvider {
+    async fn handle(&self, request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        self.provider.handle(request).await
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        self.provider.schemes()
+    }
+
+    fn name(&self) -> &'static str {
+        "recording-mock-wallet-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.requests.lock().await.push(request.clone());
+        self.provider.send_raw(request).await
+    }
+}
+
+impl RecordingWalletProvider {
+    fn new(provider: MockWalletProvider) -> Self {
+        Self {
+            provider,
+            requests: TokioMutex::default(),
+        }
+    }
+
+    async fn assert_v2_operations(
+        &self,
+        expected_actor: &str,
+        expected_authority: &TestPasskeyAuthority,
+        expected: &[WalletOperationKind],
+    ) {
+        let requests = self.requests.lock().await;
+        let mut actual = Vec::with_capacity(requests.len());
+        let mut launch_id = None;
+        for request in requests.iter() {
+            assert_eq!(
+                request.get("op").and_then(Value::as_str),
+                Some(WALLET_BUS_OPERATION),
+                "migrated wallet-link route emitted a retired raw Wallet request: {request}"
+            );
+            let request_bytes = serde_json::to_vec(
+                request
+                    .get("request")
+                    .expect("Wallet Bus v2 request envelope"),
+            )
+            .unwrap();
+            let wallet_request =
+                WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts()).unwrap();
+            assert_eq!(wallet_request.authority.actor, expected_actor);
+            assert_eq!(
+                wallet_request.authority.principal_id,
+                expected_authority.principal_id
+            );
+            assert_eq!(
+                wallet_request.authority.session_id,
+                expected_authority.session_id
+            );
+            assert_eq!(
+                wallet_request.authority.proof_binding_id.as_deref(),
+                Some(expected_authority.proof_binding_id.as_str())
+            );
+            assert_eq!(wallet_request.authority.grant_id, expected_authority.grant_id);
+            if let Some(expected_launch_id) = launch_id.as_deref() {
+                assert_eq!(wallet_request.authority.launch_id, expected_launch_id);
+            } else {
+                launch_id = Some(wallet_request.authority.launch_id.clone());
+            }
+            actual.push(wallet_request.operation.kind());
+        }
+        assert_eq!(actual, expected);
+    }
+
+    async fn assert_v2_account_reads(
+        &self,
+        expected_authority: &RuntimeWalletAuthority,
+        expected_count: usize,
+    ) {
+        let expected = vec![WalletOperationKind::ListAccounts; expected_count];
+        self.assert_v2_account_operations(expected_authority, &expected)
+            .await;
+    }
+
+    async fn assert_v2_account_operations(
+        &self,
+        expected_authority: &RuntimeWalletAuthority,
+        expected_operations: &[WalletOperationKind],
+    ) {
+        let expected = expected_authority.verified_context();
+        let requests = self.requests.lock().await;
+        let mut actual = Vec::new();
+        for request in requests.iter() {
+            let operation = request.get("op").and_then(Value::as_str);
+            assert!(
+                !matches!(
+                    operation,
+                    Some(
+                        "accounts"
+                            | "create_managed_account"
+                            | "revoke_account"
+                            | "rename_account"
+                            | "set_default_account"
+                    )
+                ),
+                "account operation emitted a retired raw Wallet request: {request}"
+            );
+            if operation != Some(WALLET_BUS_OPERATION) {
+                continue;
+            }
+            assert_eq!(request["_runtime_invocation"]["source"], "runtime");
+            assert_eq!(request["_runtime_invocation"]["target"], "wallet");
+            assert_eq!(
+                request["_runtime_invocation"]["op"],
+                WALLET_BUS_OPERATION
+            );
+            assert_eq!(
+                request["_runtime_invocation"]["transport"],
+                "runtime-local-provider-plane"
+            );
+            assert_eq!(
+                request["_runtime_invocation"]["carrier"],
+                serde_json::Value::Null
+            );
+            let request_bytes = serde_json::to_vec(
+                request
+                    .get("request")
+                    .expect("Wallet Bus v2 request envelope"),
+            )
+            .unwrap();
+            let wallet_request =
+                WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts()).unwrap();
+            let kind = wallet_request.operation.kind();
+            if !matches!(
+                kind,
+                WalletOperationKind::ListAccounts
+                    | WalletOperationKind::CreateManagedAccount
+                    | WalletOperationKind::RevokeAccount
+                    | WalletOperationKind::RenameAccount
+                    | WalletOperationKind::SetDefaultAccount
+            ) {
+                continue;
+            }
+            if let WalletProviderOperationV2::ListAccounts { include_revoked } =
+                &wallet_request.operation
+            {
+                assert!(!include_revoked);
+            }
+            assert_eq!(wallet_request.authority.actor, expected.actor());
+            assert_eq!(
+                wallet_request.authority.principal_id,
+                expected.principal_id()
+            );
+            assert_eq!(
+                wallet_request.authority.session_id,
+                expected.session_id()
+            );
+            assert_eq!(
+                wallet_request.authority.proof_binding_id.as_deref(),
+                expected.proof_binding_id()
+            );
+            assert_eq!(wallet_request.authority.grant_id, expected.grant_id());
+            assert_eq!(wallet_request.authority.launch_id, expected.launch_id());
+            actual.push(kind);
+        }
+        assert_eq!(actual, expected_operations);
+    }
+
+    async fn assert_v2_approval_operations(
+        &self,
+        expected_authority: &RuntimeWalletAuthority,
+        expected_operations: &[WalletOperationKind],
+    ) {
+        let expected = expected_authority.verified_context();
+        let requests = self.requests.lock().await;
+        let mut actual = Vec::new();
+        for request in requests.iter() {
+            let operation = request.get("op").and_then(Value::as_str);
+            assert!(
+                !matches!(
+                    operation,
+                    Some(
+                        "approval_requests"
+                            | "request_signature"
+                            | "reject_approval"
+                            | "approve_approval"
+                            | "sign_approved"
+                            | "complete_approval"
+                    )
+                ),
+                "approval operation emitted a retired raw Wallet request: {request}"
+            );
+            if operation != Some(WALLET_BUS_OPERATION) {
+                continue;
+            }
+            let request_bytes = serde_json::to_vec(
+                request
+                    .get("request")
+                    .expect("Wallet Bus v2 request envelope"),
+            )
+            .unwrap();
+            let wallet_request =
+                WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts()).unwrap();
+            let kind = wallet_request.operation.kind();
+            if !matches!(
+                kind,
+                WalletOperationKind::RequestApproval
+                    | WalletOperationKind::ListApprovals
+                    | WalletOperationKind::RejectApproval
+                    | WalletOperationKind::ApproveAndSignManaged
+                    | WalletOperationKind::ApproveConnectorHandoff
+                    | WalletOperationKind::CompleteConnectorHandoff
+            ) {
+                continue;
+            }
+            if wallet_request.authority.actor != expected.actor() {
+                continue;
+            }
+            assert_eq!(
+                wallet_request.authority.principal_id,
+                expected.principal_id()
+            );
+            assert_eq!(
+                wallet_request.authority.session_id,
+                expected.session_id()
+            );
+            assert_eq!(
+                wallet_request.authority.proof_binding_id.as_deref(),
+                expected.proof_binding_id()
+            );
+            assert_eq!(wallet_request.authority.grant_id, expected.grant_id());
+            assert_eq!(wallet_request.authority.launch_id, expected.launch_id());
+            actual.push(kind);
+        }
+        assert_eq!(actual, expected_operations);
+    }
+}
+
+impl MockWalletProvider {
+    async fn send_legacy_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+
         match request.get("op").and_then(|value| value.as_str()) {
             Some("challenge") => {
                 let domain = required_test_str(request, "domain")?;
@@ -3429,6 +3911,7 @@ impl Provider for MockWalletProvider {
                     "status": "pending",
                     "intent": intent,
                     "capsule_id": required_test_str(request, "capsule_id")?,
+                    "requested_by_actor": required_test_str(request, "capsule_id")?,
                     "resource": required_test_str(request, "resource")?,
                     "reason": required_test_str(request, "reason")?,
                     "account_id": account_id,
@@ -3439,8 +3922,13 @@ impl Provider for MockWalletProvider {
                     "payload_hash": payload_hash,
                     "payload": payload,
                     "principal_id": principal_id,
+                    "session_id": request.get("session_id").cloned().unwrap_or(json!("session:test")),
+                    "launch_id": request.get("launch_id").cloned().unwrap_or(json!("launch:test")),
                     "created_at": crate::auth::now_ts(),
-                    "expires_at": crate::auth::now_ts() + 600
+                    "expires_at": request
+                        .get("expires_at")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(|| crate::auth::now_ts() + 600)
                 });
                 approvals.push(approval.clone());
                 Ok(json!({
@@ -3475,6 +3963,79 @@ impl Provider for MockWalletProvider {
                     "status": "ok",
                     "data": { "approval_request": approval.clone() }
                 }))
+            }
+            Some("approve_and_sign_managed") => {
+                let principal_id = required_test_str(request, "principal_id")?;
+                let request_id = required_test_str(request, "request_id")?;
+                let mut approvals = self.approvals.lock().await;
+                let Some(approval) = approvals.iter_mut().find(|approval| {
+                    approval
+                        .get("principal_id")
+                        .and_then(|value| value.as_str())
+                        == Some(principal_id)
+                        && approval.get("request_id").and_then(|value| value.as_str())
+                            == Some(request_id)
+                }) else {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "not_found",
+                        "message": "wallet approval request not found"
+                    }));
+                };
+                if approval.get("status").and_then(|value| value.as_str()) != Some("pending") {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "invalid_request",
+                        "message": "wallet approval request is not pending"
+                    }));
+                }
+                if !approval
+                    .get("proof_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_managed_wallet_proof_type)
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "external_wallet_required",
+                        "message": "connector approvals require a typed connector handoff"
+                    }));
+                }
+                approval["status"] = json!("completed");
+                approval["signature_receipt"] = json!({
+                    "schema": "elastos.wallet.signature_receipt/v1",
+                    "request_id": request_id,
+                    "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
+                    "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
+                    "signature_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "completed_at": crate::auth::now_ts(),
+                });
+                if approval.get("intent").and_then(|value| value.as_str())
+                    == Some("transaction_intent")
+                {
+                    approval["signed_result"] = json!({
+                        "schema": "elastos.wallet.managed-transaction-result/v1",
+                        "request_id": request_id,
+                        "method": "eth_sendRawTransaction",
+                        "signed_transaction": "0x1234",
+                        "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
+                        "chain_namespace": approval.get("chain_namespace").cloned().unwrap_or(json!("eip155:20")),
+                        "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
+                    });
+                }
+                let mut data = json!({
+                    "approval_request": approval.clone(),
+                    "signature_receipt": approval["signature_receipt"],
+                    "signature": "0xsigned-managed",
+                    "signed_payload": {}
+                });
+                if let Some(signed_transaction) = approval
+                    .get("signed_result")
+                    .and_then(|result| result.get("signed_transaction"))
+                    .and_then(Value::as_str)
+                {
+                    data["signed_transaction"] = json!(signed_transaction);
+                }
+                Ok(json!({ "status": "ok", "data": data }))
             }
             Some("approve_approval") => {
                 let principal_id = required_test_str(request, "principal_id")?;

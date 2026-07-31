@@ -12,6 +12,7 @@ use elastos_server::content::ContentProvider;
 use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
 use elastos_server::{api, fetcher, ownership};
+use elastos_wallet_contract::WALLET_PROTOCOL_VERSION;
 
 pub(crate) struct ServerInfrastructure {
     pub(crate) audit_log: Arc<primitives::audit::AuditLog>,
@@ -38,6 +39,76 @@ const CONTENT_REPAIR_SCHEDULER_DEFAULT_INTERVAL_SECS: u64 = 15 * 60;
 const CONTENT_REPAIR_SCHEDULER_DEFAULT_LIMIT: u64 = 10;
 const CONTENT_REPAIR_SCHEDULER_DEFAULT_MAX_ATTEMPTS: u64 = 3;
 const CONTENT_REPAIR_SCHEDULER_DEFAULT_FAILURE_BUDGET: u64 = 5;
+const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn request_wallet_provider_v2_status(
+    bridge: &provider::ProviderBridge,
+    status_timeout: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    tokio::time::timeout(
+        status_timeout,
+        bridge.send_raw(&serde_json::json!({"op": "status"})),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("wallet-provider status request timed out"))?
+    .map_err(|err| anyhow::anyhow!("wallet-provider status request failed: {err}"))
+}
+
+async fn start_wallet_provider_v2(
+    registry: &provider::ProviderRegistry,
+    bridge: Arc<provider::ProviderBridge>,
+    status_timeout: Duration,
+) -> anyhow::Result<()> {
+    let startup = async {
+        let status = request_wallet_provider_v2_status(&bridge, status_timeout).await?;
+        require_wallet_provider_v2_status(&status)?;
+        let wallet_provider: Arc<dyn provider::Provider> = Arc::new(
+            provider::CapsuleProvider::with_scheme(bridge.clone(), "wallet"),
+        );
+        register_wallet_provider_v2(registry, wallet_provider).await
+    }
+    .await;
+    if let Err(startup_error) = startup {
+        if let Err(shutdown_error) = bridge.shutdown().await {
+            return Err(anyhow::anyhow!(
+                "{startup_error}; wallet-provider shutdown/reap also failed: {shutdown_error}"
+            ));
+        }
+        return Err(startup_error);
+    }
+    Ok(())
+}
+
+fn require_wallet_provider_v2_status(status: &serde_json::Value) -> anyhow::Result<()> {
+    if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        anyhow::bail!("wallet-provider status request did not succeed");
+    }
+    let data = status
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("wallet-provider status is missing data"))?;
+    if data.get("provider").and_then(serde_json::Value::as_str) != Some("wallet-provider") {
+        anyhow::bail!("wallet-provider status has an unsupported provider identity");
+    }
+    if data
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(WALLET_PROTOCOL_VERSION)
+    {
+        anyhow::bail!("wallet-provider status has an unsupported protocol version");
+    }
+    Ok(())
+}
+
+async fn register_wallet_provider_v2(
+    registry: &provider::ProviderRegistry,
+    wallet_provider: Arc<dyn provider::Provider>,
+) -> anyhow::Result<()> {
+    registry
+        .register_sub_provider("wallet", wallet_provider)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to register Wallet provider v2: {err}"))
+}
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
     setup_server_infrastructure_impl(true).await
@@ -671,16 +742,21 @@ async fn setup_server_infrastructure_impl(
             };
             match provider::ProviderBridge::spawn(&path, wallet_config).await {
                 Ok(bridge) => {
-                    let wallet_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "wallet"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("wallet", wallet_provider)
-                        .await
-                    {
-                        tracing::warn!("Failed to register elastos://wallet sub-provider: {}", e);
+                    let bridge = Arc::new(bridge);
+                    let startup = start_wallet_provider_v2(
+                        &provider_registry,
+                        bridge,
+                        WALLET_PROVIDER_STATUS_TIMEOUT,
+                    )
+                    .await;
+                    match startup {
+                        Ok(()) => {
+                            tracing::info!("wallet-provider v2 capsule from {}", path.display())
+                        }
+                        Err(e) => {
+                            tracing::warn!("Skipping wallet-provider after shutdown/reap: {}", e)
+                        }
                     }
-                    tracing::info!("wallet-provider capsule from {}", path.display());
                 }
                 Err(e) => tracing::warn!("Failed to spawn wallet-provider: {}", e),
             }
@@ -1293,8 +1369,161 @@ fn provider_config_from_env_or_file(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_wallet_provider_bridge(
+        status: serde_json::Value,
+        response_delay: Duration,
+    ) -> (
+        Arc<provider::ProviderBridge>,
+        tokio::task::JoinHandle<Vec<serde_json::Value>>,
+    ) {
+        let (bridge_writer, provider_reader) = tokio::io::duplex(4096);
+        let (provider_writer, bridge_reader) = tokio::io::duplex(4096);
+        let bridge = Arc::new(provider::ProviderBridge::from_io(
+            BufReader::new(bridge_reader),
+            bridge_writer,
+        ));
+        let provider = tokio::spawn(async move {
+            let mut reader = BufReader::new(provider_reader);
+            let mut writer = provider_writer;
+            let mut requests = Vec::new();
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            requests.push(serde_json::from_str(line.trim()).unwrap());
+            if !response_delay.is_zero() {
+                tokio::time::sleep(response_delay).await;
+            }
+            writer
+                .write_all(format!("{}\n", serde_json::to_string(&status).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap() > 0 {
+                requests.push(serde_json::from_str(line.trim()).unwrap());
+                writer.write_all(b"{\"status\":\"ok\"}\n").await.unwrap();
+                writer.flush().await.unwrap();
+            }
+            requests
+        });
+        (bridge, provider)
+    }
+
+    fn wallet_provider_status(provider_id: &str, protocol_version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "ok",
+            "data": {
+                "provider": provider_id,
+                "protocol_version": protocol_version,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn wallet_provider_v2_startup_registers_only_exact_identity_and_version() {
+        let registry = provider::ProviderRegistry::new();
+        let (bridge, provider) = test_wallet_provider_bridge(
+            wallet_provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
+            Duration::ZERO,
+        );
+        start_wallet_provider_v2(&registry, bridge, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let registration = registry
+            .registration_for_uri("elastos://wallet/status")
+            .await
+            .unwrap();
+        assert_eq!(registration.route, "wallet");
+        assert_eq!(registration.provider, "capsule-provider");
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn wallet_provider_v2_startup_reaps_identity_or_version_mismatch() {
+        for status in [
+            wallet_provider_status("wallet-provider", "1.0"),
+            wallet_provider_status("other-provider", WALLET_PROTOCOL_VERSION),
+        ] {
+            let registry = provider::ProviderRegistry::new();
+            let (bridge, provider) = test_wallet_provider_bridge(status, Duration::ZERO);
+            let error = start_wallet_provider_v2(&registry, bridge, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("unsupported"));
+            assert!(registry
+                .registration_for_uri("elastos://wallet/status")
+                .await
+                .is_none());
+            let requests = provider.await.unwrap();
+            assert_eq!(requests[0]["op"], "status");
+            assert_eq!(requests[1]["op"], "shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_provider_v2_startup_reaps_failed_or_malformed_status() {
+        for status in [
+            serde_json::json!({"status": "error"}),
+            serde_json::json!({"status": "ok", "data": []}),
+        ] {
+            let registry = provider::ProviderRegistry::new();
+            let (bridge, provider) = test_wallet_provider_bridge(status, Duration::ZERO);
+            start_wallet_provider_v2(&registry, bridge, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(registry
+                .registration_for_uri("elastos://wallet/status")
+                .await
+                .is_none());
+            let requests = provider.await.unwrap();
+            assert_eq!(requests[0]["op"], "status");
+            assert_eq!(requests[1]["op"], "shutdown");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wallet_provider_v2_status_probe_completes_within_its_bound() {
+        let (bridge, provider) = test_wallet_provider_bridge(
+            wallet_provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
+            Duration::from_millis(20),
+        );
+        let started = tokio::time::Instant::now();
+        let error = request_wallet_provider_v2_status(&bridge, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(started.elapsed(), Duration::from_millis(5));
+        provider.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wallet_provider_v2_startup_reaps_provider_that_does_not_answer_in_time() {
+        let registry = provider::ProviderRegistry::new();
+        let (bridge, provider) = test_wallet_provider_bridge(
+            wallet_provider_status("wallet-provider", WALLET_PROTOCOL_VERSION),
+            Duration::from_millis(20),
+        );
+        let error = start_wallet_provider_v2(&registry, bridge, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(registry
+            .registration_for_uri("elastos://wallet/status")
+            .await
+            .is_none());
+        let requests = provider.await.unwrap();
+        assert_eq!(requests[0]["op"], "status");
+        assert_eq!(requests[1]["op"], "shutdown");
+    }
 
     struct EnvGuard {
         keys: &'static [&'static str],

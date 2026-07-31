@@ -5,6 +5,8 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), INBOX_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -26,7 +28,9 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
         })]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let summary = app
         .clone()
@@ -124,6 +128,16 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
         })
         .expect("wallet approval completion audit event");
     assert_eq!(event.capsule_id.as_deref(), Some(INBOX_CAPSULE_ID));
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_authority,
+            &[
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveAndSignManaged,
+            ],
+        )
+        .await;
 }
 
 #[test]

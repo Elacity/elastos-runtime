@@ -270,17 +270,17 @@ fn seed_walletconnect_connector_config(data_dir: &std::path::Path) {
 #[tokio::test]
 async fn test_metamask_connector_lists_external_wallet_accounts() {
     let dir = tempfile::tempdir().unwrap();
-    let context = local_home_launch_token_context(dir.path()).unwrap();
-    let token =
-        issue_home_launch_token_with_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &context)
-            .unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_METAMASK_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
         accounts: TokioMutex::new(vec![
             json!({
                 "account_id": "wallet:eip155:20:0x1111111111111111111111111111111111111111",
-                "principal_id": context.principal_id.clone(),
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:managed:eip155:20:0x1111111111111111111111111111111111111111",
                 "chain_namespace": "eip155:20",
                 "address": "0x1111111111111111111111111111111111111111",
@@ -289,7 +289,7 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
             }),
             json!({
                 "account_id": "wallet:eip155:8453:0xA4C02dB8653DD0cA18A8736D693B0dB85C5b246C",
-                "principal_id": context.principal_id.clone(),
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:siwe:eip155:8453:0xa4c02db8653dd0ca18a8736d693b0db85c5b246c",
                 "chain_namespace": "eip155:8453",
                 "address": "0xA4C02dB8653DD0cA18A8736D693B0dB85C5b246C",
@@ -299,7 +299,7 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
             }),
             json!({
                 "account_id": "wallet:bip122:000000000019d6689c085ae165831e93:bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
-                "principal_id": context.principal_id,
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:bip122:000000000019d6689c085ae165831e93:bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
                 "chain_namespace": "bip122:000000000019d6689c085ae165831e93",
                 "address": "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
@@ -311,7 +311,9 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
         approvals: TokioMutex::default(),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let response = app
         .oneshot(
@@ -336,6 +338,9 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
     );
     assert_eq!(json["accounts"][0]["proof_type"], "siwe");
     assert_eq!(json["accounts"][0]["connector_id"], "wallet-metamask");
+    wallet_provider
+        .assert_v2_account_reads(&wallet_read_authority, 1)
+        .await;
 }
 
 #[tokio::test]
@@ -345,6 +350,8 @@ async fn test_wallet_connector_approvals_are_scoped_to_connector() {
     let token =
         issue_home_launch_token_with_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &context)
             .unwrap();
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_METAMASK_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -383,7 +390,9 @@ async fn test_wallet_connector_approvals_are_scoped_to_connector() {
         ]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let response = app
         .oneshot(
@@ -409,22 +418,25 @@ async fn test_wallet_connector_approvals_are_scoped_to_connector() {
         json["approval_requests"][0]["connector_id"],
         "wallet-metamask"
     );
+    wallet_provider
+        .assert_v2_approval_operations(&wallet_authority, &[WalletOperationKind::ListApprovals])
+        .await;
 }
 
 #[tokio::test]
 async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
     let dir = tempfile::tempdir().unwrap();
-    let context = local_home_launch_token_context(dir.path()).unwrap();
-    let token =
-        issue_home_launch_token_with_context(dir.path(), WALLET_UNISAT_CAPSULE_ID, &context)
-            .unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), WALLET_UNISAT_CAPSULE_ID, &authority);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_UNISAT_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
         accounts: TokioMutex::new(vec![
             json!({
                 "account_id": "wallet:bip122:000000000019d6689c085ae165831e93:bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
-                "principal_id": context.principal_id.clone(),
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:bip122:000000000019d6689c085ae165831e93:bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
                 "chain_namespace": "bip122:000000000019d6689c085ae165831e93",
                 "address": "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
@@ -434,7 +446,7 @@ async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
             }),
             json!({
                 "account_id": "wallet:bip122:000000000019d6689c085ae165831e93:bc1q0000000000000000000000000000000000000",
-                "principal_id": context.principal_id,
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:bip122:000000000019d6689c085ae165831e93:bc1q0000000000000000000000000000000000000",
                 "chain_namespace": "bip122:000000000019d6689c085ae165831e93",
                 "address": "bc1q0000000000000000000000000000000000000",
@@ -446,7 +458,9 @@ async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
         approvals: TokioMutex::default(),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let response = app
         .oneshot(
@@ -469,6 +483,9 @@ async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
         json["accounts"][0]["address"],
         "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l"
     );
+    wallet_provider
+        .assert_v2_account_reads(&wallet_read_authority, 1)
+        .await;
 }
 
 #[tokio::test]
@@ -478,6 +495,8 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
     let principal_id = context.principal_id.clone();
     let token =
         issue_home_launch_token_with_context(dir.path(), WALLET_CAPSULE_ID, &context).unwrap();
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -500,7 +519,9 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
         })]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let approved = app
         .clone()
@@ -531,7 +552,7 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
                 .uri("/api/apps/wallet/wallet/approvals/wallet-approval%3Abitcoin/complete")
                 .header("x-elastos-home-token", token)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"payload_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signature":"mock-bip322-signature","signer":"bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l"}"#))
+                .body(Body::from(r#"{"payload_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signature":"mock-bip322-signature","signature_type":"bip322_simple","signer":"bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l"}"#))
                 .unwrap(),
         )
         .await
@@ -543,6 +564,18 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["pending_count"], 0);
     assert_eq!(json["note"], "Signed by Wallet.");
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_authority,
+            &[
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveConnectorHandoff,
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::CompleteConnectorHandoff,
+                WalletOperationKind::ListApprovals,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -642,6 +675,8 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
     let token =
         issue_home_launch_token_with_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &context)
             .unwrap();
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_METAMASK_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -664,7 +699,9 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
         })]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let approved = app
         .clone()
@@ -690,7 +727,7 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
                 .uri("/api/apps/wallet-metamask/wallet/approvals/wallet-approval%3Aexternal/complete")
                 .header("x-elastos-home-token", token)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"payload_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signature":"0xsigned","signer":"0xabc"}"#))
+                .body(Body::from(r#"{"payload_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signature":"0xsigned","signature_type":"eip191","signer":"0xabc"}"#))
                 .unwrap(),
         )
         .await
@@ -702,6 +739,18 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["pending_count"], 0);
     assert_eq!(json["note"], "Signed by MetaMask.");
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_authority,
+            &[
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveConnectorHandoff,
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::CompleteConnectorHandoff,
+                WalletOperationKind::ListApprovals,
+            ],
+        )
+        .await;
 
     let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
     let approved_event = auth_state

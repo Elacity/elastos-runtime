@@ -477,6 +477,25 @@ fn launch_token_for_authority_context(
     .unwrap()
 }
 
+fn projection_launch_token_for_authority_context(
+    data_dir: &std::path::Path,
+    app: &str,
+    authority: &TestPasskeyAuthority,
+) -> String {
+    issue_home_projection_launch_token_with_context(
+        data_dir,
+        app,
+        app,
+        &HomeLaunchTokenContext {
+            principal_id: authority.principal_id.clone(),
+            session_id: authority.session_id.clone(),
+            proof_binding_id: Some(authority.proof_binding_id.clone()),
+            grant_id: authority.grant_id.clone(),
+        },
+    )
+    .unwrap()
+}
+
 fn intent_token_for_authority_context(
     data_dir: &std::path::Path,
     app: &str,
@@ -535,6 +554,21 @@ fn app_token_for_authority(
     };
     crate::auth::store_session_grant(data_dir, grant.clone()).unwrap();
     issue_home_launch_token_for_auth_grant(data_dir, app, &grant).unwrap()
+}
+
+fn runtime_wallet_authority_for_app_token(
+    data_dir: &std::path::Path,
+    app: &str,
+    token: &str,
+) -> RuntimeWalletAuthority {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("localhost:61180"));
+    headers.insert("origin", HeaderValue::from_static("null"));
+    headers.insert(
+        "x-elastos-home-token",
+        HeaderValue::from_str(token).unwrap(),
+    );
+    require_runtime_wallet_authority(data_dir, &headers, &[app]).unwrap()
 }
 
 fn evm_test_address(signing_key: &EvmSigningKey) -> String {

@@ -7,10 +7,11 @@ pub(in crate::api::gateway) async fn wallet_app_send_transaction(
     headers: HeaderMap,
     Json(input): Json<WalletSendTransactionRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
+    let context = authority.home_launch_context();
     if let Err(err) = consume_fresh_passkey_home_token(
         &state.data_dir,
         &input.home_token,
@@ -40,7 +41,7 @@ pub(in crate::api::gateway) async fn wallet_app_send_transaction(
             reason: "Wallet requested a native EVM transaction send",
         },
     );
-    match wallet_send_transaction(&state, &context, &input, &audit_id).await {
+    match wallet_send_transaction(&state, &context, &authority, &input, &audit_id).await {
         Ok(payload) => Json(payload).into_response(),
         Err((status, message)) => {
             let _ = append_wallet_approval_audit(
@@ -63,6 +64,7 @@ pub(in crate::api::gateway) async fn wallet_app_send_transaction(
 pub(in crate::api::gateway) async fn wallet_send_transaction(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     input: &WalletSendTransactionRequest,
     audit_id: &str,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
@@ -74,7 +76,7 @@ pub(in crate::api::gateway) async fn wallet_send_transaction(
     };
     validate_wallet_evm_address(&input.to, "to")?;
     let value = native_amount_to_hex_quantity(&input.amount, 18)?;
-    let accounts = system_wallet_accounts_summary(state, &context.principal_id).await;
+    let accounts = system_wallet_accounts_summary(state, authority).await;
     let Some(account) = accounts.accounts.iter().find(|account| {
         account.account_id == input.account_id
             && account.chain_namespace.starts_with("eip155:")
@@ -115,19 +117,18 @@ pub(in crate::api::gateway) async fn wallet_send_transaction(
     }
 
     let chain_broadcast_resource = format!("elastos://chain/{network}/broadcast_transaction");
-    let request_data = crate::api::auth_gateway::wallet_provider_data(
+    let request_data = runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "request_signature",
-            "principal_id": context.principal_id,
-            "account_id": account.account_id,
-            "chain_namespace": input.chain_namespace,
-            "intent": "transaction_intent",
-            "capsule_id": WALLET_CAPSULE_ID,
-            "resource": chain_broadcast_resource,
-            "reason": format!("Wallet sends {} native units on {}", input.amount, network),
-            "payload": intent
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RequestApproval {
+            account_id: account.account_id.clone(),
+            chain_namespace: input.chain_namespace.clone(),
+            intent: "transaction_intent".to_string(),
+            resource: chain_broadcast_resource,
+            reason: format!("Wallet sends {} native units on {}", input.amount, network),
+            payload: intent,
+            expires_at: now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
+        },
     )
     .await
     .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
@@ -153,8 +154,8 @@ pub(in crate::api::gateway) async fn wallet_send_transaction(
     let outcome = approve_managed_wallet_request(
         state,
         &state.data_dir,
-        &context.principal_id,
-        &context.session_id,
+        context,
+        authority,
         request_id,
         "Approved in Wallet send flow",
         WALLET_CAPSULE_ID,

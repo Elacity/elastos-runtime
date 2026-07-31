@@ -164,7 +164,10 @@ impl WalletProvider {
         Response::ok(json!({ "account": account, "created": true }))
     }
 
-    pub(super) fn import_managed_secret(&mut self, input: ImportManagedSecretInput) -> Response {
+    pub(super) fn import_managed_recovery_key(
+        &mut self,
+        input: ImportManagedRecoveryKeyInput,
+    ) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
         }
@@ -421,7 +424,11 @@ impl WalletProvider {
         Response::ok(json!({ "account": account }))
     }
 
-    pub(super) fn export_managed_secret(&self, principal_id: &str, account_id: &str) -> Response {
+    pub(super) fn export_managed_recovery_key(
+        &self,
+        principal_id: &str,
+        account_id: &str,
+    ) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
         }

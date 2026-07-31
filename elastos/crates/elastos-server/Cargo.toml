@@ -18,6 +18,7 @@ elastos-compute = { path = "../elastos-compute" }
 elastos-tls = { path = "../elastos-tls" }
 elastos-identity = { path = "../elastos-identity" }
 elastos-crosvm = { path = "../elastos-crosvm" }
+elastos-wallet-contract = { path = "../elastos-wallet-contract" }
 
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }

@@ -1704,6 +1704,7 @@ dependencies = [
  "elastos-runtime",
  "elastos-storage",
  "elastos-tls",
+ "elastos-wallet-contract",
  "flate2",
  "futures-lite",
  "getrandom 0.2.17",
@@ -1793,6 +1794,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "elastos-wallet-contract"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

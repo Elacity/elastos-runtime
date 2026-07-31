@@ -72,6 +72,8 @@ mod gateway_server;
 mod gateway_site;
 #[path = "gateway_wallet.rs"]
 mod gateway_wallet;
+#[path = "gateway_wallet_adapter.rs"]
+mod gateway_wallet_adapter;
 #[cfg(test)]
 use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
@@ -84,17 +86,18 @@ use gateway_home_terminal::*;
 pub(super) use gateway_home_token::{
     consume_fresh_passkey_home_token, home_launch_auth_data_dir, home_launch_token_header,
     home_session_clear_cookie_header, home_session_cookie_header_for_token,
-    issue_home_launch_token_for_auth_grant, issue_home_launch_token_with_context,
-    issue_home_projection_launch_token_with_context,
+    issue_home_launch_token_for_auth_grant, issue_home_projection_launch_token_with_context,
     issue_home_projection_launch_token_with_intent, require_home_launch_token,
     require_home_launch_token_context, require_home_launch_token_for_any_app_context,
     require_home_launch_token_for_any_context, require_home_projection_launch_token_context,
-    require_home_token, require_home_token_context, require_home_viewer_launch_token_context,
-    require_internal_shell_launch_grant_for_any_context, HomeLaunchTokenContext,
+    require_home_runtime_wallet_authority, require_home_token, require_home_token_context,
+    require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
+    require_runtime_wallet_authority, HomeLaunchTokenContext, RuntimeWalletAuthority,
 };
 #[cfg(test)]
 pub(crate) use gateway_home_token::{
-    issue_home_launch_token, issue_home_launch_token_with_intent, local_home_launch_token_context,
+    issue_home_launch_token, issue_home_launch_token_with_context,
+    issue_home_launch_token_with_intent, local_home_launch_token_context,
     set_test_home_launch_auth_data_dir, uuid_like_token,
 };
 use gateway_inbox::*;
@@ -111,6 +114,7 @@ use gateway_site::*;
 pub(super) use gateway_site::{content_type, validate_file_path};
 pub(crate) use gateway_wallet::ensure_wallet_connector_configured;
 use gateway_wallet::*;
+pub(super) use gateway_wallet_adapter::RuntimeWalletAdapter;
 
 /// Maximum size for a single file fetched through the gateway (100 MB).
 const MAX_GATEWAY_FILE_SIZE: usize = 100 * 1024 * 1024;
@@ -123,6 +127,7 @@ const MANAGED_WALLET_CHAIN_NAMESPACES: &[&str] = &[
     "eip155:8453",
     "bip122:000000000019d6689c085ae165831e93",
 ];
+const WALLET_APPROVAL_REQUEST_TTL_SECS: u64 = 10 * 60;
 const WALLET_PRICE_CACHE_TTL_SECS: u64 = 90;
 const WALLET_PRICE_API_URL: &str = "https://api.coingecko.com/api/v3/simple/price";
 const WALLET_PRICE_SOURCE_ENV: &str = "ELASTOS_WALLET_PRICE_SOURCE";

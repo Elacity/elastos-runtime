@@ -257,7 +257,11 @@ pub(super) async fn home_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = require_home_active_shell_token_context(&state.data_dir, &headers).ok();
+    let wallet_authority =
+        require_home_active_shell_wallet_authority(&state.data_dir, &headers).ok();
+    let context = wallet_authority
+        .as_ref()
+        .map(RuntimeWalletAuthority::home_launch_context);
 
     let (identity, authority, browser_state, appearance, runtime, home_state) =
         if let Some(context) = context.as_ref() {
@@ -331,9 +335,8 @@ pub(super) async fn home_summary(
     } else {
         standard_home_desktop_objects_summary()
     };
-    if let Some(context) = context.as_ref() {
-        let wallet_approvals =
-            system_wallet_approvals_summary(&state, &context.principal_id, false).await;
+    if let (Some(context), Some(authority)) = (context.as_ref(), wallet_authority.as_ref()) {
+        let wallet_approvals = system_wallet_approvals_summary(&state, authority, false).await;
         append_wallet_approval_notifications(
             &mut notifications,
             wallet_approvals.approval_requests,
@@ -2046,10 +2049,11 @@ pub(super) async fn home_events(
     headers: HeaderMap,
     Query(query): Query<HomeEventsQuery>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_home_runtime_wallet_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return home_error_response(err),
     };
+    let context = authority.home_launch_context();
     let previous_cursor = query.cursor.unwrap_or_default();
     let wait_ms = query
         .wait_ms
@@ -2057,7 +2061,7 @@ pub(super) async fn home_events(
         .min(HOME_EVENTS_MAX_WAIT_MS);
     let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
     loop {
-        let snapshot = home_realtime_snapshot(&state, &context).await;
+        let snapshot = home_realtime_snapshot(&state, &context, &authority).await;
         let cursor = home_realtime_cursor(&snapshot);
         if previous_cursor.trim().is_empty() || cursor != previous_cursor {
             let events = home_realtime_events(&previous_cursor, &snapshot);
@@ -2088,18 +2092,25 @@ pub(super) async fn home_events_stream(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_home_runtime_wallet_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return home_error_response(err),
     };
+    let context = authority.home_launch_context();
     let stream_state = HomeEventsStreamState {
         state,
         context,
+        authority,
         cursor: String::new(),
     };
     let stream = futures_lite::stream::unfold(stream_state, |mut stream_state| async move {
         loop {
-            let snapshot = home_realtime_snapshot(&stream_state.state, &stream_state.context).await;
+            let snapshot = home_realtime_snapshot(
+                &stream_state.state,
+                &stream_state.context,
+                &stream_state.authority,
+            )
+            .await;
             let cursor = home_realtime_cursor(&snapshot);
             if stream_state.cursor.is_empty() {
                 stream_state.cursor = cursor;
@@ -2144,6 +2155,7 @@ pub(super) async fn home_events_stream(
 struct HomeEventsStreamState {
     state: GatewayState,
     context: HomeLaunchTokenContext,
+    authority: RuntimeWalletAuthority,
     cursor: String,
 }
 
@@ -2160,6 +2172,7 @@ fn home_events_sse_event(response: HomeEventsResponse) -> SseEvent {
 async fn home_realtime_snapshot(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
 ) -> HomeRealtimeSnapshot {
     let data_dir = state.data_dir.clone();
     let mut home_state = tokio::task::spawn_blocking(move || home_state(&data_dir))
@@ -2192,8 +2205,7 @@ async fn home_realtime_snapshot(
     }
     let room_signature = home_room_realtime_signature(&home_state.room);
     let mut notifications = home_state.notifications;
-    let wallet_approvals =
-        system_wallet_approvals_summary(state, &context.principal_id, false).await;
+    let wallet_approvals = system_wallet_approvals_summary(state, authority, false).await;
     let mut wallet_request_signature = wallet_approvals
         .approval_requests
         .iter()
@@ -2561,6 +2573,23 @@ fn require_home_active_shell_token_context(
         return Ok(context);
     }
     require_home_active_shell_update_token_context(data_dir, headers)
+}
+
+fn require_home_active_shell_wallet_authority(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    if let Ok(authority) = require_home_runtime_wallet_authority(data_dir, headers) {
+        return Ok(authority);
+    }
+    let allowed = BTreeSet::from([
+        HOME_CAPSULE_ID.to_string(),
+        SYSTEM_CAPSULE_ID.to_string(),
+        HOME_GUI_SHELL_ID.to_string(),
+        HOME_CLI_SHELL_ID.to_string(),
+    ]);
+    let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
+    require_runtime_wallet_authority(data_dir, headers, &allowed_refs)
 }
 
 fn require_home_shell_state_token_context(
@@ -4973,16 +5002,17 @@ pub(super) async fn system_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return system_error_response(err),
         };
+    let context = authority.home_launch_context();
 
     let (runtime, wallet_accounts, wallet_approvals, runtime_log) = tokio::join!(
         home_runtime_summary(&state.data_dir),
-        system_wallet_accounts_summary(&state, &context.principal_id),
-        system_wallet_approvals_summary(&state, &context.principal_id, false),
+        system_wallet_accounts_summary(&state, &authority),
+        system_wallet_approvals_summary(&state, &authority, false),
         system_runtime_log(&state.data_dir)
     );
     Json(SystemSummaryResponse {

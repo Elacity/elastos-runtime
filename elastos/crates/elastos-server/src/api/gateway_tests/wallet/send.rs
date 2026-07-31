@@ -5,7 +5,10 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
-    let app = gateway_router(wallet_chain_test_state(dir.path()).await);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &token);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
 
     let created = app
         .clone()
@@ -123,6 +126,28 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
             && request["completed_at"].as_u64().is_some()
     }));
     assert_eq!(summary_json["wallet_approvals"]["pending_count"], 0);
+    wallet_provider
+        .assert_v2_account_operations(
+            &wallet_read_authority,
+            &[
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::ListAccounts,
+                WalletOperationKind::ListAccounts,
+                WalletOperationKind::ListAccounts,
+            ],
+        )
+        .await;
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_read_authority,
+            &[
+                WalletOperationKind::RequestApproval,
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveAndSignManaged,
+                WalletOperationKind::ListApprovals,
+            ],
+        )
+        .await;
 
     let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
     assert!(auth_state.audit.iter().any(|event| {

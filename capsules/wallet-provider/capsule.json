@@ -1,209 +1,52 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "wallet-provider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Wallet authority provider for proof challenges, linked accounts, and typed signing approvals",
   "author": "elastos",
   "role": "provider",
   "type": "microvm",
   "entrypoint": "rootfs.ext4",
-  "provides": "elastos://wallet/*",
+  "provides": "elastos://wallet/meta/status",
   "authority": {
-    "reason": "Owns wallet proof challenges, connector-bound account-link metadata, explicit approval flows, and passkey-gated managed recovery export without exposing wallet RPC or provider SDK objects to ordinary app capsules.",
+    "reason": "Owns Wallet proof challenges, connector-bound account metadata, typed approval flows, and managed Recovery Kit operations behind an authenticated Runtime-local Wallet Bus.",
     "capabilities": [
       {
-        "resource": "elastos://wallet/*",
-        "actions": ["read", "write", "execute"],
-        "operations": ["status", "accounts", "create_managed_account", "link_account", "revoke_account", "rename_account", "export_managed_secret", "set_default_account", "default_account", "challenge", "bitcoin_challenge", "verify_proof", "verify_bip322_proof", "verify_contract_proof", "request_signature", "approval_requests", "reject_approval", "approve_approval", "complete_approval", "sign_approved"]
+        "resource": "elastos://wallet/meta/status",
+        "actions": ["read"],
+        "operations": ["status"]
       }
     ],
-    "audit_events": ["wallet.status", "wallet.managed.created", "wallet.account_link", "wallet.account_revoke", "wallet.account.deleted", "wallet.account.renamed", "wallet.recovery_key.viewed", "wallet.default.updated", "wallet.proof", "wallet.sign_request", "wallet.approval_reject", "wallet.approval_approve", "wallet.approval_complete"]
+    "audit_events": [
+      "wallet.status",
+      "wallet.managed.created",
+      "wallet.account_link",
+      "wallet.account_revoke",
+      "wallet.account.deleted",
+      "wallet.account.renamed",
+      "wallet.recovery_key.viewed",
+      "wallet.default.updated",
+      "wallet.proof",
+      "wallet.sign_request",
+      "wallet.approval_reject",
+      "wallet.approval_approve",
+      "wallet.approval_complete"
+    ]
   },
   "interfaces": [
     {
       "id": "elastos.provider.wallet",
-      "version": "0.5.0",
-      "description": "Runtime provider affordance descriptors projected from wallet-provider authority metadata; descriptors are not grants.",
+      "version": "0.6.0",
+      "description": "Public Wallet provider metadata surface; private Wallet Bus operations are Runtime-local and are not generic provider methods.",
       "methods": [
         {
           "id": "status",
-          "description": "Request status through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
+          "description": "Read wallet-provider status metadata.",
           "risk": "read",
           "approval": "runtime_policy",
           "audit": "summary",
-          "resource": "elastos://wallet/*",
+          "resource": "elastos://wallet/meta/status",
           "operation": "status"
-        },
-        {
-          "id": "accounts",
-          "description": "Request accounts through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "read",
-          "approval": "runtime_policy",
-          "audit": "summary",
-          "resource": "elastos://wallet/*",
-          "operation": "accounts"
-        },
-        {
-          "id": "create_managed_account",
-          "description": "Request create managed account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "write",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "create_managed_account"
-        },
-        {
-          "id": "link_account",
-          "description": "Request link account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "write",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "link_account"
-        },
-        {
-          "id": "revoke_account",
-          "description": "Request revoke account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "write",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "revoke_account"
-        },
-        {
-          "id": "rename_account",
-          "description": "Request rename account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "write",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "rename_account"
-        },
-        {
-          "id": "export_managed_secret",
-          "description": "Request export managed secret through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "privileged",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "export_managed_secret"
-        },
-        {
-          "id": "set_default_account",
-          "description": "Request set default account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "write",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "set_default_account"
-        },
-        {
-          "id": "default_account",
-          "description": "Request default account through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "read",
-          "approval": "runtime_policy",
-          "audit": "summary",
-          "resource": "elastos://wallet/*",
-          "operation": "default_account"
-        },
-        {
-          "id": "challenge",
-          "description": "Request challenge through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "write",
-          "approval": "runtime_policy",
-          "audit": "event",
-          "resource": "elastos://wallet/*",
-          "operation": "challenge"
-        },
-        {
-          "id": "bitcoin_challenge",
-          "description": "Request bitcoin challenge through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "write",
-          "approval": "runtime_policy",
-          "audit": "event",
-          "resource": "elastos://wallet/*",
-          "operation": "bitcoin_challenge"
-        },
-        {
-          "id": "verify_proof",
-          "description": "Request verify proof through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "read",
-          "approval": "runtime_policy",
-          "audit": "event",
-          "resource": "elastos://wallet/*",
-          "operation": "verify_proof"
-        },
-        {
-          "id": "verify_bip322_proof",
-          "description": "Request verify bip322 proof through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "read",
-          "approval": "runtime_policy",
-          "audit": "event",
-          "resource": "elastos://wallet/*",
-          "operation": "verify_bip322_proof"
-        },
-        {
-          "id": "verify_contract_proof",
-          "description": "Request verify contract proof through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "read",
-          "approval": "runtime_policy",
-          "audit": "event",
-          "resource": "elastos://wallet/*",
-          "operation": "verify_contract_proof"
-        },
-        {
-          "id": "request_signature",
-          "description": "Request request signature through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "payment",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "request_signature"
-        },
-        {
-          "id": "approval_requests",
-          "description": "Request approval requests through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "read",
-          "approval": "runtime_policy",
-          "audit": "summary",
-          "resource": "elastos://wallet/*",
-          "operation": "approval_requests"
-        },
-        {
-          "id": "reject_approval",
-          "description": "Request reject approval through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "write",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "reject_approval"
-        },
-        {
-          "id": "approve_approval",
-          "description": "Request approve approval through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "payment",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "approve_approval"
-        },
-        {
-          "id": "complete_approval",
-          "description": "Request complete approval through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "payment",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "complete_approval"
-        },
-        {
-          "id": "sign_approved",
-          "description": "Request sign approved through the wallet-provider Runtime provider boundary for elastos://wallet/*.",
-          "risk": "payment",
-          "approval": "user",
-          "audit": "full",
-          "resource": "elastos://wallet/*",
-          "operation": "sign_approved"
         }
       ]
     }

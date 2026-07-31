@@ -54,6 +54,8 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = authority.system_token.clone();
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), SYSTEM_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -75,7 +77,9 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
         })]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let missing_fresh_token = app
         .clone()
@@ -129,6 +133,16 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["pending_count"], 0);
     assert_eq!(json["note"], "Approved and signed by built-in wallet.");
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_authority,
+            &[
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveAndSignManaged,
+                WalletOperationKind::ListApprovals,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]

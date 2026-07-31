@@ -24,12 +24,16 @@ async fn test_home_token_cannot_read_chain_provider() {
 #[tokio::test]
 async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let signing_key = EvmSigningKey::from_bytes((&[9u8; 32]).into()).unwrap();
     let address = evm_test_address(&signing_key);
     let authority = passkey_authority(dir.path());
-    let connector_token =
-        launch_token_for_authority_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
 
     let local_state = app
         .clone()
@@ -237,6 +241,8 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
         .unwrap();
     let launch_json: serde_json::Value = serde_json::from_slice(&launch_body).unwrap();
     let system_token = test_launch_token_from_route(launch_json["route"].as_str().unwrap());
+    let system_wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), SYSTEM_CAPSULE_ID, &system_token);
     let system_summary = app
         .clone()
         .oneshot(
@@ -272,6 +278,9 @@ async fn test_evm_wallet_link_requires_passkey_authority_and_reuses_session() {
             .unwrap(),
         WALLET_METAMASK_CAPSULE_ID
     );
+    wallet_provider
+        .assert_v2_account_reads(&system_wallet_authority, 1)
+        .await;
 
     let revoked = app
         .clone()
@@ -382,13 +391,17 @@ async fn test_auth_session_revoke_allows_admin_to_revoke_guest_session() {
 #[tokio::test]
 async fn test_metamask_connector_token_can_link_evm_wallet() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let signing_key = EvmSigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
     let address = evm_test_address(&signing_key);
     let display_address = evm_test_display_address(&address);
     let authority = passkey_authority(dir.path());
-    let connector_token =
-        launch_token_for_authority_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
 
     let challenge = app
         .clone()
@@ -452,15 +465,30 @@ async fn test_metamask_connector_token_can_link_evm_wallet() {
     assert!(payload["app_token"].as_str().unwrap().len() > 40);
     assert!(payload.get("home_token").is_none());
     assert!(payload.get("system_token").is_none());
+    wallet_provider
+        .assert_v2_operations(
+            WALLET_METAMASK_CAPSULE_ID,
+            &authority,
+            &[
+                WalletOperationKind::Challenge,
+                WalletOperationKind::VerifyProof,
+                WalletOperationKind::LinkVerifiedAccount,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]
 async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let authority = passkey_authority(dir.path());
-    let connector_token =
-        launch_token_for_authority_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
     let mut expected_addresses = Vec::new();
 
     for seed in [21u8, 22u8] {
@@ -519,6 +547,8 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
     }
 
     let wallet_token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &wallet_token);
     let summary = app
         .clone()
         .oneshot(
@@ -543,6 +573,9 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
         .filter(|account| account["connector_id"] == WALLET_METAMASK_CAPSULE_ID)
         .collect::<Vec<_>>();
     assert_eq!(metamask_accounts.len(), 2);
+    wallet_provider
+        .assert_v2_account_reads(&wallet_read_authority, 1)
+        .await;
 
     let removed_id = metamask_accounts[0]["account_id"].as_str().unwrap();
     let encoded = removed_id.replace(':', "%3A");
@@ -605,11 +638,15 @@ async fn test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one() {
 #[tokio::test]
 async fn test_metamask_connector_token_can_link_erc1271_wallet() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(wallet_chain_test_state(dir.path()).await);
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let contract = "0x00000000000000000000000000000000000000cc";
     let authority = passkey_authority(dir.path());
-    let connector_token =
-        launch_token_for_authority_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
 
     let challenge = app
         .clone()
@@ -671,6 +708,18 @@ async fn test_metamask_connector_token_can_link_erc1271_wallet() {
     assert!(payload["app_token"].as_str().unwrap().len() > 40);
     assert!(payload.get("home_token").is_none());
     assert!(payload.get("system_token").is_none());
+    wallet_provider
+        .assert_v2_operations(
+            WALLET_METAMASK_CAPSULE_ID,
+            &authority,
+            &[
+                WalletOperationKind::Challenge,
+                WalletOperationKind::VerifyProof,
+                WalletOperationKind::VerifyContractProof,
+                WalletOperationKind::LinkVerifiedAccount,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -680,8 +729,11 @@ async fn test_evm_auth_challenge_uses_http_for_loopback_home() {
     let signing_key = EvmSigningKey::from_bytes((&[12u8; 32]).into()).unwrap();
     let address = evm_test_address(&signing_key);
     let authority = passkey_authority(dir.path());
-    let connector_token =
-        launch_token_for_authority_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
 
     let response = app
         .oneshot(
@@ -808,10 +860,14 @@ async fn test_wallet_token_cannot_link_bip322_account() {
 #[tokio::test]
 async fn test_unisat_token_can_link_bip322_account_without_minting_home_session() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
     let authority = passkey_authority(dir.path());
-    let connector_token =
-        launch_token_for_authority_context(dir.path(), WALLET_UNISAT_CAPSULE_ID, &authority);
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_UNISAT_CAPSULE_ID,
+        &authority,
+    );
     let address = "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l";
 
     let challenge = app
@@ -873,6 +929,17 @@ async fn test_unisat_token_can_link_bip322_account_without_minting_home_session(
         .unwrap();
     let verified_json: serde_json::Value = serde_json::from_slice(&verified_body).unwrap();
     assert_eq!(verified_json["principal_id"], authority.principal_id);
+    wallet_provider
+        .assert_v2_operations(
+            WALLET_UNISAT_CAPSULE_ID,
+            &authority,
+            &[
+                WalletOperationKind::BitcoinChallenge,
+                WalletOperationKind::VerifyBip322Proof,
+                WalletOperationKind::LinkVerifiedAccount,
+            ],
+        )
+        .await;
 
     let summary = app
         .oneshot(
@@ -906,8 +973,11 @@ async fn test_evm_auth_challenge_is_single_use() {
     let signing_key = EvmSigningKey::from_bytes((&[10u8; 32]).into()).unwrap();
     let address = evm_test_address(&signing_key);
     let authority = passkey_authority(dir.path());
-    let connector_token =
-        launch_token_for_authority_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
 
     let challenge = app
         .clone()
@@ -996,8 +1066,11 @@ async fn test_evm_auth_challenge_requires_wallet_provider() {
     let signing_key = EvmSigningKey::from_bytes((&[13u8; 32]).into()).unwrap();
     let address = evm_test_address(&signing_key);
     let authority = passkey_authority(dir.path());
-    let connector_token =
-        launch_token_for_authority_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
 
     let response = app
         .oneshot(

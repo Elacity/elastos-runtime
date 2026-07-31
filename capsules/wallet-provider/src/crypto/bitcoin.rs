@@ -91,7 +91,7 @@ pub(crate) fn sign_bip322_simple_p2wpkh_approval(
         "chain_namespace": request.chain_namespace.clone(),
         "address": request.address.clone(),
         "intent": request.intent.clone(),
-        "capsule_id": request.capsule_id.clone(),
+        "capsule_id": request.requested_by_actor.clone(),
         "resource": request.resource.clone(),
         "reason": request.reason.clone(),
         "message_hash": format!("0x{}", hex::encode(message_hash)),

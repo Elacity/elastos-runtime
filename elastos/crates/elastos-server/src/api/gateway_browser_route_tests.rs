@@ -1027,7 +1027,18 @@ async fn test_browser_session_capacity_tracks_open_heartbeat_and_close() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
-    let app = gateway_router(browser_engine_attached_test_state(dir.path()).await);
+    let browser_wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &token);
+    let state = browser_engine_attached_test_state(dir.path()).await;
+    let wallet_provider = Arc::new(RecordingWalletProvider::default());
+    state
+        .provider_registry
+        .as_ref()
+        .unwrap()
+        .register_sub_provider("wallet", wallet_provider.clone())
+        .await
+        .unwrap();
+    let app = gateway_router(state);
 
     let before_response = app
         .clone()
@@ -1068,6 +1079,9 @@ async fn test_browser_session_capacity_tracks_open_heartbeat_and_close() {
         .unwrap();
     let opened: serde_json::Value = serde_json::from_slice(&open_body).unwrap();
     let page_id = opened["engine_page"]["page_id"].as_str().unwrap();
+    wallet_provider
+        .assert_v2_account_reads(&browser_wallet_authority, 2)
+        .await;
 
     let after_open_response = app
         .clone()
@@ -1535,6 +1549,8 @@ async fn test_browser_personal_sign_queues_wallet_inbox_approval() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let browser_wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
     let address = "0x1111111111111111111111111111111111111111";
     let account_id = format!("wallet:eip155:1:{address}");
@@ -1555,7 +1571,9 @@ async fn test_browser_personal_sign_queues_wallet_inbox_approval() {
         approvals: TokioMutex::default(),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let response = app
         .clone()
@@ -1597,6 +1615,15 @@ async fn test_browser_personal_sign_queues_wallet_inbox_approval() {
         payload["approval_request"]["capsule_id"],
         BROWSER_CAPSULE_ID
     );
+    wallet_provider
+        .assert_v2_account_reads(&browser_wallet_authority, 1)
+        .await;
+    wallet_provider
+        .assert_v2_approval_operations(
+            &browser_wallet_authority,
+            &[WalletOperationKind::RequestApproval],
+        )
+        .await;
 
     let inbox = app
         .oneshot(
@@ -1769,6 +1796,8 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let browser_wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
     let address = "0x1111111111111111111111111111111111111111";
     let account_id = format!("wallet:eip155:20:{address}");
@@ -1777,7 +1806,7 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
         bitcoin_challenges: TokioMutex::default(),
         accounts: TokioMutex::new(vec![json!({
             "account_id": account_id,
-            "principal_id": authority.principal_id,
+            "principal_id": authority.principal_id.clone(),
             "proof_binding_id": "proof:wallet:managed:eip155:20:0x1111111111111111111111111111111111111111",
             "chain_namespace": "eip155:20",
             "address": address,
@@ -1789,8 +1818,9 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
         approvals: TokioMutex::default(),
         defaults: TokioMutex::default(),
     };
-    let app =
-        gateway_router(wallet_chain_test_state_with_wallet_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_chain_test_state_with_recording_wallet_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let block_response = app
         .clone()
@@ -2035,6 +2065,9 @@ async fn test_browser_chain_reads_route_through_chain_provider_without_inbox_app
         assert_eq!(payload["result"], expected);
         assert_eq!(payload["requires_approval"], false);
     }
+    wallet_provider
+        .assert_v2_account_reads(&browser_wallet_authority, 11)
+        .await;
 
     let inbox = app
         .oneshot(
@@ -2092,6 +2125,8 @@ async fn test_browser_eth_send_transaction_queues_wallet_inbox_approval() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let browser_wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
     let address = "0x1111111111111111111111111111111111111111";
     let account_id = format!("wallet:eip155:20:{address}");
@@ -2111,8 +2146,9 @@ async fn test_browser_eth_send_transaction_queues_wallet_inbox_approval() {
         approvals: TokioMutex::default(),
         defaults: TokioMutex::default(),
     };
-    let app =
-        gateway_router(wallet_chain_test_state_with_wallet_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_chain_test_state_with_recording_wallet_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let response = app
         .clone()
@@ -2163,6 +2199,15 @@ async fn test_browser_eth_send_transaction_queues_wallet_inbox_approval() {
         payload["approval_request"]["payload"]["origin"],
         "https://glidefinance.io"
     );
+    wallet_provider
+        .assert_v2_account_reads(&browser_wallet_authority, 1)
+        .await;
+    wallet_provider
+        .assert_v2_approval_operations(
+            &browser_wallet_authority,
+            &[WalletOperationKind::RequestApproval],
+        )
+        .await;
 
     let inbox = app
         .oneshot(

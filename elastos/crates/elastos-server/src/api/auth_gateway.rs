@@ -23,6 +23,9 @@ use elastos_runtime::auth::{
     PrincipalRootProtectorV1, PrincipalRootRecoveryArchiveV1, PrincipalRootRecoveryStatusV1,
     ProofBinding, ProofBindingKind, RecoveryKitV1, RuntimeAuditEventV1,
 };
+use elastos_wallet_contract::{
+    Erc1271ProofEvidenceV1, PublicNetwork, WalletProviderOperationV2, WalletResultV2,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,7 +33,8 @@ use sha2::{Digest, Sha256};
 
 use super::gateway::{
     consume_fresh_passkey_home_token, home_session_cookie_header_for_token,
-    is_wallet_connector_capsule_id, issue_home_launch_token_for_auth_grant, GatewayState,
+    is_wallet_connector_capsule_id, issue_home_launch_token_for_auth_grant,
+    require_runtime_wallet_authority, GatewayState, RuntimeWalletAdapter, RuntimeWalletAuthority,
     HOME_CAPSULE_ID, WALLET_LINK_CAPSULE_IDS,
 };
 
@@ -1866,22 +1870,58 @@ fn require_auth_home_or_system_app_context(
 struct WalletLinkContext {
     app: String,
     context: super::gateway::HomeLaunchTokenContext,
+    authority: RuntimeWalletAuthority,
 }
 
 fn require_wallet_link_context(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> anyhow::Result<WalletLinkContext> {
-    let (app, context) = super::gateway::require_home_launch_token_for_any_app_context(
-        &state.data_dir,
-        headers,
-        WALLET_LINK_CAPSULE_IDS,
-    )?;
+    let authority =
+        require_runtime_wallet_authority(&state.data_dir, headers, WALLET_LINK_CAPSULE_IDS)?;
+    let verified = authority.verified_context();
+    let app = verified.actor().to_string();
+    let context = super::gateway::HomeLaunchTokenContext {
+        principal_id: verified.principal_id().to_string(),
+        session_id: verified.session_id().to_string(),
+        proof_binding_id: verified.proof_binding_id().map(ToString::to_string),
+        grant_id: verified.grant_id().to_string(),
+    };
     super::gateway::ensure_wallet_connector_configured(&state.data_dir, &app)?;
     if context.proof_binding_id.is_none() {
         anyhow::bail!("missing proof-bound auth session");
     }
-    Ok(WalletLinkContext { app, context })
+    Ok(WalletLinkContext {
+        app,
+        context,
+        authority,
+    })
+}
+
+async fn wallet_link_provider_data(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    operation: WalletProviderOperationV2,
+) -> anyhow::Result<Value> {
+    match wallet_link_provider_result(state, authority, operation).await? {
+        WalletResultV2::Ok { data } => Ok(data),
+        WalletResultV2::Error { message, .. } => anyhow::bail!(message),
+    }
+}
+
+async fn wallet_link_provider_result(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    operation: WalletProviderOperationV2,
+) -> anyhow::Result<WalletResultV2> {
+    let registry = state
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("wallet provider unavailable"))?;
+    Ok(RuntimeWalletAdapter::new(registry, authority)
+        .invoke(operation)
+        .await?
+        .result)
 }
 
 fn validate_passkey_proof_binding_id(proof_binding_id: &str) -> anyhow::Result<()> {
@@ -2071,8 +2111,9 @@ async fn evm_challenge_inner(
     headers: &HeaderMap,
     input: EvmChallengeRequest,
 ) -> anyhow::Result<EvmChallengeResponse> {
-    let launch_context = require_wallet_link_context(state, headers)?;
-    let context = launch_context.context;
+    let WalletLinkContext {
+        context, authority, ..
+    } = require_wallet_link_context(state, headers)?;
     validate_evm_address(&input.address).map_err(anyhow::Error::msg)?;
     if input.chain_id == 0 {
         anyhow::bail!("chain_id must be non-zero");
@@ -2086,16 +2127,16 @@ async fn evm_challenge_inner(
         "elastos://wallet/account/link".to_string(),
         format!("elastos://principal/{}", context.principal_id),
     ];
-    let data = wallet_provider_data(
+    let data = wallet_link_provider_data(
         state,
-        json!({
-            "op": "challenge",
-            "domain": domain,
-            "uri": uri,
-            "address": input.address,
-            "chain_id": input.chain_id,
-            "resources": resources,
-        }),
+        &authority,
+        WalletProviderOperationV2::Challenge {
+            domain,
+            uri,
+            address: input.address,
+            chain_id: input.chain_id,
+            resources,
+        },
     )
     .await?;
     let challenge_id = required_string(&data, "challenge_id")?;
@@ -2129,9 +2170,11 @@ async fn evm_verify_inner(
     headers: &HeaderMap,
     input: EvmVerifyRequest,
 ) -> anyhow::Result<EvmVerifyResponse> {
-    let launch_context = require_wallet_link_context(state, headers)?;
-    let app = launch_context.app;
-    let context = launch_context.context;
+    let WalletLinkContext {
+        app,
+        context,
+        authority,
+    } = require_wallet_link_context(state, headers)?;
     let session_proof_binding_id = context
         .proof_binding_id
         .clone()
@@ -2145,18 +2188,18 @@ async fn evm_verify_inner(
         .ok_or_else(|| anyhow::anyhow!("SIWE proof missing challenge resource"))?
         .to_string();
     let now = crate::auth::now_ts();
-    let data = match wallet_provider_data(
+    let data = match wallet_link_provider_result(
         state,
-        json!({
-            "op": "verify_proof",
-            "message": &input.message,
-            "signature": &input.signature,
-        }),
+        &authority,
+        WalletProviderOperationV2::VerifyProof {
+            message: input.message.clone(),
+            signature: input.signature.clone(),
+        },
     )
-    .await
+    .await?
     {
-        Ok(data) => data,
-        Err(ecdsa_err) => {
+        WalletResultV2::Ok { data } => data,
+        WalletResultV2::Error { code, message } if code == "invalid_proof" => {
             let network = network_id_for_eip155_chain_id(parsed.chain_id)
                 .ok_or_else(|| anyhow::anyhow!("ERC-1271 verification requires a configured chain-provider network for eip155:{}", parsed.chain_id))?;
             let message_hash = format!(
@@ -2176,19 +2219,23 @@ async fn evm_verify_inner(
             .await
             .map_err(|chain_err| {
                 anyhow::anyhow!(
-                    "wallet ECDSA proof failed ({ecdsa_err}); ERC-1271 verification failed ({chain_err})"
+                    "Wallet EOA proof failed ({message}); ERC-1271 verification failed ({chain_err})"
                 )
             })?;
-            wallet_provider_data(
+            let evidence = erc1271_wallet_evidence(network, erc1271_proof)?;
+            wallet_link_provider_data(
                 state,
-                json!({
-                    "op": "verify_contract_proof",
-                    "message": &input.message,
-                    "signature": &input.signature,
-                    "erc1271_proof": erc1271_proof,
-                }),
+                &authority,
+                WalletProviderOperationV2::VerifyContractProof {
+                    message: input.message.clone(),
+                    signature: input.signature.clone(),
+                    evidence,
+                },
             )
             .await?
+        }
+        WalletResultV2::Error { code, message } => {
+            anyhow::bail!("Wallet proof rejected ({code}): {message}")
         }
     };
     let proof_binding_id = required_string(&data, "proof_binding_id")?;
@@ -2236,17 +2283,17 @@ async fn evm_verify_inner(
         now,
     )?;
     crate::auth::ensure_proof_binding_not_revoked(&principal)?;
-    wallet_provider_data(
+    let _ = wallet_connector_id_for_wallet_link(&app)?;
+    wallet_link_provider_data(
         state,
-        json!({
-            "op": "link_account",
-            "principal_id": principal.principal_id.clone(),
-            "proof_binding_id": principal.proof_binding_id.clone(),
-            "chain_namespace": chain_namespace,
-            "address": address,
-            "proof_type": proof_type,
-            "connector_id": wallet_connector_id_for_wallet_link(&app)?,
-        }),
+        &authority,
+        WalletProviderOperationV2::LinkVerifiedAccount {
+            proof_binding_id: principal.proof_binding_id.clone(),
+            chain_namespace,
+            address,
+            proof_type: proof_type.clone(),
+            label: None,
+        },
     )
     .await?;
     crate::auth::append_audit_event(
@@ -2268,8 +2315,9 @@ async fn evm_verify_inner(
         }),
     )?;
 
-    let app_token = super::gateway::issue_home_launch_token_with_context(
+    let app_token = super::gateway::issue_home_projection_launch_token_with_context(
         &state.data_dir,
+        &app,
         &app,
         &super::gateway::HomeLaunchTokenContext {
             principal_id: session.principal_id.clone(),
@@ -2293,8 +2341,9 @@ async fn btc_challenge_inner(
     headers: &HeaderMap,
     input: BtcChallengeRequest,
 ) -> anyhow::Result<BtcChallengeResponse> {
-    let launch_context = require_wallet_link_context(state, headers)?;
-    let context = launch_context.context;
+    let WalletLinkContext {
+        context, authority, ..
+    } = require_wallet_link_context(state, headers)?;
     let now = crate::auth::now_ts();
     let domain = request_domain(headers)?;
     let scheme = request_scheme(&domain);
@@ -2303,16 +2352,16 @@ async fn btc_challenge_inner(
         "elastos://wallet/account/link".to_string(),
         format!("elastos://principal/{}", context.principal_id),
     ];
-    let data = wallet_provider_data(
+    let data = wallet_link_provider_data(
         state,
-        json!({
-            "op": "bitcoin_challenge",
-            "domain": domain,
-            "uri": uri,
-            "address": input.address,
-            "network": input.network,
-            "resources": resources,
-        }),
+        &authority,
+        WalletProviderOperationV2::BitcoinChallenge {
+            domain,
+            uri,
+            address: input.address,
+            network: PublicNetwork::new(input.network)?,
+            resources,
+        },
     )
     .await?;
     let challenge_id = required_string(&data, "challenge_id")?;
@@ -2355,24 +2404,28 @@ async fn btc_verify_inner(
     headers: &HeaderMap,
     input: BtcVerifyRequest,
 ) -> anyhow::Result<BtcVerifyResponse> {
-    let launch_context = require_wallet_link_context(state, headers)?;
-    let app = launch_context.app;
-    let context = launch_context.context;
+    let WalletLinkContext {
+        app,
+        context,
+        authority,
+    } = require_wallet_link_context(state, headers)?;
     let session_proof_binding_id = context
         .proof_binding_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("missing proof-bound auth session"))?;
     let challenge_id = bitcoin_challenge_id_from_message(&input.message)?;
     let now = crate::auth::now_ts();
-    let data = wallet_provider_data(
+    let data = wallet_link_provider_data(
         state,
-        json!({
-            "op": "verify_bip322_proof",
-            "message": &input.message,
-            "signature": &input.signature,
-            "signature_type": input.signature_type.as_deref().unwrap_or("bip322_simple"),
-            "public_key": input.public_key,
-        }),
+        &authority,
+        WalletProviderOperationV2::VerifyBip322Proof {
+            message: input.message.clone(),
+            signature: input.signature,
+            signature_type: input
+                .signature_type
+                .unwrap_or_else(|| "bip322_simple".to_string()),
+            public_key: input.public_key,
+        },
     )
     .await?;
     let proof_binding_id = required_string(&data, "proof_binding_id")?;
@@ -2426,17 +2479,17 @@ async fn btc_verify_inner(
         now,
     )?;
     crate::auth::ensure_proof_binding_not_revoked(&principal)?;
-    wallet_provider_data(
+    let _ = wallet_connector_id_for_wallet_link(&app)?;
+    wallet_link_provider_data(
         state,
-        json!({
-            "op": "link_account",
-            "principal_id": principal.principal_id.clone(),
-            "proof_binding_id": principal.proof_binding_id.clone(),
-            "chain_namespace": chain_namespace,
-            "address": address,
-            "proof_type": proof_type,
-            "connector_id": wallet_connector_id_for_wallet_link(&app)?,
-        }),
+        &authority,
+        WalletProviderOperationV2::LinkVerifiedAccount {
+            proof_binding_id: principal.proof_binding_id.clone(),
+            chain_namespace,
+            address,
+            proof_type,
+            label: None,
+        },
     )
     .await?;
     crate::auth::append_audit_event(
@@ -2454,8 +2507,9 @@ async fn btc_verify_inner(
         }),
     )?;
 
-    let app_token = super::gateway::issue_home_launch_token_with_context(
+    let app_token = super::gateway::issue_home_projection_launch_token_with_context(
         &state.data_dir,
+        &app,
         &app,
         &super::gateway::HomeLaunchTokenContext {
             principal_id: session.principal_id.clone(),
@@ -2537,6 +2591,23 @@ fn network_id_for_eip155_chain_id(chain_id: u64) -> Option<&'static str> {
         8453 => Some("base-mainnet"),
         _ => None,
     }
+}
+
+fn erc1271_wallet_evidence(
+    expected_network: &str,
+    mut data: Value,
+) -> anyhow::Result<Erc1271ProofEvidenceV1> {
+    if data
+        .get("network")
+        .and_then(|network| network.get("id"))
+        .and_then(Value::as_str)
+        != Some(expected_network)
+    {
+        anyhow::bail!("ERC-1271 proof network mismatch");
+    }
+    data["network"] = Value::String(expected_network.to_string());
+    serde_json::from_value(data)
+        .map_err(|err| anyhow::anyhow!("invalid ERC-1271 proof evidence: {err}"))
 }
 
 fn required_string(data: &Value, field: &str) -> anyhow::Result<String> {

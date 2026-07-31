@@ -15,8 +15,12 @@ use elastos_runtime::auth::{
     AuthSessionGrantV1, PasskeyWebAuthnBinding, ProofBinding,
 };
 use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
+use elastos_wallet_contract::{
+    WalletOperationKind, WalletProviderOperationV2, WalletProviderRequestV2,
+    WalletProviderResponseV2, WalletResultV2, WALLET_BUS_OPERATION,
+};
 use k256::ecdsa::SigningKey as EvmSigningKey;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::Sha256;
 use sha3::Keccak256;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -516,10 +520,32 @@ async fn wallet_test_state_with_provider(
     cache_dir: &std::path::Path,
     provider: MockWalletProvider,
 ) -> GatewayState {
+    wallet_test_state_with_shared_provider(cache_dir, Arc::new(provider)).await
+}
+
+async fn wallet_test_state_with_observer(
+    cache_dir: &std::path::Path,
+) -> (GatewayState, Arc<RecordingWalletProvider>) {
+    wallet_test_state_with_recording_provider(cache_dir, MockWalletProvider::default()).await
+}
+
+async fn wallet_test_state_with_recording_provider(
+    cache_dir: &std::path::Path,
+    wallet_provider: MockWalletProvider,
+) -> (GatewayState, Arc<RecordingWalletProvider>) {
+    let provider = Arc::new(RecordingWalletProvider::new(wallet_provider));
+    let state = wallet_test_state_with_shared_provider(cache_dir, provider.clone()).await;
+    (state, provider)
+}
+
+async fn wallet_test_state_with_shared_provider(
+    cache_dir: &std::path::Path,
+    provider: Arc<dyn Provider>,
+) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
     registry
-        .register_sub_provider("wallet", Arc::new(provider))
+        .register_sub_provider("wallet", provider)
         .await
         .unwrap();
     GatewayState {
@@ -538,10 +564,34 @@ async fn wallet_chain_test_state_with_wallet_provider(
     cache_dir: &std::path::Path,
     wallet_provider: MockWalletProvider,
 ) -> GatewayState {
+    wallet_chain_test_state_with_shared_wallet_provider(cache_dir, Arc::new(wallet_provider)).await
+}
+
+async fn wallet_chain_test_state_with_observer(
+    cache_dir: &std::path::Path,
+) -> (GatewayState, Arc<RecordingWalletProvider>) {
+    wallet_chain_test_state_with_recording_wallet_provider(cache_dir, MockWalletProvider::default())
+        .await
+}
+
+async fn wallet_chain_test_state_with_recording_wallet_provider(
+    cache_dir: &std::path::Path,
+    wallet_provider: MockWalletProvider,
+) -> (GatewayState, Arc<RecordingWalletProvider>) {
+    let provider = Arc::new(RecordingWalletProvider::new(wallet_provider));
+    let state =
+        wallet_chain_test_state_with_shared_wallet_provider(cache_dir, provider.clone()).await;
+    (state, provider)
+}
+
+async fn wallet_chain_test_state_with_shared_wallet_provider(
+    cache_dir: &std::path::Path,
+    wallet_provider: Arc<dyn Provider>,
+) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
     registry
-        .register_sub_provider("wallet", Arc::new(wallet_provider))
+        .register_sub_provider("wallet", wallet_provider)
         .await
         .unwrap();
     registry

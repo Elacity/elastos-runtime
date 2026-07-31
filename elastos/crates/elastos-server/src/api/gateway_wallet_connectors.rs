@@ -44,15 +44,15 @@ pub(in crate::api::gateway) async fn wallet_connector_accounts(
     Path(wallet_connector): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_wallet_connector_launch_context(
+    let authority = match require_wallet_connector_launch_authority(
         &state.data_dir,
         &headers,
         wallet_connector.as_str(),
     ) {
-        Ok(context) => context,
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    let mut summary = system_wallet_accounts_summary(&state, &context.principal_id).await;
+    let mut summary = system_wallet_accounts_summary(&state, &authority).await;
     summary.accounts.retain(|account| {
         !is_managed_wallet_proof_type(&account.proof_type)
             && account.connector_id.as_deref() == Some(wallet_connector.as_str())
@@ -66,15 +66,15 @@ pub(in crate::api::gateway) async fn wallet_connector_approvals(
     Path(wallet_connector): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_wallet_connector_launch_context(
+    let authority = match require_wallet_connector_launch_authority(
         &state.data_dir,
         &headers,
         wallet_connector.as_str(),
     ) {
-        Ok(context) => context,
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    let mut summary = system_wallet_approvals_summary(&state, &context.principal_id, false).await;
+    let mut summary = system_wallet_approvals_summary(&state, &authority, false).await;
     summary.approval_requests.retain(|request| {
         !is_managed_wallet_proof_type(&request.proof_type)
             && request.connector_id.as_deref() == Some(wallet_connector.as_str())
@@ -89,14 +89,15 @@ pub(in crate::api::gateway) async fn wallet_connector_approval_approve(
     headers: HeaderMap,
     Json(input): Json<WalletApprovalApproveRequest>,
 ) -> Response {
-    let context = match require_wallet_connector_launch_context(
+    let authority = match require_wallet_connector_launch_authority(
         &state.data_dir,
         &headers,
         wallet_connector.as_str(),
     ) {
-        Ok(context) => context,
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
+    let context = authority.home_launch_context();
     let connector_label = wallet_connector_label(wallet_connector.as_str());
     let reason = input
         .reason
@@ -104,8 +105,8 @@ pub(in crate::api::gateway) async fn wallet_connector_approval_approve(
     match approve_external_wallet_request(
         &state,
         &state.data_dir,
-        &context.principal_id,
-        &context.session_id,
+        &context,
+        &authority,
         &request_id,
         &reason,
         wallet_connector.as_str(),
@@ -113,8 +114,7 @@ pub(in crate::api::gateway) async fn wallet_connector_approval_approve(
     .await
     {
         Ok(outcome) => {
-            let mut summary =
-                system_wallet_approvals_summary(&state, &context.principal_id, false).await;
+            let mut summary = system_wallet_approvals_summary(&state, &authority, false).await;
             summary.note = Some(format!("Approved. Continue in {connector_label}."));
             summary.handoff = outcome.handoff;
             Json(summary).into_response()
@@ -129,18 +129,20 @@ pub(in crate::api::gateway) async fn wallet_connector_approval_complete(
     headers: HeaderMap,
     Json(input): Json<WalletApprovalCompleteRequest>,
 ) -> Response {
-    let context = match require_wallet_connector_launch_context(
+    let authority = match require_wallet_connector_launch_authority(
         &state.data_dir,
         &headers,
         wallet_connector.as_str(),
     ) {
-        Ok(context) => context,
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
+    let context = authority.home_launch_context();
     let connector_label = wallet_connector_label(wallet_connector.as_str());
     match complete_external_wallet_approval(
         &state,
         &context,
+        &authority,
         &request_id,
         input,
         wallet_connector.as_str(),
@@ -168,11 +170,30 @@ pub(in crate::api::gateway) fn require_wallet_connector_launch_context(
     require_home_launch_token_context(data_dir, headers, connector_id)
 }
 
+pub(in crate::api::gateway) fn require_wallet_connector_launch_authority(
+    data_dir: &FsPath,
+    headers: &HeaderMap,
+    connector_id: &str,
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    if !is_wallet_connector_capsule_id(connector_id) {
+        anyhow::bail!("unknown wallet connector capsule");
+    }
+    ensure_wallet_connector_configured(data_dir, connector_id)?;
+    require_runtime_wallet_authority(data_dir, headers, &[connector_id])
+}
+
 pub(in crate::api::gateway) fn require_wallet_app_launch_context(
     data_dir: &FsPath,
     headers: &HeaderMap,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
     require_home_launch_token_context(data_dir, headers, WALLET_CAPSULE_ID)
+}
+
+pub(in crate::api::gateway) fn require_wallet_app_launch_authority(
+    data_dir: &FsPath,
+    headers: &HeaderMap,
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    require_runtime_wallet_authority(data_dir, headers, &[WALLET_CAPSULE_ID])
 }
 
 pub(crate) fn ensure_wallet_connector_configured(

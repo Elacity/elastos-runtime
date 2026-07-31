@@ -13,12 +13,13 @@ pub(super) fn load_store(path: &Path) -> Result<WalletStore, String> {
 }
 
 pub(super) fn prune_store(mut store: WalletStore, now: u64) -> WalletStore {
+    prune_expired_lifecycles(&mut store, now);
     store
         .challenges
-        .retain(|stored| stored.consumed_at.is_none() && stored.challenge.expires_at > now);
+        .retain(|stored| stored.challenge.expires_at > now);
     store
         .bitcoin_challenges
-        .retain(|stored| stored.consumed_at.is_none() && stored.challenge.expires_at > now);
+        .retain(|stored| stored.challenge.expires_at > now);
     for request in &mut store.approval_requests {
         expire_approval_if_elapsed(request, now);
     }
@@ -36,6 +37,32 @@ pub(super) fn prune_store(mut store: WalletStore, now: u64) -> WalletStore {
             .sort_by_key(|request| request.created_at);
     }
     store
+}
+
+pub(super) fn prune_expired_lifecycles(store: &mut WalletStore, now: u64) {
+    store
+        .consumed_lifecycles
+        .retain(|record| record.request_expires_at > now);
+}
+
+pub(super) fn reject_pre_v2_pending_approvals(store: &mut WalletStore, now: u64) -> usize {
+    let mut changed = 0;
+    for request in &mut store.approval_requests {
+        if matches!(
+            request.status,
+            ApprovalStatus::Pending | ApprovalStatus::Approved
+        ) && (request.session_id.is_empty() || request.launch_id.is_empty())
+        {
+            request.status = ApprovalStatus::Rejected;
+            request.resolved_at = Some(now);
+            request.rejection_reason = Some(
+                "pre-v2 approval preserved as history; a new authority-bound request is required"
+                    .to_string(),
+            );
+            changed += 1;
+        }
+    }
+    changed
 }
 
 pub(super) fn expire_approval_if_elapsed(request: &mut WalletApprovalRequest, now: u64) {

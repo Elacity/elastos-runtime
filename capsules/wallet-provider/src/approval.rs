@@ -1,7 +1,8 @@
 use super::*;
 
-pub(super) struct CompleteApprovalCompletion<'a> {
+pub(super) struct ConnectorHandoffCompletion<'a> {
     pub(super) principal_id: &'a str,
+    pub(super) session_id: &'a str,
     pub(super) request_id: &'a str,
     pub(super) connector_id: &'a str,
     pub(super) payload_hash: &'a str,
@@ -13,14 +14,14 @@ pub(super) struct CompleteApprovalCompletion<'a> {
 }
 
 impl WalletProvider {
-    pub(super) fn request_signature(&mut self, input: SignatureRequestInput) -> Response {
+    pub(super) fn request_approval(&mut self, input: SignatureRequestInput) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
         }
-        if let Err(err) = input.validate() {
+        let now = now_ts();
+        if let Err(err) = input.validate(now) {
             return Response::error("invalid_request", err);
         }
-        let now = now_ts();
         self.store = prune_store(std::mem::take(&mut self.store), now);
         let account = match self.account_for_signature(&input) {
             Ok(account) => account,
@@ -71,11 +72,6 @@ impl WalletProvider {
             }
         }
 
-        let expires_at = approval_expires_at(input.expires_at, now);
-        let request_chain_namespace = input
-            .chain_namespace
-            .clone()
-            .unwrap_or_else(|| account.chain_namespace.clone());
         let request = WalletApprovalRequest {
             schema: "elastos.wallet.approval_request/v1".to_string(),
             request_id: format!("wallet-approval:{}", random_hex(16)),
@@ -84,18 +80,20 @@ impl WalletProvider {
             principal_id: input.principal_id,
             account_id: account.account_id,
             proof_binding_id: account.proof_binding_id,
-            chain_namespace: request_chain_namespace,
+            chain_namespace: input.chain_namespace,
             address: account.address,
             proof_type: account.proof_type,
             connector_id: account.connector_id,
             intent: input.intent,
-            capsule_id: input.capsule_id,
+            session_id: input.session_id,
+            launch_id: input.launch_id,
+            requested_by_actor: input.requested_by_actor,
             resource: input.resource,
             reason: input.reason,
             payload_hash: value_hash(&input.payload),
             payload: input.payload,
             created_at: now,
-            expires_at,
+            expires_at: input.expires_at,
             resolved_at: None,
             rejection_reason: None,
             approved_at: None,
@@ -127,9 +125,8 @@ impl WalletProvider {
             return Response::error("invalid_request", err);
         }
         let now = now_ts();
-        self.store = prune_store(std::mem::take(&mut self.store), now);
-        let requests = self
-            .store
+        let store = prune_store(self.store.clone(), now);
+        let requests = store
             .approval_requests
             .iter()
             .filter(|request| request.principal_id == principal_id)
@@ -141,8 +138,10 @@ impl WalletProvider {
     pub(super) fn reject_approval(
         &mut self,
         principal_id: &str,
+        session_id: &str,
+        actor: &str,
         request_id: &str,
-        reason: Option<&str>,
+        reason: &str,
     ) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
@@ -150,13 +149,17 @@ impl WalletProvider {
         if let Err(err) = validate_opaque_id(principal_id, "principal_id") {
             return Response::error("invalid_request", err);
         }
+        if let Err(err) = validate_opaque_id(session_id, "session_id") {
+            return Response::error("invalid_request", err);
+        }
+        if let Err(err) = validate_opaque_id(actor, "actor") {
+            return Response::error("invalid_request", err);
+        }
         if let Err(err) = validate_opaque_id(request_id, "request_id") {
             return Response::error("invalid_request", err);
         }
-        if let Some(reason) = reason {
-            if let Err(err) = validate_reason(reason) {
-                return Response::error("invalid_request", err);
-            }
+        if let Err(err) = validate_reason(reason) {
+            return Response::error("invalid_request", err);
         }
         let now = now_ts();
         self.store = prune_store(std::mem::take(&mut self.store), now);
@@ -165,15 +168,24 @@ impl WalletProvider {
         }) else {
             return Response::error("not_found", "wallet approval request not found");
         };
+        if request.session_id != session_id {
+            return Response::error(
+                "invalid_request",
+                "wallet approval request belongs to a different Runtime session",
+            );
+        }
+        if actor.starts_with("wallet-") && request.connector_id.as_deref() != Some(actor) {
+            return Response::error(
+                "invalid_request",
+                "wallet approval request belongs to a different connector",
+            );
+        }
         if request.status != ApprovalStatus::Pending {
             return Response::error("invalid_request", "wallet approval request is not pending");
         }
         request.status = ApprovalStatus::Rejected;
         request.resolved_at = Some(now);
-        request.rejection_reason = reason
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
+        request.rejection_reason = Some(reason.trim().to_string());
         let request = request.clone();
         if let Err(err) = self.save() {
             return Response::error("storage_error", err);
@@ -181,11 +193,13 @@ impl WalletProvider {
         Response::ok(json!({ "approval_request": request }))
     }
 
-    pub(super) fn approve_approval(
+    pub(super) fn approve_connector_handoff(
         &mut self,
         principal_id: &str,
+        session_id: &str,
+        actor: &str,
         request_id: &str,
-        reason: Option<&str>,
+        reason: &str,
     ) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
@@ -193,13 +207,17 @@ impl WalletProvider {
         if let Err(err) = validate_opaque_id(principal_id, "principal_id") {
             return Response::error("invalid_request", err);
         }
+        if let Err(err) = validate_opaque_id(session_id, "session_id") {
+            return Response::error("invalid_request", err);
+        }
+        if let Err(err) = validate_opaque_id(actor, "actor") {
+            return Response::error("invalid_request", err);
+        }
         if let Err(err) = validate_opaque_id(request_id, "request_id") {
             return Response::error("invalid_request", err);
         }
-        if let Some(reason) = reason {
-            if let Err(err) = validate_reason(reason) {
-                return Response::error("invalid_request", err);
-            }
+        if let Err(err) = validate_reason(reason) {
+            return Response::error("invalid_request", err);
         }
         let now = now_ts();
         self.store = prune_store(std::mem::take(&mut self.store), now);
@@ -208,15 +226,26 @@ impl WalletProvider {
         }) else {
             return Response::error("not_found", "wallet approval request not found");
         };
+        if request.session_id != session_id {
+            return Response::error(
+                "invalid_request",
+                "wallet approval request belongs to a different Runtime session",
+            );
+        }
+        if request.connector_id.as_deref() != Some(actor)
+            || is_managed_proof_type(&request.proof_type)
+        {
+            return Response::error(
+                "invalid_request",
+                "wallet connector handoff authority does not match the approval",
+            );
+        }
         if request.status != ApprovalStatus::Pending {
             return Response::error("invalid_request", "wallet approval request is not pending");
         }
         request.status = ApprovalStatus::Approved;
         request.approved_at = Some(now);
-        request.approval_reason = reason
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
+        request.approval_reason = Some(reason.trim().to_string());
         let request = request.clone();
         let handoff = match external_wallet_handoff(&request) {
             Ok(handoff) => handoff,
@@ -232,14 +261,71 @@ impl WalletProvider {
         }))
     }
 
-    pub(super) fn complete_approval(
+    pub(super) fn approve_and_sign_managed(
         &mut self,
-        completion: CompleteApprovalCompletion<'_>,
+        principal_id: &str,
+        session_id: &str,
+        request_id: &str,
+        reason: &str,
+    ) -> Response {
+        if let Err(response) = self.ensure_initialized() {
+            return response;
+        }
+        if let Err(err) = validate_opaque_id(principal_id, "principal_id") {
+            return Response::error("invalid_request", err);
+        }
+        if let Err(err) = validate_opaque_id(session_id, "session_id") {
+            return Response::error("invalid_request", err);
+        }
+        if let Err(err) = validate_opaque_id(request_id, "request_id") {
+            return Response::error("invalid_request", err);
+        }
+        if let Err(err) = validate_reason(reason) {
+            return Response::error("invalid_request", err);
+        }
+        let now = now_ts();
+        self.store = prune_store(std::mem::take(&mut self.store), now);
+        let Some(request) = self.store.approval_requests.iter_mut().find(|request| {
+            request.principal_id == principal_id && request.request_id == request_id
+        }) else {
+            return Response::error("not_found", "wallet approval request not found");
+        };
+        expire_approval_if_elapsed(request, now);
+        if request.status == ApprovalStatus::Expired {
+            return Response::error("invalid_request", "wallet approval request expired");
+        }
+        if request.status != ApprovalStatus::Pending {
+            return Response::error("invalid_request", "wallet approval request is not pending");
+        }
+        if request.session_id != session_id {
+            return Response::error(
+                "invalid_request",
+                "managed Wallet approval belongs to a different Runtime session",
+            );
+        }
+        if !is_managed_proof_type(&request.proof_type) || request.connector_id.is_some() {
+            return Response::error(
+                "external_wallet_required",
+                "connector approvals require a typed connector handoff",
+            );
+        }
+        request.status = ApprovalStatus::Approved;
+        request.approved_at = Some(now);
+        request.approval_reason = Some(reason.trim().to_string());
+        self.sign_managed_approval(principal_id, request_id)
+    }
+
+    pub(super) fn complete_connector_handoff(
+        &mut self,
+        completion: ConnectorHandoffCompletion<'_>,
     ) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
         }
         if let Err(err) = validate_opaque_id(completion.principal_id, "principal_id") {
+            return Response::error("invalid_request", err);
+        }
+        if let Err(err) = validate_opaque_id(completion.session_id, "session_id") {
             return Response::error("invalid_request", err);
         }
         if let Err(err) = validate_opaque_id(completion.request_id, "request_id") {
@@ -272,6 +358,12 @@ impl WalletProvider {
                 return Response::error(
                     "invalid_request",
                     "wallet approval request must be approved before completion",
+                );
+            }
+            if request.session_id != completion.session_id {
+                return Response::error(
+                    "invalid_request",
+                    "wallet approval request belongs to a different Runtime session",
                 );
             }
             if request.connector_id.as_deref() != Some(completion.connector_id) {
@@ -437,7 +529,7 @@ impl WalletProvider {
         }))
     }
 
-    pub(super) fn sign_approved(&mut self, principal_id: &str, request_id: &str) -> Response {
+    fn sign_managed_approval(&mut self, principal_id: &str, request_id: &str) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
         }
@@ -540,68 +632,5 @@ impl WalletProvider {
             }
         }
         Response::ok(response)
-    }
-
-    pub(super) fn record_transaction_hash(
-        &mut self,
-        principal_id: &str,
-        request_id: &str,
-        transaction_hash: &str,
-    ) -> Response {
-        if let Err(response) = self.ensure_initialized() {
-            return response;
-        }
-        if let Err(err) = validate_opaque_id(principal_id, "principal_id") {
-            return Response::error("invalid_request", err);
-        }
-        if let Err(err) = validate_opaque_id(request_id, "request_id") {
-            return Response::error("invalid_request", err);
-        }
-        if let Err(err) = validate_hash(transaction_hash, "transaction_hash") {
-            return Response::error("invalid_request", err);
-        }
-        let now = now_ts();
-        self.store = prune_store(std::mem::take(&mut self.store), now);
-        let Some(request) = self.store.approval_requests.iter_mut().find(|request| {
-            request.principal_id == principal_id && request.request_id == request_id
-        }) else {
-            return Response::error("not_found", "wallet approval request not found");
-        };
-        if request.intent != "transaction_intent" {
-            return Response::error(
-                "invalid_request",
-                "wallet approval request is not a transaction",
-            );
-        }
-        if request.status != ApprovalStatus::Completed {
-            return Response::error(
-                "invalid_request",
-                "wallet transaction hash can only be recorded after completion",
-            );
-        }
-        let signed_result = request
-            .signed_result
-            .get_or_insert_with(|| json!({ "schema": "elastos.wallet.transaction-result/v1" }));
-        if let Some(object) = signed_result.as_object_mut() {
-            object.insert(
-                "transaction_hash".to_string(),
-                Value::String(transaction_hash.to_string()),
-            );
-            object.insert(
-                "broadcast_recorded_at".to_string(),
-                Value::Number(serde_json::Number::from(now)),
-            );
-        } else {
-            request.signed_result = Some(json!({
-                "schema": "elastos.wallet.transaction-result/v1",
-                "transaction_hash": transaction_hash,
-                "broadcast_recorded_at": now,
-            }));
-        }
-        let request = request.clone();
-        if let Err(err) = self.save() {
-            return Response::error("storage_error", err);
-        }
-        Response::ok(json!({ "approval_request": request }))
     }
 }

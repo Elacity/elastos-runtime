@@ -6,19 +6,29 @@ fn link_account_persists_and_lists_active_accounts() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
 
-    let response = provider.handle(Request::LinkAccount {
-        principal_id: "person:local:alice".into(),
-        proof_binding_id: "proof:eip155:20:0xabc".into(),
-        chain_namespace: "eip155:20".into(),
-        address: "0xabc".into(),
-        proof_type: "siwe".into(),
-        connector_id: Some("wallet-metamask".into()),
-        label: Some("ESC".into()),
-    });
+    let response = invoke_wallet(
+        &mut provider,
+        "person:local:alice",
+        "wallet-metamask",
+        WalletProviderOperationV2::LinkVerifiedAccount {
+            proof_binding_id: "proof:eip155:20:0xabc".into(),
+            chain_namespace: "eip155:20".into(),
+            address: "0xabc".into(),
+            proof_type: "siwe".into(),
+            label: Some("ESC".into()),
+        },
+    );
     assert!(matches!(response, Response::Ok { .. }));
 
-    let provider = init_provider(dir.path());
-    match provider.accounts("person:local:alice", false) {
+    let mut provider = init_provider(dir.path());
+    match invoke_wallet(
+        &mut provider,
+        "person:local:alice",
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             let accounts = data["accounts"].as_array().unwrap();
             assert_eq!(accounts.len(), 1);
@@ -36,12 +46,16 @@ fn managed_accounts_report_unavailable_signing_when_key_cannot_decrypt() {
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
 
-    let response = provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        label: Some("Spending".into()),
-        create_new: true,
-    });
+    let response = invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: Some("Spending".into()),
+            create_new: true,
+        },
+    );
     let account_id = match response {
         Response::Ok { data: Some(data) } => {
             data["account"]["account_id"].as_str().unwrap().to_string()
@@ -49,7 +63,14 @@ fn managed_accounts_report_unavailable_signing_when_key_cannot_decrypt() {
         other => panic!("expected managed account, got {other:?}"),
     };
 
-    match provider.accounts(principal_id, false) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["accounts"][0]["signing_available"], true);
             assert_eq!(
@@ -63,7 +84,14 @@ fn managed_accounts_report_unavailable_signing_when_key_cannot_decrypt() {
     provider.store.managed_wallets[0].ciphertext = "00".to_string();
     provider.save().unwrap();
     let mut provider = init_provider(dir.path());
-    match provider.accounts(principal_id, false) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["accounts"][0]["signing_available"], false);
             assert_eq!(
@@ -74,17 +102,20 @@ fn managed_accounts_report_unavailable_signing_when_key_cannot_decrypt() {
         other => panic!("expected accounts, got {other:?}"),
     }
 
-    match provider.handle(Request::Signature {
-        principal_id: principal_id.into(),
-        account_id: Some(account_id),
-        chain_namespace: Some("eip155:20".into()),
-        intent: "publish_envelope".into(),
-        capsule_id: "documents".into(),
-        resource: "elastos://content/publish".into(),
-        reason: "Publish document revision".into(),
-        payload: json!({"cid": "bafy-broken-key"}),
-        expires_at: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "documents",
+        WalletProviderOperationV2::RequestApproval {
+            account_id,
+            chain_namespace: "eip155:20".into(),
+            intent: "publish_envelope".into(),
+            resource: "elastos://content/publish".into(),
+            reason: "Publish document revision".into(),
+            payload: json!({"cid": "bafy-broken-key"}),
+            expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+        },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "managed_key_unavailable");
             assert!(message.contains("recover or recreate"));
@@ -99,12 +130,16 @@ fn create_managed_account_replaces_unavailable_idempotent_account() {
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
 
-    let old_account_id = match provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:8453".into(),
-        label: Some("Base".into()),
-        create_new: false,
-    }) {
+    let old_account_id = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:8453".into(),
+            label: Some("Base".into()),
+            create_new: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             data["account"]["account_id"].as_str().unwrap().to_string()
         }
@@ -114,12 +149,16 @@ fn create_managed_account_replaces_unavailable_idempotent_account() {
     provider.save().unwrap();
 
     let mut provider = init_provider(dir.path());
-    match provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:8453".into(),
-        label: Some("Base replacement".into()),
-        create_new: false,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:8453".into(),
+            label: Some("Base replacement".into()),
+            create_new: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["created"], true);
             assert_eq!(data["account"]["chain_namespace"], "eip155:8453");
@@ -128,7 +167,14 @@ fn create_managed_account_replaces_unavailable_idempotent_account() {
         other => panic!("expected replacement managed account, got {other:?}"),
     }
 
-    match provider.accounts(principal_id, false) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             let accounts = data["accounts"].as_array().unwrap();
             assert!(accounts.iter().any(|account| {
@@ -145,21 +191,33 @@ fn create_managed_account_replaces_unavailable_idempotent_account() {
 }
 
 #[test]
-fn external_wallet_link_requires_connector_id() {
+fn external_wallet_link_derives_connector_and_rejects_caller_override() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
 
-    match provider.handle(Request::LinkAccount {
-        principal_id: "person:local:alice".into(),
-        proof_binding_id: "proof:eip155:20:0xabc".into(),
-        chain_namespace: "eip155:20".into(),
-        address: "0xabc".into(),
-        proof_type: "siwe".into(),
-        connector_id: None,
-        label: None,
-    }) {
+    let context = wallet_context("person:local:alice", "wallet-metamask");
+    let request = wallet_request(
+        &context,
+        WalletProviderOperationV2::LinkVerifiedAccount {
+            proof_binding_id: "proof:eip155:20:0xabc".into(),
+            chain_namespace: "eip155:20".into(),
+            address: "0xabc".into(),
+            proof_type: "siwe".into(),
+            label: None,
+        },
+    );
+    let mut request = serde_json::to_value(request).unwrap();
+    request["operation"]["params"]["connector_id"] = json!("wallet-unisat");
+    match decode_and_handle_outer(
+        &mut provider,
+        json!({
+            "op": "wallet_contract",
+            "request": request,
+            "_runtime_invocation": runtime_invocation_envelope(),
+        }),
+    ) {
         Response::Error { code, message } => {
-            assert_eq!(code, "invalid_request");
+            assert_eq!(code, "invalid_wallet_contract");
             assert!(message.contains("connector_id"));
         }
         other => panic!("expected connector rejection, got {other:?}"),
@@ -172,12 +230,16 @@ fn create_managed_account_persists_encrypted_key_and_is_idempotent() {
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
 
-    let first = provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        label: Some("Passkey approval".into()),
-        create_new: false,
-    });
+    let first = invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: Some("Passkey approval".into()),
+            create_new: false,
+        },
+    );
     let account_id = match first {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["created"], true);
@@ -214,12 +276,16 @@ fn create_managed_account_persists_encrypted_key_and_is_idempotent() {
     assert!(!state.contains("private_key"));
 
     let mut provider = init_provider(dir.path());
-    let second = provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        label: None,
-        create_new: false,
-    });
+    let second = invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: None,
+            create_new: false,
+        },
+    );
     match second {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["created"], false);
@@ -235,12 +301,16 @@ fn create_managed_account_can_create_new_passkey_account_on_same_network() {
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
 
-    let first = provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:8453".into(),
-        label: Some("Spending".into()),
-        create_new: false,
-    });
+    let first = invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:8453".into(),
+            label: Some("Spending".into()),
+            create_new: false,
+        },
+    );
     let first_address = match first {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["created"], true);
@@ -249,12 +319,16 @@ fn create_managed_account_can_create_new_passkey_account_on_same_network() {
         other => panic!("expected first managed account, got {other:?}"),
     };
 
-    let second = provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:8453".into(),
-        label: Some("Agent Budget".into()),
-        create_new: true,
-    });
+    let second = invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:8453".into(),
+            label: Some("Agent Budget".into()),
+            create_new: true,
+        },
+    );
     match second {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["created"], true);
@@ -273,12 +347,16 @@ fn create_managed_account_reuses_principal_key_across_evm_namespaces() {
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
 
-    let first = provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        label: None,
-        create_new: false,
-    });
+    let first = invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: None,
+            create_new: false,
+        },
+    );
     let first_address = match first {
         Response::Ok { data: Some(data) } => data["account"]["address"]
             .as_str()
@@ -287,12 +365,16 @@ fn create_managed_account_reuses_principal_key_across_evm_namespaces() {
         other => panic!("expected first managed account, got {other:?}"),
     };
 
-    let second = provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:8453".into(),
-        label: None,
-        create_new: false,
-    });
+    let second = invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:8453".into(),
+            label: None,
+            create_new: false,
+        },
+    );
     match second {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["created"], true);
@@ -310,12 +392,16 @@ fn create_managed_btc_account_uses_p2wpkh_and_separate_key_scope() {
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
 
-    let evm_address = match provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        label: None,
-        create_new: false,
-    }) {
+    let evm_address = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: None,
+            create_new: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => data["account"]["address"]
             .as_str()
             .expect("EVM managed address")
@@ -323,12 +409,16 @@ fn create_managed_btc_account_uses_p2wpkh_and_separate_key_scope() {
         other => panic!("expected EVM managed account, got {other:?}"),
     };
 
-    let (btc_account_id, btc_address) = match provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: BITCOIN_MAINNET_CHAIN_NAMESPACE.into(),
-        label: Some("Bitcoin".into()),
-        create_new: false,
-    }) {
+    let (btc_account_id, btc_address) = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: BITCOIN_MAINNET_CHAIN_NAMESPACE.into(),
+            label: Some("Bitcoin".into()),
+            create_new: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["created"], true);
             let account = &data["account"];
@@ -344,12 +434,16 @@ fn create_managed_btc_account_uses_p2wpkh_and_separate_key_scope() {
     };
     assert_eq!(provider.store.managed_wallets.len(), 2);
 
-    match provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: BITCOIN_MAINNET_CHAIN_NAMESPACE.into(),
-        label: None,
-        create_new: false,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: BITCOIN_MAINNET_CHAIN_NAMESPACE.into(),
+            label: None,
+            create_new: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["created"], false);
             assert_eq!(data["account"]["account_id"], btc_account_id);
@@ -360,30 +454,37 @@ fn create_managed_btc_account_uses_p2wpkh_and_separate_key_scope() {
 }
 
 #[test]
-fn default_account_is_principal_scoped_and_drives_accountless_signature_requests() {
+fn default_account_is_principal_scoped_and_drives_explicit_signature_requests() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
     let account_id = "wallet:eip155:20:0xabc";
 
     assert!(matches!(
-        provider.handle(Request::LinkAccount {
-            principal_id: principal_id.into(),
-            proof_binding_id: "proof:eip155:20:0xabc".into(),
-            chain_namespace: "eip155:20".into(),
-            address: "0xabc".into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: Some("MetaMask".into()),
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:0xabc".into(),
+                chain_namespace: "eip155:20".into(),
+                address: "0xabc".into(),
+                proof_type: "siwe".into(),
+                label: Some("MetaMask".into()),
+            },
+        ),
         Response::Ok { .. }
     ));
-    match provider.handle(Request::SetDefaultAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        intent: "publish_envelope".into(),
-        account_id: account_id.into(),
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::SetDefaultAccount {
+            chain_namespace: "eip155:20".into(),
+            intent: "publish_envelope".into(),
+            account_id: account_id.into(),
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["default_account"]["account_id"], account_id);
             assert_eq!(data["default_account"]["intent"], "publish_envelope");
@@ -391,12 +492,16 @@ fn default_account_is_principal_scoped_and_drives_accountless_signature_requests
         other => panic!("expected default account, got {other:?}"),
     }
 
-    match provider.handle(Request::SetDefaultAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        intent: "browser_connect".into(),
-        account_id: account_id.into(),
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::SetDefaultAccount {
+            chain_namespace: "eip155:20".into(),
+            intent: "browser_connect".into(),
+            account_id: account_id.into(),
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["default_account"]["account_id"], account_id);
             assert_eq!(data["default_account"]["intent"], "browser_connect");
@@ -405,10 +510,14 @@ fn default_account_is_principal_scoped_and_drives_accountless_signature_requests
     }
 
     let mut provider = init_provider(dir.path());
-    match provider.handle(Request::Accounts {
-        principal_id: principal_id.into(),
-        include_revoked: false,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["accounts"].as_array().unwrap().len(), 1);
             assert_eq!(data["default_accounts"].as_array().unwrap().len(), 2);
@@ -417,17 +526,20 @@ fn default_account_is_principal_scoped_and_drives_accountless_signature_requests
         other => panic!("expected accounts with defaults, got {other:?}"),
     }
 
-    match provider.handle(Request::Signature {
-        principal_id: principal_id.into(),
-        account_id: None,
-        chain_namespace: Some("eip155:20".into()),
-        intent: "publish_envelope".into(),
-        capsule_id: "documents".into(),
-        resource: "elastos://content/publish".into(),
-        reason: "Publish document revision".into(),
-        payload: json!({"cid": "bafy-default"}),
-        expires_at: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "documents",
+        WalletProviderOperationV2::RequestApproval {
+            account_id: account_id.to_string(),
+            chain_namespace: "eip155:20".into(),
+            intent: "publish_envelope".into(),
+            resource: "elastos://content/publish".into(),
+            reason: "Publish document revision".into(),
+            payload: json!({"cid": "bafy-default"}),
+            expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             let approval = &data["approval_request"];
             assert_eq!(approval["account_id"], account_id);
@@ -449,53 +561,73 @@ fn evm_default_account_is_latest_wins_across_eip155_chains() {
     let ethereum_account_id = "wallet:eip155:1:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     assert!(matches!(
-        provider.handle(Request::LinkAccount {
-            principal_id: principal_id.into(),
-            proof_binding_id: "proof:eip155:20:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            chain_namespace: "eip155:20".into(),
-            address: esc_address.into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: Some("ESC".into()),
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+                chain_namespace: "eip155:20".into(),
+                address: esc_address.into(),
+                proof_type: "siwe".into(),
+                label: Some("ESC".into()),
+            },
+        ),
         Response::Ok { .. }
     ));
     assert!(matches!(
-        provider.handle(Request::LinkAccount {
-            principal_id: principal_id.into(),
-            proof_binding_id: "proof:eip155:1:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-            chain_namespace: "eip155:1".into(),
-            address: ethereum_address.into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: Some("Ethereum".into()),
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:1:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .into(),
+                chain_namespace: "eip155:1".into(),
+                address: ethereum_address.into(),
+                proof_type: "siwe".into(),
+                label: Some("Ethereum".into()),
+            },
+        ),
         Response::Ok { .. }
     ));
 
     assert!(matches!(
-        provider.handle(Request::SetDefaultAccount {
-            principal_id: principal_id.into(),
-            chain_namespace: "eip155:1".into(),
-            intent: "transaction_intent".into(),
-            account_id: ethereum_account_id.into(),
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet",
+            WalletProviderOperationV2::SetDefaultAccount {
+                chain_namespace: "eip155:1".into(),
+                intent: "transaction_intent".into(),
+                account_id: ethereum_account_id.into(),
+            },
+        ),
         Response::Ok { .. }
     ));
     assert!(matches!(
-        provider.handle(Request::SetDefaultAccount {
-            principal_id: principal_id.into(),
-            chain_namespace: "eip155:20".into(),
-            intent: "transaction_intent".into(),
-            account_id: esc_account_id.into(),
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet",
+            WalletProviderOperationV2::SetDefaultAccount {
+                chain_namespace: "eip155:20".into(),
+                intent: "transaction_intent".into(),
+                account_id: esc_account_id.into(),
+            },
+        ),
         Response::Ok { .. }
     ));
 
-    match provider.handle(Request::Accounts {
-        principal_id: principal_id.into(),
-        include_revoked: false,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             let defaults = data["default_accounts"].as_array().unwrap();
             assert_eq!(defaults.len(), 1);
@@ -506,54 +638,73 @@ fn evm_default_account_is_latest_wins_across_eip155_chains() {
     }
 
     assert!(matches!(
-        provider.handle(Request::SetDefaultAccount {
-            principal_id: principal_id.into(),
-            chain_namespace: "eip155:1".into(),
-            intent: "transaction_intent".into(),
-            account_id: ethereum_account_id.into(),
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet",
+            WalletProviderOperationV2::SetDefaultAccount {
+                chain_namespace: "eip155:1".into(),
+                intent: "transaction_intent".into(),
+                account_id: ethereum_account_id.into(),
+            },
+        ),
         Response::Ok { .. }
     ));
 
-    match provider.handle(Request::Signature {
-        principal_id: principal_id.into(),
-        account_id: None,
-        chain_namespace: Some("eip155:20".into()),
-        intent: "publish_envelope".into(),
-        capsule_id: "documents".into(),
-        resource: "elastos://content/publish".into(),
-        reason: "Publish document revision".into(),
-        payload: json!({"cid": "bafy-default"}),
-        expires_at: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::DefaultAccount {
+            chain_namespace: "eip155:20".into(),
+            intent: "publish_envelope".into(),
+        },
+    ) {
         Response::Error { code, .. } => assert_eq!(code, "not_found"),
         other => panic!("expected missing publish default, got {other:?}"),
     }
 
-    match provider.handle(Request::Signature {
-        principal_id: principal_id.into(),
-        account_id: None,
-        chain_namespace: Some("eip155:20".into()),
-        intent: "transaction_intent".into(),
-        capsule_id: "browser".into(),
-        resource: "elastos://wallet/eip155:20/sign/transaction_intent".into(),
-        reason: "Browser transaction".into(),
-        payload: json!({
-            "schema": "elastos.chain.unsigned_transaction_intent/v1",
-            "transaction_type": "eip155_legacy",
-            "chain_id": 20,
-            "from": ethereum_address,
-            "to": "0x0000000000000000000000000000000000000001",
-            "value": "0x0",
-            "data": "0x",
-            "gas_limit": "0x5208",
-            "gas_price": "0x1",
-            "nonce": "0x0",
-            "requires_wallet_approval": true,
-            "wallet_intent": "transaction_intent"
-        }),
-        expires_at: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::DefaultAccount {
+            chain_namespace: "eip155:20".into(),
+            intent: "transaction_intent".into(),
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["default_account"]["account_id"], ethereum_account_id);
+        }
+        other => panic!("expected latest EVM default, got {other:?}"),
+    }
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "browser",
+        WalletProviderOperationV2::RequestApproval {
+            account_id: ethereum_account_id.to_string(),
+            chain_namespace: "eip155:20".into(),
+            intent: "transaction_intent".into(),
+            resource: "elastos://wallet/eip155:20/sign/transaction_intent".into(),
+            reason: "Browser transaction".into(),
+            payload: json!({
+                "schema": "elastos.chain.unsigned_transaction_intent/v1",
+                "transaction_type": "eip155_legacy",
+                "chain_id": 20,
+                "from": ethereum_address,
+                "to": "0x0000000000000000000000000000000000000001",
+                "value": "0x0",
+                "data": "0x",
+                "gas_limit": "0x5208",
+                "gas_price": "0x1",
+                "nonce": "0x0",
+                "requires_wallet_approval": true,
+                "wallet_intent": "transaction_intent"
+            }),
+            expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["approval_request"]["account_id"], ethereum_account_id);
             assert_eq!(data["approval_request"]["chain_namespace"], "eip155:20");
@@ -570,24 +721,31 @@ fn default_account_rejects_cross_chain_or_missing_accounts() {
     let account_id = "wallet:eip155:20:0xabc";
 
     assert!(matches!(
-        provider.handle(Request::LinkAccount {
-            principal_id: principal_id.into(),
-            proof_binding_id: "proof:eip155:20:0xabc".into(),
-            chain_namespace: "eip155:20".into(),
-            address: "0xabc".into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: None,
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:0xabc".into(),
+                chain_namespace: "eip155:20".into(),
+                address: "0xabc".into(),
+                proof_type: "siwe".into(),
+                label: None,
+            },
+        ),
         Response::Ok { .. }
     ));
 
-    match provider.handle(Request::SetDefaultAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:8453".into(),
-        intent: "publish_envelope".into(),
-        account_id: account_id.into(),
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::SetDefaultAccount {
+            chain_namespace: "eip155:8453".into(),
+            intent: "publish_envelope".into(),
+            account_id: account_id.into(),
+        },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "invalid_request");
             assert!(message.contains("chain"));
@@ -595,17 +753,15 @@ fn default_account_rejects_cross_chain_or_missing_accounts() {
         other => panic!("expected cross-chain rejection, got {other:?}"),
     }
 
-    match provider.handle(Request::Signature {
-        principal_id: principal_id.into(),
-        account_id: None,
-        chain_namespace: Some("eip155:20".into()),
-        intent: "credential".into(),
-        capsule_id: "system".into(),
-        resource: "elastos://wallet/eip155:20/sign/credential".into(),
-        reason: "Issue credential".into(),
-        payload: json!({"credential": "test"}),
-        expires_at: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::DefaultAccount {
+            chain_namespace: "eip155:20".into(),
+            intent: "credential".into(),
+        },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "not_found");
             assert!(message.contains("default"));
@@ -616,11 +772,34 @@ fn default_account_rejects_cross_chain_or_missing_accounts() {
 
 #[test]
 fn create_managed_account_requires_explicit_chain_namespace() {
-    let request = serde_json::from_value::<Request>(json!({
-        "op": "create_managed_account",
-        "principal_id": "person:local:alice"
-    }));
-    assert!(request.is_err());
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = init_provider(dir.path());
+    let context = wallet_context("person:local:alice", "wallet");
+    let request = wallet_request(
+        &context,
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: None,
+            create_new: false,
+        },
+    );
+    let mut request = serde_json::to_value(request).unwrap();
+    request["operation"]["params"]
+        .as_object_mut()
+        .unwrap()
+        .remove("chain_namespace");
+    let response = decode_and_handle_outer(
+        &mut provider,
+        json!({
+            "op": "wallet_contract",
+            "request": request,
+            "_runtime_invocation": runtime_invocation_envelope(),
+        }),
+    );
+    assert!(matches!(
+        response,
+        Response::Error { ref code, .. } if code == "invalid_wallet_contract"
+    ));
 }
 
 #[test]
@@ -647,32 +826,53 @@ fn revoke_account_hides_account_by_default() {
     let account_id = "wallet:eip155:20:0xabc";
 
     assert!(matches!(
-        provider.handle(Request::LinkAccount {
-            principal_id: principal_id.into(),
-            proof_binding_id: "proof:eip155:20:0xabc".into(),
-            chain_namespace: "eip155:20".into(),
-            address: "0xabc".into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: None,
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:0xabc".into(),
+                chain_namespace: "eip155:20".into(),
+                address: "0xabc".into(),
+                proof_type: "siwe".into(),
+                label: None,
+            },
+        ),
         Response::Ok { .. }
     ));
     assert!(matches!(
-        provider.handle(Request::RevokeAccount {
-            principal_id: principal_id.into(),
-            account_id: account_id.into(),
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet",
+            WalletProviderOperationV2::RevokeAccount {
+                account_id: account_id.into(),
+            },
+        ),
         Response::Ok { .. }
     ));
 
-    match provider.accounts(principal_id, false) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert!(data["accounts"].as_array().unwrap().is_empty());
         }
         other => panic!("expected accounts, got {other:?}"),
     }
-    match provider.accounts(principal_id, true) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: true,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["accounts"].as_array().unwrap().len(), 1);
         }
@@ -685,35 +885,56 @@ fn rename_account_updates_active_label_only() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
-    let account_id = match provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:8453".into(),
-        label: Some("Spending".into()),
-        create_new: true,
-    }) {
+    let account_id = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:8453".into(),
+            label: Some("Spending".into()),
+            create_new: true,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             data["account"]["account_id"].as_str().unwrap().to_string()
         }
         other => panic!("expected managed account, got {other:?}"),
     };
 
-    match provider.handle(Request::RenameAccount {
-        principal_id: principal_id.into(),
-        account_id: account_id.clone(),
-        label: "  Savings  ".into(),
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::RenameAccount {
+            account_id: account_id.clone(),
+            label: "  Savings  ".into(),
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["account"]["label"], "Savings");
         }
         other => panic!("expected renamed account, got {other:?}"),
     }
-    match provider.handle(Request::RenameAccount {
-        principal_id: principal_id.into(),
-        account_id,
-        label: "".into(),
-    }) {
+    let context = wallet_context(principal_id, "wallet");
+    let request = wallet_request(
+        &context,
+        WalletProviderOperationV2::RenameAccount {
+            account_id,
+            label: "placeholder".into(),
+        },
+    );
+    let mut request = serde_json::to_value(request).unwrap();
+    request["operation"]["params"]["label"] = json!("");
+    match decode_and_handle_outer(
+        &mut provider,
+        json!({
+            "op": "wallet_contract",
+            "request": request,
+            "_runtime_invocation": runtime_invocation_envelope(),
+        }),
+    ) {
         Response::Error { code, message } => {
-            assert_eq!(code, "invalid_request");
+            assert_eq!(code, "invalid_wallet_contract");
             assert!(message.contains("label"));
         }
         other => panic!("expected blank label rejection, got {other:?}"),
@@ -721,25 +942,33 @@ fn rename_account_updates_active_label_only() {
 }
 
 #[test]
-fn export_managed_secret_returns_private_recovery_key_for_active_managed_account_only() {
+fn export_managed_recovery_key_is_available_for_active_managed_account_only() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
-    let account_id = match provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        label: None,
-        create_new: false,
-    }) {
+    let account_id = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: None,
+            create_new: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             data["account"]["account_id"].as_str().unwrap().to_string()
         }
         other => panic!("expected managed account, got {other:?}"),
     };
-    match provider.handle(Request::ExportManagedSecret {
-        principal_id: principal_id.into(),
-        account_id: account_id.clone(),
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ExportManagedRecoveryKey {
+            account_id: account_id.clone(),
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["schema"], "elastos.wallet.recovery-key/v1");
             assert_eq!(data["account_id"], account_id);
@@ -750,21 +979,28 @@ fn export_managed_secret_returns_private_recovery_key_for_active_managed_account
     }
 
     assert!(matches!(
-        provider.handle(Request::LinkAccount {
-            principal_id: principal_id.into(),
-            proof_binding_id: "proof:eip155:20:0xabc".into(),
-            chain_namespace: "eip155:20".into(),
-            address: "0xabc".into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: None,
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:0xabc".into(),
+                chain_namespace: "eip155:20".into(),
+                address: "0xabc".into(),
+                proof_type: "siwe".into(),
+                label: None,
+            },
+        ),
         Response::Ok { .. }
     ));
-    match provider.handle(Request::ExportManagedSecret {
-        principal_id: principal_id.into(),
-        account_id: "wallet:eip155:20:0xabc".into(),
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ExportManagedRecoveryKey {
+            account_id: "wallet:eip155:20:0xabc".into(),
+        },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "external_wallet_required");
             assert!(message.contains("passkey-managed"));
@@ -774,25 +1010,33 @@ fn export_managed_secret_returns_private_recovery_key_for_active_managed_account
 }
 
 #[test]
-fn import_managed_secret_restores_exported_wallet_recovery_key() {
+fn import_managed_recovery_key_restores_exported_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let principal_id = "person:local:alice";
-    let account_id = match provider.handle(Request::CreateManagedAccount {
-        principal_id: principal_id.into(),
-        chain_namespace: "eip155:20".into(),
-        label: Some("Spending".into()),
-        create_new: false,
-    }) {
+    let account_id = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: Some("Spending".into()),
+            create_new: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             data["account"]["account_id"].as_str().unwrap().to_string()
         }
         other => panic!("expected managed account, got {other:?}"),
     };
-    let recovery_key = match provider.handle(Request::ExportManagedSecret {
-        principal_id: principal_id.into(),
-        account_id: account_id.clone(),
-    }) {
+    let recovery_key = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ExportManagedRecoveryKey {
+            account_id: account_id.clone(),
+        },
+    ) {
         Response::Ok { data: Some(data) } => data,
         other => panic!("expected recovery key export, got {other:?}"),
     };
@@ -800,7 +1044,14 @@ fn import_managed_secret_restores_exported_wallet_recovery_key() {
     provider.store.managed_wallets[0].ciphertext = "00".to_string();
     provider.save().unwrap();
     let mut provider = init_provider(dir.path());
-    match provider.accounts(principal_id, false) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(
                 data["accounts"][0]["signing_status"],
@@ -810,11 +1061,15 @@ fn import_managed_secret_restores_exported_wallet_recovery_key() {
         other => panic!("expected accounts, got {other:?}"),
     }
 
-    match provider.handle(Request::ImportManagedSecret {
-        principal_id: principal_id.into(),
-        recovery_key,
-        label: Some("Recovered".into()),
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ImportManagedRecoveryKey {
+            recovery_key,
+            label: Some("Recovered".into()),
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["imported"], true);
             assert_eq!(data["account"]["account_id"], account_id);
@@ -822,7 +1077,14 @@ fn import_managed_secret_restores_exported_wallet_recovery_key() {
         }
         other => panic!("expected recovery key import, got {other:?}"),
     }
-    match provider.accounts(principal_id, false) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(
                 data["accounts"][0]["signing_status"],

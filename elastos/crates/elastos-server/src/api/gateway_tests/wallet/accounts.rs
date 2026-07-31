@@ -1,5 +1,72 @@
 use super::super::*;
 
+#[test]
+fn raw_wallet_account_dispatch_is_recovery_only() {
+    fn collect_raw_dispatches(
+        api_dir: &std::path::Path,
+        dir: &std::path::Path,
+        matches: &mut Vec<(String, String, usize)>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().and_then(|name| name.to_str()) != Some("gateway_tests") {
+                    collect_raw_dispatches(api_dir, &path, matches);
+                }
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs")
+                || file_name.ends_with("_tests.rs")
+            {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            for operation in [
+                "accounts",
+                "create_managed_account",
+                "revoke_account",
+                "rename_account",
+                "set_default_account",
+            ] {
+                let count = source.matches(&format!(r#""op": "{operation}""#)).count();
+                if count > 0 {
+                    matches.push((
+                        path.strip_prefix(api_dir)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        operation.to_string(),
+                        count,
+                    ));
+                }
+            }
+        }
+    }
+
+    let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
+    let mut matches = Vec::new();
+    collect_raw_dispatches(&api_dir, &api_dir, &mut matches);
+    matches.sort();
+    assert_eq!(
+        matches,
+        vec![("auth_gateway.rs".to_string(), "accounts".to_string(), 1)],
+        "raw Wallet account dispatch escaped wallet_recovery_keys_for_principal"
+    );
+
+    let recovery_bundle = std::fs::read_to_string(api_dir.join("auth_gateway.rs")).unwrap();
+    let raw_dispatch = recovery_bundle.find(r#""op": "accounts""#).unwrap();
+    let recovery_helper = recovery_bundle
+        .find("async fn wallet_recovery_keys_for_principal")
+        .unwrap();
+    assert_eq!(
+        recovery_bundle[..raw_dispatch].rfind("async fn "),
+        Some(recovery_helper)
+    );
+}
+
 #[tokio::test]
 async fn test_system_token_can_review_and_reject_wallet_approvals() {
     let dir = tempfile::tempdir().unwrap();
@@ -80,7 +147,10 @@ async fn test_system_can_create_managed_wallet_account() {
     let context = local_home_launch_token_context(dir.path()).unwrap();
     let token =
         issue_home_launch_token_with_context(dir.path(), SYSTEM_CAPSULE_ID, &context).unwrap();
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), SYSTEM_CAPSULE_ID, &token);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
 
     let response = app
         .oneshot(
@@ -129,6 +199,17 @@ async fn test_system_can_create_managed_wallet_account() {
         "bip122:000000000019d6689c085ae165831e93"
     );
     assert!(bitcoin["address"].as_str().unwrap().starts_with("bc1q"));
+    wallet_provider
+        .assert_v2_account_operations(
+            &wallet_read_authority,
+            &[
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::ListAccounts,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -137,7 +218,10 @@ async fn test_wallet_app_can_create_and_summarize_accounts() {
     let context = local_home_launch_token_context(dir.path()).unwrap();
     let token =
         issue_home_launch_token_with_context(dir.path(), WALLET_CAPSULE_ID, &context).unwrap();
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &token);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
 
     let created = app
         .clone()
@@ -208,6 +292,53 @@ async fn test_wallet_app_can_create_and_summarize_accounts() {
     assert!(accounts
         .iter()
         .any(|account| account["label"] == "Agent Budget"));
+    wallet_provider
+        .assert_v2_account_operations(
+            &wallet_read_authority,
+            &[
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::ListAccounts,
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::ListAccounts,
+                WalletOperationKind::ListAccounts,
+            ],
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn test_wallet_summary_preserves_unavailable_provider_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
+    let app = gateway_router(test_state(dir.path()));
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/wallet/wallet/summary")
+                .header("x-elastos-home-token", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let accounts = &payload["wallet_accounts"];
+    assert_eq!(accounts["available"], false);
+    assert_eq!(accounts["linked_count"], 0);
+    assert_eq!(accounts["accounts"], json!([]));
+    assert_eq!(accounts["default_accounts"], json!([]));
+    assert!(accounts["note"]
+        .as_str()
+        .unwrap()
+        .contains("wallet provider unavailable"));
 }
 
 #[tokio::test]
@@ -215,7 +346,10 @@ async fn test_wallet_transaction_default_also_drives_browser_connect_default() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &token);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
 
     let created = app
         .clone()
@@ -266,6 +400,18 @@ async fn test_wallet_transaction_default_also_drives_browser_connect_default() {
     assert!(defaults
         .iter()
         .any(|item| { item["account_id"] == account_id && item["intent"] == "browser_connect" }));
+    wallet_provider
+        .assert_v2_account_operations(
+            &wallet_read_authority,
+            &[
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::ListAccounts,
+                WalletOperationKind::SetDefaultAccount,
+                WalletOperationKind::SetDefaultAccount,
+                WalletOperationKind::ListAccounts,
+            ],
+        )
+        .await;
 }
 
 #[test]
@@ -287,7 +433,10 @@ async fn test_wallet_app_can_delete_managed_account() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &token);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
 
     let created = app
         .clone()
@@ -380,6 +529,18 @@ async fn test_wallet_app_can_delete_managed_account() {
         .unwrap();
     let summary_payload: serde_json::Value = serde_json::from_slice(&summary_body).unwrap();
     assert_eq!(summary_payload["wallet_accounts"]["linked_count"], 0);
+    wallet_provider
+        .assert_v2_account_operations(
+            &wallet_read_authority,
+            &[
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::ListAccounts,
+                WalletOperationKind::RevokeAccount,
+                WalletOperationKind::ListAccounts,
+                WalletOperationKind::ListAccounts,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -387,7 +548,10 @@ async fn test_wallet_app_can_rename_account() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &token);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
 
     let created = app
         .clone()
@@ -446,6 +610,17 @@ async fn test_wallet_app_can_rename_account() {
         .unwrap()
         .iter()
         .any(|account| account["label"] == "Spending"));
+    wallet_provider
+        .assert_v2_account_operations(
+            &wallet_read_authority,
+            &[
+                WalletOperationKind::CreateManagedAccount,
+                WalletOperationKind::ListAccounts,
+                WalletOperationKind::RenameAccount,
+                WalletOperationKind::ListAccounts,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -573,7 +748,10 @@ async fn test_wallet_recovery_key_import_requires_fresh_passkey_home_token() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let wallet_token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
-    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &wallet_token);
+    let (state, wallet_provider) = wallet_test_state_with_observer(dir.path()).await;
+    let app = gateway_router(state);
 
     let recovery_key = json!({
         "schema": "elastos.wallet.recovery-key/v1",
@@ -649,4 +827,7 @@ async fn test_wallet_recovery_key_import_requires_fresh_passkey_home_token() {
             account["label"] == "Recovered Base"
                 && account["signing_status"] == "managed_key_available"
         }));
+    wallet_provider
+        .assert_v2_account_reads(&wallet_read_authority, 1)
+        .await;
 }

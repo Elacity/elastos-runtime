@@ -1,5 +1,6 @@
 use axum::http::{HeaderMap, HeaderValue};
 use base64::Engine as _;
+use elastos_wallet_contract::VerifiedWalletInvocationContext;
 use rand::RngCore;
 
 use super::*;
@@ -95,8 +96,35 @@ struct HomeLaunchTokenEnvelope {
 
 #[derive(Debug)]
 struct RequiredHomeLaunchToken {
+    launch_id: String,
     launch_context: HomeLaunchContext,
     context: HomeLaunchTokenContext,
+}
+
+/// Runtime-owned Wallet authority produced only after launch-token validation.
+#[derive(Debug, Clone)]
+pub(in crate::api) struct RuntimeWalletAuthority {
+    context: VerifiedWalletInvocationContext,
+}
+
+impl RuntimeWalletAuthority {
+    pub(in crate::api) fn verified_context(&self) -> &VerifiedWalletInvocationContext {
+        &self.context
+    }
+
+    pub(in crate::api) fn home_launch_context(&self) -> HomeLaunchTokenContext {
+        HomeLaunchTokenContext {
+            principal_id: self.context.principal_id().to_string(),
+            session_id: self.context.session_id().to_string(),
+            proof_binding_id: self.context.proof_binding_id().map(ToString::to_string),
+            grant_id: self.context.grant_id().to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_verified_context(context: VerifiedWalletInvocationContext) -> Self {
+        Self { context }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -580,6 +608,45 @@ pub(crate) fn home_launch_token_header(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Project a verified launch-token v4 context into private Wallet Bus authority.
+pub(in crate::api) fn require_runtime_wallet_authority(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+    allowed_apps: &[&str],
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    let required = require_home_launch_token_for_any_from(data_dir, headers, allowed_apps, None)?;
+    runtime_wallet_authority(required)
+}
+
+pub(in crate::api) fn require_home_runtime_wallet_authority(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    let required = require_home_launch_token_for_any_from_with_origin(
+        data_dir,
+        headers,
+        &[HOME_CAPSULE_ID],
+        Some(HOME_SESSION_COOKIE),
+        HomeLaunchOriginPolicy::Browser,
+    )?;
+    runtime_wallet_authority(required)
+}
+
+fn runtime_wallet_authority(
+    required: RequiredHomeLaunchToken,
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    let context = VerifiedWalletInvocationContext::new(
+        required.context.principal_id,
+        required.context.session_id,
+        required.context.proof_binding_id,
+        required.context.grant_id,
+        required.launch_context.executable_actor,
+        required.launch_id,
+    )
+    .map_err(|err| anyhow::anyhow!("invalid verified Wallet authority: {err}"))?;
+    Ok(RuntimeWalletAuthority { context })
+}
+
 fn require_home_launch_token_for_any_from(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
@@ -717,6 +784,7 @@ fn require_home_launch_token_for_any_from_expected_did(
         }
     }
     Ok(RequiredHomeLaunchToken {
+        launch_id: envelope.payload.launch_id,
         launch_context: envelope.payload.launch_context,
         context: HomeLaunchTokenContext {
             principal_id: envelope.payload.principal_id,

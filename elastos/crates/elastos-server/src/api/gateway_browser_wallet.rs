@@ -57,9 +57,9 @@ pub(in crate::api::gateway) async fn browser_app_wallet_bridge(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => {
                 return browser_wallet_cors_response(
                     &headers,
@@ -67,10 +67,12 @@ pub(in crate::api::gateway) async fn browser_app_wallet_bridge(
                 );
             }
         };
+    let context = authority.home_launch_context();
     let response = Json(
         browser_wallet_bridge_payload(
             &state,
             &context,
+            &authority,
             home_launch_token_header(&headers).as_deref(),
             browser_request_origin(&headers).as_deref(),
         )
@@ -148,9 +150,9 @@ pub(in crate::api::gateway) async fn browser_app_wallet_request_signature(
     headers: HeaderMap,
     Json(input): Json<BrowserWalletSignatureRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => {
                 return browser_wallet_cors_response(
                     &headers,
@@ -158,10 +160,12 @@ pub(in crate::api::gateway) async fn browser_app_wallet_request_signature(
                 );
             }
         };
-    let response = match create_browser_wallet_signature_request(&state, &context, input).await {
-        Ok(payload) => Json(payload).into_response(),
-        Err((status, message)) => (status, message).into_response(),
-    };
+    let context = authority.home_launch_context();
+    let response =
+        match create_browser_wallet_signature_request(&state, &context, &authority, input).await {
+            Ok(payload) => Json(payload).into_response(),
+            Err((status, message)) => (status, message).into_response(),
+        };
     browser_wallet_cors_response(&headers, response)
 }
 
@@ -170,9 +174,9 @@ pub(in crate::api::gateway) async fn browser_app_wallet_request_transaction(
     headers: HeaderMap,
     Json(input): Json<BrowserWalletTransactionRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => {
                 return browser_wallet_cors_response(
                     &headers,
@@ -180,7 +184,12 @@ pub(in crate::api::gateway) async fn browser_app_wallet_request_transaction(
                 );
             }
         };
-    let response = match create_browser_wallet_transaction_request(&state, &context, input).await {
+    let context = authority.home_launch_context();
+    let response = match create_browser_wallet_transaction_request(
+        &state, &context, &authority, input,
+    )
+    .await
+    {
         Ok(payload) => Json(payload).into_response(),
         Err((status, message)) => (status, message).into_response(),
     };
@@ -192,9 +201,9 @@ pub(in crate::api::gateway) async fn browser_app_wallet_read(
     headers: HeaderMap,
     Json(input): Json<BrowserWalletReadRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => {
                 return browser_wallet_cors_response(
                     &headers,
@@ -202,7 +211,8 @@ pub(in crate::api::gateway) async fn browser_app_wallet_read(
                 );
             }
         };
-    let response = match browser_wallet_read(&state, &context, input).await {
+    let context = authority.home_launch_context();
+    let response = match browser_wallet_read(&state, &context, &authority, input).await {
         Ok(payload) => Json(payload).into_response(),
         Err((status, message)) => (status, message).into_response(),
     };
@@ -214,9 +224,9 @@ pub(in crate::api::gateway) async fn browser_app_wallet_broadcast_transaction(
     headers: HeaderMap,
     Json(input): Json<BrowserWalletBroadcastRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => {
                 return browser_wallet_cors_response(
                     &headers,
@@ -224,6 +234,7 @@ pub(in crate::api::gateway) async fn browser_app_wallet_broadcast_transaction(
                 );
             }
         };
+    let context = authority.home_launch_context();
     if !is_safe_runtime_id(&input.request_id) {
         return browser_wallet_cors_response(
             &headers,
@@ -235,7 +246,9 @@ pub(in crate::api::gateway) async fn browser_app_wallet_broadcast_transaction(
         );
     }
     let response =
-        match browser_wallet_broadcast_transaction(&state, &context, &input.request_id).await {
+        match browser_wallet_broadcast_transaction(&state, &context, &authority, &input.request_id)
+            .await
+        {
             Ok(payload) => Json(payload).into_response(),
             Err((status, message)) => (status, message).into_response(),
         };
@@ -247,9 +260,9 @@ pub(in crate::api::gateway) async fn browser_app_wallet_approval_status(
     headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => {
                 return browser_wallet_cors_response(
                     &headers,
@@ -267,7 +280,7 @@ pub(in crate::api::gateway) async fn browser_app_wallet_approval_status(
                 .into_response(),
         );
     }
-    let response = match browser_wallet_approval_status(&state, &context, &request_id).await {
+    let response = match browser_wallet_approval_status(&state, &authority, &request_id).await {
         Ok(payload) => Json(payload).into_response(),
         Err((status, message)) => (status, message).into_response(),
     };
@@ -277,6 +290,7 @@ pub(in crate::api::gateway) async fn browser_app_wallet_approval_status(
 async fn create_browser_wallet_transaction_request(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     input: BrowserWalletTransactionRequest,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let account_id = input.account_id.clone();
@@ -348,7 +362,7 @@ async fn create_browser_wallet_transaction_request(
             "Browser transaction approvals require a supported eip155 chain".to_string(),
         ));
     };
-    let accounts = system_wallet_accounts_summary(state, &context.principal_id).await;
+    let accounts = system_wallet_accounts_summary(state, authority).await;
     let Some(account) = accounts.accounts.iter().find(|account| {
         account.account_id == account_id
             && account.chain_namespace.starts_with("eip155:")
@@ -415,32 +429,21 @@ async fn create_browser_wallet_transaction_request(
             serde_json::json!(context.session_id.clone()),
         );
     }
-    let wallet_sign_resource = format!(
-        "elastos://wallet/{}/sign/transaction_intent",
-        chain_namespace
-    );
-    let wallet_call = browser_provider_resource_call(
-        "wallet",
-        "request_signature",
-        wallet_sign_resource,
-        serde_json::json!({
-            "principal_id": context.principal_id,
-            "account_id": account.account_id.clone(),
-            "chain_namespace": chain_namespace,
-            "intent": "transaction_intent",
-            "capsule_id": BROWSER_CAPSULE_ID,
-            "resource": chain_broadcast_resource,
-            "reason": format!("Browser page requests {method} on {network}"),
-            "payload": intent
-        }),
-    )?;
-    let response = browser_provider_resource_response(state, wallet_call).await?;
-    let data = provider_response_data(&response).ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "wallet-provider returned an invalid approval response".to_string(),
-        )
-    })?;
+    let data = runtime_wallet_data(
+        state,
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RequestApproval {
+            account_id: account.account_id.clone(),
+            chain_namespace,
+            intent: "transaction_intent".to_string(),
+            resource: chain_broadcast_resource,
+            reason: format!("Browser page requests {method} on {network}"),
+            payload: intent,
+            expires_at: now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
+        },
+    )
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
     Ok(serde_json::json!({
         "schema": "elastos.browser.wallet-approval-result/v1",
         "requires_approval": true,
@@ -543,6 +546,7 @@ fn provider_response_data_or_bad_request(
 async fn create_browser_wallet_signature_request(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     input: BrowserWalletSignatureRequest,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let account_id = input.account_id.clone();
@@ -631,7 +635,7 @@ async fn create_browser_wallet_signature_request(
             "invalid browser page URL".to_string(),
         ));
     }
-    let accounts = system_wallet_accounts_summary(state, &context.principal_id).await;
+    let accounts = system_wallet_accounts_summary(state, authority).await;
     let Some(account) = accounts.accounts.iter().find(|account| {
         account.account_id == account_id
             && account.chain_namespace.starts_with("eip155:")
@@ -671,28 +675,21 @@ async fn create_browser_wallet_signature_request(
     if let Some(canonical) = typed_data_canonical {
         payload["typed_data_canonical"] = serde_json::Value::String(canonical);
     }
-    let response = auth_gateway::wallet_provider_data(
+    let data = runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "request_signature",
-            "principal_id": context.principal_id,
-            "account_id": account_id,
-            "chain_namespace": chain_namespace,
-            "intent": intent,
-            "capsule_id": BROWSER_CAPSULE_ID,
-            "resource": format!("elastos://wallet/{}/sign/{resource_action}", chain_namespace),
-            "reason": reason,
-            "payload": payload
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RequestApproval {
+            account_id,
+            chain_namespace: chain_namespace.clone(),
+            intent: intent.to_string(),
+            resource: format!("elastos://wallet/{chain_namespace}/sign/{resource_action}"),
+            reason,
+            payload,
+            expires_at: now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
+        },
     )
     .await
     .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
-    let data = provider_response_data(&response).ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "wallet-provider returned an invalid approval response".to_string(),
-        )
-    })?;
     Ok(serde_json::json!({
         "schema": "elastos.browser.wallet-approval-result/v1",
         "requires_approval": true,
@@ -766,16 +763,15 @@ fn browser_typed_data_signature_parts(
 
 async fn browser_wallet_approval_status(
     state: &GatewayState,
-    context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let response = auth_gateway::wallet_provider_data(
+    let response = runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "approval_requests",
-            "principal_id": context.principal_id,
-            "include_resolved": true,
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ListApprovals {
+            include_resolved: true,
+        },
     )
     .await
     .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
@@ -1033,9 +1029,10 @@ async fn record_browser_transaction_hash(
 async fn browser_wallet_broadcast_transaction(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let status = browser_wallet_approval_status(state, context, request_id).await?;
+    let status = browser_wallet_approval_status(state, authority, request_id).await?;
     if status.get("status").and_then(|value| value.as_str()) != Some("completed") {
         return Err((
             StatusCode::BAD_REQUEST,

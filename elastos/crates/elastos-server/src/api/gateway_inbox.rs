@@ -4,11 +4,12 @@ pub(super) async fn inbox_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, INBOX_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[INBOX_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return inbox_error_response(err),
         };
+    let context = authority.home_launch_context();
 
     let data_dir = state.data_dir.clone();
     let sync_context = context.clone();
@@ -20,8 +21,7 @@ pub(super) async fn inbox_summary(
     let home_state = home_state(&state.data_dir);
     let mut notifications = home_state.notifications;
     append_home_service_access_notifications(&state.data_dir, &context, &mut notifications);
-    let wallet_approvals =
-        system_wallet_approvals_summary(&state, &context.principal_id, false).await;
+    let wallet_approvals = system_wallet_approvals_summary(&state, &authority, false).await;
     append_wallet_approval_notifications(&mut notifications, wallet_approvals.approval_requests);
     if let Ok(capability_requests) = runtime_capability_pending_requests(&state.data_dir).await {
         append_runtime_capability_notifications(&mut notifications, capability_requests);
@@ -153,17 +153,18 @@ pub(super) async fn inbox_action(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, INBOX_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[INBOX_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return inbox_error_response(err),
         };
+    let context = authority.home_launch_context();
 
     let action = match parse_inbox_action_request(&headers, &body).map_err(anyhow::Error::msg) {
         Ok(req) => req,
         Err(err) => return inbox_error_response(err),
     };
-    match dispatch_inbox_action(&state, &context, &action).await {
+    match dispatch_inbox_action(&state, &context, &authority, &action).await {
         Ok(message) => {
             let result = inspect_action_request_id_from_action(&action.action_id)
                 .map(|request_id| inspect_action_result_receipt(&state.data_dir, request_id))
@@ -210,6 +211,7 @@ fn parse_inbox_action_request(
 async fn dispatch_inbox_action(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     action: &InboxActionRequest,
 ) -> anyhow::Result<String> {
     let action_id = action.action_id.as_str();
@@ -276,8 +278,8 @@ async fn dispatch_inbox_action(
         let outcome = approve_managed_wallet_request(
             state,
             data_dir,
-            &context.principal_id,
-            &context.session_id,
+            context,
+            authority,
             request_id,
             "Approved in Inbox",
             INBOX_CAPSULE_ID,
@@ -287,14 +289,13 @@ async fn dispatch_inbox_action(
         return Ok(outcome.message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-reject-request:") {
-        crate::api::auth_gateway::wallet_provider_data(
+        runtime_wallet_data(
             state,
-            serde_json::json!({
-                "op": "reject_approval",
-                "principal_id": context.principal_id.clone(),
-                "request_id": request_id,
-                "reason": "Rejected in Inbox",
-            }),
+            authority,
+            elastos_wallet_contract::WalletProviderOperationV2::RejectApproval {
+                request_id: request_id.to_string(),
+                reason: "Rejected in Inbox".to_string(),
+            },
         )
         .await?;
         append_wallet_approval_audit(

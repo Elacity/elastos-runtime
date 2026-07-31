@@ -187,15 +187,16 @@ pub(super) async fn browser_app_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return system_error_response(err),
         };
+    let context = authority.home_launch_context();
     let engine_adapter =
         browser_engine_summary(state.provider_registry.as_ref(), &context.principal_id).await;
     let net = browser_net_summary(state.provider_registry.as_ref(), &context.principal_id).await;
-    let wallet_accounts = system_wallet_accounts_summary(&state, &context.principal_id).await;
+    let wallet_accounts = system_wallet_accounts_summary(&state, &authority).await;
     let wallet_status = if wallet_accounts.linked_count > 0 {
         "configured"
     } else {
@@ -313,11 +314,12 @@ pub(super) async fn browser_app_open(
     headers: HeaderMap,
     Json(input): Json<BrowserOpenRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
     let home_token = home_launch_token_header(&headers);
     let request_origin = browser_request_origin(&headers);
     if input.async_open {
@@ -325,8 +327,15 @@ pub(super) async fn browser_app_open(
         let open_id = job.id.clone();
         let state_for_task = state.clone();
         tokio::spawn(async move {
-            match execute_browser_open(&state_for_task, context, input, home_token, request_origin)
-                .await
+            match execute_browser_open(
+                &state_for_task,
+                context,
+                authority,
+                input,
+                home_token,
+                request_origin,
+            )
+            .await
             {
                 Ok(result) => complete_browser_open_job(&job, result).await,
                 Err(error) => fail_browser_open_job(&job, error.status_value()).await,
@@ -343,7 +352,16 @@ pub(super) async fn browser_app_open(
         )
             .into_response();
     }
-    match execute_browser_open(&state, context, input, home_token, request_origin).await {
+    match execute_browser_open(
+        &state,
+        context,
+        authority,
+        input,
+        home_token,
+        request_origin,
+    )
+    .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(error) => error.into_response(),
     }
@@ -395,6 +413,7 @@ fn browser_open_status_value(open_id: &str, snapshot: BrowserOpenJobSnapshot) ->
 async fn execute_browser_open(
     state: &GatewayState,
     context: HomeLaunchTokenContext,
+    authority: RuntimeWalletAuthority,
     input: BrowserOpenRequest,
     home_token: Option<String>,
     request_origin: Option<String>,
@@ -534,6 +553,7 @@ async fn execute_browser_open(
     let wallet = browser_wallet_bridge_payload(
         state,
         &context,
+        &authority,
         home_token.as_deref(),
         request_origin.as_deref(),
     )

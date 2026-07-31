@@ -114,10 +114,11 @@ pub(super) fn browser_wallet_account_is_signable_evm(account: &SystemWalletAccou
 pub(in crate::api::gateway) async fn browser_wallet_bridge_payload(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     launch_token: Option<&str>,
     approval_origin: Option<&str>,
 ) -> serde_json::Value {
-    let summary = system_wallet_accounts_summary(state, &context.principal_id).await;
+    let summary = system_wallet_accounts_summary(state, authority).await;
     let browser_accounts = browser_projected_evm_accounts(&summary);
     let browser_summary = SystemWalletAccountsSummary {
         accounts: browser_accounts,

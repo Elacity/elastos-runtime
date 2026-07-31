@@ -17,7 +17,7 @@ pub(super) struct LinkedAccount {
     pub(super) revoked_at: Option<u64>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct WalletStore {
     #[serde(default)]
     pub(super) accounts: Vec<LinkedAccount>,
@@ -31,6 +31,17 @@ pub(super) struct WalletStore {
     pub(super) approval_requests: Vec<WalletApprovalRequest>,
     #[serde(default)]
     pub(super) default_accounts: Vec<DefaultWalletAccount>,
+    #[serde(default)]
+    pub(super) consumed_lifecycles: Vec<ConsumedWalletLifecycle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct ConsumedWalletLifecycle {
+    pub(super) lifecycle_id: String,
+    pub(super) request_sha256: String,
+    #[serde(default)]
+    pub(super) request_expires_at: u64,
+    pub(super) consumed_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,7 +146,12 @@ pub(super) struct WalletApprovalRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) connector_id: Option<String>,
     pub(super) intent: String,
-    pub(super) capsule_id: String,
+    #[serde(default)]
+    pub(super) session_id: String,
+    #[serde(default)]
+    pub(super) launch_id: String,
+    #[serde(alias = "capsule_id")]
+    pub(super) requested_by_actor: String,
     pub(super) resource: String,
     pub(super) reason: String,
     pub(super) payload: Value,
