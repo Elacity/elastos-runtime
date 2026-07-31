@@ -3713,17 +3713,9 @@ fn completed_browser_transaction_approval(
     reason: &str,
 ) -> serde_json::Value {
     let context = authority.verified_context();
-    let payload = json!({
-        "schema": "elastos.chain.unsigned_transaction_intent/v1",
-        "network": { "id": "esc-mainnet" },
-        "from": "0x1111111111111111111111111111111111111111",
-        "to": "0x2222222222222222222222222222222222222222",
-        "value": "0x1",
-        "data": "0x",
-        "wallet_intent": "transaction_intent"
-    });
+    let payload = completed_browser_transaction_payload(request_id);
     let operation = WalletProviderOperationV2::RequestApproval {
-        account_id: "wallet:eip155:20:0x1111111111111111111111111111111111111111".to_string(),
+        account_id: format!("wallet:eip155:20:{MOCK_MANAGED_EVM_ADDRESS}"),
         chain_namespace: "eip155:20".to_string(),
         intent: "transaction_intent".to_string(),
         resource: "elastos://chain/esc-mainnet/broadcast_transaction".to_string(),
@@ -3746,10 +3738,10 @@ fn completed_browser_transaction_approval(
         "requested_by_actor": BROWSER_CAPSULE_ID,
         "resource": "elastos://chain/esc-mainnet/broadcast_transaction",
         "reason": reason,
-        "account_id": "wallet:eip155:20:0x1111111111111111111111111111111111111111",
+        "account_id": format!("wallet:eip155:20:{MOCK_MANAGED_EVM_ADDRESS}"),
         "chain_namespace": "eip155:20",
-        "address": "0x1111111111111111111111111111111111111111",
-        "proof_binding_id": "proof:wallet:managed:eip155:20:0x1111111111111111111111111111111111111111",
+        "address": MOCK_MANAGED_EVM_ADDRESS,
+        "proof_binding_id": format!("proof:wallet:managed:eip155:20:{MOCK_MANAGED_EVM_ADDRESS}"),
         "proof_type": "managed_evm",
         "payload_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "principal_id": context.principal_id(),
@@ -3765,11 +3757,41 @@ fn completed_browser_transaction_approval(
             "method": "eth_sendTransaction",
             "signed_transaction": signed_transaction,
             "transaction_hash": transaction_hash,
-            "signer": "0x1111111111111111111111111111111111111111",
+            "signer": MOCK_MANAGED_EVM_ADDRESS,
             "payload_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "chain_namespace": "eip155:20"
         }
     })
+}
+
+fn completed_browser_transaction_payload(request_id: &str) -> Value {
+    let digest = Sha256::digest(request_id.as_bytes());
+    let mut nonce = [0u8; 8];
+    nonce.copy_from_slice(&digest[..8]);
+    let nonce = u64::from_be_bytes(nonce).max(1);
+    json!({
+        "schema": "elastos.chain.unsigned_transaction_intent/v1",
+        "transaction_type": "eip155_legacy",
+        "network": { "id": "esc-mainnet", "chain_id": 20 },
+        "from": MOCK_MANAGED_EVM_ADDRESS,
+        "to": "0x2222222222222222222222222222222222222222",
+        "value": "0x1",
+        "data": "0x",
+        "chain_id": 20,
+        "nonce": format!("0x{nonce:x}"),
+        "gas_price": "0x3b9aca00",
+        "gas_limit": "0x5208",
+        "requires_wallet_approval": true,
+        "wallet_intent": "transaction_intent"
+    })
+}
+
+fn completed_browser_signed_transaction(request_id: &str) -> String {
+    mock_sign_eip155_transaction(&completed_browser_transaction_payload(request_id)).unwrap()
+}
+
+fn completed_browser_transaction_hash(signed_transaction: &str) -> String {
+    signed_evm_transaction_hash_for_test(signed_transaction)
 }
 
 #[tokio::test]
@@ -3780,6 +3802,8 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let signed_transaction = completed_browser_signed_transaction(request_id);
+    let transaction_hash = completed_browser_transaction_hash(&signed_transaction);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -3787,8 +3811,8 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
         approvals: TokioMutex::new(vec![completed_browser_transaction_approval(
             &browser_wallet_authority,
             request_id,
-            "0x02f8",
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &signed_transaction,
+            &transaction_hash,
             "Browser page requests eth_sendTransaction on esc-mainnet",
         )]),
         defaults: TokioMutex::default(),
@@ -3813,7 +3837,10 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
         .unwrap();
     let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
     assert_eq!(status_json["status"], "completed");
-    assert_eq!(status_json["signed_transaction"], "0x02f8");
+    assert_eq!(
+        status_json["signed_transaction"],
+        signed_transaction.as_str()
+    );
     assert!(status_json["transaction_hash"].is_null());
 
     let broadcast_response = app
@@ -3840,10 +3867,7 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
         payload["schema"],
         "elastos.browser.transaction-broadcast/v1"
     );
-    assert_eq!(
-        payload["transaction_hash"],
-        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    );
+    assert_eq!(payload["transaction_hash"], transaction_hash.as_str());
     assert_eq!(payload["recorded"], true);
 
     let recorded_status = app
@@ -3862,10 +3886,7 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
         .await
         .unwrap();
     let recorded_json: serde_json::Value = serde_json::from_slice(&recorded_body).unwrap();
-    assert_eq!(
-        recorded_json["transaction_hash"],
-        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    );
+    assert_eq!(recorded_json["transaction_hash"], transaction_hash.as_str());
 
     let second_broadcast_response = app
         .oneshot(
@@ -3888,7 +3909,7 @@ async fn test_browser_completed_transaction_approval_broadcasts_through_chain_pr
     let second_payload: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
     assert_eq!(
         second_payload["transaction_hash"],
-        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        transaction_hash.as_str()
     );
     assert_eq!(second_payload["already_recorded"], true);
 }
@@ -3901,8 +3922,9 @@ async fn test_browser_transaction_broadcast_record_failure_does_not_rebroadcast_
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:cccccccccccccccccccccccccccccccc";
-    let signed_transaction = "0xdeadbeef0017";
-    reset_mock_chain_broadcast_count(signed_transaction);
+    let signed_transaction = completed_browser_signed_transaction(request_id);
+    let transaction_hash = completed_browser_transaction_hash(&signed_transaction);
+    reset_mock_chain_broadcast_count(&signed_transaction);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -3910,8 +3932,8 @@ async fn test_browser_transaction_broadcast_record_failure_does_not_rebroadcast_
         approvals: TokioMutex::new(vec![completed_browser_transaction_approval(
             &browser_wallet_authority,
             request_id,
-            signed_transaction,
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &signed_transaction,
+            &transaction_hash,
             "Browser page requests eth_sendTransaction on esc-mainnet; record-fails",
         )]),
         defaults: TokioMutex::default(),
@@ -3943,7 +3965,7 @@ async fn test_browser_transaction_broadcast_record_failure_does_not_rebroadcast_
     assert!(first_json["completion_error"]
         .as_str()
         .is_some_and(|message| message.contains("projection")));
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 1);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
 
     let retry_response = app
         .oneshot(
@@ -3965,7 +3987,7 @@ async fn test_browser_transaction_broadcast_record_failure_does_not_rebroadcast_
         .unwrap();
     let retry_json: serde_json::Value = serde_json::from_slice(&retry_body).unwrap();
     assert_eq!(retry_json["completion_status"], "complete");
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 1);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
 }
 
 #[tokio::test]
@@ -3976,9 +3998,10 @@ async fn test_browser_uncertain_broadcast_reconciles_by_wallet_hash_without_rebr
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:11111111111111111111111111111111";
-    let signed_transaction = "0xfeedface0001";
-    let transaction_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    reset_mock_chain_broadcast_count(signed_transaction);
+    let signed_transaction = completed_browser_signed_transaction(request_id);
+    let transaction_hash = completed_browser_transaction_hash(&signed_transaction);
+    reset_mock_chain_broadcast_count(&signed_transaction);
+    mark_mock_chain_broadcast_uncertain(&signed_transaction, true);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -3986,8 +4009,8 @@ async fn test_browser_uncertain_broadcast_reconciles_by_wallet_hash_without_rebr
         approvals: TokioMutex::new(vec![completed_browser_transaction_approval(
             &browser_wallet_authority,
             request_id,
-            signed_transaction,
-            transaction_hash,
+            &signed_transaction,
+            &transaction_hash,
             "Browser uncertain broadcast recovery",
         )]),
         defaults: TokioMutex::default(),
@@ -4009,7 +4032,7 @@ async fn test_browser_uncertain_broadcast_reconciles_by_wallet_hash_without_rebr
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 1);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
     let effect_store = transaction_effect_store_for_test(
         &state,
         browser_wallet_authority.verified_context().principal_id(),
@@ -4037,9 +4060,9 @@ async fn test_browser_uncertain_broadcast_reconciles_by_wallet_hash_without_rebr
         .await
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(payload["transaction_hash"], transaction_hash);
+    assert_eq!(payload["transaction_hash"], transaction_hash.as_str());
     assert_eq!(payload["completion_status"], "complete");
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 1);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
 }
 
 #[tokio::test]
@@ -4050,14 +4073,14 @@ async fn test_browser_chain_provider_unavailable_recovers_after_restart_without_
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:55555555555555555555555555555555";
-    let signed_transaction = "0xdecafbad0003";
-    let transaction_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    reset_mock_chain_broadcast_count(signed_transaction);
+    let signed_transaction = completed_browser_signed_transaction(request_id);
+    let transaction_hash = completed_browser_transaction_hash(&signed_transaction);
+    reset_mock_chain_broadcast_count(&signed_transaction);
     let approval = completed_browser_transaction_approval(
         &browser_wallet_authority,
         request_id,
-        signed_transaction,
-        transaction_hash,
+        &signed_transaction,
+        &transaction_hash,
         "Browser provider-unavailable recovery",
     );
     let unavailable_provider = MockWalletProvider {
@@ -4087,7 +4110,7 @@ async fn test_browser_chain_provider_unavailable_recovers_after_restart_without_
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&first_body).contains("chain provider unavailable"));
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 0);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
 
     let restarted_provider = MockWalletProvider {
         challenges: TokioMutex::default(),
@@ -4116,9 +4139,12 @@ async fn test_browser_chain_provider_unavailable_recovers_after_restart_without_
         .await
         .unwrap();
     let recovered_json: serde_json::Value = serde_json::from_slice(&recovered_body).unwrap();
-    assert_eq!(recovered_json["transaction_hash"], transaction_hash);
+    assert_eq!(
+        recovered_json["transaction_hash"],
+        transaction_hash.as_str()
+    );
     assert_eq!(recovered_json["completion_status"], "complete");
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 0);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
 }
 
 #[tokio::test]
@@ -4129,13 +4155,14 @@ async fn test_browser_stale_wallet_operation_binding_is_rejected_before_broadcas
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:66666666666666666666666666666666";
-    let signed_transaction = "0xdecafbad0004";
-    reset_mock_chain_broadcast_count(signed_transaction);
+    let signed_transaction = completed_browser_signed_transaction(request_id);
+    let transaction_hash = completed_browser_transaction_hash(&signed_transaction);
+    reset_mock_chain_broadcast_count(&signed_transaction);
     let mut approval = completed_browser_transaction_approval(
         &browser_wallet_authority,
         request_id,
-        signed_transaction,
-        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &signed_transaction,
+        &transaction_hash,
         "Browser stale operation binding",
     );
     approval["wallet_request_sha256"] = json!(format!("request:sha256:{}", "d".repeat(64)));
@@ -4166,7 +4193,7 @@ async fn test_browser_stale_wallet_operation_binding_is_rejected_before_broadcas
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("stale or substituted"));
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 0);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
 }
 
 #[tokio::test]
@@ -4177,9 +4204,10 @@ async fn test_browser_indeterminate_broadcast_never_rebroadcasts_without_chain_e
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:22222222222222222222222222222222";
-    let signed_transaction = "0xfeedface0002";
-    let transaction_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    reset_mock_chain_broadcast_count(signed_transaction);
+    let signed_transaction = completed_browser_signed_transaction(request_id);
+    let transaction_hash = completed_browser_transaction_hash(&signed_transaction);
+    reset_mock_chain_broadcast_count(&signed_transaction);
+    mark_mock_chain_broadcast_uncertain(&signed_transaction, false);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -4187,8 +4215,8 @@ async fn test_browser_indeterminate_broadcast_never_rebroadcasts_without_chain_e
         approvals: TokioMutex::new(vec![completed_browser_transaction_approval(
             &browser_wallet_authority,
             request_id,
-            signed_transaction,
-            transaction_hash,
+            &signed_transaction,
+            &transaction_hash,
             "Browser indeterminate broadcast",
         )]),
         defaults: TokioMutex::default(),
@@ -4217,21 +4245,21 @@ async fn test_browser_indeterminate_broadcast_never_rebroadcasts_without_chain_e
                 .unwrap();
             assert!(String::from_utf8_lossy(&body).contains("will not rebroadcast"));
         }
-        assert_eq!(mock_chain_broadcast_count(signed_transaction), 1);
+        assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
     }
 }
 
 #[tokio::test]
-async fn test_browser_chain_receipt_hash_mismatch_fails_closed() {
+async fn test_browser_wallet_hash_mismatch_fails_before_chain_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:33333333333333333333333333333333";
-    let signed_transaction = "0xdecafbad0001";
+    let signed_transaction = completed_browser_signed_transaction(request_id);
     let wallet_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    reset_mock_chain_broadcast_count(signed_transaction);
+    reset_mock_chain_broadcast_count(&signed_transaction);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -4239,7 +4267,7 @@ async fn test_browser_chain_receipt_hash_mismatch_fails_closed() {
         approvals: TokioMutex::new(vec![completed_browser_transaction_approval(
             &browser_wallet_authority,
             request_id,
-            signed_transaction,
+            &signed_transaction,
             wallet_hash,
             "Browser receipt mismatch",
         )]),
@@ -4264,8 +4292,8 @@ async fn test_browser_chain_receipt_hash_mismatch_fails_closed() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("Wallet-computed hash"));
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 1);
+    assert!(String::from_utf8_lossy(&body).contains("exact signed transaction"));
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
 }
 
 #[tokio::test]
@@ -4276,9 +4304,9 @@ async fn test_browser_audit_failure_is_pending_and_retry_does_not_rebroadcast() 
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:44444444444444444444444444444444";
-    let signed_transaction = "0xdecafbad0002";
-    let transaction_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    reset_mock_chain_broadcast_count(signed_transaction);
+    let signed_transaction = completed_browser_signed_transaction(request_id);
+    let transaction_hash = completed_browser_transaction_hash(&signed_transaction);
+    reset_mock_chain_broadcast_count(&signed_transaction);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -4286,8 +4314,8 @@ async fn test_browser_audit_failure_is_pending_and_retry_does_not_rebroadcast() 
         approvals: TokioMutex::new(vec![completed_browser_transaction_approval(
             &browser_wallet_authority,
             request_id,
-            signed_transaction,
-            transaction_hash,
+            &signed_transaction,
+            &transaction_hash,
             "Browser audit-fails once",
         )]),
         defaults: TokioMutex::default(),
@@ -4320,7 +4348,7 @@ async fn test_browser_audit_failure_is_pending_and_retry_does_not_rebroadcast() 
                 .as_str()
                 .is_some_and(|message| message.contains("audit")));
         }
-        assert_eq!(mock_chain_broadcast_count(signed_transaction), 1);
+        assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
     }
 }
 
@@ -4418,9 +4446,9 @@ async fn test_browser_requested_audit_failure_prevents_managed_chain_dispatch() 
     let browser_wallet_authority =
         runtime_wallet_authority_for_app_token(dir.path(), BROWSER_CAPSULE_ID, &browser_token);
     let request_id = "wallet-request:88888888888888888888888888888888";
-    let signed_transaction = "0xdecafbad0011";
-    let transaction_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    reset_mock_chain_broadcast_count(signed_transaction);
+    let signed_transaction = completed_browser_signed_transaction(request_id);
+    let transaction_hash = completed_browser_transaction_hash(&signed_transaction);
+    reset_mock_chain_broadcast_count(&signed_transaction);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -4428,8 +4456,8 @@ async fn test_browser_requested_audit_failure_prevents_managed_chain_dispatch() 
         approvals: TokioMutex::new(vec![completed_browser_transaction_approval(
             &browser_wallet_authority,
             request_id,
-            signed_transaction,
-            transaction_hash,
+            &signed_transaction,
+            &transaction_hash,
             "Browser requested-audit-fails",
         )]),
         defaults: TokioMutex::default(),
@@ -4455,7 +4483,7 @@ async fn test_browser_requested_audit_failure_prevents_managed_chain_dispatch() 
         .unwrap();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(String::from_utf8_lossy(&body).contains("requested audit"));
-    assert_eq!(mock_chain_broadcast_count(signed_transaction), 0);
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
 }
 
 #[tokio::test]

@@ -44,6 +44,20 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
     assert_eq!(account["signing_available"], true);
     assert_eq!(account["signing_status"], "managed_key_available");
     let account_id = account["account_id"].as_str().unwrap().to_string();
+    let account_address = account["address"].as_str().unwrap();
+    let expected_signed_transaction = mock_sign_eip155_transaction(&json!({
+        "from": account_address,
+        "to": "0x2222222222222222222222222222222222222222",
+        "value": "0x1",
+        "data": "0x",
+        "chain_id": 20,
+        "nonce": "0x1",
+        "gas_price": "0x3b9aca00",
+        "gas_limit": "0x5208"
+    }))
+    .unwrap();
+    let expected_transaction_hash =
+        signed_evm_transaction_hash_for_test(&expected_signed_transaction);
     let send_intent = json!({
         "account_id": account_id,
         "chain_namespace": "eip155:20",
@@ -61,7 +75,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
         r#"{{"account_id":"{account_id}","chain_namespace":"eip155:20","to":"0x2222222222222222222222222222222222222222","amount":"0.000000000000000001","step_up_token":"{}"}}"#,
         send_token
     );
-    reset_mock_chain_broadcast_count("0x1234");
+    reset_mock_chain_broadcast_count(&expected_signed_transaction);
 
     let sent = app
         .clone()
@@ -88,10 +102,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
     );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["schema"], "elastos.wallet.send-transaction-result/v1");
-    assert_eq!(
-        json["transaction_hash"],
-        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    );
+    assert_eq!(json["transaction_hash"], expected_transaction_hash.as_str());
     assert_eq!(
         json["signed_result"]["schema"],
         "elastos.wallet.signed-transaction-result/v1"
@@ -100,7 +111,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
         json["receipt"]["schema"],
         "elastos.chain.broadcast_receipt/v1"
     );
-    assert_eq!(mock_chain_broadcast_count("0x1234"), 1);
+    assert_eq!(mock_chain_broadcast_count(&expected_signed_transaction), 1);
     let effect_store = transaction_effect_store_for_test(
         &state,
         wallet_read_authority.verified_context().principal_id(),
@@ -164,7 +175,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
     assert_eq!(replay_json["request_id"], json["request_id"]);
     assert_eq!(replay_json["transaction_hash"], json["transaction_hash"]);
     assert_eq!(replay_json["completion_status"], "complete");
-    assert_eq!(mock_chain_broadcast_count("0x1234"), 1);
+    assert_eq!(mock_chain_broadcast_count(&expected_signed_transaction), 1);
 
     let summary = app
         .oneshot(
@@ -188,8 +199,7 @@ async fn test_wallet_send_signs_and_broadcasts_managed_evm_transaction() {
         request["status"] == "completed"
             && request["capsule_id"] == WALLET_CAPSULE_ID
             && request["intent"] == "transaction_intent"
-            && request["transaction_hash"]
-                == "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            && request["transaction_hash"] == expected_transaction_hash.as_str()
             && request["completed_at"].as_u64().is_some()
     }));
     assert_eq!(summary_json["wallet_approvals"]["pending_count"], 0);

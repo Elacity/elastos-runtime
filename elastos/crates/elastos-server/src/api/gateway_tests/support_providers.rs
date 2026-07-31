@@ -1,5 +1,98 @@
 struct MockChainProvider;
 
+const MOCK_MANAGED_EVM_ADDRESS: &str = "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a";
+
+fn mock_trim_integer_bytes(bytes: &[u8]) -> &[u8] {
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    &bytes[first..]
+}
+
+fn mock_managed_evm_signing_key(index: usize) -> Result<EvmSigningKey, ProviderError> {
+    let byte = u8::try_from(index)
+        .ok()
+        .and_then(|value| value.checked_add(0x10))
+        .ok_or_else(|| ProviderError::Provider("mock managed EVM key index overflow".to_string()))?;
+    EvmSigningKey::from_bytes((&[byte; 32]).into())
+        .map_err(|err| ProviderError::Provider(err.to_string()))
+}
+
+fn mock_managed_evm_address(index: usize) -> Result<String, ProviderError> {
+    let key = mock_managed_evm_signing_key(index)?;
+    let point = key.verifying_key().to_encoded_point(false);
+    let digest = Keccak256::digest(&point.as_bytes()[1..]);
+    Ok(format!("0x{}", hex::encode(&digest[12..])))
+}
+
+fn mock_managed_evm_key_for_address(address: &str) -> Result<EvmSigningKey, ProviderError> {
+    for index in 1..=128 {
+        if mock_managed_evm_address(index)?.eq_ignore_ascii_case(address) {
+            return mock_managed_evm_signing_key(index);
+        }
+    }
+    Err(ProviderError::Provider(format!(
+        "mock has no managed EVM signing key for {address}"
+    )))
+}
+
+fn mock_sign_eip155_transaction(payload: &Value) -> Result<String, ProviderError> {
+    let quantity = |field: &str| {
+        exact_payload_quantity(payload, field)
+            .map_err(|err| ProviderError::Provider(err.to_string()))
+    };
+    let chain_id = payload
+        .get("chain_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProviderError::Provider("mock transaction missing chain_id".to_string()))?;
+    let nonce = quantity("nonce")?;
+    let gas_price = quantity("gas_price")?;
+    let gas_limit = quantity("gas_limit")?;
+    let to = exact_payload_bytes(payload, "to")
+        .map_err(|err| ProviderError::Provider(err.to_string()))?;
+    let value = quantity("value")?;
+    let data = exact_payload_bytes(payload, "data")
+        .map_err(|err| ProviderError::Provider(err.to_string()))?;
+    let chain_id_raw = mock_trim_integer_bytes(&chain_id.to_be_bytes()).to_vec();
+    let signing_payload = rlp_encode_list(&[
+        rlp_encode_bytes(&nonce),
+        rlp_encode_bytes(&gas_price),
+        rlp_encode_bytes(&gas_limit),
+        rlp_encode_bytes(&to),
+        rlp_encode_bytes(&value),
+        rlp_encode_bytes(&data),
+        rlp_encode_bytes(&chain_id_raw),
+        rlp_encode_bytes(&[]),
+        rlp_encode_bytes(&[]),
+    ]);
+    let from = required_test_str(payload, "from")?;
+    let signing_key = mock_managed_evm_key_for_address(from)?;
+    let signing_hash = Keccak256::digest(signing_payload);
+    let (signature, recovery_id) = signing_key
+        .sign_prehash_recoverable(&signing_hash)
+        .map_err(|err| ProviderError::Provider(err.to_string()))?;
+    let signature = signature.to_bytes();
+    let v = chain_id
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(35))
+        .and_then(|value| value.checked_add(u64::from(recovery_id.to_byte())))
+        .ok_or_else(|| ProviderError::Provider("mock transaction chain id overflow".to_string()))?;
+    let v_bytes = v.to_be_bytes();
+    let signed = rlp_encode_list(&[
+        rlp_encode_bytes(&nonce),
+        rlp_encode_bytes(&gas_price),
+        rlp_encode_bytes(&gas_limit),
+        rlp_encode_bytes(&to),
+        rlp_encode_bytes(&value),
+        rlp_encode_bytes(&data),
+        rlp_encode_bytes(mock_trim_integer_bytes(&v_bytes)),
+        rlp_encode_bytes(mock_trim_integer_bytes(&signature[..32])),
+        rlp_encode_bytes(mock_trim_integer_bytes(&signature[32..])),
+    ]);
+    Ok(format!("0x{}", hex::encode(signed)))
+}
+
 fn mock_chain_broadcast_counts() -> &'static std::sync::Mutex<HashMap<String, usize>> {
     static COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> =
         std::sync::OnceLock::new();
@@ -9,11 +102,58 @@ fn mock_chain_broadcast_counts() -> &'static std::sync::Mutex<HashMap<String, us
 fn reset_mock_chain_broadcast_count(signed_transaction: &str) {
     let mut counts = mock_chain_broadcast_counts().lock().unwrap();
     counts.remove(signed_transaction);
+    drop(counts);
+    mock_chain_uncertain_broadcasts()
+        .lock()
+        .unwrap()
+        .remove(signed_transaction);
+    if signed_transaction.starts_with("0x")
+        && signed_transaction.len() % 2 == 0
+        && signed_transaction[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        mock_chain_hidden_transaction_hashes()
+            .lock()
+            .unwrap()
+            .remove(&signed_evm_transaction_hash_for_test(signed_transaction));
+    }
 }
 
 fn mock_chain_broadcast_count(signed_transaction: &str) -> usize {
     let counts = mock_chain_broadcast_counts().lock().unwrap();
     counts.get(signed_transaction).copied().unwrap_or(0)
+}
+
+fn mock_chain_uncertain_broadcasts() -> &'static std::sync::Mutex<HashSet<String>> {
+    static TRANSACTIONS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    TRANSACTIONS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn mock_chain_hidden_transaction_hashes() -> &'static std::sync::Mutex<HashSet<String>> {
+    static HASHES: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    HASHES.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn mark_mock_chain_broadcast_uncertain(signed_transaction: &str, visible: bool) {
+    mock_chain_uncertain_broadcasts()
+        .lock()
+        .unwrap()
+        .insert(signed_transaction.to_string());
+    let transaction_hash = signed_evm_transaction_hash_for_test(signed_transaction);
+    let mut hidden = mock_chain_hidden_transaction_hashes().lock().unwrap();
+    if visible {
+        hidden.remove(&transaction_hash);
+    } else {
+        hidden.insert(transaction_hash);
+    }
+}
+
+fn signed_evm_transaction_hash_for_test(signed_transaction: &str) -> String {
+    let raw = hex::decode(signed_transaction.trim_start_matches("0x")).unwrap();
+    format!("0x{}", hex::encode(Keccak256::digest(raw)))
 }
 
 #[async_trait::async_trait]
@@ -252,6 +392,10 @@ impl Provider for MockChainProvider {
                 let hash = required_test_str(request, "hash")?;
                 if hash
                     == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    || mock_chain_hidden_transaction_hashes()
+                        .lock()
+                        .unwrap()
+                        .contains(hash)
                 {
                     return Ok(json!({
                         "status": "ok",
@@ -301,6 +445,10 @@ impl Provider for MockChainProvider {
                 let hash = required_test_str(request, "hash")?;
                 if hash
                     == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    || mock_chain_hidden_transaction_hashes()
+                        .lock()
+                        .unwrap()
+                        .contains(hash)
                 {
                     return Ok(json!({
                         "status": "ok",
@@ -362,20 +510,23 @@ impl Provider for MockChainProvider {
                 let signed_transaction = required_test_str(request, "signed_transaction")?;
                 let mut counts = mock_chain_broadcast_counts().lock().unwrap();
                 *counts.entry(signed_transaction.to_string()).or_insert(0) += 1;
-                if matches!(
-                    signed_transaction,
-                    "0xfeedface0001" | "0xfeedface0002"
-                ) {
+                drop(counts);
+                if mock_chain_uncertain_broadcasts()
+                    .lock()
+                    .unwrap()
+                    .contains(signed_transaction)
+                {
                     return Err(ProviderError::Provider(
                         "simulated uncertain Chain broadcast transport".to_string(),
                     ));
                 }
+                let transaction_hash = signed_evm_transaction_hash_for_test(signed_transaction);
                 Ok(json!({
                     "status": "ok",
                     "data": {
                         "schema": "elastos.chain.broadcast_receipt/v1",
                         "network": required_test_str(request, "network")?,
-                        "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        "transaction_hash": transaction_hash
                     }
                 }))
             }
@@ -4568,7 +4719,7 @@ impl MockWalletProvider {
                         "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l".to_string()
                     }
                 } else if create_new {
-                    format!("0x{:040x}", accounts.len() + 1)
+                    mock_managed_evm_address(accounts.len() + 1)?
                 } else {
                     "0x1111111111111111111111111111111111111111".to_string()
                 };
@@ -5056,12 +5207,19 @@ impl MockWalletProvider {
                 if approval.get("intent").and_then(|value| value.as_str())
                     == Some("transaction_intent")
                 {
+                    let signed_transaction = mock_sign_eip155_transaction(
+                        approval
+                            .get("payload")
+                            .ok_or_else(|| ProviderError::Provider("mock transaction approval is missing payload".to_string()))?,
+                    )?;
+                    let transaction_hash =
+                        signed_evm_transaction_hash_for_test(&signed_transaction);
                     approval["signed_result"] = json!({
                         "schema": "elastos.wallet.signed-transaction-result/v1",
                         "request_id": request_id,
                         "method": "eth_sendTransaction",
-                        "signed_transaction": "0x1234",
-                        "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "signed_transaction": signed_transaction,
+                        "transaction_hash": transaction_hash,
                         "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
                         "chain_namespace": approval.get("chain_namespace").cloned().unwrap_or(json!("eip155:20")),
                         "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
@@ -5249,12 +5407,19 @@ impl MockWalletProvider {
                 if approval.get("intent").and_then(|value| value.as_str())
                     == Some("transaction_intent")
                 {
+                    let signed_transaction = mock_sign_eip155_transaction(
+                        approval
+                            .get("payload")
+                            .ok_or_else(|| ProviderError::Provider("mock transaction approval is missing payload".to_string()))?,
+                    )?;
+                    let transaction_hash =
+                        signed_evm_transaction_hash_for_test(&signed_transaction);
                     approval["signed_result"] = json!({
                         "schema": "elastos.wallet.signed-transaction-result/v1",
                         "request_id": request_id,
                         "method": "eth_sendTransaction",
-                        "signed_transaction": "0x1234",
-                        "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "signed_transaction": signed_transaction,
+                        "transaction_hash": transaction_hash,
                         "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
                         "chain_namespace": approval.get("chain_namespace").cloned().unwrap_or(json!("eip155:20")),
                         "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),

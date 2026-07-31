@@ -1,5 +1,6 @@
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, Weak};
 
 use elastos_runtime::auth::RuntimeAuditEventV1;
 use elastos_wallet_contract::{
@@ -9,6 +10,7 @@ use elastos_wallet_contract::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sha3::Keccak256;
 use tokio::sync::Mutex;
 
 use super::*;
@@ -26,7 +28,10 @@ const MAX_TRANSACTION_RECEIPT_BYTES: usize = 128 * 1024;
 pub(in crate::api::gateway) const NATIVE_TRANSACTION_SOURCE: &str = "native_wallet";
 pub(in crate::api::gateway) const BROWSER_TRANSACTION_SOURCE: &str = "browser_wallet";
 
-static TRANSACTION_EFFECT_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+type TransactionEffectLockKey = (PathBuf, String);
+type TransactionEffectLockMap = HashMap<TransactionEffectLockKey, Weak<Mutex<()>>>;
+
+static TRANSACTION_EFFECT_LOCKS: OnceLock<Mutex<TransactionEffectLockMap>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub(in crate::api::gateway) struct RuntimeTransactionRequest {
@@ -258,6 +263,25 @@ impl RuntimeTransactionEffect {
         if let Some(hash) = self.wallet_transaction_hash.as_deref() {
             validate_transaction_hash(hash)?;
         }
+        if let Some(signed_transaction) = self.signed_transaction.as_deref() {
+            let exact = validate_signed_evm_transaction_authority(self, signed_transaction)?;
+            match self.wallet_binding.as_ref() {
+                Some(RuntimeTransactionWalletBinding::ManagedSigned {
+                    signed_transaction_sha256,
+                }) if signed_transaction_sha256 == &exact.sha256 => {}
+                Some(RuntimeTransactionWalletBinding::ManagedSigned { .. }) => {
+                    anyhow::bail!("signed transaction digest differs from durable Wallet binding");
+                }
+                _ => {}
+            }
+            if self
+                .wallet_transaction_hash
+                .as_deref()
+                .is_some_and(|hash| !hash.eq_ignore_ascii_case(&exact.transaction_hash))
+            {
+                anyhow::bail!("signed transaction hash differs from durable Wallet binding");
+            }
+        }
         if let Some(signed_result) = self.signed_result.as_ref() {
             validate_bounded_object(
                 "transaction signed result",
@@ -422,8 +446,9 @@ pub(in crate::api::gateway) async fn ensure_runtime_transaction_approval(
     request: RuntimeTransactionRequest,
 ) -> Result<RuntimeTransactionApproval, (StatusCode, String)> {
     validate_transaction_request(authority, &request)?;
-    let _guard = transaction_effect_guard().lock().await;
     let principal_id = authority.verified_context().principal_id();
+    let lock = transaction_effect_lock(&state.data_dir, principal_id).await;
+    let _guard = lock.lock().await;
     let mut store = load_transaction_effect_store(state, principal_id)?;
     let request_binding = transaction_request_binding(&request);
     let authority_binding = transaction_authority(authority);
@@ -466,6 +491,42 @@ pub(in crate::api::gateway) async fn ensure_runtime_transaction_approval(
                 "session_id".to_string(),
                 json!(authority.verified_context().session_id()),
             );
+            intent_object.insert("effect_id".to_string(), json!(request.effect_id.as_str()));
+            intent_object.insert("source".to_string(), json!(request.source));
+            intent_object.insert(
+                "request_sha256".to_string(),
+                json!(request.request_sha256.as_str()),
+            );
+            intent_object.insert("account_id".to_string(), json!(request.account_id.as_str()));
+            intent_object.insert(
+                "chain_namespace".to_string(),
+                json!(request.chain_namespace.as_str()),
+            );
+            intent_object.insert(
+                "proof_binding_id".to_string(),
+                json!(authority.verified_context().proof_binding_id()),
+            );
+            intent_object.insert(
+                "grant_id".to_string(),
+                json!(authority.verified_context().grant_id()),
+            );
+            intent_object.insert(
+                "launch_id".to_string(),
+                json!(authority.verified_context().launch_id()),
+            );
+            intent_object.insert(
+                "requested_by_actor".to_string(),
+                json!(authority.verified_context().actor()),
+            );
+            intent_object
+                .entry("method".to_string())
+                .or_insert_with(|| {
+                    json!(if request.source == NATIVE_TRANSACTION_SOURCE {
+                        "wallet_send"
+                    } else {
+                        "eth_sendTransaction"
+                    })
+                });
         }
         let approval_request_id = wallet_request_id(&request.effect_id, "approval");
         let mut effect = RuntimeTransactionEffect {
@@ -547,8 +608,9 @@ pub(in crate::api::gateway) async fn resume_runtime_native_transaction_approval(
         ));
     }
 
-    let _guard = transaction_effect_guard().lock().await;
     let principal_id = authority.verified_context().principal_id();
+    let lock = transaction_effect_lock(&state.data_dir, principal_id).await;
+    let _guard = lock.lock().await;
     let mut store = load_transaction_effect_store(state, principal_id)?;
     let effect_index = store
         .effects
@@ -645,8 +707,9 @@ pub(in crate::api::gateway) async fn complete_runtime_transaction_effect(
     lookup: RuntimeTransactionLookup<'_>,
     managed_approval: Option<RuntimeManagedTransactionApproval<'_>>,
 ) -> Result<RuntimeTransactionCompletion, (StatusCode, String)> {
-    let _guard = transaction_effect_guard().lock().await;
     let principal_id = authority.verified_context().principal_id();
+    let lock = transaction_effect_lock(&state.data_dir, principal_id).await;
+    let _guard = lock.lock().await;
     let mut store = load_transaction_effect_store(state, principal_id)?;
     let effect_index = match find_effect_index(&store, &lookup) {
         Some(index) => index,
@@ -764,8 +827,6 @@ pub(in crate::api::gateway) async fn complete_runtime_transaction_effect(
                         "completed Wallet approval is missing signed transaction".to_string(),
                     )
                 })?;
-            let (canonical_signed, digest) =
-                canonical_signed_transaction(signed_transaction).map_err(bad_gateway_error)?;
             let wallet_hash = signed_result
                 .get("transaction_hash")
                 .and_then(Value::as_str)
@@ -777,13 +838,25 @@ pub(in crate::api::gateway) async fn complete_runtime_transaction_effect(
                     )
                 })?;
             validate_transaction_hash(wallet_hash).map_err(bad_gateway_error)?;
+            let exact = validate_signed_evm_transaction_authority(
+                &store.effects[effect_index],
+                signed_transaction,
+            )
+            .map_err(bad_gateway_error)?;
+            if !wallet_hash.eq_ignore_ascii_case(&exact.transaction_hash) {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Wallet transaction hash does not match the exact signed transaction"
+                        .to_string(),
+                ));
+            }
             let effect = &mut store.effects[effect_index];
             effect.approval_snapshot = Some(approval);
-            effect.signed_transaction = Some(canonical_signed);
+            effect.signed_transaction = Some(exact.canonical);
             effect.wallet_binding = Some(RuntimeTransactionWalletBinding::ManagedSigned {
-                signed_transaction_sha256: digest,
+                signed_transaction_sha256: exact.sha256,
             });
-            effect.wallet_transaction_hash = Some(wallet_hash.to_string());
+            effect.wallet_transaction_hash = Some(exact.transaction_hash);
             effect.signed_result = Some(signed_result);
             effect.state = TransactionEffectState::Signed;
             effect.completion_error = None;
@@ -1155,6 +1228,16 @@ async fn prepare_chain_transaction(
     state: &GatewayState,
     request: &RuntimeTransactionRequest,
 ) -> Result<Value, (StatusCode, String)> {
+    let expected_chain_id = request
+        .chain_namespace
+        .strip_prefix("eip155:")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "transaction request has an invalid EVM namespace".to_string(),
+            )
+        })?;
     let intent = wallet_chain_provider_data(
         state,
         json!({
@@ -1169,11 +1252,18 @@ async fn prepare_chain_transaction(
     .await?;
     if intent.get("schema").and_then(Value::as_str)
         != Some("elastos.chain.unsigned_transaction_intent/v1")
+        || intent.get("transaction_type").and_then(Value::as_str) != Some("eip155_legacy")
         || intent
             .get("network")
             .and_then(|network| network.get("id"))
             .and_then(Value::as_str)
             != Some(request.network.as_str())
+        || intent
+            .get("network")
+            .and_then(|network| network.get("chain_id"))
+            .and_then(Value::as_u64)
+            != Some(expected_chain_id)
+        || intent.get("chain_id").and_then(Value::as_u64) != Some(expected_chain_id)
         || !intent
             .get("from")
             .and_then(Value::as_str)
@@ -1184,6 +1274,10 @@ async fn prepare_chain_transaction(
             .is_some_and(|to| to.eq_ignore_ascii_case(&request.to))
         || intent.get("value").and_then(Value::as_str) != Some(request.value.as_str())
         || intent.get("data").and_then(Value::as_str) != Some(request.data.as_str())
+        || intent
+            .get("requires_wallet_approval")
+            .and_then(Value::as_bool)
+            != Some(true)
         || intent.get("wallet_intent").and_then(Value::as_str) != Some("transaction_intent")
     {
         return Err((
@@ -1197,6 +1291,17 @@ async fn prepare_chain_transaction(
         MAX_TRANSACTION_INTENT_BYTES,
     )
     .map_err(bad_gateway_error)?;
+    for field in ["nonce", "gas_price", "gas_limit", "value"] {
+        exact_payload_quantity(&intent, field).map_err(bad_gateway_error)?;
+    }
+    let to = exact_payload_bytes(&intent, "to").map_err(bad_gateway_error)?;
+    if to.len() != 20 {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Chain transaction intent has an invalid EVM destination".to_string(),
+        ));
+    }
+    exact_payload_bytes(&intent, "data").map_err(bad_gateway_error)?;
     Ok(intent)
 }
 
@@ -1503,6 +1608,389 @@ fn validate_chain_result(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactSignedEvmTransaction {
+    canonical: String,
+    sha256: String,
+    transaction_hash: String,
+}
+
+struct RlpItem<'a> {
+    is_list: bool,
+    payload: &'a [u8],
+    encoded_len: usize,
+}
+
+fn parse_rlp_length(bytes: &[u8]) -> anyhow::Result<usize> {
+    if bytes.is_empty() || bytes[0] == 0 {
+        anyhow::bail!("RLP length is not canonical");
+    }
+    bytes.iter().try_fold(0usize, |length, byte| {
+        length
+            .checked_mul(256)
+            .and_then(|length| length.checked_add(usize::from(*byte)))
+            .ok_or_else(|| anyhow::anyhow!("RLP length overflows this Runtime"))
+    })
+}
+
+fn parse_rlp_item(input: &[u8]) -> anyhow::Result<RlpItem<'_>> {
+    let first = *input
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("signed transaction contains truncated RLP"))?;
+    if first <= 0x7f {
+        return Ok(RlpItem {
+            is_list: false,
+            payload: &input[..1],
+            encoded_len: 1,
+        });
+    }
+    let (is_list, payload_offset, payload_len) = match first {
+        0x00..=0x7f => unreachable!("single-byte RLP was handled above"),
+        0x80..=0xb7 => (false, 1usize, usize::from(first - 0x80)),
+        0xb8..=0xbf => {
+            let length_bytes = usize::from(first - 0xb7);
+            if input.len() < 1 + length_bytes {
+                anyhow::bail!("signed transaction contains truncated RLP length");
+            }
+            let length = parse_rlp_length(&input[1..1 + length_bytes])?;
+            if length < 56 {
+                anyhow::bail!("signed transaction uses non-canonical long RLP bytes");
+            }
+            (false, 1 + length_bytes, length)
+        }
+        0xc0..=0xf7 => (true, 1usize, usize::from(first - 0xc0)),
+        0xf8..=0xff => {
+            let length_bytes = usize::from(first - 0xf7);
+            if input.len() < 1 + length_bytes {
+                anyhow::bail!("signed transaction contains truncated RLP list length");
+            }
+            let length = parse_rlp_length(&input[1..1 + length_bytes])?;
+            if length < 56 {
+                anyhow::bail!("signed transaction uses a non-canonical long RLP list");
+            }
+            (true, 1 + length_bytes, length)
+        }
+    };
+    let encoded_len = payload_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| anyhow::anyhow!("signed transaction RLP length overflows"))?;
+    if input.len() < encoded_len {
+        anyhow::bail!("signed transaction contains truncated RLP payload");
+    }
+    let payload = &input[payload_offset..encoded_len];
+    if !is_list && payload_len == 1 && payload[0] < 0x80 {
+        anyhow::bail!("signed transaction uses non-canonical single-byte RLP");
+    }
+    Ok(RlpItem {
+        is_list,
+        payload,
+        encoded_len,
+    })
+}
+
+fn rlp_length_prefix(length: usize, offset: u8) -> Vec<u8> {
+    if length < 56 {
+        return vec![offset + length as u8];
+    }
+    let raw = length.to_be_bytes();
+    let first = raw
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(raw.len() - 1);
+    let length_bytes = &raw[first..];
+    let mut encoded = vec![offset + 55 + length_bytes.len() as u8];
+    encoded.extend_from_slice(length_bytes);
+    encoded
+}
+
+pub(in crate::api::gateway) fn rlp_encode_bytes(bytes: &[u8]) -> Vec<u8> {
+    if bytes.len() == 1 && bytes[0] < 0x80 {
+        return vec![bytes[0]];
+    }
+    let mut encoded = rlp_length_prefix(bytes.len(), 0x80);
+    encoded.extend_from_slice(bytes);
+    encoded
+}
+
+pub(in crate::api::gateway) fn rlp_encode_list(items: &[Vec<u8>]) -> Vec<u8> {
+    let payload_len = items.iter().map(Vec::len).sum::<usize>();
+    let mut encoded = rlp_length_prefix(payload_len, 0xc0);
+    for item in items {
+        encoded.extend_from_slice(item);
+    }
+    encoded
+}
+
+fn canonical_unsigned_integer(bytes: &[u8], field: &str) -> anyhow::Result<()> {
+    if bytes.first() == Some(&0) {
+        anyhow::bail!("signed transaction {field} is not canonical");
+    }
+    Ok(())
+}
+
+fn validate_low_s_signature(signature: &k256::ecdsa::Signature) -> anyhow::Result<()> {
+    if signature.normalize_s().is_some() {
+        anyhow::bail!("signed transaction signature is not canonical low-s");
+    }
+    Ok(())
+}
+
+fn rlp_u64_value(bytes: &[u8], field: &str) -> anyhow::Result<u64> {
+    canonical_unsigned_integer(bytes, field)?;
+    if bytes.len() > std::mem::size_of::<u64>() {
+        anyhow::bail!("signed transaction {field} exceeds u64");
+    }
+    Ok(bytes
+        .iter()
+        .fold(0u64, |value, byte| (value << 8) | u64::from(*byte)))
+}
+
+pub(in crate::api::gateway) fn exact_payload_quantity(
+    payload: &Value,
+    field: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let value = payload
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transaction payload is missing {field}"))?;
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow::anyhow!("transaction payload {field} is not 0x-prefixed"))?;
+    if raw == "0" {
+        return Ok(Vec::new());
+    }
+    if raw.is_empty()
+        || raw.starts_with('0')
+        || raw.len() > 64
+        || !raw.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("transaction payload {field} is not a canonical quantity");
+    }
+    let padded;
+    let encoded = if raw.len() % 2 == 0 {
+        raw
+    } else {
+        padded = format!("0{raw}");
+        &padded
+    };
+    hex::decode(encoded)
+        .map_err(|_| anyhow::anyhow!("transaction payload {field} contains invalid hex"))
+}
+
+pub(in crate::api::gateway) fn exact_payload_bytes(
+    payload: &Value,
+    field: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let value = payload
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("transaction payload is missing {field}"))?;
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow::anyhow!("transaction payload {field} is not 0x-prefixed"))?;
+    if raw.len() % 2 != 0 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("transaction payload {field} contains invalid hex");
+    }
+    hex::decode(raw)
+        .map_err(|_| anyhow::anyhow!("transaction payload {field} contains invalid hex"))
+}
+
+fn exact_optional_intent_string(intent: &Value, field: &str, expected: &str) -> anyhow::Result<()> {
+    if let Some(value) = intent.get(field) {
+        if value.as_str() != Some(expected) {
+            anyhow::bail!("transaction intent {field} authority mismatch");
+        }
+    }
+    Ok(())
+}
+
+fn validate_extended_transaction_intent_authority(
+    effect: &RuntimeTransactionEffect,
+) -> anyhow::Result<()> {
+    let intent = &effect.intent;
+    if intent.get("effect_id").is_none() {
+        return Ok(());
+    }
+    for (field, expected) in [
+        ("effect_id", effect.effect_id.as_str()),
+        ("source", effect.source.as_str()),
+        ("request_sha256", effect.request_sha256.as_str()),
+        ("account_id", effect.account_id.as_str()),
+        ("chain_namespace", effect.chain_namespace.as_str()),
+        ("principal_id", effect.authority.principal_id.as_str()),
+        ("session_id", effect.authority.session_id.as_str()),
+        ("grant_id", effect.authority.grant_id.as_str()),
+        ("launch_id", effect.authority.launch_id.as_str()),
+        ("requested_by_actor", effect.authority.actor.as_str()),
+    ] {
+        if intent.get(field).and_then(Value::as_str) != Some(expected) {
+            anyhow::bail!("transaction intent {field} authority mismatch");
+        }
+    }
+    let expected_method = if effect.source == NATIVE_TRANSACTION_SOURCE {
+        "wallet_send"
+    } else {
+        "eth_sendTransaction"
+    };
+    if intent.get("method").and_then(Value::as_str) != Some(expected_method)
+        || intent.get("proof_binding_id")
+            != Some(
+                &effect
+                    .authority
+                    .proof_binding_id
+                    .clone()
+                    .map_or(Value::Null, Value::String),
+            )
+    {
+        anyhow::bail!("transaction intent extended authority mismatch");
+    }
+    Ok(())
+}
+
+fn validate_signed_evm_transaction_authority(
+    effect: &RuntimeTransactionEffect,
+    signed_transaction: &str,
+) -> anyhow::Result<ExactSignedEvmTransaction> {
+    let intent = &effect.intent;
+    let expected_chain_id = effect
+        .chain_namespace
+        .strip_prefix("eip155:")
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("transaction effect has an invalid EVM namespace"))?;
+    if intent.get("schema").and_then(Value::as_str)
+        != Some("elastos.chain.unsigned_transaction_intent/v1")
+        || intent.get("transaction_type").and_then(Value::as_str) != Some("eip155_legacy")
+        || intent.get("wallet_intent").and_then(Value::as_str) != Some("transaction_intent")
+        || intent
+            .get("requires_wallet_approval")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || intent.get("chain_id").and_then(Value::as_u64) != Some(expected_chain_id)
+        || intent
+            .get("network")
+            .and_then(|network| network.get("id"))
+            .and_then(Value::as_str)
+            != Some(effect.network.as_str())
+        || intent
+            .get("network")
+            .and_then(|network| network.get("chain_id"))
+            .and_then(Value::as_u64)
+            != Some(expected_chain_id)
+        || !intent
+            .get("from")
+            .and_then(Value::as_str)
+            .is_some_and(|address| address.eq_ignore_ascii_case(&effect.address))
+    {
+        anyhow::bail!("signed transaction intent does not match exact effect authority");
+    }
+    validate_extended_transaction_intent_authority(effect)?;
+    exact_optional_intent_string(intent, "account_id", &effect.account_id)?;
+    exact_optional_intent_string(intent, "chain_namespace", &effect.chain_namespace)?;
+
+    let (canonical, sha256) = canonical_signed_transaction(signed_transaction)?;
+    let bytes = hex::decode(canonical.trim_start_matches("0x"))?;
+    let root = parse_rlp_item(&bytes)?;
+    if !root.is_list || root.encoded_len != bytes.len() {
+        anyhow::bail!("signed transaction must be one exact legacy RLP list");
+    }
+    let mut encoded_fields = root.payload;
+    let mut fields = Vec::with_capacity(9);
+    while !encoded_fields.is_empty() {
+        let item = parse_rlp_item(encoded_fields)?;
+        if item.is_list {
+            anyhow::bail!("signed transaction fields must be RLP byte strings");
+        }
+        fields.push(item.payload);
+        encoded_fields = &encoded_fields[item.encoded_len..];
+    }
+    if fields.len() != 9 {
+        anyhow::bail!("signed legacy transaction must contain exactly nine fields");
+    }
+    for (field, name) in fields.iter().zip([
+        "nonce",
+        "gas_price",
+        "gas_limit",
+        "to",
+        "value",
+        "data",
+        "v",
+        "r",
+        "s",
+    ]) {
+        if name != "to" && name != "data" {
+            canonical_unsigned_integer(field, name)?;
+        }
+    }
+    let expected_to = exact_payload_bytes(intent, "to")?;
+    if expected_to.len() != 20
+        || fields[0] != exact_payload_quantity(intent, "nonce")?
+        || fields[1] != exact_payload_quantity(intent, "gas_price")?
+        || fields[2] != exact_payload_quantity(intent, "gas_limit")?
+        || fields[3] != expected_to
+        || fields[4] != exact_payload_quantity(intent, "value")?
+        || fields[5] != exact_payload_bytes(intent, "data")?
+    {
+        anyhow::bail!("signed transaction bytes differ from the exact reviewed transaction");
+    }
+    let v = rlp_u64_value(fields[6], "v")?;
+    let eip155_v = v.checked_sub(35).ok_or_else(|| {
+        anyhow::anyhow!("signed transaction does not use EIP-155 replay protection")
+    })?;
+    if eip155_v / 2 != expected_chain_id {
+        anyhow::bail!("signed transaction chain id differs from the exact review");
+    }
+    let recovery_id = k256::ecdsa::RecoveryId::try_from((eip155_v % 2) as u8)
+        .map_err(|_| anyhow::anyhow!("signed transaction has an invalid recovery id"))?;
+    if fields[7].is_empty() || fields[7].len() > 32 || fields[8].is_empty() || fields[8].len() > 32
+    {
+        anyhow::bail!("signed transaction has invalid signature scalar widths");
+    }
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r[32 - fields[7].len()..].copy_from_slice(fields[7]);
+    s[32 - fields[8].len()..].copy_from_slice(fields[8]);
+    let signature = k256::ecdsa::Signature::from_scalars(r, s)
+        .map_err(|_| anyhow::anyhow!("signed transaction has invalid signature scalars"))?;
+    validate_low_s_signature(&signature)?;
+    let chain_id_bytes = if expected_chain_id == 0 {
+        Vec::new()
+    } else {
+        let raw = expected_chain_id.to_be_bytes();
+        raw[raw
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(raw.len() - 1)..]
+            .to_vec()
+    };
+    let signing_payload = rlp_encode_list(&[
+        rlp_encode_bytes(fields[0]),
+        rlp_encode_bytes(fields[1]),
+        rlp_encode_bytes(fields[2]),
+        rlp_encode_bytes(fields[3]),
+        rlp_encode_bytes(fields[4]),
+        rlp_encode_bytes(fields[5]),
+        rlp_encode_bytes(&chain_id_bytes),
+        rlp_encode_bytes(&[]),
+        rlp_encode_bytes(&[]),
+    ]);
+    let signing_hash = Keccak256::digest(signing_payload);
+    let verifying_key =
+        k256::ecdsa::VerifyingKey::recover_from_prehash(&signing_hash, &signature, recovery_id)
+            .map_err(|_| anyhow::anyhow!("signed transaction signer recovery failed"))?;
+    let public_key = verifying_key.to_encoded_point(false);
+    let recovered = Keccak256::digest(&public_key.as_bytes()[1..]);
+    let recovered_address = format!("0x{}", hex::encode(&recovered[12..]));
+    if !recovered_address.eq_ignore_ascii_case(&effect.address) {
+        anyhow::bail!("signed transaction signer differs from the exact reviewed account");
+    }
+    let transaction_hash = format!("0x{}", hex::encode(Keccak256::digest(&bytes)));
+    Ok(ExactSignedEvmTransaction {
+        canonical,
+        sha256,
+        transaction_hash,
+    })
+}
+
 fn canonical_signed_transaction(value: &str) -> anyhow::Result<(String, String)> {
     let encoded = value
         .strip_prefix("0x")
@@ -1606,8 +2094,17 @@ fn append_transaction_effect_audit(
     crate::auth::append_audit_event(&state.data_dir, event)
 }
 
-fn transaction_effect_guard() -> &'static Mutex<()> {
-    TRANSACTION_EFFECT_GUARD.get_or_init(|| Mutex::new(()))
+async fn transaction_effect_lock(data_dir: &Path, principal_id: &str) -> Arc<Mutex<()>> {
+    let key = (data_dir.to_path_buf(), principal_id.to_string());
+    let locks = TRANSACTION_EFFECT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
 fn transaction_authority(authority: &RuntimeWalletAuthority) -> TransactionAuthorityBinding {
@@ -1903,4 +2400,236 @@ fn conflict_error(err: anyhow::Error) -> (StatusCode, String) {
 
 fn bad_gateway_error(err: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::BAD_GATEWAY, err.to_string())
+}
+
+#[cfg(test)]
+mod exact_signed_transaction_tests {
+    use super::*;
+    use k256::ecdsa::SigningKey;
+
+    fn trim_integer(bytes: &[u8]) -> &[u8] {
+        let first = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(bytes.len());
+        &bytes[first..]
+    }
+
+    fn signing_key(byte: u8) -> SigningKey {
+        SigningKey::from_bytes((&[byte; 32]).into()).unwrap()
+    }
+
+    fn address_for_key(key: &SigningKey) -> String {
+        let point = key.verifying_key().to_encoded_point(false);
+        let digest = Keccak256::digest(&point.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&digest[12..]))
+    }
+
+    fn sign_intent(intent: &Value, key: &SigningKey) -> String {
+        let chain_id = intent["chain_id"].as_u64().unwrap();
+        let nonce = exact_payload_quantity(intent, "nonce").unwrap();
+        let gas_price = exact_payload_quantity(intent, "gas_price").unwrap();
+        let gas_limit = exact_payload_quantity(intent, "gas_limit").unwrap();
+        let to = exact_payload_bytes(intent, "to").unwrap();
+        let value = exact_payload_quantity(intent, "value").unwrap();
+        let data = exact_payload_bytes(intent, "data").unwrap();
+        let chain_id_bytes = chain_id.to_be_bytes();
+        let signing_payload = rlp_encode_list(&[
+            rlp_encode_bytes(&nonce),
+            rlp_encode_bytes(&gas_price),
+            rlp_encode_bytes(&gas_limit),
+            rlp_encode_bytes(&to),
+            rlp_encode_bytes(&value),
+            rlp_encode_bytes(&data),
+            rlp_encode_bytes(trim_integer(&chain_id_bytes)),
+            rlp_encode_bytes(&[]),
+            rlp_encode_bytes(&[]),
+        ]);
+        let signing_hash = Keccak256::digest(signing_payload);
+        let (signature, recovery_id) = key.sign_prehash_recoverable(&signing_hash).unwrap();
+        let signature = signature.to_bytes();
+        let v = chain_id * 2 + 35 + u64::from(recovery_id.to_byte());
+        let v_bytes = v.to_be_bytes();
+        let signed = rlp_encode_list(&[
+            rlp_encode_bytes(&nonce),
+            rlp_encode_bytes(&gas_price),
+            rlp_encode_bytes(&gas_limit),
+            rlp_encode_bytes(&to),
+            rlp_encode_bytes(&value),
+            rlp_encode_bytes(&data),
+            rlp_encode_bytes(trim_integer(&v_bytes)),
+            rlp_encode_bytes(trim_integer(&signature[..32])),
+            rlp_encode_bytes(trim_integer(&signature[32..])),
+        ]);
+        format!("0x{}", hex::encode(signed))
+    }
+
+    fn effect_for_key(key: &SigningKey) -> RuntimeTransactionEffect {
+        let address = address_for_key(key);
+        let effect_id = format!("transaction-effect:sha256:{}", "a".repeat(64));
+        let request_sha256 = "b".repeat(64);
+        let account_id = format!("wallet:eip155:20:{address}");
+        let authority = TransactionAuthorityBinding {
+            principal_id: "principal:test".to_string(),
+            session_id: "session:test".to_string(),
+            proof_binding_id: Some("proof:test".to_string()),
+            grant_id: "grant:test".to_string(),
+            actor: BROWSER_CAPSULE_ID.to_string(),
+            launch_id: "launch:test".to_string(),
+        };
+        let intent = json!({
+            "schema": "elastos.chain.unsigned_transaction_intent/v1",
+            "transaction_type": "eip155_legacy",
+            "network": { "id": "esc-mainnet", "chain_id": 20 },
+            "from": address,
+            "to": "0x2222222222222222222222222222222222222222",
+            "value": "0x1",
+            "data": "0x",
+            "chain_id": 20,
+            "nonce": "0x1",
+            "gas_price": "0x3b9aca00",
+            "gas_limit": "0x5208",
+            "requires_wallet_approval": true,
+            "wallet_intent": "transaction_intent",
+            "effect_id": effect_id,
+            "source": BROWSER_TRANSACTION_SOURCE,
+            "request_sha256": request_sha256,
+            "account_id": account_id,
+            "chain_namespace": "eip155:20",
+            "principal_id": authority.principal_id,
+            "session_id": authority.session_id,
+            "proof_binding_id": authority.proof_binding_id,
+            "grant_id": authority.grant_id,
+            "launch_id": authority.launch_id,
+            "requested_by_actor": authority.actor,
+            "method": "eth_sendTransaction"
+        });
+        RuntimeTransactionEffect {
+            schema: TRANSACTION_EFFECT_SCHEMA.to_string(),
+            effect_id,
+            source: BROWSER_TRANSACTION_SOURCE.to_string(),
+            authority,
+            request_sha256,
+            request_binding: json!({}),
+            approval_request_id: "wallet-request:test".to_string(),
+            wallet_request_sha256: format!("request:sha256:{}", "c".repeat(64)),
+            approval_expires_at: 2,
+            approval_reason: "test exact signed transaction".to_string(),
+            account_id,
+            address,
+            chain_namespace: "eip155:20".to_string(),
+            network: "esc-mainnet".to_string(),
+            intent,
+            state: TransactionEffectState::ApprovalPending,
+            approval_snapshot: None,
+            signed_transaction: None,
+            wallet_binding: None,
+            wallet_transaction_hash: None,
+            signed_result: None,
+            receipt: None,
+            requested_audit_completed: false,
+            projection_completed: false,
+            completion_audit_completed: false,
+            completion_error: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn exact_eip155_signature_binds_reviewed_fields_signer_chain_and_hash() {
+        let key = signing_key(0x11);
+        let effect = effect_for_key(&key);
+        let signed = sign_intent(&effect.intent, &key);
+        let exact = validate_signed_evm_transaction_authority(&effect, &signed).unwrap();
+        assert_eq!(exact.canonical, signed);
+        assert_eq!(
+            exact.transaction_hash,
+            format!(
+                "0x{}",
+                hex::encode(Keccak256::digest(
+                    hex::decode(signed.trim_start_matches("0x")).unwrap()
+                ))
+            )
+        );
+    }
+
+    #[test]
+    fn exact_eip155_signature_rejects_reviewed_value_substitution() {
+        let key = signing_key(0x11);
+        let mut effect = effect_for_key(&key);
+        let signed = sign_intent(&effect.intent, &key);
+        effect.intent["value"] = json!("0x2");
+        let err = validate_signed_evm_transaction_authority(&effect, &signed).unwrap_err();
+        assert!(err.to_string().contains("exact reviewed transaction"));
+    }
+
+    #[test]
+    fn exact_eip155_signature_rejects_wrong_signer_and_chain() {
+        let key = signing_key(0x11);
+        let effect = effect_for_key(&key);
+        let wrong_signer = sign_intent(&effect.intent, &signing_key(0x12));
+        assert!(
+            validate_signed_evm_transaction_authority(&effect, &wrong_signer)
+                .unwrap_err()
+                .to_string()
+                .contains("signer")
+        );
+
+        let mut wrong_chain_intent = effect.intent.clone();
+        wrong_chain_intent["chain_id"] = json!(21);
+        let wrong_chain = sign_intent(&wrong_chain_intent, &key);
+        assert!(
+            validate_signed_evm_transaction_authority(&effect, &wrong_chain)
+                .unwrap_err()
+                .to_string()
+                .contains("chain id")
+        );
+    }
+
+    #[test]
+    fn pre_hardening_v1_signed_effect_remains_restart_readable() {
+        let key = signing_key(0x11);
+        let mut effect = effect_for_key(&key);
+        for field in [
+            "effect_id",
+            "source",
+            "request_sha256",
+            "account_id",
+            "chain_namespace",
+            "principal_id",
+            "session_id",
+            "proof_binding_id",
+            "grant_id",
+            "launch_id",
+            "requested_by_actor",
+            "method",
+        ] {
+            effect.intent.as_object_mut().unwrap().remove(field);
+        }
+        let signed = sign_intent(&effect.intent, &key);
+        let exact = validate_signed_evm_transaction_authority(&effect, &signed).unwrap();
+        effect.signed_transaction = Some(signed);
+        effect.wallet_binding = Some(RuntimeTransactionWalletBinding::ManagedSigned {
+            signed_transaction_sha256: exact.sha256,
+        });
+        effect.wallet_transaction_hash = Some(exact.transaction_hash);
+        effect.state = TransactionEffectState::Signed;
+        effect.validate(&effect.authority.principal_id).unwrap();
+    }
+
+    #[test]
+    fn ethereum_integer_and_signature_canonicality_are_enforced() {
+        assert!(canonical_unsigned_integer(&[], "nonce").is_ok());
+        assert!(canonical_unsigned_integer(&[0], "nonce").is_err());
+        let mut r = [0u8; 32];
+        r[31] = 1;
+        let mut high_s = [0u8; 32];
+        high_s.copy_from_slice(
+            &hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140")
+                .unwrap(),
+        );
+        let signature = k256::ecdsa::Signature::from_scalars(r, high_s).unwrap();
+        assert!(validate_low_s_signature(&signature).is_err());
+    }
 }
