@@ -4,11 +4,12 @@ import {
   closeHomeGuiWindowForToken,
   openHomeGuiTarget,
   relaunchHomeGuiWindowForToken,
+  renewHomeGuiBrowserWindowAuthority,
   restoreHomeGuiSession,
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260731a";
+} from "./home-gui.js?v=home-20260731b";
 import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
@@ -17,17 +18,20 @@ import {
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260731a";
+} from "./home-gui-authority.js?v=home-20260731b";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
 const homeToken = fragment.get("home_token") || "";
 const homeOrigin = route.searchParams.get("home_origin") || "";
 const pendingRequests = new Map();
+const HOME_GUI_REQUEST_TIMEOUT_MS = 30_000;
 const consumedAuthorizedAttachmentReceipts = new Set();
 const MAX_AUTHORIZED_ATTACHMENT_RECEIPTS = 128;
 const AUTHORIZED_ATTACHMENT_SCHEMA =
   "elastos.home.authorized-target-attachment/v1";
+const BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE =
+  "elastos.home.browser-authority-renew.result/v1";
 const AUTHORIZED_ATTACHMENT_TARGET_TITLES = Object.freeze({
   "wallet-metamask": "MetaMask",
   "wallet-unisat": "UniSat",
@@ -62,13 +66,17 @@ function postToHome(message) {
   window.parent.postMessage({ ...message, homeToken }, homeOrigin);
 }
 
-function requestHome(type, payload = {}) {
+function requestHome(type, payload = {}, options = {}) {
   const id = requestId();
+  const timeoutMs =
+    Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0
+      ? Math.min(options.timeoutMs, HOME_GUI_REQUEST_TIMEOUT_MS)
+      : HOME_GUI_REQUEST_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
     const timeout = window.setTimeout(() => {
       pendingRequests.delete(id);
       reject(new Error("Home did not answer the shell request"));
-    }, 30_000);
+    }, timeoutMs);
     pendingRequests.set(id, { resolve, reject, timeout });
     postToHome({ type, requestId: id, ...payload });
   });
@@ -129,6 +137,9 @@ function handleGuiCommand(message) {
   if (command === "relaunch-window") {
     return relaunchHomeGuiWindowForToken(message.homeToken);
   }
+  if (command === "renew-browser-authority") {
+    return handleBrowserAuthorityRenewalCommand(message);
+  }
   if (command === "open-target") {
     return openHomeGuiTarget(message.target, { query: message.query || {} });
   }
@@ -142,6 +153,84 @@ function handleGuiCommand(message) {
     return true;
   }
   return false;
+}
+
+async function handleBrowserAuthorityRenewalCommand(message) {
+  const requestId =
+    typeof message.requestId === "string" ? message.requestId.trim() : "";
+  const oldHomeToken =
+    typeof message.oldHomeToken === "string"
+      ? message.oldHomeToken.trim()
+      : "";
+  const browserInstance =
+    typeof message.browserInstance === "string"
+      ? message.browserInstance.trim()
+      : "";
+  if (
+    !hasExactKeys(message, [
+      "type",
+      "command",
+      "requestId",
+      "oldHomeToken",
+      "browserInstance",
+      "expiresAt",
+    ]) ||
+    requestId !== message.requestId ||
+    !requestId ||
+    requestId.length > 128 ||
+    oldHomeToken !== message.oldHomeToken ||
+    !oldHomeToken ||
+    oldHomeToken.length > 4_096 ||
+    browserInstance !== message.browserInstance ||
+    !browserInstance ||
+    browserInstance.length > 256 ||
+    !Number.isSafeInteger(message.expiresAt)
+  ) {
+    throw new Error("Home GUI rejected a malformed Browser authority renewal");
+  }
+  try {
+    const remainingMs = Math.min(
+      HOME_GUI_REQUEST_TIMEOUT_MS,
+      message.expiresAt - Date.now(),
+    );
+    if (remainingMs <= 0) {
+      throw new Error("Home GUI rejected an expired Browser authority renewal");
+    }
+    const renewed = await renewHomeGuiBrowserWindowAuthority(
+      oldHomeToken,
+      browserInstance,
+      { timeoutMs: remainingMs },
+    );
+    if (
+      renewed?.browserInstance !== browserInstance ||
+      typeof renewed.freshHomeToken !== "string" ||
+      !renewed.freshHomeToken ||
+      renewed.freshHomeToken === oldHomeToken
+    ) {
+      throw new Error("Home GUI could not renew Browser authority");
+    }
+    postToHome({
+      type: BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE,
+      requestId,
+      oldHomeToken,
+      browserInstance,
+      ok: true,
+      freshHomeToken: renewed.freshHomeToken,
+      reason: "",
+    });
+    return true;
+  } catch (_error) {
+    postToHome({
+      type: BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE,
+      requestId,
+      oldHomeToken,
+      browserInstance,
+      ok: false,
+      freshHomeToken: "",
+      reason: "renewal_failed",
+    });
+    return false;
+  }
 }
 
 function consumeAuthorizedAttachmentDescriptor(message) {
@@ -274,7 +363,8 @@ bindHomeGuiInteractions({
   requestSummaryRefresh: () => {
     postToHome({ type: "home:refresh-summary" });
   },
-  launchTarget: (target, query) => requestHome("home:launch-target", { target, query }),
+  launchTarget: (target, query, options) =>
+    requestHome("home:launch-target", { target, query }, options),
   signOut: () => requestHome("home:sign-out"),
 });
 setHomeGuiMounted(true);

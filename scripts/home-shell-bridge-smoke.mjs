@@ -226,6 +226,8 @@ const summary = {
   ],
 };
 let activeShellName = "home-cli";
+const renewalBrowserInstance = "browser:authority-renewal-bridge";
+let renewalBrowserLaunchCount = 0;
 let passkeyCompleted = false;
 const braveAddress = "0x2222222222222222222222222222222222222222";
 const metamaskAddress = "0x1111111111111111111111111111111111111111";
@@ -457,6 +459,20 @@ globalThis.fetch = async (url, init = {}) => {
       });
     }
     if (body?.target === "browser") {
+      if (body?.query?.browser_instance === renewalBrowserInstance) {
+        renewalBrowserLaunchCount += 1;
+        const renewalToken = renewalBrowserLaunchCount === 1
+          ? "browser-renewal-old-token"
+          : "browser-renewal-fresh-token";
+        return jsonResponse({
+          attach_kind: "iframe",
+          route:
+            `/apps/browser/?browser_instance=${encodeURIComponent(renewalBrowserInstance)}` +
+            `&home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=${renewalToken}`,
+          target: "browser",
+          title: "Browser",
+        });
+      }
       return jsonResponse({
         attach_kind: "iframe",
         route: "/apps/browser/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=browser-token",
@@ -1454,6 +1470,150 @@ assert(
     passkeyRequestsBeforeBrowser,
   "Browser frame obtained host passkey authority",
   requests,
+);
+
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-browser-renewal-old",
+  target: "browser",
+  query: { browser_instance: renewalBrowserInstance },
+  homeToken: "gui-token",
+});
+const renewalLaunchReply = await waitForReply(
+  shellMessages,
+  "launch-browser-renewal-old",
+);
+assert(
+  renewalLaunchReply.payload?.result?.route?.includes(
+    "#home_token=browser-renewal-old-token",
+  ),
+  "Home did not establish the old Browser authority context",
+  renewalLaunchReply,
+);
+const browserRenewalReplies = [];
+const browserRenewalFrameWindow = {
+  postMessage(payload, origin) {
+    if (
+      payload?.type ===
+      "elastos.home.browser-authority-renew.result/v1"
+    ) {
+      browserRenewalReplies.push({ origin, payload });
+    }
+  },
+};
+sendChildMessage("null", browserRenewalFrameWindow, {
+  type: "home:app-ready",
+  homeToken: "browser-renewal-old-token",
+});
+const firstRenewalRequest = {
+  type: "elastos.home.browser-authority-renew.request/v1",
+  requestId: "browser-renewal-request-1",
+  homeToken: "browser-renewal-old-token",
+  browserInstance: renewalBrowserInstance,
+};
+sendChildMessage("null", browserRenewalFrameWindow, firstRenewalRequest);
+sendChildMessage("null", browserRenewalFrameWindow, firstRenewalRequest);
+const firstRenewalCommands = shellMessages.filter(
+  (message) =>
+    message.payload?.command === "renew-browser-authority" &&
+    message.payload?.requestId === firstRenewalRequest.requestId,
+);
+assert(
+  firstRenewalCommands.length === 1 &&
+    Object.keys(firstRenewalCommands[0].payload).sort().join(",") ===
+      "browserInstance,command,expiresAt,oldHomeToken,requestId,type" &&
+    Number.isSafeInteger(firstRenewalCommands[0].payload.expiresAt),
+  "duplicate Browser renewal request launched duplicate GUI work",
+  firstRenewalCommands,
+);
+sendChildMessage("null", shellFrameWindow, {
+  type: "elastos.home.browser-authority-renew.result/v1",
+  requestId: firstRenewalRequest.requestId,
+  oldHomeToken: firstRenewalRequest.homeToken,
+  browserInstance: renewalBrowserInstance,
+  ok: false,
+  freshHomeToken: "",
+  reason: "renewal_failed",
+  homeToken: "gui-token",
+});
+assert(
+  browserRenewalReplies.length === 1 &&
+    browserRenewalReplies[0].origin === "*" &&
+    browserRenewalReplies[0].payload?.ok === false &&
+    browserRenewalReplies[0].payload?.homeToken ===
+      "browser-renewal-old-token",
+  "failed GUI renewal did not preserve and notify the exact old Browser frame",
+  browserRenewalReplies,
+);
+
+const secondRenewalRequest = {
+  ...firstRenewalRequest,
+  requestId: "browser-renewal-request-2",
+};
+sendChildMessage("null", browserRenewalFrameWindow, secondRenewalRequest);
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-browser-renewal-fresh",
+  target: "browser",
+  query: { browser_instance: renewalBrowserInstance },
+  homeToken: "gui-token",
+});
+const freshRenewalLaunchReply = await waitForReply(
+  shellMessages,
+  "launch-browser-renewal-fresh",
+);
+assert(
+  freshRenewalLaunchReply.payload?.result?.route?.includes(
+    "#home_token=browser-renewal-fresh-token",
+  ),
+  "Home did not establish the fresh Browser authority context",
+  freshRenewalLaunchReply,
+);
+const renewalSuccess = {
+  type: "elastos.home.browser-authority-renew.result/v1",
+  requestId: secondRenewalRequest.requestId,
+  oldHomeToken: secondRenewalRequest.homeToken,
+  browserInstance: renewalBrowserInstance,
+  ok: true,
+  freshHomeToken: "browser-renewal-fresh-token",
+  reason: "",
+  homeToken: "gui-token",
+};
+sendChildMessage("null", {}, renewalSuccess);
+sendChildMessage("null", shellFrameWindow, {
+  ...renewalSuccess,
+  freshHomeToken: "substituted-fresh-token",
+});
+assert(
+  browserRenewalReplies.length === 1,
+  "Browser renewal accepted a substituted GUI source or fresh token",
+  browserRenewalReplies,
+);
+sendChildMessage("null", shellFrameWindow, renewalSuccess);
+assert(
+  browserRenewalReplies.length === 2 &&
+    Object.keys(browserRenewalReplies[1].payload).sort().join(",") ===
+      "browserInstance,freshHomeToken,homeToken,ok,reason,requestId,type" &&
+    browserRenewalReplies[1].payload?.ok === true &&
+    browserRenewalReplies[1].payload?.freshHomeToken ===
+      "browser-renewal-fresh-token",
+  "exact GUI renewal success did not acknowledge the old Browser frame",
+  browserRenewalReplies,
+);
+const renewalCommandCount = shellMessages.filter(
+  (message) => message.payload?.command === "renew-browser-authority",
+).length;
+sendChildMessage("null", browserRenewalFrameWindow, {
+  ...firstRenewalRequest,
+  requestId: "retired-old-context-request",
+});
+assert(
+  shellMessages.filter(
+    (message) => message.payload?.command === "renew-browser-authority",
+  ).length === renewalCommandCount &&
+    browserRenewalReplies.length === 2,
+  "retired old Browser authority remained able to request renewal",
+  { browserRenewalReplies, shellMessages },
 );
 
 sendChildMessage("null", shellFrameWindow, {

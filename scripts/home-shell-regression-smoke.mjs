@@ -3,6 +3,8 @@
 const moduleVersion = "home-20260725a";
 const savedStatePatches = [];
 const requests = [];
+const windowEventListeners = new Map();
+let randomUuidSerial = 0;
 
 class FakeClassList {
   constructor() {
@@ -140,13 +142,29 @@ globalThis.document = {
   createElement: (tag) => new FakeElement(tag),
 };
 globalThis.window = {
-  crypto: { randomUUID: () => "home-shell-regression-smoke" },
+  crypto: {
+    randomUUID: () => `home-shell-regression-smoke-${++randomUuidSerial}`,
+  },
   localStorage: { getItem: () => null, setItem: () => {} },
+  location: { href: "http://localhost:61180/apps/home-gui/" },
   performance: { now: () => Date.now() },
   innerWidth: 1280,
   innerHeight: 800,
+  addEventListener(type, listener) {
+    const listeners = windowEventListeners.get(type) || [];
+    listeners.push(listener);
+    windowEventListeners.set(type, listeners);
+  },
+  setTimeout,
+  clearTimeout,
   clearInterval: () => {},
 };
+
+function sendWindowEvent(type, event) {
+  for (const listener of windowEventListeners.get(type) || []) {
+    listener(event);
+  }
+}
 globalThis.fetch = async (_url, init = {}) => {
   requests.push({
     url: String(_url),
@@ -284,10 +302,18 @@ shellWindows.configureWindowHooks({
   updateTaskbarState: () => {},
   launchTarget: async (target, query) => {
     restoredBrowserLaunches.push({ target, query: { ...query } });
+    if (restoredBrowserLaunches.length === 2) {
+      throw new Error("simulated Browser authority renewal failure");
+    }
+    const launchToken = restoredBrowserLaunches.length === 1
+      ? "browser-window-close-token"
+      : `browser-window-renewed-token-${restoredBrowserLaunches.length}`;
     return {
       target,
       title: "Browser",
-      route: `/apps/browser/?browser_instance=${encodeURIComponent(query.browser_instance)}`,
+      route:
+        `/apps/browser/?browser_instance=${encodeURIComponent(query.browser_instance)}` +
+        `#home_token=${launchToken}`,
       attach_kind: "iframe",
       launch_status: "launched",
     };
@@ -325,7 +351,164 @@ assert(
   "Home refresh changed the persisted Browser window identity",
   restoredBrowserLaunches,
 );
-shellCore.shellState.windows.clear();
+const restoredBrowserEntry = [...shellCore.shellState.windows.values()][0];
+const restoredBrowserFrame = restoredBrowserEntry.node.querySelector(".window-frame");
+const browserCloseMessages = [];
+restoredBrowserFrame.contentWindow = {
+  postMessage(message, origin) {
+    browserCloseMessages.push({ message, origin });
+  },
+};
+const originalBrowserWindow = {
+  entry: restoredBrowserEntry,
+  frame: restoredBrowserFrame,
+  node: restoredBrowserEntry.node,
+  route: restoredBrowserFrame.dataset.route,
+};
+const expiredAuthorityClose = shellWindows.closeWindow(restoredBrowserEntry.id);
+const expiredAuthorityCloseRequest = browserCloseMessages.at(-1);
+assert(
+  expiredAuthorityCloseRequest?.message.homeToken ===
+    "browser-window-close-token" &&
+    shellCore.shellState.windows.has(restoredBrowserEntry.id),
+  "expired Browser authority close did not remain nonterminal before renewal",
+  { expiredAuthorityCloseRequest },
+);
+const failedRenewal = shellWindows.renewBrowserWindowAuthority(
+  restoredBrowserEntry.id,
+);
+const duplicateFailedRenewal = shellWindows.renewBrowserWindowAuthority(
+  restoredBrowserEntry.id,
+);
+const failedRenewals = await Promise.allSettled([
+  failedRenewal,
+  duplicateFailedRenewal,
+]);
+assert(
+  failedRenewal === duplicateFailedRenewal &&
+    failedRenewals.every(
+      (result) =>
+        result.status === "rejected" &&
+        result.reason?.message ===
+          "simulated Browser authority renewal failure",
+    ) &&
+    restoredBrowserLaunches.length === 2 &&
+    restoredBrowserFrame.dataset.route === originalBrowserWindow.route &&
+    restoredBrowserEntry.browserCloseRequest &&
+    shellCore.shellState.windows.has(restoredBrowserEntry.id),
+  "failed Browser authority renewal changed the old frame or duplicated launch",
+  {
+    launches: restoredBrowserLaunches,
+    route: restoredBrowserFrame.dataset.route,
+    failedRenewals,
+  },
+);
+const successfulRenewal = await shellWindows.renewBrowserWindowAuthority(
+  restoredBrowserEntry.id,
+);
+assert(
+  successfulRenewal?.browserInstance ===
+    "browser:restored-refresh-regression" &&
+    successfulRenewal?.freshHomeToken ===
+      "browser-window-renewed-token-3" &&
+    await expiredAuthorityClose === false &&
+    restoredBrowserLaunches.length === 3 &&
+    restoredBrowserLaunches[2].query.browser_instance ===
+      "browser:restored-refresh-regression" &&
+    shellCore.shellState.windows.get(restoredBrowserEntry.id) ===
+      originalBrowserWindow.entry &&
+    restoredBrowserEntry.node === originalBrowserWindow.node &&
+    restoredBrowserEntry.node.querySelector(".window-frame") ===
+      originalBrowserWindow.frame &&
+    restoredBrowserFrame.dataset.route.includes(
+      "browser_instance=browser%3Arestored-refresh-regression",
+    ) &&
+    restoredBrowserFrame.dataset.route.endsWith(
+      "#home_token=browser-window-renewed-token-3",
+    ) &&
+    browserCloseMessages.length === 1 &&
+    restoredBrowserEntry.node.dataset.browserCloseState === "retry",
+  "expired Browser authority close blocked in-place renewal of the active owner",
+  {
+    launches: restoredBrowserLaunches,
+    route: restoredBrowserFrame.dataset.route,
+    windows: [...shellCore.shellState.windows.keys()],
+  },
+);
+const renewedBrowserToken = "browser-window-renewed-token-3";
+const firstBrowserClose = shellWindows.closeWindow(restoredBrowserEntry.id);
+const firstBrowserCloseRequest = browserCloseMessages.at(-1);
+assert(
+  firstBrowserCloseRequest?.origin === "*" &&
+    Object.keys(firstBrowserCloseRequest.message).sort().join(",") ===
+      "browserInstance,homeToken,requestId,type" &&
+    firstBrowserCloseRequest.message.type ===
+      "elastos.browser.window-close.request/v1" &&
+    firstBrowserCloseRequest.message.homeToken === renewedBrowserToken &&
+    firstBrowserCloseRequest.message.browserInstance ===
+      "browser:restored-refresh-regression" &&
+    shellCore.shellState.windows.has(restoredBrowserEntry.id),
+  "explicit Browser close did not retain the frame while requesting exact cleanup",
+  { firstBrowserCloseRequest, windows: [...shellCore.shellState.windows.keys()] },
+);
+const pendingResult = {
+  type: "elastos.browser.window-close.result/v1",
+  requestId: firstBrowserCloseRequest.message.requestId,
+  homeToken: renewedBrowserToken,
+  browserInstance: "browser:restored-refresh-regression",
+  state: "pending",
+  pageId: "page-1",
+  generation: 1,
+  cleanupId: "cleanup-1",
+  terminalKind: "",
+  reason: "transport_failure",
+};
+sendWindowEvent("message", {
+  origin: "null",
+  source: { postMessage() {} },
+  data: { ...pendingResult, state: "terminal", terminalKind: "closed", reason: "" },
+});
+assert(
+  shellCore.shellState.windows.has(restoredBrowserEntry.id),
+  "a terminal receipt from the wrong iframe source removed Browser",
+);
+sendWindowEvent("message", {
+  origin: "null",
+  source: restoredBrowserFrame.contentWindow,
+  data: pendingResult,
+});
+assert(
+  await firstBrowserClose === false &&
+    shellCore.shellState.windows.has(restoredBrowserEntry.id) &&
+    restoredBrowserEntry.node.dataset.browserCloseState === "retry" &&
+    restoredBrowserEntry.node
+      .querySelector("[data-action='close']")
+      .getAttribute("aria-label") === "Retry Browser close",
+  "nonterminal Browser cleanup did not retain the exact frame and expose retry",
+  {
+    state: restoredBrowserEntry.node.dataset.browserCloseState,
+    windows: [...shellCore.shellState.windows.keys()],
+  },
+);
+const secondBrowserClose = shellWindows.closeAllTargetWindows("browser");
+const secondBrowserCloseRequest = browserCloseMessages.at(-1);
+sendWindowEvent("message", {
+  origin: "null",
+  source: restoredBrowserFrame.contentWindow,
+  data: {
+    ...pendingResult,
+    requestId: secondBrowserCloseRequest.message.requestId,
+    state: "terminal",
+    terminalKind: "already_absent",
+    reason: "",
+  },
+});
+assert(
+  await secondBrowserClose === true &&
+    !shellCore.shellState.windows.has(restoredBrowserEntry.id),
+  "group close did not accept the exact already-absent Browser cleanup receipt",
+  { secondBrowserCloseRequest, windows: [...shellCore.shellState.windows.keys()] },
+);
 shellCore.shellState.activeWindowId = null;
 shellCore.shellState.homeBrowserState.session = null;
 

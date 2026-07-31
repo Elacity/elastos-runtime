@@ -46,7 +46,7 @@ import {
   renderTaskbar,
   toggleLauncher,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260731a";
+} from "./shell-surface.js?v=home-20260731b";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -55,9 +55,10 @@ import {
   handleShellResize,
   openTarget,
   focusWindow,
+  renewBrowserWindowAuthority,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260731a";
+} from "./shell-windows.js?v=home-20260731b";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -208,9 +209,12 @@ export function closeHomeGuiWindow(windowId) {
   closeWindow(windowId);
 }
 
-export function relaunchHomeGuiTarget(windowId, target) {
-  closeWindow(windowId);
+export async function relaunchHomeGuiTarget(windowId, target) {
+  if (await closeWindow(windowId) !== true) {
+    return false;
+  }
   window.setTimeout(() => openTarget(target), 0);
+  return true;
 }
 
 export function deliverMessageToHomeGuiTargetFrame(target, payload, options = null) {
@@ -310,6 +314,14 @@ function homeLaunchTokenFromRoute(route) {
   }
 }
 
+function browserInstanceFromRoute(route) {
+  try {
+    return new URL(route, window.location.href).searchParams.get("browser_instance") || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
 function homeGuiWindowEntryForToken(homeToken) {
   if (!homeToken) {
     return null;
@@ -343,15 +355,40 @@ export function attachAuthorizedHomeGuiTarget(launched) {
   return attachAuthorizedTarget(launched);
 }
 
-export function relaunchHomeGuiWindowForToken(homeToken) {
+export async function relaunchHomeGuiWindowForToken(homeToken) {
   const entry = homeGuiWindowEntryForToken(homeToken);
   if (!entry) {
     return false;
   }
   const { id, targetId, launchQuery } = entry;
-  closeWindow(id);
+  if (targetId === "browser") {
+    return renewBrowserWindowAuthority(id);
+  }
+  if (await closeWindow(id) !== true) {
+    return false;
+  }
   window.setTimeout(() => openTarget(targetId, { query: launchQuery || {} }), 0);
   return true;
+}
+
+export function renewHomeGuiBrowserWindowAuthority(
+  homeToken,
+  browserInstance,
+  options = {},
+) {
+  const entry = homeGuiWindowEntryForToken(homeToken);
+  const frame = entry?.node?.querySelector(".window-frame");
+  const route = frame?.dataset?.route || frame?.getAttribute("src") || "";
+  if (
+    !entry ||
+    entry.targetId !== "browser" ||
+    !browserInstance ||
+    entry.launchQuery?.browser_instance !== browserInstance ||
+    browserInstanceFromRoute(route) !== browserInstance
+  ) {
+    return Promise.resolve(false);
+  }
+  return renewBrowserWindowAuthority(entry.id, options);
 }
 
 export function hideHomeGuiLauncher() {

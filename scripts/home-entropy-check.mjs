@@ -1594,7 +1594,8 @@ const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-p
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260725a";
 const homeClipboardAssetVersion = "home-20260726a";
-const homeGuiAssetVersion = "home-20260731a";
+const homeGuiAssetVersion = "home-20260731b";
+const homeShellHostAssetVersion = "home-20260731b";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -1871,7 +1872,7 @@ assert(
   "Home must allow GBA to open Library and Library to return compatible ROMs while keeping both directions source-gated",
 );
 assert(
-  shellIndex.includes(`home-shell-host.js?v=${homeClipboardAssetVersion}`),
+  shellIndex.includes(`home-shell-host.js?v=${homeShellHostAssetVersion}`),
   "Home entry module must cache-bust after shell browser changes",
 );
 assert(
@@ -4422,13 +4423,84 @@ assert(
     browserJs.includes("requireTerminalRuntimePageCloseOutcome") &&
     !browserJs.includes("__elastosBrowserReleaseRuntimePage") &&
     !shellWindows.includes("__elastosBrowserReleaseRuntimePage") &&
+    shellWindows.includes('"elastos.browser.window-close.request/v1"') &&
+    shellWindows.includes('"elastos.browser.window-close.result/v1"') &&
+    shellWindows.includes("event.source !== record.frameWindow") &&
+    shellWindows.includes("markBrowserWindowCloseState(record.entry, \"retry\")") &&
+    shellWindows.includes("Promise.all(entries.map((entry) => closeWindow(entry.id)))") &&
+    shellWindows.includes(
+      "export function renewBrowserWindowAuthority(id, options = {})",
+    ) &&
+    shellWindows.includes(
+      "nextAuthority?.browserInstance !== browserInstance",
+    ) &&
+    shellWindows.includes(
+      "settleBrowserWindowClose(entry.browserCloseRequest, false)",
+    ) &&
+    shellWindows.includes("freshHomeToken: nextAuthority.homeToken") &&
+    homeGuiJs.includes('if (targetId === "browser")') &&
+    homeGuiJs.includes("return renewBrowserWindowAuthority(id);") &&
+    homeGuiJs.includes("export function renewHomeGuiBrowserWindowAuthority(") &&
+    homeGuiShell.includes(
+      '"elastos.home.browser-authority-renew.result/v1"',
+    ) &&
+    homeGuiShell.includes("const HOME_GUI_REQUEST_TIMEOUT_MS = 30_000;") &&
+    homeGuiShell.includes("async function handleBrowserAuthorityRenewalCommand(message)") &&
+    homeGuiShell.includes("message.expiresAt - Date.now()") &&
+    homeGuiShell.includes('{ timeoutMs: remainingMs }') &&
+    shellJs.includes(
+      '"elastos.home.browser-authority-renew.request/v1"',
+    ) &&
+    shellJs.includes(
+      '"elastos.home.browser-authority-renew.result/v1"',
+    ) &&
+    shellJs.includes(
+      "const BROWSER_AUTHORITY_RENEWAL_GUI_TIMEOUT_MS = 30_000;",
+    ) &&
+    shellJs.includes(
+      "const BROWSER_AUTHORITY_RENEWAL_TIMEOUT_MS = 35_000;",
+    ) &&
+    shellJs.includes(
+      "expiresAt: Date.now() + BROWSER_AUTHORITY_RENEWAL_GUI_TIMEOUT_MS",
+    ) &&
+    shellJs.includes("const pendingBrowserAuthorityRenewals = new Map();") &&
+    shellJs.includes("function startBrowserAuthorityRenewal(") &&
+    shellJs.includes("function handleBrowserAuthorityRenewalResult(") &&
+    !shellJs.includes('data.type === "home:relaunch-self"') &&
+    browserMain.includes(
+      "const BROWSER_AUTHORITY_RENEWAL_ACK_TIMEOUT_MS = 40_000;",
+    ) &&
+    browserMain.includes("async function handleHomeBrowserWindowCloseRequest(event)") &&
+    browserMain.includes("runtimeOpenInFlight > 0") &&
+    browserMain.includes("await closeRuntimePage(owner, { explicitRetry: true })") &&
+    homeShellRegressionSmoke.includes(
+      "nonterminal Browser cleanup did not retain the exact frame and expose retry",
+    ) &&
+    homeShellRegressionSmoke.includes(
+      "expired Browser authority close blocked in-place renewal of the active owner",
+    ) &&
+    homeShellRegressionSmoke.includes(
+      "failed Browser authority renewal changed the old frame or duplicated launch",
+    ) &&
+    homeShellBridgeSmoke.includes(
+      "duplicate Browser renewal request launched duplicate GUI work",
+    ) &&
+    homeShellBridgeSmoke.includes(
+      "failed GUI renewal did not preserve and notify the exact old Browser frame",
+    ) &&
+    homeShellBridgeSmoke.includes(
+      "retired old Browser authority remained able to request renewal",
+    ) &&
+    homeShellRegressionSmoke.includes(
+      "group close did not accept the exact already-absent Browser cleanup receipt",
+    ) &&
     browserJs.includes("window.__elastosBrowserCurrentPageId") &&
     gatewayApi.includes('"/api/apps/browser/pages/:page_id/close"') &&
     gatewayBrowserApi.includes("pub(super) async fn browser_app_page_close") &&
     gatewayBrowserRouteTests.includes(
       '.uri(format!("/api/apps/browser/pages/{page_id}/close"))',
     ),
-  "Browser unload must retain the authenticated Runtime owner for terminal reconciliation before replacement, without exposing a same-origin function hook to Home",
+  "Browser unload must retain the authenticated Runtime owner while explicit Home close waits for an exact source-bound terminal receipt before removing its frame",
 );
 const walletWalletconnect = read("capsules/wallet-walletconnect/browser/index.html");
 const walletWalletconnectJs = read(

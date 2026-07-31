@@ -87,6 +87,12 @@ const homeShellHostContract = read("docs/HOME_SHELL_HOST_CONTRACT.md");
 const homeClipboardHeadlessSmoke = read(
   "scripts/home-clipboard-headless-smoke.mjs",
 );
+const browserWindowCloseHeadlessSmoke = read(
+  "scripts/browser-window-close-headless-smoke.mjs",
+);
+const browserWindowCloseHandshakeTest = read(
+  "scripts/browser-window-close-handshake.test.mjs",
+);
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
 const browserEngineAdapter = readAll([
@@ -1841,7 +1847,8 @@ assert(
     ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260731a") &&
+    browser.includes("browser.js?v=browser-20260731b") &&
+    !browser.includes("browser.js?v=browser-20260731a") &&
     !browser.includes("browser.js?v=browser-20260730a") &&
     !browser.includes("browser.js?v=browser-20260728a") &&
     !browser.includes("browser.js?v=browser-20260727a") &&
@@ -1982,6 +1989,21 @@ const finalizeRuntimePageCloseBlock = sourceBlock(
   "function finalizeRuntimePageClose(owner)",
   "Browser terminal close finalizer",
 );
+const handleHomeBrowserWindowCloseRequestBlock = sourceBlock(
+  browserMain,
+  "async function handleHomeBrowserWindowCloseRequest(event)",
+  "Browser explicit Home window close",
+);
+const classifyFreshWindowCloseSummaryBlock = sourceBlock(
+  browserMain,
+  "function classifyFreshWindowCloseSummary(summary)",
+  "Browser fresh ownership probe",
+);
+const settleInitialRuntimeOpenPostFailureBlock = sourceBlock(
+  browserMain,
+  "function settleInitialRuntimeOpenPostFailure(settlement, error)",
+  "Browser initial open failure settlement",
+);
 const failRuntimeOwnedPageBlock = sourceBlock(
   browserMain,
   "async function failRuntimeOwnedPage(",
@@ -2004,10 +2026,107 @@ assert(
     finalizeRuntimePageCloseBlock.includes("currentRemoteExitId = \"\";") &&
     finalizeRuntimePageCloseBlock.includes("publishRuntimePageForHost(null);") &&
     finalizeRuntimePageCloseBlock.includes("closeRemoteDisplay();") &&
+    finalizeRuntimePageCloseBlock.includes(
+      "runtimeOwnershipTerminallyAbsent = true;",
+    ) &&
     (browserMain.match(/currentPage = null;/g) || []).length === 2 &&
     (browserMain.match(/publishRuntimePageForHost\(null\);/g) || []).length === 1 &&
     (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 2,
   "Browser unload and post-ownership failure cleanup must retain Runtime ownership; only a Runtime-proven terminal close may clear the exact page generation, identities, or persistence",
+);
+
+assert(
+  browserMain.includes('"elastos.browser.window-close.request/v1"') &&
+    browserMain.includes('"elastos.browser.window-close.result/v1"') &&
+    browserMain.includes(
+      '"elastos.home.browser-authority-renew.request/v1"',
+    ) &&
+    browserMain.includes(
+      '"elastos.home.browser-authority-renew.result/v1"',
+    ) &&
+    browserMain.includes(
+      "const BROWSER_AUTHORITY_RENEWAL_ACK_TIMEOUT_MS = 40_000;",
+    ) &&
+    browserMain.includes("function handleHomeBrowserAuthorityRenewalResult(event)") &&
+    browserMain.includes("event.source !== window.top") &&
+    browserMain.includes("message.requestId !== request.requestId") &&
+    browserMain.includes("browserAuthorityRenewalAttempts = Math.min(") &&
+    browserMain.includes("BROWSER_AUTHORITY_RENEWAL_RETRY_DELAYS_MS.length - 1") &&
+    browserMain.includes("? { browser_instance: browserInstanceId }") &&
+    handleHomeBrowserWindowCloseRequestBlock.includes("runtimeOpenInFlight > 0") &&
+    handleHomeBrowserWindowCloseRequestBlock.includes(
+      "await closeRuntimePage(owner, { explicitRetry: true })",
+    ) &&
+    handleHomeBrowserWindowCloseRequestBlock.includes("recoverableRuntimePage()") &&
+    handleHomeBrowserWindowCloseRequestBlock.includes(
+      '"runtime_open_in_flight"',
+    ) &&
+    browserMain.includes("let unsettledRuntimeOpen = null;") &&
+    browserMain.includes("function requestFreshRuntimeAuthority(error)") &&
+    browserMain.includes("stopPageStatusPolling();") &&
+    browserMain.includes("stopPageHeartbeat();") &&
+    browserMain.includes("!relaunchRequested") &&
+    browserMain.includes(
+      "function proveRuntimeOwnershipAbsentBeforeDispatch()",
+    ) &&
+    browserMain.includes("const nextUrl = normalizeRuntimeOpenUrl(value);") &&
+    browserMain.includes(
+      'pendingWindowCloseOwnership("runtime_ownership_unproven")',
+    ) &&
+    browserMain.includes('"terminal_pre_effect_failure"') &&
+    browserMain.includes('"terminal_post_effect_cleanup"') &&
+    !classifyFreshWindowCloseSummaryBlock.includes(
+      "terminalWindowCloseAbsence()",
+    ) &&
+    settleInitialRuntimeOpenPostFailureBlock.includes(
+      "isAuthoritySessionError(error)",
+    ) &&
+    settleInitialRuntimeOpenPostFailureBlock.includes(
+      "terminalRuntimeOpenOutcome(error?.payload)",
+    ) &&
+    homeGuiWindowsSource.includes("pendingBrowserWindowCloses") &&
+    homeGuiWindowsSource.includes("event.source !== record.frameWindow") &&
+    homeGuiWindowsSource.includes("markBrowserWindowCloseState(record.entry, \"retry\")") &&
+    homeGuiWindowsSource.includes("Promise.all(entries.map((entry) => closeWindow(entry.id)))") &&
+    browserWindowCloseHeadlessSmoke.includes(
+      'schema: "elastos.browser.window-close-headless-smoke/v1"',
+    ) &&
+    browserWindowCloseHeadlessSmoke.includes("simulated lost open poll") &&
+    browserWindowCloseHeadlessSmoke.includes(
+      "ownerless close claimed terminal while the exact async open was pending",
+    ) &&
+    browserWindowCloseHeadlessSmoke.includes(
+      "old retained Browser frame did not accept the exact already-absent reap receipt",
+    ) &&
+    browserWindowCloseHeadlessSmoke.includes("generic Browser iframe navigation called Runtime close") &&
+    browserWindowCloseHandshakeTest.includes(
+      "ownership-changing open returns pending without closing or claiming terminal",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "recoverable Runtime owner is closed exactly when no current page exists",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "cleanup-pending outcome plus an empty summary never proves absence",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "initial 409 conflict never proves Browser ownership absent",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "initial normalization rejection before dispatch proves local absence",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "active authority expiry retries exact renewal and accepts only its bound success",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "authority renewal remains live at the capped retry interval",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "late Home launch response cannot resume a timed-out GUI renewal",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "expired GUI renewal command cannot start a Browser launch",
+    ),
+  "Explicit Home Browser close must be source/token/instance bound, retain the frame through pending or ownership transitions, and remove it only after an exact terminal Runtime receipt",
 );
 
 assert(
@@ -2122,7 +2241,9 @@ assert(
 
 assert(
   browserJs.includes("function syncDisplayInputFromSession(displaySession)") &&
-    browserJs.includes("syncDisplayInputFromSession(page.display_session)") &&
+    browserJs.includes(
+      "syncDisplayInputFromSession(openedPage.display_session)",
+    ) &&
     browserJs.includes("currentPage?.display_session?.input === \"datachannel\"") &&
     browserJs.includes("currentPage?.display_session?.input_protocol === \"selkies_v1\"") &&
     browserJs.includes('currentInputTransport() === "datachannel"') &&

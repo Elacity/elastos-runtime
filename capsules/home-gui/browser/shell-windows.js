@@ -46,6 +46,12 @@ const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
+const BROWSER_WINDOW_CLOSE_TIMEOUT_MS = 10_000;
+const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
+  "elastos.browser.window-close.request/v1";
+const BROWSER_WINDOW_CLOSE_RESULT_TYPE =
+  "elastos.browser.window-close.result/v1";
+const OPAQUE_CAPSULE_ORIGIN = "null";
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"]);
 const WALLET_CONNECTOR_TARGETS = new Set([
@@ -77,6 +83,9 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
 ];
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
 const pendingWindowLaunches = new Set();
+const pendingBrowserWindowCloses = new Map();
+
+window.addEventListener("message", handleBrowserWindowCloseResult);
 
 function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
@@ -481,6 +490,253 @@ function removeWindowEntries(entries) {
   return true;
 }
 
+function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index]);
+}
+
+function browserWindowCloseContext(entry) {
+  if (!entry || entry.targetId !== "browser") {
+    return null;
+  }
+  const frame = entry.node.querySelector(".window-frame");
+  let frameWindow = null;
+  try {
+    frameWindow = frame?.contentWindow || null;
+  } catch (_error) {
+    return null;
+  }
+  const route = frame?.dataset?.route || frame?.getAttribute("src") || "";
+  let homeToken = "";
+  try {
+    const url = new URL(route, window.location.href);
+    homeToken =
+      new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
+  } catch (_error) {
+    return null;
+  }
+  const browserInstance =
+    typeof entry.launchQuery?.browser_instance === "string"
+      ? entry.launchQuery.browser_instance
+      : "";
+  if (!frameWindow || !homeToken || !browserInstance) {
+    return null;
+  }
+  return { browserInstance, frameWindow, homeToken };
+}
+
+function browserWindowCloseRequestId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(
+      bytes,
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("");
+  }
+  throw new Error("Home GUI requires browser crypto for close isolation");
+}
+
+function markBrowserWindowCloseState(entry, state) {
+  if (!entry || !shellState.windows.has(entry.id)) {
+    return;
+  }
+  const closeButton = entry.node.querySelector("[data-action='close']");
+  entry.node.dataset.browserCloseState = state;
+  closeButton.disabled = state === "pending";
+  if (state === "retry") {
+    closeButton.setAttribute("aria-label", "Retry Browser close");
+    closeButton.title = "Runtime cleanup is pending. Activate to retry close.";
+    return;
+  }
+  closeButton.setAttribute("aria-label", "Close");
+  closeButton.title = state === "pending" ? "Closing Browser…" : "";
+}
+
+function settleBrowserWindowClose(record, terminal) {
+  window.clearTimeout(record.timeout);
+  pendingBrowserWindowCloses.delete(record.requestId);
+  if (record.entry.browserCloseRequest === record) {
+    delete record.entry.browserCloseRequest;
+  }
+  if (terminal && shellState.windows.get(record.entry.id) === record.entry) {
+    removeWindowEntries([record.entry]);
+    record.resolve(true);
+    return;
+  }
+  markBrowserWindowCloseState(record.entry, "retry");
+  record.resolve(false);
+}
+
+function handleBrowserWindowCloseResult(event) {
+  const message = event.data;
+  if (
+    event.origin !== OPAQUE_CAPSULE_ORIGIN ||
+    !hasExactKeys(message, [
+      "type",
+      "requestId",
+      "homeToken",
+      "browserInstance",
+      "state",
+      "pageId",
+      "generation",
+      "cleanupId",
+      "terminalKind",
+      "reason",
+    ]) ||
+    message.type !== BROWSER_WINDOW_CLOSE_RESULT_TYPE
+  ) {
+    return;
+  }
+  const record = pendingBrowserWindowCloses.get(message.requestId);
+  if (
+    !record ||
+    event.source !== record.frameWindow ||
+    message.homeToken !== record.homeToken ||
+    message.browserInstance !== record.browserInstance ||
+    !["terminal", "pending", "error"].includes(message.state) ||
+    typeof message.pageId !== "string" ||
+    !Number.isSafeInteger(message.generation) ||
+    message.generation < 0 ||
+    typeof message.cleanupId !== "string" ||
+    typeof message.terminalKind !== "string" ||
+    typeof message.reason !== "string"
+  ) {
+    return;
+  }
+  const terminal =
+    message.state === "terminal" &&
+    ["closed", "already_absent", "no_page"].includes(message.terminalKind) &&
+    message.reason === "";
+  settleBrowserWindowClose(record, terminal);
+}
+
+function requestBrowserWindowClose(entry) {
+  if (entry.browserCloseRequest) {
+    return entry.browserCloseRequest.promise;
+  }
+  const context = browserWindowCloseContext(entry);
+  if (!context) {
+    markBrowserWindowCloseState(entry, "retry");
+    return Promise.resolve(false);
+  }
+  const requestId = browserWindowCloseRequestId();
+  let resolveRequest;
+  const promise = new Promise((resolve) => {
+    resolveRequest = resolve;
+  });
+  const record = {
+    ...context,
+    entry,
+    promise,
+    requestId,
+    resolve: resolveRequest,
+    timeout: 0,
+  };
+  record.timeout = window.setTimeout(() => {
+    settleBrowserWindowClose(record, false);
+  }, BROWSER_WINDOW_CLOSE_TIMEOUT_MS);
+  entry.browserCloseRequest = record;
+  pendingBrowserWindowCloses.set(requestId, record);
+  markBrowserWindowCloseState(entry, "pending");
+  context.frameWindow.postMessage(
+    {
+      type: BROWSER_WINDOW_CLOSE_REQUEST_TYPE,
+      requestId,
+      homeToken: context.homeToken,
+      browserInstance: context.browserInstance,
+    },
+    "*",
+  );
+  return promise;
+}
+
+function browserLaunchAuthority(route) {
+  try {
+    const url = new URL(route, window.location.href);
+    return {
+      browserInstance: url.searchParams.get("browser_instance") || "",
+      homeToken:
+        new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") ||
+        "",
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+export function renewBrowserWindowAuthority(id, options = {}) {
+  const entry = shellState.windows.get(id);
+  if (!entry || entry.targetId !== "browser") {
+    return Promise.resolve(false);
+  }
+  if (entry.browserAuthorityRenewal) {
+    return entry.browserAuthorityRenewal;
+  }
+  const launchQuery = normalizedLaunchQuery(entry.launchQuery);
+  const browserInstance = launchQuery.browser_instance || "";
+  const frame = entry.node.querySelector(".window-frame");
+  const currentAuthority = browserLaunchAuthority(
+    frame?.dataset?.route || frame?.getAttribute("src") || "",
+  );
+  if (!browserInstance || currentAuthority?.browserInstance !== browserInstance) {
+    return Promise.resolve(false);
+  }
+  let renewal;
+  renewal = Promise.resolve()
+    .then(() =>
+      requireWindowHooks().launchTarget("browser", launchQuery, options),
+    )
+    .then((launched) => {
+      if (shellState.windows.get(id) !== entry) {
+        return false;
+      }
+      const nextAuthority = browserLaunchAuthority(launched?.route || "");
+      if (
+        launched?.target !== "browser" ||
+        launched.attach_kind !== "iframe" ||
+        launchDidFail(launched) ||
+        nextAuthority?.browserInstance !== browserInstance ||
+        !nextAuthority.homeToken ||
+        nextAuthority.homeToken === currentAuthority.homeToken
+      ) {
+        throw new Error("Browser authority renewal returned an invalid launch");
+      }
+      launched.title = canonicalTargetTitle(launched.target, launched.title);
+      entry.title = launched.title;
+      fitLaunchedWindow(entry);
+      if (entry.browserCloseRequest) {
+        settleBrowserWindowClose(entry.browserCloseRequest, false);
+      }
+      syncBrowserWindow(entry, launched);
+      try {
+        renderWindowTaskbar();
+        persistBrowserSession();
+      } catch (error) {
+        console.warn("Home GUI could not persist renewed Browser authority", error);
+      }
+      return Object.freeze({
+        browserInstance,
+        freshHomeToken: nextAuthority.homeToken,
+      });
+    })
+    .finally(() => {
+      if (entry.browserAuthorityRenewal === renewal) {
+        delete entry.browserAuthorityRenewal;
+      }
+    });
+  entry.browserAuthorityRenewal = renewal;
+  return renewal;
+}
+
 function activateTargetGroup(targetId) {
   const visibleTop = topBrowserWindowEntryForTarget(targetId, { includeHidden: false });
   if (visibleTop) {
@@ -499,7 +755,16 @@ export function hideAllTargetWindows(targetId) {
 }
 
 export function closeAllTargetWindows(targetId) {
-  return removeWindowEntries(browserWindowEntriesForTarget(targetId));
+  const entries = browserWindowEntriesForTarget(targetId);
+  if (targetId !== "browser") {
+    return removeWindowEntries(entries);
+  }
+  if (entries.length === 0) {
+    return false;
+  }
+  return Promise.all(entries.map((entry) => closeWindow(entry.id))).then(
+    (results) => results.every((result) => result === true),
+  );
 }
 
 function renderSystemErrorWindow({
@@ -973,9 +1238,12 @@ function hideWindow(id) {
 export function closeWindow(id) {
   const entry = shellState.windows.get(id);
   if (!entry) {
-    return;
+    return false;
   }
-  removeWindowEntries([entry]);
+  if (entry.targetId === "browser") {
+    return requestBrowserWindowClose(entry);
+  }
+  return removeWindowEntries([entry]);
 }
 
 function focusTopVisibleWindow() {

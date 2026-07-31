@@ -50,6 +50,12 @@ const HOME_CLI_SHELL_ID = "home-cli";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
 const MAX_LAUNCHED_APP_CONTEXTS = 128;
+const BROWSER_AUTHORITY_RENEWAL_GUI_TIMEOUT_MS = 30_000;
+const BROWSER_AUTHORITY_RENEWAL_TIMEOUT_MS = 35_000;
+const BROWSER_AUTHORITY_RENEWAL_REQUEST_TYPE =
+  "elastos.home.browser-authority-renew.request/v1";
+const BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE =
+  "elastos.home.browser-authority-renew.result/v1";
 const HOME_GUI_AUTHORIZED_ATTACHMENT_SCHEMA =
   "elastos.home.authorized-target-attachment/v1";
 const WALLET_CONNECTOR_TARGET_TITLES = Object.freeze({
@@ -82,6 +88,7 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
 });
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
+const pendingBrowserAuthorityRenewals = new Map();
 const homeClipboardPrompt = createHomeClipboardPrompt({
   root: document.querySelector("#home-clipboard-prompt"),
   title: document.querySelector("#home-clipboard-title"),
@@ -140,12 +147,14 @@ function retireLaunchedAppContext(homeToken) {
   if (!context) {
     return false;
   }
+  cancelBrowserAuthorityRenewalsForToken(homeToken);
   homeClipboardHost.retireFrame(context.clipboardState);
   launchedAppContexts.delete(homeToken);
   return true;
 }
 
 function clearLaunchedAppContexts() {
+  clearPendingBrowserAuthorityRenewals();
   for (const context of launchedAppContexts.values()) {
     homeClipboardHost.retireFrame(context.clipboardState);
   }
@@ -228,10 +237,207 @@ async function closeHomeGuiWindow(homeToken) {
   retireLaunchedAppContext(homeToken);
 }
 
-async function relaunchHomeGuiTarget(homeToken) {
-  requireHomeGuiActive("relaunch window");
-  postToActiveShell({ type: "home:gui-command", command: "relaunch-window", homeToken });
-  retireLaunchedAppContext(homeToken);
+function postBrowserAuthorityRenewalResult(record, result) {
+  try {
+    record.source.postMessage(
+      {
+        type: BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE,
+        requestId: record.requestId,
+        homeToken: record.oldHomeToken,
+        browserInstance: record.browserInstance,
+        ok: result.ok,
+        freshHomeToken: result.freshHomeToken,
+        reason: result.reason,
+      },
+      OPAQUE_FRAME_TARGET,
+    );
+  } catch (error) {
+    console.warn("home could not return Browser authority renewal", error);
+  }
+}
+
+function cancelBrowserAuthorityRenewalsForToken(homeToken) {
+  for (const [requestId, record] of pendingBrowserAuthorityRenewals) {
+    if (record.oldHomeToken !== homeToken) {
+      continue;
+    }
+    window.clearTimeout(record.timeout);
+    pendingBrowserAuthorityRenewals.delete(requestId);
+  }
+}
+
+function clearPendingBrowserAuthorityRenewals() {
+  for (const record of pendingBrowserAuthorityRenewals.values()) {
+    window.clearTimeout(record.timeout);
+  }
+  pendingBrowserAuthorityRenewals.clear();
+}
+
+function settleBrowserAuthorityRenewal(record, result) {
+  if (pendingBrowserAuthorityRenewals.get(record.requestId) !== record) {
+    return false;
+  }
+  window.clearTimeout(record.timeout);
+  pendingBrowserAuthorityRenewals.delete(record.requestId);
+  if (result.ok) {
+    retireLaunchedAppContext(record.oldHomeToken);
+  }
+  postBrowserAuthorityRenewalResult(record, result);
+  return true;
+}
+
+function startBrowserAuthorityRenewal(event, context, message) {
+  const requestId =
+    typeof message.requestId === "string" ? message.requestId.trim() : "";
+  const browserInstance =
+    typeof message.browserInstance === "string"
+      ? message.browserInstance.trim()
+      : "";
+  if (
+    context.kind !== "app-frame" ||
+    context.targetId !== "browser" ||
+    !hasExactMessageKeys(message, [
+      "type",
+      "requestId",
+      "homeToken",
+      "browserInstance",
+    ]) ||
+    message.type !== BROWSER_AUTHORITY_RENEWAL_REQUEST_TYPE ||
+    !requestId ||
+    requestId !== message.requestId ||
+    requestId.length > 128 ||
+    !browserInstance ||
+    browserInstance !== message.browserInstance ||
+    browserInstance.length > 256 ||
+    context.browserInstance !== browserInstance ||
+    context.source !== event.source
+  ) {
+    return false;
+  }
+  const pendingForFrame = [...pendingBrowserAuthorityRenewals.values()].find(
+    (record) =>
+      record.oldHomeToken === context.homeToken &&
+      record.browserInstance === browserInstance &&
+      record.source === event.source,
+  );
+  if (pendingForFrame) {
+    if (pendingForFrame.requestId !== requestId) {
+      postBrowserAuthorityRenewalResult(
+        {
+          requestId,
+          oldHomeToken: context.homeToken,
+          browserInstance,
+          source: event.source,
+        },
+        {
+          ok: false,
+          freshHomeToken: "",
+          reason: "renewal_in_flight",
+        },
+      );
+    }
+    return true;
+  }
+  if (pendingBrowserAuthorityRenewals.has(requestId)) {
+    return false;
+  }
+  const record = {
+    requestId,
+    oldHomeToken: context.homeToken,
+    browserInstance,
+    source: event.source,
+    timeout: 0,
+  };
+  record.timeout = window.setTimeout(() => {
+    settleBrowserAuthorityRenewal(record, {
+      ok: false,
+      freshHomeToken: "",
+      reason: "gui_timeout",
+    });
+  }, BROWSER_AUTHORITY_RENEWAL_TIMEOUT_MS);
+  pendingBrowserAuthorityRenewals.set(requestId, record);
+  try {
+    requireHomeGuiActive("renew Browser authority");
+    if (!postToActiveShell({
+      type: "home:gui-command",
+      command: "renew-browser-authority",
+      requestId,
+      oldHomeToken: context.homeToken,
+      browserInstance,
+      expiresAt: Date.now() + BROWSER_AUTHORITY_RENEWAL_GUI_TIMEOUT_MS,
+    })) {
+      throw new Error("Home GUI did not accept Browser authority renewal");
+    }
+  } catch (_error) {
+    settleBrowserAuthorityRenewal(record, {
+      ok: false,
+      freshHomeToken: "",
+      reason: "gui_unavailable",
+    });
+  }
+  return true;
+}
+
+function handleBrowserAuthorityRenewalResult(context, message) {
+  if (
+    context.kind !== "shell-frame" ||
+    context.targetId !== HOME_GUI_SHELL_ID ||
+    !hasExactMessageKeys(message, [
+      "type",
+      "requestId",
+      "oldHomeToken",
+      "browserInstance",
+      "ok",
+      "freshHomeToken",
+      "reason",
+      "homeToken",
+    ]) ||
+    message.type !== BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE
+  ) {
+    return false;
+  }
+  const record = pendingBrowserAuthorityRenewals.get(message.requestId);
+  if (
+    !record ||
+    message.oldHomeToken !== record.oldHomeToken ||
+    message.browserInstance !== record.browserInstance ||
+    typeof message.ok !== "boolean" ||
+    typeof message.freshHomeToken !== "string" ||
+    message.freshHomeToken.length > 4_096 ||
+    typeof message.reason !== "string" ||
+    message.reason.length > 128
+  ) {
+    return false;
+  }
+  if (!message.ok) {
+    if (message.freshHomeToken || !message.reason) {
+      return false;
+    }
+    return settleBrowserAuthorityRenewal(record, {
+      ok: false,
+      freshHomeToken: "",
+      reason: message.reason,
+    });
+  }
+  const oldContext = launchedAppContexts.get(record.oldHomeToken);
+  const freshContext = launchedAppContexts.get(message.freshHomeToken);
+  if (
+    message.reason !== "" ||
+    !message.freshHomeToken ||
+    message.freshHomeToken === record.oldHomeToken ||
+    oldContext?.targetId !== "browser" ||
+    oldContext.browserInstance !== record.browserInstance ||
+    oldContext.source !== record.source ||
+    freshContext?.targetId !== "browser" ||
+    freshContext.browserInstance !== record.browserInstance
+  ) {
+    return false;
+  }
+  return settleBrowserAuthorityRenewal(record, {
+    ok: true,
+    freshHomeToken: message.freshHomeToken,
+    reason: "",
+  });
 }
 
 async function deliverMessageToHomeGuiTargetFrame(target, payload) {
@@ -307,6 +513,10 @@ function rememberLaunchedAppContext(launched) {
   }
   launchedAppContexts.set(token, {
     targetId: launched.target,
+    browserInstance:
+      launched.target === "browser"
+        ? browserInstanceFromRoute(launched.route || "")
+        : "",
     origin: OPAQUE_CAPSULE_ORIGIN,
     parentOrigin: window.location.origin,
     source: null,
@@ -865,6 +1075,18 @@ window.addEventListener("message", (event) => {
   if (handleHomeWalletConnectorEffect(event, context, data)) {
     return;
   }
+  if (data.type === BROWSER_AUTHORITY_RENEWAL_REQUEST_TYPE) {
+    if (!startBrowserAuthorityRenewal(event, context, data)) {
+      console.warn("home ignored invalid Browser authority renewal request");
+    }
+    return;
+  }
+  if (data.type === BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE) {
+    if (!handleBrowserAuthorityRenewalResult(context, data)) {
+      console.warn("home ignored invalid Browser authority renewal result");
+    }
+    return;
+  }
   if (data.type === "home:launch-target") {
     const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
     const target = typeof data.target === "string" ? data.target.trim() : "";
@@ -1068,16 +1290,6 @@ window.addEventListener("message", (event) => {
     });
     return;
   }
-  if (data.type === "home:relaunch-self") {
-    if (context.kind !== "app-frame" || !context.targetId) {
-      console.warn("home ignored unauthorized relaunch-self message", context.targetId);
-      return;
-    }
-    relaunchHomeGuiTarget(context.homeToken).catch((error) => {
-      console.error("home relaunch-self failed", error);
-    });
-    return;
-  }
   if (data.type !== "home:open-target") {
     return;
   }
@@ -1183,6 +1395,7 @@ function homeMessageContext(event, data) {
     source: launched.source,
     clipboardState: launched.clipboardState,
     walletEffectState: launched.walletEffectState,
+    browserInstance: launched.browserInstance,
   };
 }
 
@@ -1190,6 +1403,14 @@ function homeLaunchTokenFromRoute(route) {
   try {
     const url = new URL(route, window.location.href);
     return new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function browserInstanceFromRoute(route) {
+  try {
+    return new URL(route, window.location.href).searchParams.get("browser_instance") || "";
   } catch (_error) {
     return "";
   }
