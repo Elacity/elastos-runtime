@@ -50,6 +50,8 @@ const BROWSER_VM_TARGET_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSI
 const DISPLAY_MODE_BOOT_ARG: &str = "elastos.browser_display_mode";
 const DISPLAY_WIDTH_BOOT_ARG: &str = "elastos.browser_width";
 const DISPLAY_HEIGHT_BOOT_ARG: &str = "elastos.browser_height";
+const PRODUCT_STREAM_WIDTH: u64 = 1920;
+const PRODUCT_STREAM_HEIGHT: u64 = 1080;
 const DISK_LIFETIME_LOCK_SUFFIX: &str = ".lifetime.lock";
 const LEGACY_VZ_CONFIGURATION_KEYS: [&str; 14] = [
     "ELASTOS_BROWSER_VM_ICE_SERVER",
@@ -362,8 +364,7 @@ async fn run() -> Result<(), String> {
     let launch = request
         .get("launch_request")
         .ok_or_else(|| unbound_launch_error("Browser VM open request missing launch_request"))?;
-    let transport =
-        validate_launch_request(launch, request_from_stdin).map_err(unbound_launch_error)?;
+    let transport = validate_launch_request(launch, request_from_stdin)?;
     let identity = VzLaunchIdentity::from_launch(launch);
     if !elastos_vz::is_supported() {
         return Err(did_not_act_settlement(
@@ -710,6 +711,15 @@ fn validate_launch_request(
     launch: &Value,
     request_from_stdin: bool,
 ) -> Result<VzTransportLaunch, String> {
+    let transport =
+        validate_vz_transport_launch(launch, request_from_stdin).map_err(unbound_launch_error)?;
+    let identity = VzLaunchIdentity::from_launch(launch);
+    validate_launch_configuration(launch)
+        .map_err(|error| did_not_act_settlement(&identity, error))?;
+    Ok(transport)
+}
+
+fn validate_launch_configuration(launch: &Value) -> Result<(), String> {
     if launch.get("schema").and_then(Value::as_str)
         != Some("elastos.browser.engine.launch-request/v1")
     {
@@ -758,7 +768,7 @@ fn validate_launch_request(
             "Browser VZ launcher requires adapter_ipc.runtime_stream_path for Runtime-mediated egress".to_string()
         })?;
     validate_absolute_path("adapter_ipc.runtime_stream_path", runtime_stream_path)?;
-    validate_vz_transport_launch(launch, request_from_stdin)
+    Ok(())
 }
 
 fn validate_vz_transport_launch(
@@ -1210,13 +1220,12 @@ fn append_browser_display_boot_args_without_legacy_media(
         .and_then(Value::as_str)
         .unwrap_or("webrtc_remote_display");
     write!(boot_args, " {DISPLAY_MODE_BOOT_ARG}={display_mode}").map_err(|err| err.to_string())?;
-    if let Some((width, height)) = launch_viewport(launch)? {
-        write!(
-            boot_args,
-            " {DISPLAY_WIDTH_BOOT_ARG}={width} {DISPLAY_HEIGHT_BOOT_ARG}={height}"
-        )
-        .map_err(|err| err.to_string())?;
-    }
+    let _ = launch_viewport(launch)?;
+    write!(
+        boot_args,
+        " {DISPLAY_WIDTH_BOOT_ARG}={PRODUCT_STREAM_WIDTH} {DISPLAY_HEIGHT_BOOT_ARG}={PRODUCT_STREAM_HEIGHT}"
+    )
+    .map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -3627,6 +3636,7 @@ mod tests {
     fn canonical_vz_launch_requires_complete_transport_before_effects() {
         let transport = transport_fixture('d');
         let launch = launch_for_transport(&transport);
+        assert!(launch.get("viewport").is_none());
         validate_launch_request(&launch, true).unwrap();
 
         let mut missing = launch.clone();
@@ -3636,6 +3646,7 @@ mod tests {
             .remove("transport_authority");
         let error = validate_launch_request(&missing, true).unwrap_err();
         assert!(error.contains("binding is incomplete"));
+        assert!(serde_json::from_str::<Value>(&error).is_err());
 
         let mut disabled = launch.clone();
         for field in [
@@ -3658,6 +3669,43 @@ mod tests {
                 .contains("substitute Runtime transport authority")
         );
         assert!(validate_vz_boot_args("console=hvc0 elastos.browser_ice_config_hex=7b7d").is_err());
+    }
+
+    #[test]
+    fn bound_null_viewport_returns_exact_pre_effect_did_not_act() {
+        let transport = transport_fixture('e');
+        let mut launch = launch_for_transport(&transport);
+        launch["viewport"] = Value::Null;
+
+        let error = validate_launch_request(&launch, true).unwrap_err();
+        let settlement: Value = serde_json::from_str(&error).unwrap();
+
+        assert_eq!(settlement["state"], "did_not_act");
+        assert_eq!(
+            settlement["binding_hash"],
+            transport.authority["binding_hash"]
+        );
+        assert_eq!(settlement["generation"], transport.authority["generation"]);
+        assert_eq!(settlement["page_id"], transport.authority["page_id"]);
+        assert_eq!(settlement["vm_id"], transport.authority["vm_id"]);
+        assert_eq!(
+            settlement["stream_id"],
+            transport.authority["egress"]["stream_id"]
+        );
+        assert!(settlement["message"]
+            .as_str()
+            .unwrap()
+            .contains("viewport.width must be an integer"));
+        assert!(settlement["effects"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == false));
+        assert!(settlement["absence"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| value == true));
     }
 
     #[test]
@@ -4155,7 +4203,7 @@ mod tests {
     }
 
     #[test]
-    fn display_boot_args_include_launch_viewport() {
+    fn display_boot_args_use_fixed_1080p_product_stream() {
         let launch = json!({
             "schema": "elastos.browser.engine.launch-request/v1",
             "adapter": "browser-vm-product",
@@ -4181,31 +4229,37 @@ mod tests {
         append_browser_display_boot_args_without_legacy_media(&mut boot_args, &launch).unwrap();
 
         assert!(boot_args.contains("elastos.browser_display_mode=webrtc_remote_display"));
-        assert!(boot_args.contains("elastos.browser_width=1470"));
-        assert!(boot_args.contains("elastos.browser_height=758"));
+        assert!(boot_args.contains("elastos.browser_width=1920"));
+        assert!(boot_args.contains("elastos.browser_height=1080"));
+        assert!(!boot_args.contains("elastos.browser_width=1470"));
+        assert!(!boot_args.contains("elastos.browser_height=758"));
+    }
+
+    #[test]
+    fn omitted_viewport_keeps_fixed_1080p_product_stream() {
+        let transport = transport_fixture('f');
+        let launch = launch_for_transport(&transport);
+        let mut boot_args = "console=hvc0".to_string();
+
+        append_browser_display_boot_args_without_legacy_media(&mut boot_args, &launch).unwrap();
+
+        assert!(boot_args.contains("elastos.browser_width=1920"));
+        assert!(boot_args.contains("elastos.browser_height=1080"));
     }
 
     #[test]
     fn launch_requires_runtime_owned_stream_path_for_egress() {
-        let launch = json!({
-            "schema": "elastos.browser.engine.launch-request/v1",
-            "adapter": "browser-vm-product",
-            "engine": "chromium_microvm",
-            "stream_id": "stream_test",
-            "display_mode": "webrtc_remote_display",
-            "guarantee_level": "mechanism_microvm",
-            "network_mode": "runtime_net_only",
-            "direct_network": false,
-            "wallet_injection": false,
-            "relay_ipc": {
-                "kind": "unix_socket",
-                "path": "/tmp/elastos-browser-local-exit-relay.sock"
-            }
-        });
+        let transport = transport_fixture('a');
+        let mut launch = launch_for_transport(&transport);
+        launch["adapter_ipc"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_stream_path");
 
-        let err = validate_launch_request(&launch, false).unwrap_err();
+        let err = validate_launch_request(&launch, true).unwrap_err();
 
-        assert!(err.contains("adapter_ipc.runtime_stream_path"));
+        assert!(err.contains("before exact identity validation"));
+        assert!(err.contains("transport launch identity changed"));
     }
 
     #[test]

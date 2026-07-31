@@ -27,7 +27,7 @@ import {
   isMissingRuntimePageError,
   requestedDisplayMode,
 } from "./browser-status.js?v=browser-20260730b";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260730b";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260731a";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;
@@ -40,8 +40,6 @@ const BROWSER_OPEN_POLL_INTERVAL_MS = 1_200;
 const BROWSER_OPEN_POLL_TIMEOUT_MS = 5 * 60_000;
 const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024;
 const PRODUCT_DISPLAY_MODE = "webrtc_remote_display";
-const PRODUCT_DISPLAY_ASPECT_WIDTH = 16;
-const PRODUCT_DISPLAY_ASPECT_HEIGHT = 9;
 const GUARANTEE_MECHANISM_MICROVM = "mechanism_microvm";
 const GUARANTEE_OPERATOR_RBI = "operator_rbi";
 const GUARANTEE_POLICY_WEBVIEW = "policy_webview";
@@ -91,7 +89,6 @@ let currentDisplayMode = "";
 let currentDisplayInput = "runtime_route";
 let currentDisplayInputProtocol = "elastos_json";
 let statusTimer = 0;
-let lastViewport = null;
 let canGoBack = false;
 let canGoForward = false;
 let pageStatusTimer = 0;
@@ -437,7 +434,6 @@ function releaseRuntimePageForUnload() {
   homeClipboard.teardown();
   stopPageStatusPolling();
   stopPageHeartbeat();
-  resizeObserver.disconnect();
 }
 
 function updateMetricsNode(status) {
@@ -721,47 +717,20 @@ function updateNavState() {
     document.body.dataset.loading === "true" || !currentPage;
 }
 
-function browserViewport() {
-  const rect = renderPanel.getBoundingClientRect();
-  const width = Math.max(320, Math.min(3840, Math.round(rect.width || 1280)));
-  const height = Math.max(240, Math.min(2160, Math.round(rect.height || 720)));
-  return aspectPreservingProductViewport(width, height);
-}
-
-function aspectPreservingProductViewport(width, height) {
-  const minScale = Math.max(
-    Math.ceil(320 / PRODUCT_DISPLAY_ASPECT_WIDTH),
-    Math.ceil(240 / PRODUCT_DISPLAY_ASPECT_HEIGHT),
-  );
-  const maxScale = Math.min(
-    Math.floor(3840 / PRODUCT_DISPLAY_ASPECT_WIDTH),
-    Math.floor(2160 / PRODUCT_DISPLAY_ASPECT_HEIGHT),
-  );
-  const requestedScale = Math.min(
-    Math.floor(width / PRODUCT_DISPLAY_ASPECT_WIDTH),
-    Math.floor(height / PRODUCT_DISPLAY_ASPECT_HEIGHT),
-  );
-  const scale = Math.max(minScale, Math.min(maxScale, requestedScale));
-  return {
-    width: PRODUCT_DISPLAY_ASPECT_WIDTH * scale,
-    height: PRODUCT_DISPLAY_ASPECT_HEIGHT * scale,
-  };
-}
-
-function syncViewFromResponse(response) {
+function syncViewFromResponse(response, { dimensions = true } = {}) {
   if (typeof response?.can_go_back === "boolean") {
     canGoBack = response.can_go_back;
   }
   if (typeof response?.can_go_forward === "boolean") {
     canGoForward = response.can_go_forward;
   }
-  if (Number(response?.width) && Number(response?.height)) {
+  if (
+    dimensions &&
+    Number(response?.width) &&
+    Number(response?.height)
+  ) {
     currentView = {
       ...(currentView || {}),
-      width: Number(response.width),
-      height: Number(response.height),
-    };
-    lastViewport = {
       width: Number(response.width),
       height: Number(response.height),
     };
@@ -828,7 +797,6 @@ async function sendBrowserInput(
   }
   const requiresRuntimeRoute =
     event?.type === "browser_command" ||
-    event?.type === "resize" ||
     event?.type === "paste_text" ||
     event?.type === "file_upload" ||
     event?.type === "clipboard_write";
@@ -930,7 +898,6 @@ remoteDisplay = createBrowserRemoteDisplay({
   resetPageStatus: () => {
     lastPageStatus = null;
   },
-  scheduleViewportResize,
   setActiveBrowserPage: () => {
     document.body.dataset.browserPage = "active";
   },
@@ -1334,7 +1301,6 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     const body = {
       url: nextUrl,
       reason: "open browser page",
-      viewport: browserViewport(),
       display_mode: displayMode,
       guarantee_level: guaranteeLevel,
       async_open: true,
@@ -1380,7 +1346,7 @@ async function requestRuntimeOpen(value, { history = "push" } = {}) {
     publishRuntimePageForHost(currentPage);
     currentDisplayMode = page.display_session?.mode || "";
     syncDisplayInputFromSession(page.display_session);
-    currentView = page.view || viewFromDisplaySession(page.display_session);
+    currentView = viewFromDisplaySession(page.display_session) || page.view;
     canGoBack = false;
     canGoForward = false;
     updateMetricsNode(null);
@@ -1666,17 +1632,6 @@ bindBrowserInputSurface({
   showStatus,
   unlockRemoteAudioFromGesture,
 });
-
-function scheduleViewportResize() {
-  if (!currentPage) {
-    return;
-  }
-  const viewport = browserViewport();
-  lastViewport = viewport;
-}
-
-const resizeObserver = new ResizeObserver(scheduleViewportResize);
-resizeObserver.observe(renderPanel);
 
 window.addEventListener("beforeunload", () => {
   releaseRuntimePageForUnload();

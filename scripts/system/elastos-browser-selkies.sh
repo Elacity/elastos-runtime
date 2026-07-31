@@ -17,9 +17,6 @@ encoder="${ELASTOS_BROWSER_SELKIES_ENCODER:-x264enc}"
 framerate="${ELASTOS_BROWSER_SELKIES_FRAMERATE:-30}"
 video_bitrate="${ELASTOS_BROWSER_SELKIES_VIDEO_BITRATE:-16}"
 h264_crf="${ELASTOS_BROWSER_SELKIES_H264_CRF:-23}"
-width="${ELASTOS_BROWSER_SELKIES_WIDTH:-1920}"
-height="${ELASTOS_BROWSER_SELKIES_HEIGHT:-1080}"
-resolution_mode="${ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE:-dynamic}"
 verify_url="${ELASTOS_BROWSER_SELKIES_VERIFY_URL:-https://example.com/}"
 
 if [[ ! -d "$repo_root" ]]; then
@@ -41,9 +38,6 @@ args=(
   --selkies-framerate "$framerate"
   --selkies-video-bitrate "$video_bitrate"
   --selkies-h264-crf "$h264_crf"
-  --selkies-width "$width"
-  --selkies-height "$height"
-  --selkies-resolution-mode "$resolution_mode"
   --verify-url "$verify_url"
 )
 

@@ -15,7 +15,7 @@ function usage() {
     [--min-video-height 720] \\
     [--min-video-fps 24] \\
     [--max-video-drop-ratio 0.10] \\
-    [--resize-width 0 --resize-height 0] \\
+    [--resize-width 0 --resize-height 0] (viewer dimensions) \\
     [--url https://example.com/] \\
     [--timeout-ms 30000]
 `);
@@ -346,58 +346,85 @@ function displayPointForMediaElement(video, pageMetrics, displaySize) {
   };
 }
 
-async function remoteVideoElementSize(page) {
+async function remoteVideoElementState(page) {
   return await page.evaluate(() => {
     const video = globalThis.__elastosRemoteVideo;
     if (!video) {
       return null;
     }
     const rect = video.getBoundingClientRect();
+    const style = getComputedStyle(video);
+    const decodedFrames = Number(
+      video.getVideoPlaybackQuality?.().totalVideoFrames ||
+        video.webkitDecodedFrameCount ||
+        0,
+    );
     return {
       video_width: Number(video.videoWidth || 0),
       video_height: Number(video.videoHeight || 0),
       client_width: Number(rect.width || 0),
       client_height: Number(rect.height || 0),
+      current_time: Number(video.currentTime || 0),
+      decoded_frames: decodedFrames,
+      object_fit: style.objectFit,
     };
   });
 }
 
-async function assertRemoteViewportResize(adapter, pageId, page, width, height) {
-  const response = expectOk(
-    await adapter.request({
-      op: "input",
-      page_id: pageId,
-      event: {
-        type: "resize",
-        viewport: { width, height },
-      },
-    }),
-    "runtime/provider viewport resize",
-  );
-  if (response.accepted !== true || response.direct_network !== false) {
-    throw new Error(`Runtime/provider resize was not accepted fail-closed (${JSON.stringify(response)})`);
-  }
-  if (Math.abs(Number(response.width || 0) - width) > 2 || Math.abs(Number(response.height || 0) - height) > 2) {
-    throw new Error(`Runtime/provider resize did not return requested viewport (${JSON.stringify(response)})`);
-  }
-  let lastSize = null;
+function containedMediaSize(viewerWidth, viewerHeight, mediaWidth, mediaHeight) {
+  const scale = Math.min(viewerWidth / mediaWidth, viewerHeight / mediaHeight);
+  return {
+    width: mediaWidth * scale,
+    height: mediaHeight * scale,
+  };
+}
+
+async function assertViewerResizeContinuity(page, width, height) {
+  let before = null;
   await waitFor(
     async () => {
-      lastSize = await remoteVideoElementSize(page);
-      return Number(lastSize?.video_width || 0) > 0 && Number(lastSize?.video_height || 0) > 0;
+      before = await remoteVideoElementState(page);
+      return before?.video_width === 1920 && before?.video_height === 1080;
     },
     10_000,
-    "remote video dimensions after provider viewport resize",
+    "fixed 1920x1080 remote video before viewer resize",
   );
+  await page.setViewportSize({ width, height });
+  let after = null;
+  await waitFor(
+    async () => {
+      after = await remoteVideoElementState(page);
+      return (
+        after?.video_width === 1920 &&
+        after?.video_height === 1080 &&
+        Math.abs(Number(after.client_width || 0) - width) <= 2 &&
+        Math.abs(Number(after.client_height || 0) - height) <= 2 &&
+        after.object_fit === "contain" &&
+        (
+          Number(after.decoded_frames || 0) > Number(before.decoded_frames || 0) ||
+          Number(after.current_time || 0) > Number(before.current_time || 0)
+        )
+      );
+    },
+    10_000,
+    "fixed remote video continuity after viewer resize",
+  );
+  const content = containedMediaSize(width, height, 1920, 1080);
   return {
-    requested_width: width,
-    requested_height: height,
-    css_width: Number(response.width || 0),
-    css_height: Number(response.height || 0),
-    video_width: Number(lastSize?.video_width || 0),
-    video_height: Number(lastSize?.video_height || 0),
-    client_width: Number(lastSize?.client_width || 0),
-    client_height: Number(lastSize?.client_height || 0),
+    viewer_width: width,
+    viewer_height: height,
+    guest_raster_width: 1920,
+    guest_raster_height: 1080,
+    video_width: Number(after?.video_width || 0),
+    video_height: Number(after?.video_height || 0),
+    client_width: Number(after?.client_width || 0),
+    client_height: Number(after?.client_height || 0),
+    content_width: content.width,
+    content_height: content.height,
+    object_fit: after?.object_fit || "",
+    frame_progress: true,
+    input_mapping: "decoded_video_coordinates",
+    guest_resize_requests: 0,
   };
 }
 
@@ -580,10 +607,6 @@ async function main() {
 
   try {
     expectOk(await adapter.request({ op: "init", config }), "init");
-    const launchViewport = {
-      width: args.resizeWidth > 0 ? args.resizeWidth : 1280,
-      height: args.resizeHeight > 0 ? args.resizeHeight : 720,
-    };
     const launchedPage = expectOk(
       await adapter.request({
         op: "launch",
@@ -594,7 +617,6 @@ async function main() {
         reason: "verify hosted product WebRTC media",
         display_mode: "webrtc_remote_display",
         guarantee_level: "operator_rbi",
-        viewport: launchViewport,
       }),
       "launch",
     );
@@ -657,6 +679,23 @@ async function main() {
       remoteVideo.autoplay = true;
       remoteVideo.muted = true;
       remoteVideo.playsInline = true;
+      Object.assign(document.documentElement.style, {
+        width: "100%",
+        height: "100%",
+      });
+      Object.assign(document.body.style, {
+        width: "100%",
+        height: "100%",
+        margin: "0",
+        overflow: "hidden",
+      });
+      Object.assign(remoteVideo.style, {
+        display: "block",
+        width: "100%",
+        height: "100%",
+        objectFit: "contain",
+        background: "#000",
+      });
       remoteVideo.srcObject = globalThis.__elastosRemoteStream;
       globalThis.__elastosRemoteVideo = remoteVideo;
       document.body.appendChild(remoteVideo);
@@ -764,13 +803,10 @@ async function main() {
       height: Number(session.height || launchedPage.view?.height || 720),
     };
     const resizeGate = args.resizeWidth > 0
-      ? await assertRemoteViewportResize(adapter, launchedPage.page_id, page, args.resizeWidth, args.resizeHeight)
+      ? await assertViewerResizeContinuity(page, args.resizeWidth, args.resizeHeight)
       : null;
-    const effectiveDisplaySize = resizeGate
-      ? { width: resizeGate.video_width, height: resizeGate.video_height }
-      : displaySize;
     const media = args.requireMedia
-      ? await assertRemoteMediaPlayback(args.cdpEndpoint, args.url, args.timeoutMs, sendInput, effectiveDisplaySize)
+      ? await assertRemoteMediaPlayback(args.cdpEndpoint, args.url, args.timeoutMs, sendInput, displaySize)
       : null;
     if (args.holdMs > 0) {
       const deadline = Date.now() + args.holdMs;

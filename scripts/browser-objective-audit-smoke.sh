@@ -208,8 +208,8 @@ fi
     console.error("hosted_provider_product_accepted missing text must require --artifact-out");
     process.exit(1);
   }
-  if (!String(hostedCriterion.missing || "").includes("dynamic viewport resize")) {
-    console.error("hosted_provider_product_accepted missing text must require dynamic viewport resize proof");
+  if (!String(hostedCriterion.missing || "").includes("fixed-raster viewer resize continuity")) {
+    console.error("hosted_provider_product_accepted missing text must require fixed-raster viewer resize continuity");
     process.exit(1);
   }
   const manualCriterion = audit.criteria.find((item) => item.id === "manual_ux_accepted");
@@ -281,12 +281,20 @@ cat >"$tmp_dir/hosted-skipped-youtube.json" <<'JSON'
         "max_video_drop_ratio": 0.1
       },
       "resize_gate": {
-        "requested_width": 1000,
-        "requested_height": 700,
-        "css_width": 1000,
-        "css_height": 700,
+        "viewer_width": 1000,
+        "viewer_height": 700,
+        "guest_raster_width": 1920,
+        "guest_raster_height": 1080,
         "video_width": 1920,
-        "video_height": 1080
+        "video_height": 1080,
+        "client_width": 1000,
+        "client_height": 700,
+        "content_width": 1000,
+        "content_height": 562.5,
+        "object_fit": "contain",
+        "frame_progress": true,
+        "input_mapping": "decoded_video_coordinates",
+        "guest_resize_requests": 0
       },
       "navigation": {
         "can_go_back_after_navigate": true,
@@ -345,12 +353,20 @@ cat >"$tmp_dir/hosted-valid.json" <<'JSON'
         "max_video_drop_ratio": 0.1
       },
       "resize_gate": {
-        "requested_width": 1000,
-        "requested_height": 700,
-        "css_width": 1000,
-        "css_height": 700,
+        "viewer_width": 1000,
+        "viewer_height": 700,
+        "guest_raster_width": 1920,
+        "guest_raster_height": 1080,
         "video_width": 1920,
-        "video_height": 1080
+        "video_height": 1080,
+        "client_width": 1000,
+        "client_height": 700,
+        "content_width": 1000,
+        "content_height": 562.5,
+        "object_fit": "contain",
+        "frame_progress": true,
+        "input_mapping": "decoded_video_coordinates",
+        "guest_resize_requests": 0
       },
       "navigation": {
         "can_go_back_after_navigate": true,
@@ -382,12 +398,20 @@ cat >"$tmp_dir/hosted-valid.json" <<'JSON'
         "max_video_drop_ratio": 0.1
       },
       "resize_gate": {
-        "requested_width": 1000,
-        "requested_height": 700,
-        "css_width": 1000,
-        "css_height": 700,
+        "viewer_width": 1000,
+        "viewer_height": 700,
+        "guest_raster_width": 1920,
+        "guest_raster_height": 1080,
         "video_width": 1920,
-        "video_height": 1080
+        "video_height": 1080,
+        "client_width": 1000,
+        "client_height": 700,
+        "content_width": 1000,
+        "content_height": 562.5,
+        "object_fit": "contain",
+        "frame_progress": true,
+        "input_mapping": "decoded_video_coordinates",
+        "guest_resize_requests": 0
       },
       "media": {
         "audio_decoded_delta": 1024,
@@ -430,8 +454,8 @@ fi
     console.error("hosted_provider_product_accepted must fail without resize_gate");
     process.exit(1);
   }
-  if (!String(hostedCriterion.missing || "").includes("dynamic viewport resize")) {
-    console.error("missing resize_gate rejection must point to dynamic viewport resize proof");
+  if (!String(hostedCriterion.missing || "").includes("fixed-raster viewer resize continuity")) {
+    console.error("missing resize_gate rejection must point to fixed-raster viewer resize continuity");
     process.exit(1);
   }
 ' "$tmp_dir/hosted-missing-resize-audit.json"

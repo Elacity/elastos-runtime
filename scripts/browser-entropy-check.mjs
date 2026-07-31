@@ -112,6 +112,9 @@ const browserNativeOperatorConfig = read(
   "scripts/browser-native-operator-config.mjs",
 );
 const browserDisplayModeSmoke = read("scripts/browser-display-mode-smoke.mjs");
+const browserFixedProductRasterChromiumTest = read(
+  "scripts/browser-fixed-product-raster-chromium.test.mjs",
+);
 const browserRuntimeTurnCapabilitySmoke = read(
   "scripts/browser-runtime-turn-capability-smoke.mjs",
 );
@@ -603,12 +606,11 @@ assert(
     browserJs.includes("prepareAudio(expectsAudio)") &&
     browserJs.includes("unlockRemoteAudioFromGesture") &&
     browserJs.includes('nextPeerConnection.addTransceiver("audio"') &&
-    browserJs.includes('event?.type === "resize"') &&
     browserJs.includes('event?.type === "paste_text"') &&
     browserJs.includes('event?.type === "file_upload"') &&
     browserJs.includes("Remote audio enabled.") &&
     browserDisplayModeSmoke.includes("audio_invariants_checked"),
-  "Browser UI must keep WebRTC audio explicit, user-gesture unlocked, resize protocol-aware, and covered by display-mode smoke",
+  "Browser UI must keep WebRTC audio explicit, user-gesture unlocked, and covered by display-mode smoke",
 );
 
 assert(
@@ -923,39 +925,32 @@ assert(
     browserSelkiesRuntimeExitTarget.includes('selkies_width="1920"') &&
     browserSelkiesRuntimeExitTarget.includes('selkies_height="1080"') &&
     browserSelkiesRuntimeExitTarget.includes(
-      '\\"--force-device-scale-factor=1.5\\"',
+      '\\"--force-device-scale-factor=1\\"',
     ) &&
-    browserSelkiesRuntimeExitTarget.includes(
+    !browserSelkiesRuntimeExitTarget.includes(
       "ELASTOS_SELKIES_INITIAL_RESOLUTION",
     ) &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-resolution-mode") &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-width") &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-height") &&
     browserSelkiesRuntimeExitTarget.includes(
-      "needle = 'resize_display(' + quote + '1920x1080' + quote + ')'",
+      "--is-manual-resolution-mode=true",
     ) &&
-    browserSelkiesRuntimeExitTarget.includes(
-      'selkies_resolution_mode="dynamic"',
-    ) &&
-    browserSelkiesRuntimeExitTarget.includes("--selkies-resolution-mode") &&
-    browserSelkiesRuntimeExitTarget.includes(
-      "--is-manual-resolution-mode=false",
-    ) &&
-    browserSelkiesRuntimeExitTarget.includes("--enable-resize=true") &&
+    browserSelkiesRuntimeExitTarget.includes("--enable-resize=false") &&
     browserSelkiesRuntimeExitTarget.includes("--clipboard-enabled=true") &&
     browserSelkiesRuntimeExitTarget.includes(
       "browser-selkies-cargo-target",
     ) &&
-    browserSelkiesServiceWrapper.includes(
-      "ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE:-dynamic",
-    ) &&
-    browserSelkiesServiceWrapper.includes(
-      '--selkies-resolution-mode "$resolution_mode"',
-    ) &&
-    browserSelkiesServiceEnv.includes(
-      "ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE=dynamic",
-    ) &&
+    !browserSelkiesServiceWrapper.includes("ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE") &&
+    !browserSelkiesServiceWrapper.includes("ELASTOS_BROWSER_SELKIES_WIDTH") &&
+    !browserSelkiesServiceWrapper.includes("ELASTOS_BROWSER_SELKIES_HEIGHT") &&
+    !browserSelkiesServiceEnv.includes("ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE") &&
+    !browserSelkiesServiceEnv.includes("ELASTOS_BROWSER_SELKIES_WIDTH") &&
+    !browserSelkiesServiceEnv.includes("ELASTOS_BROWSER_SELKIES_HEIGHT") &&
     browserCapsuleDoc.includes(
-      "1920x1080 stream with a stable 1280x720 CSS viewport",
+      "fixed 1920x1080 stream/page raster at DPR 1",
     ),
-  "Canonical hosted Browser launcher must default to tunable H.264 with an explicit normal-browser viewport scale and remote-resize gating, not fixed-compositor manual mode with zoomed-out CSS",
+  "Canonical hosted Browser launcher must keep one fixed 1920x1080 DPR-1 compositor/capture/page raster and expose only codec tuning",
 );
 
 assert(
@@ -1495,7 +1490,9 @@ assert(
     browserVzEngineSupervisor.includes("elastos.browser_ice_config_hex=") &&
     browserVzEngineSupervisor.includes("elastos.browser_width") &&
     browserVzEngineSupervisor.includes("elastos.browser_height") &&
-    browserVzEngineSupervisor.includes("display_boot_args_include_launch_viewport") &&
+    browserVzEngineSupervisor.includes("PRODUCT_STREAM_WIDTH: u64 = 1920") &&
+    browserVzEngineSupervisor.includes("PRODUCT_STREAM_HEIGHT: u64 = 1080") &&
+    browserVzEngineSupervisor.includes("display_boot_args_use_fixed_1080p_product_stream") &&
     browserVzEngineSupervisor.includes("engine=chromium_microvm") &&
     browserVzEngineSupervisor.includes("selkies_gstreamer") &&
     browserVzEngineSupervisor.includes("media_transport") &&
@@ -1844,7 +1841,8 @@ assert(
     ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260730a") &&
+    browser.includes("browser.js?v=browser-20260731a") &&
+    !browser.includes("browser.js?v=browser-20260730a") &&
     !browser.includes("browser.js?v=browser-20260728a") &&
     !browser.includes("browser.js?v=browser-20260727a") &&
     !browser.includes("browser.js?v=browser-20260726b") &&
@@ -1904,7 +1902,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260730b") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260731a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260730b") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260728a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260724a") &&
@@ -1991,7 +1990,7 @@ const failRuntimeOwnedPageBlock = sourceBlock(
 assert(
   releaseRuntimePageForUnloadBlock.includes("stopPageStatusPolling();") &&
     releaseRuntimePageForUnloadBlock.includes("stopPageHeartbeat();") &&
-    releaseRuntimePageForUnloadBlock.includes("resizeObserver.disconnect();") &&
+    !releaseRuntimePageForUnloadBlock.includes("resizeObserver") &&
     !releaseRuntimePageForUnloadBlock.includes("closeRuntimePage(") &&
     !releaseRuntimePageForUnloadBlock.includes("currentPage = null") &&
     !releaseRuntimePageForUnloadBlock.includes("publishRuntimePageForHost(null)") &&
@@ -2066,17 +2065,22 @@ assert(
 );
 
 assert(
-  !browserJs.includes('type: "resize"') &&
-    browserJs.includes("sendBrowserInput(") &&
-    browserJs.includes("function scheduleViewportResize()") &&
-    browserJs.includes("lastViewport = viewport;") &&
-    !browserJs.includes('event?.type === "resize" && event.viewport') &&
+  !browserJs.includes("scheduleViewportResize") &&
+    !browserJs.includes("ResizeObserver") &&
+    !browserJs.includes('{ type: "resize"') &&
     browserSelkiesControlService.includes(
       "Emulation.setDeviceMetricsOverride",
     ) &&
     browserSelkiesControlService.includes(
-      "deviceScaleFactor: config.displaySurface.deviceScaleFactor",
+      "deviceScaleFactor: 1",
     ) &&
+    browserSelkiesControlService.includes("function browserDisplayMetrics") &&
+    browserSelkiesControlService.includes("const PRODUCT_RASTER_WIDTH = 1920") &&
+    browserSelkiesControlService.includes("const PRODUCT_RASTER_HEIGHT = 1080") &&
+    browserSelkiesControlService.includes(
+      "Browser guest raster is fixed at 1920x1080",
+    ) &&
+    !browserSelkiesControlService.includes("function resizeBrowserPage") &&
     browserSelkiesControlService.includes("function mediaKindsForSdp") &&
     !browserSelkiesControlService.includes("isSelkiesAudioUnavailable") &&
     !browserSelkiesControlService.includes("audio_offer_unavailable") &&
@@ -2092,8 +2096,17 @@ assert(
     browserHostedProductSupervisor.includes("hosted product audio sessions must include an audio media section") &&
     !browserEngineAdapter.includes("supervisor_accepts_video_only_vm_product_display") &&
     browserEngineAdapter.includes("Browser VM product display sessions must advertise audio=true and video=true") &&
-    browserSelkiesControlService.includes('body?.event?.type === "resize"'),
-  "Browser viewport changes must never go through the Selkies pointer datachannel, VM staging must not force a zoomed CSS surface, and media flags must match the negotiated SDP",
+    browserDisplayModeSmoke.includes("contained video corners must map to all encoded corners after viewer resize") &&
+    browserFixedProductRasterChromiumTest.includes(
+      "installed-shaped Chromium fills the DPR-1 raster through a loopback proxy",
+    ) &&
+    browserFixedProductRasterChromiumTest.includes(
+      'corners: ["tl", "tr", "bl", "br"]',
+    ) &&
+    browserFixedProductRasterChromiumTest.includes(
+      "fixture navigation did not traverse the loopback Runtime-shaped proxy",
+    ),
+  "Browser must keep one fixed 1920x1080 DPR-1 guest raster, scale only the viewer, and keep media flags matched to negotiated SDP",
 );
 assert(
   browserJs.includes("const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024") &&

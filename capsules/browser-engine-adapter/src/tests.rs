@@ -479,7 +479,7 @@ fn protocol_v2_rejects_old_launch_before_dispatching_any_effect() {
 }
 
 #[test]
-fn full_width_generation_dispatches_exact_vz_authority_over_private_stdin() {
+fn full_width_generation_omits_absent_viewport_from_private_vz_dispatch() {
     let generation = format!("sha256:{}", "6".repeat(64));
     let transport = test_vz_transport_launch(&generation);
     let adapter: AdapterConfig = serde_json::from_value(json!({
@@ -490,7 +490,7 @@ fn full_width_generation_dispatches_exact_vz_authority_over_private_stdin() {
             "program": "/bin/sh",
             "args": [
                 "-c",
-                "test -z \"${ELASTOS_BROWSER_ENGINE_REQUEST:-}\" || exit 70; request=$(cat); printf '%s' \"$request\" | grep -Fq \"\\\"lifecycle_generation\\\":\\\"$EXPECTED_GENERATION\\\"\" || exit 71; printf '%s' \"$request\" | grep -Fq \"\\\"binding_hash\\\":\\\"$EXPECTED_BINDING\\\"\" || exit 72; printf '%s' \"$request\" | grep -Fq transport_secret || exit 73; printf '%s\\n' '{\"schema\":\"elastos.browser.engine.launch-error/v1\",\"code\":\"dispatch_probe_complete\",\"message\":\"exact VZ request reached the supervisor over private stdin\"}' >&2; exit 42"
+                "test -z \"${ELASTOS_BROWSER_ENGINE_REQUEST:-}\" || exit 70; request=$(cat); printf '%s' \"$request\" | grep -Fq \"\\\"lifecycle_generation\\\":\\\"$EXPECTED_GENERATION\\\"\" || exit 71; printf '%s' \"$request\" | grep -Fq \"\\\"binding_hash\\\":\\\"$EXPECTED_BINDING\\\"\" || exit 72; printf '%s' \"$request\" | grep -Fq transport_secret || exit 73; printf '%s' \"$request\" | grep -Fq '\"viewport\":' && exit 74; printf '%s\\n' '{\"schema\":\"elastos.browser.engine.launch-error/v1\",\"code\":\"dispatch_probe_complete\",\"message\":\"exact VZ request reached the supervisor over private stdin\"}' >&2; exit 42"
             ],
             "timeout_ms": 2000,
             "env": {

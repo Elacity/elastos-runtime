@@ -28,7 +28,6 @@ export function createBrowserRemoteDisplay({
   renderEmpty,
   renderPanel,
   resetPageStatus,
-  scheduleViewportResize,
   setActiveBrowserPage,
   setDisplayInput,
   showStatus,
@@ -73,9 +72,9 @@ export function createBrowserRemoteDisplay({
   remoteAudio.muted = true;
   remoteAudio.defaultMuted = true;
 
-  function mediaDiagnosticValue(value, fallback = "unknown") {
+  function mediaDiagnosticValue(value, defaultValue = "unknown") {
     const text = String(value || "");
-    return /^[a-z][a-z0-9_-]{0,31}$/.test(text) ? text : fallback;
+    return /^[a-z][a-z0-9_-]{0,31}$/.test(text) ? text : defaultValue;
   }
 
   function mediaDiagnosticNumber(value) {
@@ -503,14 +502,12 @@ export function createBrowserRemoteDisplay({
     inputChannel.addEventListener("error", teardownBoundInputChannel);
     if (inputChannel.readyState === "open") {
       emitMediaDiagnostic("viewer_input_channel_open", "input");
-      scheduleViewportResize({ force: true });
       return;
     }
     inputChannel.addEventListener(
       "open",
       () => {
         emitMediaDiagnostic("viewer_input_channel_open", "input");
-        scheduleViewportResize({ force: true });
       },
       { once: true },
     );

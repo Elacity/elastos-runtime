@@ -448,8 +448,8 @@ The candidate gate verifies:
 - WebRTC audio track, video track, datachannel input, and connected ICE,
 - controlled media playback with decoded audio/video bytes, at least a
   five-second hold, rendered size, and drop-ratio quality floor,
-- remote compositor resize proof, so stream dimensions match the Browser panel
-  after a window-ratio change instead of relying on local video stretch,
+- viewer resize continuity, so the fixed stream remains decoded, contained, and
+  input-aligned after a Browser window-ratio change,
 - Runtime/provider navigation: address navigate, back, forward, reload,
 - Runtime-mediated wallet bridge,
 - Glide connect-wallet flow,
@@ -475,16 +475,12 @@ resolution instead of manual fixed-size mode, enables remote resize explicitly,
 and keeps manual mode available only through operator opt-in. A follow-up live
 test still failed to observe a resized video stream. A 1280x720 Selkies
 surface then produced zero decoded WebRTC frames, so the live operator baseline
-returned to the known-rendering 1920x1080 stream and uses Chromium
-`--force-device-scale-factor=1.5` to match the Home window's normal-browser
-CSS viewport while the dynamic resize gate remains open. A later live check
+returned to the known-rendering 1920x1080 stream. A later live check
 proved arbitrary CDP viewport resize can leave blank right/bottom capture
-regions inside the fixed Selkies stream, so the current baseline keeps a stable
-1280x720 CSS viewport and treats true responsive compositor resize as unaccepted
-provider work.
-Selkies remains a hosted proof/bake-off baseline, not accepted as
-normal-browser-equivalent UX, until the provider passes the dynamic viewport
-resize gate.
+regions inside the fixed Selkies stream. The 0.6 policy therefore fixes the
+guest compositor, capture, and page raster at 1920x1080 with DPR 1. Home uses
+contained viewer scaling and decoded-video input coordinates; dynamic guest
+viewport resize is no longer an acceptance requirement.
 
 ## Manual UX Gate
 
@@ -494,8 +490,8 @@ manual hosted Home review:
 - typing in the address bar does not fight polling or lose focus,
 - page typing latency is acceptable,
 - scrolling and click fidelity feel browser-like,
-- resizing preserves page ratio and page scale instead of stretching or staying
-  fixed-size,
+- resizing preserves the contained 16:9 image, decoded-frame progress, and
+  decoded-video input alignment without guest clipping or freeze,
 - hosted WebRTC providers show `audio=true`, unlock remote audio through an
   explicit user gesture, report an unmuted/remote-audio-enabled status, and
   expose received-audio evidence,

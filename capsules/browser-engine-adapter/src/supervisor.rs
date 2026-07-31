@@ -85,10 +85,12 @@ pub(super) fn run_supervisor_launch(
         "adapter_ipc": &context.stream_session.adapter_ipc,
         "relay_ipc": &context.stream_session.relay_ipc,
         "wallet": &context.wallet,
-        "viewport": context.viewport,
         "display_mode": context.display_mode,
         "guarantee_level": context.guarantee_level,
     });
+    if let Some(viewport) = context.viewport {
+        request["viewport"] = json!(viewport);
+    }
     if let Some(transport) = transport {
         request["page_id"] = json!(transport.page_id);
         request["vm_id"] = json!(transport.vm_id);

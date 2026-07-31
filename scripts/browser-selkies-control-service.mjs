@@ -33,6 +33,8 @@ const VM_LOG_NAMES = [
 ];
 const MAX_WEBSOCKET_FRAME_BYTES = 16 * 1024 * 1024;
 const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024;
+const PRODUCT_RASTER_WIDTH = 1920;
+const PRODUCT_RASTER_HEIGHT = 1080;
 const WALLET_RUNTIME_BINDING = "__elastosBrowserWalletRuntime";
 const WALLET_RUNTIME_RESULT = "__elastosBrowserWalletRuntimeResult";
 const WALLET_RUNTIME_ORIGIN = "null";
@@ -425,20 +427,16 @@ function readIceServersConfig(value) {
 }
 
 function readDisplaySurfaceConfig(value) {
-  const streamWidth = numberOr(value?.stream_width, 1920);
-  const streamHeight = numberOr(value?.stream_height, 1080);
-  const cssWidth = numberOr(value?.css_width, streamWidth);
-  const cssHeight = numberOr(value?.css_height, streamHeight);
-  if (streamWidth < 640 || streamWidth > 3840 || streamHeight < 360 || streamHeight > 2160) {
-    fail("display_surface stream size must be within 640x360 and 3840x2160");
-  }
-  if (cssWidth < 320 || cssWidth > 3840 || cssHeight < 240 || cssHeight > 2160) {
-    fail("display_surface CSS viewport must be within 320x240 and 3840x2160");
+  const streamWidth = numberOr(value?.stream_width, PRODUCT_RASTER_WIDTH);
+  const streamHeight = numberOr(value?.stream_height, PRODUCT_RASTER_HEIGHT);
+  if (
+    streamWidth !== PRODUCT_RASTER_WIDTH ||
+    streamHeight !== PRODUCT_RASTER_HEIGHT
+  ) {
+    fail("display_surface must use the fixed 1920x1080 product raster");
   }
   return {
     stream: { width: streamWidth, height: streamHeight },
-    css: { width: cssWidth, height: cssHeight },
-    deviceScaleFactor: streamWidth / cssWidth,
   };
 }
 
@@ -557,67 +555,15 @@ function numberOr(value, defaultValue) {
   return Number.isInteger(value) && value > 0 ? value : defaultValue;
 }
 
-function gcd(left, right) {
-  let a = Math.abs(left);
-  let b = Math.abs(right);
-  while (b) {
-    const next = a % b;
-    a = b;
-    b = next;
-  }
-  return a || 1;
-}
-
-function aspectPreservingDisplaySize(requested, config) {
-  const ratioBase = gcd(
-    config.displaySurface.stream.width,
-    config.displaySurface.stream.height,
-  );
-  const unitWidth = config.displaySurface.stream.width / ratioBase;
-  const unitHeight = config.displaySurface.stream.height / ratioBase;
-  const minScale = Math.max(
-    Math.ceil(320 / unitWidth),
-    Math.ceil(240 / unitHeight),
-    1,
-  );
-  const maxScale = Math.min(
-    Math.floor(3840 / unitWidth),
-    Math.floor(2160 / unitHeight),
-  );
-  const requestedScale = Math.min(
-    Math.floor(requested.width / unitWidth),
-    Math.floor(requested.height / unitHeight),
-  );
-  const scale = Math.max(minScale, Math.min(maxScale, requestedScale));
+export function browserDisplayMetrics(config) {
+  const stream = config.displaySurface.stream;
   return {
-    width: unitWidth * scale,
-    height: unitHeight * scale,
+    width: stream.width,
+    height: stream.height,
+    deviceScaleFactor: 1,
+    streamWidth: stream.width,
+    streamHeight: stream.height,
   };
-}
-
-function validateLaunchViewport(launch) {
-  const viewport = launch?.viewport;
-  if (viewport == null) {
-    return;
-  }
-  if (
-    !Number.isInteger(viewport.width) ||
-    !Number.isInteger(viewport.height) ||
-    viewport.width < 320 ||
-    viewport.width > 3840 ||
-    viewport.height < 240 ||
-    viewport.height > 2160
-  ) {
-    throw new Error("launch viewport must be within 320x240 and 3840x2160");
-  }
-}
-
-function displaySizeForLaunch(launch, config) {
-  validateLaunchViewport(launch);
-  if (launch?.viewport) {
-    return aspectPreservingDisplaySize(launch.viewport, config);
-  }
-  return aspectPreservingDisplaySize(config.displaySurface.css, config);
 }
 
 function sleep(ms) {
@@ -2184,7 +2130,7 @@ class SelkiesPage {
     this.signalingStats.opened_at = nowIso();
     const wallet = normalizeWalletBridge(this.launchRequest.wallet || {});
     this.wallet = wallet;
-    const displaySize = displaySizeForLaunch(this.launchRequest, this.config);
+    const displaySize = browserDisplayMetrics(this.config);
     logControlEvent("page_open_browser_page_start", { page_id: this.pageId });
     const browserPage = await openBrowserPage(
       this.config,
@@ -2398,7 +2344,7 @@ class SelkiesPage {
   }
 
   supervisorResult(sdp, browserPage, wallet, audioOfferSdp) {
-    const displaySize = displaySizeForLaunch(this.launchRequest, this.config);
+    const displaySize = browserDisplayMetrics(this.config);
     const audioSdp = normalizeAudioOfferSdp(audioOfferSdp);
     const media = mediaKindsForSdp(sdp);
     const audioMedia = mediaKindsForSdp(audioSdp);
@@ -2940,17 +2886,68 @@ async function closeBrowserTarget(browserControl, targetId) {
   }
 }
 
-async function applyBrowserViewport(cdp, launch, config) {
-  const displaySize = displaySizeForLaunch(launch, config);
+async function applyBrowserViewport(cdp, config) {
+  const displaySize = browserDisplayMetrics(config);
   await cdp.request("Emulation.setDeviceMetricsOverride", {
     width: displaySize.width,
     height: displaySize.height,
-    deviceScaleFactor: config.displaySurface.deviceScaleFactor,
+    deviceScaleFactor: displaySize.deviceScaleFactor,
     mobile: false,
     screenWidth: displaySize.width,
     screenHeight: displaySize.height,
   });
   return displaySize;
+}
+
+export async function projectRuntimeProxyOnlineState(cdp, runtimeFetchProxyUrl) {
+  if (!runtimeFetchProxyUrl) {
+    throw new Error("Browser Runtime proxy is required before projecting online state");
+  }
+  await cdp.request("Network.enable");
+  await cdp.request("Network.overrideNetworkState", {
+    offline: false,
+    latency: 0,
+    downloadThroughput: -1,
+    uploadThroughput: -1,
+    connectionType: "other",
+  });
+  const evaluated = await cdp.request("Runtime.evaluate", {
+    expression: `JSON.stringify({
+      online: navigator.onLine === true,
+      connection_type: String(navigator.connection?.type || ""),
+      effective_type: String(navigator.connection?.effectiveType || "")
+    })`,
+    returnByValue: true,
+  });
+  let state = null;
+  try {
+    state = JSON.parse(String(evaluated?.result?.value || ""));
+  } catch {}
+  if (evaluated?.exceptionDetails || state?.online !== true) {
+    throw new Error("Chromium did not accept the Runtime online-state projection");
+  }
+  return {
+    online: true,
+    connection_type: String(state.connection_type || "").slice(0, 32),
+    effective_type: String(state.effective_type || "").slice(0, 32),
+  };
+}
+
+async function projectAndLogRuntimeProxyOnlineState(
+  cdp,
+  runtimeFetchProxyUrl,
+  targetId,
+  phase,
+) {
+  const state = await projectRuntimeProxyOnlineState(cdp, runtimeFetchProxyUrl);
+  logControlEvent("browser_page_online_projection", {
+    target_id: targetId ? String(targetId).slice(0, 128) : null,
+    phase: String(phase || "").slice(0, 48),
+    online: state.online,
+    connection_type: state.connection_type,
+    effective_type: state.effective_type,
+  });
+  return state;
 }
 
 function walletRuntimeHttpError(message, code = 4100) {
@@ -3304,9 +3301,6 @@ async function openBrowserPage(config, url, wallet, launch, options = {}) {
     title: "Selkies Browser",
     file_chooser: createBrowserFileChooserState(),
     runtimeFetchProxyUrl: config.runtimeFetchProxyUrl,
-    launchViewport: launch?.viewport
-      ? { width: launch.viewport.width, height: launch.viewport.height }
-      : null,
     navigationInProgress: false,
     _cdp: cdp,
   };
@@ -3318,10 +3312,15 @@ async function openBrowserPage(config, url, wallet, launch, options = {}) {
     logControlEvent("browser_page_cdp_connect_done", { target_id: body.id || null });
     await cdp.request("Page.enable");
     await cdp.request("Runtime.enable");
-    await cdp.request("Network.enable").catch(() => {});
+    await projectAndLogRuntimeProxyOnlineState(
+      cdp,
+      config.runtimeFetchProxyUrl,
+      body.id,
+      "before_initial_navigation",
+    );
     await cdp.request("Log.enable").catch(() => {});
     await ensureBrowserFileChooserInterception(cdp, browserPage);
-    await applyBrowserViewport(cdp, launch, config);
+    await applyBrowserViewport(cdp, config);
     logControlEvent("browser_page_wallet_bridge_start", { target_id: body.id || null });
     initScriptId = await installWalletBridge(cdp, wallet);
     logControlEvent("browser_page_wallet_bridge_done", { target_id: body.id || null });
@@ -3339,6 +3338,12 @@ async function openBrowserPage(config, url, wallet, launch, options = {}) {
       error_text: navigation.errorText || null,
     }));
     const page = await readBrowserPageState(cdp, url, "Selkies Browser", browserControl.timeoutMs);
+    await projectAndLogRuntimeProxyOnlineState(
+      cdp,
+      config.runtimeFetchProxyUrl,
+      body.id,
+      "after_initial_navigation",
+    );
     console.error(JSON.stringify({
       schema: "elastos.browser.selkies-control.navigation-state/v1",
       url: page.url,
@@ -3355,29 +3360,6 @@ async function openBrowserPage(config, url, wallet, launch, options = {}) {
       cdp.close();
     }
   }
-}
-
-async function resizeBrowserPage(config, browserPage, event, timeoutMs) {
-  if (!browserPage?.debugger_url) {
-    throw new Error("browser page debugger URL is unavailable");
-  }
-  validateLaunchViewport({ viewport: event?.viewport });
-  browserPage.runtimeFetchProxyUrl = config.runtimeFetchProxyUrl;
-  return withBrowserCdp(browserPage, timeoutMs, async (cdp) => {
-    await cdp.request("Page.enable");
-    await cdp.request("Runtime.enable");
-    await ensureBrowserFileChooserInterception(cdp, browserPage);
-    const displaySize = await applyBrowserViewport(cdp, { viewport: event?.viewport }, config);
-    return {
-      url: browserPage.url || "",
-      title: browserPage.title || "Selkies Browser",
-      can_go_back: browserPage.can_go_back === true,
-      can_go_forward: browserPage.can_go_forward === true,
-      width: displaySize.width,
-      height: displaySize.height,
-      file_chooser: summarizeBrowserFileChooser(browserPage),
-    };
-  });
 }
 
 function validatePasteText(value) {
@@ -3825,6 +3807,11 @@ async function collectBrowserDiagnostics(browserPage, timeoutMs) {
         viewport_width: window.innerWidth,
         viewport_height: window.innerHeight,
         device_pixel_ratio: window.devicePixelRatio || 1,
+        navigator_online: navigator.onLine === true,
+        navigator_connection: {
+          type: String(navigator.connection?.type || "").slice(0, 32),
+          effective_type: String(navigator.connection?.effectiveType || "").slice(0, 32),
+        },
         body_text: trim(document.body && document.body.innerText),
         body_html: trim(document.body && document.body.innerHTML),
         body_child_count: document.body ? document.body.children.length : 0,
@@ -4146,6 +4133,12 @@ async function applyBrowserCommand(config, browserPage, event, timeoutMs) {
         throw new Error("unsupported browser command");
       }
       await cdp.waitForEvent("Page.domContentEventFired", Math.min(timeoutMs, 15000), "domcontent").catch(() => {});
+      await projectAndLogRuntimeProxyOnlineState(
+        cdp,
+        config.runtimeFetchProxyUrl,
+        browserPage.target_id,
+        `after_${command}_navigation`,
+      );
     });
     const state = await refreshBrowserPageState(browserPage, timeoutMs);
     if (command === "navigate") {
@@ -4180,12 +4173,11 @@ async function replaceBrowserPageTarget(config, browserPage, url, timeoutMs) {
   const oldTargetId = browserPage.target_id || "";
   const oldCdp = browserPage._cdp || null;
   const oldStopWalletBridgeWatch = browserPage._stopWalletBridgeWatch || null;
-  const launch = browserPage.launchViewport ? { viewport: browserPage.launchViewport } : {};
   const replacement = await openBrowserPage(
     config,
     url,
     normalizeWalletBridge(browserPage.wallet || {}),
-    launch,
+    {},
     { forceNewTarget: true },
   );
   if (typeof oldStopWalletBridgeWatch === "function") {
@@ -4202,7 +4194,6 @@ async function replaceBrowserPageTarget(config, browserPage, url, timeoutMs) {
   browserPage.title = replacement.title;
   browserPage.file_chooser = replacement.file_chooser;
   browserPage.runtimeFetchProxyUrl = replacement.runtimeFetchProxyUrl;
-  browserPage.launchViewport = replacement.launchViewport;
   browserPage._cdp = replacement._cdp;
   browserPage._stopWalletBridgeWatch = startWalletBridgeWatch(
     browserPage,
@@ -4559,24 +4550,8 @@ async function main() {
           return;
         }
         if (body?.event?.type === "resize") {
-          const state = await resizeBrowserPage(
-            config,
-            page.browserPage,
-            body.event,
-            config.signalTimeoutMs,
-          );
-          httpJson(res, 200, {
-            schema: "elastos.browser.input-result/v1",
-            page_id: pageId,
-            accepted: true,
-            actual_url: state.url,
-            title: state.title,
-            can_go_back: state.can_go_back,
-            can_go_forward: state.can_go_forward,
-            width: state.width,
-            height: state.height,
-            file_chooser: state.file_chooser || summarizeBrowserFileChooser(page.browserPage),
-            direct_network: false,
+          httpJson(res, 400, {
+            error: "Browser guest raster is fixed at 1920x1080",
           });
           return;
         }

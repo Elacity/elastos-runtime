@@ -382,8 +382,8 @@ Browser UI
 
 This proof is enough to test public-web page rendering inside ElastOS, including
 Glide and exit-IP diagnostics through the configured server Exit. The current
-proof includes actual URL/title round-tripping, viewport resize, long-polled
-WebRTC proof media, wheel, click, paste, and basic keyboard input. It is not a
+proof includes actual URL/title round-tripping, viewer resize continuity,
+long-polled WebRTC proof media, wheel, click, paste, and basic keyboard input. It is not a
 general-purpose browser experience because product readiness requires the
 browser engine's real compositor/audio/video surface, not diagnostic collectors.
 The Browser open route now requires the engine to return an explicit
@@ -692,10 +692,13 @@ payload bytes; decoded audio bytes are required only with `--require-media` on a
 controlled media fixture. Browser UI translates pointer, wheel, key, and
 text input events to Selkies datachannel commands only for this product adapter;
 generic Browser capsules still speak the Runtime Browser ABI, not raw host input
-APIs. Browser commands such as address navigation, back, forward, reload, and
-viewport resize remain Runtime/provider input calls; the Selkies control service
-applies them over private CDP and returns the current page state with
-`direct_network=false`.
+APIs. Browser commands such as address navigation, back, forward, and reload
+remain Runtime/provider input calls; the Selkies control service applies them
+over private CDP and returns the current page state with `direct_network=false`.
+The 0.6 product raster is fixed at 1920x1080 with DPR 1. Home resizes only the
+viewer using `object-fit: contain`, and maps input through decoded-video
+coordinates. Home CSS dimensions never resize the guest compositor or page
+raster.
 Browser status polling consumes that page state, including `can_go_back` and
 `can_go_forward`, so visible navigation follows Chromium's actual history
 instead of a UI-side shadow model. Address-bar submits in an active hosted
@@ -725,10 +728,10 @@ service, writes target diagnostics, and stays in the foreground until `/shutdown
 or process termination cleans up the target. The smoke above is now only a `--verify
 --cleanup-after-verify` wrapper around this launcher, so the tested path and the
 launched path do not drift. The launcher defaults to a product H.264
-profile (`x264enc`, 1920x1080 stream with a stable 1280x720 CSS viewport, 30 fps,
-16 Mbps, dynamic resize still gated as a provider requirement) and exposes `--selkies-encoder`, `--selkies-framerate`,
-`--selkies-video-bitrate`, `--selkies-h264-crf`, `--selkies-width`,
-`--selkies-height`, and `--selkies-resolution-mode` for operator tuning.
+profile (`x264enc`, fixed 1920x1080 stream/page raster at DPR 1, 30 fps,
+16 Mbps) and exposes `--selkies-encoder`, `--selkies-framerate`,
+`--selkies-video-bitrate`, and `--selkies-h264-crf` for codec tuning. Raster
+size and resolution mode are not operator configuration.
 Helper Rust binaries are built into a shared
 `${XDG_CACHE_HOME:-$HOME/.cache}/elastos/browser-selkies-cargo-target` cache by
 default, not into each session directory. Per-launch Browser startup must not
@@ -743,15 +746,11 @@ single-writer user-data directory. This is the current hosted-provider bridge
 toward principal-owned Browser state; the final protected object root remains
 `localhost://Users/<principal>/BrowserProfiles/...` or an equivalent encrypted
 provider-owned root.
-Dynamic resolution is the intended product behavior because a fixed compositor
-is not normal-browser-equivalent UX. Manual fixed-size mode is only for explicit
-diagnostic targets. The current hosted Selkies path remains a proof provider
-until it passes the resize gate; a 1280x720 compositor test produced zero
-decoded frames, so the live baseline stays on the known-rendering 1920x1080
-stream and uses Chromium device scaling to avoid zoomed-out page CSS. Arbitrary
-Browser window resize is not accepted as dynamic compositor resize on the
-current Selkies baseline; provider-side resize requests keep the stable CSS
-viewport so the stream does not render blank right/bottom capture regions.
+The 0.6 invariant is one fixed 1920x1080 compositor, capture surface, and page
+raster at DPR 1. The earlier dynamic CDP viewport path is retired because a
+smaller emulated viewport left blank right/bottom regions inside the encoded
+frame. Browser window resize changes only the contained viewer; decoded frame
+progress and decoded-video coordinate mapping must remain stable.
 `browser-engine-adapter` accepts supervisor timeouts up to 300 seconds because
 per-launch hosted session supervisors may need more than the old 30-second proof
 limit. A configured adapter-level `control_socket_path` is no longer sufficient

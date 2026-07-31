@@ -141,12 +141,20 @@ function qualityGateAccepted(qualityGate) {
 function resizeGateAccepted(resizeGate) {
   return (
     resizeGate &&
-    Number(resizeGate.requested_width || 0) >= 320 &&
-    Number(resizeGate.requested_height || 0) >= 240 &&
-    Math.abs(Number(resizeGate.css_width || 0) - Number(resizeGate.requested_width || 0)) <= 2 &&
-    Math.abs(Number(resizeGate.css_height || 0) - Number(resizeGate.requested_height || 0)) <= 2 &&
-    Number(resizeGate.video_width || 0) >= Number(resizeGate.css_width || 0) &&
-    Number(resizeGate.video_height || 0) >= Number(resizeGate.css_height || 0)
+    Number(resizeGate.viewer_width || 0) >= 320 &&
+    Number(resizeGate.viewer_height || 0) >= 240 &&
+    Number(resizeGate.guest_raster_width || 0) === 1920 &&
+    Number(resizeGate.guest_raster_height || 0) === 1080 &&
+    Number(resizeGate.video_width || 0) === 1920 &&
+    Number(resizeGate.video_height || 0) === 1080 &&
+    Math.abs(Number(resizeGate.client_width || 0) - Number(resizeGate.viewer_width || 0)) <= 2 &&
+    Math.abs(Number(resizeGate.client_height || 0) - Number(resizeGate.viewer_height || 0)) <= 2 &&
+    Number(resizeGate.content_width || 0) <= Number(resizeGate.client_width || 0) &&
+    Number(resizeGate.content_height || 0) <= Number(resizeGate.client_height || 0) &&
+    resizeGate.object_fit === "contain" &&
+    resizeGate.frame_progress === true &&
+    resizeGate.input_mapping === "decoded_video_coordinates" &&
+    Number(resizeGate.guest_resize_requests) === 0
   );
 }
 
@@ -507,7 +515,7 @@ function main() {
       "A hosted provider has passed the product-compositor machine gate including YouTube/audio stress.",
       hostedAccepted(hostedBakeoff),
       args.hostedBakeoff ? [args.hostedBakeoff] : [],
-      "Run scripts/browser-hosted-provider-bakeoff.sh with --artifact-out for Kasm/BrowserBox/Selkies and provide accepted JSON that proves product_compositor, audio/video tracks, input, quality, dynamic viewport resize, navigation, wallet bridge, Glide connect, direct_network=false, and non-skipped YouTube audio/video stress.",
+      "Run scripts/browser-hosted-provider-bakeoff.sh with --artifact-out for Kasm/BrowserBox/Selkies and provide accepted JSON that proves product_compositor, audio/video tracks, input, quality, fixed-raster viewer resize continuity, navigation, wallet bridge, Glide connect, direct_network=false, and non-skipped YouTube audio/video stress.",
     ),
     criterion(
       "native_product_media_accepted",

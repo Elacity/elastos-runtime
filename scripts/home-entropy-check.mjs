@@ -4414,7 +4414,7 @@ assert(
     browserJs.includes('window.addEventListener("pagehide", releaseRuntimePageForUnload)') &&
     browserUnloadReleaseBlock.includes("stopPageStatusPolling();") &&
     browserUnloadReleaseBlock.includes("stopPageHeartbeat();") &&
-    browserUnloadReleaseBlock.includes("resizeObserver.disconnect();") &&
+    !browserUnloadReleaseBlock.includes("resizeObserver") &&
     !browserUnloadReleaseBlock.includes("closeRuntimePage(") &&
     !browserUnloadReleaseBlock.includes("publishRuntimePageForHost(null)") &&
     !browserUnloadReleaseBlock.includes("closeRemoteDisplay()") &&
@@ -9120,7 +9120,6 @@ assert(
 assert(
   browserJs.includes("const requiresRuntimeRoute =") &&
     browserJs.includes('event?.type === "browser_command"') &&
-    browserJs.includes('event?.type === "resize"') &&
     browserJs.includes("!requiresRuntimeRoute") &&
     browserJs.includes("navigateAddress") &&
     browserJs.includes('command: "navigate"') &&
@@ -9137,7 +9136,10 @@ assert(
     browserSelkiesControlService.includes(
       "Emulation.setDeviceMetricsOverride",
     ) &&
-    browserSelkiesControlService.includes('body?.event?.type === "resize"') &&
+    browserSelkiesControlService.includes(
+      "Browser guest raster is fixed at 1920x1080",
+    ) &&
+    !browserSelkiesControlService.includes("function resizeBrowserPage") &&
     browserSelkiesControlServiceSmoke.includes('"type": "browser_command"') &&
     browserSelkiesControlServiceSmoke.includes('"command": "navigate"') &&
     browserSelkiesControlServiceSmoke.includes("ERR_CONNECTION_CLOSED") &&
@@ -9145,13 +9147,10 @@ assert(
     browserSelkiesControlServiceSmoke.includes('"command": "reload"') &&
     browserPlanningSurface.includes("Runtime/provider navigation") &&
     read("docs/BROWSER_CAPSULE.md").includes(
-      "commands such as address navigation, back, forward, reload, and",
-    ) &&
-    read("docs/BROWSER_CAPSULE.md").includes(
-      "viewport resize remain Runtime/provider input calls",
+      "commands such as address navigation, back, forward, and reload",
     ) &&
     read("docs/BROWSER_CAPSULE.md").includes("private CDP"),
-  "Hosted Selkies product navigation and viewport resize commands must stay on the Runtime/provider route and be applied by private CDP instead of disappearing into the Selkies pointer/key datachannel or reopening compositor sessions",
+  "Hosted Selkies product navigation must stay on the Runtime/provider route while guest raster resize remains retired",
 );
 assert(
     browserJs.includes("lastPageStatus = status") &&
@@ -9199,7 +9198,14 @@ assert(
     browserHostedProductWebrtcSmoke.includes("item.kind || item.mediaType") &&
     browserHostedProductWebrtcSmoke.includes("video_element_decoded_frames") &&
     browserHostedProductWebrtcSmoke.includes("assertQualityGate") &&
-    browserHostedProductWebrtcSmoke.includes("assertRemoteViewportResize") &&
+    browserHostedProductWebrtcSmoke.includes("assertViewerResizeContinuity") &&
+    browserHostedProductWebrtcSmoke.includes("guest_raster_width: 1920") &&
+    browserHostedProductWebrtcSmoke.includes("guest_raster_height: 1080") &&
+    browserHostedProductWebrtcSmoke.includes('object_fit: after?.object_fit || ""') &&
+    browserHostedProductWebrtcSmoke.includes('input_mapping: "decoded_video_coordinates"') &&
+    browserHostedProductWebrtcSmoke.includes("guest_resize_requests: 0") &&
+    !browserHostedProductWebrtcSmoke.includes("assertRemoteViewportResize") &&
+    !browserHostedProductWebrtcSmoke.includes('type: "resize"') &&
     browserHostedProductWebrtcSmoke.includes("resize_gate") &&
     browserHostedProductWebrtcSmokeShell.includes("--resize-width") &&
     browserHostedProductWebrtcSmokeShell.includes("--resize-height") &&
@@ -9221,7 +9227,7 @@ assert(
     read("docs/BROWSER_CAPSULE.md").includes(
       "Browser UI pauses page-status polling while the user is actively editing",
     ),
-  "Hosted Browser product quality must expose engine history state, refresh address state after datachannel navigation, protect address-bar editing from status polling, and provide measurable WebRTC/video-element stats with enforced media and remote-viewport resize gates instead of stale navigation state, fixed or unproven compositor scale, or subjective quality reports",
+  "Hosted Browser product quality must expose engine history state, refresh address state after datachannel navigation, protect address-bar editing from status polling, and provide measurable WebRTC/video-element stats with enforced media and fixed-raster viewer-resize gates instead of stale navigation state, provider-driven compositor resize, or subjective quality reports",
 );
 assert(
   browserSelkiesControlService.includes("readIceServersConfig") &&
@@ -9296,28 +9302,24 @@ assert(
     browserSelkiesRuntimeExitTarget.includes('selkies_width="1920"') &&
     browserSelkiesRuntimeExitTarget.includes('selkies_height="1080"') &&
     browserSelkiesRuntimeExitTarget.includes(
-      '\\"--force-device-scale-factor=1.5\\"',
+      '\\"--force-device-scale-factor=1\\"',
     ) &&
-    browserSelkiesRuntimeExitTarget.includes(
+    !browserSelkiesRuntimeExitTarget.includes(
       "ELASTOS_SELKIES_INITIAL_RESOLUTION",
     ) &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-resolution-mode") &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-width") &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-height") &&
     browserSelkiesRuntimeExitTarget.includes(
-      "needle = 'resize_display(' + quote + '1920x1080' + quote + ')'",
+      "--is-manual-resolution-mode=true",
     ) &&
-    browserSelkiesRuntimeExitTarget.includes(
-      'selkies_resolution_mode="dynamic"',
-    ) &&
-    browserSelkiesRuntimeExitTarget.includes("--selkies-resolution-mode") &&
-    browserSelkiesRuntimeExitTarget.includes(
-      "--is-manual-resolution-mode=false",
-    ) &&
-    browserSelkiesRuntimeExitTarget.includes("--enable-resize=true") &&
+    browserSelkiesRuntimeExitTarget.includes("--enable-resize=false") &&
     browserSelkiesRuntimeExitTarget.includes("--selkies-encoder") &&
-    browserSelkiesRuntimeExitTarget.includes("selkies_resolution") &&
+    browserSelkiesRuntimeExitTarget.includes('selkies_resolution_mode: "fixed"') &&
     read("docs/BROWSER_CAPSULE.md").includes(
-      "1920x1080 stream with a stable 1280x720 CSS viewport",
+      "fixed 1920x1080 stream/page raster at DPR 1",
     ),
-  "Canonical hosted Browser launcher must default to a tunable H.264 profile with explicit normal-browser viewport scale and remote-resize gating instead of the old JPEG proof profile or unproven zoomed-out CSS surface",
+  "Canonical hosted Browser launcher must use a fixed 1920x1080 DPR-1 compositor/capture/page raster while retaining only codec-quality tuning",
 );
 assert(
   browserEngineAdapter.includes("MAX_SUPERVISOR_TIMEOUT_MS: u64 = 300_000") &&
@@ -9580,14 +9582,35 @@ assert(
     browserJs.includes("touchPanState") &&
     browserJs.includes("suppressSyntheticClickUntil") &&
     browserJs.includes("bindInputChannel") &&
-    browserJs.includes("scheduleViewportResize({ force: true })") &&
-    browserJs.includes("function scheduleViewportResize()") &&
-    browserJs.includes("lastViewport = viewport;") &&
-    !browserJs.includes('type: "resize",') &&
+    !browserJs.includes("scheduleViewportResize") &&
+    !browserJs.includes("ResizeObserver") &&
+    !browserJs.includes('{ type: "resize"') &&
+    browserSelkiesControlService.includes("browserDisplayMetrics") &&
+    browserSelkiesControlService.includes("deviceScaleFactor: 1") &&
+    browserSelkiesControlService.includes("const PRODUCT_RASTER_WIDTH = 1920") &&
+    browserSelkiesControlService.includes("const PRODUCT_RASTER_HEIGHT = 1080") &&
     browserStyle.includes("object-fit: contain;") &&
     browserStyle.includes("object-position: center center;") &&
     browserStyle.includes("touch-action: none;"),
-  "Hosted Selkies Browser must stream a content-only app-mode Chromium surface, suppress Chrome-for-Testing infobars, reuse/reset or replace failed kiosk targets, disable Home iframe auto-fit for the dynamic Browser viewport, map input against the actual remote video coordinate space, support touch/pan input, preserve remote display aspect ratio without visual zoom/stretch, and keep WebRTC resize authority in the launch/session contract so users do not see a nested browser or misaligned input",
+  "Hosted Selkies Browser must stream a fixed 1920x1080 DPR-1 app-mode Chromium surface, map input through decoded-video coordinates, and preserve aspect ratio through viewer-only contain scaling",
+);
+assert(
+  browserSelkiesControlService.includes(
+    "function projectRuntimeProxyOnlineState",
+  ) &&
+    browserSelkiesControlService.includes("Network.overrideNetworkState") &&
+    browserSelkiesControlService.includes(
+      "before_initial_navigation",
+    ) &&
+    browserSelkiesControlService.includes(
+      "after_initial_navigation",
+    ) &&
+    browserSelkiesControlService.includes(
+      "`after_${command}_navigation`",
+    ) &&
+    browserSelkiesControlService.includes("navigator_online") &&
+    browserSelkiesControlService.includes("navigator_connection"),
+  "Runtime-proxied Browser targets must project and verify usable online state before and after top-level navigation without adding a guest NIC",
 );
 assert(
   shellWindows.includes("function fitLaunchedWindow") &&

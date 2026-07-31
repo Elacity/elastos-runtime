@@ -114,7 +114,6 @@ const browserMediaContentRectSource = extractFunction(
   browserSource,
   "browserMediaContentRect",
 );
-
 function runCase(query) {
   const script = new vm.Script(`
     const params = new URLSearchParams(${JSON.stringify(query)});
@@ -306,10 +305,9 @@ assert(
 assert(
   browserSource.includes("const requiresRuntimeRoute =") &&
     browserSource.includes('event?.type === "browser_command"') &&
-    browserSource.includes('event?.type === "resize"') &&
     browserSource.includes('event?.type === "file_upload"') &&
     browserSource.includes("!requiresRuntimeRoute"),
-  "Browser viewport resize and file upload must route through Runtime/provider CDP control instead of Selkies datachannel fallback",
+  "Browser commands and file upload must route through Runtime/provider CDP control instead of Selkies datachannel fallback",
 );
 assert(
   sameBrowserStreamTarget("https://ela.city/", "https://ela.city/home") &&
@@ -324,10 +322,15 @@ assert(
   "Browser address-bar navigation must try Runtime/provider navigation from Chrome error pages before falling back to a fresh Runtime session",
 );
 assert(
-  browserSource.includes("function scheduleViewportResize()") &&
-    browserSource.includes("lastViewport = viewport;") &&
-    !browserSource.includes('type: "resize"'),
-  "Stable WebRTC Browser display must not send provider resize commands that can freeze the fixed compositor stream",
+  !browserSource.includes("scheduleViewportResize") &&
+    !browserSource.includes('{ type: "resize"') &&
+    !browserSource.includes("ResizeObserver") &&
+    browserSource.includes("const PRODUCT_RASTER_WIDTH = 1920") &&
+    browserSource.includes("const PRODUCT_RASTER_HEIGHT = 1080") &&
+    browserSource.includes("deviceScaleFactor: 1") &&
+    browserSource.includes("width: stream.width") &&
+    browserSource.includes("height: stream.height"),
+  "Browser must keep one fixed 1920x1080 DPR-1 guest raster and never drive it from the Home panel",
 );
 assert(
   homeGuiWindowsSource.includes(`syncBrowserWindow(entry, launched);
@@ -353,7 +356,7 @@ assert(
 );
 assert(
   !selkiesMessagesForInputSource.includes('event.type === "resize"'),
-  "Selkies datachannel input must not own viewport resize; resize is provider state, not pointer input",
+  "Selkies datachannel input must not own guest raster size",
 );
 assert(
   browserSource.includes(
@@ -446,6 +449,8 @@ assert(
     ${browserPointFromEventSource}
     JSON.stringify({
       center: browserPointFromEvent({ clientX: 500, clientY: 500 }),
+      topLeft: browserPointFromEvent({ clientX: 0, clientY: 218.75 }),
+      bottomRight: browserPointFromEvent({ clientX: 1000, clientY: 781.25 }),
       outside: browserPointFromEvent({ clientX: 500, clientY: 100 })
     });
   `);
@@ -453,6 +458,13 @@ assert(
   assert(
     points.center.x === 960 && points.center.y === 540,
     `contained center must map to video center, got ${JSON.stringify(points.center)}`,
+  );
+  assert(
+    points.topLeft.x === 0 &&
+      points.topLeft.y === 0 &&
+      points.bottomRight.x === 1920 &&
+      points.bottomRight.y === 1080,
+    `contained video corners must map to all encoded corners after viewer resize, got ${JSON.stringify(points)}`,
   );
   assert(
     points.outside === null,
@@ -519,6 +531,6 @@ console.log(
     default_mode: "webrtc_remote_display",
     diagnostic_requires_debug: true,
     audio_invariants_checked: requiredAudioInvariants.length,
-    input_invariants_checked: 10,
+    input_invariants_checked: 12,
   }),
 );
