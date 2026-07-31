@@ -138,6 +138,7 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
             &wallet_authority,
             &[
                 WalletOperationKind::ListApprovals,
+                WalletOperationKind::ListApprovals,
                 WalletOperationKind::ApproveAndSignManaged,
                 WalletOperationKind::ListApprovals,
             ],

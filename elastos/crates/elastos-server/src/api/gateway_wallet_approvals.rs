@@ -115,6 +115,15 @@ pub(in crate::api::gateway) async fn approve_wallet_managed_request(
     input: WalletApprovalApproveRequest,
     capsule_id: &'static str,
 ) -> Response {
+    let request = match pending_wallet_approval_request(state, authority, request_id).await {
+        Ok(request) => request,
+        Err(err) => return system_error_response(err),
+    };
+    if request.intent == "browser_account_access" && capsule_id != WALLET_CAPSULE_ID {
+        return system_error_response(anyhow::anyhow!(
+            "Review Browser account access in Wallet before allowing it"
+        ));
+    }
     let Some(step_up_token) = input.step_up_token.as_deref() else {
         return system_error_response(anyhow::anyhow!(
             "fresh passkey verification is required to sign with a built-in wallet"
@@ -140,12 +149,12 @@ pub(in crate::api::gateway) async fn approve_wallet_managed_request(
     ) {
         return system_error_response(err);
     }
-    match approve_managed_wallet_request(
+    match approve_pending_managed_wallet_request(
         state,
         &state.data_dir,
         context,
         authority,
-        request_id,
+        request,
         &reason,
         capsule_id,
     )
@@ -176,9 +185,28 @@ pub(in crate::api::gateway) async fn approve_managed_wallet_request(
     capsule_id: &'static str,
 ) -> anyhow::Result<WalletApprovalReviewOutcome> {
     let request = pending_wallet_approval_request(state, authority, request_id).await?;
+    approve_pending_managed_wallet_request(
+        state, data_dir, context, authority, request, reason, capsule_id,
+    )
+    .await
+}
+
+pub(in crate::api::gateway) async fn approve_pending_managed_wallet_request(
+    state: &GatewayState,
+    data_dir: &FsPath,
+    context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
+    request: SystemWalletApprovalSummary,
+    reason: &str,
+    capsule_id: &'static str,
+) -> anyhow::Result<WalletApprovalReviewOutcome> {
+    if request.intent == "browser_account_access" && capsule_id != WALLET_CAPSULE_ID {
+        anyhow::bail!("Review Browser account access in Wallet before allowing it");
+    }
     if !is_managed_wallet_proof_type(&request.proof_type) {
         anyhow::bail!("Open the approval method to approve external wallet requests");
     }
+    let request_id = request.request_id.as_str();
     let signed = runtime_wallet_data(
         state,
         authority,
@@ -489,6 +517,7 @@ pub(in crate::api::gateway) fn system_wallet_approval_summary(
             .get("connector_id")
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
+        review: wallet_account_access_review(value),
         created_at: value.get("created_at")?.as_u64()?,
         expires_at: value.get("expires_at")?.as_u64()?,
         completed_at: value
@@ -504,4 +533,75 @@ pub(in crate::api::gateway) fn system_wallet_approval_summary(
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
     })
+}
+
+fn wallet_account_access_review(value: &serde_json::Value) -> Option<serde_json::Value> {
+    if value.get("intent")?.as_str()? != "browser_account_access" {
+        return None;
+    }
+    if value
+        .get("requested_by_actor")
+        .or_else(|| value.get("capsule_id"))?
+        .as_str()?
+        != BROWSER_CAPSULE_ID
+    {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    let text = |field: &str| payload.get(field).and_then(|value| value.as_str());
+    if text("schema")? != "elastos.browser.account-access-request/v1"
+        || text("permission")? != "eth_accounts"
+        || text("principal_id")? != value.get("principal_id")?.as_str()?
+        || text("session_id")? != value.get("session_id")?.as_str()?
+        || text("launch_id")? != value.get("launch_id")?.as_str()?
+        || text("account_id")? != value.get("account_id")?.as_str()?
+        || text("requested_chain_namespace")? != value.get("chain_namespace")?.as_str()?
+        || !text("address")?.eq_ignore_ascii_case(value.get("address")?.as_str()?)
+        || text("proof_binding_id")?.trim().is_empty()
+        || payload
+            .get("requires_wallet_approval")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+    {
+        return None;
+    }
+    let chain_namespaces = payload.get("chain_namespaces")?.as_array()?;
+    if chain_namespaces.len() != 2
+        || chain_namespaces[0].as_str() != Some("eip155:20")
+        || chain_namespaces[1].as_str() != Some("eip155:8453")
+        || !matches!(
+            text("requested_chain_namespace")?,
+            "eip155:20" | "eip155:8453"
+        )
+    {
+        return None;
+    }
+    let origin = text("origin")?;
+    let page_url = text("page_url")?;
+    let page = url::Url::parse(page_url).ok()?;
+    let parsed_origin = url::Url::parse(origin).ok()?;
+    if !matches!(page.scheme(), "http" | "https")
+        || page.host_str().is_none()
+        || !matches!(parsed_origin.scheme(), "http" | "https")
+        || parsed_origin.host_str().is_none()
+        || parsed_origin.origin().ascii_serialization() != origin
+        || page.origin() != parsed_origin.origin()
+    {
+        return None;
+    }
+    let grant_expires_at = payload.get("grant_expires_at")?.as_u64()?;
+    if grant_expires_at <= now_ts() || grant_expires_at > now_ts().saturating_add(12 * 60 * 60) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "kind": "account_access",
+        "permission": "eth_accounts",
+        "origin": origin,
+        "page_url": page_url,
+        "account_id": text("account_id")?,
+        "requested_chain_namespace": text("requested_chain_namespace")?,
+        "chain_namespaces": chain_namespaces,
+        "address": text("address")?,
+        "grant_expires_at": grant_expires_at,
+    }))
 }

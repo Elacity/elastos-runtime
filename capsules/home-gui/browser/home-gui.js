@@ -46,7 +46,7 @@ import {
   renderTaskbar,
   toggleLauncher,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260726a";
+} from "./shell-surface.js?v=home-20260731a";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -57,7 +57,7 @@ import {
   focusWindow,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260726a";
+} from "./shell-windows.js?v=home-20260731a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";

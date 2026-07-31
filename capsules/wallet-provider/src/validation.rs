@@ -55,6 +55,7 @@ pub(super) struct SignatureRequestInput {
     pub(super) principal_id: String,
     pub(super) session_id: String,
     pub(super) launch_id: String,
+    pub(super) proof_binding_id: Option<String>,
     pub(super) account_id: String,
     pub(super) chain_namespace: String,
     pub(super) intent: String,
@@ -100,6 +101,9 @@ impl SignatureRequestInput {
         validate_opaque_id(&self.principal_id, "principal_id")?;
         validate_opaque_id(&self.session_id, "session_id")?;
         validate_opaque_id(&self.launch_id, "launch_id")?;
+        if let Some(proof_binding_id) = &self.proof_binding_id {
+            validate_opaque_id(proof_binding_id, "proof_binding_id")?;
+        }
         validate_opaque_id(&self.account_id, "account_id")?;
         validate_opaque_id(&self.chain_namespace, "chain_namespace")?;
         validate_signing_intent(&self.intent)?;
@@ -289,6 +293,7 @@ pub(super) fn validate_signing_intent(value: &str) -> Result<(), String> {
         | "publish_envelope"
         | "transaction_intent"
         | "browser_connect"
+        | "browser_account_access"
         | "browser_personal_sign"
         | "browser_typed_data_sign"
         | "bitcoin_bip322_proof"
@@ -301,6 +306,7 @@ pub(super) fn managed_signing_intent_is_supported(value: &str) -> bool {
     matches!(
         value,
         "transaction_intent"
+            | "browser_account_access"
             | "browser_personal_sign"
             | "browser_typed_data_sign"
             | "bitcoin_bip322_proof"

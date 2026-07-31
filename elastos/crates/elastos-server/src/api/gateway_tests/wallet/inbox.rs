@@ -134,6 +134,7 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
             &[
                 WalletOperationKind::ListApprovals,
                 WalletOperationKind::ListApprovals,
+                WalletOperationKind::ListApprovals,
                 WalletOperationKind::ApproveAndSignManaged,
             ],
         )

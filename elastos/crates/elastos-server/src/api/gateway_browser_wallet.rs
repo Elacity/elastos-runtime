@@ -10,6 +10,9 @@ use gateway_browser_wallet_bridge::browser_wallet_account_is_signable_evm;
 pub(in crate::api::gateway) use gateway_browser_wallet_bridge::{
     browser_chain_namespace_network, browser_wallet_bridge_payload, is_browser_wallet_intent,
 };
+use gateway_browser_wallet_bridge::{
+    browser_projected_evm_accounts, BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES,
+};
 use gateway_browser_wallet_reads::browser_wallet_read;
 
 fn browser_wallet_cors_origin(headers: &HeaderMap) -> HeaderValue {
@@ -96,6 +99,14 @@ pub(in crate::api::gateway) struct BrowserWalletSignatureRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(in crate::api::gateway) struct BrowserWalletAccountAccessRequest {
+    pub(in crate::api::gateway) chain_namespace: String,
+    pub(in crate::api::gateway) page_url: String,
+    pub(in crate::api::gateway) origin: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::api::gateway) struct BrowserWalletTransactionRequest {
     pub(in crate::api::gateway) method: String,
     #[serde(default)]
@@ -128,6 +139,54 @@ pub(in crate::api::gateway) struct BrowserWalletBroadcastRequest {
     pub(in crate::api::gateway) request_id: String,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api::gateway) struct BrowserWalletApprovalStatusQuery {
+    #[serde(default)]
+    pub(in crate::api::gateway) page_url: Option<String>,
+    #[serde(default)]
+    pub(in crate::api::gateway) origin: Option<String>,
+}
+
+const BROWSER_ACCOUNT_ACCESS_TTL_SECS: u64 = 12 * 60 * 60;
+
+fn validate_browser_wallet_page_origin(
+    page_url: &str,
+    origin: &str,
+) -> Result<String, (StatusCode, String)> {
+    let invalid_page = || {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid browser page URL".to_string(),
+        )
+    };
+    let invalid_origin = || {
+        (
+            StatusCode::BAD_REQUEST,
+            "Browser wallet request origin must be an exact HTTP(S) origin".to_string(),
+        )
+    };
+    let page = url::Url::parse(page_url).map_err(|_| invalid_page())?;
+    if !matches!(page.scheme(), "http" | "https") || page.host_str().is_none() {
+        return Err(invalid_page());
+    }
+    let parsed = url::Url::parse(origin).map_err(|_| invalid_origin())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(invalid_origin());
+    }
+    let canonical = parsed.origin().ascii_serialization();
+    if origin != canonical {
+        return Err(invalid_origin());
+    }
+    if canonical != page.origin().ascii_serialization() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Browser wallet request origin does not match page URL origin".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
 pub(in crate::api::gateway) async fn browser_app_wallet_request_signature(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -146,6 +205,29 @@ pub(in crate::api::gateway) async fn browser_app_wallet_request_signature(
     let context = authority.home_launch_context();
     let response =
         match create_browser_wallet_signature_request(&state, &context, &authority, input).await {
+            Ok(payload) => Json(payload).into_response(),
+            Err((status, message)) => (status, message).into_response(),
+        };
+    browser_wallet_cors_response(&headers, response)
+}
+
+pub(in crate::api::gateway) async fn browser_app_wallet_request_accounts(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(input): Json<BrowserWalletAccountAccessRequest>,
+) -> Response {
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
+            Err(err) => {
+                return browser_wallet_cors_response(
+                    &headers,
+                    gateway_provider_error_response("browser", err),
+                );
+            }
+        };
+    let response =
+        match create_browser_wallet_account_access_request(&state, &authority, input).await {
             Ok(payload) => Json(payload).into_response(),
             Err((status, message)) => (status, message).into_response(),
         };
@@ -239,6 +321,7 @@ pub(in crate::api::gateway) async fn browser_app_wallet_approval_status(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     Path(request_id): Path<String>,
+    Query(query): Query<BrowserWalletApprovalStatusQuery>,
 ) -> Response {
     let authority =
         match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
@@ -260,11 +343,141 @@ pub(in crate::api::gateway) async fn browser_app_wallet_approval_status(
                 .into_response(),
         );
     }
-    let response = match browser_wallet_approval_status(&state, &authority, &request_id).await {
+    let response = match browser_wallet_approval_status(
+        &state,
+        &authority,
+        &request_id,
+        query.page_url.as_deref(),
+        query.origin.as_deref(),
+    )
+    .await
+    {
         Ok(payload) => Json(payload).into_response(),
         Err((status, message)) => (status, message).into_response(),
     };
     browser_wallet_cors_response(&headers, response)
+}
+
+async fn create_browser_wallet_account_access_request(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    input: BrowserWalletAccountAccessRequest,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let context = authority.verified_context();
+    let proof_binding_id = context.proof_binding_id().ok_or_else(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "Browser account access requires proof-bound launch authority".to_string(),
+        )
+    })?;
+    let origin = validate_browser_wallet_page_origin(&input.page_url, &input.origin)?;
+    if browser_chain_namespace_network(&input.chain_namespace).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Browser account access requires a Runtime-supported eip155 chain".to_string(),
+        ));
+    }
+    let summary = system_wallet_accounts_summary(state, authority).await;
+    let account = browser_projected_evm_accounts(&summary)
+        .into_iter()
+        .find(|account| {
+            account.chain_namespace == input.chain_namespace
+                && browser_wallet_account_is_signable_evm(account)
+                && is_managed_wallet_proof_type(&account.proof_type)
+                && account.connector_id.is_none()
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Browser account access requires a Runtime-managed EVM account for the selected chain"
+                    .to_string(),
+            )
+        })?;
+    let chain_namespaces = BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES
+        .iter()
+        .map(|namespace| (*namespace).to_string())
+        .collect::<Vec<_>>();
+    let grant_expires_at = now_ts().saturating_add(BROWSER_ACCOUNT_ACCESS_TTL_SECS);
+    let payload = serde_json::json!({
+        "schema": "elastos.browser.account-access-request/v1",
+        "permission": "eth_accounts",
+        "principal_id": context.principal_id(),
+        "session_id": context.session_id(),
+        "launch_id": context.launch_id(),
+        "proof_binding_id": proof_binding_id,
+        "origin": origin,
+        "page_url": input.page_url,
+        "account_id": account.account_id,
+        "requested_chain_namespace": input.chain_namespace,
+        "chain_namespaces": chain_namespaces,
+        "address": account.address,
+        "grant_expires_at": grant_expires_at,
+        "requires_wallet_approval": true,
+    });
+    let data = runtime_wallet_data(
+        state,
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RequestApproval {
+            account_id: account.account_id.clone(),
+            chain_namespace: input.chain_namespace.clone(),
+            intent: "browser_account_access".to_string(),
+            resource: format!(
+                "elastos://wallet/account/{}/permission/eth_accounts",
+                account.account_id
+            ),
+            reason: format!(
+                "Browser origin {origin} requests access on Runtime-supported EVM networks: {}",
+                BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES.join(", ")
+            ),
+            payload,
+            expires_at: now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
+        },
+    )
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    let approval = data
+        .get("approval_request")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "wallet-provider did not create an account-access approval request".to_string(),
+            )
+        })?;
+    let request_id = approval
+        .get("request_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| is_safe_runtime_id(value))
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "wallet-provider returned an invalid account-access approval id".to_string(),
+            )
+        })?;
+    append_browser_effect_audit_or_500(
+        &state.data_dir,
+        BrowserEffectAuditInput {
+            event_type: "browser.wallet.account_access.requested",
+            principal_id: context.principal_id(),
+            session_id: context.session_id(),
+            request_id,
+            result: "pending",
+            method: "eth_requestAccounts",
+            resource: &input.chain_namespace,
+            page_url: &input.page_url,
+            origin: Some(&origin),
+            decision: "wallet_review_required_before_disclosure",
+        },
+    )?;
+    Ok(serde_json::json!({
+        "schema": "elastos.browser.account-access-request-result/v1",
+        "approval_request": {
+            "request_id": request_id,
+            "status": approval.get("status").cloned().unwrap_or(serde_json::json!("pending")),
+            "expires_at": approval.get("expires_at").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "requires_approval": true,
+    }))
 }
 
 async fn create_browser_wallet_transaction_request(
@@ -717,10 +930,280 @@ fn browser_typed_data_signature_parts(
     Ok((requested_address, typed_data, canonical))
 }
 
+fn completed_browser_wallet_result_error(detail: &str) -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("completed browser wallet approval {detail}"),
+    )
+}
+
+fn completed_browser_wallet_result_string<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, (StatusCode, String)> {
+    value
+        .get(field)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| completed_browser_wallet_result_error(&format!("is missing {field}")))
+}
+
+fn browser_account_access_request_payload<'a>(
+    request: &'a serde_json::Value,
+    authority: &RuntimeWalletAuthority,
+    page_url: Option<&str>,
+    origin: Option<&str>,
+) -> Result<&'a serde_json::Value, (StatusCode, String)> {
+    let context = authority.verified_context();
+    let page_url = page_url.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Browser account-access status requires the exact page URL".to_string(),
+        )
+    })?;
+    let origin = origin.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Browser account-access status requires the exact page origin".to_string(),
+        )
+    })?;
+    let canonical_origin = validate_browser_wallet_page_origin(page_url, origin)?;
+    if !is_managed_wallet_proof_type(
+        request
+            .get("proof_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+    ) || request
+        .get("connector_id")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(completed_browser_wallet_result_error(
+            "is not backed by a Runtime-managed signer",
+        ));
+    }
+    for (field, expected) in [
+        ("principal_id", context.principal_id()),
+        ("session_id", context.session_id()),
+        ("launch_id", context.launch_id()),
+        ("requested_by_actor", BROWSER_CAPSULE_ID),
+    ] {
+        if request.get(field).and_then(|value| value.as_str()) != Some(expected) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "browser wallet approval request not found".to_string(),
+            ));
+        }
+    }
+    let payload = request
+        .get("payload")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            completed_browser_wallet_result_error("is missing account-access request payload")
+        })?;
+    if completed_browser_wallet_result_string(payload, "schema")?
+        != "elastos.browser.account-access-request/v1"
+        || completed_browser_wallet_result_string(payload, "permission")? != "eth_accounts"
+        || payload
+            .get("requires_wallet_approval")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+    {
+        return Err(completed_browser_wallet_result_error(
+            "has an invalid account-access request payload",
+        ));
+    }
+    for (field, expected) in [
+        ("principal_id", context.principal_id()),
+        ("session_id", context.session_id()),
+        ("launch_id", context.launch_id()),
+        ("page_url", page_url),
+        ("origin", canonical_origin.as_str()),
+    ] {
+        if completed_browser_wallet_result_string(payload, field)? != expected {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "browser wallet approval request not found".to_string(),
+            ));
+        }
+    }
+    let proof_binding_id = context.proof_binding_id().ok_or_else(|| {
+        completed_browser_wallet_result_error("has no proof-bound Browser authority")
+    })?;
+    if completed_browser_wallet_result_string(payload, "proof_binding_id")? != proof_binding_id {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "browser wallet approval request not found".to_string(),
+        ));
+    }
+    let account_id = completed_browser_wallet_result_string(request, "account_id")?;
+    let chain_namespace = completed_browser_wallet_result_string(request, "chain_namespace")?;
+    let address = completed_browser_wallet_result_string(request, "address")?;
+    if completed_browser_wallet_result_string(payload, "account_id")? != account_id
+        || completed_browser_wallet_result_string(payload, "requested_chain_namespace")?
+            != chain_namespace
+        || !completed_browser_wallet_result_string(payload, "address")?
+            .eq_ignore_ascii_case(address)
+        || !BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES.contains(&chain_namespace)
+    {
+        return Err(completed_browser_wallet_result_error(
+            "has substituted account-access account authority",
+        ));
+    }
+    let namespaces = payload
+        .get("chain_namespaces")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            completed_browser_wallet_result_error("is missing account-access network set")
+        })?;
+    if namespaces.len() != BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES.len()
+        || !namespaces
+            .iter()
+            .zip(BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES)
+            .all(|(actual, expected)| actual.as_str() == Some(*expected))
+    {
+        return Err(completed_browser_wallet_result_error(
+            "has an invalid account-access network set",
+        ));
+    }
+    let now = now_ts();
+    if !payload
+        .get("grant_expires_at")
+        .and_then(|value| value.as_u64())
+        .is_some_and(|expires_at| {
+            expires_at > now && expires_at <= now.saturating_add(BROWSER_ACCOUNT_ACCESS_TTL_SECS)
+        })
+    {
+        return Err(completed_browser_wallet_result_error(
+            "has an invalid or expired account-access grant",
+        ));
+    }
+    Ok(payload)
+}
+
+fn validate_completed_browser_account_access_result(
+    request_id: &str,
+    request: &serde_json::Value,
+    request_payload: &serde_json::Value,
+    result: &serde_json::Value,
+    authority: &RuntimeWalletAuthority,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let context = authority.verified_context();
+    if completed_browser_wallet_result_string(result, "schema")?
+        != "elastos.browser.account-access-result/v1"
+        || completed_browser_wallet_result_string(result, "request_id")? != request_id
+        || completed_browser_wallet_result_string(result, "permission")? != "eth_accounts"
+    {
+        return Err(completed_browser_wallet_result_error(
+            "has an invalid account-access result envelope",
+        ));
+    }
+    for (field, expected) in [
+        ("principal_id", context.principal_id()),
+        ("session_id", context.session_id()),
+        ("launch_id", context.launch_id()),
+    ] {
+        if completed_browser_wallet_result_string(result, field)? != expected
+            || completed_browser_wallet_result_string(request_payload, field)? != expected
+        {
+            return Err(completed_browser_wallet_result_error(&format!(
+                "account-access result does not match its {field} authority"
+            )));
+        }
+    }
+    let proof_binding_id = context.proof_binding_id().ok_or_else(|| {
+        completed_browser_wallet_result_error("has no proof-bound Browser authority")
+    })?;
+    if completed_browser_wallet_result_string(result, "proof_binding_id")? != proof_binding_id
+        || completed_browser_wallet_result_string(request_payload, "proof_binding_id")?
+            != proof_binding_id
+    {
+        return Err(completed_browser_wallet_result_error(
+            "does not match its Browser proof binding",
+        ));
+    }
+    for field in [
+        "origin",
+        "page_url",
+        "account_id",
+        "requested_chain_namespace",
+    ] {
+        if completed_browser_wallet_result_string(result, field)?
+            != completed_browser_wallet_result_string(request_payload, field)?
+        {
+            return Err(completed_browser_wallet_result_error(&format!(
+                "account-access result does not match its request {field}"
+            )));
+        }
+    }
+    if completed_browser_wallet_result_string(result, "account_id")?
+        != completed_browser_wallet_result_string(request, "account_id")?
+        || completed_browser_wallet_result_string(result, "requested_chain_namespace")?
+            != completed_browser_wallet_result_string(request, "chain_namespace")?
+        || !completed_browser_wallet_result_string(result, "address")?
+            .eq_ignore_ascii_case(completed_browser_wallet_result_string(request, "address")?)
+        || !completed_browser_wallet_result_string(result, "address")?.eq_ignore_ascii_case(
+            completed_browser_wallet_result_string(request_payload, "address")?,
+        )
+        || completed_browser_wallet_result_string(result, "payload_hash")?
+            != completed_browser_wallet_result_string(request, "payload_hash")?
+    {
+        return Err(completed_browser_wallet_result_error(
+            "account-access result does not match its request account authority",
+        ));
+    }
+    let result_namespaces = result
+        .get("chain_namespaces")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            completed_browser_wallet_result_error("is missing account-access result network set")
+        })?;
+    let request_namespaces = request_payload
+        .get("chain_namespaces")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            completed_browser_wallet_result_error("is missing account-access request network set")
+        })?;
+    if result_namespaces != request_namespaces {
+        return Err(completed_browser_wallet_result_error(
+            "account-access result does not match its request network set",
+        ));
+    }
+    let grant_expires_at = result
+        .get("grant_expires_at")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            completed_browser_wallet_result_error("is missing account-access grant expiry")
+        })?;
+    if request_payload
+        .get("grant_expires_at")
+        .and_then(|value| value.as_u64())
+        != Some(grant_expires_at)
+        || grant_expires_at <= now_ts()
+    {
+        return Err(completed_browser_wallet_result_error(
+            "has an invalid or expired account-access grant",
+        ));
+    }
+    Ok(serde_json::json!({
+        "permission": "eth_accounts",
+        "principal_id": context.principal_id(),
+        "session_id": context.session_id(),
+        "launch_id": context.launch_id(),
+        "origin": completed_browser_wallet_result_string(result, "origin")?,
+        "account_id": completed_browser_wallet_result_string(result, "account_id")?,
+        "requested_chain_namespace": completed_browser_wallet_result_string(result, "requested_chain_namespace")?,
+        "chain_namespaces": result_namespaces,
+        "address": completed_browser_wallet_result_string(result, "address")?,
+        "grant_expires_at": grant_expires_at,
+    }))
+}
+
 async fn browser_wallet_approval_status(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     request_id: &str,
+    page_url: Option<&str>,
+    origin: Option<&str>,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let response = runtime_wallet_data(
         state,
@@ -761,6 +1244,14 @@ async fn browser_wallet_approval_status(
         .get("status")
         .and_then(|value| value.as_str())
         .unwrap_or("unknown");
+    let intent = request.get("intent").and_then(|value| value.as_str());
+    let account_access_payload = if intent == Some("browser_account_access") {
+        Some(browser_account_access_request_payload(
+            request, authority, page_url, origin,
+        )?)
+    } else {
+        None
+    };
     let mut payload = serde_json::json!({
         "schema": "elastos.browser.wallet-approval-status/v1",
         "request_id": request_id,
@@ -773,8 +1264,16 @@ async fn browser_wallet_approval_status(
                 "completed browser wallet approval is missing signed result".to_string(),
             )
         })?;
-        if matches!(
-            request.get("intent").and_then(|value| value.as_str()),
+        if intent == Some("browser_account_access") {
+            payload["account_access"] = validate_completed_browser_account_access_result(
+                request_id,
+                request,
+                account_access_payload.expect("account access payload validated above"),
+                result,
+                authority,
+            )?;
+        } else if matches!(
+            intent,
             Some("browser_personal_sign") | Some("browser_typed_data_sign")
         ) {
             let signature = result
@@ -817,7 +1316,9 @@ async fn browser_wallet_approval_status(
                 ));
             }
         }
-        payload["signed_result"] = result.clone();
+        if intent != Some("browser_account_access") {
+            payload["signed_result"] = result.clone();
+        }
     }
     Ok(payload)
 }

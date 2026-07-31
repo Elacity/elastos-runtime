@@ -577,6 +577,8 @@ struct SystemWalletApprovalSummary {
     proof_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     connector_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review: Option<serde_json::Value>,
     created_at: u64,
     expires_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]

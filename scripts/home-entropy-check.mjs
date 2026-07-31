@@ -1594,7 +1594,7 @@ const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-p
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260725a";
 const homeClipboardAssetVersion = "home-20260726a";
-const homeGuiAssetVersion = "home-20260726a";
+const homeGuiAssetVersion = "home-20260731a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -4653,7 +4653,10 @@ const inboxWalletApprovalBoundary = {
     gatewayInboxApi.includes('"wallet.approve"') &&
     gatewayInboxApi.includes('"reason": "Approved in Inbox"'),
   gatewayApprovesManagedWalletFromInbox: gatewayInboxApi.includes(
-    "approve_managed_wallet_request(",
+    "approve_pending_managed_wallet_request(",
+  ) &&
+    gatewayInboxApi.includes(
+      "pending_wallet_approval_request(",
   ) &&
     gatewayInboxApi.includes('"Approved in Inbox"') &&
     gatewayInboxApi.includes("INBOX_CAPSULE_ID"),

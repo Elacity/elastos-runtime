@@ -39,6 +39,23 @@ pub(super) fn managed_signature_envelope(request: &WalletApprovalRequest) -> Val
     })
 }
 
+fn browser_account_access_attestation(request: &WalletApprovalRequest) -> Value {
+    json!({
+        "schema": "elastos.browser.account-access-attestation/v1",
+        "request_id": request.request_id,
+        "principal_id": request.principal_id,
+        "account_id": request.account_id,
+        "chain_namespace": request.chain_namespace,
+        "address": request.address,
+        "intent": request.intent,
+        "requested_by_actor": request.requested_by_actor,
+        "resource": request.resource,
+        "reason": request.reason,
+        "payload_hash": request.payload_hash,
+        "payload": request.payload,
+    })
+}
+
 pub(super) struct ManagedSignatureOutput {
     pub(super) kind: ManagedSignatureKind,
     pub(super) authority: String,
@@ -67,6 +84,16 @@ pub(super) fn sign_managed_approval(
         return Err(
             "managed Bitcoin accounts only support bitcoin_bip322_proof signing".to_string(),
         );
+    }
+    if request.intent == "browser_account_access" {
+        let payload = browser_account_access_attestation(request);
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+        let signature = sign_evm_message(signing_key, &payload_bytes)?;
+        return Ok(ManagedSignatureOutput {
+            kind: ManagedSignatureKind::Message,
+            authority: signature,
+            payload,
+        });
     }
     if request.intent == "browser_personal_sign" {
         let (signature, payload) = sign_browser_personal_sign_approval(signing_key, request)?;
@@ -147,6 +174,25 @@ pub(super) fn managed_signed_result(
     request: &WalletApprovalRequest,
     signed: &ManagedSignatureOutput,
 ) -> Option<Value> {
+    if request.intent == "browser_account_access" {
+        return Some(json!({
+            "schema": "elastos.browser.account-access-result/v1",
+            "request_id": request.request_id,
+            "permission": "eth_accounts",
+            "principal_id": request.payload.get("principal_id").cloned().unwrap_or(Value::Null),
+            "session_id": request.payload.get("session_id").cloned().unwrap_or(Value::Null),
+            "launch_id": request.payload.get("launch_id").cloned().unwrap_or(Value::Null),
+            "proof_binding_id": request.payload.get("proof_binding_id").cloned().unwrap_or(Value::Null),
+            "origin": request.payload.get("origin").cloned().unwrap_or(Value::Null),
+            "page_url": request.payload.get("page_url").cloned().unwrap_or(Value::Null),
+            "account_id": request.account_id,
+            "requested_chain_namespace": request.payload.get("requested_chain_namespace").cloned().unwrap_or(Value::Null),
+            "chain_namespaces": request.payload.get("chain_namespaces").cloned().unwrap_or(Value::Null),
+            "address": request.address,
+            "grant_expires_at": request.payload.get("grant_expires_at").cloned().unwrap_or(Value::Null),
+            "payload_hash": request.payload_hash,
+        }));
+    }
     if request.intent == "browser_personal_sign" {
         return browser_personal_sign_result(request, &signed.authority);
     }

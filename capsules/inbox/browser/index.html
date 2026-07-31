@@ -704,6 +704,9 @@
         actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
         actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId })));
         actions.appendChild(createActionButton("Reject", "wallet-reject-request:" + actionId.slice("wallet-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("wallet-review-request:")) {
+        const requestId = actionId.slice("wallet-review-request:".length);
+        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId }), "primary"));
       } else if (typeof actionId === "string" && actionId.startsWith("capability-approve-request:")) {
         actions.appendChild(createActionButton("Approve", actionId, "primary"));
         actions.appendChild(createActionButton("Deny", "capability-deny-request:" + actionId.slice("capability-approve-request:".length), "danger"));

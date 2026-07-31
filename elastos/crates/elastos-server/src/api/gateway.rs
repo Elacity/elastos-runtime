@@ -769,6 +769,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(gateway_browser::browser_app_page_webrtc),
         )
         .route(
+            "/api/apps/browser/wallet/request-accounts",
+            post(gateway_browser::browser_app_wallet_request_accounts)
+                .options(gateway_browser::browser_app_wallet_cors_preflight),
+        )
+        .route(
             "/api/apps/browser/wallet/request-signature",
             post(gateway_browser::browser_app_wallet_request_signature)
                 .options(gateway_browser::browser_app_wallet_cors_preflight),

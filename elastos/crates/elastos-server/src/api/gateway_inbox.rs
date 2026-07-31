@@ -64,7 +64,15 @@ pub(super) fn append_wallet_approval_notifications(
             ),
             action_ref: Some(HomeNotificationActionSummary {
                 app: WALLET_CAPSULE_ID.to_string(),
-                action_id: format!("wallet-approve-request:{}", request.request_id),
+                action_id: format!(
+                    "{}:{}",
+                    if request.intent == "browser_account_access" {
+                        "wallet-review-request"
+                    } else {
+                        "wallet-approve-request"
+                    },
+                    request.request_id
+                ),
             }),
             severity: "attention".to_string(),
             read: false,
@@ -140,6 +148,7 @@ fn wallet_approval_title(intent: &str) -> String {
         "credential" => "Credential signing request".to_string(),
         "publish_envelope" => "Publish approval request".to_string(),
         "transaction_intent" => "Transaction approval request".to_string(),
+        "browser_account_access" => "Browser account access request".to_string(),
         "browser_personal_sign" => "Browser signature request".to_string(),
         "browser_typed_data_sign" => "Browser typed data signature request".to_string(),
         "bitcoin_bip322_proof" => "Bitcoin proof request".to_string(),
@@ -265,6 +274,10 @@ async fn dispatch_inbox_action(
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-approve-request:") {
+        let pending = pending_wallet_approval_request(state, authority, request_id).await?;
+        if pending.intent == "browser_account_access" {
+            anyhow::bail!("Review Browser account access in Wallet before allowing it");
+        }
         let Some(step_up_token) = action.step_up_token.as_deref() else {
             anyhow::bail!("fresh passkey verification is required to sign with a built-in wallet");
         };
@@ -279,12 +292,12 @@ async fn dispatch_inbox_action(
                 "reason": "Approved in Inbox",
             }),
         )?;
-        let outcome = approve_managed_wallet_request(
+        let outcome = approve_pending_managed_wallet_request(
             state,
             data_dir,
             context,
             authority,
-            request_id,
+            pending,
             "Approved in Inbox",
             INBOX_CAPSULE_ID,
         )

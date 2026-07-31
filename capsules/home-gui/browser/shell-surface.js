@@ -59,7 +59,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260726a";
+} from "./shell-windows.js?v=home-20260731a";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;
@@ -1519,7 +1519,10 @@ function walletApprovalEntries(summary) {
     const actionId = entry?.action_ref?.action_id;
     return entry?.kind === "wallet_approval_request"
       && typeof actionId === "string"
-      && actionId.startsWith("wallet-approve-request:");
+      && (
+        actionId.startsWith("wallet-approve-request:")
+        || actionId.startsWith("wallet-review-request:")
+      );
   });
 }
 

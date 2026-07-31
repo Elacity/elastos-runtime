@@ -56,6 +56,75 @@ async fn open_mock_browser_page(app: axum::Router, token: &str, reason: &str) ->
         .to_string()
 }
 
+fn completed_browser_account_access_approval(
+    context: &elastos_wallet_contract::VerifiedWalletInvocationContext,
+    request_id: &str,
+    grant_expires_at: u64,
+) -> serde_json::Value {
+    let account_id = "wallet:eip155:20:0x1111111111111111111111111111111111111111";
+    let address = "0x1111111111111111111111111111111111111111";
+    let payload_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let payload = json!({
+        "schema": "elastos.browser.account-access-request/v1",
+        "permission": "eth_accounts",
+        "principal_id": context.principal_id(),
+        "session_id": context.session_id(),
+        "launch_id": context.launch_id(),
+        "proof_binding_id": context.proof_binding_id(),
+        "origin": "https://dapp.example",
+        "page_url": "https://dapp.example/connect",
+        "account_id": account_id,
+        "requested_chain_namespace": "eip155:20",
+        "chain_namespaces": ["eip155:20", "eip155:8453"],
+        "address": address,
+        "grant_expires_at": grant_expires_at,
+        "requires_wallet_approval": true,
+    });
+    json!({
+        "schema": "elastos.wallet.approval_request/v1",
+        "request_id": request_id,
+        "wallet_request_sha256": "wallet-request-sha",
+        "authority_binding": "authority-binding",
+        "kind": "signature",
+        "status": "completed",
+        "principal_id": context.principal_id(),
+        "session_id": context.session_id(),
+        "launch_id": context.launch_id(),
+        "account_id": account_id,
+        "proof_binding_id": "proof:wallet:managed",
+        "chain_namespace": "eip155:20",
+        "address": address,
+        "proof_type": "managed_evm",
+        "connector_id": null,
+        "intent": "browser_account_access",
+        "requested_by_actor": BROWSER_CAPSULE_ID,
+        "resource": format!("elastos://wallet/account/{account_id}/permission/eth_accounts"),
+        "reason": "Browser origin requests exact account access",
+        "payload": payload,
+        "payload_hash": payload_hash,
+        "created_at": crate::auth::now_ts().saturating_sub(1),
+        "expires_at": crate::auth::now_ts().saturating_add(600),
+        "completed_at": crate::auth::now_ts(),
+        "signed_result": {
+            "schema": "elastos.browser.account-access-result/v1",
+            "request_id": request_id,
+            "permission": "eth_accounts",
+            "principal_id": context.principal_id(),
+            "session_id": context.session_id(),
+            "launch_id": context.launch_id(),
+            "proof_binding_id": context.proof_binding_id(),
+            "origin": "https://dapp.example",
+            "page_url": "https://dapp.example/connect",
+            "account_id": account_id,
+            "requested_chain_namespace": "eip155:20",
+            "chain_namespaces": ["eip155:20", "eip155:8453"],
+            "address": address,
+            "grant_expires_at": grant_expires_at,
+            "payload_hash": payload_hash,
+        },
+    })
+}
+
 fn browser_cleanup_id(opened: &serde_json::Value) -> &str {
     opened["runtime_cleanup"]["id"]
         .as_str()
@@ -6235,4 +6304,248 @@ async fn test_raw_browser_engine_and_exit_provider_proxy_routes_are_unavailable(
             "route {route} returned {message}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_browser_account_access_creates_review_only_inbox_handoff_without_disclosure() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let wallet_token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
+    let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let address = "0x1111111111111111111111111111111111111111";
+    let account_id = format!("wallet:eip155:20:{address}");
+    let provider = MockWalletProvider {
+        challenges: TokioMutex::default(),
+        bitcoin_challenges: TokioMutex::default(),
+        accounts: TokioMutex::new(vec![json!({
+            "account_id": account_id,
+            "principal_id": authority.principal_id,
+            "proof_binding_id": "proof:wallet:managed:browser-consent",
+            "chain_namespace": "eip155:20",
+            "address": address,
+            "proof_type": "managed_evm",
+            "signing_available": true,
+            "signing_status": "managed_key_available",
+            "linked_at": crate::auth::now_ts(),
+        })]),
+        approvals: TokioMutex::default(),
+        defaults: TokioMutex::default(),
+    };
+    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/browser/wallet/request-accounts")
+                .header("x-elastos-home-token", browser_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "chain_namespace": "eip155:20",
+                        "page_url": "https://dapp.example/connect",
+                        "origin": "https://dapp.example",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        created["schema"],
+        "elastos.browser.account-access-request-result/v1"
+    );
+    assert_eq!(created["requires_approval"], true);
+    assert_eq!(created["approval_request"]["status"], "pending");
+    assert!(
+        created.get("address").is_none(),
+        "unapproved account-access response disclosed an address"
+    );
+    assert!(created.get("account_id").is_none());
+    assert!(created["approval_request"].get("address").is_none());
+    assert!(created["approval_request"].get("account_id").is_none());
+    let request_id = created["approval_request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let summary = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/wallet/wallet/summary")
+                .header("x-elastos-home-token", wallet_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let review = &summary["wallet_approvals"]["approval_requests"][0]["review"];
+    assert_eq!(review["kind"], "account_access");
+    assert_eq!(review["origin"], "https://dapp.example");
+    assert_eq!(
+        review["chain_namespaces"],
+        json!(["eip155:20", "eip155:8453"])
+    );
+    assert_eq!(review["address"], address);
+
+    let inbox = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/inbox/summary")
+                .header("x-elastos-home-token", inbox_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbox.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(inbox.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let inbox: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let notification = inbox["notifications"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "wallet_approval_request")
+        .unwrap();
+    assert_eq!(notification["title"], "Browser account access request");
+    assert_eq!(
+        notification["action_ref"]["action_id"],
+        format!("wallet-review-request:{request_id}")
+    );
+
+    let crafted_direct_approval = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/inbox/actions")
+                .header("x-elastos-home-token", inbox_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action_id": format!("wallet-approve-request:{request_id}"),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(crafted_direct_approval.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(crafted_direct_approval.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("Review Browser account access in Wallet"));
+}
+
+#[tokio::test]
+async fn test_browser_account_access_status_returns_only_exact_origin_bound_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let browser_token = app_token_for_authority(dir.path(), BROWSER_CAPSULE_ID, &authority);
+    let mut headers = HeaderMap::new();
+    headers.insert(HOST, HeaderValue::from_static("localhost:61180"));
+    headers.insert("origin", HeaderValue::from_static("null"));
+    headers.insert(
+        "x-elastos-home-token",
+        HeaderValue::from_str(&browser_token).unwrap(),
+    );
+    let launch =
+        require_home_launch_token_binding(dir.path(), &headers, &[BROWSER_CAPSULE_ID]).unwrap();
+    let runtime_authority = runtime_wallet_authority(&launch).unwrap();
+    let request_id = "wallet-approval:browser-consent-completed";
+    let tampered_request_id = "wallet-approval:browser-consent-tampered";
+    let grant_expires_at = crate::auth::now_ts().saturating_add(600);
+    let exact = completed_browser_account_access_approval(
+        runtime_authority.verified_context(),
+        request_id,
+        grant_expires_at,
+    );
+    let mut tampered = completed_browser_account_access_approval(
+        runtime_authority.verified_context(),
+        tampered_request_id,
+        grant_expires_at,
+    );
+    tampered["signed_result"]["origin"] = json!("https://attacker.example");
+    let provider = MockWalletProvider {
+        challenges: TokioMutex::default(),
+        bitcoin_challenges: TokioMutex::default(),
+        accounts: TokioMutex::default(),
+        approvals: TokioMutex::new(vec![exact, tampered]),
+        defaults: TokioMutex::default(),
+    };
+    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("page_url", "https://dapp.example/connect")
+        .append_pair("origin", "https://dapp.example")
+        .finish();
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(format!(
+                    "/api/apps/browser/wallet/approvals/{request_id}?{query}"
+                ))
+                .header("x-elastos-home-token", browser_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status["status"], "completed");
+    assert_eq!(status["account_access"]["permission"], "eth_accounts");
+    assert_eq!(status["account_access"]["origin"], "https://dapp.example");
+    assert_eq!(
+        status["account_access"]["address"],
+        "0x1111111111111111111111111111111111111111"
+    );
+    assert!(status.get("signed_result").is_none());
+    assert!(status.get("signature").is_none());
+
+    let tampered = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(format!(
+                    "/api/apps/browser/wallet/approvals/{tampered_request_id}?{query}"
+                ))
+                .header("x-elastos-home-token", browser_token.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tampered.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let missing_context = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri(format!("/api/apps/browser/wallet/approvals/{request_id}"))
+                .header("x-elastos-home-token", browser_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_context.status(), StatusCode::BAD_REQUEST);
 }

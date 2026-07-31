@@ -52,6 +52,7 @@ const MAX_APPROVAL_REQUEST_TTL_SECS: u64 = 30 * 60;
 const MAX_APPROVAL_PAYLOAD_BYTES: usize = 32 * 1024;
 const MAX_RESOLVED_APPROVAL_HISTORY_PER_PRINCIPAL: usize = 100;
 const MAX_ACTIVE_APPROVAL_REQUESTS_PER_PRINCIPAL: usize = 100;
+const MAX_BROWSER_ACCOUNT_ACCESS_TTL_SECS: u64 = 12 * 60 * 60;
 const MAX_EFFECTFUL_LIFECYCLE_HISTORY: usize = 512;
 const MANAGED_EVM_PROOF_TYPE: &str = "managed_evm";
 const MANAGED_BTC_P2WPKH_PROOF_TYPE: &str = "managed_btc_p2wpkh";
@@ -289,6 +290,7 @@ impl WalletProvider {
                 principal_id: principal_id.to_string(),
                 session_id: session_id.to_string(),
                 launch_id: request.authority.launch_id.clone(),
+                proof_binding_id: request.authority.proof_binding_id.clone(),
                 account_id: account_id.clone(),
                 chain_namespace: chain_namespace.clone(),
                 intent: intent.clone(),

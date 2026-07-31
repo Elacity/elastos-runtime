@@ -8,7 +8,7 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260726a";
+} from "./home-gui.js?v=home-20260731a";
 import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
@@ -17,7 +17,7 @@ import {
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260726a";
+} from "./home-gui-authority.js?v=home-20260731a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));

@@ -3,12 +3,13 @@
 use super::*;
 use std::collections::HashSet;
 
-const BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES: &[&str] = &["eip155:20", "eip155:8453"];
+pub(super) const BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES: &[&str] = &["eip155:20", "eip155:8453"];
 
 pub(in crate::api::gateway) fn is_browser_wallet_intent(intent: Option<&str>) -> bool {
     matches!(
         intent,
-        Some("browser_personal_sign")
+        Some("browser_account_access")
+            | Some("browser_personal_sign")
             | Some("browser_typed_data_sign")
             | Some("transaction_intent")
     )
@@ -74,7 +75,7 @@ fn browser_default_chain_namespace(summary: &SystemWalletAccountsSummary) -> Opt
         .map(|account| account.chain_namespace.clone())
 }
 
-fn browser_projected_evm_accounts(
+pub(super) fn browser_projected_evm_accounts(
     summary: &SystemWalletAccountsSummary,
 ) -> Vec<SystemWalletAccountSummary> {
     let default_account_id = browser_default_account_id(summary);
@@ -132,6 +133,10 @@ pub(in crate::api::gateway) async fn browser_wallet_bridge_payload(
         approval_origin.as_deref(),
         "/api/apps/browser/wallet/request-signature",
     );
+    let account_access_url = browser_wallet_bridge_url(
+        approval_origin.as_deref(),
+        "/api/apps/browser/wallet/request-accounts",
+    );
     let transaction_url = browser_wallet_bridge_url(
         approval_origin.as_deref(),
         "/api/apps/browser/wallet/request-transaction",
@@ -154,12 +159,14 @@ pub(in crate::api::gateway) async fn browser_wallet_bridge_payload(
         "schema": "elastos.browser.wallet-bridge/v1",
         "principal_id": context.principal_id,
         "session_id": context.session_id,
+        "launch_id": authority.verified_context().launch_id(),
         "default_chain_namespace": default_chain_namespace,
         "default_account_id": default_account_id,
         "accounts": browser_summary.accounts,
         "signing": "approval_required",
         "bridge_url": bridge_url,
         "approval_url": approval_url,
+        "account_access_url": account_access_url,
         "transaction_url": transaction_url,
         "read_url": read_url,
         "transaction_broadcast_url": transaction_broadcast_url,

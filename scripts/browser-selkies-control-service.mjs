@@ -251,6 +251,31 @@ export async function waitForWalletApprovalTransaction(
   return receipt.transaction_hash;
 }
 
+export async function waitForWalletAccountAccess(requestId, expiresAt, options) {
+  const status = await waitForWalletApprovalStatus(requestId, expiresAt, options);
+  if (status.status === "rejected") {
+    throw walletApprovalError(
+      "Wallet account access was rejected in ElastOS Wallet/Inbox.",
+      4001,
+    );
+  }
+  if (status.status === "expired") {
+    throw walletApprovalError("Wallet account access expired before approval.", 4001);
+  }
+  if (
+    !Array.isArray(status.accounts) ||
+    status.accounts.length !== 1 ||
+    typeof status.accounts[0] !== "string" ||
+    !/^0x[0-9a-f]{40}$/i.test(status.accounts[0])
+  ) {
+    throw walletApprovalError(
+      "Runtime wallet account-access approval completed without one exact account.",
+      4100,
+    );
+  }
+  return status.accounts;
+}
+
 export function cacheWalletApprovalPromise(cache, cacheKey, create, onReuse) {
   const existing = cache.get(cacheKey);
   if (existing) {
@@ -714,6 +739,7 @@ function normalizeWalletBridge(wallet) {
           account_id: String(account?.account_id || ""),
           chain_namespace: String(account?.chain_namespace || ""),
           address: String(account?.address || "").toLowerCase(),
+          proof_type: String(account?.proof_type || ""),
           label: account?.label ? String(account.label) : null,
         }))
         .filter((account) => safeId(account.account_id) && /^eip155:\d+$/.test(account.chain_namespace) && /^0x[0-9a-f]{40}$/.test(account.address))
@@ -734,12 +760,17 @@ function normalizeWalletBridge(wallet) {
     default_account_id: defaultAccountId,
     bridge_url: typeof wallet?.bridge_url === "string" ? wallet.bridge_url : "",
     approval_url: typeof wallet?.approval_url === "string" ? wallet.approval_url : "",
+    account_access_url:
+      typeof wallet?.account_access_url === "string" ? wallet.account_access_url : "",
     transaction_url: typeof wallet?.transaction_url === "string" ? wallet.transaction_url : "",
     read_url: typeof wallet?.read_url === "string" ? wallet.read_url : "",
     transaction_broadcast_url:
       typeof wallet?.transaction_broadcast_url === "string" ? wallet.transaction_broadcast_url : "",
     approval_status_url: typeof wallet?.approval_status_url === "string" ? wallet.approval_status_url : "",
     home_token: typeof wallet?.home_token === "string" ? wallet.home_token : "",
+    principal_id: typeof wallet?.principal_id === "string" ? wallet.principal_id : "",
+    session_id: typeof wallet?.session_id === "string" ? wallet.session_id : "",
+    launch_id: typeof wallet?.launch_id === "string" ? wallet.launch_id : "",
   };
 }
 
@@ -755,20 +786,10 @@ function chainNamespaceToHex(namespace) {
 }
 
 function walletInitScript(wallet) {
-  const current =
-    wallet.accounts.find(
-      (account) =>
-        account.account_id === wallet.default_account_id &&
-        account.chain_namespace === wallet.default_chain_namespace,
-    ) ||
-    wallet.accounts.find((account) => account.account_id === wallet.default_account_id) ||
-    wallet.accounts.find((account) => account.chain_namespace === wallet.default_chain_namespace) ||
-    wallet.accounts[0] ||
-    null;
   const initialState = {
     chainId: chainNamespaceToHex(wallet.default_chain_namespace),
-    selectedAddress: current?.address || null,
-    accounts: wallet.accounts,
+    selectedAddress: null,
+    accounts: [],
     defaultChainNamespace: wallet.default_chain_namespace,
     defaultAccountId: wallet.default_account_id,
     runtimeBinding: WALLET_RUNTIME_BINDING,
@@ -785,6 +806,7 @@ function walletInitScript(wallet) {
       ${waitForWalletApprovalStatus.toString()}
       ${waitForWalletApprovalSignature.toString()}
       ${waitForWalletApprovalTransaction.toString()}
+      ${waitForWalletAccountAccess.toString()}
       ${cacheWalletApprovalPromise.toString()}
       if (!globalThis.__elastosBrowserNavigationPolicyInstalled) {
         Object.defineProperty(globalThis, "__elastosBrowserNavigationPolicyInstalled", {
@@ -1072,7 +1094,10 @@ function walletInitScript(wallet) {
         return walletRefreshInFlight;
       }
       walletRefreshInFlight = (async () => {
-        const payload = await runtimeCall({ action: "bridge" });
+        const payload = await runtimeCall({
+          action: "bridge",
+          body: { chain_namespace: state.defaultChainNamespace },
+        });
         if (payload?.schema !== "elastos.browser.wallet-bridge/v1") {
           throw runtimeError("Runtime wallet bridge refresh failed.");
         }
@@ -1167,11 +1192,86 @@ function walletInitScript(wallet) {
       applyChain(next);
       return null;
     };
-    const forceRefreshIfNoAccounts = async () => {
-      if (currentAccounts().length === 0) {
-        await refreshWalletState({ force: true }).catch(() => {});
+    let accountAccessInFlight = null;
+    const runtimeAccounts = async () => {
+      const accounts = await runtimeCall({
+        action: "accounts",
+        body: { chain_namespace: state.defaultChainNamespace },
+      });
+      if (!Array.isArray(accounts) || accounts.length > 1) {
+        throw runtimeError("Runtime wallet returned invalid account-access state.");
       }
-      return currentAccounts();
+      await refreshWalletState({ force: true });
+      const visible = currentAccounts();
+      if (
+        visible.length !== accounts.length ||
+        visible.some(
+          (address, index) =>
+            address.toLowerCase() !== String(accounts[index]).toLowerCase(),
+        )
+      ) {
+        throw runtimeError("Runtime wallet account-access state is inconsistent.");
+      }
+      return visible;
+    };
+    const requestRuntimeAccounts = async () => {
+      const existing = await runtimeAccounts();
+      if (existing.length > 0) {
+        return existing;
+      }
+      if (accountAccessInFlight) {
+        return accountAccessInFlight;
+      }
+      accountAccessInFlight = (async () => {
+        const approval = await runtimeCall({
+          action: "requestAccounts",
+          body: { chain_namespace: state.defaultChainNamespace },
+        });
+        if (Array.isArray(approval?.accounts) && approval.accounts.length === 1) {
+          await refreshWalletState({ force: true });
+          return currentAccounts();
+        }
+        const requestId = approval?.approval_request?.request_id;
+        const expiresAt = approval?.approval_request?.expires_at;
+        if (!requestId) {
+          throw runtimeError("Runtime wallet account-access approval request was not created.");
+        }
+        const accounts = await waitForWalletAccountAccess(requestId, expiresAt, {
+          getStatus: runtimeGetApproval,
+          pollIntervalMs: 1200,
+        });
+        await refreshWalletState({ force: true });
+        const visible = currentAccounts();
+        if (
+          visible.length !== accounts.length ||
+          visible.some(
+            (address, index) =>
+              address.toLowerCase() !== String(accounts[index]).toLowerCase(),
+          )
+        ) {
+          throw runtimeError("Runtime wallet account-access state did not match its approval.");
+        }
+        return visible;
+      })().finally(() => {
+        accountAccessInFlight = null;
+      });
+      return accountAccessInFlight;
+    };
+    const requireEthAccountsPermissionRequest = (params) => {
+      const requested = params[0];
+      if (!requested || typeof requested !== "object" || Array.isArray(requested)) {
+        throw runtimeError(
+          "wallet_requestPermissions requires an eth_accounts permission object.",
+          4200,
+        );
+      }
+      const keys = Object.keys(requested);
+      if (keys.length !== 1 || keys[0] !== "eth_accounts") {
+        throw runtimeError(
+          "Only eth_accounts permission is supported by Runtime Wallet.",
+          4200,
+        );
+      }
     };
       const request = async (payload = {}) => {
         const method = payload && payload.method;
@@ -1179,23 +1279,18 @@ function walletInitScript(wallet) {
         pushWalletDebug("request", { method: String(method || ""), params_len: params.length });
         await refreshWalletState().catch(() => {});
       if (method === "eth_accounts") {
-        const accounts = await forceRefreshIfNoAccounts();
+        const accounts = await runtimeAccounts();
         provider.selectedAddress = accounts[0] || null;
         return accounts;
       }
       if (method === "eth_requestAccounts") {
-        const accounts = await forceRefreshIfNoAccounts();
-        if (accounts.length === 0) {
-          const error = new Error("No ElastOS Wallet EVM account is available for this Runtime principal. Open Wallet to create or link an EVM account first.");
-          error.code = 4100;
-          throw error;
-        }
+        const accounts = await requestRuntimeAccounts();
         provider.selectedAddress = accounts[0];
         emit("accountsChanged", accounts);
         emit("connect", { chainId: provider.chainId });
         return accounts;
       }
-      if (method === "eth_coinbase") return currentAccounts()[0] || null;
+      if (method === "eth_coinbase") return (await runtimeAccounts())[0] || null;
       if (method === "eth_chainId") {
         if (!provider.chainId) {
           const error = new Error("No ElastOS Wallet EVM chain is selected for this Runtime principal.");
@@ -1205,8 +1300,30 @@ function walletInitScript(wallet) {
         return provider.chainId;
       }
       if (method === "net_version") return provider.chainId ? String(parseInt(provider.chainId, 16)) : "";
-      if (method === "wallet_getPermissions" || method === "wallet_requestPermissions") {
-        return currentAccounts().length > 0 ? [{ parentCapability: "eth_accounts", caveats: [] }] : [];
+      if (method === "wallet_getPermissions") {
+        return (await runtimeAccounts()).length > 0
+          ? [{ parentCapability: "eth_accounts", caveats: [] }]
+          : [];
+      }
+      if (method === "wallet_requestPermissions") {
+        requireEthAccountsPermissionRequest(params);
+        await requestRuntimeAccounts();
+        return [{ parentCapability: "eth_accounts", caveats: [] }];
+      }
+      if (method === "wallet_revokePermissions") {
+        requireEthAccountsPermissionRequest(params);
+        await runtimeCall({
+          action: "revokeAccounts",
+          body: { chain_namespace: state.defaultChainNamespace },
+        });
+        provider.__elastosUpdateWallet({
+          accounts: [],
+          defaultChainNamespace: state.defaultChainNamespace,
+          defaultAccountId: "",
+        });
+        provider.selectedAddress = null;
+        emit("accountsChanged", []);
+        return null;
       }
         if (method === "wallet_switchEthereumChain") {
           return switchToChainId(params[0] && params[0].chainId);
@@ -2973,14 +3090,26 @@ function runtimeFetchProxyOrigin(proxyUrl) {
   return `${proxyUrl.protocol}//${proxyUrl.host}`;
 }
 
-function visibleWalletBridgePayload(payload) {
+function visibleWalletBridgePayload(runtime, account, chainNamespace) {
+  const accounts = account
+    ? runtime.wallet.accounts
+        .filter(
+          (candidate) =>
+            candidate.account_id === account.account_id &&
+            candidate.address.toLowerCase() === account.address.toLowerCase(),
+        )
+        .map((candidate) => ({
+          account_id: candidate.account_id,
+          chain_namespace: candidate.chain_namespace,
+          address: candidate.address,
+          label: candidate.label,
+        }))
+    : [];
   return {
     schema: "elastos.browser.wallet-bridge/v1",
-    accounts: Array.isArray(payload?.accounts) ? payload.accounts : [],
-    default_chain_namespace:
-      typeof payload?.default_chain_namespace === "string" ? payload.default_chain_namespace : "",
-    default_account_id:
-      typeof payload?.default_account_id === "string" ? payload.default_account_id : "",
+    accounts,
+    default_chain_namespace: chainNamespace,
+    default_account_id: account?.account_id || "",
     signing: "approval_required",
     authority: "runtime_mediated",
     transport: "cdp_runtime_binding",
@@ -2988,6 +3117,15 @@ function visibleWalletBridgePayload(payload) {
 }
 
 function updateWalletRuntimeState(runtime, payload) {
+  for (const field of ["principal_id", "session_id", "launch_id"]) {
+    if (
+      typeof payload?.[field] !== "string" ||
+      !payload[field] ||
+      (runtime.wallet[field] && payload[field] !== runtime.wallet[field])
+    ) {
+      throw walletRuntimeHttpError("Runtime wallet refresh changed its launch authority.");
+    }
+  }
   const next = normalizeWalletBridge({
     ...runtime.wallet,
     accounts: Array.isArray(payload?.accounts) ? payload.accounts : runtime.wallet.accounts,
@@ -3002,6 +3140,10 @@ function updateWalletRuntimeState(runtime, payload) {
     bridge_url: typeof payload?.bridge_url === "string" ? payload.bridge_url : runtime.wallet.bridge_url,
     approval_url:
       typeof payload?.approval_url === "string" ? payload.approval_url : runtime.wallet.approval_url,
+    account_access_url:
+      typeof payload?.account_access_url === "string"
+        ? payload.account_access_url
+        : runtime.wallet.account_access_url,
     transaction_url:
       typeof payload?.transaction_url === "string" ? payload.transaction_url : runtime.wallet.transaction_url,
     read_url: typeof payload?.read_url === "string" ? payload.read_url : runtime.wallet.read_url,
@@ -3014,6 +3156,9 @@ function updateWalletRuntimeState(runtime, payload) {
         ? payload.approval_status_url
         : runtime.wallet.approval_status_url,
     home_token: typeof payload?.home_token === "string" ? payload.home_token : runtime.wallet.home_token,
+    principal_id: payload.principal_id,
+    session_id: payload.session_id,
+    launch_id: payload.launch_id,
   });
   runtime.wallet = next;
   return next;
@@ -3147,11 +3292,334 @@ function walletRuntimeFetchViaProxy(
   });
 }
 
-async function dispatchWalletRuntimeBinding(runtime, message) {
+export function walletRuntimeRequestedAccount(runtime, rawBody, { required = true } = {}) {
+  const body = rawBody && typeof rawBody === "object" && !Array.isArray(rawBody) ? rawBody : {};
+  const requestedChain =
+    typeof body.chain_namespace === "string" && body.chain_namespace
+      ? body.chain_namespace
+      : runtime.wallet.default_chain_namespace;
+  if (!/^eip155:\d+$/.test(requestedChain)) {
+    throw walletRuntimeHttpError("Runtime wallet request chain is invalid.", 4902);
+  }
+  const managed = (candidate) => candidate.proof_type === "managed_evm";
+  const account =
+    runtime.wallet.accounts.find(
+      (candidate) =>
+        managed(candidate) &&
+        candidate.chain_namespace === requestedChain &&
+        candidate.account_id === runtime.wallet.default_account_id,
+    ) ||
+    runtime.wallet.accounts.find(
+      (candidate) => managed(candidate) && candidate.chain_namespace === requestedChain,
+    );
+  if (!account) {
+    if (!required) {
+      return null;
+    }
+    throw walletRuntimeHttpError(
+      `No Runtime-managed wallet account is available for ${requestedChain}.`,
+      4902,
+    );
+  }
+  if (
+    Object.hasOwn(body, "account_id") &&
+    body.account_id !== account.account_id
+  ) {
+    throw walletRuntimeHttpError(
+      "Runtime wallet request account does not match the selected account.",
+      4100,
+    );
+  }
+  if (
+    Object.hasOwn(body, "address") &&
+    (typeof body.address !== "string" ||
+      body.address.toLowerCase() !== account.address.toLowerCase())
+  ) {
+    throw walletRuntimeHttpError(
+      "Runtime wallet request address does not match the selected account.",
+      4100,
+    );
+  }
+  return account;
+}
+
+function walletRuntimePermissionKey(context, accountId) {
+  return `${context.pageOrigin || ""}\n${accountId}`;
+}
+
+function walletRuntimeAccountChainNamespaces(runtime, accountId, address) {
+  const normalizedAddress = String(address || "").toLowerCase();
+  const namespaces = [];
+  for (const account of runtime.wallet.accounts) {
+    if (
+      account.account_id === accountId &&
+      account.address.toLowerCase() === normalizedAddress &&
+      !namespaces.includes(account.chain_namespace)
+    ) {
+      namespaces.push(account.chain_namespace);
+    }
+  }
+  return namespaces;
+}
+
+function walletRuntimeSameStringArray(actual, expected) {
+  return (
+    Array.isArray(actual) &&
+    actual.length === expected.length &&
+    actual.every((value, index) => value === expected[index])
+  );
+}
+
+export function walletRuntimeGrantedAccount(
+  runtime,
+  context,
+  chainNamespace,
+  { required = true } = {},
+) {
+  const account = walletRuntimeRequestedAccount(
+    runtime,
+    { chain_namespace: chainNamespace },
+    { required },
+  );
+  if (!account) {
+    return null;
+  }
+  const key = walletRuntimePermissionKey(context, account.account_id);
+  const grant = runtime.accountPermissions.get(key);
+  const now = Math.floor(Date.now() / 1000);
+  const chainNamespaces = walletRuntimeAccountChainNamespaces(
+    runtime,
+    account.account_id,
+    account.address,
+  );
+  if (
+    !grant ||
+    grant.grant_expires_at <= now ||
+    grant.grant_expires_at > now + 12 * 60 * 60 ||
+    grant.principal_id !== runtime.wallet.principal_id ||
+    grant.session_id !== runtime.wallet.session_id ||
+    grant.launch_id !== runtime.wallet.launch_id ||
+    grant.origin !== context.pageOrigin ||
+    grant.account_id !== account.account_id ||
+    grant.address.toLowerCase() !== account.address.toLowerCase() ||
+    !walletRuntimeSameStringArray(grant.chain_namespaces, chainNamespaces) ||
+    !grant.chain_namespaces.includes(chainNamespace)
+  ) {
+    runtime.accountPermissions.delete(key);
+    if (required) {
+      throw walletRuntimeHttpError(
+        "This Browser origin has not been granted access to the selected Runtime wallet account.",
+        4100,
+      );
+    }
+    return null;
+  }
+  return account;
+}
+
+export function walletRuntimeRecordAccountAccess(runtime, context, requestId, access) {
+  const pending = runtime.pendingAccountAccess.get(requestId);
+  const pendingMatches = Boolean(
+    pending &&
+      pending.executionContextId === context.executionContextId &&
+      pending.origin === context.pageOrigin,
+  );
+  if (
+    !pendingMatches ||
+    runtime.revokedAccountAccess.has(requestId) ||
+    access?.permission !== "eth_accounts" ||
+    access?.principal_id !== runtime.wallet.principal_id ||
+    access?.session_id !== runtime.wallet.session_id ||
+    access?.launch_id !== runtime.wallet.launch_id ||
+    access?.origin !== context.pageOrigin ||
+    access?.requested_chain_namespace !== pending.requestedChainNamespace ||
+    !walletRuntimeSameStringArray(access?.chain_namespaces, pending.chainNamespaces) ||
+    access?.account_id !== pending.accountId ||
+    String(access?.address || "").toLowerCase() !== pending.address.toLowerCase() ||
+    !Number.isInteger(access?.grant_expires_at) ||
+    access.grant_expires_at <= Math.floor(Date.now() / 1000) ||
+    access.grant_expires_at > Math.floor(Date.now() / 1000) + 12 * 60 * 60
+  ) {
+    if (pendingMatches) {
+      runtime.pendingAccountAccess.delete(requestId);
+      runtime.revokedAccountAccess.add(requestId);
+    }
+    throw walletRuntimeHttpError(
+      "Runtime wallet account-access approval did not match this Browser context.",
+      4100,
+    );
+  }
+  runtime.pendingAccountAccess.delete(requestId);
+  runtime.accountPermissions.set(walletRuntimePermissionKey(context, access.account_id), {
+    request_id: requestId,
+    permission: "eth_accounts",
+    principal_id: access.principal_id,
+    session_id: access.session_id,
+    launch_id: access.launch_id,
+    origin: access.origin,
+    account_id: access.account_id,
+    chain_namespaces: [...access.chain_namespaces],
+    address: access.address.toLowerCase(),
+    grant_expires_at: access.grant_expires_at,
+  });
+}
+
+function walletRuntimeRevokeAccounts(runtime, context, chainNamespace) {
+  const account = walletRuntimeRequestedAccount(
+    runtime,
+    { chain_namespace: chainNamespace },
+    { required: false },
+  );
+  if (!account) {
+    return;
+  }
+  const key = walletRuntimePermissionKey(context, account.account_id);
+  const grant = runtime.accountPermissions.get(key);
+  if (grant?.request_id) {
+    runtime.revokedAccountAccess.add(grant.request_id);
+  }
+  runtime.accountPermissions.delete(key);
+  for (const [requestId, pending] of runtime.pendingAccountAccess.entries()) {
+    if (
+      pending.executionContextId === context.executionContextId &&
+      pending.origin === context.pageOrigin &&
+      pending.accountId === account.account_id
+    ) {
+      runtime.pendingAccountAccess.delete(requestId);
+      runtime.revokedAccountAccess.add(requestId);
+    }
+  }
+}
+
+function walletRuntimeCanonicalPostBody(runtime, operation, rawBody, context) {
+  const body = rawBody && typeof rawBody === "object" && !Array.isArray(rawBody) ? rawBody : {};
+  const chainNamespace =
+    typeof body.chain_namespace === "string" && body.chain_namespace
+      ? body.chain_namespace
+      : runtime.wallet.default_chain_namespace;
+  const account = walletRuntimeGrantedAccount(runtime, context, chainNamespace);
+  if (operation === "transactionBroadcast") {
+    const requestId = typeof body.request_id === "string" ? body.request_id : "";
+    if (!safeId(requestId)) {
+      throw walletRuntimeHttpError("Runtime wallet approval request id is invalid.", 4001);
+    }
+    return { request_id: requestId };
+  }
+  if (typeof body.method !== "string" || !body.method || !Array.isArray(body.params)) {
+    throw walletRuntimeHttpError("Runtime wallet request method and params are invalid.", 4001);
+  }
+  const canonical = {
+    method: body.method,
+    params: body.params,
+    chain_namespace: account.chain_namespace,
+    address: account.address,
+    page_url: context.pageUrl,
+    origin: context.pageOrigin,
+  };
+  if (operation !== "read") {
+    canonical.account_id = account.account_id;
+  }
+  return canonical;
+}
+
+export function walletRuntimeContextAllowsBinding(context) {
+  return (
+    context.isDocument === true &&
+    context.isTopLevel === true &&
+    ["http:", "https:"].includes(context.protocol)
+  );
+}
+
+async function dispatchWalletRuntimeBinding(runtime, message, context) {
+  if (!walletRuntimeContextAllowsBinding(context)) {
+    throw walletRuntimeHttpError(
+      "Runtime wallet binding is available only to the top-level HTTP(S) document.",
+      4100,
+    );
+  }
   if (message.action === "bridge") {
     const payload = await walletRuntimeFetchJson(runtime, runtime.wallet.bridge_url);
     updateWalletRuntimeState(runtime, payload);
-    return visibleWalletBridgePayload(payload);
+    const requested = walletRuntimeRequestedAccount(runtime, message.body || {}, {
+      required: false,
+    });
+    const chainNamespace =
+      requested?.chain_namespace ||
+      String(message.body?.chain_namespace || runtime.wallet.default_chain_namespace);
+    const granted = requested
+      ? walletRuntimeGrantedAccount(runtime, context, chainNamespace, { required: false })
+      : null;
+    return visibleWalletBridgePayload(runtime, granted, chainNamespace);
+  }
+  if (message.action === "accounts") {
+    const account = walletRuntimeRequestedAccount(runtime, message.body || {}, {
+      required: false,
+    });
+    if (!account) {
+      return [];
+    }
+    const granted = walletRuntimeGrantedAccount(
+      runtime,
+      context,
+      account.chain_namespace,
+      { required: false },
+    );
+    return granted ? [granted.address] : [];
+  }
+  if (message.action === "requestAccounts") {
+    const account = walletRuntimeRequestedAccount(runtime, message.body || {});
+    const granted = walletRuntimeGrantedAccount(
+      runtime,
+      context,
+      account.chain_namespace,
+      { required: false },
+    );
+    if (granted) {
+      return { accounts: [granted.address], already_granted: true };
+    }
+    const result = await walletRuntimeFetchJson(runtime, runtime.wallet.account_access_url, {
+      method: "POST",
+      body: {
+        chain_namespace: account.chain_namespace,
+        page_url: context.pageUrl,
+        origin: context.pageOrigin,
+      },
+    });
+    const requestId = result?.approval_request?.request_id;
+    if (!safeId(requestId)) {
+      throw walletRuntimeHttpError(
+        "Runtime wallet account-access approval id is invalid.",
+        4100,
+      );
+    }
+    runtime.pendingAccountAccess.set(requestId, {
+      executionContextId: context.executionContextId,
+      origin: context.pageOrigin,
+      requestedChainNamespace: account.chain_namespace,
+      chainNamespaces: walletRuntimeAccountChainNamespaces(
+        runtime,
+        account.account_id,
+        account.address,
+      ),
+      accountId: account.account_id,
+      address: account.address,
+    });
+    return {
+      schema: "elastos.browser.account-access-request-result/v1",
+      approval_request: {
+        request_id: requestId,
+        status: String(result?.approval_request?.status || "pending"),
+        expires_at: Number(result?.approval_request?.expires_at || 0),
+      },
+      requires_approval: true,
+    };
+  }
+  if (message.action === "revokeAccounts") {
+    const chainNamespace = String(
+      message.body?.chain_namespace || runtime.wallet.default_chain_namespace,
+    );
+    walletRuntimeRevokeAccounts(runtime, context, chainNamespace);
+    return { revoked: true };
   }
   if (message.action === "post") {
     const operation = String(message.operation || "");
@@ -3161,7 +3629,7 @@ async function dispatchWalletRuntimeBinding(runtime, message) {
     }
     return walletRuntimeFetchJson(runtime, runtime.wallet[urlField], {
       method: "POST",
-      body: message.body || {},
+      body: walletRuntimeCanonicalPostBody(runtime, operation, message.body, context),
     });
   }
   if (message.action === "approvalStatus") {
@@ -3170,16 +3638,81 @@ async function dispatchWalletRuntimeBinding(runtime, message) {
       throw walletRuntimeHttpError("Runtime wallet approval request id is invalid.", 4001);
     }
     const base = String(runtime.wallet.approval_status_url || "").replace(/\/+$/, "");
-    return walletRuntimeFetchJson(
-      runtime,
+    const target = new URL(
       `${base}/${encodeURIComponent(requestId)}`,
+      runtime.wallet.approval_status_url,
+    );
+    target.searchParams.set("page_url", context.pageUrl);
+    target.searchParams.set("origin", context.pageOrigin || "");
+    const result = await walletRuntimeFetchJson(
+      runtime,
+      target.href,
       { timeoutMs: message.timeout_ms },
     );
+    if (result?.status === "completed" && result?.account_access) {
+      walletRuntimeRecordAccountAccess(runtime, context, requestId, result.account_access);
+      result.accounts = [result.account_access.address];
+      delete result.account_access;
+    } else if (result?.status === "rejected" || result?.status === "expired") {
+      const pending = runtime.pendingAccountAccess.get(requestId);
+      if (
+        pending?.executionContextId === context.executionContextId &&
+        pending.origin === context.pageOrigin
+      ) {
+        runtime.pendingAccountAccess.delete(requestId);
+        runtime.revokedAccountAccess.add(requestId);
+      }
+    }
+    return result;
   }
   throw walletRuntimeHttpError("Unsupported Runtime wallet bridge action.", 4001);
 }
 
-async function resolveWalletRuntimeBinding(cdp, id, response) {
+async function walletRuntimeExecutionContext(cdp, executionContextId) {
+  const evaluated = await cdp.request(
+    "Runtime.evaluate",
+    {
+      expression: `(() => ({
+        marker: "elastos-wallet-context-v1",
+        page_url: typeof globalThis.location?.href === "string" ? globalThis.location.href : "",
+        is_document: typeof globalThis.document === "object" && globalThis.document !== null,
+        is_top_level: typeof globalThis.window === "object" && globalThis.window === globalThis.top
+      }))()`,
+      contextId: executionContextId,
+      returnByValue: true,
+      awaitPromise: false,
+    },
+    5000,
+  );
+  const description = evaluated?.result?.value;
+  if (
+    evaluated?.exceptionDetails ||
+    !description ||
+    typeof description !== "object" ||
+    Array.isArray(description) ||
+    description.marker !== "elastos-wallet-context-v1" ||
+    typeof description.page_url !== "string" ||
+    !description.page_url
+  ) {
+    throw walletRuntimeHttpError("Runtime wallet execution context is invalid.", 4100);
+  }
+  let pageUrl;
+  try {
+    pageUrl = new URL(description.page_url);
+  } catch {
+    throw walletRuntimeHttpError("Runtime wallet execution context URL is invalid.", 4100);
+  }
+  return {
+    executionContextId,
+    pageUrl: pageUrl.href,
+    pageOrigin: pageUrl.origin === "null" ? null : pageUrl.origin,
+    protocol: pageUrl.protocol,
+    isDocument: description.is_document === true,
+    isTopLevel: description.is_top_level === true,
+  };
+}
+
+async function resolveWalletRuntimeBinding(cdp, executionContextId, id, response) {
   const payload = JSON.stringify({ id, ...response });
   await cdp.request(
     "Runtime.evaluate",
@@ -3188,6 +3721,7 @@ async function resolveWalletRuntimeBinding(cdp, id, response) {
         `globalThis[${JSON.stringify(WALLET_RUNTIME_RESULT)}] && ` +
         `globalThis[${JSON.stringify(WALLET_RUNTIME_RESULT)}](${JSON.stringify(payload)})`,
       awaitPromise: false,
+      contextId: executionContextId,
     },
     5000,
   );
@@ -3204,14 +3738,21 @@ async function handleWalletRuntimeBinding(cdp, runtime, params) {
     message = {};
   }
   const id = typeof message.id === "string" && message.id ? message.id : "";
-  if (!id) {
+  const executionContextId = params.executionContextId;
+  if (
+    !safeId(id) ||
+    id.length > 160 ||
+    !Number.isInteger(executionContextId) ||
+    executionContextId <= 0
+  ) {
     return;
   }
   try {
-    const result = await dispatchWalletRuntimeBinding(runtime, message);
-    await resolveWalletRuntimeBinding(cdp, id, { ok: true, result });
+    const context = await walletRuntimeExecutionContext(cdp, executionContextId);
+    const result = await dispatchWalletRuntimeBinding(runtime, message, context);
+    await resolveWalletRuntimeBinding(cdp, executionContextId, id, { ok: true, result });
   } catch (error) {
-    await resolveWalletRuntimeBinding(cdp, id, {
+    await resolveWalletRuntimeBinding(cdp, executionContextId, id, {
       ok: false,
       error: {
         message: error instanceof Error ? error.message : String(error),
@@ -3226,6 +3767,9 @@ async function installWalletRuntimeBinding(cdp, wallet, timeoutMs) {
     wallet: normalizeWalletBridge(wallet),
     timeoutMs,
     runtimeFetchProxyUrl: cdp.runtimeFetchProxyUrl || null,
+    accountPermissions: new Map(),
+    pendingAccountAccess: new Map(),
+    revokedAccountAccess: new Set(),
   };
   runtime.wallet = normalizeWalletBridge({
     ...runtime.wallet,

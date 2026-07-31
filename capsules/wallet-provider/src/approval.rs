@@ -89,7 +89,7 @@ impl WalletProvider {
         {
             return Response::error(
                 "unsupported_managed_signing_intent",
-                "managed signing is implemented only for Browser personal_sign, typed data, transaction, and Bitcoin BIP-322 intents",
+                "managed signing is implemented only for Browser account access, personal_sign, typed data, transaction, and Bitcoin BIP-322 intents",
             );
         }
         if account.chain_namespace == BITCOIN_MAINNET_CHAIN_NAMESPACE
@@ -113,6 +113,20 @@ impl WalletProvider {
         if input.intent == "browser_typed_data_sign" {
             if let Err(err) = validate_browser_typed_data_sign_payload(&input.payload, &account) {
                 return Response::error("invalid_browser_typed_data_sign", err);
+            }
+        }
+        if input.intent == "browser_account_access" {
+            if let Err(err) = validate_browser_account_access_payload(
+                &input.payload,
+                &account,
+                &input.chain_namespace,
+                &input.session_id,
+                &input.launch_id,
+                input.proof_binding_id.as_deref(),
+                &input.requested_by_actor,
+                now,
+            ) {
+                return Response::error("invalid_browser_account_access", err);
             }
         }
         if input.intent == "bitcoin_bip322_proof" {
@@ -687,7 +701,7 @@ impl WalletProvider {
         if !managed_signing_intent_is_supported(&request.intent) {
             return Response::error(
                 "unsupported_managed_signing_intent",
-                "managed signing is implemented only for Browser personal_sign, typed data, transaction, and Bitcoin BIP-322 intents",
+                "managed signing is implemented only for Browser account access, personal_sign, typed data, transaction, and Bitcoin BIP-322 intents",
             );
         }
         let Some(account) = self.store.accounts.iter().find(|account| {
@@ -785,6 +799,142 @@ impl WalletProvider {
         }
         Response::ok(response)
     }
+}
+
+fn validate_browser_account_access_payload(
+    payload: &Value,
+    account: &LinkedAccount,
+    requested_chain_namespace: &str,
+    session_id: &str,
+    launch_id: &str,
+    request_proof_binding_id: Option<&str>,
+    requested_by_actor: &str,
+    now: u64,
+) -> Result<(), String> {
+    const FIELDS: &[&str] = &[
+        "schema",
+        "permission",
+        "principal_id",
+        "session_id",
+        "launch_id",
+        "proof_binding_id",
+        "origin",
+        "page_url",
+        "account_id",
+        "requested_chain_namespace",
+        "chain_namespaces",
+        "address",
+        "grant_expires_at",
+        "requires_wallet_approval",
+    ];
+    const SUPPORTED_CHAIN_NAMESPACES: &[&str] = &["eip155:20", "eip155:8453"];
+
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "Browser account access payload must be an object".to_string())?;
+    if object.len() != FIELDS.len() || !object.keys().all(|key| FIELDS.contains(&key.as_str())) {
+        return Err("Browser account access payload fields are invalid".to_string());
+    }
+    let text = |field: &str| {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("Browser account access payload missing {field}"))
+    };
+    if text("schema")? != "elastos.browser.account-access-request/v1" {
+        return Err("Browser account access payload schema is invalid".to_string());
+    }
+    if text("permission")? != "eth_accounts" {
+        return Err("Browser account access permission must be eth_accounts".to_string());
+    }
+    if requested_by_actor != "browser" {
+        return Err("Browser account access must be requested by Browser".to_string());
+    }
+    if !is_managed_proof_type(&account.proof_type) || account.connector_id.is_some() {
+        return Err("Browser account access requires a Runtime-managed account".to_string());
+    }
+    if text("principal_id")? != account.principal_id {
+        return Err("Browser account access principal does not match selected account".to_string());
+    }
+    if text("session_id")? != session_id || text("launch_id")? != launch_id {
+        return Err(
+            "Browser account access session or launch authority does not match".to_string(),
+        );
+    }
+    let proof_binding_id = text("proof_binding_id")?;
+    validate_opaque_id(proof_binding_id, "proof_binding_id")?;
+    if Some(proof_binding_id) != request_proof_binding_id {
+        return Err("Browser account access proof binding does not match authority".to_string());
+    }
+    if text("account_id")? != account.account_id {
+        return Err("Browser account access account does not match selected account".to_string());
+    }
+    let requested_payload_chain = text("requested_chain_namespace")?;
+    if requested_payload_chain != requested_chain_namespace
+        || !chain_namespaces_compatible(&account.chain_namespace, requested_payload_chain)
+    {
+        return Err("Browser account access chain does not match selected account".to_string());
+    }
+    let chain_namespaces = object
+        .get("chain_namespaces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Browser account access chain_namespaces are missing".to_string())?;
+    if chain_namespaces.len() != SUPPORTED_CHAIN_NAMESPACES.len()
+        || !chain_namespaces
+            .iter()
+            .zip(SUPPORTED_CHAIN_NAMESPACES)
+            .all(|(actual, expected)| actual.as_str() == Some(*expected))
+        || !SUPPORTED_CHAIN_NAMESPACES.contains(&requested_payload_chain)
+        || !SUPPORTED_CHAIN_NAMESPACES
+            .iter()
+            .all(|namespace| chain_namespaces_compatible(&account.chain_namespace, namespace))
+    {
+        return Err(
+            "Browser account access chain_namespaces do not match the supported network set"
+                .to_string(),
+        );
+    }
+    if !text("address")?.eq_ignore_ascii_case(&account.address) {
+        return Err("Browser account access address does not match selected account".to_string());
+    }
+    let origin = text("origin")?;
+    let page_url = text("page_url")?;
+    if origin.len() > 512
+        || page_url.len() > 4096
+        || !(origin.starts_with("https://") || origin.starts_with("http://"))
+        || !(page_url.starts_with("https://") || page_url.starts_with("http://"))
+        || origin.ends_with('/')
+        || origin.chars().any(char::is_whitespace)
+        || page_url.chars().any(char::is_whitespace)
+        || !page_url.strip_prefix(origin).is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.starts_with('/')
+                || suffix.starts_with('?')
+                || suffix.starts_with('#')
+        })
+    {
+        return Err("Browser account access page URL or origin is invalid".to_string());
+    }
+    if object
+        .get("requires_wallet_approval")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("Browser account access must require wallet approval".to_string());
+    }
+    let grant_expires_at = object
+        .get("grant_expires_at")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Browser account access grant expiry is missing".to_string())?;
+    if grant_expires_at <= now
+        || grant_expires_at > now.saturating_add(MAX_BROWSER_ACCOUNT_ACCESS_TTL_SECS)
+    {
+        return Err(
+            "Browser account access grant expiry is outside the allowed window".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_chain_outcome_target(
