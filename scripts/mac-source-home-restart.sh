@@ -282,6 +282,16 @@ for pid in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true); do
   kill -KILL "$pid" 2>/dev/null || true
 done
 
+principal_root_backup_dir="${data_dir}/backups/principal-root-upgrade-$(date -u +%s)-$$"
+principal_root_upgrade_log="${gateway_log%.log}-principal-root-upgrade.json"
+(
+  umask 077
+  "$gateway_bin" principal-root-upgrade \
+    --data-dir "$data_dir" \
+    --backup-dir "$principal_root_backup_dir" \
+    >"$principal_root_upgrade_log"
+)
+
 python3 - "$repo_root" "$test_home" "$addr" "$gateway_log" <<'PY'
 import os
 import sys

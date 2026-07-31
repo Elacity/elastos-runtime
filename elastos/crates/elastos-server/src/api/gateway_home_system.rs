@@ -989,6 +989,19 @@ fn home_services_selection_state_uri(context: &HomeLaunchTokenContext) -> String
     )
 }
 
+pub(super) fn principal_root_protected_object_inventory(
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    [".AppData/ElastOS/Home", ".AppData/ElastOS/Profile"]
+        .into_iter()
+        .map(|relative| {
+            crate::auth::PrincipalRootProtectedObjectDeclarationV1::root(format!(
+                "{localhost_root}/{relative}"
+            ))
+        })
+        .collect()
+}
+
 fn home_services_selection_state_path(
     data_dir: &std::path::Path,
     context: &HomeLaunchTokenContext,

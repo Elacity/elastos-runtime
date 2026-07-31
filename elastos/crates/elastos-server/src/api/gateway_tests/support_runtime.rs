@@ -300,6 +300,11 @@ fn write_test_viewer_capsule(
 ) {
     activate_test_capsule(data_dir, name);
     let capsule_dir = data_dir.join("capsules").join(name);
+    let storage = if name == "gba-ucity" {
+        "localhost://Users/self/.AppData/LocalHost/GBA/ucity/*"
+    } else {
+        "localhost://Users/self/.AppData/LocalHost/GBA/test/*"
+    };
     std::fs::create_dir_all(&capsule_dir).unwrap();
     std::fs::write(
         capsule_dir.join("capsule.json"),
@@ -314,7 +319,7 @@ fn write_test_viewer_capsule(
             "entrypoint": entrypoint,
             "viewer": viewer,
             "permissions": {
-                "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/test/*"]
+                "storage": [storage]
             }
         }))
         .unwrap(),

@@ -726,11 +726,47 @@ fn viewer_storage_root_uri(
     Ok(root_uri)
 }
 
+pub(super) fn principal_root_protected_object_inventory(
+    data_dir: &FsPath,
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    let mut inventory = vec![
+        crate::auth::PrincipalRootProtectedObjectDeclarationV1::root(format!(
+            "{localhost_root}/.AppData/LocalHost/GBA"
+        )),
+    ];
+    for storage in super::capsule_inventory::list_active_capsule_manifests(data_dir)
+        .into_iter()
+        .flat_map(|manifest| manifest.permissions.storage)
+    {
+        let root_uri = principal_scoped_storage_uri_for_root(&storage, localhost_root);
+        if root_uri == localhost_root
+            || !root_uri
+                .strip_prefix(localhost_root)
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
+            continue;
+        }
+        let browser_profiles = format!("{localhost_root}/BrowserProfiles");
+        if root_uri == browser_profiles || root_uri.starts_with(&format!("{browser_profiles}/")) {
+            continue;
+        }
+        inventory.push(crate::auth::PrincipalRootProtectedObjectDeclarationV1::root(root_uri));
+    }
+    inventory.sort();
+    inventory.dedup();
+    inventory
+}
+
 fn principal_scoped_storage_uri(storage: &str, context: &HomeLaunchTokenContext) -> String {
-    let root_uri = storage.trim_end_matches('*').trim_end_matches('/');
     let principal_root = crate::auth::principal_localhost_root(&context.principal_id);
+    principal_scoped_storage_uri_for_root(storage, &principal_root)
+}
+
+fn principal_scoped_storage_uri_for_root(storage: &str, principal_root: &str) -> String {
+    let root_uri = storage.trim_end_matches('*').trim_end_matches('/');
     if root_uri == "localhost://Users/self" {
-        return principal_root;
+        return principal_root.to_string();
     }
     if let Some(rest) = root_uri.strip_prefix("localhost://Users/self/") {
         return format!("{principal_root}/{rest}");

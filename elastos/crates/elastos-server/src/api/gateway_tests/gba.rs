@@ -130,6 +130,202 @@ async fn home_content_launch_uses_the_bound_gba_viewer_without_compute() {
 }
 
 #[tokio::test]
+async fn old_install_upgrade_encrypts_ucity_save_and_state_before_normal_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = library_test_state(dir.path()).await;
+    let context = local_home_launch_token_context(dir.path()).unwrap();
+    let protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &context.principal_id);
+    let save_uri = format!(
+        "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+        protection.localhost_root
+    );
+    let state_uri = format!(
+        "{}/.AppData/LocalHost/GBA/ucity/states/rom-id.ss1",
+        protection.localhost_root
+    );
+    let save_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &save_uri).unwrap();
+    let state_path =
+        elastos_common::localhost::rooted_localhost_fs_path(dir.path(), &state_uri).unwrap();
+    std::fs::create_dir_all(save_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    std::fs::write(&save_path, b"old-install uCity save").unwrap();
+    std::fs::write(&state_path, b"old-install uCity state").unwrap();
+
+    crate::api::auth_gateway::verify_configured_principal_roots_ready(dir.path())
+        .expect_err("old install must not be ready while declared objects are plaintext");
+    let backup_parent = dir.path().join("backups");
+    std::fs::create_dir_all(&backup_parent).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&backup_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let backup_dir = backup_parent.join("principal-root-upgrade-regression");
+    let receipt = crate::api::auth_gateway::migrate_configured_principal_roots_offline(
+        dir.path(),
+        &backup_dir,
+    )
+    .unwrap();
+
+    assert_eq!(receipt.status, "migrated");
+    assert_eq!(receipt.root_count, 1);
+    assert_eq!(receipt.object_count, 2);
+    assert_ne!(
+        std::fs::read(&save_path).unwrap(),
+        b"old-install uCity save"
+    );
+    assert_ne!(
+        std::fs::read(&state_path).unwrap(),
+        b"old-install uCity state"
+    );
+    assert!(backup_dir.join("upgrade-receipt.json").is_file());
+    assert!(backup_dir.join("root-000/receipt.json").is_file());
+    let plaintext_backups = std::fs::read_dir(backup_dir.join("root-000"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".plaintext.backup")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(plaintext_backups.len(), 2);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&backup_parent)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(backup_dir.join("upgrade-receipt.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    crate::api::auth_gateway::verify_configured_principal_roots_ready(dir.path()).unwrap();
+
+    let app = gateway_router(state);
+    let launched = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header(HOST, "localhost:61180")
+                .header("origin", "http://localhost:61180")
+                .header("sec-fetch-site", "same-origin")
+                .header(
+                    "x-elastos-home-token",
+                    issue_home_launch_token_with_context(dir.path(), HOME_CAPSULE_ID, &context)
+                        .unwrap(),
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"gba-ucity"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = launched.status();
+    let body = axum::body::to_bytes(launched.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let launch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let route = url::Url::parse("http://localhost")
+        .unwrap()
+        .join(launch["route"].as_str().unwrap())
+        .unwrap();
+    let token = url::form_urlencoded::parse(route.fragment().unwrap().as_bytes())
+        .find_map(|(key, value)| (key == "home_token").then(|| value.into_owned()))
+        .unwrap();
+
+    for (scope, name, before, after) in [
+        (
+            "save",
+            "rom-id.sav",
+            b"old-install uCity save".as_slice(),
+            b"new-install uCity save".as_slice(),
+        ),
+        (
+            "state",
+            "rom-id.ss1",
+            b"old-install uCity state".as_slice(),
+            b"new-install uCity state".as_slice(),
+        ),
+    ] {
+        let uri = format!("/api/viewers/gba-emulator/storage/gba-ucity/{scope}/{name}");
+        let restored = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(HOST, "localhost:61180")
+                    .header("origin", "null")
+                    .header("x-elastos-home-token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(restored.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], before);
+
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(&uri)
+                    .header(HOST, "localhost:61180")
+                    .header("origin", "null")
+                    .header("x-elastos-home-token", &token)
+                    .body(Body::from(after.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::NO_CONTENT);
+
+        let reloaded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(HOST, "localhost:61180")
+                    .header("origin", "null")
+                    .header("x-elastos-home-token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reloaded.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(reloaded.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], after);
+    }
+}
+
+#[tokio::test]
 async fn selected_gba_content_token_rejects_resource_substitution() {
     let dir = tempfile::tempdir().unwrap();
     let state = library_test_state(dir.path()).await;

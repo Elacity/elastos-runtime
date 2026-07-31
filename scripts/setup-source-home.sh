@@ -1329,7 +1329,7 @@ echo "[setup-source-home] rustup home: ${RUSTUP_HOME:-<default>}"
 mkdir -p "${DATA_DIR}"
 if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
     install_browser_source_home_config
-    echo "[setup-source-home] config-only ready"
+    echo "[setup-source-home] config-only artifacts installed"
     exit 0
 fi
 
@@ -1419,11 +1419,12 @@ start_browser_runtime_turn
 install_browser_source_home_config
 
 cat <<EOF
-[setup-source-home] ready
+[setup-source-home] artifacts installed; offline principal-root upgrade and restart are required before readiness
 
-Start the Mac/Linux source gateway with:
-  HOME="${HOME}" "${ROOT}/elastos/target/release/elastos" gateway --addr localhost:45542
+Use the platform source-home restart script. It stops the Runtime, performs the
+canonical principal-root upgrade, and starts Home only after the readiness gate
+passes.
 
-Open:
-  http://localhost:45542/apps/home/
+Direct gateway startup remains fail-closed while a configured protected root
+contains declared plaintext or an incomplete migration journal.
 EOF

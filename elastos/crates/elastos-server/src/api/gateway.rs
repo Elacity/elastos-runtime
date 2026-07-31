@@ -86,6 +86,18 @@ use gateway_capsule_catalog::*;
 use gateway_esp::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
+
+pub(crate) fn principal_root_protected_object_inventory(
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    let mut inventory =
+        gateway_home_system::principal_root_protected_object_inventory(localhost_root);
+    inventory.extend(
+        gateway_transaction_effects::principal_root_protected_object_inventory(localhost_root),
+    );
+    inventory
+}
+
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 use gateway_home_system::*;
 use gateway_home_terminal::*;

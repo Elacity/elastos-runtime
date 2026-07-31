@@ -41,6 +41,7 @@ where
     let _host_guard = crate::host_lock::acquire_host_process_lock(&data_dir, "gateway", &addr)?;
     crate::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "gateway");
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
+    api::auth_gateway::verify_configured_principal_roots_ready(&data_dir)?;
     let cache_path = cache_dir.unwrap_or_else(|| data_dir.join("gateway-cache"));
     std::fs::create_dir_all(&cache_path)?;
     let control_plane = setup_control_plane().await?;
@@ -75,6 +76,7 @@ where
         crate::host_lock::acquire_host_process_lock(&data_dir, "gateway-public", &addr)?;
     crate::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "gateway-public");
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
+    api::auth_gateway::verify_configured_principal_roots_ready(&data_dir)?;
     let components_path = data_dir.join("components.json");
     if !components_path.exists() {
         anyhow::bail!(

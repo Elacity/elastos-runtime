@@ -60,6 +60,8 @@ required = [
     "browser_helper_initrd_sha256",
     "browser_helper_rootfs_sha256",
     "Mac source-home Browser helper verification failed",
+    "principal-root-upgrade",
+    "principal_root_backup_dir",
 ]
 missing = [needle for needle in required if needle not in source]
 if missing:

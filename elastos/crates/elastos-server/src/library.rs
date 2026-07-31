@@ -5412,6 +5412,28 @@ fn is_runtime_private_uri(localhost_root: &str, uri: &str) -> bool {
         || is_trash_uri(localhost_root, uri)
 }
 
+pub(crate) fn principal_root_protected_object_inventory(
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    [
+        "Desktop",
+        "Documents",
+        "Pictures",
+        "Videos",
+        "Downloads",
+        "Public",
+        ".Trash",
+        ".AppData/LocalHost/.Runtime/Library",
+    ]
+    .into_iter()
+    .map(|relative| {
+        crate::auth::PrincipalRootProtectedObjectDeclarationV1::root(format!(
+            "{localhost_root}/{relative}"
+        ))
+    })
+    .collect()
+}
+
 fn record_is_published(record: &LibraryPublishRecord) -> bool {
     record.unpublished_at.is_none()
         && record

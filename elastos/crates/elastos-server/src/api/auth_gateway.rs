@@ -416,7 +416,8 @@ pub async fn full_recovery_bundle_export(
 ) -> Response {
     match full_recovery_bundle_export_inner(&state, &headers, input).await {
         Ok(value) => Json(value).into_response(),
-        Err(err) => auth_error_response(err),
+        Err(err) => principal_root_migration_required_response(&err)
+            .unwrap_or_else(|| auth_error_response(err)),
     }
 }
 
@@ -440,8 +441,14 @@ pub async fn full_recovery_bundle_import(
             }
             http_response
         }
-        Err(err) => auth_error_response(err),
+        Err(err) => principal_root_migration_required_response(&err)
+            .unwrap_or_else(|| auth_error_response(err)),
     }
+}
+
+fn principal_root_migration_required_response(err: &anyhow::Error) -> Option<Response> {
+    err.downcast_ref::<crate::auth::PrincipalRootMigrationRequiredV1>()
+        .map(|outcome| (StatusCode::CONFLICT, Json(outcome.clone())).into_response())
 }
 
 pub async fn passkey_revoke(
@@ -858,39 +865,110 @@ async fn recovery_status_inner(
 ) -> anyhow::Result<PrincipalRootRecoveryStatusV1> {
     let context = require_auth_home_or_system_context(state, headers)?;
     let principal = require_active_passkey_principal_for_context(state, &context)?;
-    let Some(protection) = crate::auth::load_principal_root_protection(
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
+    let inspection = crate::auth::inspect_declarative_principal_root_protection(
         &state.data_dir,
         &principal.principal_id,
         &principal.localhost_root,
-    )?
-    else {
-        return Ok(PrincipalRootRecoveryStatusV1::unprotected(
+        &protected_object_inventory,
+    )?;
+    let Some(protection) = inspection.protection else {
+        let mut status = PrincipalRootRecoveryStatusV1::unprotected(
             principal.principal_id,
             principal.localhost_root,
-        ));
+        );
+        if inspection.plaintext_object_count > 0 {
+            status
+                .required_actions
+                .insert(0, "migrate_declared_plaintext_objects".to_string());
+        }
+        return Ok(status);
     };
+    let root_encrypted = inspection.plaintext_object_count == 0
+        && inspection.encrypted_object_count == inspection.declared_object_count;
     let protection_configured = !protection.protectors.is_empty();
     let recovery_configured = protection
         .protectors
         .iter()
         .any(|protector| protector.verified_at.is_some());
     let recovery_download_available = recovery_archive_from_protection(&protection).is_some();
-    let required_actions = if recovery_configured {
-        Vec::new()
-    } else {
-        vec!["verify_recovery_before_public_guest_hosting".to_string()]
-    };
+    let mut required_actions = Vec::new();
+    if !root_encrypted {
+        required_actions.push("migrate_declared_plaintext_objects".to_string());
+    }
+    if !recovery_configured {
+        required_actions.push("verify_recovery_before_public_guest_hosting".to_string());
+    }
     Ok(PrincipalRootRecoveryStatusV1 {
         schema: elastos_runtime::auth::PRINCIPAL_ROOT_RECOVERY_STATUS_SCHEMA.to_string(),
         principal_id: principal.principal_id,
         localhost_root: principal.localhost_root,
-        root_encrypted: true,
+        root_encrypted,
         recovery_configured,
         recovery_download_available,
         protection_configured,
         required_actions,
         crypto: protection.crypto,
     })
+}
+
+pub fn verify_configured_principal_roots_ready(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let declarations = configured_principal_root_upgrade_declarations(data_dir)?;
+    crate::auth::verify_declared_principal_roots_ready(data_dir, &declarations)
+}
+
+pub fn migrate_configured_principal_roots_offline(
+    data_dir: &std::path::Path,
+    backup_dir: &std::path::Path,
+) -> anyhow::Result<crate::auth::PrincipalRootUpgradeReceiptV1> {
+    crate::auth::migrate_declared_principal_roots_offline(data_dir, backup_dir, || {
+        configured_principal_root_upgrade_declarations(data_dir)
+    })
+}
+
+fn configured_principal_root_upgrade_declarations(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Vec<crate::auth::PrincipalRootUpgradeDeclarationV1>> {
+    let mut protections = crate::auth::load_auth_state(data_dir)?.principal_root_protections;
+    protections.sort_by(|left, right| {
+        (&left.principal_id, &left.localhost_root)
+            .cmp(&(&right.principal_id, &right.localhost_root))
+    });
+    Ok(protections
+        .into_iter()
+        .map(
+            |protection| crate::auth::PrincipalRootUpgradeDeclarationV1 {
+                inventory: principal_root_protected_object_inventory(
+                    data_dir,
+                    &protection.localhost_root,
+                ),
+                principal_id: protection.principal_id,
+                localhost_root: protection.localhost_root,
+            },
+        )
+        .collect())
+}
+
+pub(crate) fn principal_root_protected_object_inventory(
+    data_dir: &std::path::Path,
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    let mut inventory = crate::documents::principal_root_protected_object_inventory(localhost_root);
+    inventory.extend(crate::library::principal_root_protected_object_inventory(
+        localhost_root,
+    ));
+    inventory.extend(super::gateway::principal_root_protected_object_inventory(
+        localhost_root,
+    ));
+    inventory.extend(
+        super::viewer_gateway::principal_root_protected_object_inventory(data_dir, localhost_root),
+    );
+    // BrowserProfiles are VM lifecycle artifacts, and provider logs are
+    // provider-internal state. Neither is a principal-root protected object.
+    inventory.sort();
+    inventory.dedup();
+    inventory
 }
 
 async fn full_recovery_bundle_export_inner(
@@ -911,19 +989,6 @@ async fn full_recovery_bundle_export_inner(
     }
     let wallet_authority = runtime_wallet_authority(&launch)?;
     let context = launch.context.clone();
-    consume_passkey_step_up_token(
-        &state.data_dir,
-        &input.step_up_token,
-        &launch,
-        180,
-        "auth.full-recovery-bundle.export",
-        &serde_json::json!({
-            "principal_id": input.principal_id,
-            "localhost_root": input.localhost_root,
-            "label": input.label,
-            "download_password": input.download_password,
-        }),
-    )?;
     let principal = require_active_passkey_principal_for_context(state, &context)?;
     if input.principal_id != principal.principal_id
         || input.localhost_root != principal.localhost_root
@@ -938,6 +1003,28 @@ async fn full_recovery_bundle_export_inner(
     }
 
     let now = crate::auth::now_ts();
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
+    let protection_activation =
+        crate::auth::begin_declarative_principal_root_protection_activation(
+            &state.data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+            &protected_object_inventory,
+        )?;
+    consume_passkey_step_up_token(
+        &state.data_dir,
+        &input.step_up_token,
+        &launch,
+        180,
+        "auth.full-recovery-bundle.export",
+        &serde_json::json!({
+            "principal_id": input.principal_id,
+            "localhost_root": input.localhost_root,
+            "label": input.label,
+            "download_password": input.download_password,
+        }),
+    )?;
     let kit = recovery_kit_get_or_create_for_principal(
         state,
         &context,
@@ -945,6 +1032,7 @@ async fn full_recovery_bundle_export_inner(
         input.label.as_deref(),
         now,
     )?;
+    drop(protection_activation);
     let wallet_recovery_set = export_managed_recovery_set(state, &wallet_authority).await?;
     let wallet_recovery_keys = full_bundle_wallet_recovery_keys(wallet_recovery_set)?;
     let wallet_recovery_key_count = wallet_recovery_keys.len();
@@ -1859,6 +1947,9 @@ async fn recovery_kit_import_inner(
         );
     }
     let now = crate::auth::now_ts();
+    let candidate_data_key = crate::auth::recovery_kit_data_key(&kit)?;
+    let mut protection =
+        protection_from_recovery_kit(&kit, Some("Imported Recovery Kit"), now, None)?;
     let previous_principal_id = principal.principal_id.clone();
     let previous_localhost_root = principal.localhost_root.clone();
     let verified_did_recovery_protector = match input.did_recovery_proof.as_ref() {
@@ -1876,9 +1967,24 @@ async fn recovery_kit_import_inner(
         },
         None => None,
     };
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(&state.data_dir, &kit.localhost_root);
+    let _protection_activation =
+        crate::auth::begin_declarative_principal_root_protection_activation_with_candidate(
+            &state.data_dir,
+            &protection,
+            &candidate_data_key,
+            &protected_object_inventory,
+        )?;
     let archive = crate::auth::recovery_archive_from_kit(&state.data_dir, &kit)?;
-    let mut protection =
-        protection_from_recovery_kit(&kit, Some("Imported Recovery Kit"), now, Some(archive))?;
+    let recovery_protector = protection
+        .protectors
+        .iter_mut()
+        .find(|protector| {
+            protector.kind == elastos_runtime::auth::PrincipalRootProtectorKind::RecoveryKit
+        })
+        .ok_or_else(|| anyhow::anyhow!("candidate protection has no Recovery Kit protector"))?;
+    recovery_protector.archive = Some(archive);
     if let Some(protector) = verified_did_recovery_protector {
         protection.protectors.push(protector);
     }
@@ -3913,6 +4019,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_status_distinguishes_configured_protection_from_plaintext_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
+                .unwrap();
+        crate::auth::store_test_principal_root_protection(temp.path(), &principal.principal_id);
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            principal.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"legacy plaintext").unwrap();
+
+        let status = recovery_status_inner(&state, &home_token_headers(&grant.home_token))
+            .await
+            .unwrap();
+
+        assert!(status.protection_configured);
+        assert!(!status.root_encrypted);
+        assert!(status
+            .required_actions
+            .contains(&"migrate_declared_plaintext_objects".to_string()));
+        assert!(!serde_json::to_string(&status)
+            .unwrap()
+            .contains(object_uri.as_str()));
+    }
+
+    #[tokio::test]
     async fn recovery_status_requires_verified_protector() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
@@ -4201,7 +4349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_kit_import_accepts_verified_material_without_prior_protection() {
+    async fn recovery_kit_import_accepts_exact_kit_envelope_binding_without_prior_protection() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
@@ -4225,11 +4373,38 @@ mod tests {
             1_800_000_000,
         )
         .unwrap();
+        let archive = crate::auth::recovery_archive_from_kit(temp.path(), &kit).unwrap();
+        let protection = protection_from_recovery_kit(
+            &kit,
+            Some("Exact imported binding"),
+            1_800_000_000,
+            Some(archive),
+        )
+        .unwrap();
+        crate::auth::store_principal_root_protection(temp.path(), protection).unwrap();
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            principal.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        crate::auth::write_principal_root_object(
+            temp.path(),
+            &grant.principal_id,
+            &principal.localhost_root,
+            &object_uri,
+            &object_path,
+            b"exact imported key",
+        )
+        .unwrap();
+        let mut auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
+        auth_state.principal_root_protections.clear();
+        crate::auth::save_auth_state(temp.path(), &auth_state).unwrap();
         let request = RecoveryKitMaterialImport {
             principal_id: grant.principal_id.clone(),
             localhost_root: principal.localhost_root.clone(),
             reassign_to_current_principal: false,
-            kit,
+            kit: kit.clone(),
             did_recovery_proof: None,
         };
 
@@ -4244,10 +4419,226 @@ mod tests {
             .unwrap();
         assert!(status.root_encrypted);
         assert!(status.recovery_configured);
+        assert_eq!(
+            crate::auth::read_principal_root_object(
+                temp.path(),
+                &kit.principal_id,
+                &kit.localhost_root,
+                &object_uri,
+                &object_path,
+            )
+            .unwrap(),
+            b"exact imported key"
+        );
         let auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
         let event = auth_state.audit.last().unwrap();
         assert_eq!(event.event_type, "auth.recovery_kit.imported");
         assert_eq!(event.result, "ok");
+    }
+
+    #[tokio::test]
+    async fn recovery_kit_import_rejects_wrong_key_binding_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
+                .unwrap();
+        let exact_kit = create_recovery_kit_for_principal(
+            &grant.principal_id,
+            &principal.localhost_root,
+            Some("exact"),
+            1_800_000_000,
+        )
+        .unwrap();
+        let archive = crate::auth::recovery_archive_from_kit(temp.path(), &exact_kit).unwrap();
+        let protection = protection_from_recovery_kit(
+            &exact_kit,
+            Some("Exact retained binding"),
+            1_800_000_000,
+            Some(archive),
+        )
+        .unwrap();
+        crate::auth::store_principal_root_protection(temp.path(), protection).unwrap();
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            principal.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        crate::auth::write_principal_root_object(
+            temp.path(),
+            &grant.principal_id,
+            &principal.localhost_root,
+            &object_uri,
+            &object_path,
+            b"exact retained key",
+        )
+        .unwrap();
+        let wrong_kit = create_recovery_kit_for_principal(
+            &grant.principal_id,
+            &principal.localhost_root,
+            Some("wrong"),
+            1_800_000_001,
+        )
+        .unwrap();
+        assert_ne!(wrong_kit.data_key_id, exact_kit.data_key_id);
+        let auth_state_path = crate::auth::auth_state_path(temp.path()).unwrap();
+        let auth_state_before = std::fs::read(&auth_state_path).unwrap();
+        let archive_key_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), "ElastOS/System/Auth")
+                .unwrap()
+                .join("recovery-archive.key");
+        let archive_key_before = std::fs::read(&archive_key_path).unwrap();
+        let object_before = std::fs::read(&object_path).unwrap();
+
+        let err = recovery_kit_import_inner(
+            &state,
+            &home_token_headers(&grant.home_token),
+            RecoveryKitMaterialImport {
+                principal_id: grant.principal_id,
+                localhost_root: principal.localhost_root,
+                reassign_to_current_principal: false,
+                kit: wrong_kit,
+                did_recovery_proof: None,
+            },
+        )
+        .await
+        .expect_err("a valid but wrong Recovery Kit must not activate the root");
+
+        assert!(err.to_string().contains("envelope binding is invalid"));
+        assert_eq!(std::fs::read(auth_state_path).unwrap(), auth_state_before);
+        assert_eq!(std::fs::read(archive_key_path).unwrap(), archive_key_before);
+        assert_eq!(std::fs::read(object_path).unwrap(), object_before);
+        assert!(crate::auth::is_auth_session_active(
+            temp.path(),
+            &grant.session_id,
+            crate::auth::now_ts()
+        )
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn recovery_kit_import_requires_plaintext_migration_before_any_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
+                .unwrap();
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            principal.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"existing uCity save").unwrap();
+        let kit = create_recovery_kit_for_principal(
+            &grant.principal_id,
+            &principal.localhost_root,
+            Some("test"),
+            1_800_000_000,
+        )
+        .unwrap();
+        let before = crate::auth::load_auth_state(temp.path()).unwrap();
+        let archive_key_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), "ElastOS/System/Auth")
+                .unwrap()
+                .join("recovery-archive.key");
+
+        let err = recovery_kit_import_inner(
+            &state,
+            &home_token_headers(&grant.home_token),
+            RecoveryKitMaterialImport {
+                principal_id: grant.principal_id,
+                localhost_root: principal.localhost_root.clone(),
+                reassign_to_current_principal: false,
+                kit,
+                did_recovery_proof: None,
+            },
+        )
+        .await
+        .expect_err("plaintext migration must precede Recovery Kit import");
+        let outcome = err
+            .downcast_ref::<crate::auth::PrincipalRootMigrationRequiredV1>()
+            .expect("typed migration-required outcome");
+        let after = crate::auth::load_auth_state(temp.path()).unwrap();
+
+        assert_eq!(outcome.plaintext_object_count, 1);
+        assert_eq!(after.audit.len(), before.audit.len());
+        assert_eq!(after.sessions.len(), before.sessions.len());
+        assert_eq!(
+            after.principal_root_protections,
+            before.principal_root_protections
+        );
+        assert!(!archive_key_path.exists());
+        assert_eq!(std::fs::read(object_path).unwrap(), b"existing uCity save");
+    }
+
+    #[test]
+    fn protected_object_inventory_includes_gba_but_excludes_vm_and_provider_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let localhost_root = crate::auth::principal_localhost_root("person:local:inventory");
+        let inventory = principal_root_protected_object_inventory(temp.path(), &localhost_root);
+        let uris = inventory
+            .iter()
+            .map(crate::auth::PrincipalRootProtectedObjectDeclarationV1::uri)
+            .collect::<Vec<_>>();
+
+        assert!(uris
+            .iter()
+            .any(|uri| uri.ends_with("/.AppData/LocalHost/GBA")));
+        assert!(uris.iter().all(|uri| !uri.contains("/BrowserProfiles")));
+        assert!(uris
+            .iter()
+            .all(|uri| { !uri.contains("/ProviderLogs") && !uri.contains("/.Runtime/Providers") }));
+    }
+
+    #[test]
+    fn configured_principal_root_readiness_rejects_declared_plaintext() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:startup-readiness";
+        let protection =
+            crate::auth::store_test_principal_root_protection(temp.path(), principal_id);
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/legacy.sav",
+            protection.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"legacy save").unwrap();
+
+        let error = verify_configured_principal_roots_ready(temp.path())
+            .expect_err("Home readiness must reject declared plaintext");
+        let outcome = error
+            .downcast_ref::<crate::auth::PrincipalRootMigrationRequiredV1>()
+            .expect("typed migration-required readiness result");
+
+        assert_eq!(outcome.principal_id, principal_id);
+        assert_eq!(outcome.plaintext_object_count, 1);
+        assert_eq!(std::fs::read(object_path).unwrap(), b"legacy save");
     }
 
     #[tokio::test]
@@ -4395,6 +4786,31 @@ mod tests {
             1_800_000_000,
         )
         .unwrap();
+        let archive = crate::auth::recovery_archive_from_kit(temp.path(), &kit).unwrap();
+        let protection = protection_from_recovery_kit(
+            &kit,
+            Some("Orphaned exact binding"),
+            1_800_000_000,
+            Some(archive),
+        )
+        .unwrap();
+        crate::auth::store_principal_root_protection(temp.path(), protection).unwrap();
+        let recovered_object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            old_principal.localhost_root
+        );
+        let recovered_object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &recovered_object_uri)
+                .unwrap();
+        crate::auth::write_principal_root_object(
+            temp.path(),
+            &old_principal.principal_id,
+            &old_principal.localhost_root,
+            &recovered_object_uri,
+            &recovered_object_path,
+            b"reassigned exact key",
+        )
+        .unwrap();
         crate::auth::revoke_passkey_binding(
             temp.path(),
             &old.proof_binding_id,
@@ -4472,6 +4888,17 @@ mod tests {
         assert!(status.root_encrypted);
         assert!(status.recovery_configured);
         assert_eq!(status.principal_id, old_principal.principal_id);
+        assert_eq!(
+            crate::auth::read_principal_root_object(
+                temp.path(),
+                &old_principal.principal_id,
+                &old_principal.localhost_root,
+                &recovered_object_uri,
+                &recovered_object_path,
+            )
+            .unwrap(),
+            b"reassigned exact key"
+        );
         let auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
         let event = auth_state.audit.last().unwrap();
         assert_eq!(event.event_type, "auth.recovery_kit.reassigned");

@@ -790,6 +790,25 @@ async fn run_upgrade_from_head(
         println!("  Capsule cache unchanged");
     }
 
+    // The replaced binary makes an existing host exit through its installed
+    // binary supersession watch. Do not migrate protected objects until that
+    // host has released the Runtime identity and all object owners are offline.
+    wait_for_runtime_host_release(data_dir).await?;
+    let principal_root_backup = data_dir.join("backups").join(format!(
+        "principal-root-upgrade-{}-{}",
+        crate::auth::now_ts(),
+        std::process::id()
+    ));
+    let principal_root_receipt =
+        crate::api::auth_gateway::migrate_configured_principal_roots_offline(
+            data_dir,
+            &principal_root_backup,
+        )?;
+    println!(
+        "  Principal-root readiness: {} ({} object(s))",
+        principal_root_receipt.status, principal_root_receipt.object_count
+    );
+
     // 13. Save new state
     if let Some(parent) = publisher_release_head_path(data_dir).parent() {
         std::fs::create_dir_all(parent)?;
@@ -839,6 +858,21 @@ async fn run_upgrade_from_head(
     println!();
 
     Ok(())
+}
+
+async fn wait_for_runtime_host_release(data_dir: &Path) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if crate::host_lock::active_host_process(data_dir)?.is_none() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the active Runtime did not stop for principal-root upgrade; installation is not ready"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 fn optional_release_object_cid(head: &serde_json::Value) -> anyhow::Result<Option<&str>> {

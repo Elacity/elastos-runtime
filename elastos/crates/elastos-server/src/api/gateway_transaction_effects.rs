@@ -1672,6 +1672,16 @@ fn transaction_effect_location(
     Ok((localhost_root, uri, path))
 }
 
+pub(super) fn principal_root_protected_object_inventory(
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    vec![
+        crate::auth::PrincipalRootProtectedObjectDeclarationV1::exact(format!(
+            "{localhost_root}/{TRANSACTION_EFFECT_STORE_RELATIVE_PATH}"
+        )),
+    ]
+}
+
 fn load_transaction_effect_store(
     state: &GatewayState,
     principal_id: &str,
