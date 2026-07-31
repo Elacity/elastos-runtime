@@ -72,6 +72,8 @@ mod gateway_room;
 mod gateway_server;
 #[path = "gateway_site.rs"]
 mod gateway_site;
+#[path = "gateway_transaction_effects.rs"]
+mod gateway_transaction_effects;
 #[path = "gateway_wallet.rs"]
 mod gateway_wallet;
 #[path = "gateway_wallet_adapter.rs"]
@@ -105,8 +107,10 @@ pub(crate) use gateway_home_token::{
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
-pub(super) use gateway_passkey_step_up::consume_passkey_step_up_token;
 use gateway_passkey_step_up::*;
+pub(super) use gateway_passkey_step_up::{
+    consume_or_recover_passkey_step_up_effect, consume_passkey_step_up_token,
+};
 #[cfg(test)]
 pub(crate) use gateway_passkey_step_up::{
     issue_passkey_step_up_token_at_for_test, issue_passkey_step_up_token_for_test,
@@ -120,6 +124,7 @@ pub(crate) use gateway_server::advertised_gateway_urls;
 pub use gateway_server::start_gateway_server;
 use gateway_site::*;
 pub(super) use gateway_site::{content_type, validate_file_path};
+use gateway_transaction_effects::*;
 pub(crate) use gateway_wallet::ensure_wallet_connector_configured;
 use gateway_wallet::*;
 pub(super) use gateway_wallet_adapter::RuntimeWalletAdapter;

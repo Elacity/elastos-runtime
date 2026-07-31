@@ -49,6 +49,9 @@ pub(super) struct BitcoinChallengeInput {
 }
 
 pub(super) struct SignatureRequestInput {
+    pub(super) request_id: String,
+    pub(super) wallet_request_sha256: String,
+    pub(super) authority_binding: String,
     pub(super) principal_id: String,
     pub(super) session_id: String,
     pub(super) launch_id: String,
@@ -92,6 +95,9 @@ impl BitcoinChallengeInput {
 
 impl SignatureRequestInput {
     pub(super) fn validate(&self, now: u64) -> Result<(), String> {
+        validate_opaque_id(&self.request_id, "request_id")?;
+        validate_opaque_id(&self.wallet_request_sha256, "wallet_request_sha256")?;
+        validate_hash(&self.authority_binding, "authority_binding")?;
         validate_opaque_id(&self.principal_id, "principal_id")?;
         validate_opaque_id(&self.session_id, "session_id")?;
         validate_opaque_id(&self.launch_id, "launch_id")?;
@@ -350,6 +356,17 @@ pub(super) fn validate_signature(value: &str) -> Result<(), String> {
 pub(super) fn value_hash(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     bytes_hash(&bytes)
+}
+
+pub(super) fn wallet_authority_binding(authority: &WalletAuthorityV2) -> String {
+    value_hash(&json!({
+        "principal_id": authority.principal_id,
+        "session_id": authority.session_id,
+        "proof_binding_id": authority.proof_binding_id,
+        "grant_id": authority.grant_id,
+        "actor": authority.actor,
+        "launch_id": authority.launch_id,
+    }))
 }
 
 pub(super) fn bytes_hash(bytes: &[u8]) -> String {

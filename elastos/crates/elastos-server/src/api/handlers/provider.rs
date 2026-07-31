@@ -12,7 +12,9 @@ use axum::{
 };
 use serde_json::Value;
 
-use crate::provider_resource::{build_capability_resource, provider_operation_action};
+use crate::provider_resource::{
+    build_capability_resource, ensure_generic_wallet_capability, provider_operation_action,
+};
 use elastos_runtime::capability::{Action, CapabilityManager, CapabilityToken, ResourceId};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::Session;
@@ -53,6 +55,11 @@ pub async fn provider_proxy(
             format!("Unsupported provider operation action mapping: {scheme}/{op}"),
         )
     })?;
+    ensure_generic_wallet_capability(&resource, required_action)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    if scheme == "wallet" {
+        request = serde_json::json!({"op": "status"});
+    }
 
     enforce_capability(&state, &session, &headers, &resource, required_action).await?;
     attach_localhost_provider_wire_token(&scheme, &op, &headers, &mut request);
@@ -175,8 +182,47 @@ mod tests {
     use axum::Extension;
     use elastos_runtime::capability::{CapabilityManager, CapabilityStore, TokenConstraints};
     use elastos_runtime::primitives::{audit::AuditLog, metrics::MetricsManager};
-    use elastos_runtime::provider::ProviderRegistry;
+    use elastos_runtime::provider::{
+        Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
+    };
     use elastos_runtime::session::SessionType;
+    use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct CapturingWalletProvider {
+        requests: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CapturingWalletProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "capturing Wallet provider only supports raw status".to_string(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["wallet"]
+        }
+
+        fn name(&self) -> &'static str {
+            "capturing-wallet"
+        }
+
+        async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            Ok(serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "provider": "wallet-provider",
+                    "version": "0.2.0"
+                }
+            }))
+        }
+    }
 
     #[test]
     fn localhost_provider_proxy_attaches_validated_header_token_to_wire_body() {
@@ -237,6 +283,88 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .contains("no provider for scheme: chain"));
+    }
+
+    #[tokio::test]
+    async fn generic_http_wallet_status_is_bounded_and_non_principal_specific() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(CapturingWalletProvider::default());
+        registry
+            .register_sub_provider("wallet", provider.clone())
+            .await
+            .unwrap();
+        let state = ProviderProxyState {
+            registry,
+            capability_manager: None,
+        };
+
+        let response = provider_proxy(
+            State(state),
+            Extension(Session::new(SessionType::Shell, None)),
+            Path(("wallet".to_string(), "status".to_string())),
+            HeaderMap::new(),
+            serde_json::json!({
+                "principal_id": "caller-selected-principal",
+                "token": "caller-selected-token",
+                "request": {
+                    "op": "wallet_contract"
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("read-only Wallet status should remain available");
+
+        assert_eq!(response.0["status"], "ok");
+        assert_eq!(
+            *provider.requests.lock().await,
+            vec![serde_json::json!({"op": "status"})]
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_http_wallet_operations_fail_before_provider_invocation() {
+        let registry = Arc::new(ProviderRegistry::new());
+        let provider = Arc::new(CapturingWalletProvider::default());
+        registry
+            .register_sub_provider("wallet", provider.clone())
+            .await
+            .unwrap();
+        let state = ProviderProxyState {
+            registry,
+            capability_manager: None,
+        };
+
+        for operation in [
+            "wallet_contract",
+            "challenge",
+            "accounts",
+            "request_signature",
+            "export_managed_secret",
+            "approval_requests",
+            "broadcast_transaction",
+        ] {
+            let error = provider_proxy(
+                State(state.clone()),
+                Extension(Session::new(SessionType::Shell, None)),
+                Path(("wallet".to_string(), operation.to_string())),
+                HeaderMap::new(),
+                serde_json::json!({
+                    "principal_id": "caller-selected-principal",
+                    "token": "caller-selected-token"
+                })
+                .to_string(),
+            )
+            .await
+            .expect_err("generic Wallet authority must fail closed");
+
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{operation}");
+        }
+
+        assert!(
+            provider.requests.lock().await.is_empty(),
+            "rejected generic Wallet operations must not reach ProviderRegistry"
+        );
     }
 
     #[tokio::test]

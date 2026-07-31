@@ -4,6 +4,10 @@ struct MockInspectActProvider {
     calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
 }
 
+struct MockInspectWalletProvider {
+    calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+}
+
 #[async_trait::async_trait]
 impl Provider for MockInspectActProvider {
     async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
@@ -41,6 +45,31 @@ impl Provider for MockInspectActProvider {
                 "target": request.pointer("/_runtime_invocation/target").cloned().unwrap_or(json!(null)),
             }
         }))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockInspectWalletProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock Wallet provider only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["wallet"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-inspect-wallet"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.calls.lock().await.push(request.clone());
+        Ok(json!({"status": "ok", "data": {"provider": "wallet-provider"}}))
     }
 }
 
@@ -239,6 +268,94 @@ async fn inspect_gateway_is_system_read_only() {
         .await
         .unwrap();
     assert_eq!(revoke.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn inspect_planning_exposes_only_wallet_status_without_provider_invocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = inspect_test_state(dir.path()).await;
+    let calls = Arc::new(TokioMutex::new(Vec::new()));
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider(
+            "wallet",
+            Arc::new(MockInspectWalletProvider {
+                calls: calls.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let app = gateway_router(state);
+    let system_token = issue_home_launch_token(dir.path(), SYSTEM_CAPSULE_ID).unwrap();
+
+    let status = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/provider/inspect/plan")
+                .header("x-elastos-home-token", system_token.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"scheme":"wallet","operation":"status","request":{"principal_id":"caller-selected-principal","token":"caller-token"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(status.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(
+        payload["data"]["capabilities"][0]["resource"],
+        crate::provider_resource::WALLET_STATUS_RESOURCE
+    );
+    assert_eq!(
+        payload["data"]["capabilities"][0]["actions"],
+        json!(["read"])
+    );
+    assert_eq!(payload["data"]["dispatch"], false);
+
+    for operation in ["wallet_contract", "accounts", "request_signature"] {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("localhost:61180", "null")
+                    .method("POST")
+                    .uri("/api/provider/inspect/plan")
+                    .header("x-elastos-home-token", system_token.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "scheme": "wallet",
+                            "operation": operation,
+                            "request": {
+                                "principal_id": "caller-selected-principal",
+                                "token": "caller-token"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "error", "{operation}");
+        assert_eq!(payload["code"], "invalid_request", "{operation}");
+    }
+
+    assert!(
+        calls.lock().await.is_empty(),
+        "Inspect Wallet planning must not invoke ProviderRegistry"
+    );
 }
 
 #[tokio::test]

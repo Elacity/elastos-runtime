@@ -9,20 +9,48 @@ run() {
   "$@"
 }
 
+single_test_filters=(
+  test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one
+  test_wallet_app_can_delete_managed_account
+  test_wallet_recovery_key_requires_passkey_step_up
+  test_wallet_recovery_key_import_requires_passkey_step_up
+  test_wallet_summary_reports_walletconnect_available_only_when_pinned
+  test_walletconnect_connector_requires_pinned_config
+)
+browser_wallet_bridge_filter=browser_wallet_bridge_tests
+
+printf '\n==> validating Wallet safety test filters\n'
+count_library_tests() {
+  cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
+    --lib "$1" -- --list |
+    awk '/: test$/ { matches++ } END { print matches + 0 }'
+}
+
+for filter in "${single_test_filters[@]}"; do
+  matches="$(count_library_tests "$filter")"
+  if [ "$matches" -ne 1 ]; then
+    printf 'Wallet safety filter %s resolved to %s library tests; expected exactly one\n' \
+      "$filter" "$matches" >&2
+    exit 1
+  fi
+  printf '[wallet-product-safety-smoke] %s -> 1 library test\n' "$filter"
+done
+
+browser_wallet_bridge_matches="$(count_library_tests "$browser_wallet_bridge_filter")"
+if [ "$browser_wallet_bridge_matches" -eq 0 ]; then
+  printf 'Wallet safety filter %s resolved to zero library tests\n' \
+    "$browser_wallet_bridge_filter" >&2
+  exit 1
+fi
+printf '[wallet-product-safety-smoke] %s -> %s library tests\n' \
+  "$browser_wallet_bridge_filter" "$browser_wallet_bridge_matches"
+
+for filter in "${single_test_filters[@]}"; do
+  run cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
+    --lib "$filter" -- --nocapture
+done
 run cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
-  test_metamask_can_link_multiple_accounts_and_wallet_can_remove_one -- --nocapture
-run cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
-  test_wallet_app_can_delete_managed_account -- --nocapture
-run cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
-  test_wallet_recovery_key_requires_fresh_passkey_home_token -- --nocapture
-run cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
-  test_wallet_recovery_key_import_requires_fresh_passkey_home_token -- --nocapture
-run cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
-  test_wallet_summary_reports_walletconnect_available_only_when_pinned -- --nocapture
-run cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
-  test_walletconnect_connector_requires_pinned_config -- --nocapture
-run cargo test --manifest-path elastos/Cargo.toml -p elastos-server \
-  browser_wallet_bridge_tests --lib -- --nocapture
+  --lib "$browser_wallet_bridge_filter" -- --nocapture
 
 node --input-type=module <<'NODE'
 import { readFileSync } from "node:fs";

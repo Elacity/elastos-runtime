@@ -86,11 +86,6 @@ elastos://net/resolve
 elastos://net/connect
 elastos://net/stream
 elastos://net/http
-elastos://wallet/challenge
-elastos://wallet/verify_proof
-elastos://wallet/request_signature
-elastos://wallet/prepare_transaction
-elastos://wallet/broadcast_transaction
 ```
 
 `elastos://net/http` is optional and constrained. General browsing should prefer
@@ -98,6 +93,14 @@ a stream relay where the browser engine owns TLS. HTTP-fetch proxying is useful
 for controlled content, caching, diagnostics, or compatibility, but it makes the
 runtime or exit provider a content proxy and should not be the default browser
 path.
+
+Wallet account, proof, approval, signing, Recovery, and transaction operations
+are not capsule-visible provider resources. The generic Wallet provider surface
+contains only read-only `elastos://wallet/meta/status`. Browser product routes
+validate signed launch-token v4 authority and invoke typed
+`WalletProviderOperationV2` requests through the private Runtime-local Wallet
+Bus 2.2 adapter. Chain reads and transaction effects remain typed
+`chain-provider` operations.
 
 Exit providers should be pluggable:
 
@@ -888,13 +891,14 @@ a trusted content intermediary and weakens the browser security boundary.
 ## Wallet Bridge
 
 For dapps, the browser engine adapter may expose an EIP-1193-compatible provider
-to web pages, but it must be backed by `elastos://wallet/*`.
+to web pages, but Wallet authority must terminate in Runtime's private typed
+Wallet Bus adapter.
 
 ```text
 web page window.ethereum request
   -> Browser Engine Adapter origin check
-  -> Runtime wallet/chain request
-  -> typed provider operation
+  -> verified Browser launch authority
+  -> typed WalletProviderOperationV2 or chain-provider operation
   -> Wallet/Inbox approval only for signing or transaction effects
   -> selected signer or chain provider
   -> signed audit/result or read receipt
@@ -965,9 +969,9 @@ only the JSON-RPC result shape to the page. Managed `eth_sendTransaction` is
 converted into a typed transaction flow: Gateway
 validates the Browser request, `chain-provider` prepares the unsigned intent,
 Wallet/Inbox approves and signs, and `chain-provider` broadcasts. Web pages
-receive only the final transaction hash. The Wallet provider call itself is
-authorized as `elastos://wallet/<chain>/sign/transaction_intent`, while the
-approval resource shown to the user is the chain effect:
+receive only the final transaction hash. Runtime submits the Wallet approval as
+a typed `RequestApproval` through the private Wallet Bus; the approval resource
+shown to the user remains the chain effect:
 `elastos://chain/<network>/broadcast_transaction`. External EVM accounts use
 connector handoff after Wallet/Inbox approval: the connector capsule receives
 the typed transaction request, asks the external wallet to send it, then

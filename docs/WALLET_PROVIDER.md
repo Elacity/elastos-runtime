@@ -6,11 +6,17 @@ It is not the Runtime root of identity and it is not an app SDK.
 
 The contract is:
 
-`capsule -> runtime capability -> elastos://wallet/* -> wallet-provider -> wallet backend`
+`signed launch-token v4 -> verified RuntimeWalletAuthority -> private RuntimeWalletAdapter -> WalletProviderRequestV2 (Wallet Bus 2.2) -> wallet-provider`
 
 Capsules never receive private keys, browser wallet objects, raw wallet RPC,
 node RPC, seed phrases, or provider SDK handles. A wallet address is a proof
 binding on a Runtime principal, not the principal itself.
+
+The generic provider plane exposes only read-only
+`elastos://wallet/meta/status`. Generic HTTP, component/Carrier, attached
+component, capability-request, and Inspect callers cannot select a principal,
+forward a local bearer token, dispatch `wallet_contract`, or request any Wallet
+account, proof, approval, signing, secret, Recovery, or transaction operation.
 
 ## Authority Model
 
@@ -79,10 +85,10 @@ preferences, encrypted managed EVM wallet envelopes, pending SIWE proof
 challenges, and typed wallet approval requests in `wallet-state.json`. Account
 records and defaults are keyed by `principal_id`; proof challenges are
 short-lived, single-use, and bind the exact challenge resource.
-`request_signature` records a pending approval for an allowed intent and returns
-no signature. Every signature request must name `chain_namespace + intent`. If
-the caller omits `account_id`, the provider resolves the principal's explicit
-default for that chain and intent or fails closed.
+The typed `RequestApproval` operation records a pending approval for an allowed
+intent and returns no signature. Runtime resolves and supplies the exact
+principal-owned account, chain namespace, intent, resource, reason, payload, and
+expiry before invoking the private adapter.
 
 Built-in wallet keys are provider-owned and encrypted at rest under
 `localhost://ElastOS/SystemServices/Wallet/wallet-key.hex`. They are
@@ -114,37 +120,26 @@ DID-only recovery still needs a DID-envelope unwrap/rewrap path.
 
 ## Operations
 
-The provider surface is intentionally narrow:
+The public provider surface is intentionally limited to one operation:
 
-| Operation | Capability resource | Purpose |
-|-----------|---------------------|---------|
-| `status` | `elastos://wallet/meta/status` | Report provider version and configured wallet adapters |
-| `challenge` | `elastos://wallet/proof/challenge` | Create a Runtime-bound wallet proof challenge |
-| `bitcoin_challenge` | `elastos://wallet/proof/bip322/challenge` | Create a Runtime-bound Bitcoin ownership challenge |
-| `verify_proof` | `elastos://wallet/proof/verify` | Verify the currently supported EVM SIWE proof against the issued challenge |
-| `verify_bip322_proof` | `elastos://wallet/proof/bip322/verify` | Verify the currently supported Bitcoin BIP-322 proof against the issued challenge |
-| `verify_contract_proof` | `elastos://wallet/proof/verify_contract` | Consume an issued SIWE challenge only after chain-provider verifies ERC-1271 smart-account signature validity |
-| `create_managed_account` | `elastos://wallet/account/create_managed` | Create or return a passkey-controlled built-in EVM account |
-| `link_account` | `elastos://wallet/account/link` | Attach a verified wallet proof binding to a principal |
-| `accounts` | `elastos://wallet/account/list` | List linked accounts visible to the current principal |
-| `revoke_account` | `elastos://wallet/account/revoke` | Revoke a linked proof binding and related grants |
-| `rename_account` | `elastos://wallet/account/rename` | Rename a principal-scoped account label |
-| `export_managed_secret` | `elastos://wallet/account/export_secret` | Export a built-in account recovery key after fresh passkey verification |
-| `import_managed_secret` | `elastos://wallet/account/import_secret` | Import a built-in account recovery key after fresh passkey verification |
-| `set_default_account` | `elastos://wallet/account/set_default` | Select a principal-scoped default linked account for one chain and signing intent |
-| `default_account` | `elastos://wallet/account/default` | Resolve the selected account without exposing wallet authority to the caller |
-| `request_signature` | `elastos://wallet/<chain_namespace>/sign/<intent>` | Request explicit approval for a typed signing intent on a named chain |
-| `approval_requests` | `elastos://wallet/approval/list` | List wallet approval requests for the current principal |
-| `reject_approval` | `elastos://wallet/approval/reject` | Reject a pending wallet approval request |
-| `approve_approval` | `elastos://wallet/approval/approve` | Approve a pending request and create a wallet handoff |
-| `complete_approval` | `elastos://wallet/approval/complete` | Complete an approved request with a provider-owned signature receipt |
-| `sign_approved` | `elastos://wallet/approval/sign_approved` | Execute an approved request with a provider-owned managed wallet key |
+| Operation | Capability resource | Action | Purpose |
+|-----------|---------------------|--------|---------|
+| `status` | `elastos://wallet/meta/status` | `read` | Report bounded provider identity, version, and adapter status without principal data |
 
-The runtime resource mapper must reject unknown wallet operations and
-`request_signature` calls without a validated `chain_namespace + intent`.
-Typed transaction prepare/broadcast belongs to `chain-provider`; wallet-provider
-only owns proof bindings, approval state, managed signing, and connector
-completion receipts.
+All principal-sensitive work uses the private Runtime-local Wallet Bus 2.2
+envelope. Runtime derives `RuntimeWalletAuthority` only from a successfully
+validated signed launch token, constructs `WalletProviderRequestV2`, and
+dispatches a typed `WalletProviderOperationV2` through
+`RuntimeWalletAdapter`. The typed variants cover account reads and writes,
+proof challenges and verification, approval lifecycle operations, validated
+chain-outcome projection, and managed Recovery import/export. They are not
+generic provider methods or capsule capability resources.
+
+Generic `wallet_contract`, legacy proof/account/approval/signing/secret/Recovery
+names, signing URI derivation, and Wallet transaction prepare/broadcast all fail
+before provider invocation. Transaction prepare and broadcast remain typed
+`chain-provider` effects; wallet-provider owns proof bindings, approval state,
+managed signing, and connector completion receipts.
 
 Wallet owns accounts, approval methods, built-in send, and recovery-key
 actions. `POST /api/apps/wallet/wallet/managed` creates or returns the
@@ -248,7 +243,9 @@ the connector owns only Reown/AppKit browser UX plus the operator-pinned local
 adapter. Mode A is the first target: ElastOS acts as the dApp and external
 wallets sign Runtime challenges or requests. Mode B, where external dApps treat
 ElastOS as a WalletConnect wallet, is a later security milestone. Internal
-capsules do not use WalletConnect; they call `elastos://wallet/*`.
+capsules do not use WalletConnect or generic Wallet provider calls; their
+product routes enter the private typed Wallet Bus through verified Runtime
+authority.
 
 `wallet-walletconnect` remains invisible unless the runtime finds
 `elastos.walletconnect.connector/v1` config plus a local hashed Reown/AppKit SDK

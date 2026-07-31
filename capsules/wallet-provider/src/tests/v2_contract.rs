@@ -51,10 +51,107 @@ fn write_pre_v2_pending_approval_store(dir: &Path) -> PathBuf {
     let approval = stored["approval_requests"][0].as_object_mut().unwrap();
     approval.remove("session_id");
     approval.remove("launch_id");
+    approval.remove("wallet_request_sha256");
+    approval.remove("authority_binding");
+    approval.remove("validated_chain_outcome");
     let requested_by_actor = approval.remove("requested_by_actor").unwrap();
     approval.insert("capsule_id".to_string(), requested_by_actor);
     fs::write(&store_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
     store_path
+}
+
+#[test]
+fn request_approval_uses_the_runtime_request_identity_and_replays_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = init_provider(dir.path());
+    let principal_id = "person:local:alice";
+    let account_id = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: None,
+            create_new: false,
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            data["account"]["account_id"].as_str().unwrap().to_string()
+        }
+        other => panic!("expected managed account, got {other:?}"),
+    };
+    let context = wallet_context(principal_id, "system");
+    let operation = WalletProviderOperationV2::RequestApproval {
+        account_id,
+        chain_namespace: "eip155:20".into(),
+        intent: "transaction_intent".into(),
+        resource: "elastos://chain/esc-mainnet/broadcast_transaction".into(),
+        reason: "Stable approval".into(),
+        payload: transaction_intent_payload(&provider.store.accounts[0].address),
+        expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+    };
+    let request = wallet_request(&context, operation.clone());
+
+    for _ in 0..2 {
+        match invoke_wallet_request(&mut provider, &request) {
+            Response::Ok { data: Some(data) } => {
+                assert_eq!(data["approval_request"]["request_id"], request.request_id);
+            }
+            other => panic!("expected idempotent approval, got {other:?}"),
+        }
+    }
+    assert_eq!(provider.store.approval_requests.len(), 1);
+
+    let mut substituted = match operation {
+        WalletProviderOperationV2::RequestApproval {
+            account_id,
+            chain_namespace,
+            intent,
+            resource,
+            reason: _,
+            payload,
+            expires_at,
+        } => WalletProviderOperationV2::RequestApproval {
+            account_id,
+            chain_namespace,
+            intent,
+            resource,
+            reason: "Substituted approval".into(),
+            payload,
+            expires_at,
+        },
+        _ => unreachable!(),
+    };
+    let now = now_ts();
+    let substituted_request = WalletProviderRequestV2::new(
+        &context,
+        request.request_id.clone(),
+        now,
+        now.saturating_add(120),
+        substituted.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        invoke_wallet_request(&mut provider, &substituted_request),
+        Response::Error { ref code, .. } if code == "approval_identity_conflict"
+    ));
+
+    if let WalletProviderOperationV2::RequestApproval { reason, .. } = &mut substituted {
+        *reason = "Stable approval".into();
+    }
+    let foreign = wallet_context_in_session(principal_id, "system", "session:other");
+    let foreign_request = WalletProviderRequestV2::new(
+        &foreign,
+        request.request_id.clone(),
+        now,
+        now.saturating_add(120),
+        substituted,
+    )
+    .unwrap();
+    assert!(matches!(
+        invoke_wallet_request(&mut provider, &foreign_request),
+        Response::Error { ref code, .. } if code == "approval_identity_conflict"
+    ));
 }
 
 #[test]
@@ -153,7 +250,7 @@ fn wallet_contract_rejects_missing_and_mixed_protocol_versions() {
             create_new: true,
         },
     );
-    for version in [Some("1.0"), Some("2.0"), Some("2.2"), None] {
+    for version in [Some("1.0"), Some("2.0"), Some("2.1"), None] {
         let mut value = serde_json::to_value(&request).unwrap();
         match version {
             Some(version) => value["protocol_version"] = json!(version),

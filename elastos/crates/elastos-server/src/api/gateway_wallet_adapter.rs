@@ -35,10 +35,7 @@ impl<'a> RuntimeWalletAdapter<'a> {
         &self,
         operation: WalletProviderOperationV2,
     ) -> anyhow::Result<WalletProviderResponseV2> {
-        let issued_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| anyhow::anyhow!("Runtime clock is before the Unix epoch"))?
-            .as_secs();
+        let issued_at = wallet_invocation_time()?;
         let mut nonce = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut nonce);
         self.invoke_with_runtime_fields(
@@ -47,6 +44,15 @@ impl<'a> RuntimeWalletAdapter<'a> {
             operation,
         )
         .await
+    }
+
+    pub(in crate::api) async fn invoke_with_request_id(
+        &self,
+        request_id: String,
+        operation: WalletProviderOperationV2,
+    ) -> anyhow::Result<WalletProviderResponseV2> {
+        self.invoke_with_runtime_fields(request_id, wallet_invocation_time()?, operation)
+            .await
     }
 
     async fn invoke_with_runtime_fields(
@@ -98,6 +104,13 @@ impl<'a> RuntimeWalletAdapter<'a> {
         WalletProviderResponseV2::decode_for_request(&bytes, &request)
             .map_err(|err| anyhow::anyhow!("invalid Wallet provider v2 response: {err}"))
     }
+}
+
+fn wallet_invocation_time() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("Runtime clock is before the Unix epoch"))?
+        .as_secs())
 }
 
 #[cfg(test)]

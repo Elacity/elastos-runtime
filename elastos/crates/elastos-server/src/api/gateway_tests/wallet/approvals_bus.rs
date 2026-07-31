@@ -31,9 +31,33 @@ fn approval_callers_use_wallet_bus_v2_while_deferred_paths_remain_explicit() {
 
     let browser_source = include_str!("../../gateway_browser_wallet.rs");
     let send_source = include_str!("../../gateway_wallet_send.rs");
+    let transaction_effect_source = include_str!("../../gateway_transaction_effects.rs");
     let wallet_app_source = include_str!("../../gateway_wallet_app.rs");
-    assert!(browser_source.contains(r#""op": "record_transaction_hash""#));
-    assert!(send_source.contains(r#""op": "record_transaction_hash""#));
+    let transaction_sources = [
+        browser_source,
+        send_source,
+        transaction_effect_source,
+        include_str!("../../gateway_wallet_adapter.rs"),
+        include_str!("../../gateway_wallet_accounts.rs"),
+        include_str!("../../auth_gateway.rs"),
+    ]
+    .join("\n");
+    for retired in [
+        "record_transaction_hash",
+        "BrowserPendingTransactionBroadcast",
+        "pending-transaction-broadcast",
+    ] {
+        assert!(
+            !transaction_sources.contains(retired),
+            "production transaction path still contains retired implementation {retired}"
+        );
+    }
+    assert!(browser_source.contains("ensure_runtime_transaction_approval"));
+    assert!(browser_source.contains("complete_runtime_transaction_effect"));
+    assert!(send_source.contains("ensure_runtime_transaction_approval"));
+    assert!(send_source.contains("complete_runtime_transaction_effect"));
+    assert!(transaction_effect_source.contains("TransactionEffectState::BroadcastInFlight"));
+    assert!(transaction_effect_source.contains("AttachValidatedChainOutcome"));
     assert!(!wallet_app_source.contains(r#""op": "export_managed_secret""#));
     assert!(!wallet_app_source.contains(r#""op": "import_managed_secret""#));
 }

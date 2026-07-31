@@ -3008,20 +3008,24 @@ assertManifestMethod(providerCapsuleManifests, "chain-provider", "elastos.provid
   resource: "elastos://chain/*",
   operation: "broadcast_transaction",
 });
-assertManifestMethod(providerCapsuleManifests, "wallet-provider", "elastos.provider.wallet", "request_signature", {
-  risk: "payment",
-  approval: "user",
-  audit: "full",
-  resource: "elastos://wallet/*",
-  operation: "request_signature",
-});
-assertManifestMethod(providerCapsuleManifests, "wallet-provider", "elastos.provider.wallet", "verify_proof", {
+assertManifestMethod(providerCapsuleManifests, "wallet-provider", "elastos.provider.wallet", "status", {
   risk: "read",
   approval: "runtime_policy",
-  audit: "event",
-  resource: "elastos://wallet/*",
-  operation: "verify_proof",
+  audit: "summary",
+  resource: "elastos://wallet/meta/status",
+  operation: "status",
 });
+const walletProviderInterface = providerCapsuleManifests["wallet-provider"].interfaces.find(
+  (entry) => entry?.id === "elastos.provider.wallet",
+);
+assert(
+  walletProviderInterface?.methods?.length === 1 &&
+    walletProviderInterface.methods[0]?.id === "status" &&
+    providerCapsuleManifests["wallet-provider"].provides ===
+      "elastos://wallet/meta/status",
+  "wallet-provider public interface must expose only read-only status; authority-bound operations stay on the private Wallet Bus",
+  walletProviderInterface,
+);
 assertManifestMethod(providerCapsuleManifests, "key-provider", "elastos.provider.key", "release", {
   risk: "rights",
   approval: "user",
@@ -6829,10 +6833,14 @@ assert(
     walletProvider.includes(
       "bitcoin_bip322_challenge_rejects_unsupported_p2wsh_script",
     ) &&
-    read("elastos/crates/elastos-server/src/provider_resource.rs").includes(
-      "elastos://wallet/proof/bip322/verify",
-    ),
-  "Bitcoin wallet proof must use typed BIP-322/signed-message capability resources with fail-closed verification coverage",
+    read("elastos/crates/elastos-wallet-contract/src/lib.rs").includes(
+      "VerifyBip322Proof",
+    ) &&
+    read("elastos/crates/elastos-server/src/api/gateway_wallet_adapter.rs").includes(
+      "WalletProviderRequestV2",
+    ) &&
+    !providerResource.includes("elastos://wallet/proof/bip322/verify"),
+  "Bitcoin wallet proof must use typed Wallet Bus operations with fail-closed verification coverage and no generic proof resource",
 );
 assert(
   gatewayApi.includes("/api/auth/btc/challenge") &&
@@ -6860,10 +6868,18 @@ assert(
   "Wallet must use built-in managed Bitcoin signing or connector handoff, not manual BIP-322 forms",
 );
 assert(
-  read("elastos/crates/elastos-server/src/provider_resource.rs").includes(
-    "wallet/{chain_namespace}/sign/{intent}",
-  ) && carrierBridge.includes("wallet_signature_parts_from_uri"),
-  "Wallet capability resources must bind chain namespace and intent through the Carrier/provider path",
+  providerResource.includes(
+    'pub const WALLET_STATUS_RESOURCE: &str = "elastos://wallet/meta/status";',
+  ) &&
+    providerResource.includes(
+      "wallet_resource_rejects_all_principal_sensitive_operations",
+    ) &&
+    !providerResource.includes("wallet/{chain_namespace}/sign/{intent}") &&
+    !carrierBridge.includes("wallet_signature_parts_from_uri") &&
+    carrierBridge.includes(
+      "generic Wallet dispatch is limited to read-only elastos://wallet/meta/status",
+    ),
+  "Wallet generic provider and Carrier paths must expose only read-only status and reject signing URI derivation",
 );
 assert(
   systemJs.includes('["eip155:1", "Ethereum"]') &&
@@ -9816,13 +9832,16 @@ assert(
   "Wallet recovery/delete routes must be provider-backed, passkey-gated, and covered by gateway tests",
 );
 assert(
-  walletProviderManifest.includes("rename_account") &&
-    walletProviderManifest.includes("export_managed_secret") &&
+  walletProviderManifest.includes('"operation": "status"') &&
+    walletProviderManifest.includes("authenticated Runtime-local Wallet Bus") &&
     walletProviderManifest.includes("wallet.account.renamed") &&
     walletProviderManifest.includes("wallet.recovery_key.viewed") &&
-    walletProviderManifest.includes("passkey-gated managed recovery export") &&
+    !walletProviderManifest.includes('"operation": "rename_account"') &&
+    !walletProviderManifest.includes('"operation": "export_managed_secret"') &&
+    !walletProviderManifest.includes('"operation": "request_signature"') &&
+    !walletProviderManifest.includes('"operation": "wallet_contract"') &&
     !walletProviderManifest.includes("private keys to app capsules"),
-  "wallet-provider manifest must document rename and managed recovery export without claiming impossible zero key display for the Wallet recovery surface",
+  "wallet-provider manifest must keep principal-sensitive operations off its public interface while retaining internal audit truth",
 );
 assert(
   wallet.includes(

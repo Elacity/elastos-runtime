@@ -17,12 +17,13 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 
-pub const WALLET_PROTOCOL_VERSION: &str = "2.1";
+pub const WALLET_PROTOCOL_VERSION: &str = "2.2";
 pub const WALLET_BUS_OPERATION: &str = "wallet_contract";
 pub const WALLET_REQUEST_SCHEMA: &str = "elastos.wallet.provider-request/v2";
 pub const WALLET_RESPONSE_SCHEMA: &str = "elastos.wallet.provider-response/v2";
 pub const ERC1271_EVIDENCE_SCHEMA: &str = "elastos.chain.erc1271_proof/v1";
 pub const MANAGED_RECOVERY_SET_SCHEMA: &str = "elastos.wallet.managed-recovery-set/v1";
+pub const VALIDATED_CHAIN_OUTCOME_SCHEMA: &str = "elastos.wallet.validated-chain-outcome/v1";
 pub const DEFAULT_BITCOIN_NETWORK: &str = "bitcoin";
 pub const MAX_INVOCATION_TTL_SECS: u64 = 300;
 pub const MAX_CLOCK_SKEW_SECS: u64 = 60;
@@ -30,6 +31,7 @@ pub const MAX_APPROVAL_PAYLOAD_BYTES: usize = 32 * 1024;
 pub const MAX_RECOVERY_KEY_BYTES: usize = 64 * 1024;
 pub const MAX_MANAGED_RECOVERY_SET_KEYS: usize = 64;
 pub const MAX_MANAGED_RECOVERY_SET_BYTES: usize = 256 * 1024;
+pub const MAX_VALIDATED_CHAIN_RECEIPT_BYTES: usize = 128 * 1024;
 
 const REQUEST_ID_PREFIX: &str = "wallet-request:";
 const ERC1271_MAGIC_VALUE: &str = "0x1626ba7e";
@@ -237,6 +239,7 @@ pub enum WalletOperationKind {
     ApproveAndSignManaged,
     ApproveConnectorHandoff,
     CompleteConnectorHandoff,
+    AttachValidatedChainOutcome,
     ExportManagedRecoveryKey,
     ImportManagedRecoveryKey,
     ExportManagedRecoverySet,
@@ -264,6 +267,7 @@ impl WalletOperationKind {
             Self::ApproveAndSignManaged => "approve_and_sign_managed",
             Self::ApproveConnectorHandoff => "approve_connector_handoff",
             Self::CompleteConnectorHandoff => "complete_connector_handoff",
+            Self::AttachValidatedChainOutcome => "attach_validated_chain_outcome",
             Self::ExportManagedRecoveryKey => "export_managed_recovery_key",
             Self::ImportManagedRecoveryKey => "import_managed_recovery_key",
             Self::ExportManagedRecoverySet => "export_managed_recovery_set",
@@ -314,6 +318,98 @@ impl Erc1271ProofEvidenceV1 {
         if self.checked_at == 0 {
             return Err(ContractError::new(
                 "ERC-1271 evidence checked_at is required",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Runtime-validated Chain outcome projected into Wallet history.
+///
+/// This projection is non-authoritative: Runtime owns the durable transaction
+/// effect and Chain remains the source of broadcast and receipt truth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ValidatedChainOutcomeBindingV1 {
+    ManagedSigned {
+        signed_transaction_sha256: String,
+    },
+    ExternalConnector {
+        connector_id: String,
+        originating_address: String,
+    },
+}
+
+impl ValidatedChainOutcomeBindingV1 {
+    fn validate(&self) -> ContractResult<()> {
+        match self {
+            Self::ManagedSigned {
+                signed_transaction_sha256,
+            } => validate_hash32(
+                "validated Chain outcome signed_transaction_sha256",
+                signed_transaction_sha256,
+            ),
+            Self::ExternalConnector {
+                connector_id,
+                originating_address,
+            } => {
+                validate_token("validated Chain outcome connector_id", connector_id, 128)?;
+                validate_evm_address(
+                    "validated Chain outcome originating_address",
+                    originating_address,
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatedChainOutcomeV1 {
+    pub schema: String,
+    pub approval_request_id: String,
+    pub account_id: String,
+    pub chain_namespace: String,
+    pub network: PublicNetwork,
+    pub binding: ValidatedChainOutcomeBindingV1,
+    pub transaction_hash: String,
+    pub chain_observation: Value,
+    pub confirmed_at: u64,
+}
+
+impl ValidatedChainOutcomeV1 {
+    pub fn validate(&self) -> ContractResult<()> {
+        if self.schema != VALIDATED_CHAIN_OUTCOME_SCHEMA {
+            return Err(ContractError::new(
+                "unsupported validated Chain outcome schema",
+            ));
+        }
+        validate_request_id(&self.approval_request_id)?;
+        validate_required("validated Chain outcome account_id", &self.account_id, 256)?;
+        validate_token(
+            "validated Chain outcome chain_namespace",
+            &self.chain_namespace,
+            64,
+        )?;
+        PublicNetwork::new(self.network.as_str())?;
+        self.binding.validate()?;
+        validate_hash32(
+            "validated Chain outcome transaction_hash",
+            &self.transaction_hash,
+        )?;
+        if !self.chain_observation.is_object() {
+            return Err(ContractError::new(
+                "validated Chain outcome observation must be a JSON object",
+            ));
+        }
+        validate_json_size(
+            "validated Chain outcome observation",
+            &self.chain_observation,
+            MAX_VALIDATED_CHAIN_RECEIPT_BYTES,
+        )?;
+        if self.confirmed_at == 0 {
+            return Err(ContractError::new(
+                "validated Chain outcome confirmed_at is required",
             ));
         }
         Ok(())
@@ -497,6 +593,9 @@ pub enum WalletProviderOperationV2 {
         signer: String,
         transaction_hash: Option<String>,
     },
+    AttachValidatedChainOutcome {
+        outcome: ValidatedChainOutcomeV1,
+    },
     ExportManagedRecoveryKey {
         account_id: String,
     },
@@ -532,6 +631,9 @@ impl WalletProviderOperationV2 {
             Self::ApproveAndSignManaged { .. } => WalletOperationKind::ApproveAndSignManaged,
             Self::ApproveConnectorHandoff { .. } => WalletOperationKind::ApproveConnectorHandoff,
             Self::CompleteConnectorHandoff { .. } => WalletOperationKind::CompleteConnectorHandoff,
+            Self::AttachValidatedChainOutcome { .. } => {
+                WalletOperationKind::AttachValidatedChainOutcome
+            }
             Self::ExportManagedRecoveryKey { .. } => WalletOperationKind::ExportManagedRecoveryKey,
             Self::ImportManagedRecoveryKey { .. } => WalletOperationKind::ImportManagedRecoveryKey,
             Self::ExportManagedRecoverySet { .. } => WalletOperationKind::ExportManagedRecoverySet,
@@ -570,6 +672,7 @@ impl WalletProviderOperationV2 {
             Self::ApproveAndSignManaged { .. } => "wallet:approval:managed-sign",
             Self::ApproveConnectorHandoff { .. } => "wallet:approval:connector-approve",
             Self::CompleteConnectorHandoff { .. } => "wallet:approval:connector-complete",
+            Self::AttachValidatedChainOutcome { .. } => "wallet:transaction:project-chain-outcome",
             Self::ExportManagedRecoveryKey { .. } => "wallet:recovery:export-managed",
             Self::ImportManagedRecoveryKey { .. } => "wallet:recovery:import-managed",
             Self::ExportManagedRecoverySet { .. } => "wallet:recovery:export-managed-set",
@@ -597,6 +700,7 @@ impl WalletProviderOperationV2 {
             Self::ApproveAndSignManaged { .. } => "wallet.approval.managed.approve-sign",
             Self::ApproveConnectorHandoff { .. } => "wallet.approval.connector.approve",
             Self::CompleteConnectorHandoff { .. } => "wallet.approval.connector.complete",
+            Self::AttachValidatedChainOutcome { .. } => "wallet.transaction.chain-outcome.attach",
             Self::ExportManagedRecoveryKey { .. } => "wallet.recovery.managed.export",
             Self::ImportManagedRecoveryKey { .. } => "wallet.recovery.managed.import",
             Self::ExportManagedRecoverySet { .. } => "wallet.recovery.managed-set.export",
@@ -611,6 +715,7 @@ impl WalletProviderOperationV2 {
             | Self::SetDefaultAccount { account_id, .. }
             | Self::RequestApproval { account_id, .. }
             | Self::ExportManagedRecoveryKey { account_id } => Some(account_id),
+            Self::AttachValidatedChainOutcome { outcome } => Some(&outcome.account_id),
             _ => None,
         }
     }
@@ -621,6 +726,7 @@ impl WalletProviderOperationV2 {
             | Self::ApproveAndSignManaged { request_id, .. }
             | Self::ApproveConnectorHandoff { request_id, .. }
             | Self::CompleteConnectorHandoff { request_id, .. } => Some(request_id),
+            Self::AttachValidatedChainOutcome { outcome } => Some(&outcome.approval_request_id),
             _ => None,
         }
     }
@@ -803,6 +909,7 @@ impl WalletProviderOperationV2 {
                 }
                 Ok(())
             }
+            Self::AttachValidatedChainOutcome { outcome } => outcome.validate(),
             Self::ImportManagedRecoveryKey {
                 recovery_key,
                 label,
@@ -1387,6 +1494,28 @@ mod tests {
         .unwrap()
     }
 
+    fn validated_chain_outcome() -> ValidatedChainOutcomeV1 {
+        ValidatedChainOutcomeV1 {
+            schema: VALIDATED_CHAIN_OUTCOME_SCHEMA.to_string(),
+            approval_request_id: REQUEST_ID.to_string(),
+            account_id: ACCOUNT_ID.to_string(),
+            chain_namespace: "eip155:20".to_string(),
+            network: PublicNetwork::new("esc-mainnet").unwrap(),
+            binding: ValidatedChainOutcomeBindingV1::ManagedSigned {
+                signed_transaction_sha256:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+            },
+            transaction_hash: HASH.to_string(),
+            chain_observation: json!({
+                "schema": "elastos.chain.broadcast_receipt/v1",
+                "network": "esc-mainnet",
+                "transaction_hash": HASH,
+            }),
+            confirmed_at: NOW,
+        }
+    }
+
     fn operations() -> Vec<(WalletOperationKind, WalletProviderOperationV2)> {
         vec![
             (
@@ -1537,6 +1666,12 @@ mod tests {
                 },
             ),
             (
+                WalletOperationKind::AttachValidatedChainOutcome,
+                WalletProviderOperationV2::AttachValidatedChainOutcome {
+                    outcome: validated_chain_outcome(),
+                },
+            ),
+            (
                 WalletOperationKind::ExportManagedRecoveryKey,
                 WalletProviderOperationV2::ExportManagedRecoveryKey {
                     account_id: ACCOUNT_ID.to_string(),
@@ -1589,7 +1724,7 @@ mod tests {
     #[test]
     fn wire_contract_constants_are_exact() {
         assert_eq!(WALLET_BUS_OPERATION, "wallet_contract");
-        assert_eq!(WALLET_PROTOCOL_VERSION, "2.1");
+        assert_eq!(WALLET_PROTOCOL_VERSION, "2.2");
         assert_eq!(WALLET_REQUEST_SCHEMA, "elastos.wallet.provider-request/v2");
         assert_eq!(
             WALLET_RESPONSE_SCHEMA,
@@ -1600,6 +1735,126 @@ mod tests {
             MANAGED_RECOVERY_SET_SCHEMA,
             "elastos.wallet.managed-recovery-set/v1"
         );
+        assert_eq!(
+            VALIDATED_CHAIN_OUTCOME_SCHEMA,
+            "elastos.wallet.validated-chain-outcome/v1"
+        );
+    }
+
+    #[test]
+    fn validated_chain_outcome_is_authority_bound_and_bounded() {
+        let operation = WalletProviderOperationV2::AttachValidatedChainOutcome {
+            outcome: validated_chain_outcome(),
+        };
+        operation.validate().unwrap();
+        assert_eq!(
+            operation.capability(),
+            "wallet:transaction:project-chain-outcome"
+        );
+        assert_eq!(
+            operation.authority_intent(),
+            "wallet.transaction.chain-outcome.attach"
+        );
+        assert_eq!(operation.account_id(), Some(ACCOUNT_ID));
+        assert_eq!(operation.approval_request_id(), Some(REQUEST_ID));
+
+        let request = request(operation);
+        assert!(request.account_binding.is_some());
+        assert!(request.approval_binding.is_some());
+    }
+
+    #[test]
+    fn validated_chain_outcome_rejects_invalid_or_oversized_fields() {
+        let mut cases = Vec::new();
+
+        let mut invalid = validated_chain_outcome();
+        invalid.schema = "elastos.wallet.validated-chain-outcome/v0".to_string();
+        cases.push(invalid);
+
+        let mut invalid = validated_chain_outcome();
+        invalid.approval_request_id = "wallet-approval:legacy".to_string();
+        cases.push(invalid);
+
+        let mut invalid = validated_chain_outcome();
+        invalid.binding = ValidatedChainOutcomeBindingV1::ManagedSigned {
+            signed_transaction_sha256: "sha256:abcd".to_string(),
+        };
+        cases.push(invalid);
+
+        let mut invalid = validated_chain_outcome();
+        invalid.transaction_hash = "0x1234".to_string();
+        cases.push(invalid);
+
+        let mut invalid = validated_chain_outcome();
+        invalid.chain_observation = Value::Null;
+        cases.push(invalid);
+
+        let mut invalid = validated_chain_outcome();
+        invalid.confirmed_at = 0;
+        cases.push(invalid);
+
+        for outcome in cases {
+            assert!(
+                WalletProviderOperationV2::AttachValidatedChainOutcome { outcome }
+                    .validate()
+                    .is_err()
+            );
+        }
+
+        let mut oversized = validated_chain_outcome();
+        oversized.chain_observation =
+            json!({ "data": "x".repeat(MAX_VALIDATED_CHAIN_RECEIPT_BYTES) });
+        assert!(
+            WalletProviderOperationV2::AttachValidatedChainOutcome { outcome: oversized }
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validated_chain_outcome_external_binding_is_closed_and_bounded() {
+        let mut external = validated_chain_outcome();
+        external.binding = ValidatedChainOutcomeBindingV1::ExternalConnector {
+            connector_id: "wallet-metamask".to_string(),
+            originating_address: EVM_ADDRESS.to_string(),
+        };
+        external.chain_observation = json!({
+            "network": "esc-mainnet",
+            "hash": HASH,
+            "transaction": {
+                "hash": HASH,
+                "from": EVM_ADDRESS,
+            },
+        });
+        external.validate().unwrap();
+
+        let mut invalid = external.clone();
+        invalid.binding = ValidatedChainOutcomeBindingV1::ExternalConnector {
+            connector_id: "wallet metamask".to_string(),
+            originating_address: EVM_ADDRESS.to_string(),
+        };
+        assert!(invalid.validate().is_err());
+
+        let mut invalid = external;
+        invalid.binding = ValidatedChainOutcomeBindingV1::ExternalConnector {
+            connector_id: "wallet-metamask".to_string(),
+            originating_address: "0x1234".to_string(),
+        };
+        assert!(invalid.validate().is_err());
+
+        let mut ambiguous = serde_json::to_value(validated_chain_outcome()).unwrap();
+        ambiguous["binding"]["originating_address"] = json!(EVM_ADDRESS);
+        assert!(serde_json::from_value::<ValidatedChainOutcomeV1>(ambiguous).is_err());
+
+        let mut ambiguous = serde_json::to_value(validated_chain_outcome()).unwrap();
+        ambiguous["binding"] = json!({
+            "kind": "external_connector",
+            "connector_id": "wallet-metamask",
+            "originating_address": EVM_ADDRESS,
+            "signed_transaction_sha256":
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        });
+        assert!(serde_json::from_value::<ValidatedChainOutcomeV1>(ambiguous).is_err());
     }
 
     #[test]
@@ -2036,12 +2291,12 @@ mod tests {
         });
         let value = serde_json::to_value(request).unwrap();
         for (schema, version) in [
-            (None, Some("2.1")),
+            (None, Some("2.2")),
             (Some(WALLET_REQUEST_SCHEMA), None),
-            (Some("elastos.wallet.provider-request/v1"), Some("2.1")),
+            (Some("elastos.wallet.provider-request/v1"), Some("2.2")),
             (Some(WALLET_REQUEST_SCHEMA), Some("1.0")),
             (Some(WALLET_REQUEST_SCHEMA), Some("2.0")),
-            (Some(WALLET_REQUEST_SCHEMA), Some("2.2")),
+            (Some(WALLET_REQUEST_SCHEMA), Some("2.1")),
         ] {
             let mut candidate = value.clone();
             match schema {
@@ -2281,12 +2536,12 @@ mod tests {
         }
 
         for (schema, version) in [
-            (None, Some("2.1")),
+            (None, Some("2.2")),
             (Some(WALLET_RESPONSE_SCHEMA), None),
-            (Some("elastos.wallet.provider-response/v1"), Some("2.1")),
+            (Some("elastos.wallet.provider-response/v1"), Some("2.2")),
             (Some(WALLET_RESPONSE_SCHEMA), Some("1.0")),
             (Some(WALLET_RESPONSE_SCHEMA), Some("2.0")),
-            (Some(WALLET_RESPONSE_SCHEMA), Some("2.2")),
+            (Some(WALLET_RESPONSE_SCHEMA), Some("2.1")),
         ] {
             let mut candidate = serde_json::to_value(&response).unwrap();
             match schema {

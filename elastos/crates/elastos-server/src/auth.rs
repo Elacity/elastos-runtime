@@ -2898,9 +2898,12 @@ mod tests {
             .unwrap()
             .activated_at;
 
-        let mut substituted = AuthState::default();
-        substituted.audit_chain_state =
-            Some(sign_audit_chain_state(data_dir.path(), activated_at, None).unwrap());
+        let mut substituted = AuthState {
+            audit_chain_state: Some(
+                sign_audit_chain_state(data_dir.path(), activated_at, None).unwrap(),
+            ),
+            ..AuthState::default()
+        };
         let mut event = test_audit_event(1);
         event.reason = "substituted-at-the-same-sequence".to_string();
         let event = sign_audit_event(data_dir.path(), event).unwrap();

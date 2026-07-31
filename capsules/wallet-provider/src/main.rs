@@ -12,9 +12,9 @@ use elastos_auth::{
     verify_siwe_challenge, AuthChallengeInput, AuthChallengeV1, ProofBinding,
 };
 use elastos_wallet_contract::{
-    ManagedRecoveryKeyEntryV1, ManagedRecoverySetV1, WalletProviderOperationV2,
-    WalletProviderRequestV2, WalletProviderResponseV2, WalletResultV2, WALLET_BUS_OPERATION,
-    WALLET_PROTOCOL_VERSION,
+    ManagedRecoveryKeyEntryV1, ManagedRecoverySetV1, ValidatedChainOutcomeBindingV1,
+    ValidatedChainOutcomeV1, WalletAuthorityV2, WalletProviderOperationV2, WalletProviderRequestV2,
+    WalletProviderResponseV2, WalletResultV2, WALLET_BUS_OPERATION, WALLET_PROTOCOL_VERSION,
 };
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
@@ -124,6 +124,9 @@ impl WalletProvider {
         now: u64,
     ) -> WalletResultV2 {
         prune_expired_lifecycles(&mut self.store, now);
+        if let Some(response) = self.idempotent_transaction_effect_replay(request) {
+            return response_into_wallet_result(response);
+        }
         if self
             .store
             .consumed_lifecycles
@@ -280,6 +283,9 @@ impl WalletProvider {
                 payload,
                 expires_at,
             } => self.request_approval(SignatureRequestInput {
+                request_id: request.request_id.clone(),
+                wallet_request_sha256: request.request_sha256.clone(),
+                authority_binding: wallet_authority_binding(&request.authority),
                 principal_id: principal_id.to_string(),
                 session_id: session_id.to_string(),
                 launch_id: request.authority.launch_id.clone(),
@@ -292,6 +298,9 @@ impl WalletProvider {
                 payload: payload.clone(),
                 expires_at: *expires_at,
             }),
+            WalletProviderOperationV2::AttachValidatedChainOutcome { outcome } => {
+                self.attach_validated_chain_outcome(&request.authority, outcome)
+            }
             WalletProviderOperationV2::ListApprovals { include_resolved } => {
                 self.approval_requests(principal_id, *include_resolved)
             }

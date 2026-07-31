@@ -4,7 +4,9 @@ use elastos_runtime::invoke;
 use serde_json::{json, Value};
 
 use super::{error, ok, InspectSource};
-use crate::provider_resource::{build_capability_resource, provider_operation_action};
+use crate::provider_resource::{
+    build_capability_resource, ensure_generic_wallet_capability, provider_operation_action,
+};
 
 fn preview_execution_policy() -> Value {
     json!({
@@ -29,20 +31,28 @@ pub(super) async fn plan(source: &Arc<dyn InspectSource>, request: &Value) -> Va
     if let Some(scheme) = request.get("scheme").and_then(Value::as_str) {
         let body = request.get("request").cloned().unwrap_or_else(|| json!({}));
         return match build_capability_resource(scheme, operation, &body) {
-            Ok(resource) => ok(json!({
-                "schema": "elastos.inspect.gate-preview/v1",
-                "mode": "provider_resource",
-                "provider": scheme,
-                "operation": operation,
-                "capabilities": [{
-                    "resource": resource,
-                    "actions": provider_operation_action(scheme, operation)
-                        .map(|action| vec![action.to_string()])
-                        .unwrap_or_default(),
-                }],
-                "execution": preview_execution_policy(),
-                "dispatch": false,
-            })),
+            Ok(resource) => {
+                let action = provider_operation_action(scheme, operation);
+                if let Some(action) = action {
+                    if let Err(message) = ensure_generic_wallet_capability(&resource, action) {
+                        return error("invalid_request", &message);
+                    }
+                }
+                ok(json!({
+                    "schema": "elastos.inspect.gate-preview/v1",
+                    "mode": "provider_resource",
+                    "provider": scheme,
+                    "operation": operation,
+                    "capabilities": [{
+                        "resource": resource,
+                        "actions": action
+                            .map(|action| vec![action.to_string()])
+                            .unwrap_or_default(),
+                    }],
+                    "execution": preview_execution_policy(),
+                    "dispatch": false,
+                }))
+            }
             Err(message) => error("invalid_request", &message),
         };
     }

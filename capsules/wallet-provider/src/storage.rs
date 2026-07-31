@@ -51,7 +51,10 @@ pub(super) fn reject_pre_v2_pending_approvals(store: &mut WalletStore, now: u64)
         if matches!(
             request.status,
             ApprovalStatus::Pending | ApprovalStatus::Approved
-        ) && (request.session_id.is_empty() || request.launch_id.is_empty())
+        ) && (request.session_id.is_empty()
+            || request.launch_id.is_empty()
+            || request.wallet_request_sha256.is_empty()
+            || request.authority_binding.is_empty())
         {
             request.status = ApprovalStatus::Rejected;
             request.resolved_at = Some(now);

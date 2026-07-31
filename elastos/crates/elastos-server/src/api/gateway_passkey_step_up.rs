@@ -155,6 +155,13 @@ struct ConsumedPasskeyStepUp {
     consumed_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::api) struct PasskeyStepUpEffectIdentity {
+    pub(in crate::api) step_up_id: String,
+    pub(in crate::api) request_sha256: String,
+    pub(in crate::api) recovered: bool,
+}
+
 struct IssuedPasskeyStepUp {
     token: String,
     step_up_id: String,
@@ -382,6 +389,46 @@ pub(in crate::api) fn consume_passkey_step_up_token(
     operation: &str,
     request: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    consume_passkey_step_up_for_effect(
+        data_dir,
+        token,
+        launch,
+        max_age_secs,
+        operation,
+        request,
+        false,
+    )
+    .map(|_| ())
+}
+
+pub(in crate::api) fn consume_or_recover_passkey_step_up_effect(
+    data_dir: &Path,
+    token: &str,
+    launch: &RequiredHomeLaunchToken,
+    max_age_secs: u64,
+    operation: &str,
+    request: &serde_json::Value,
+) -> anyhow::Result<PasskeyStepUpEffectIdentity> {
+    consume_passkey_step_up_for_effect(
+        data_dir,
+        token,
+        launch,
+        max_age_secs,
+        operation,
+        request,
+        true,
+    )
+}
+
+fn consume_passkey_step_up_for_effect(
+    data_dir: &Path,
+    token: &str,
+    launch: &RequiredHomeLaunchToken,
+    max_age_secs: u64,
+    operation: &str,
+    request: &serde_json::Value,
+    allow_exact_recovery: bool,
+) -> anyhow::Result<PasskeyStepUpEffectIdentity> {
     let operation = validate_step_up_operation(operation)?;
     let request_sha256 = canonical_request_sha256(request)?;
     let token = token.trim();
@@ -442,8 +489,30 @@ pub(in crate::api) fn consume_passkey_step_up_token(
     };
     marker.validate()?;
     let _state_guard = step_up_state_guard()?;
-    prepare_consumed_capacity(data_dir, now)?;
     let path = consumed_path(data_dir, &marker.step_up_id)?;
+    if path.is_file() {
+        let existing: ConsumedPasskeyStepUp =
+            read_strict_json(&path, "passkey step-up consumed state")?;
+        existing.validate()?;
+        if allow_exact_recovery
+            && existing.token_sha256 == marker.token_sha256
+            && existing.step_up_id == marker.step_up_id
+            && existing.original_launch_id == marker.original_launch_id
+            && existing.principal_id == marker.principal_id
+            && existing.session_id == marker.session_id
+            && existing.operation == marker.operation
+            && existing.request_sha256 == marker.request_sha256
+            && existing.expires_at == marker.expires_at
+        {
+            return Ok(PasskeyStepUpEffectIdentity {
+                step_up_id: existing.step_up_id,
+                request_sha256: existing.request_sha256,
+                recovered: true,
+            });
+        }
+        anyhow::bail!("passkey step-up token has already been used");
+    }
+    prepare_consumed_capacity(data_dir, now)?;
     persist_new_json(
         &path,
         &marker,
@@ -459,6 +528,11 @@ pub(in crate::api) fn consume_passkey_step_up_token(
         } else {
             err
         }
+    })?;
+    Ok(PasskeyStepUpEffectIdentity {
+        step_up_id: marker.step_up_id,
+        request_sha256: marker.request_sha256,
+        recovered: false,
     })
 }
 
@@ -1704,6 +1778,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(replay.to_string().contains("already been used"));
+    }
+
+    #[test]
+    fn transaction_effect_recovery_accepts_only_the_identical_consumed_step_up() {
+        let fixture = fixture();
+        let request = serde_json::json!({ "request_id": "inspect-action-1" });
+        let token = issue_passkey_step_up_token_for_test(
+            fixture.data_dir.path(),
+            &fixture.app_token,
+            INBOX_CAPSULE_ID,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap();
+
+        let consumed = consume_or_recover_passkey_step_up_effect(
+            fixture.data_dir.path(),
+            &token,
+            &fixture.launch,
+            180,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap();
+        assert!(!consumed.recovered);
+        let recovered = consume_or_recover_passkey_step_up_effect(
+            fixture.data_dir.path(),
+            &token,
+            &fixture.launch,
+            180,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap();
+        assert!(recovered.recovered);
+        assert_eq!(recovered.step_up_id, consumed.step_up_id);
+        assert_eq!(recovered.request_sha256, consumed.request_sha256);
+
+        let changed = consume_or_recover_passkey_step_up_effect(
+            fixture.data_dir.path(),
+            &token,
+            &fixture.launch,
+            180,
+            "inspect.approve",
+            &serde_json::json!({ "request_id": "inspect-action-2" }),
+        )
+        .unwrap_err();
+        assert!(changed.to_string().contains("intent mismatch"));
+        let ordinary_replay = consume_passkey_step_up_token(
+            fixture.data_dir.path(),
+            &token,
+            &fixture.launch,
+            180,
+            "inspect.approve",
+            &request,
+        )
+        .unwrap_err();
+        assert!(ordinary_replay.to_string().contains("already been used"));
     }
 
     #[test]

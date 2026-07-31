@@ -14,6 +14,59 @@ pub(super) struct ConnectorHandoffCompletion<'a> {
 }
 
 impl WalletProvider {
+    pub(super) fn idempotent_transaction_effect_replay(
+        &self,
+        wallet_request: &WalletProviderRequestV2,
+    ) -> Option<Response> {
+        match &wallet_request.operation {
+            WalletProviderOperationV2::RequestApproval { .. } => {
+                let existing = self
+                    .store
+                    .approval_requests
+                    .iter()
+                    .find(|request| request.request_id == wallet_request.request_id)?;
+                let authority_binding = wallet_authority_binding(&wallet_request.authority);
+                if existing.principal_id != wallet_request.authority.principal_id
+                    || existing.wallet_request_sha256 != wallet_request.request_sha256
+                    || existing.authority_binding != authority_binding
+                {
+                    return Some(Response::error(
+                        "approval_identity_conflict",
+                        "Wallet approval identity was reused with substituted semantics or authority",
+                    ));
+                }
+                Some(Response::ok(json!({
+                    "approval_request": existing,
+                    "requires_approval": existing.status == ApprovalStatus::Pending,
+                    "signature": Value::Null,
+                })))
+            }
+            WalletProviderOperationV2::AttachValidatedChainOutcome { outcome } => {
+                let existing = self
+                    .store
+                    .approval_requests
+                    .iter()
+                    .find(|request| request.request_id == outcome.approval_request_id)?;
+                if let Err(err) =
+                    validate_chain_outcome_target(existing, &wallet_request.authority, outcome)
+                {
+                    return Some(Response::error("chain_outcome_conflict", err));
+                }
+                existing.validated_chain_outcome.as_ref().map(|stored| {
+                    if stored != outcome {
+                        Response::error(
+                            "chain_outcome_conflict",
+                            "validated Chain outcome substitution was rejected",
+                        )
+                    } else {
+                        Response::ok(json!({ "approval_request": existing }))
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn request_approval(&mut self, input: SignatureRequestInput) -> Response {
         if let Err(response) = self.ensure_initialized() {
             return response;
@@ -74,7 +127,9 @@ impl WalletProvider {
 
         let request = WalletApprovalRequest {
             schema: "elastos.wallet.approval_request/v1".to_string(),
-            request_id: format!("wallet-approval:{}", random_hex(16)),
+            request_id: input.request_id,
+            wallet_request_sha256: input.wallet_request_sha256,
+            authority_binding: input.authority_binding,
             kind: "signature".to_string(),
             status: ApprovalStatus::Pending,
             principal_id: input.principal_id,
@@ -101,6 +156,7 @@ impl WalletProvider {
             completed_at: None,
             signature_receipt: None,
             signed_result: None,
+            validated_chain_outcome: None,
         };
         self.store.approval_requests.push(request.clone());
         if let Err(err) = self.save() {
@@ -111,6 +167,44 @@ impl WalletProvider {
             "requires_approval": true,
             "signature": Value::Null,
         }))
+    }
+
+    pub(super) fn attach_validated_chain_outcome(
+        &mut self,
+        authority: &WalletAuthorityV2,
+        outcome: &ValidatedChainOutcomeV1,
+    ) -> Response {
+        if let Err(response) = self.ensure_initialized() {
+            return response;
+        }
+        let Some(request_index) = self
+            .store
+            .approval_requests
+            .iter()
+            .position(|request| request.request_id == outcome.approval_request_id)
+        else {
+            return Response::error("not_found", "wallet approval request not found");
+        };
+        let request = self.store.approval_requests[request_index].clone();
+        if let Err(err) = validate_chain_outcome_target(&request, authority, outcome) {
+            return Response::error("chain_outcome_conflict", err);
+        }
+        if let Some(stored) = request.validated_chain_outcome.as_ref() {
+            return if stored == outcome {
+                Response::ok(json!({ "approval_request": request }))
+            } else {
+                Response::error(
+                    "chain_outcome_conflict",
+                    "validated Chain outcome substitution was rejected",
+                )
+            };
+        }
+        self.store.approval_requests[request_index].validated_chain_outcome = Some(outcome.clone());
+        let request = self.store.approval_requests[request_index].clone();
+        if let Err(err) = self.save() {
+            return Response::error("storage_error", err);
+        }
+        Response::ok(json!({ "approval_request": request }))
     }
 
     pub(super) fn approval_requests(
@@ -633,4 +727,176 @@ impl WalletProvider {
         }
         Response::ok(response)
     }
+}
+
+fn validate_chain_outcome_target(
+    request: &WalletApprovalRequest,
+    authority: &WalletAuthorityV2,
+    outcome: &ValidatedChainOutcomeV1,
+) -> Result<(), String> {
+    if request.principal_id != authority.principal_id
+        || request.authority_binding != wallet_authority_binding(authority)
+    {
+        return Err("validated Chain outcome authority does not match the approval".to_string());
+    }
+    if request.request_id != outcome.approval_request_id
+        || request.account_id != outcome.account_id
+        || request.chain_namespace != outcome.chain_namespace
+    {
+        return Err("validated Chain outcome approval binding mismatch".to_string());
+    }
+    if request.status != ApprovalStatus::Completed || request.intent != "transaction_intent" {
+        return Err(
+            "validated Chain outcome requires a completed transaction approval".to_string(),
+        );
+    }
+    let signed_result = request
+        .signed_result
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| "completed approval is missing its signed transaction result".to_string())?;
+    if signed_result
+        .get("transaction_hash")
+        .and_then(Value::as_str)
+        != Some(outcome.transaction_hash.as_str())
+    {
+        return Err("validated Chain outcome transaction hash mismatch".to_string());
+    }
+    if request
+        .payload
+        .get("network")
+        .and_then(|network| network.get("id"))
+        .and_then(Value::as_str)
+        != Some(outcome.network.as_str())
+    {
+        return Err("validated Chain outcome network mismatch".to_string());
+    }
+    match &outcome.binding {
+        ValidatedChainOutcomeBindingV1::ManagedSigned {
+            signed_transaction_sha256,
+        } => {
+            if !is_managed_proof_type(&request.proof_type)
+                || request.connector_id.is_some()
+                || signed_result.get("schema").and_then(Value::as_str)
+                    != Some("elastos.wallet.signed-transaction-result/v1")
+            {
+                return Err(
+                    "validated managed Chain outcome requires a managed signed result".to_string(),
+                );
+            }
+            let signed_transaction = signed_result
+                .get("signed_transaction")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "completed approval is missing its signed transaction".to_string()
+                })?;
+            if canonical_signed_transaction_sha256(signed_transaction)?
+                != *signed_transaction_sha256
+            {
+                return Err(
+                    "validated Chain outcome signed transaction digest mismatch".to_string()
+                );
+            }
+        }
+        ValidatedChainOutcomeBindingV1::ExternalConnector {
+            connector_id,
+            originating_address,
+        } => {
+            if request.connector_id.as_deref() != Some(connector_id.as_str())
+                || !request.address.eq_ignore_ascii_case(originating_address)
+                || signed_result.get("schema").and_then(Value::as_str)
+                    != Some("elastos.wallet.external-transaction-result/v1")
+                || signed_result.get("signed_transaction").is_some()
+            {
+                return Err(
+                    "validated external Chain outcome connector binding mismatch".to_string(),
+                );
+            }
+        }
+    }
+    if signed_result.get("request_id").and_then(Value::as_str) != Some(request.request_id.as_str())
+        || signed_result.get("method").and_then(Value::as_str) != Some("eth_sendTransaction")
+        || signed_result.get("chain_namespace").and_then(Value::as_str)
+            != Some(request.chain_namespace.as_str())
+        || !signed_result
+            .get("signer")
+            .and_then(Value::as_str)
+            .is_some_and(|signer| signer.eq_ignore_ascii_case(&request.address))
+        || signed_result.get("payload_hash").and_then(Value::as_str)
+            != Some(request.payload_hash.as_str())
+    {
+        return Err("validated Chain outcome signed result binding mismatch".to_string());
+    }
+    validate_chain_observation_binding(outcome)
+}
+
+fn canonical_signed_transaction_sha256(signed_transaction: &str) -> Result<String, String> {
+    let encoded = signed_transaction
+        .strip_prefix("0x")
+        .ok_or_else(|| "signed transaction must be 0x-prefixed".to_string())?;
+    let bytes =
+        hex::decode(encoded).map_err(|_| "signed transaction must be hexadecimal".to_string())?;
+    if bytes.is_empty() {
+        return Err("signed transaction must not be empty".to_string());
+    }
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(sha2::Sha256::digest(bytes))
+    ))
+}
+
+fn validate_chain_observation_binding(outcome: &ValidatedChainOutcomeV1) -> Result<(), String> {
+    let observation = outcome
+        .chain_observation
+        .as_object()
+        .ok_or_else(|| "validated Chain observation must be an object".to_string())?;
+    if observation.get("network").and_then(Value::as_str) != Some(outcome.network.as_str()) {
+        return Err("validated Chain observation network mismatch".to_string());
+    }
+    let outer_hash = observation
+        .get("transaction_hash")
+        .or_else(|| observation.get("hash"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "validated Chain observation is missing its transaction hash".to_string())?;
+    if outer_hash != outcome.transaction_hash {
+        return Err("validated Chain observation transaction hash mismatch".to_string());
+    }
+    if let Some(nested_hash) = observation
+        .get("receipt")
+        .and_then(|receipt| receipt.get("transactionHash"))
+        .and_then(Value::as_str)
+    {
+        if nested_hash != outcome.transaction_hash {
+            return Err("validated Chain receipt payload hash mismatch".to_string());
+        }
+    }
+    if let Some(nested_hash) = observation
+        .get("transaction")
+        .and_then(|transaction| transaction.get("hash"))
+        .and_then(Value::as_str)
+    {
+        if nested_hash != outcome.transaction_hash {
+            return Err("validated Chain transaction payload hash mismatch".to_string());
+        }
+    }
+    if let ValidatedChainOutcomeBindingV1::ExternalConnector {
+        originating_address,
+        ..
+    } = &outcome.binding
+    {
+        let observed_from = observation
+            .get("transaction")
+            .and_then(Value::as_object)
+            .and_then(|transaction| transaction.get("from"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "validated external Chain observation is missing originating account".to_string()
+            })?;
+        if !observed_from.eq_ignore_ascii_case(originating_address) {
+            return Err(
+                "validated external Chain observation originating account mismatch".to_string(),
+            );
+        }
+    }
+    Ok(())
 }

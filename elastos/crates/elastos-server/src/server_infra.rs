@@ -1447,7 +1447,7 @@ mod tests {
     async fn wallet_provider_v2_startup_reaps_identity_or_version_mismatch() {
         for status in [
             wallet_provider_status("wallet-provider", "2.0"),
-            wallet_provider_status("wallet-provider", "2.2"),
+            wallet_provider_status("wallet-provider", "2.1"),
             wallet_provider_status("wallet-provider", "1.0"),
             wallet_provider_status("other-provider", WALLET_PROTOCOL_VERSION),
         ] {

@@ -2,7 +2,6 @@ use super::gateway_browser::{
     browser_close_reconciled_receipt, browser_provider_resource_call, provider_response_data,
     provider_response_error_message,
 };
-use super::BROWSER_CAPSULE_ID;
 use serde_json::json;
 
 #[test]
@@ -75,17 +74,15 @@ fn test_browser_close_reconciliation_rejects_unrelated_engine_errors() {
 }
 
 #[test]
-fn test_browser_provider_resource_call_separates_carrier_call_from_effect_resource() {
-    let call = browser_provider_resource_call(
+fn test_browser_provider_resource_call_rejects_generic_wallet_signing() {
+    let error = browser_provider_resource_call(
         "wallet",
         "request_signature",
         "elastos://wallet/eip155:20/sign/transaction_intent".to_string(),
         json!({
-            "principal_id": "person:local:alice",
             "account_id": "wallet:eip155:20:0x1111111111111111111111111111111111111111",
             "chain_namespace": "eip155:20",
             "intent": "transaction_intent",
-            "capsule_id": BROWSER_CAPSULE_ID,
             "resource": "elastos://chain/esc-mainnet/broadcast_transaction",
             "reason": "Browser page requests eth_sendTransaction on esc-mainnet",
             "payload": {
@@ -93,18 +90,13 @@ fn test_browser_provider_resource_call_separates_carrier_call_from_effect_resour
             }
         }),
     )
-    .expect("wallet signing provider call should be carrier-shaped");
+    .err()
+    .expect("Browser signing must use the private typed Wallet adapter");
 
-    assert_eq!(call.scheme, "wallet");
-    assert_eq!(
-        call.resource,
-        "elastos://wallet/eip155:20/sign/transaction_intent"
-    );
-    assert_eq!(call.request["op"], "request_signature");
-    assert_eq!(
-        call.request["resource"],
-        "elastos://chain/esc-mainnet/broadcast_transaction"
-    );
+    assert_eq!(error.0, axum::http::StatusCode::BAD_REQUEST);
+    assert!(error
+        .1
+        .contains("Unsupported wallet provider operation: request_signature"));
 }
 
 #[test]

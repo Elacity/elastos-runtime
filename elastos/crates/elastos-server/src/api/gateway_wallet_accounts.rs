@@ -34,6 +34,26 @@ pub(in crate::api::gateway) async fn runtime_wallet_data(
     }
 }
 
+pub(in crate::api::gateway) async fn runtime_wallet_data_with_request_id(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    request_id: String,
+    operation: elastos_wallet_contract::WalletProviderOperationV2,
+) -> anyhow::Result<serde_json::Value> {
+    let registry = state
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("wallet provider unavailable"))?;
+    match RuntimeWalletAdapter::new(registry, authority)
+        .invoke_with_request_id(request_id, operation)
+        .await?
+        .result
+    {
+        elastos_wallet_contract::WalletResultV2::Ok { data } => Ok(data),
+        elastos_wallet_contract::WalletResultV2::Error { message, .. } => anyhow::bail!(message),
+    }
+}
+
 fn wallet_accounts_summary_from_response(
     response: anyhow::Result<serde_json::Value>,
 ) -> SystemWalletAccountsSummary {

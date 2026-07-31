@@ -134,6 +134,10 @@ pub(super) enum ApprovalStatus {
 pub(super) struct WalletApprovalRequest {
     pub(super) schema: String,
     pub(super) request_id: String,
+    #[serde(default)]
+    pub(super) wallet_request_sha256: String,
+    #[serde(default)]
+    pub(super) authority_binding: String,
     pub(super) kind: String,
     pub(super) status: ApprovalStatus,
     pub(super) principal_id: String,
@@ -172,6 +176,8 @@ pub(super) struct WalletApprovalRequest {
     pub(super) signature_receipt: Option<WalletSignatureReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) signed_result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) validated_chain_outcome: Option<ValidatedChainOutcomeV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

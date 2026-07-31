@@ -250,6 +250,35 @@ impl Provider for MockChainProvider {
             })),
             Some("transaction") => {
                 let hash = required_test_str(request, "hash")?;
+                if hash
+                    == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "network": required_test_str(request, "network")?,
+                            "hash": hash,
+                            "transaction": null
+                        }
+                    }));
+                }
+                let observed_hash = if hash
+                    == "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                {
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                } else {
+                    hash
+                };
+                let observed_from = match hash {
+                    "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    | "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" => {
+                        "0x3333333333333333333333333333333333333333"
+                    }
+                    "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" => {
+                        "0x4444444444444444444444444444444444444444"
+                    }
+                    _ => "0x1111111111111111111111111111111111111111",
+                };
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -259,8 +288,8 @@ impl Provider for MockChainProvider {
                             .unwrap_or("esc-mainnet"),
                         "hash": hash,
                         "transaction": {
-                            "hash": hash,
-                            "from": "0x1111111111111111111111111111111111111111",
+                            "hash": observed_hash,
+                            "from": observed_from,
                             "to": "0x2222222222222222222222222222222222222222",
                             "value": "0x1",
                             "blockNumber": "0x2a"
@@ -270,6 +299,18 @@ impl Provider for MockChainProvider {
             }
             Some("receipt") => {
                 let hash = required_test_str(request, "hash")?;
+                if hash
+                    == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "network": required_test_str(request, "network")?,
+                            "hash": hash,
+                            "receipt": null
+                        }
+                    }));
+                }
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -321,6 +362,14 @@ impl Provider for MockChainProvider {
                 let signed_transaction = required_test_str(request, "signed_transaction")?;
                 let mut counts = mock_chain_broadcast_counts().lock().unwrap();
                 *counts.entry(signed_transaction.to_string()).or_insert(0) += 1;
+                if matches!(
+                    signed_transaction,
+                    "0xfeedface0001" | "0xfeedface0002"
+                ) {
+                    return Err(ProviderError::Provider(
+                        "simulated uncertain Chain broadcast transport".to_string(),
+                    ));
+                }
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -2902,6 +2951,9 @@ impl Provider for MockWalletProvider {
                     expires_at,
                 } => json!({
                     "op": "request_signature",
+                    "request_id": wallet_request.request_id,
+                    "wallet_request_sha256": wallet_request.request_sha256,
+                    "authority_binding": wallet_request.session_binding,
                     "principal_id": wallet_request.authority.principal_id,
                     "session_id": wallet_request.authority.session_id,
                     "launch_id": wallet_request.authority.launch_id,
@@ -2913,6 +2965,14 @@ impl Provider for MockWalletProvider {
                     "reason": reason,
                     "payload": payload,
                     "expires_at": expires_at,
+                }),
+                WalletProviderOperationV2::AttachValidatedChainOutcome { outcome } => json!({
+                    "op": "attach_validated_chain_outcome",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "session_id": wallet_request.authority.session_id,
+                    "launch_id": wallet_request.authority.launch_id,
+                    "capsule_id": wallet_request.authority.actor,
+                    "outcome": outcome,
                 }),
                 WalletProviderOperationV2::ListApprovals { include_resolved } => json!({
                     "op": "approval_requests",
@@ -3240,6 +3300,7 @@ impl RecordingWalletProvider {
                     | WalletOperationKind::ApproveAndSignManaged
                     | WalletOperationKind::ApproveConnectorHandoff
                     | WalletOperationKind::CompleteConnectorHandoff
+                    | WalletOperationKind::AttachValidatedChainOutcome
             ) {
                 continue;
             }
@@ -4048,9 +4109,30 @@ impl MockWalletProvider {
                 let payload_hash = format!("0x{}", hex::encode(Keccak256::digest(&payload_bytes)));
                 drop(accounts);
                 let mut approvals = self.approvals.lock().await;
-                let request_id = format!("wallet-approval:mock-{}", approvals.len() + 1);
+                let request_id = request
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("wallet-approval:mock-{}", approvals.len() + 1));
+                if let Some(existing) = approvals.iter().find(|approval| {
+                    approval.get("request_id").and_then(Value::as_str)
+                        == Some(request_id.as_str())
+                }) {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "approval_request": existing,
+                            "requires_approval": existing.get("status").and_then(Value::as_str) == Some("pending"),
+                            "signature": serde_json::Value::Null
+                        }
+                    }));
+                }
                 let approval = json!({
+                    "schema": "elastos.wallet.approval_request/v1",
                     "request_id": request_id,
+                    "wallet_request_sha256": request.get("wallet_request_sha256").cloned().unwrap_or(json!("legacy")),
+                    "authority_binding": request.get("authority_binding").cloned().unwrap_or(json!("legacy")),
+                    "kind": "signature",
                     "status": "pending",
                     "intent": intent,
                     "capsule_id": required_test_str(request, "capsule_id")?,
@@ -4060,6 +4142,7 @@ impl MockWalletProvider {
                     "account_id": account_id,
                     "chain_namespace": chain_namespace,
                     "address": account.get("address").cloned().unwrap_or(json!("0x0")),
+                    "proof_binding_id": account.get("proof_binding_id").cloned().unwrap_or(json!("proof:wallet:test")),
                     "proof_type": account.get("proof_type").cloned().unwrap_or(json!("siwe")),
                     "connector_id": account.get("connector_id").cloned().unwrap_or(json!(null)),
                     "payload_hash": payload_hash,
@@ -4156,10 +4239,11 @@ impl MockWalletProvider {
                     == Some("transaction_intent")
                 {
                     approval["signed_result"] = json!({
-                        "schema": "elastos.wallet.managed-transaction-result/v1",
+                        "schema": "elastos.wallet.signed-transaction-result/v1",
                         "request_id": request_id,
-                        "method": "eth_sendRawTransaction",
+                        "method": "eth_sendTransaction",
                         "signed_transaction": "0x1234",
+                        "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
                         "chain_namespace": approval.get("chain_namespace").cloned().unwrap_or(json!("eip155:20")),
                         "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
@@ -4347,10 +4431,11 @@ impl MockWalletProvider {
                     == Some("transaction_intent")
                 {
                     approval["signed_result"] = json!({
-                        "schema": "elastos.wallet.managed-transaction-result/v1",
+                        "schema": "elastos.wallet.signed-transaction-result/v1",
                         "request_id": request_id,
-                        "method": "eth_sendRawTransaction",
+                        "method": "eth_sendTransaction",
                         "signed_transaction": "0x1234",
+                        "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
                         "chain_namespace": approval.get("chain_namespace").cloned().unwrap_or(json!("eip155:20")),
                         "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
@@ -4374,17 +4459,16 @@ impl MockWalletProvider {
                     "data": data
                 }))
             }
-            Some("record_transaction_hash") => {
+            Some("attach_validated_chain_outcome") => {
                 let principal_id = required_test_str(request, "principal_id")?;
-                let request_id = required_test_str(request, "request_id")?;
-                let transaction_hash = required_test_str(request, "transaction_hash")?;
-                if request_id.contains("record-fails") {
-                    return Ok(json!({
-                        "status": "error",
-                        "code": "record_failed",
-                        "message": "simulated wallet transaction hash recording failure"
-                    }));
-                }
+                let outcome = request
+                    .get("outcome")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProviderError::Provider("missing validated Chain outcome".to_string())
+                })?;
+                let request_id = required_test_str(&outcome, "approval_request_id")?;
                 let mut approvals = self.approvals.lock().await;
                 let Some(approval) = approvals.iter_mut().find(|approval| {
                     approval
@@ -4400,11 +4484,24 @@ impl MockWalletProvider {
                         "message": "wallet approval request not found"
                     }));
                 };
+                if approval
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| reason.contains("record-fails"))
+                    && approval.get("projection_failed_once").is_none()
+                {
+                    approval["projection_failed_once"] = json!(true);
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "projection_failed",
+                        "message": "simulated Wallet Chain outcome projection failure"
+                    }));
+                }
                 if approval.get("status").and_then(|value| value.as_str()) != Some("completed") {
                     return Ok(json!({
                         "status": "error",
                         "code": "invalid_request",
-                        "message": "wallet transaction hash can only be recorded after completion"
+                        "message": "Wallet Chain outcome requires completed approval"
                     }));
                 }
                 if approval.get("intent").and_then(|value| value.as_str())
@@ -4416,13 +4513,17 @@ impl MockWalletProvider {
                         "message": "wallet approval request is not a transaction"
                     }));
                 }
-                let mut signed_result = approval
-                    .get("signed_result")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                signed_result["transaction_hash"] = json!(transaction_hash);
-                signed_result["broadcast_recorded_at"] = json!(crate::auth::now_ts());
-                approval["signed_result"] = signed_result;
+                if let Some(existing) = approval.get("validated_chain_outcome") {
+                    if existing != &outcome {
+                        return Ok(json!({
+                            "status": "error",
+                            "code": "chain_outcome_conflict",
+                            "message": "simulated Wallet Chain outcome substitution"
+                        }));
+                    }
+                } else {
+                    approval["validated_chain_outcome"] = outcome;
+                }
                 Ok(json!({
                     "status": "ok",
                     "data": { "approval_request": approval.clone() }

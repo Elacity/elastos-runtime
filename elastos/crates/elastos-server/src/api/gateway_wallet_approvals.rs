@@ -163,8 +163,7 @@ pub(in crate::api::gateway) async fn approve_wallet_managed_request(
 pub(in crate::api::gateway) struct WalletApprovalReviewOutcome {
     pub(in crate::api::gateway) message: String,
     pub(in crate::api::gateway) handoff: Option<serde_json::Value>,
-    pub(in crate::api::gateway) signed_result: Option<serde_json::Value>,
-    pub(in crate::api::gateway) signed_transaction: Option<String>,
+    pub(in crate::api::gateway) approval_request: Option<serde_json::Value>,
 }
 
 pub(in crate::api::gateway) async fn approve_managed_wallet_request(
@@ -204,16 +203,10 @@ pub(in crate::api::gateway) async fn approve_managed_wallet_request(
     Ok(WalletApprovalReviewOutcome {
         message: "Approved and signed by built-in wallet.".to_string(),
         handoff: None,
-        signed_result: signed.get("approval_request").and_then(|request| {
-            request
-                .get("signed_result")
-                .filter(|value| value.is_object())
-                .cloned()
-        }),
-        signed_transaction: signed
-            .get("signed_transaction")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string),
+        approval_request: signed
+            .get("approval_request")
+            .filter(|value| value.is_object())
+            .cloned(),
     })
 }
 
@@ -261,8 +254,7 @@ pub(in crate::api::gateway) async fn approve_external_wallet_request(
             wallet_connector_label(capsule_id)
         ),
         handoff,
-        signed_result: None,
-        signed_transaction: None,
+        approval_request: None,
     })
 }
 

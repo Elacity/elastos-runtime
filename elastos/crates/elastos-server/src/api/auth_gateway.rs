@@ -3042,13 +3042,6 @@ fn wallet_connector_id_for_wallet_link(app: &str) -> anyhow::Result<&str> {
     anyhow::bail!("wallet linking requires a dedicated wallet connector capsule")
 }
 
-pub(crate) async fn wallet_provider_data(
-    state: &GatewayState,
-    request: Value,
-) -> anyhow::Result<Value> {
-    provider_data(state, "wallet", request).await
-}
-
 async fn chain_provider_data(state: &GatewayState, request: Value) -> anyhow::Result<Value> {
     provider_data(state, "chain", request).await
 }
