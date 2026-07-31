@@ -697,11 +697,17 @@ fn pre_v2_migration_rejects_only_unresolved_history_and_writes_the_canonical_act
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_pre_v2_migration_save_leaves_provider_uninitialized() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let dir = tempfile::tempdir().unwrap();
     let store_path = write_pre_v2_pending_approval_store(dir.path());
-    fs::create_dir(store_path.with_extension("json.tmp")).unwrap();
+    let wallet_dir = store_path.parent().unwrap();
+    let mut permissions = fs::metadata(wallet_dir).unwrap().permissions();
+    permissions.set_mode(0o500);
+    fs::set_permissions(wallet_dir, permissions).unwrap();
 
     let mut provider = WalletProvider::new();
     let init = decode_and_handle_outer(
@@ -711,6 +717,9 @@ fn failed_pre_v2_migration_save_leaves_provider_uninitialized() {
             "config": { "base_path": dir.path().display().to_string() }
         }),
     );
+    let mut permissions = fs::metadata(wallet_dir).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(wallet_dir, permissions).unwrap();
     assert!(matches!(
         init,
         Response::Error { ref code, .. } if code == "storage_error"

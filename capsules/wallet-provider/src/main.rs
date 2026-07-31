@@ -22,7 +22,6 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
-use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -372,8 +371,8 @@ impl WalletProvider {
             .join("SystemServices")
             .join("Wallet");
         let store_path = wallet_dir.join("wallet-state.json");
-        if let Err(err) = fs::create_dir_all(&wallet_dir) {
-            return Response::error("storage_error", err.to_string());
+        if let Err(err) = create_wallet_dir_durable(&wallet_dir) {
+            return Response::error("storage_error", err);
         }
         let storage_key = match load_or_create_storage_key(&wallet_dir) {
             Ok(key) => key,

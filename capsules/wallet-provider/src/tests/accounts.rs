@@ -2,6 +2,7 @@ use super::support::*;
 use super::*;
 use elastos_wallet_contract::MANAGED_RECOVERY_SET_SCHEMA;
 use std::collections::BTreeSet;
+use std::fs;
 
 #[test]
 fn link_account_persists_and_lists_active_accounts() {
@@ -1311,12 +1312,8 @@ fn managed_recovery_set_save_failure_rolls_back_and_leaves_lifecycle_retryable()
         &context,
         WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set },
     );
-    let staging_path = target
-        .store_path
-        .as_ref()
-        .unwrap()
-        .with_extension("json.tmp");
-    std::fs::create_dir(&staging_path).unwrap();
+    let store_path = target.store_path.clone().unwrap();
+    target.store_path = Some(target_dir.path().join("missing").join("wallet-state.json"));
 
     assert!(matches!(
         invoke_wallet_request(&mut target, &request),
@@ -1330,7 +1327,7 @@ fn managed_recovery_set_save_failure_rolls_back_and_leaves_lifecycle_retryable()
         .iter()
         .any(|record| record.lifecycle_id == request.lifecycle_id));
 
-    std::fs::remove_dir(&staging_path).unwrap();
+    target.store_path = Some(store_path);
     assert!(matches!(
         invoke_wallet_request(&mut target, &request),
         Response::Ok { .. }
