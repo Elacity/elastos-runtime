@@ -75,6 +75,7 @@ impl WalletProvider {
         if let Err(err) = input.validate(now) {
             return Response::error("invalid_request", err);
         }
+        let previous_store = self.store.clone();
         self.store = prune_store(std::mem::take(&mut self.store), now);
         let account = match self.account_for_signature(&input) {
             Ok(account) => account,
@@ -160,6 +161,7 @@ impl WalletProvider {
         };
         self.store.approval_requests.push(request.clone());
         if let Err(err) = self.save() {
+            self.recover_store_after_save_failure(previous_store);
             return Response::error("storage_error", err);
         }
         Response::ok(json!({
@@ -633,6 +635,7 @@ impl WalletProvider {
         if let Err(err) = validate_opaque_id(request_id, "request_id") {
             return Response::error("invalid_request", err);
         }
+        let previous_store = self.store.clone();
         let now = now_ts();
         self.store = prune_store(std::mem::take(&mut self.store), now);
         let request = match self.store.approval_requests.iter_mut().find(|request| {
@@ -673,16 +676,9 @@ impl WalletProvider {
                 return Response::error("invalid_bitcoin_bip322_proof", err);
             }
         }
-        let Some(secret) = self.store.managed_wallets.iter().find(|secret| {
-            secret.principal_id == principal_id
-                && secret.account_id == request.account_id
-                && secret.revoked_at.is_none()
-        }) else {
-            return Response::error("not_found", "managed wallet key not found");
-        };
-        let signing_key = match self.decrypt_managed_key(secret) {
+        let signing_key = match self.managed_signing_key_for_account(account) {
             Ok(signing_key) => signing_key,
-            Err(err) => return Response::error("storage_error", err),
+            Err(err) => return Response::error("managed_key_unavailable", err),
         };
         let signed = match sign_managed_approval(&signing_key, &request) {
             Ok(signed) => signed,
@@ -710,6 +706,7 @@ impl WalletProvider {
         stored_request.signed_result = managed_signed_result(&stored_request.clone(), &signed);
         let stored_request = stored_request.clone();
         if let Err(err) = self.save() {
+            self.recover_store_after_save_failure(previous_store);
             return Response::error("storage_error", err);
         }
         let mut response = json!({

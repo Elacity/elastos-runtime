@@ -498,7 +498,7 @@ fn managed_atomic_signing_rolls_back_and_allows_safe_retry() {
     provider.store.managed_wallets[0].ciphertext = "00".into();
     assert!(matches!(
         invoke_wallet_request(&mut provider, &approve),
-        Response::Error { ref code, .. } if code == "storage_error"
+        Response::Error { ref code, .. } if code == "managed_key_unavailable"
     ));
     assert_eq!(
         provider.store.approval_requests[0].status,
@@ -518,6 +518,35 @@ fn managed_atomic_signing_rolls_back_and_allows_safe_retry() {
     assert_eq!(
         provider.store.approval_requests[0].status,
         ApprovalStatus::Completed
+    );
+}
+
+#[test]
+fn failed_save_recovery_adopts_persisted_truth_after_an_uncertain_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = init_provider(dir.path());
+    let previous_store = provider.store.clone();
+    assert!(matches!(
+        invoke_wallet(
+            &mut provider,
+            "person:local:persisted-truth",
+            "wallet",
+            WalletProviderOperationV2::CreateManagedAccount {
+                chain_namespace: "eip155:20".into(),
+                label: None,
+                create_new: false,
+            },
+        ),
+        Response::Ok { .. }
+    ));
+    let persisted_store = serde_json::to_value(&provider.store).unwrap();
+
+    provider.store = previous_store.clone();
+    provider.recover_store_after_save_failure(previous_store);
+
+    assert_eq!(
+        serde_json::to_value(&provider.store).unwrap(),
+        persisted_store
     );
 }
 

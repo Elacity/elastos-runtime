@@ -306,6 +306,25 @@ pub(super) fn transaction_intent_payload(from: &str) -> Value {
     })
 }
 
+pub(super) fn browser_personal_sign_payload(
+    account_id: &str,
+    address: &str,
+    message: &str,
+) -> Value {
+    json!({
+        "schema": "elastos.browser.wallet-signature-request/v1",
+        "method": "personal_sign",
+        "params": [message, address],
+        "message": message,
+        "address": address,
+        "account_id": account_id,
+        "chain_namespace": "eip155:20",
+        "page_url": "https://dapp.example/sign",
+        "origin": "https://dapp.example",
+        "requires_wallet_approval": true
+    })
+}
+
 pub(super) fn bitcoin_bip322_payload(address: &str, message: &str) -> Value {
     json!({
         "schema": "elastos.wallet.bitcoin_bip322_request/v1",

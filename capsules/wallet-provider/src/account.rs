@@ -62,15 +62,9 @@ impl WalletProvider {
                 (false, "external_connector_required")
             };
         }
-        let Some(secret) = self.store.managed_wallets.iter().find(|secret| {
-            secret.principal_id == account.principal_id
-                && secret.account_id == account.account_id
-                && secret.revoked_at.is_none()
-        }) else {
-            return (false, "managed_key_missing");
-        };
-        match self.decrypt_managed_key(secret) {
+        match self.managed_signing_key_for_account(account) {
             Ok(_) => (true, "managed_key_available"),
+            Err(err) if err == "managed wallet key not found" => (false, "managed_key_missing"),
             Err(_) => (false, "managed_key_unavailable"),
         }
     }
@@ -96,45 +90,72 @@ impl WalletProvider {
             Ok(scope) => scope,
             Err(err) => return Response::error("invalid_request", err),
         };
-        if !input.create_new {
-            if let Some(existing) = self.store.accounts.iter().find(|account| {
+        let reusable_signing_key = if input.create_new {
+            None
+        } else {
+            let mut exact_account = None;
+            let mut distinct_keys = Vec::<SigningKey>::new();
+            for account in self.store.accounts.iter().filter(|account| {
                 account.principal_id == input.principal_id
-                    && account.chain_namespace == input.chain_namespace
-                    && account.proof_type == proof_type
                     && account.revoked_at.is_none()
+                    && managed_key_scope(&account.chain_namespace)
+                        .map(|scope| scope == key_scope)
+                        .unwrap_or(false)
             }) {
-                let (signing_available, _) = self.account_signing_status(existing);
-                if signing_available {
-                    return Response::ok(json!({ "account": existing, "created": false }));
+                let Ok(signing_key) = self.managed_signing_key_for_account(account) else {
+                    continue;
+                };
+                if account.chain_namespace == input.chain_namespace
+                    && account.proof_type == proof_type
+                    && exact_account.is_none()
+                {
+                    exact_account = Some(account.clone());
+                }
+                let key_bytes = signing_key.to_bytes();
+                if distinct_keys
+                    .iter()
+                    .all(|existing| existing.to_bytes() != key_bytes)
+                {
+                    distinct_keys.push(signing_key);
                 }
             }
-        }
+            if distinct_keys.len() > 1 {
+                return Response::error(
+                    "managed_key_ambiguous",
+                    "multiple distinct active managed wallet keys are eligible for reuse; create_new is required",
+                );
+            }
+            if let Some(existing) = exact_account {
+                return Response::ok(json!({ "account": existing, "created": false }));
+            }
+            distinct_keys.pop()
+        };
 
+        let previous = self.store.clone();
         let now = now_ts();
-        let signing_key = if input.create_new {
-            SigningKey::random(&mut OsRng)
-        } else {
-            self.store
-                .managed_wallets
-                .iter()
-                .filter(|secret| {
-                    secret.principal_id == input.principal_id
-                        && secret.revoked_at.is_none()
-                        && managed_key_scope(&secret.chain_namespace)
-                            .map(|scope| scope == key_scope)
-                            .unwrap_or(false)
-                })
-                .find_map(|secret| self.decrypt_managed_key(secret).ok())
-                .unwrap_or_else(|| SigningKey::random(&mut OsRng))
+        let mut signing_key =
+            reusable_signing_key.unwrap_or_else(|| SigningKey::random(&mut OsRng));
+        let (address, new_account_id) = loop {
+            let address =
+                match managed_address_for_signing_key(&signing_key, &input.chain_namespace) {
+                    Ok(address) => address,
+                    Err(err) => return Response::error("invalid_request", err),
+                };
+            let new_account_id = account_id(&input.chain_namespace, &address);
+            let authority_exists =
+                self.store.accounts.iter().any(|account| {
+                    account.revoked_at.is_none() && account.account_id == new_account_id
+                }) || self.store.managed_wallets.iter().any(|secret| {
+                    secret.revoked_at.is_none() && secret.account_id == new_account_id
+                });
+            if !authority_exists {
+                break (address, new_account_id);
+            }
+            signing_key = SigningKey::random(&mut OsRng);
         };
-        let address = match managed_address_for_signing_key(&signing_key, &input.chain_namespace) {
-            Ok(address) => address,
-            Err(err) => return Response::error("invalid_request", err),
-        };
-        let account_id = account_id(&input.chain_namespace, &address);
         let private_key_bytes = signing_key.to_bytes();
         let secret = match self.encrypt_managed_key(
-            &account_id,
+            &new_account_id,
             &input.principal_id,
             &input.chain_namespace,
             &address,
@@ -145,7 +166,7 @@ impl WalletProvider {
             Err(err) => return Response::error("storage_error", err),
         };
         let account = LinkedAccount {
-            account_id: account_id.clone(),
+            account_id: new_account_id,
             principal_id: input.principal_id,
             proof_binding_id: format!("proof:wallet:managed:{}:{}", input.chain_namespace, address),
             chain_namespace: input.chain_namespace,
@@ -159,6 +180,7 @@ impl WalletProvider {
         self.store.managed_wallets.push(secret);
         self.store.accounts.push(account.clone());
         if let Err(err) = self.save() {
+            self.recover_store_after_save_failure(previous);
             return Response::error("storage_error", err);
         }
         Response::ok(json!({ "account": account, "created": true }))
@@ -512,14 +534,7 @@ impl WalletProvider {
                 "recovery key is available only for passkey-managed accounts",
             );
         }
-        let Some(secret) = self.store.managed_wallets.iter().find(|secret| {
-            secret.principal_id == principal_id
-                && secret.account_id == account_id
-                && secret.revoked_at.is_none()
-        }) else {
-            return Response::error("not_found", "managed wallet key not found");
-        };
-        let signing_key = match self.decrypt_managed_key(secret) {
+        let signing_key = match self.managed_signing_key_for_account(account) {
             Ok(signing_key) => signing_key,
             Err(err) => return Response::error("storage_error", err),
         };

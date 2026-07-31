@@ -8,7 +8,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{AeadCore, Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use elastos_auth::{
-    ethereum_signed_message_hash, normalize_evm_address, recover_evm_address,
+    ethereum_signed_message_hash, normalize_evm_address, recover_evm_address, validate_evm_address,
     verify_siwe_challenge, AuthChallengeInput, AuthChallengeV1, ProofBinding,
 };
 use elastos_wallet_contract::{
@@ -163,7 +163,7 @@ impl WalletProvider {
             });
         self.store = prune_store(std::mem::take(&mut self.store), now);
         if let Err(err) = self.save() {
-            self.store = snapshot;
+            self.recover_store_after_save_failure(snapshot);
             return WalletResultV2::Error {
                 code: "storage_error".to_string(),
                 message: err,
@@ -779,6 +779,75 @@ impl WalletProvider {
         SigningKey::from_slice(&private_key).map_err(|err| err.to_string())
     }
 
+    fn managed_signing_key_for_account(
+        &self,
+        account: &LinkedAccount,
+    ) -> Result<SigningKey, String> {
+        if account.revoked_at.is_some() {
+            return Err("managed wallet account is revoked".to_string());
+        }
+        if account.connector_id.is_some() {
+            return Err("managed wallet account cannot carry connector authority".to_string());
+        }
+        let expected_proof_type = managed_proof_type(&account.chain_namespace)?;
+        if account.proof_type != expected_proof_type {
+            return Err("managed wallet account proof type does not match its chain".to_string());
+        }
+        let canonical_address = |address: &str| -> Result<String, String> {
+            if expected_proof_type == MANAGED_EVM_PROOF_TYPE {
+                validate_evm_address(address)?;
+                Ok(normalize_evm_address(address))
+            } else {
+                Ok(address.to_string())
+            }
+        };
+        let account_address = canonical_address(&account.address)?;
+        let mut matching_secrets = self.store.managed_wallets.iter().filter(|secret| {
+            secret.revoked_at.is_none()
+                && secret.principal_id == account.principal_id
+                && secret.account_id == account.account_id
+        });
+        let secret = matching_secrets
+            .next()
+            .ok_or_else(|| "managed wallet key not found".to_string())?;
+        if matching_secrets.next().is_some() {
+            return Err("managed wallet account has multiple active signing keys".to_string());
+        }
+        if secret.schema != "elastos.wallet.managed_secret/v1"
+            || secret.principal_id != account.principal_id
+            || secret.account_id != account.account_id
+            || secret.chain_namespace != account.chain_namespace
+        {
+            return Err("managed wallet key metadata does not match its account".to_string());
+        }
+        let secret_address = canonical_address(&secret.address)?;
+        if secret_address != account_address {
+            return Err("managed wallet key address does not match its account".to_string());
+        }
+        let signing_key = self.decrypt_managed_key(secret)?;
+        let derived_address = canonical_address(&managed_address_for_signing_key(
+            &signing_key,
+            &account.chain_namespace,
+        )?)?;
+        if derived_address != account_address || derived_address != secret_address {
+            return Err("managed wallet key derives a different account address".to_string());
+        }
+        let expected_account_id = account_id(&account.chain_namespace, &derived_address);
+        if account.account_id != expected_account_id || secret.account_id != expected_account_id {
+            return Err("managed wallet account id does not match its key authority".to_string());
+        }
+        let expected_proof_binding_id = format!(
+            "proof:wallet:managed:{}:{}",
+            account.chain_namespace, derived_address
+        );
+        if account.proof_binding_id != expected_proof_binding_id {
+            return Err(
+                "managed wallet proof binding does not match its key authority".to_string(),
+            );
+        }
+        Ok(signing_key)
+    }
+
     fn managed_storage_key(&self, principal_id: &str) -> Result<[u8; 32], String> {
         let storage_key = self
             .storage_key
@@ -799,6 +868,14 @@ impl WalletProvider {
             return Err("wallet-provider is not initialized".to_string());
         };
         save_store(path, &self.store)
+    }
+
+    fn recover_store_after_save_failure(&mut self, previous_store: WalletStore) {
+        let persisted_store = self
+            .store_path
+            .as_deref()
+            .and_then(|path| load_store_if_present(path).ok().flatten());
+        self.store = persisted_store.unwrap_or(previous_store);
     }
 
     fn account_for_signature(
@@ -822,19 +899,16 @@ impl WalletProvider {
         if !is_managed_proof_type(&account.proof_type) {
             return Ok(());
         }
-        let Some(secret) = self.store.managed_wallets.iter().find(|secret| {
-            secret.principal_id == account.principal_id
-                && secret.account_id == account.account_id
-                && secret.revoked_at.is_none()
-        }) else {
-            return Err(Response::error(
-                "managed_key_missing",
-                "managed wallet key not found",
-            ));
-        };
-        self.decrypt_managed_key(secret)
+        self.managed_signing_key_for_account(account)
             .map(|_| ())
-            .map_err(|err| Response::error("managed_key_unavailable", err))
+            .map_err(|err| {
+                let code = if err == "managed wallet key not found" {
+                    "managed_key_missing"
+                } else {
+                    "managed_key_unavailable"
+                };
+                Response::error(code, err)
+            })
     }
 
     fn ensure_initialized(&self) -> Result<(), Response> {

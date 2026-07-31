@@ -194,6 +194,122 @@ fn create_managed_account_replaces_unavailable_idempotent_account() {
 }
 
 #[test]
+fn substituted_decryptable_managed_key_is_not_account_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = init_provider(dir.path());
+    let principal_id = "person:local:substituted-key";
+    let (account_id, address) = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: None,
+            create_new: false,
+        },
+    ) {
+        Response::Ok { data: Some(data) } => (
+            data["account"]["account_id"].as_str().unwrap().to_string(),
+            data["account"]["address"].as_str().unwrap().to_string(),
+        ),
+        other => panic!("expected managed account, got {other:?}"),
+    };
+    let account = provider.store.accounts[0].clone();
+    let replacement_key = SigningKey::from_slice(&[0x33; 32]).unwrap();
+    provider.store.managed_wallets[0] = provider
+        .encrypt_managed_key(
+            &account.account_id,
+            &account.principal_id,
+            &account.chain_namespace,
+            &account.address,
+            replacement_key.to_bytes().as_ref(),
+            now_ts(),
+        )
+        .unwrap();
+
+    assert!(provider.managed_signing_key_for_account(&account).is_err());
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["accounts"][0]["signing_available"], false);
+            assert_eq!(
+                data["accounts"][0]["signing_status"],
+                "managed_key_unavailable"
+            );
+        }
+        other => panic!("expected account status, got {other:?}"),
+    }
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "browser",
+        WalletProviderOperationV2::RequestApproval {
+            account_id: account_id.clone(),
+            chain_namespace: "eip155:20".into(),
+            intent: "browser_personal_sign".into(),
+            resource: "elastos://wallet/eip155:20/sign/browser_personal_sign".into(),
+            reason: "Browser page requests personal_sign".into(),
+            payload: browser_personal_sign_payload(&account_id, &address, "Substituted key"),
+            expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+        },
+    ) {
+        Response::Error { code, message } => {
+            assert_eq!(code, "managed_key_unavailable");
+            assert!(message.contains("different account address"));
+        }
+        other => panic!("expected substituted key rejection, got {other:?}"),
+    }
+    assert!(provider.store.approval_requests.is_empty());
+}
+
+#[test]
+fn managed_key_reuse_requires_one_bound_active_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = init_provider(dir.path());
+    let principal_id = "person:local:ambiguous-reuse";
+
+    for create_new in [false, true] {
+        assert!(matches!(
+            invoke_wallet(
+                &mut provider,
+                principal_id,
+                "wallet",
+                WalletProviderOperationV2::CreateManagedAccount {
+                    chain_namespace: "eip155:20".into(),
+                    label: None,
+                    create_new,
+                },
+            ),
+            Response::Ok { .. }
+        ));
+    }
+    let before = serde_json::to_value(&provider.store).unwrap();
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:8453".into(),
+            label: None,
+            create_new: false,
+        },
+    ) {
+        Response::Error { code, message } => {
+            assert_eq!(code, "managed_key_ambiguous");
+            assert!(message.contains("create_new is required"));
+        }
+        other => panic!("expected ambiguous key rejection, got {other:?}"),
+    }
+    assert_eq!(serde_json::to_value(&provider.store).unwrap(), before);
+}
+
+#[test]
 fn external_wallet_link_derives_connector_and_rejects_caller_override() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
