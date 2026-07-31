@@ -2,6 +2,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
@@ -13,7 +14,7 @@ const MAX_BROWSER_FILE_UPLOAD_BYTES = 16 * 1024 * 1024;
 const MAX_BROWSER_INPUT_BODY_BYTES =
   Math.ceil((MAX_BROWSER_FILE_UPLOAD_BYTES * 4) / 3) + 64 * 1024;
 const MAX_LAUNCH_RECONCILIATIONS = 128;
-const MAX_LAUNCH_RECONCILIATION_JOURNAL_BYTES = 256 * 1024;
+const MAX_LAUNCH_RECONCILIATION_JOURNAL_BYTES = 2 * 1024 * 1024;
 const LAUNCH_RECONCILIATION_JOURNAL_SCHEMA =
   "elastos.browser.vm-control-service.launch-reconciliations/v1";
 const LAUNCH_SETTLEMENT_DID_NOT_ACT = "did_not_act";
@@ -23,6 +24,25 @@ const CONTROL_SERVICE_IDENTITY_SCHEMA =
   "elastos.browser.vm-control-service.identity/v1";
 const HOST_PROCESS_BINDING_SCHEMA =
   "elastos.browser.host-process-binding/v1";
+const VZ_TRANSPORT_AUTHORITY_SCHEMA =
+  "elastos.browser.vz-transport-authority/v1";
+const VZ_TRANSPORT_SECRET_SCHEMA =
+  "elastos.browser.vz-transport-secret/v1";
+const TERMINAL_CLEANUP_EFFECT_KEYS = [
+  "page_absent",
+  "child_absent",
+  "vm_absent",
+  "route_absent",
+  "socket_absent",
+  "transport_session_absent",
+  "turn_process_absent",
+  "turn_listener_absent",
+  "turn_relay_ports_absent",
+  "ordinary_vsock_bridge_absent",
+  "media_vsock_bridge_absent",
+  "bootstrap_vsock_bridge_absent",
+  "hibernation_state_absent",
+];
 const ownedLauncherChildren = new Set();
 
 function fail(message) {
@@ -100,6 +120,340 @@ function safeId(value) {
   return typeof value === "string" && /^[A-Za-z0-9:_-]+$/.test(value);
 }
 
+function exactObjectKeys(value, keys) {
+  return (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.hasOwn(value, key))
+  );
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalJson(value[key])]),
+    );
+  }
+  return value;
+}
+
+function sha256Label(value) {
+  return `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
+}
+
+function sha256LabelIsSafe(value) {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function loopbackLiteral(value) {
+  if (typeof value !== "string" || net.isIP(value) === 0) return false;
+  if (net.isIPv4(value)) return value.startsWith("127.");
+  return value === "::1" || value === "0:0:0:0:0:0:0:1";
+}
+
+function validateVzTransportStream(stream, loopbackTarget) {
+  if (
+    !exactObjectKeys(stream, [
+      "schema",
+      "stream_id",
+      "target",
+      "runtime_socket_path",
+      "vsock_port",
+    ]) ||
+    stream.schema !== "elastos.browser.vz-transport-stream/v1" ||
+    !safeId(stream.stream_id) ||
+    stream.stream_id.length > 512 ||
+    typeof stream.runtime_socket_path !== "string" ||
+    !stream.runtime_socket_path.startsWith("/") ||
+    stream.runtime_socket_path.length > 103 ||
+    /[\r\n\0]/.test(stream.runtime_socket_path) ||
+    !Number.isInteger(stream.vsock_port) ||
+    stream.vsock_port < 1 ||
+    stream.vsock_port > 0xffffffff
+  ) {
+    throw new Error("invalid Browser VZ transport stream");
+  }
+  let target;
+  try {
+    target = new URL(stream.target);
+  } catch {
+    throw new Error("invalid Browser VZ transport target");
+  }
+  if (
+    !["tcp:", "tls:"].includes(target.protocol) ||
+    !target.port ||
+    target.username ||
+    target.password ||
+    !["", "/"].includes(target.pathname) ||
+    target.search ||
+    target.hash ||
+    (loopbackTarget && !loopbackLiteral(target.hostname))
+  ) {
+    throw new Error("invalid Browser VZ transport target");
+  }
+  return stream;
+}
+
+function validateVzTurnAuthority(turn, expiresAtUnixMs) {
+  if (
+    !exactObjectKeys(turn, [
+      "schema",
+      "guest_url",
+      "guest_host",
+      "guest_port",
+      "listen_host",
+      "listen_port",
+      "advertised_host",
+      "relay_host",
+      "relay_port_min",
+      "relay_port_max",
+      "protocols",
+      "username",
+      "credential_hash",
+      "auth_secret_hash",
+    ]) ||
+    turn.schema !== "elastos.browser.vz-turn-authority/v1" ||
+    !loopbackLiteral(turn.guest_host) ||
+    !loopbackLiteral(turn.listen_host) ||
+    !Number.isInteger(turn.guest_port) ||
+    turn.guest_port < 1 ||
+    turn.guest_port > 65535 ||
+    !Number.isInteger(turn.listen_port) ||
+    turn.listen_port < 1 ||
+    turn.listen_port > 65535 ||
+    typeof turn.advertised_host !== "string" ||
+    !turn.advertised_host ||
+    turn.advertised_host.length > 253 ||
+    /[\s\r\n\0/\\]/.test(turn.advertised_host) ||
+    typeof turn.relay_host !== "string" ||
+    net.isIP(turn.relay_host) === 0 ||
+    !Number.isInteger(turn.relay_port_min) ||
+    !Number.isInteger(turn.relay_port_max) ||
+    turn.relay_port_min < 1 ||
+    turn.relay_port_max > 65535 ||
+    turn.relay_port_min > turn.relay_port_max ||
+    turn.relay_port_max - turn.relay_port_min + 1 > 64 ||
+    !isDeepStrictEqual(turn.protocols, ["turn", "tcp"]) ||
+    turn.guest_url !==
+      `turn:${turn.guest_host}:${turn.guest_port}?transport=tcp` ||
+    typeof turn.username !== "string" ||
+    !/^[0-9]+:[A-Za-z0-9_-]+$/.test(turn.username) ||
+    Number(turn.username.split(":", 1)[0]) * 1000 !== expiresAtUnixMs ||
+    !sha256LabelIsSafe(turn.credential_hash) ||
+    !sha256LabelIsSafe(turn.auth_secret_hash)
+  ) {
+    throw new Error("invalid Browser VZ TURN authority");
+  }
+}
+
+function validateVzTransportAuthority(
+  authority,
+  { requireLive = false } = {},
+) {
+  if (
+    !exactObjectKeys(authority, [
+      "schema",
+      "binding_hash",
+      "generation",
+      "page_id",
+      "vm_id",
+      "principal_id",
+      "egress",
+      "media",
+      "turn",
+      "bootstrap_vsock_port",
+      "expires_at_unix_ms",
+    ]) ||
+    authority.schema !== VZ_TRANSPORT_AUTHORITY_SCHEMA ||
+    !sha256LabelIsSafe(authority.binding_hash) ||
+    !sha256LabelIsSafe(authority.generation) ||
+    !safeId(authority.page_id) ||
+    !safeId(authority.vm_id) ||
+    !safeId(authority.principal_id) ||
+    !Number.isInteger(authority.bootstrap_vsock_port) ||
+    authority.bootstrap_vsock_port < 1 ||
+    authority.bootstrap_vsock_port > 0xffffffff ||
+    !Number.isSafeInteger(authority.expires_at_unix_ms) ||
+    authority.expires_at_unix_ms < 1
+  ) {
+    throw new Error("invalid Browser VZ transport authority");
+  }
+  const egress = validateVzTransportStream(authority.egress, false);
+  const media = validateVzTransportStream(authority.media, true);
+  if (
+    egress.stream_id === media.stream_id ||
+    egress.runtime_socket_path === media.runtime_socket_path ||
+    egress.vsock_port === media.vsock_port ||
+    authority.bootstrap_vsock_port === egress.vsock_port ||
+    authority.bootstrap_vsock_port === media.vsock_port
+  ) {
+    throw new Error("Browser VZ transport bindings are not distinct");
+  }
+  const now = Date.now();
+  if (
+    authority.expires_at_unix_ms > now + 24 * 60 * 60 * 1000 ||
+    (requireLive && authority.expires_at_unix_ms <= now)
+  ) {
+    throw new Error("Browser VZ transport authority expiry is invalid");
+  }
+  validateVzTurnAuthority(authority.turn, authority.expires_at_unix_ms);
+  const unsigned = { ...authority };
+  delete unsigned.binding_hash;
+  const expected = sha256Label(
+    Buffer.from(JSON.stringify(canonicalJson(unsigned))),
+  );
+  if (
+    expected !== authority.binding_hash ||
+    Buffer.byteLength(JSON.stringify(authority)) > 32 * 1024
+  ) {
+    throw new Error("Browser VZ transport authority binding hash mismatch");
+  }
+  return authority;
+}
+
+function validateVzTransportSecret(authority, secret) {
+  validateVzTransportAuthority(authority, { requireLive: true });
+  if (
+    !exactObjectKeys(secret, [
+      "schema",
+      "binding_hash",
+      "credential",
+      "auth_secret",
+    ]) ||
+    secret.schema !== VZ_TRANSPORT_SECRET_SCHEMA ||
+    secret.binding_hash !== authority.binding_hash ||
+    typeof secret.credential !== "string" ||
+    !secret.credential ||
+    secret.credential.length > 512 ||
+    /[\r\n\0]/.test(secret.credential) ||
+    typeof secret.auth_secret !== "string" ||
+    !secret.auth_secret ||
+    secret.auth_secret.length > 512 ||
+    /[\r\n\0]/.test(secret.auth_secret) ||
+    sha256Label(Buffer.from(secret.credential)) !==
+      authority.turn.credential_hash ||
+    sha256Label(Buffer.from(secret.auth_secret)) !==
+      authority.turn.auth_secret_hash
+  ) {
+    throw new Error("invalid Browser VZ transport secret");
+  }
+  const expectedCredential = crypto
+    .createHmac("sha1", secret.auth_secret)
+    .update(authority.turn.username)
+    .digest("base64");
+  if (expectedCredential !== secret.credential) {
+    throw new Error("Browser VZ TURN credential mismatch");
+  }
+  return secret;
+}
+
+function valueContainsTransportSecret(value, secret = null) {
+  if (Array.isArray(value)) {
+    return value.some((entry) =>
+      valueContainsTransportSecret(entry, secret),
+    );
+  }
+  if (!value || typeof value !== "object") {
+    return (
+      typeof value === "string" &&
+      (value === secret?.credential || value === secret?.auth_secret)
+    );
+  }
+  return Object.entries(value).some(
+    ([key, entry]) =>
+      ["credential", "auth_secret", "transport_secret"].includes(key) ||
+      valueContainsTransportSecret(entry, secret),
+  );
+}
+
+function validateVzTransportEffectReceipt(receipt, authority) {
+  const effects = receipt?.effects;
+  const effectKeys = [
+    "vz_network_devices_zero",
+    "guest_bootstrap_validated",
+    "guest_loopback_only",
+    "guest_interfaces",
+    "guest_default_route_absent",
+    "guest_direct_network_absent",
+    "ordinary_stream_fixed_target",
+    "media_stream_fixed_target",
+    "turn_launch_owned",
+    "turn_listener_loopback",
+    "hibernation_disabled",
+  ];
+  if (
+    !exactObjectKeys(receipt, [
+      "schema",
+      "binding_hash",
+      "generation",
+      "page_id",
+      "vm_id",
+      "expires_at_unix_ms",
+      "terminal",
+      "effects",
+    ]) ||
+    receipt.schema !== "elastos.browser.vz-transport-effect-receipt/v1" ||
+    receipt.binding_hash !== authority.binding_hash ||
+    receipt.generation !== authority.generation ||
+    receipt.page_id !== authority.page_id ||
+    receipt.vm_id !== authority.vm_id ||
+    receipt.expires_at_unix_ms !== authority.expires_at_unix_ms ||
+    receipt.terminal !== true ||
+    !exactObjectKeys(effects, effectKeys) ||
+    !isDeepStrictEqual(effects.guest_interfaces, ["lo"]) ||
+    effectKeys
+      .filter((key) => key !== "guest_interfaces")
+      .some((key) => effects[key] !== true) ||
+    valueContainsTransportSecret(receipt)
+  ) {
+    throw new Error(
+      "launcher returned an invalid Browser VZ transport effect receipt",
+    );
+  }
+  return receipt;
+}
+
+function vzTransportLaunchBinding(launch) {
+  const fields = [
+    launch.page_id,
+    launch.vm_id,
+    launch.transport_authority,
+    launch.transport_secret,
+  ];
+  if (fields.every((value) => value === undefined)) return null;
+  if (fields.some((value) => value === undefined)) {
+    throw new Error("incomplete Browser VZ transport launch binding");
+  }
+  validateVzTransportSecret(
+    validateVzTransportAuthority(launch.transport_authority, {
+      requireLive: true,
+    }),
+    launch.transport_secret,
+  );
+  if (
+    !safeId(launch.page_id) ||
+    !safeId(launch.vm_id) ||
+    launch.page_id !== launch.transport_authority.page_id ||
+    launch.vm_id !== launch.transport_authority.vm_id ||
+    launch.lifecycle_generation !== launch.transport_authority.generation ||
+    launch.stream_id !== launch.transport_authority.egress.stream_id ||
+    (launch.principal_id || null) !==
+      launch.transport_authority.principal_id
+  ) {
+    throw new Error("Browser VZ transport launch binding changed");
+  }
+  return {
+    page_id: launch.page_id,
+    vm_id: launch.vm_id,
+    transport_authority: launch.transport_authority,
+  };
+}
+
 function controlServiceIdentityIsSafe(identity, controlSocketPath) {
   return (
     identity?.schema === CONTROL_SERVICE_IDENTITY_SCHEMA &&
@@ -146,6 +500,22 @@ function validateRuntimeCleanupBinding(binding, pageId) {
   ) {
     throw new Error("invalid Runtime Browser cleanup binding");
   }
+  if (binding.transport_authority !== undefined) {
+    validateVzTransportAuthority(binding.transport_authority);
+    validateVzTransportEffectReceipt(
+      binding.transport_receipt,
+      binding.transport_authority,
+    );
+    if (
+      binding.transport_authority.page_id !== binding.page_id ||
+      binding.transport_authority.generation !== binding.generation ||
+      binding.transport_authority.egress.stream_id !== binding.stream_id
+    ) {
+      throw new Error("invalid Runtime Browser VZ transport cleanup binding");
+    }
+  } else if (binding.transport_receipt !== undefined) {
+    throw new Error("unexpected Runtime Browser VZ transport cleanup receipt");
+  }
   validateAbsolutePath(binding.control_socket_path, "runtime_cleanup.control_socket_path");
   if (binding.shutdown_socket_path) {
     validateAbsolutePath(
@@ -163,7 +533,14 @@ function validateRuntimeCleanupBinding(binding, pageId) {
   return binding;
 }
 
-function exactCleanupEffects(binding, pageId, activePages, activeVms, childAbsent) {
+function exactCleanupEffects(
+  binding,
+  pageId,
+  activePages,
+  activeVms,
+  childAbsent,
+  transportEffects = {},
+) {
   const pageAbsent =
     !activePages.has(pageId) &&
     [...activeVms.values()].every((record) => !record.pages.has(pageId));
@@ -174,6 +551,56 @@ function exactCleanupEffects(binding, pageId, activePages, activeVms, childAbsen
     vm_absent: pageAbsent && childAbsent,
     route_absent: pageAbsent,
     socket_absent: socketAbsent,
+    ...transportEffects,
+  };
+}
+
+function tcpEndpointAbsent(host, port, timeoutMs = 500) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    const finish = (absent) => {
+      if (settled) return;
+      settled = true;
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(absent);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(false));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", (error) =>
+      finish(error?.code === "ECONNREFUSED"),
+    );
+  });
+}
+
+async function exactTransportCleanupEffects(binding, termination) {
+  const authority = binding.transport_authority;
+  if (!authority) return {};
+  validateVzTransportAuthority(authority);
+  validateVzTransportEffectReceipt(
+    binding.transport_receipt,
+    authority,
+  );
+  const sessionAbsent = !fs.existsSync(binding.isolation.session_dir);
+  const turnListenerAbsent = await tcpEndpointAbsent(
+    authority.turn.listen_host,
+    authority.turn.listen_port,
+  );
+  const gracefulOwnerExit = termination?.graceful === true;
+  const ownedEffectsAbsent = gracefulOwnerExit && sessionAbsent;
+  return {
+    transport_session_absent: sessionAbsent,
+    turn_process_absent: ownedEffectsAbsent,
+    turn_listener_absent: ownedEffectsAbsent && turnListenerAbsent,
+    turn_relay_ports_absent: ownedEffectsAbsent && turnListenerAbsent,
+    ordinary_vsock_bridge_absent: ownedEffectsAbsent,
+    media_vsock_bridge_absent: ownedEffectsAbsent,
+    bootstrap_vsock_bridge_absent: ownedEffectsAbsent,
+    hibernation_state_absent:
+      ownedEffectsAbsent &&
+      binding.transport_receipt.effects.hibernation_disabled === true,
   };
 }
 
@@ -186,7 +613,11 @@ function launchIdentityMatchesCleanupBinding(launch, binding) {
     binding.engine === launch.engine &&
     binding.display_mode === launch.display_mode &&
     binding.guarantee_level === launch.guarantee_level &&
-    (binding.principal_id || null) === (launch.principal_id || null)
+    (binding.principal_id || null) === (launch.principal_id || null) &&
+    isDeepStrictEqual(
+      binding.transport_authority,
+      launch.transport_authority,
+    )
   );
 }
 
@@ -212,6 +643,12 @@ function cleanupBindingForSupervisorResult(
     isolation: result.isolation,
     control_service: controlServiceIdentity,
     process: result.process,
+    ...(launch.transport_authority
+      ? {
+          transport_authority: launch.transport_authority,
+          transport_receipt: result.transport_receipt,
+        }
+      : {}),
   };
   validateRuntimeCleanupBinding(binding, result.page_id);
   return binding;
@@ -237,6 +674,35 @@ function terminalCleanupReceipt(binding, effects, fields = {}) {
   };
 }
 
+function durableTerminalCleanupReceiptIsSafe(receipt, launch, binding) {
+  if (launch?.transport_authority === undefined) {
+    return receipt === undefined;
+  }
+  try {
+    validateRuntimeCleanupBinding(binding, binding?.page_id);
+    validateVzTransportAuthority(launch.transport_authority);
+    validateVzTransportEffectReceipt(
+      binding.transport_receipt,
+      launch.transport_authority,
+    );
+  } catch {
+    return false;
+  }
+  return (
+    receipt?.schema ===
+      "elastos.browser.supervisor-cleanup-result/v2" &&
+    receipt.page_id === binding.page_id &&
+    receipt.generation === binding.generation &&
+    receipt.terminal === true &&
+    isDeepStrictEqual(receipt.binding, binding) &&
+    launchIdentityMatchesCleanupBinding(launch, binding) &&
+    TERMINAL_CLEANUP_EFFECT_KEYS.every(
+      (key) => receipt.effects?.[key] === true,
+    ) &&
+    !valueContainsTransportSecret(receipt)
+  );
+}
+
 function requireExactRuntimeCleanupRecord(
   config,
   controlServiceIdentity,
@@ -259,7 +725,21 @@ function requireExactRuntimeCleanupRecord(
     binding.shutdown_socket_path === config.control_socket_path &&
     isDeepStrictEqual(binding.control_service, controlServiceIdentity) &&
     JSON.stringify(binding.isolation) === JSON.stringify(page.isolation) &&
-    JSON.stringify(binding.process) === JSON.stringify(page.process);
+    JSON.stringify(binding.process) === JSON.stringify(page.process) &&
+    isDeepStrictEqual(
+      binding.transport_authority,
+      launch.transport_authority,
+    ) &&
+    isDeepStrictEqual(
+      page.transport_authority,
+      launch.transport_authority,
+    ) &&
+    isDeepStrictEqual(
+      binding.transport_receipt,
+      launch.transport_authority
+        ? page.transport_receipt
+        : undefined,
+    );
   if (!exact) {
     throw new Error(
       "Runtime Browser cleanup binding does not match the active VM effect",
@@ -510,6 +990,7 @@ function validateVmOpenRequest(body) {
   if (body.requirements?.network_mode !== "runtime_net_only" || body.requirements?.direct_network !== false) {
     throw new Error("Browser VM control service requires runtime_net_only VM requirements");
   }
+  vzTransportLaunchBinding(launch);
   return launch;
 }
 
@@ -518,7 +999,7 @@ function launchReconciliationKey(generation, streamId) {
 }
 
 function launchReconciliationIdentity(launch) {
-  return {
+  const identity = {
     adapter: launch.adapter,
     engine: launch.engine,
     lifecycle_generation: launch.lifecycle_generation,
@@ -527,6 +1008,12 @@ function launchReconciliationIdentity(launch) {
     display_mode: launch.display_mode,
     guarantee_level: launch.guarantee_level,
   };
+  if (launch.transport_authority) {
+    identity.page_id = launch.page_id;
+    identity.vm_id = launch.vm_id;
+    identity.transport_authority = launch.transport_authority;
+  }
+  return identity;
 }
 
 function launchReconciliationJournalPath(config) {
@@ -570,6 +1057,34 @@ function launchReconciliationRecordIsSafe(record) {
     (effects.vm_acquired !== null ||
       state === "cleanup_pending" ||
       state === "effect_acquired");
+  let transportIsSafe = false;
+  try {
+    if (launch?.transport_authority === undefined) {
+      transportIsSafe =
+        launch?.page_id === undefined && launch?.vm_id === undefined;
+    } else {
+      validateVzTransportAuthority(launch.transport_authority);
+      transportIsSafe =
+        launch.page_id === launch.transport_authority.page_id &&
+        launch.vm_id === launch.transport_authority.vm_id &&
+        launch.lifecycle_generation ===
+          launch.transport_authority.generation &&
+        launch.stream_id === launch.transport_authority.egress.stream_id &&
+        (launch.principal_id || null) ===
+          launch.transport_authority.principal_id &&
+        !valueContainsTransportSecret(record);
+    }
+  } catch {
+    transportIsSafe = false;
+  }
+  const terminalCleanupReceiptIsSafe =
+    state === "terminal_post_effect_cleanup"
+      ? durableTerminalCleanupReceiptIsSafe(
+          record.terminal_cleanup_receipt,
+          launch,
+          record.cleanup_binding,
+        )
+      : record.terminal_cleanup_receipt === undefined;
   return (
     record?.schema ===
       "elastos.browser.vm-control-service.launch-reconciliation/v1" &&
@@ -586,6 +1101,7 @@ function launchReconciliationRecordIsSafe(record) {
       (safeId(launch.principal_id) && launch.principal_id.length <= 512)) &&
     launch.display_mode === "webrtc_remote_display" &&
     launch.guarantee_level === "mechanism_microvm" &&
+    transportIsSafe &&
     (record.control_service === undefined ||
       controlServiceIdentityIsSafe(
         record.control_service,
@@ -600,7 +1116,8 @@ function launchReconciliationRecordIsSafe(record) {
       (effects.page_acquired === false && effects.vm_acquired === false)) &&
     (state !== "terminal_post_effect_cleanup" ||
       (typeof effects.page_acquired === "boolean" &&
-        typeof effects.vm_acquired === "boolean"))
+        typeof effects.vm_acquired === "boolean")) &&
+    terminalCleanupReceiptIsSafe
   );
 }
 
@@ -617,6 +1134,10 @@ function durableLaunchReconciliationRecord(record) {
   }
   if (record.control_service !== undefined) {
     durable.control_service = record.control_service;
+  }
+  if (record.terminal_cleanup_receipt !== undefined) {
+    durable.terminal_cleanup_receipt =
+      record.terminal_cleanup_receipt;
   }
   return durable;
 }
@@ -805,10 +1326,25 @@ function reconcileLaunch(launchReconciliationStore, activePages, body) {
       "Browser VM launch reconciliation requires safe lifecycle_generation and stream_id",
     );
   }
+  if (body.transport_authority !== undefined) {
+    validateVzTransportAuthority(body.transport_authority);
+    if (
+      body.transport_authority.generation !== body.lifecycle_generation ||
+      body.transport_authority.egress.stream_id !== body.stream_id
+    ) {
+      throw new Error(
+        "Browser VM launch reconciliation transport binding changed",
+      );
+    }
+  }
   const exactActivePages = [...activePages.values()].filter(
     (record) =>
       record?.launch?.lifecycle_generation === body.lifecycle_generation &&
-      record?.launch?.stream_id === body.stream_id,
+      record?.launch?.stream_id === body.stream_id &&
+      isDeepStrictEqual(
+        record?.launch?.transport_authority,
+        body.transport_authority,
+      ),
   );
   if (exactActivePages.length === 1) {
     const record = exactActivePages[0];
@@ -835,9 +1371,15 @@ function reconcileLaunch(launchReconciliationStore, activePages, body) {
       schema: "elastos.browser.vm-control-service.launch-reconciliation/v1",
       state: "cleanup_pending",
       responder_control_service: launchReconciliationStore.control_service,
+      ...(body.transport_authority
+        ? { transport_authority: body.transport_authority }
+        : {}),
       launch: {
         lifecycle_generation: body.lifecycle_generation,
         stream_id: body.stream_id,
+        ...(body.transport_authority
+          ? { transport_authority: body.transport_authority }
+          : {}),
       },
     };
   }
@@ -851,15 +1393,34 @@ function reconcileLaunch(launchReconciliationStore, activePages, body) {
       schema: "elastos.browser.vm-control-service.launch-reconciliation/v1",
       state: "indeterminate",
       responder_control_service: launchReconciliationStore.control_service,
+      ...(body.transport_authority
+        ? { transport_authority: body.transport_authority }
+        : {}),
       launch: {
         lifecycle_generation: body.lifecycle_generation,
         stream_id: body.stream_id,
+        ...(body.transport_authority
+          ? { transport_authority: body.transport_authority }
+          : {}),
       },
     };
+  }
+  if (
+    !isDeepStrictEqual(
+      record.launch?.transport_authority,
+      body.transport_authority,
+    )
+  ) {
+    throw new Error(
+      "Browser VM launch reconciliation authority does not match the durable record",
+    );
   }
   return {
     ...record,
     responder_control_service: launchReconciliationStore.control_service,
+    ...(record.launch?.transport_authority
+      ? { transport_authority: record.launch.transport_authority }
+      : {}),
   };
 }
 
@@ -868,6 +1429,7 @@ function markLaunchReconciliationTerminal(
   generation,
   streamId,
   effects,
+  terminalCleanupReceipt,
 ) {
   const launchReconciliations = launchReconciliationStore.records;
   const record = launchReconciliations.get(
@@ -880,6 +1442,9 @@ function markLaunchReconciliationTerminal(
       "terminal_post_effect_cleanup",
       {
         effects,
+        ...(terminalCleanupReceipt
+          ? { terminal_cleanup_receipt: terminalCleanupReceipt }
+          : {}),
       },
     );
   }
@@ -891,6 +1456,32 @@ function validateSupervisorResult(result, launch) {
   }
   if (!safeId(result.page_id)) {
     throw new Error("launcher returned unsafe page_id");
+  }
+  if (launch.transport_authority) {
+    validateVzTransportAuthority(result.transport_authority);
+    validateVzTransportEffectReceipt(
+      result.transport_receipt,
+      launch.transport_authority,
+    );
+    if (
+      result.page_id !== launch.page_id ||
+      result.vm_id !== launch.vm_id ||
+      !isDeepStrictEqual(
+        result.transport_authority,
+        launch.transport_authority,
+      ) ||
+      valueContainsTransportSecret(result, launch.transport_secret)
+    ) {
+      throw new Error(
+        "launcher returned a mismatched Browser VZ transport binding",
+      );
+    }
+  } else if (
+    result.vm_id !== undefined ||
+    result.transport_authority !== undefined ||
+    result.transport_receipt !== undefined
+  ) {
+    throw new Error("launcher returned unexpected Browser VZ transport state");
   }
   if (result.adapter !== launch.adapter || result.engine !== launch.engine || result.stream_id !== launch.stream_id) {
     throw new Error("launcher returned mismatched adapter, engine, or stream_id");
@@ -911,6 +1502,18 @@ function validateSupervisorResult(result, launch) {
   const expectedMediaTransport = "runtime_relay";
   if (result.display_session?.media_transport !== expectedMediaTransport) {
     throw new Error(`Browser VM display sessions must report media_transport=${expectedMediaTransport}`);
+  }
+  if (
+    launch.transport_authority &&
+    (
+      result.display_session?.ice_connection_policy !==
+        "engine_relay_only" ||
+      result.display_session?.ice_servers !== undefined
+    )
+  ) {
+    throw new Error(
+      "Browser VZ display must expose engine_relay_only without TURN credentials",
+    );
   }
   if (result.display_session?.audio !== true || result.display_session?.video !== true) {
     throw new Error("Browser VM product display sessions must advertise audio=true and video=true");
@@ -1434,6 +2037,9 @@ function streamAuthorityFromStreamId(streamId) {
 }
 
 function sameProfileVmKey(body, launch) {
+  if (launch.transport_authority) {
+    return null;
+  }
   const profileLease = launchProfileLeaseKey(body, launch);
   if (!profileLease) {
     return null;
@@ -1737,6 +2343,9 @@ function markVmPendingLaunchReconciliationsTerminal(
   const pending = vmRecord?.pending_reconciliations;
   if (!(pending instanceof Map)) return;
   for (const [key, launch] of pending) {
+    if (launch.transport_authority) {
+      continue;
+    }
     recordProvenLaunchFailure(
       launchReconciliationStore,
       launch,
@@ -1756,7 +2365,18 @@ async function settleDispatchedLaunchFailure(
   launcher,
   error,
   shutdownTimeoutMs,
+  transportLaunch = false,
 ) {
+  if (
+    transportLaunch &&
+    error?.launch_settlement !== LAUNCH_SETTLEMENT_DID_NOT_ACT
+  ) {
+    return launchSettlementError(
+      error,
+      LAUNCH_SETTLEMENT_PENDING,
+      error?.launch_cleanup_error || null,
+    );
+  }
   if (
     error?.launch_settlement === LAUNCH_SETTLEMENT_DID_NOT_ACT ||
     error?.launch_settlement === LAUNCH_SETTLEMENT_TERMINAL ||
@@ -1998,6 +2618,12 @@ async function openPage(
   };
   const processOwnershipId = newHostProcessOwnershipId();
   const serialized = JSON.stringify(request);
+  const launcherEnvironment = { ...process.env };
+  if (launch.transport_authority) {
+    delete launcherEnvironment[OPEN_REQUEST_ENV];
+  } else {
+    launcherEnvironment[OPEN_REQUEST_ENV] = serialized;
+  }
   const timeoutMs = Number(config.launch_timeout_ms ?? 120000);
   const startedAt = Date.now();
   const requestId = request.control_plane.request_id;
@@ -2036,10 +2662,7 @@ async function openPage(
       ? await runPersistentProgram(
           config.launcher_program,
           config.launcher_args || [],
-          {
-            ...process.env,
-            [OPEN_REQUEST_ENV]: serialized,
-          },
+          launcherEnvironment,
           `${serialized}\n`,
           timeoutMs,
           signal,
@@ -2047,10 +2670,7 @@ async function openPage(
       : await runProgram(
           config.launcher_program,
           config.launcher_args || [],
-          {
-            ...process.env,
-            [OPEN_REQUEST_ENV]: serialized,
-          },
+          launcherEnvironment,
           `${serialized}\n`,
           timeoutMs,
           signal,
@@ -2169,6 +2789,7 @@ async function openPage(
         launcher,
         error,
         Number(config.shutdown_timeout_ms ?? 30000),
+        Boolean(launch.transport_authority),
       );
       recordProvenLaunchFailure(
         launchReconciliations,
@@ -2277,6 +2898,10 @@ async function shutdownPage(
         "Browser VM cleanup remains indeterminate after service restart: exact owned launcher unavailable",
       );
     }
+    const transportEffects = await exactTransportCleanupEffects(
+      runtimeCleanup,
+      { graceful: true, terminal_record: true },
+    );
     return terminalCleanupReceipt(
       runtimeCleanup,
       {
@@ -2285,6 +2910,7 @@ async function shutdownPage(
         vm_absent: true,
         route_absent: true,
         socket_absent: true,
+        ...transportEffects,
       },
       { already_absent: true },
     );
@@ -2339,9 +2965,10 @@ async function shutdownPage(
   } catch (error) {
     cleanupErrors.push(error instanceof Error ? error.message : String(error));
   }
+  let launcherTermination = null;
   if (cleanupErrors.length === 0) {
     try {
-      await terminatePersistentLauncher(
+      launcherTermination = await terminatePersistentLauncher(
         ownedLauncherChild,
         Number(config.shutdown_timeout_ms ?? 30000),
       );
@@ -2351,6 +2978,14 @@ async function shutdownPage(
       ) {
         throw new Error(
           "Browser VM exact owned launcher did not produce an exit receipt",
+        );
+      }
+      if (
+        runtimeCleanup.transport_authority &&
+        launcherTermination?.graceful !== true
+      ) {
+        throw new Error(
+          "Browser VZ exact launcher did not produce a graceful terminal exit",
         );
       }
     } catch (error) {
@@ -2383,6 +3018,18 @@ async function shutdownPage(
       `Browser VM cleanup remains indeterminate: ${externallyUnresolved.join(", ")}`,
     );
   }
+  const transportEffects = await exactTransportCleanupEffects(
+    runtimeCleanup,
+    launcherTermination,
+  );
+  const unresolvedTransport = Object.entries(transportEffects)
+    .filter(([, value]) => value !== true)
+    .map(([key]) => key);
+  if (unresolvedTransport.length > 0) {
+    throw new Error(
+      `Browser VM cleanup remains indeterminate: ${unresolvedTransport.join(", ")}`,
+    );
+  }
 
   activePages.delete(pageId);
   if (vmRecord) {
@@ -2400,6 +3047,7 @@ async function shutdownPage(
       activePages,
       activeVms,
       true,
+      transportEffects,
     ),
     {
       forced_vm_retirement: Boolean(closeError),
@@ -2418,6 +3066,7 @@ async function shutdownPage(
       page_acquired: true,
       vm_acquired: true,
     },
+    runtimeCleanup.transport_authority ? receipt : undefined,
   );
   return receipt;
 }
@@ -2479,12 +3128,17 @@ async function proxyGuestPageWebrtc(config, activePages, activeVms, pageId, body
 function terminatePersistentLauncher(child, timeoutMs) {
   return new Promise((resolve, reject) => {
     if (!child || child.exitCode != null || child.signalCode != null) {
-      resolve();
+      resolve({
+        graceful: child?.exitCode === 0 && child?.signalCode == null,
+        already_exited: true,
+        forced: false,
+      });
       return;
     }
     let killTimer;
     let reapTimer;
     let settled = false;
+    let forced = false;
     const settle = (error = null) => {
       if (settled) return;
       settled = true;
@@ -2492,7 +3146,16 @@ function terminatePersistentLauncher(child, timeoutMs) {
       clearTimeout(reapTimer);
       child.removeListener("exit", exited);
       if (error) reject(error);
-      else resolve();
+      else {
+        resolve({
+          graceful:
+            !forced &&
+            child.exitCode === 0 &&
+            child.signalCode == null,
+          already_exited: false,
+          forced,
+        });
+      }
     };
     const exited = () => {
       settle();
@@ -2500,6 +3163,7 @@ function terminatePersistentLauncher(child, timeoutMs) {
     child.once("exit", exited);
     killTimer = setTimeout(() => {
       try {
+        forced = true;
         if (!child.kill("SIGKILL")) {
           settle(new Error("Browser VM launcher could not be killed"));
           return;

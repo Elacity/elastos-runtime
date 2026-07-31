@@ -45,6 +45,26 @@ export function normalizeIceCandidateForRuntime(candidate) {
   return normalized;
 }
 
+export function iceCandidateType(candidate) {
+  const line = String(candidate?.candidate || candidate || "")
+    .trim()
+    .replace(/^a=/, "");
+  const tokens = line.split(/\s+/);
+  const typeIndex = tokens.findIndex(
+    (token) => token.toLowerCase() === "typ",
+  );
+  return typeIndex >= 0 && typeIndex + 1 < tokens.length
+    ? tokens[typeIndex + 1].toLowerCase()
+    : "";
+}
+
+export function sdpHasOnlyRelayCandidates(sdp) {
+  return String(sdp || "")
+    .split(/\r?\n/)
+    .filter((line) => /^a=candidate:/i.test(line.trim()))
+    .every((line) => iceCandidateType(line) === "relay");
+}
+
 export function normalizeDisplayIceServers(value) {
   if (!Array.isArray(value)) {
     return [];

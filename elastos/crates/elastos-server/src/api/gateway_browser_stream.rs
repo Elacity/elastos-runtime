@@ -10,7 +10,7 @@ use std::os::unix::fs::FileTypeExt as _;
 #[cfg(unix)]
 use tokio::io::{copy, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpStream, UnixListener, UnixStream};
 
 const BROWSER_RUNTIME_STREAM_TMP_DIR: &str = "elastos-browser-streams";
 const BROWSER_ADAPTER_IPC_TMP_DIR: &str = "elastos-browser-adapter-ipc";
@@ -22,6 +22,11 @@ const BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS: u64 = 300;
 const BROWSER_RUNTIME_STREAM_STALE_SECS: u64 = BROWSER_RUNTIME_STREAM_ACCEPT_TIMEOUT_SECS * 2;
 const EXIT_STREAM_SESSION_SCHEMA: &str = "elastos.exit.stream-session/v1";
 const EXIT_REMOTE_CARRIER_SESSION_SCHEMA: &str = "elastos.exit.remote-carrier-session/v1";
+
+#[cfg(unix)]
+static BROWSER_VZ_FIXED_MEDIA_LISTENERS: OnceLock<
+    tokio::sync::Mutex<BTreeMap<PathBuf, watch::Sender<bool>>>,
+> = OnceLock::new();
 
 pub(in crate::api::gateway) async fn gateway_browser_net_http(
     registry: &ProviderRegistry,
@@ -278,6 +283,184 @@ pub(in crate::api::gateway) async fn browser_attach_runtime_stream_path(
         serde_json::json!(runtime_stream_path.to_string_lossy().to_string()),
     );
     Ok(receipt)
+}
+
+#[cfg(unix)]
+pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
+    authority: &serde_json::Value,
+) -> anyhow::Result<()> {
+    validate_live_browser_vz_transport_authority(authority).map_err(anyhow::Error::msg)?;
+    let socket_path = authority
+        .pointer("/media/runtime_socket_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Browser VZ media Runtime socket is missing"))?;
+    let target = authority
+        .pointer("/media/target")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Browser VZ media target is missing"))?;
+    let parsed = url::Url::parse(target)?;
+    let host = parsed
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .filter(IpAddr::is_loopback)
+        .ok_or_else(|| anyhow::anyhow!("Browser VZ media target must be loopback"))?;
+    let port = parsed
+        .port()
+        .ok_or_else(|| anyhow::anyhow!("Browser VZ media target port is missing"))?;
+    let target = std::net::SocketAddr::new(host, port);
+    let expires_at = authority
+        .get("expires_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("Browser VZ media expiry is missing"))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?
+        .as_millis() as u64;
+    let lifetime = Duration::from_millis(
+        expires_at
+            .checked_sub(now)
+            .ok_or_else(|| anyhow::anyhow!("Browser VZ media authority is expired"))?,
+    );
+    let socket_path = PathBuf::from(socket_path);
+    let listeners = BROWSER_VZ_FIXED_MEDIA_LISTENERS.get_or_init(Default::default);
+    let mut listeners = listeners.lock().await;
+    if listeners.contains_key(&socket_path) {
+        anyhow::bail!("Browser VZ media listener binding already exists");
+    }
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::symlink_metadata(&socket_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!(
+            "Browser VZ media Runtime socket path already exists: {}",
+            socket_path.display()
+        ),
+        Err(err) => return Err(err.into()),
+    }
+    let listener = UnixListener::bind(&socket_path)?;
+    std::fs::set_permissions(
+        &socket_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
+    let (cancel, mut cancelled) = watch::channel(false);
+    listeners.insert(socket_path.clone(), cancel);
+    drop(listeners);
+    tokio::spawn(async move {
+        let mut sessions = tokio::task::JoinSet::new();
+        let expiry = tokio::time::sleep(lifetime);
+        tokio::pin!(expiry);
+        loop {
+            tokio::select! {
+                _ = cancelled.changed() => break,
+                _ = &mut expiry => break,
+                accepted = listener.accept() => match accepted {
+                    Ok((mut guest, _)) => {
+                        sessions.spawn(async move {
+                            let mut turn = TcpStream::connect(target).await?;
+                            copy_bidirectional(&mut guest, &mut turn).await
+                        });
+                    }
+                    Err(_) => break,
+                },
+                result = sessions.join_next(), if !sessions.is_empty() => {
+                    if let Some(Ok(Err(err))) = result {
+                        tracing::warn!(
+                            target = %target,
+                            error = %err,
+                            "Browser VZ fixed media forwarding failed"
+                        );
+                    }
+                }
+            }
+        }
+        sessions.abort_all();
+        while sessions.join_next().await.is_some() {}
+        drop(listener);
+        let _ = std::fs::remove_file(&socket_path);
+        let listeners = BROWSER_VZ_FIXED_MEDIA_LISTENERS.get_or_init(Default::default);
+        listeners.lock().await.remove(&socket_path);
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
+    _authority: &serde_json::Value,
+) -> anyhow::Result<()> {
+    anyhow::bail!("Browser VZ media forwarding requires a Unix Runtime host")
+}
+
+pub(in crate::api::gateway) async fn close_browser_vz_fixed_media_listener(
+    authority: &serde_json::Value,
+) -> Result<(), String> {
+    validate_browser_vz_transport_authority(authority)?;
+    let socket_path = PathBuf::from(
+        authority
+            .pointer("/media/runtime_socket_path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Browser VZ media Runtime socket is missing".to_string())?,
+    );
+    #[cfg(unix)]
+    {
+        let listeners = BROWSER_VZ_FIXED_MEDIA_LISTENERS.get_or_init(Default::default);
+        let cancel = listeners.lock().await.get(&socket_path).cloned();
+        if let Some(cancel) = cancel {
+            cancel
+                .send(true)
+                .map_err(|_| "Browser VZ media listener owner disappeared".to_string())?;
+        } else if socket_path.exists() {
+            let metadata = std::fs::symlink_metadata(&socket_path)
+                .map_err(|err| format!("Browser VZ media socket metadata failed: {err}"))?;
+            if !metadata.file_type().is_socket() {
+                return Err(
+                    "Browser VZ media path exists without an exact Runtime socket".to_string(),
+                );
+            }
+            match UnixStream::connect(&socket_path).await {
+                Ok(stream) => {
+                    drop(stream);
+                    return Err(
+                        "Browser VZ media socket has a live owner outside this Runtime".to_string(),
+                    );
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    std::fs::remove_file(&socket_path).map_err(|err| {
+                        format!("Browser VZ stale media socket retirement failed: {err}")
+                    })?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "Browser VZ media socket ownership is indeterminate: {err}"
+                    ))
+                }
+            }
+        } else {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let registered = listeners.lock().await.contains_key(&socket_path);
+            if !registered && !socket_path.exists() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("Browser VZ media listener cleanup timed out".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket_path;
+        Err("Browser VZ media forwarding requires a Unix Runtime host".to_string())
+    }
 }
 
 #[derive(Debug, Clone)]

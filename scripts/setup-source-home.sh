@@ -162,6 +162,33 @@ find_turnserver() {
     return 1
 }
 
+find_vz_turn_program() {
+    if [[ -n "${ELASTOS_BROWSER_VM_TURN_PROGRAM:-}" ]]; then
+        if [[ ! -x "${ELASTOS_BROWSER_VM_TURN_PROGRAM}" ]]; then
+            echo "ELASTOS_BROWSER_VM_TURN_PROGRAM is not executable: ${ELASTOS_BROWSER_VM_TURN_PROGRAM}" >&2
+            return 2
+        fi
+        printf '%s\n' "${ELASTOS_BROWSER_VM_TURN_PROGRAM}"
+        return
+    fi
+    if command -v turnserver >/dev/null 2>&1; then
+        command -v turnserver
+        return
+    fi
+    local candidate
+    for candidate in \
+        /usr/bin/turnserver \
+        /usr/local/bin/turnserver \
+        /opt/homebrew/bin/turnserver
+    do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+    return 1
+}
+
 browser_vm_target_platform() {
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64) printf '%s\n' "linux-amd64" ;;
@@ -828,6 +855,7 @@ JSON
 refresh_browser_vm_rootfs_files() {
     local rootfs="${ELASTOS_BROWSER_VM_ROOTFS:-${DATA_DIR}/browser-vm/rootfs.ext4}"
     local control_source="${ROOT}/scripts/browser-selkies-control-service.mjs"
+    local vz_transport_bootstrap_source="${ROOT}/scripts/browser-vm-vz-transport-bootstrap.mjs"
 
     if [[ ! -f "$rootfs" ]]; then
         return
@@ -870,6 +898,9 @@ refresh_browser_vm_rootfs_files() {
     refresh_browser_vm_rootfs_file "$rootfs" "$control_source" \
         "/opt/elastos/bin/browser-selkies-control-service.mjs" "0100644" \
         "control-service" "$debugfs"
+    refresh_browser_vm_rootfs_file "$rootfs" "$vz_transport_bootstrap_source" \
+        "/opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs" "0100755" \
+        "vz-transport-bootstrap" "$debugfs"
     refresh_browser_vm_rootfs_file "$rootfs" "$init_source" \
         "/opt/elastos/bin/browser-vm-init" "0100755" \
         "vm-init" "$debugfs"
@@ -999,6 +1030,8 @@ install_browser_runtime_helpers() {
         "${DATA_DIR}/bin/browser-vm-control-service.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-remote-vz-launcher.mjs" \
         "${DATA_DIR}/bin/browser-vm-remote-vz-launcher.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-vz-transport-bootstrap.mjs" \
+        "${DATA_DIR}/scripts/browser-vm-vz-transport-bootstrap.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-local-crosvm-launcher.mjs" \
         "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-prepare-rootfs-pool.mjs" \
@@ -1072,6 +1105,17 @@ start_browser_runtime_turn() {
     fi
     if has_remote_browser_vm_control_config; then
         echo "[setup-source-home] skip Browser runtime TURN relay: remote Browser VM control is preserved"
+        return
+    fi
+    if [[ "$PLATFORM" == "darwin-arm64" ]]; then
+        local vz_turn_program
+        vz_turn_program="$(find_vz_turn_program || true)"
+        if [[ -z "$vz_turn_program" ]]; then
+            echo "turnserver was not found; install coturn or set ELASTOS_BROWSER_VM_TURN_PROGRAM for launch-owned VZ TURN." >&2
+            exit 1
+        fi
+        export ELASTOS_BROWSER_VM_TURN_PROGRAM="$vz_turn_program"
+        echo "[setup-source-home] configure launch-owned Browser VZ TURN"
         return
     fi
     if [[ -n "${ELASTOS_BROWSER_VM_ICE_SERVER:-}" || -n "${ELASTOS_BROWSER_VM_ICE_SERVERS_JSON:-}" ]]; then

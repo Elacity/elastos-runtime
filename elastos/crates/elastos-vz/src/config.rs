@@ -374,6 +374,11 @@ pub struct VmConfig {
     /// guest→runtime API access.
     pub network: Option<NetworkConfig>,
 
+    /// Attach no VZ network device. This is an explicit per-VM opt-in used by
+    /// the Browser VZ vsock transport; `false` preserves the existing NAT or
+    /// bridged behavior for every other VZ caller.
+    pub network_disabled: bool,
+
     /// Attach the VM kernel console to host stdio for interactive
     /// capsules. The Vz translation wires this through a
     /// `VZFileHandleSerialPortAttachment` over a `socketpair`.
@@ -451,6 +456,7 @@ impl VmConfig {
             data_disk_path: None,
             vsock_cid: 3,
             network: None,
+            network_disabled: false,
             interactive_stdio: false,
             carrier_socket_path: None,
             initramfs_path: None,

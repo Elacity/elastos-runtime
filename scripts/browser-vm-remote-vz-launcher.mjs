@@ -33,11 +33,17 @@ const vmMediaRelayEnvKeys = [
   "ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX",
 ];
 const vmIceEnvKeys = [...vmIceServerEnvKeys, ...vmMediaRelayEnvKeys];
+const vmLauncherEnvKeys = [
+  "ELASTOS_BROWSER_VM_TURN_PROGRAM",
+  "ELASTOS_BROWSER_VM_TURNSERVER_BIN",
+];
 const vmTurnEnvKeys = new Set(vmIceEnvKeys);
 
 const children = new Set();
 const localServers = new Set();
 const cleanupCommands = [];
+const localCleanupDirs = new Set();
+let cleanupStarted = false;
 
 function fail(message) {
   console.error(message);
@@ -272,6 +278,17 @@ function remoteRuntimeTurnEnv(remoteDataDir) {
   return env;
 }
 
+function remoteLaunchTurnProgramEnv() {
+  const program =
+    process.env.ELASTOS_BROWSER_REMOTE_VZ_TURN_PROGRAM ||
+    process.env.ELASTOS_BROWSER_VM_TURN_PROGRAM ||
+    "";
+  validateAbsolutePath(program, "remote Browser VZ TURN program");
+  return {
+    ELASTOS_BROWSER_VM_TURN_PROGRAM: program,
+  };
+}
+
 function readOpenRequest() {
   const stdin = fs.readFileSync(0, "utf8");
   const raw = stdin.trim() ? stdin : process.env[OPEN_REQUEST_ENV] || "";
@@ -341,15 +358,45 @@ function validateOpenRequest(request) {
   if (!stat.isSocket()) {
     throw new Error(`server Runtime stream path is not a Unix socket: ${launch.adapter_ipc.runtime_stream_path}`);
   }
+  const transportFields = [
+    launch.page_id,
+    launch.vm_id,
+    launch.transport_authority,
+    launch.transport_secret,
+  ];
+  if (!transportFields.every((value) => value === undefined)) {
+    if (
+      transportFields.some((value) => value === undefined) ||
+      !/^[A-Za-z0-9:_-]+$/.test(launch.page_id || "") ||
+      !/^[A-Za-z0-9:_-]+$/.test(launch.vm_id || "") ||
+      launch.transport_authority?.schema !==
+        "elastos.browser.vz-transport-authority/v1" ||
+      launch.transport_secret?.schema !==
+        "elastos.browser.vz-transport-secret/v1" ||
+      launch.transport_authority.page_id !== launch.page_id ||
+      launch.transport_authority.vm_id !== launch.vm_id ||
+      launch.transport_authority.generation !==
+        launch.lifecycle_generation ||
+      launch.transport_authority.egress?.stream_id !== launch.stream_id ||
+      launch.transport_authority.egress?.runtime_socket_path !==
+        launch.adapter_ipc.runtime_stream_path ||
+      launch.transport_secret.binding_hash !==
+        launch.transport_authority.binding_hash
+    ) {
+      throw new Error("remote VZ transport launch binding is invalid");
+    }
+  }
   return launch;
 }
 
 function cloneForRemote(request, remoteRelayPath, remoteDataDir) {
   const copy = JSON.parse(JSON.stringify(request));
-  copy.launch_request.adapter_ipc = {
-    ...copy.launch_request.adapter_ipc,
-    runtime_stream_path: remoteRelayPath,
-  };
+  if (!copy.launch_request.transport_authority) {
+    copy.launch_request.adapter_ipc = {
+      ...copy.launch_request.adapter_ipc,
+      runtime_stream_path: remoteRelayPath,
+    };
+  }
   const profile = copy.profile || copy.launch_request.profile;
   const remoteDiskPath = remoteProfileDiskPath(profile, remoteDataDir);
   if (copy.profile) {
@@ -393,6 +440,25 @@ function startTcpRemoteForward(localTcpPort, remoteTcpPort) {
   });
   child.stderr.on("data", (chunk) => {
     process.stderr.write(`[remote-vz tcp-forward] ${chunk}`);
+  });
+  return child;
+}
+
+function startTcpLocalForward(host, port) {
+  if (!["127.0.0.1", "::1"].includes(host)) {
+    throw new Error("remote VZ TURN local forward requires literal loopback");
+  }
+  const child = spawnTracked(sshBin, [
+    ...sshBaseArgs(),
+    "-N",
+    "-L",
+    `${host}:${port}:${host}:${port}`,
+    sshHost,
+  ], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  child.stderr.on("data", (chunk) => {
+    process.stderr.write(`[remote-vz turn-forward] ${chunk}`);
   });
   return child;
 }
@@ -632,11 +698,12 @@ function startRemoteUnixToTcpBridge(remoteUnixPath, remoteTcpPort, remotePidPath
     "}",
     "trap cleanup_bridge INT TERM HUP EXIT",
     "python3 -u - <<'PY' &",
-    "import os, socket, sys, threading",
+    "import os, pathlib, socket, sys, threading",
     "path = os.environ['ELASTOS_BRIDGE_UNIX']",
     "port = int(os.environ['ELASTOS_BRIDGE_PORT'])",
     "max_sessions = max(1, int(os.environ.get('ELASTOS_BRIDGE_MAX_SESSIONS', '32')))",
     "try:",
+    "    pathlib.Path(path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)",
     "    os.unlink(path)",
     "except FileNotFoundError:",
     "    pass",
@@ -789,17 +856,47 @@ function remoteSupervisorCleanupCommand(pidPath) {
     `pid_file=${shellQuote(pidPath)}`,
     'if [ -f "$pid_file" ]; then',
     '  pid=$(cat "$pid_file" 2>/dev/null || true)',
-    '  rm -f "$pid_file"',
     '  case "$pid" in',
-    "    ''|*[!0-9]*) ;;",
+    "    ''|*[!0-9]*) exit 71 ;;",
     '    *)',
     '      proc_command=$(ps -p "$pid" -o command= 2>/dev/null || true)',
     '      case "$proc_command" in',
-    '        *browser-vz-engine-supervisor*) kill "$pid" 2>/dev/null || true; sleep 1; kill -KILL "$pid" 2>/dev/null || true ;;',
+    '        *browser-vz-engine-supervisor*)',
+    '          kill "$pid" 2>/dev/null || true',
+    '          attempts=0',
+    '          while kill -0 "$pid" 2>/dev/null; do',
+    '            attempts=$((attempts + 1))',
+    '            [ "$attempts" -lt 300 ] || exit 73',
+    '            sleep 0.1',
+    '          done',
+    '          rm -f "$pid_file"',
+    '          ;;',
+    "        '') rm -f \"$pid_file\" ;;",
+    '        *) exit 72 ;;',
     '      esac',
     '      ;;',
     '  esac',
     'fi',
+  ].join("\n");
+}
+
+function remoteTransportAbsenceCommand(authority, sessionDir) {
+  validateAbsolutePath(sessionDir, "remote VZ transport session directory");
+  const turn = authority.turn;
+  return [
+    `session_dir=${shellQuote(sessionDir)}`,
+    `turn_port=${shellQuote(String(turn.listen_port))}`,
+    `relay_min=${shellQuote(String(turn.relay_port_min))}`,
+    `relay_max=${shellQuote(String(turn.relay_port_max))}`,
+    '[ ! -e "$session_dir" ] || exit 74',
+    'command -v lsof >/dev/null 2>&1 || exit 75',
+    'if lsof -nP -iTCP:"$turn_port" -sTCP:LISTEN 2>/dev/null | grep -q .; then exit 76; fi',
+    'port="$relay_min"',
+    'while [ "$port" -le "$relay_max" ]; do',
+    '  if lsof -nP -iTCP:"$port" 2>/dev/null | grep -q .; then exit 77; fi',
+    '  if lsof -nP -iUDP:"$port" 2>/dev/null | grep -q .; then exit 78; fi',
+    '  port=$((port + 1))',
+    'done',
   ].join("\n");
 }
 
@@ -945,15 +1042,24 @@ function startRemoteSupervisor(remoteRequest, remoteVmEnv, supervisorPidPath) {
     `export ELASTOS_BROWSER_VM_VSOCK_ATTEMPT_TIMEOUT_MS=${shellQuote(process.env.ELASTOS_BROWSER_VM_VSOCK_ATTEMPT_TIMEOUT_MS || "1000")}`,
     `export ELASTOS_BROWSER_VM_TRACE=${shellQuote(process.env.ELASTOS_BROWSER_VM_TRACE || "1")}`,
     `export ELASTOS_BROWSER_VM_TRACE_EGRESS=${shellQuote(process.env.ELASTOS_BROWSER_VM_TRACE_EGRESS || "0")}`,
-    ...optionalRemoteEnvExports(vmIceEnvKeys, remoteVmEnv),
+    ...optionalRemoteEnvExports(
+      [...vmIceEnvKeys, ...vmLauncherEnvKeys],
+      remoteVmEnv,
+    ),
     "supervisor_pid=",
     "cleanup_supervisor() {",
     "  status=$?",
     "  trap - INT TERM HUP EXIT",
     "  if [ -n \"${supervisor_pid:-}\" ]; then",
     "    kill \"$supervisor_pid\" 2>/dev/null || true",
-    "    sleep 1",
-    "    kill -KILL \"$supervisor_pid\" 2>/dev/null || true",
+    "    attempts=0",
+    "    while kill -0 \"$supervisor_pid\" 2>/dev/null; do",
+    "      attempts=$((attempts + 1))",
+    "      if [ \"$attempts\" -ge 300 ]; then",
+    "        exit 73",
+    "      fi",
+    "      sleep 0.1",
+    "    done",
     "    wait \"$supervisor_pid\" 2>/dev/null || true",
     "  fi",
     "  rm -f \"$PIDFILE\" \"$REQUEST_FILE\"",
@@ -1057,6 +1163,9 @@ function rewriteResult(result, launch, localSessionDir, localControlPath, remote
 }
 
 async function cleanupAndExit(signal) {
+  if (cleanupStarted) return;
+  cleanupStarted = true;
+  let cleanupOk = true;
   for (const { server, socketPath } of Array.from(localServers)) {
     try {
       server.close();
@@ -1067,24 +1176,43 @@ async function cleanupAndExit(signal) {
       } catch {}
     }
   }
+  for (const command of cleanupCommands.reverse()) {
+    try {
+      runSsh(command, { timeoutMs: 35_000 });
+    } catch (error) {
+      cleanupOk = false;
+      process.stderr.write(
+        `[remote-vz cleanup] exact remote cleanup failed: ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+    }
+  }
   for (const child of Array.from(children)) {
     try {
       child.kill("SIGTERM");
     } catch {}
   }
-  for (const command of cleanupCommands.reverse()) {
-    try {
-      runSsh(command, { timeoutMs: 5000 });
-    } catch {}
-  }
-  setTimeout(() => {
-    for (const child of Array.from(children)) {
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  for (const child of Array.from(children)) {
+    if (child.exitCode == null && child.signalCode == null) {
       try {
         child.kill("SIGKILL");
-      } catch {}
+      } catch {
+        cleanupOk = false;
+      }
     }
-    process.exit(signal ? 0 : 1);
-  }, 500).unref();
+  }
+  if (cleanupOk) {
+    for (const directory of localCleanupDirs) {
+      try {
+        fs.rmSync(directory, { recursive: true, force: true });
+      } catch {
+        cleanupOk = false;
+      }
+    }
+  }
+  process.exit(signal && cleanupOk ? 0 : 1);
 }
 
 async function main() {
@@ -1107,23 +1235,72 @@ async function main() {
   if (reapStaleRemoteRelaysEnabled()) {
     runSsh(remoteStaleRelayCleanupCommand(remoteRoot), { timeoutMs: 10000 });
   }
-  const remoteVmEnv = remoteRuntimeTurnEnv(remoteDataDir);
+  const transportAuthority = launch.transport_authority || null;
+  const remoteVmEnv = transportAuthority
+    ? remoteLaunchTurnProgramEnv()
+    : remoteRuntimeTurnEnv(remoteDataDir);
   const suffix = sessionSuffix(launch.stream_id);
   const localSessionDir = path.join(localRoot, suffix);
+  localCleanupDirs.add(localSessionDir);
   const localControlPath = path.join(localSessionDir, "control.sock");
-  const remoteRelayPath = path.join(remoteRelayRoot, `ebv-${suffix}.sock`);
+  const remoteRelayPath = transportAuthority
+    ? transportAuthority.egress.runtime_socket_path
+    : path.join(remoteRelayRoot, `ebv-${suffix}.sock`);
   const remoteRelayPidPath = path.join(remoteRoot, `relay-${suffix}.pid`);
+  const remoteMediaRelayPath =
+    transportAuthority?.media?.runtime_socket_path || "";
+  const remoteMediaRelayPidPath = path.join(
+    remoteRoot,
+    `media-relay-${suffix}.pid`,
+  );
   const remoteSupervisorPidPath = path.join(remoteRoot, `supervisor-${suffix}.pid`);
   validateUnixSocketPathBudget(localControlPath, "local control socket path");
   validateUnixSocketPathBudget(remoteRelayPath, "remote relay socket path");
 
   fs.mkdirSync(localSessionDir, { recursive: true, mode: 0o700 });
   await startRemoteRelayTunnel(launch.adapter_ipc.runtime_stream_path, remoteRelayPath, remoteRelayPidPath, suffix);
+  if (transportAuthority) {
+    validateAbsolutePath(
+      transportAuthority.media.runtime_socket_path,
+      "launch_request.transport_authority.media.runtime_socket_path",
+    );
+    const localMediaPath =
+      transportAuthority.media.runtime_socket_path;
+    const localMediaStat = fs.statSync(localMediaPath);
+    if (!localMediaStat.isSocket()) {
+      throw new Error(
+        "Runtime VZ media stream path is not an exact Unix socket",
+      );
+    }
+    await startRemoteRelayTunnel(
+      localMediaPath,
+      remoteMediaRelayPath,
+      remoteMediaRelayPidPath,
+      `${suffix}-media`,
+    );
+    startTcpLocalForward(
+      transportAuthority.turn.listen_host,
+      transportAuthority.turn.listen_port,
+    );
+  }
 
   const remoteRequest = cloneForRemote(request, remoteRelayPath, remoteDataDir);
   const remoteSupervisor = startRemoteSupervisor(remoteRequest, remoteVmEnv, remoteSupervisorPidPath);
   const remoteResult = await readFirstJsonLine(remoteSupervisor);
   const remoteControlPath = remoteResult.control_socket_path;
+  if (transportAuthority) {
+    const remoteSessionDir = remoteResult.isolation?.session_dir;
+    validateAbsolutePath(
+      remoteSessionDir,
+      "remote supervisor isolation.session_dir",
+    );
+    cleanupCommands.unshift(
+      remoteTransportAbsenceCommand(
+        transportAuthority,
+        remoteSessionDir,
+      ),
+    );
+  }
 
   await startControlTunnel(localControlPath, remoteControlPath);
 

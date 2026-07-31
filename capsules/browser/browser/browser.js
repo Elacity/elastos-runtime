@@ -27,7 +27,7 @@ import {
   isMissingRuntimePageError,
   requestedDisplayMode,
 } from "./browser-status.js?v=browser-20260725a";
-import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260727a";
+import { createBrowserRemoteDisplay } from "./browser-remote-display.js?v=browser-20260728a";
 
 const STATUS_TTL_MS = 4200;
 const PAGE_STATUS_INTERVAL_MS = 2_500;

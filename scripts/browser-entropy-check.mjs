@@ -1097,7 +1097,7 @@ assert(
     browserSourceHomeConfigSmoke.includes("runtime-turn-user") &&
     browserSourceHomeConfigSmoke.includes("guest-control status probe diagnostics") &&
     browserSourceHomeConfigSmoke.includes("open-error debug hold diagnostics") &&
-    browserSourceHomeConfigSmoke.includes("Mac source-home Browser config must load runtime TURN credentials") &&
+    browserSourceHomeConfigSmoke.includes("Local Mac source-home Browser config must use no-NIC VZ transport by default") &&
     browserSourceHomeConfig.includes('engine_mode: "vm"') &&
     browserSourceHomeConfig.includes("source-home-browser-exit") &&
     !browserSourceHomeConfig.includes("--engine-mode") &&
@@ -1780,7 +1780,8 @@ assert(
     ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260727a") &&
+    browser.includes("browser.js?v=browser-20260728a") &&
+    !browser.includes("browser.js?v=browser-20260727a") &&
     !browser.includes("browser.js?v=browser-20260726b") &&
     !browser.includes("browser.js?v=browser-20260726a") &&
     !browser.includes("browser.js?v=browser-20260725a") &&
@@ -1838,7 +1839,8 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260728a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260724a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260711h") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260629a") &&
@@ -1859,8 +1861,20 @@ assert(
     browserJs.includes("WEBRTC_ENGINE_CANDIDATE_POLL_ATTEMPTS") &&
     browserJs.includes("signalCandidate(null)") &&
     browserJs.includes('const iceTransportPolicy =') &&
-    browserJs.includes('displaySession.media_transport === "runtime_relay" ? "relay" : "all"') &&
+    browserJs.includes(
+      'displaySession.media_transport === "runtime_relay" && !engineRelayOnly',
+    ) &&
     browserJs.includes("iceTransportPolicy,") &&
+    browserRemoteDisplay.includes(
+      'displaySession.ice_connection_policy === "engine_relay_only"',
+    ) &&
+    browserRemoteDisplay.includes(
+      "displaySession.ice_servers !== undefined",
+    ) &&
+    browserRemoteDisplay.includes("sdpHasOnlyRelayCandidates") &&
+    browserRemoteDisplay.includes(
+      'iceCandidateType(normalized) !== "relay"',
+    ) &&
     browserJs.includes("The Browser Engine is running, but the secure display connection is not ready.") &&
     browserJs.includes(
       "Runtime must close this session before another Browser Engine or Exit Node can open.",

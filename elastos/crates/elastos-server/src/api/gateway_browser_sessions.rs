@@ -56,6 +56,8 @@ pub(in crate::api::gateway) struct BrowserLaunchReservation {
     id: String,
     cleanup_id: String,
     generation: String,
+    page_id: String,
+    vm_id: String,
     engine_route_provider: String,
     selected_engine_adapter: Option<String>,
 }
@@ -67,6 +69,14 @@ impl BrowserLaunchReservation {
 
     pub(in crate::api::gateway) fn cleanup_id(&self) -> &str {
         &self.cleanup_id
+    }
+
+    pub(in crate::api::gateway) fn page_id(&self) -> &str {
+        &self.page_id
+    }
+
+    pub(in crate::api::gateway) fn vm_id(&self) -> &str {
+        &self.vm_id
     }
 
     pub(in crate::api::gateway) fn engine_route_provider(&self) -> &str {
@@ -128,6 +138,8 @@ struct BrowserSessionRecord {
     owner_launch_id: String,
     cleanup_id: String,
     generation: String,
+    expected_page_id: String,
+    vm_id: String,
     page_id: Option<String>,
     engine_route_provider: String,
     selected_engine_adapter: Option<String>,
@@ -138,6 +150,7 @@ struct BrowserSessionRecord {
     provider_cleanup: Option<serde_json::Value>,
     browser_page: Option<serde_json::Value>,
     stream_cleanup: Option<BrowserStreamCleanup>,
+    transport_authority: Option<serde_json::Value>,
     state: BrowserSessionState,
     phase: BrowserLifecyclePhase,
     url: String,
@@ -236,6 +249,8 @@ pub(in crate::api::gateway) struct BrowserEngineCleanup {
     pub(in crate::api::gateway) engine_adapter: String,
     pub(in crate::api::gateway) engine: String,
     pub(in crate::api::gateway) stream_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) transport_authority: Option<serde_json::Value>,
     pub(in crate::api::gateway) provider_cleanup: serde_json::Value,
 }
 
@@ -262,6 +277,38 @@ pub(in crate::api::gateway) struct BrowserLaunchReconciliation {
     pub(in crate::api::gateway) stream_id: String,
     #[serde(default)]
     pub(in crate::api::gateway) stream_cleanup: Option<BrowserStreamCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api::gateway) transport_authority: Option<serde_json::Value>,
+    #[serde(
+        default = "browser_launch_dispatch_state_dispatched",
+        skip_serializing_if = "browser_launch_dispatch_state_is_dispatched"
+    )]
+    dispatch_state: BrowserLaunchDispatchState,
+}
+
+impl BrowserLaunchReconciliation {
+    pub(in crate::api::gateway) fn was_dispatched(&self) -> bool {
+        self.dispatch_state == BrowserLaunchDispatchState::Dispatched
+    }
+
+    pub(in crate::api::gateway) fn transport_authority(&self) -> Option<&serde_json::Value> {
+        self.transport_authority.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BrowserLaunchDispatchState {
+    Prepared,
+    Dispatched,
+}
+
+fn browser_launch_dispatch_state_dispatched() -> BrowserLaunchDispatchState {
+    BrowserLaunchDispatchState::Dispatched
+}
+
+fn browser_launch_dispatch_state_is_dispatched(state: &BrowserLaunchDispatchState) -> bool {
+    *state == BrowserLaunchDispatchState::Dispatched
 }
 
 #[derive(Debug, Clone)]
@@ -405,7 +452,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
         ));
     }
     let id = registry.next_reservation_id();
-    let generation = hash_label(&format!(
+    let generation = browser_launch_generation_hash_label(&format!(
         "{scope}\n{principal_id}\n{}\n{id}\n{}",
         lifecycle.owner_launch_id,
         SystemTime::now()
@@ -414,6 +461,14 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             .as_nanos()
     ));
     let cleanup_id = format!("browser-cleanup:{}", generation.replace(':', "-"));
+    let page_id = format!(
+        "page:vz-{}",
+        hex::encode(Sha256::digest(format!("{generation}\npage").as_bytes()))
+    );
+    let vm_id = format!(
+        "browser-vm-{}",
+        hex::encode(Sha256::digest(format!("{generation}\nvm").as_bytes()))
+    );
     let engine_route_provider = lifecycle.engine_route_provider.clone();
     let selected_engine_adapter = lifecycle.selected_engine_adapter.clone();
     let now = Instant::now();
@@ -426,6 +481,8 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             owner_launch_id: lifecycle.owner_launch_id,
             cleanup_id: cleanup_id.clone(),
             generation: generation.clone(),
+            expected_page_id: page_id.clone(),
+            vm_id: vm_id.clone(),
             page_id: None,
             engine_route_provider: lifecycle.engine_route_provider,
             selected_engine_adapter: lifecycle.selected_engine_adapter,
@@ -436,6 +493,7 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
             provider_cleanup: None,
             browser_page: None,
             stream_cleanup: None,
+            transport_authority: None,
             state: BrowserSessionState::Launching,
             phase: BrowserLifecyclePhase::AcquiringSlot,
             url: sanitize_browser_lifecycle_url(&lifecycle.url),
@@ -454,6 +512,8 @@ pub(in crate::api::gateway) async fn reserve_browser_launch(
         id,
         cleanup_id,
         generation,
+        page_id,
+        vm_id,
         engine_route_provider,
         selected_engine_adapter,
     })
@@ -610,6 +670,13 @@ pub(in crate::api::gateway) async fn complete_browser_launch(
             || record.scope != browser_session_scope(data_dir)
             || record.selected_engine_adapter != reservation.selected_engine_adapter
             || record
+                .transport_authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    effect.page_id != record.expected_page_id
+                        || effect.provider_cleanup.get("transport_authority") != Some(authority)
+                })
+            || record
                 .selected_engine_adapter
                 .as_deref()
                 .is_some_and(|selected| selected != effect.engine_adapter)
@@ -633,10 +700,26 @@ pub(in crate::api::gateway) async fn complete_browser_launch(
             .ok_or_else(|| "Browser provider cleanup binding is incomplete".to_string())?
     };
     write_browser_durable_ownership(data_dir, &ownership)?;
+    if reservation_transport_authority_is_bound(&registry, reservation) {
+        remove_browser_durable_file(
+            data_dir,
+            browser_launch_reconciliation_path(data_dir, &reservation.cleanup_id),
+        )?;
+    }
     Ok(BrowserCleanupHandle {
         schema: "elastos.browser.cleanup-handle/v1".to_string(),
         id: reservation.cleanup_id.clone(),
     })
+}
+
+fn reservation_transport_authority_is_bound(
+    registry: &BrowserSessionRegistry,
+    reservation: &BrowserLaunchReservation,
+) -> bool {
+    registry
+        .sessions
+        .get(&reservation.id)
+        .is_some_and(|record| record.transport_authority.is_some())
 }
 
 pub(in crate::api::gateway) async fn release_browser_launch(
@@ -644,6 +727,125 @@ pub(in crate::api::gateway) async fn release_browser_launch(
 ) {
     let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
     registry.lock().await.sessions.remove(&reservation.id);
+}
+
+pub(in crate::api::gateway) async fn browser_launch_transport_authority(
+    reservation: &BrowserLaunchReservation,
+) -> Option<serde_json::Value> {
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    registry
+        .lock()
+        .await
+        .sessions
+        .get(&reservation.id)
+        .and_then(|record| record.transport_authority.clone())
+}
+
+pub(in crate::api::gateway) async fn bind_browser_vz_transport_authority(
+    data_dir: &Path,
+    reservation: &BrowserLaunchReservation,
+    stream_id: &str,
+    stream_cleanup: Option<BrowserStreamCleanup>,
+    authority: serde_json::Value,
+) -> Result<(), String> {
+    validate_live_browser_vz_transport_authority(&authority)?;
+    let scope = browser_session_scope(data_dir);
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let mut registry = registry.lock().await;
+    let record = registry.sessions.get_mut(&reservation.id).ok_or_else(|| {
+        "Browser launch ownership disappeared before transport binding".to_string()
+    })?;
+    if record.scope != scope
+        || record.cleanup_id != reservation.cleanup_id
+        || record.generation != reservation.generation
+        || record.expected_page_id != reservation.page_id
+        || record.vm_id != reservation.vm_id
+        || authority
+            .get("generation")
+            .and_then(serde_json::Value::as_str)
+            != Some(record.generation.as_str())
+        || authority.get("page_id").and_then(serde_json::Value::as_str)
+            != Some(record.expected_page_id.as_str())
+        || authority.get("vm_id").and_then(serde_json::Value::as_str) != Some(record.vm_id.as_str())
+        || authority
+            .pointer("/egress/stream_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(stream_id)
+        || stream_cleanup.as_ref().is_some_and(|cleanup| {
+            cleanup.stream_id != stream_id || cleanup.principal_id != record.principal_id
+        })
+    {
+        return Err("Browser VZ transport ownership changed before binding".to_string());
+    }
+    record.transport_authority = Some(authority.clone());
+    record.stream_cleanup = stream_cleanup.clone();
+    let reconciliation = browser_launch_reconciliation_for_record(
+        record,
+        stream_id,
+        stream_cleanup,
+        BrowserLaunchDispatchState::Prepared,
+    );
+    if !browser_launch_reconciliation_is_safe(&reconciliation) {
+        record.transport_authority = None;
+        return Err("Browser VZ transport reconciliation binding is invalid".to_string());
+    }
+    if let Err(err) = write_browser_launch_reconciliation(data_dir, &reconciliation) {
+        record.transport_authority = None;
+        return Err(err);
+    }
+    Ok(())
+}
+
+pub(in crate::api::gateway) async fn mark_browser_vz_transport_dispatched(
+    data_dir: &Path,
+    reservation: &BrowserLaunchReservation,
+    stream_id: &str,
+) -> Result<(), String> {
+    let scope = browser_session_scope(data_dir);
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let registry = registry.lock().await;
+    let record = registry
+        .sessions
+        .get(&reservation.id)
+        .ok_or_else(|| "Browser launch ownership disappeared before dispatch".to_string())?;
+    if record.scope != scope
+        || record.cleanup_id != reservation.cleanup_id
+        || record.generation != reservation.generation
+        || record.transport_authority.is_none()
+        || record
+            .transport_authority
+            .as_ref()
+            .and_then(|authority| authority.pointer("/egress/stream_id"))
+            .and_then(serde_json::Value::as_str)
+            != Some(stream_id)
+    {
+        return Err("Browser VZ transport ownership changed before dispatch".to_string());
+    }
+    let reconciliation = browser_launch_reconciliation_for_record(
+        record,
+        stream_id,
+        record.stream_cleanup.clone(),
+        BrowserLaunchDispatchState::Dispatched,
+    );
+    write_browser_launch_reconciliation(data_dir, &reconciliation)
+}
+
+pub(in crate::api::gateway) async fn discard_browser_vz_transport_preparation(
+    data_dir: &Path,
+    reservation: &BrowserLaunchReservation,
+) -> Result<(), String> {
+    let registry = BROWSER_SESSION_REGISTRY.get_or_init(Default::default);
+    let registry = registry.lock().await;
+    let Some(record) = registry.sessions.get(&reservation.id) else {
+        return Ok(());
+    };
+    if record.transport_authority.is_none() {
+        return Ok(());
+    }
+    remove_browser_durable_file(
+        data_dir,
+        browser_launch_reconciliation_path(data_dir, &reservation.cleanup_id),
+    )
 }
 
 pub(in crate::api::gateway) async fn record_browser_launch_reconciliation_obligation(
@@ -669,17 +871,12 @@ pub(in crate::api::gateway) async fn record_browser_launch_reconciliation_obliga
     {
         return Err("Browser launch reconciliation ownership changed".to_string());
     }
-    let reconciliation = BrowserLaunchReconciliation {
-        schema: BROWSER_LAUNCH_RECONCILIATION_SCHEMA.to_string(),
-        cleanup_id: record.cleanup_id.clone(),
-        principal_id: record.principal_id.clone(),
-        owner_launch_id: record.owner_launch_id.clone(),
-        generation: record.generation.clone(),
-        engine_route_provider: record.engine_route_provider.clone(),
-        selected_engine_adapter: record.selected_engine_adapter.clone(),
-        stream_id: stream_id.to_string(),
+    let reconciliation = browser_launch_reconciliation_for_record(
+        record,
+        stream_id,
         stream_cleanup,
-    };
+        BrowserLaunchDispatchState::Dispatched,
+    );
     if !browser_launch_reconciliation_is_safe(&reconciliation) {
         return Err("Browser launch reconciliation binding is invalid".to_string());
     }
@@ -696,6 +893,27 @@ pub(in crate::api::gateway) async fn record_browser_launch_reconciliation_obliga
     drop(registry);
     super::notify_browser_lifecycle_reconciler(data_dir);
     Ok(())
+}
+
+fn browser_launch_reconciliation_for_record(
+    record: &BrowserSessionRecord,
+    stream_id: &str,
+    stream_cleanup: Option<BrowserStreamCleanup>,
+    dispatch_state: BrowserLaunchDispatchState,
+) -> BrowserLaunchReconciliation {
+    BrowserLaunchReconciliation {
+        schema: BROWSER_LAUNCH_RECONCILIATION_SCHEMA.to_string(),
+        cleanup_id: record.cleanup_id.clone(),
+        principal_id: record.principal_id.clone(),
+        owner_launch_id: record.owner_launch_id.clone(),
+        generation: record.generation.clone(),
+        engine_route_provider: record.engine_route_provider.clone(),
+        selected_engine_adapter: record.selected_engine_adapter.clone(),
+        stream_id: stream_id.to_string(),
+        stream_cleanup,
+        transport_authority: record.transport_authority.clone(),
+        dispatch_state,
+    }
 }
 
 pub(in crate::api::gateway) async fn claim_pending_browser_launch_reconciliations(
@@ -772,6 +990,7 @@ pub(in crate::api::gateway) async fn promote_browser_launch_reconciliation_effec
         || cleanup.generation != reconciliation.generation
         || cleanup.engine_route_provider != reconciliation.engine_route_provider
         || cleanup.stream_id != reconciliation.stream_id
+        || cleanup.transport_authority != reconciliation.transport_authority
         || !browser_engine_cleanup_is_safe(&cleanup)
     {
         return Err("Browser reconciled effect ownership changed".to_string());
@@ -1621,6 +1840,7 @@ fn browser_engine_cleanup(session: &BrowserSessionRecord) -> Option<BrowserEngin
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .unwrap_or_default(),
+        transport_authority: session.transport_authority.clone(),
         provider_cleanup: session.provider_cleanup.clone()?,
     })
 }
@@ -1972,6 +2192,23 @@ fn browser_engine_cleanup_is_safe(cleanup: &BrowserEngineCleanup) -> bool {
         && cleanup.engine_adapter.len() <= 256
         && cleanup.engine.len() <= 256
         && cleanup.stream_id.len() <= 256
+        && cleanup
+            .transport_authority
+            .as_ref()
+            .is_none_or(|authority| {
+                validate_browser_vz_transport_authority(authority).is_ok()
+                    && authority
+                        .get("generation")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(cleanup.generation.as_str())
+                    && authority.get("page_id").and_then(serde_json::Value::as_str)
+                        == Some(cleanup.page_id.as_str())
+                    && authority
+                        .pointer("/egress/stream_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(cleanup.stream_id.as_str())
+                    && provider_cleanup.get("transport_authority") == Some(authority)
+            })
         && is_safe_runtime_id(&cleanup.cleanup_id)
         && is_safe_runtime_id(&cleanup.page_id)
         && is_safe_runtime_id(&cleanup.principal_id)
@@ -2030,6 +2267,20 @@ fn browser_launch_reconciliation_is_safe(reconciliation: &BrowserLaunchReconcili
         && is_safe_runtime_id(&reconciliation.generation)
         && is_safe_runtime_id(&reconciliation.engine_route_provider)
         && is_safe_runtime_id(&reconciliation.stream_id)
+        && reconciliation
+            .transport_authority
+            .as_ref()
+            .is_none_or(|authority| {
+                validate_browser_vz_transport_authority(authority).is_ok()
+                    && authority
+                        .get("generation")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(reconciliation.generation.as_str())
+                    && authority
+                        .pointer("/egress/stream_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(reconciliation.stream_id.as_str())
+            })
         && reconciliation
             .stream_cleanup
             .as_ref()
@@ -2364,6 +2615,10 @@ pub(in crate::api::gateway) fn browser_lifecycle_vm_key_hash(parts: &[&str]) -> 
     browser_lifecycle_hash(&joined)
 }
 
+fn browser_launch_generation_hash_label(value: &str) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(value.as_bytes())))
+}
+
 fn hash_label(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     format!("sha256:{}", hex::encode(&digest[..8]))
@@ -2418,6 +2673,8 @@ mod tests {
             owner_launch_id: "launch:test".to_string(),
             cleanup_id: format!("browser-cleanup:{}", page_id.unwrap_or("launching")),
             generation: "sha256:generation".to_string(),
+            expected_page_id: "page:vz-test".to_string(),
+            vm_id: "browser-vm-test".to_string(),
             page_id: page_id.map(str::to_string),
             engine_route_provider: "mock-browser-route".to_string(),
             selected_engine_adapter: Some("mock-adapter".to_string()),
@@ -2437,6 +2694,7 @@ mod tests {
             }),
             browser_page: page_id.map(|page_id| serde_json::json!({"page_id": page_id})),
             stream_cleanup: None,
+            transport_authority: None,
             state,
             phase: match state {
                 BrowserSessionState::Launching => BrowserLifecyclePhase::AcquiringSlot,

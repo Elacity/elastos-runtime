@@ -1,8 +1,10 @@
 use super::*;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+const MAX_BROWSER_ENGINE_LAUNCH_REQUEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub(super) struct SupervisorLaunchError {
@@ -53,8 +55,9 @@ pub(super) fn run_supervisor_launch(
     adapter: &AdapterConfig,
     context: &LaunchContext<'_>,
     lifecycle_generation: &str,
+    transport: Option<&VzTransportLaunchContext>,
 ) -> Result<SupervisorLaunchResult, SupervisorLaunchError> {
-    let request = json!({
+    let mut request = json!({
         "schema": "elastos.browser.engine.launch-request/v1",
         "adapter": &adapter.id,
         "engine": adapter.kind,
@@ -74,16 +77,36 @@ pub(super) fn run_supervisor_launch(
         "display_mode": context.display_mode,
         "guarantee_level": context.guarantee_level,
     });
-    let mut child = Command::new(&supervisor.program)
+    if let Some(transport) = transport {
+        request["page_id"] = json!(transport.page_id);
+        request["vm_id"] = json!(transport.vm_id);
+        request["transport_authority"] = transport.authority.clone();
+        request["transport_secret"] = transport.secret.clone();
+    }
+    let serialized = request.to_string();
+    ensure_bounded_supervisor_request(&serialized)?;
+    let mut command = Command::new(&supervisor.program);
+    command
         .args(&supervisor.args)
         .envs(&supervisor.env)
         .env_remove("ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE")
-        .env("ELASTOS_BROWSER_ENGINE_REQUEST", request.to_string())
-        .stdin(Stdio::null())
+        .env_remove("ELASTOS_BROWSER_ENGINE_REQUEST")
+        .stdin(if transport.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if transport.is_none() {
+        command.env("ELASTOS_BROWSER_ENGINE_REQUEST", &serialized);
+    }
+    let mut child = command
         .spawn()
         .map_err(|err| SupervisorLaunchError::process(err.to_string()))?;
+    if transport.is_some() {
+        write_private_supervisor_request(&mut child, serialized.as_bytes())?;
+    }
     let deadline = Instant::now() + Duration::from_millis(supervisor.timeout_ms);
     let status = loop {
         match child.try_wait() {
@@ -110,10 +133,59 @@ pub(super) fn run_supervisor_launch(
     if !status.success() {
         return Err(supervisor_launch_error(status, &stderr));
     }
-    let result = serde_json::from_str::<SupervisorLaunchResult>(stdout.trim()).map_err(|err| {
+    let result_value = serde_json::from_str::<Value>(stdout.trim()).map_err(|err| {
+        SupervisorLaunchError::process(format!("invalid browser engine supervisor output: {err}"))
+    })?;
+    if transport.is_some_and(|transport| {
+        value_contains_transport_secret(&result_value)
+            || value_contains_exact_transport_secret(&result_value, &transport.secret)
+    }) {
+        return Err(SupervisorLaunchError::process(
+            "browser engine supervisor exposed a private VZ transport secret",
+        ));
+    }
+    let result = serde_json::from_value::<SupervisorLaunchResult>(result_value).map_err(|err| {
         SupervisorLaunchError::process(format!("invalid browser engine supervisor output: {err}"))
     })?;
     Ok(result)
+}
+
+fn ensure_bounded_supervisor_request(serialized: &str) -> Result<(), SupervisorLaunchError> {
+    if serialized.len() <= MAX_BROWSER_ENGINE_LAUNCH_REQUEST_BYTES {
+        Ok(())
+    } else {
+        Err(SupervisorLaunchError::process(
+            "Browser engine launch request exceeds its bounded size",
+        ))
+    }
+}
+
+fn write_private_supervisor_request(
+    child: &mut std::process::Child,
+    serialized: &[u8],
+) -> Result<(), SupervisorLaunchError> {
+    let Some(mut stdin) = child.stdin.take() else {
+        kill_and_reap(child);
+        return Err(SupervisorLaunchError::process(
+            "Browser VZ supervisor private request pipe is unavailable",
+        ));
+    };
+    let result = stdin
+        .write_all(serialized)
+        .and_then(|_| stdin.write_all(b"\n"));
+    drop(stdin);
+    if let Err(err) = result {
+        kill_and_reap(child);
+        return Err(SupervisorLaunchError::process(format!(
+            "Browser VZ supervisor private request write failed: {err}"
+        )));
+    }
+    Ok(())
+}
+
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub(super) fn run_supervisor_prewarm(supervisor: &EngineSupervisorConfig) -> Result<Value, String> {
@@ -418,6 +490,7 @@ pub(super) fn validate_supervisor_result(
     adapter: &AdapterConfig,
     expected_stream_id: &str,
     expected_display_mode: BrowserDisplayMode,
+    expected_transport: Option<&VzTransportLaunchContext>,
 ) -> Result<(), String> {
     if result.schema != "elastos.browser.engine.supervisor-result/v1" {
         return Err("unsupported browser engine supervisor result schema".to_string());
@@ -433,6 +506,44 @@ pub(super) fn validate_supervisor_result(
     }
     if result.stream_id != expected_stream_id {
         return Err("browser engine supervisor stream_id mismatch".to_string());
+    }
+    match expected_transport {
+        Some(transport)
+            if result.page_id == transport.page_id
+                && result.vm_id.as_deref() == Some(transport.vm_id.as_str())
+                && result.transport_authority.as_ref() == Some(&transport.authority) =>
+        {
+            validate_vz_transport_authority(&transport.authority)?;
+            validate_vz_transport_effect_receipt(
+                result.transport_receipt.as_ref().ok_or_else(|| {
+                    "browser engine supervisor omitted the VZ transport effect receipt".to_string()
+                })?,
+                &transport.authority,
+            )?;
+            if result
+                .display_session
+                .get("ice_connection_policy")
+                .and_then(Value::as_str)
+                != Some("engine_relay_only")
+                || result.display_session.get("ice_servers").is_some()
+            {
+                return Err(
+                    "browser engine supervisor exposed an invalid VZ ICE policy".to_string()
+                );
+            }
+        }
+        Some(_) => {
+            return Err("browser engine supervisor VZ transport authority mismatch".to_string())
+        }
+        None if result.vm_id.is_some()
+            || result.transport_authority.is_some()
+            || result.transport_receipt.is_some() =>
+        {
+            return Err(
+                "browser engine supervisor returned unexpected VZ transport authority".to_string(),
+            )
+        }
+        None => {}
     }
     if result.network_mode != AdapterNetworkMode::RuntimeNetOnly {
         return Err("browser engine supervisor must report runtime_net_only".to_string());
@@ -579,4 +690,58 @@ fn native_surface_dimension(value: &Value, field: &str, label: &str) -> Result<u
         ));
     }
     Ok(dimension)
+}
+
+#[cfg(test)]
+mod private_request_tests {
+    use super::*;
+
+    #[test]
+    fn serialized_launch_request_is_bounded() {
+        assert!(ensure_bounded_supervisor_request(
+            &"x".repeat(MAX_BROWSER_ENGINE_LAUNCH_REQUEST_BYTES)
+        )
+        .is_ok());
+        assert!(ensure_bounded_supervisor_request(
+            &"x".repeat(MAX_BROWSER_ENGINE_LAUNCH_REQUEST_BYTES + 1)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn private_request_write_failure_kills_and_reaps_child() {
+        let marker = std::env::temp_dir().join(format!(
+            "elastos-browser-private-request-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 0<&-; : > \"$1\"; sleep 30",
+                "browser-private-request-test",
+            ])
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists());
+
+        let result = write_private_supervisor_request(&mut child, b"private request");
+
+        assert!(result.is_err());
+        assert!(child.try_wait().unwrap().is_some());
+        let _ = fs::remove_file(marker);
+    }
 }

@@ -97,15 +97,15 @@ exec "$node_bin" "$repo_root/scripts/browser-vm-control-service.mjs"
 SH
 chmod 755 "$tmp_dir/control-service"
 
-cat > "$tmp_dir/fake-vz-launcher" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ -n "${ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE:-}" ]]; then
-  printf '%s\n' "$$" >> "$ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE"
-fi
-exec "${ELASTOS_NODE_BIN:?}" - <<'NODE'
+cat > "$tmp_dir/fake-vz-launcher.cjs" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
+if (process.env.ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE) {
+  fs.appendFileSync(
+    process.env.ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE,
+    `${process.pid}\n`,
+  );
+}
 const raw = fs.readFileSync(0, "utf8").trim() || process.env.ELASTOS_BROWSER_VM_OPEN_REQUEST;
 const body = JSON.parse(raw);
 const launch = body.launch_request;
@@ -121,12 +121,50 @@ if (body.profile?.schema !== "elastos.browser.profile/v1"
     || !String(body.profile?.disk_path || "").endsWith("/BrowserProfiles/default/profile.ext4")) {
   throw new Error("VM open request must carry the Runtime Browser profile descriptor");
 }
+if (
+  Boolean(launch.transport_authority) !== Boolean(launch.transport_secret) ||
+  Boolean(launch.transport_authority) !== Boolean(launch.page_id) ||
+  Boolean(launch.transport_authority) !== Boolean(launch.vm_id)
+) {
+  throw new Error("VM open request carried an incomplete VZ transport binding");
+}
+const transportReceipt = launch.transport_authority
+  ? {
+      schema: "elastos.browser.vz-transport-effect-receipt/v1",
+      binding_hash: launch.transport_authority.binding_hash,
+      generation: launch.transport_authority.generation,
+      page_id: launch.transport_authority.page_id,
+      vm_id: launch.transport_authority.vm_id,
+      expires_at_unix_ms: launch.transport_authority.expires_at_unix_ms,
+      terminal: true,
+      effects: {
+        vz_network_devices_zero: true,
+        guest_bootstrap_validated: true,
+        guest_loopback_only: true,
+        guest_interfaces: ["lo"],
+        guest_default_route_absent: true,
+        guest_direct_network_absent: true,
+        ordinary_stream_fixed_target: true,
+        media_stream_fixed_target: true,
+        turn_launch_owned: true,
+        turn_listener_loopback: true,
+        hibernation_disabled: true,
+      },
+    }
+  : undefined;
 console.log(JSON.stringify({
   schema: "elastos.browser.engine.supervisor-result/v1",
-  page_id: "page:vm-autostart-smoke",
+  page_id: launch.page_id || "page:vm-autostart-smoke",
   adapter: launch.adapter,
   engine: launch.engine,
   stream_id: launch.stream_id,
+  ...(launch.transport_authority
+    ? {
+        vm_id: launch.vm_id,
+        transport_authority: launch.transport_authority,
+        transport_receipt: transportReceipt,
+      }
+    : {}),
   actual_url: launch.url,
   title: "ElastOS Browser VM Autostart Smoke",
   network_mode: "runtime_net_only",
@@ -161,7 +199,13 @@ console.log(JSON.stringify({
       type: "offer",
       sdp: "v=0\r\ns=ElastOS Browser VM Autostart Smoke Audio\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
     },
-    ice_servers: JSON.parse(process.env.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON || "[]"),
+    ...(launch.transport_authority
+      ? { ice_connection_policy: "engine_relay_only" }
+      : {
+          ice_servers: JSON.parse(
+            process.env.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON || "[]",
+          ),
+        }),
     display_backend: "vm_selkies_gstreamer_webrtc",
     backend_class: "product_compositor",
     media_transport: "runtime_relay",
@@ -172,8 +216,14 @@ console.log(JSON.stringify({
     signaling_url: "/api/apps/browser/pages/page%3Avm-autostart-smoke/webrtc",
   },
 }));
+process.once("SIGTERM", () => process.exit(0));
+process.once("SIGINT", () => process.exit(0));
 setInterval(() => {}, 1000);
 NODE
+cat > "$tmp_dir/fake-vz-launcher" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$node_bin" "$tmp_dir/fake-vz-launcher.cjs"
 SH
 chmod 755 "$tmp_dir/fake-vz-launcher"
 
@@ -226,6 +276,94 @@ request.stream_id = process.env.NEXT_STREAM;
 request.lifecycle_generation = `sha256:${request.stream_id}`;
 process.stdout.write(JSON.stringify(request));
 ')"
+transport_request_path="$tmp_dir/private-stdin-request.json"
+(
+  umask 077
+  BASE_REQUEST="$request_json" "$node_bin" > "$transport_request_path" <<'NODE'
+const crypto = require("node:crypto");
+
+const canonicalJson = (value) => {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((out, key) => {
+        out[key] = canonicalJson(value[key]);
+        return out;
+      }, {});
+  }
+  return value;
+};
+const sha256Label = (value) =>
+  `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
+const request = JSON.parse(process.env.BASE_REQUEST);
+request.stream_id = "stream:vm-private-stdin-smoke";
+request.lifecycle_generation = sha256Label(
+  Buffer.from("vm-private-stdin-generation"),
+);
+request.principal_id = "person:local:vm-private-stdin-smoke";
+request.target = "tls://private-stdin.invalid:443";
+request.page_id = "page:vm-private-stdin-smoke";
+request.vm_id = "vm:vm-private-stdin-smoke";
+const expiresAtUnixMs = (Math.floor(Date.now() / 1000) + 300) * 1000;
+const username = `${expiresAtUnixMs / 1000}:private-stdin-smoke`;
+const authSecret = crypto.randomBytes(32).toString("base64url");
+const credential = crypto
+  .createHmac("sha1", authSecret)
+  .update(username)
+  .digest("base64");
+const authority = {
+  schema: "elastos.browser.vz-transport-authority/v1",
+  generation: request.lifecycle_generation,
+  page_id: request.page_id,
+  vm_id: request.vm_id,
+  principal_id: request.principal_id,
+  egress: {
+    schema: "elastos.browser.vz-transport-stream/v1",
+    stream_id: request.stream_id,
+    target: request.target,
+    runtime_socket_path: "/tmp/vm-private-stdin-egress.sock",
+    vsock_port: 19091,
+  },
+  media: {
+    schema: "elastos.browser.vz-transport-stream/v1",
+    stream_id: "stream:vm-private-stdin-media",
+    target: "tcp://127.0.0.1:49961",
+    runtime_socket_path: "/tmp/vm-private-stdin-media.sock",
+    vsock_port: 19094,
+  },
+  turn: {
+    schema: "elastos.browser.vz-turn-authority/v1",
+    guest_url: "turn:127.0.0.1:3478?transport=tcp",
+    guest_host: "127.0.0.1",
+    guest_port: 3478,
+    listen_host: "127.0.0.1",
+    listen_port: 49961,
+    advertised_host: "127.0.0.1",
+    relay_host: "127.0.0.1",
+    relay_port_min: 49962,
+    relay_port_max: 49965,
+    protocols: ["turn", "tcp"],
+    username,
+    credential_hash: sha256Label(Buffer.from(credential)),
+    auth_secret_hash: sha256Label(Buffer.from(authSecret)),
+  },
+  bootstrap_vsock_port: 19093,
+  expires_at_unix_ms: expiresAtUnixMs,
+};
+authority.binding_hash = sha256Label(
+  Buffer.from(JSON.stringify(canonicalJson(authority))),
+);
+request.transport_authority = authority;
+request.transport_secret = {
+  schema: "elastos.browser.vz-transport-secret/v1",
+  binding_hash: authority.binding_hash,
+  credential,
+  auth_secret: authSecret,
+};
+process.stdout.write(JSON.stringify(request));
+NODE
+)
 
 startup_lock="${control_socket}.start.lock"
 printf '%s\n' '{}' > "$startup_lock"
@@ -244,26 +382,38 @@ process.stdout.write(JSON.stringify({
   runtime_cleanup: {
     schema: "elastos.browser.engine-cleanup-binding/v2",
     page_id: page.page_id,
-    generation: `sha256:${page.stream_id}`,
+    generation:
+      page.transport_authority?.generation || `sha256:${page.stream_id}`,
     stream_id: page.stream_id,
     adapter: page.adapter,
     engine: page.engine,
     display_mode: "webrtc_remote_display",
     guarantee_level: "mechanism_microvm",
-    principal_id: null,
+    principal_id: page.transport_authority?.principal_id || null,
     control_socket_path: page.control_socket_path,
     shutdown_socket_path: shutdownSocketPath,
     isolated_session: true,
     isolation: page.isolation,
+    control_service: page.control_service,
     process: page.process,
+    ...(page.transport_authority
+      ? {
+          transport_authority: page.transport_authority,
+          transport_receipt: page.transport_receipt,
+        }
+      : {}),
   },
 }));
 NODE
 )"
-  curl --fail --unix-socket "$control_socket" -sS --max-time 3 \
-    -H 'Content-Type: application/json' \
-    -d "$cleanup_body" \
-    http://localhost/shutdown >/dev/null
+  local cleanup_response
+  if ! cleanup_response="$(curl --fail-with-body --unix-socket "$control_socket" -sS --max-time 3 \
+      -H 'Content-Type: application/json' \
+      -d "$cleanup_body" \
+      http://localhost/shutdown)"; then
+    printf '%s\n' "$cleanup_response" >&2
+    return 1
+  fi
 }
 
 startup_lock_identity="$tmp_dir/startup-lock-identity.json"
@@ -345,6 +495,68 @@ if (result.control_status?.idle_vm_keepalive_ms !== 45000) throw new Error("prew
 if (result.control_status?.hibernation_mode !== "off") throw new Error("prewarm should not claim hibernation unless enabled");
 if (result.network_mode !== "runtime_net_only" || result.direct_network !== false) throw new Error("prewarm leaked network authority");
 NODE
+
+env -u ELASTOS_BROWSER_ENGINE_REQUEST \
+    -u ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE \
+    ELASTOS_BROWSER_VM_CONTROL_SOCKET="$control_socket" \
+    ELASTOS_BROWSER_VM_CONTROL_SERVICE="$tmp_dir/control-service" \
+    ELASTOS_BROWSER_VM_CONTROL_LAUNCHER="$tmp_dir/fake-vz-launcher" \
+    ELASTOS_BROWSER_VM_CONTROL_LOG="$control_log" \
+    ELASTOS_BROWSER_VM_DATA_DIR="$data_dir" \
+    ELASTOS_BROWSER_VM_ROOT="$vm_root" \
+    ELASTOS_BROWSER_VM_AUTOSTART_PID_FILE="$launcher_pid_file" \
+    ELASTOS_BROWSER_VM_PLATFORM="darwin-arm64" \
+    ELASTOS_BROWSER_VM_CONTROL_MAX_ACTIVE_PAGES="1" \
+    ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS="45000" \
+    ELASTOS_BROWSER_VM_ICE_SERVERS_JSON='[{"urls":["turn:192.0.2.10:3478?transport=udp"],"username":"first-turn","credential":"first-secret"}]' \
+    "$node_bin" "$repo_root/scripts/browser-vm-engine-supervisor.mjs" \
+    < "$transport_request_path" \
+    > "$tmp_dir/private-stdin-result.json"
+
+"$node_bin" - <<'NODE' \
+  "$tmp_dir/private-stdin-result.json" \
+  "$control_log" \
+  "$transport_request_path"
+const fs = require("node:fs");
+const [resultPath, logPath, requestPath] = process.argv.slice(2);
+const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+const request = JSON.parse(fs.readFileSync(requestPath, "utf8"));
+if ((fs.statSync(requestPath).mode & 0o777) !== 0o600) {
+  throw new Error("private stdin request fixture is not owner-only");
+}
+if (
+  result.page_id !== request.page_id ||
+  result.vm_id !== request.vm_id ||
+  JSON.stringify(result.transport_authority) !==
+    JSON.stringify(request.transport_authority) ||
+  result.transport_receipt?.binding_hash !==
+    request.transport_authority.binding_hash ||
+  result.transport_receipt?.generation !== request.lifecycle_generation ||
+  result.transport_receipt?.terminal !== true
+) {
+  throw new Error("private stdin launch did not preserve the exact VZ binding");
+}
+if (
+  result.display_session?.ice_connection_policy !== "engine_relay_only" ||
+  Object.prototype.hasOwnProperty.call(
+    result.display_session || {},
+    "ice_servers",
+  )
+) {
+  throw new Error("private stdin launch exposed a non-engine-owned ICE policy");
+}
+const evidence = `${fs.readFileSync(resultPath, "utf8")}\n${fs.readFileSync(logPath, "utf8")}`;
+for (const secret of [
+  request.transport_secret.credential,
+  request.transport_secret.auth_secret,
+]) {
+  if (evidence.includes(secret)) {
+    throw new Error("private VZ transport secret reached result or control log");
+  }
+}
+NODE
+
+close_page "$tmp_dir/private-stdin-result.json"
 
 printf '%s\n' "$request_json" | \
   ELASTOS_BROWSER_ENGINE_REQUEST="$request_json" \

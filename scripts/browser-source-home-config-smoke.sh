@@ -69,6 +69,9 @@ ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4="192.168.65.1" \
 ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4="192.168.65.2" \
 ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX="24" \
 ELASTOS_BROWSER_VM_TURNSERVER_BIN="/tmp/elastos-local-turnserver" \
+ELASTOS_BROWSER_REMOTE_VZ_TURN_PROGRAM="/opt/homebrew/bin/turnserver" \
+ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST="192.168.65.1" \
+ELASTOS_BROWSER_VZ_TURN_RELAY_HOST="192.168.65.1" \
 "$node_bin" scripts/browser-source-home-config.mjs \
   --data-dir "$tmp_dir/mac-vm-data" \
   --platform darwin-arm64 \
@@ -85,6 +88,9 @@ ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4="10.99.0.2" \
 ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX="24" \
 ELASTOS_BROWSER_VM_TURNSERVER_BIN="/tmp/elastos-local-turnserver" \
 ELASTOS_BROWSER_REMOTE_VZ_DATA_DIR="$tmp_dir/mac-provider-data" \
+ELASTOS_BROWSER_REMOTE_VZ_TURN_PROGRAM="/opt/homebrew/bin/turnserver" \
+ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST="192.168.65.1" \
+ELASTOS_BROWSER_VZ_TURN_RELAY_HOST="192.168.65.1" \
 "$node_bin" scripts/browser-source-home-config.mjs \
   --data-dir "$tmp_dir/linux-remote-vz-data" \
   --platform linux-amd64 \
@@ -148,15 +154,18 @@ EOF
   --platform linux-arm64 \
   --out-dir "$tmp_dir/linux-turn-config" >/dev/null
 
-"$node_bin" - "$tmp_dir/vm-config/browser-engine-adapter.json" "$tmp_dir/vm-config/exit-provider.json" "$tmp_dir/vm-config/browser-local-exit.json" "$tmp_dir/mac-vm-config/browser-engine-adapter.json" "$tmp_dir/linux-remote-vz-config/browser-engine-adapter.json" "$tmp_dir/default-mac-config/browser-engine-adapter.json" "$tmp_dir/turn-config/browser-engine-adapter.json" "$tmp_dir/linux-turn-config/browser-engine-adapter.json" "$tmp_dir/preserve-config/exit-provider.json" "$preserve_out" <<'NODE'
+"$node_bin" - "$tmp_dir/vm-config/browser-engine-adapter.json" "$tmp_dir/vm-config/exit-provider.json" "$tmp_dir/vm-config/browser-local-exit.json" "$tmp_dir/mac-vm-config/browser-engine-adapter.json" "$tmp_dir/mac-vm-config/browser-vz-vsock-transport.json" "$tmp_dir/linux-remote-vz-config/browser-engine-adapter.json" "$tmp_dir/linux-remote-vz-config/browser-vz-vsock-transport.json" "$tmp_dir/default-mac-config/browser-engine-adapter.json" "$tmp_dir/default-mac-config/browser-vz-vsock-transport.json" "$tmp_dir/turn-config/browser-engine-adapter.json" "$tmp_dir/linux-turn-config/browser-engine-adapter.json" "$tmp_dir/preserve-config/exit-provider.json" "$preserve_out" <<'NODE'
 const fs = require("node:fs");
-const [vmAdapterPath, vmExitPath, vmLocalExitPath, macVmAdapterPath, linuxRemoteVmAdapterPath, defaultMacVmAdapterPath, turnAdapterPath, linuxTurnAdapterPath, preserveExitPath, preserveOutPath] = process.argv.slice(2);
+const [vmAdapterPath, vmExitPath, vmLocalExitPath, macVmAdapterPath, macVzTransportPath, linuxRemoteVmAdapterPath, linuxRemoteVzTransportPath, defaultMacVmAdapterPath, defaultMacVzTransportPath, turnAdapterPath, linuxTurnAdapterPath, preserveExitPath, preserveOutPath] = process.argv.slice(2);
 const vmAdapter = JSON.parse(fs.readFileSync(vmAdapterPath, "utf8"));
 const vmExit = JSON.parse(fs.readFileSync(vmExitPath, "utf8"));
 const vmLocalExit = JSON.parse(fs.readFileSync(vmLocalExitPath, "utf8"));
 const macVmAdapter = JSON.parse(fs.readFileSync(macVmAdapterPath, "utf8"));
+const macVzTransport = JSON.parse(fs.readFileSync(macVzTransportPath, "utf8"));
 const linuxRemoteVmAdapter = JSON.parse(fs.readFileSync(linuxRemoteVmAdapterPath, "utf8"));
+const linuxRemoteVzTransport = JSON.parse(fs.readFileSync(linuxRemoteVzTransportPath, "utf8"));
 const defaultMacVmAdapter = JSON.parse(fs.readFileSync(defaultMacVmAdapterPath, "utf8"));
+const defaultMacVzTransport = JSON.parse(fs.readFileSync(defaultMacVzTransportPath, "utf8"));
 const turnAdapter = JSON.parse(fs.readFileSync(turnAdapterPath, "utf8"));
 const linuxTurnAdapter = JSON.parse(fs.readFileSync(linuxTurnAdapterPath, "utf8"));
 const preserveExit = JSON.parse(fs.readFileSync(preserveExitPath, "utf8"));
@@ -317,8 +326,40 @@ if (macAdapter?.kind !== "chromium_microvm") throw new Error("wrong Mac VM engin
 if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_PLATFORM !== "darwin-arm64") {
   throw new Error("Mac source-home Browser config must use the Darwin VM platform");
 }
-if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION !== "1") {
-  throw new Error("Mac source-home Browser config must enable VZ save/restore hibernation");
+if (
+  macVzTransport.schema !==
+    "elastos.browser.vz-transport-config/v1" ||
+  macVzTransport.enabled !== true ||
+  macVzTransport.turn_listen_host !== "127.0.0.1" ||
+  macVzTransport.turn_advertised_host !== "192.168.65.1" ||
+  macVzTransport.turn_relay_host !== "192.168.65.1" ||
+  macVzTransport.guest_turn_host !== "127.0.0.1" ||
+  new Set([
+    macVzTransport.bootstrap_vsock_port,
+    macVzTransport.egress_vsock_port,
+    macVzTransport.media_vsock_port,
+  ]).size !== 3
+) {
+  throw new Error("Mac source-home VZ transport authority config is invalid");
+}
+if ((fs.statSync(macVzTransportPath).mode & 0o077) !== 0) {
+  throw new Error("Mac source-home VZ transport config must be owner-only");
+}
+const macVzTransportBytes = fs.readFileSync(macVzTransportPath, "utf8");
+if (
+  macVzTransportBytes.includes("mac-secret") ||
+  macVzTransportBytes.includes("source-home-secret")
+) {
+  throw new Error("Mac source-home VZ transport config persisted a shared TURN secret");
+}
+if (
+  macAdapter?.supervisor?.env?.ELASTOS_BROWSER_REMOTE_VZ_TURN_PROGRAM !==
+  "/opt/homebrew/bin/turnserver"
+) {
+  throw new Error("Remote VZ source-home config must bind the remote TURN program path");
+}
+if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION !== "0") {
+  throw new Error("Mac source-home VZ transport config must disable hibernation");
 }
 if (macAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS !== "300000") {
   throw new Error("Mac VZ source-home Browser config may keep same-principal Browser VMs warm briefly");
@@ -370,6 +411,12 @@ if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_REMOTE_VZ_LAUNCH_TIMEOU
 if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_REMOTE_VZ_DATA_DIR !== linuxRemoteVmAdapterPath.replace(/\/linux-remote-vz-config\/browser-engine-adapter\.json$/, "/mac-provider-data")) {
   throw new Error("Linux remote VZ source-home Browser config must pin the remote provider data dir instead of falling back to the Mac default install");
 }
+if (
+  linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_REMOTE_VZ_TURN_PROGRAM !==
+  "/opt/homebrew/bin/turnserver"
+) {
+  throw new Error("Linux remote VZ config must bind the remote TURN program path");
+}
 if (linuxRemoteAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS !== "120000") {
   throw new Error("Linux remote VZ source-home Browser config must keep command proxy requests from timing out before Browser input returns");
 }
@@ -377,6 +424,13 @@ if (Object.prototype.hasOwnProperty.call(linuxRemoteAdapter?.supervisor?.env || 
   throw new Error("Linux remote VZ source-home Browser config must let the remote launcher derive an inner guest-ready margin");
 }
 assertNoRemoteVzLocalTurnEnv(linuxRemoteAdapter?.supervisor?.env, "Linux remote VZ source-home Browser config");
+if (
+  linuxRemoteVzTransport.schema !==
+    "elastos.browser.vz-transport-config/v1" ||
+  linuxRemoteVzTransport.turn_advertised_host !== "192.168.65.1"
+) {
+  throw new Error("Linux remote VZ source-home config must issue VZ transport authority");
+}
 const defaultMacAdapter = defaultMacVmAdapter.adapters?.[0];
 if (defaultMacAdapter?.supervisor?.control_socket_path !== "/tmp/elastos-browser-vm-control-darwin-arm64.sock") {
   throw new Error("Mac source-home Browser config must declare a default VM control socket");
@@ -393,22 +447,19 @@ if (defaultMacAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST
 if (defaultMacAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_CONTROL_LAUNCHER !== defaultMacVmAdapterPath.replace(/\/default-mac-config\/browser-engine-adapter\.json$/, "/default-mac-data/bin/browser-vz-engine-supervisor")) {
   throw new Error("Mac source-home Browser config must default to the local VZ control launcher");
 }
+if (
+  defaultMacVzTransport.schema !==
+    "elastos.browser.vz-transport-config/v1" ||
+  defaultMacVzTransport.turn_advertised_host !== "127.0.0.1" ||
+  defaultMacAdapter?.supervisor?.env?.ELASTOS_BROWSER_VM_HIBERNATION !== "0"
+) {
+  throw new Error("Local Mac source-home Browser config must use no-NIC VZ transport by default");
+}
 const turnEnv = turnAdapter.adapters?.[0]?.supervisor?.env || {};
-if (!turnEnv.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON?.includes("runtime-turn-user")) {
-  throw new Error("Mac source-home Browser config must load runtime TURN credentials from HOME/runtime-turn");
-}
-if (turnEnv.ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY !== "relay") {
-  throw new Error("Mac source-home Browser config must carry relay-only ICE policy from runtime TURN credentials");
-}
-if (turnEnv.ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4 !== "192.168.66.1") {
-  throw new Error("Mac source-home Browser config must load runtime TURN media relay host IPv4");
-}
-if (turnEnv.ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4 !== "192.168.66.2") {
-  throw new Error("Mac source-home Browser config must load runtime TURN media relay guest IPv4");
-}
-if (turnEnv.ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX !== "24") {
-  throw new Error("Mac source-home Browser config must load runtime TURN media relay prefix");
-}
+assertNoRemoteVzLocalTurnEnv(
+  turnEnv,
+  "Local Mac no-NIC VZ source-home Browser config",
+);
 const linuxTurnEnv = linuxTurnAdapter.adapters?.[0]?.supervisor?.env || {};
 if (!linuxTurnEnv.ELASTOS_BROWSER_VM_ICE_SERVERS_JSON?.includes("{host_ip}")) {
   throw new Error("Linux source-home Browser config must preserve per-session TURN host placeholder");

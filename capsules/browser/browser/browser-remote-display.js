@@ -1,10 +1,12 @@
 import { collectWebrtcStats } from "./browser-status.js?v=browser-20260725a";
 import {
+  iceCandidateType,
   normalizeDisplayIceServers,
   normalizeEngineCandidate,
   normalizeIceCandidateForRuntime,
+  sdpHasOnlyRelayCandidates,
   stripTrickleCandidatesFromSdp,
-} from "./browser-webrtc.js?v=browser-20260520e";
+} from "./browser-webrtc.js?v=browser-20260728a";
 
 const WEBRTC_CONNECT_TIMEOUT_MS = 30000;
 const WEBRTC_DISCONNECT_GRACE_MS = 10000;
@@ -62,6 +64,7 @@ export function createBrowserRemoteDisplay({
   let lastAudioEngineCandidateSummary = "none";
   let audioOfferSummary = null;
   let audioAnswerSummary = null;
+  let engineRelayOnly = false;
   const remoteAudio = new Audio();
   remoteAudio.autoplay = true;
   remoteAudio.muted = true;
@@ -136,6 +139,7 @@ export function createBrowserRemoteDisplay({
     failureStarted = false;
     remoteAudioExpected = false;
     remoteAudioUnlocked = false;
+    engineRelayOnly = false;
     window.clearTimeout(connectTimer);
     window.clearTimeout(candidatePollTimer);
     window.clearTimeout(audioCandidatePollTimer);
@@ -484,6 +488,14 @@ export function createBrowserRemoteDisplay({
           "Browser display signaling returned an invalid candidate.",
         );
       }
+      if (
+        engineRelayOnly &&
+        iceCandidateType(normalized) !== "relay"
+      ) {
+        throw malformedDisplayResponse(
+          "Browser display signaling returned a non-relay engine candidate.",
+        );
+      }
       if (nextPeerConnection === peerConnection) {
         engineCandidateCount += 1;
       }
@@ -507,7 +519,8 @@ export function createBrowserRemoteDisplay({
     if (
       audioOffer?.schema !== "elastos.browser.webrtc-offer/v1" ||
       audioOffer?.type !== "offer" ||
-      !audioOffer?.sdp
+      !audioOffer?.sdp ||
+      (engineRelayOnly && !sdpHasOnlyRelayCandidates(audioOffer.sdp))
     ) {
       throw malformedDisplayResponse("Browser audio could not connect.");
     }
@@ -670,6 +683,19 @@ export function createBrowserRemoteDisplay({
     }
 
     close();
+    engineRelayOnly =
+      displaySession.ice_connection_policy === "engine_relay_only";
+    if (
+      engineRelayOnly &&
+      (
+        displaySession.offerer !== "engine" ||
+        displaySession.ice_servers !== undefined
+      )
+    ) {
+      throw malformedDisplayResponse(
+        "Browser display returned an invalid engine relay policy.",
+      );
+    }
     trackReady = false;
     window.clearTimeout(connectTimer);
     const inputTransport =
@@ -681,7 +707,9 @@ export function createBrowserRemoteDisplay({
     setDisplayInput(inputTransport, inputProtocol);
     const iceServers = normalizeDisplayIceServers(displaySession.ice_servers);
     const iceTransportPolicy =
-      displaySession.media_transport === "runtime_relay" ? "relay" : "all";
+      displaySession.media_transport === "runtime_relay" && !engineRelayOnly
+        ? "relay"
+        : "all";
     const nextPeerConnection = new RTCPeerConnection({
       iceServers,
       iceTransportPolicy,
@@ -919,7 +947,9 @@ export function createBrowserRemoteDisplay({
       if (
         initialOffer?.schema !== "elastos.browser.webrtc-offer/v1" ||
         initialOffer?.type !== "offer" ||
-        !initialOffer?.sdp
+        !initialOffer?.sdp ||
+        (engineRelayOnly &&
+          !sdpHasOnlyRelayCandidates(initialOffer.sdp))
       ) {
         throw malformedDisplayResponse("Browser display could not connect.");
       }

@@ -5,11 +5,13 @@
 //! Runtime bridge. It does not perform DNS or open public TCP itself.
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -22,7 +24,10 @@ const CONFIG_ENV: &str = "ELASTOS_BROWSER_VM_RUNTIME_RELAY_CONFIG";
 #[serde(deny_unknown_fields)]
 struct RelayConfig {
     schema: String,
-    guest_relay_ipc_path: String,
+    #[serde(default)]
+    guest_relay_ipc_path: Option<String>,
+    #[serde(default)]
+    guest_loopback_tcp: Option<GuestLoopbackTcp>,
     network_mode: NetworkMode,
     direct_network: bool,
     transport: HostTransportConfig,
@@ -32,6 +37,13 @@ struct RelayConfig {
     buffer_bytes: usize,
     #[serde(default)]
     max_sessions: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestLoopbackTcp {
+    host: String,
+    port: u16,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -62,6 +74,11 @@ enum DuplexStream {
     File(File),
 }
 
+enum GuestListener {
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
 fn main() {
     match run_from_env(&mut io::stdout()) {
         Ok(()) => {}
@@ -82,17 +99,45 @@ fn run_from_env(stdout: &mut dyn Write) -> Result<(), String> {
 fn run_relay(config: &RelayConfig, stdout: &mut dyn Write) -> Result<(), String> {
     validate_config(config)?;
     let runtime_transport = RuntimeTransport::from_config(&config.transport)?;
-    let guest_path = Path::new(&config.guest_relay_ipc_path);
-    prepare_socket_path(guest_path, config.replace_existing_socket)?;
-    let listener = UnixListener::bind(guest_path).map_err(|err| err.to_string())?;
-    let _socket_guard = SocketFileGuard::new(guest_path);
+    let (listener, socket_guard) = match (
+        config.guest_relay_ipc_path.as_deref(),
+        config.guest_loopback_tcp.as_ref(),
+    ) {
+        (Some(path), None) => {
+            let guest_path = Path::new(path);
+            prepare_socket_path(guest_path, config.replace_existing_socket)?;
+            (
+                GuestListener::Unix(UnixListener::bind(guest_path).map_err(|err| err.to_string())?),
+                Some(SocketFileGuard::new(guest_path)),
+            )
+        }
+        (None, Some(tcp)) => (
+            GuestListener::Tcp(
+                TcpListener::bind(tcp_socket_addr(&tcp.host, tcp.port)?)
+                    .map_err(|err| err.to_string())?,
+            ),
+            None,
+        ),
+        _ => return Err("Browser VM runtime relay guest listener is invalid".to_string()),
+    };
 
     writeln!(
         stdout,
         "{}",
         json!({
             "schema": "elastos.browser.vm-runtime-relay.ready/v1",
-            "guest_relay_ipc_path": config.guest_relay_ipc_path,
+            "guest_listener": match (
+                config.guest_relay_ipc_path.as_deref(),
+                config.guest_loopback_tcp.as_ref(),
+            ) {
+                (Some(path), None) => json!({"kind": "unix_socket", "path": path}),
+                (None, Some(tcp)) => json!({
+                    "kind": "loopback_tcp",
+                    "host": tcp.host,
+                    "port": tcp.port,
+                }),
+                _ => Value::Null,
+            },
             "transport": transport_label(&config.transport),
             "network_mode": "runtime_net_only",
             "direct_network": false,
@@ -110,7 +155,7 @@ fn run_relay(config: &RelayConfig, stdout: &mut dyn Write) -> Result<(), String>
         if config.max_sessions > 0 && accepted >= config.max_sessions {
             break;
         }
-        let (guest_stream, _) = listener.accept().map_err(|err| err.to_string())?;
+        let guest_stream = listener.accept()?;
         accepted += 1;
         let transport = Arc::clone(&runtime_transport);
         let buffer_bytes = config.buffer_bytes;
@@ -119,7 +164,7 @@ fn run_relay(config: &RelayConfig, stdout: &mut dyn Write) -> Result<(), String>
         workers.push(thread::spawn(move || {
             let host_stream = transport.connect()?;
             let (guest_to_runtime, runtime_to_guest) =
-                forward_pair(DuplexStream::Unix(guest_stream), host_stream, buffer_bytes)?;
+                forward_pair(guest_stream, host_stream, buffer_bytes)?;
             eprintln!(
                 "browser VM runtime relay session {session_id} guest_to_runtime={guest_to_runtime} runtime_to_guest={runtime_to_guest}"
             );
@@ -132,6 +177,7 @@ fn run_relay(config: &RelayConfig, stdout: &mut dyn Write) -> Result<(), String>
             .join()
             .map_err(|_| "browser VM runtime relay worker panicked".to_string())??;
     }
+    drop(socket_guard);
     Ok(())
 }
 
@@ -139,7 +185,23 @@ fn validate_config(config: &RelayConfig) -> Result<(), String> {
     if config.schema != "elastos.browser.vm-runtime-relay.config/v1" {
         return Err("unsupported browser VM runtime relay config schema".to_string());
     }
-    validate_unix_socket_path("guest_relay_ipc_path", &config.guest_relay_ipc_path)?;
+    match (
+        config.guest_relay_ipc_path.as_deref(),
+        config.guest_loopback_tcp.as_ref(),
+    ) {
+        (Some(path), None) => validate_unix_socket_path("guest_relay_ipc_path", path)?,
+        (None, Some(tcp)) => {
+            let address = tcp_socket_addr(&tcp.host, tcp.port)?;
+            if !address.ip().is_loopback() {
+                return Err("guest_loopback_tcp.host must be loopback".to_string());
+            }
+        }
+        _ => {
+            return Err(
+                "exactly one of guest_relay_ipc_path or guest_loopback_tcp is required".to_string(),
+            )
+        }
+    }
     if config.network_mode != NetworkMode::RuntimeNetOnly {
         return Err("browser VM runtime relay must be runtime_net_only".to_string());
     }
@@ -255,6 +317,21 @@ impl RuntimeTransport {
                 .map_err(|_| "vsock listener lock poisoned".to_string())?
                 .accept()
                 .map(DuplexStream::File),
+        }
+    }
+}
+
+impl GuestListener {
+    fn accept(&self) -> Result<DuplexStream, String> {
+        match self {
+            Self::Unix(listener) => listener
+                .accept()
+                .map(|(stream, _)| DuplexStream::Unix(stream))
+                .map_err(|err| err.to_string()),
+            Self::Tcp(listener) => listener
+                .accept()
+                .map(|(stream, _)| DuplexStream::Tcp(stream))
+                .map_err(|err| err.to_string()),
         }
     }
 }
@@ -547,8 +624,8 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_socket_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "elastos-browser-vm-runtime-relay-{}-{}",
+        let path = Path::new("/tmp").join(format!(
+            "bvr-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -562,7 +639,8 @@ mod tests {
     fn config(guest_relay_ipc_path: String, host_path: String) -> RelayConfig {
         RelayConfig {
             schema: "elastos.browser.vm-runtime-relay.config/v1".to_string(),
-            guest_relay_ipc_path,
+            guest_relay_ipc_path: Some(guest_relay_ipc_path),
+            guest_loopback_tcp: None,
             network_mode: NetworkMode::RuntimeNetOnly,
             direct_network: false,
             transport: HostTransportConfig::UnixSocket { path: host_path },
@@ -608,7 +686,7 @@ mod tests {
 
         let mut bad_path = relay;
         bad_path.direct_network = false;
-        bad_path.guest_relay_ipc_path = "relative.sock".to_string();
+        bad_path.guest_relay_ipc_path = Some("relative.sock".to_string());
         assert!(validate_config(&bad_path)
             .unwrap_err()
             .contains("absolute Unix socket path"));
@@ -651,6 +729,26 @@ mod tests {
         assert!(validate_config(&relay)
             .unwrap_err()
             .contains("literal IP address"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepts_only_literal_loopback_guest_tcp() {
+        let dir = temp_socket_dir();
+        let mut relay = config(
+            dir.join("guest.sock").display().to_string(),
+            dir.join("host.sock").display().to_string(),
+        );
+        relay.guest_relay_ipc_path = None;
+        relay.guest_loopback_tcp = Some(GuestLoopbackTcp {
+            host: "127.0.0.1".to_string(),
+            port: 3478,
+        });
+        assert!(validate_config(&relay).is_ok());
+        relay.guest_loopback_tcp.as_mut().unwrap().host = "192.0.2.1".to_string();
+        assert!(validate_config(&relay)
+            .unwrap_err()
+            .contains("must be loopback"));
         let _ = fs::remove_dir_all(dir);
     }
 

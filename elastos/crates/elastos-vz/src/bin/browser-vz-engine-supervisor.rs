@@ -14,18 +14,23 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use elastos_common::{
     CapsuleManifest, CapsuleRole, CapsuleType, MicroVmConfig, Permissions, ResourceLimits,
     SCHEMA_V1,
 };
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 use elastos_vz::{VmConfig, VzConfig, VzProvider};
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing_subscriber::{fmt, EnvFilter};
 
 const OPEN_REQUEST_ENV: &str = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
+const VZ_TRANSPORT_AUTHORITY_SCHEMA: &str = "elastos.browser.vz-transport-authority/v1";
+const VZ_TRANSPORT_SECRET_SCHEMA: &str = "elastos.browser.vz-transport-secret/v1";
 const DEFAULT_CONTROL_PORT: u32 = 19092;
 const DEFAULT_RELAY_PORT: u32 = 19091;
 const DEFAULT_PROFILE_DISK_MIB: u64 = 2048;
@@ -86,11 +91,11 @@ async fn run() -> Result<(), String> {
     }
 
     trace_stage("read_request", "");
-    let request = read_open_request()?;
+    let (request, request_from_stdin) = read_open_request()?;
     let launch = request
         .get("launch_request")
         .ok_or_else(|| "Browser VM open request missing launch_request".to_string())?;
-    validate_launch_request(launch)?;
+    let transport = validate_launch_request(launch, request_from_stdin)?;
     trace_stage(
         "validated_request",
         format!(
@@ -134,20 +139,28 @@ async fn run() -> Result<(), String> {
             current_unix_seconds()
         );
     }
-    append_browser_display_boot_args(&mut boot_args, launch)?;
+    append_browser_display_boot_args(&mut boot_args, launch, transport.as_ref())?;
     let profile_disk = prepare_browser_profile_disk(&request)?;
     append_browser_profile_boot_arg(&mut boot_args, &profile_disk.profile_key);
 
     fs::create_dir_all(&paths.session_dir).map_err(|err| err.to_string())?;
     fs::create_dir_all(&paths.state_dir).map_err(|err| err.to_string())?;
     prepare_socket_path(&paths.control_socket_path)?;
-    let hibernation = BrowserVmHibernation::from_env(
-        &paths,
-        launch,
-        &profile_disk.profile_key,
-        &profile_disk.path,
-        &boot_args,
-    )?;
+    let turn = transport
+        .as_ref()
+        .map(|transport| LaunchTurn::start(&paths, transport))
+        .transpose()?;
+    let hibernation = if transport.is_some() {
+        None
+    } else {
+        BrowserVmHibernation::from_env(
+            &paths,
+            launch,
+            &profile_disk.profile_key,
+            &profile_disk.path,
+            &boot_args,
+        )?
+    };
     let launch_rootfs = prepare_launch_rootfs(&paths, hibernation.as_ref())?;
     trace_stage(
         "prepared_rootfs",
@@ -172,7 +185,7 @@ async fn run() -> Result<(), String> {
     trace_stage("provider_init_done", "");
 
     let mut vm_config = VmConfig {
-        vm_id: format!("browser-vm-{}", uuid::Uuid::new_v4()),
+        vm_id: browser_vm_id(transport.as_ref())?,
         kernel_path: paths.kernel_path.clone(),
         boot_args,
         rootfs_path: launch_rootfs.path.clone(),
@@ -183,6 +196,7 @@ async fn run() -> Result<(), String> {
         data_disk_path: None,
         vsock_cid: 3,
         network: None,
+        network_disabled: transport.is_some(),
         interactive_stdio: false,
         carrier_socket_path: None,
         initramfs_path: paths.initramfs_path.clone(),
@@ -208,24 +222,68 @@ async fn run() -> Result<(), String> {
         trace_stage("start_vm_done", "");
     }
 
+    let guest_transport_receipt = match transport.as_ref() {
+        Some(transport) => {
+            match bootstrap_vz_transport(Arc::clone(&provider), &handle, transport).await {
+                Ok(receipt) => Some(receipt),
+                Err(error) => {
+                    let _ = provider.stop(&handle).await;
+                    let _ = fs::remove_dir_all(&paths.session_dir);
+                    return Err(error);
+                }
+            }
+        }
+        None => None,
+    };
     let shutdown = Arc::new(AtomicBool::new(false));
     trace_stage("spawn_egress_bridge", "");
     let egress_max_sessions = env_u32("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS", 16)?;
     if egress_max_sessions == 0 || egress_max_sessions > 256 {
         return Err("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS must be from 1 to 256".to_string());
     }
+    let egress_port = transport
+        .as_ref()
+        .and_then(|transport| {
+            transport
+                .authority
+                .pointer("/egress/vsock_port")
+                .and_then(Value::as_u64)
+        })
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(paths.relay_port);
     let egress = if env_bool("ELASTOS_BROWSER_VM_DISABLE_EGRESS_BRIDGE", false) {
         tokio::spawn(async {})
     } else {
         spawn_egress_bridge(
             Arc::clone(&provider),
             handle.clone(),
-            paths.relay_port,
+            egress_port,
             paths.runtime_stream_path.clone(),
             Arc::clone(&shutdown),
             egress_max_sessions as usize,
         )
     };
+    let media = transport.as_ref().map(|transport| {
+        spawn_egress_bridge(
+            Arc::clone(&provider),
+            handle.clone(),
+            transport
+                .authority
+                .pointer("/media/vsock_port")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .expect("validated Browser VZ media vsock port"),
+            PathBuf::from(
+                transport
+                    .authority
+                    .pointer("/media/runtime_socket_path")
+                    .and_then(Value::as_str)
+                    .expect("validated Browser VZ media Runtime socket"),
+            ),
+            Arc::clone(&shutdown),
+            egress_max_sessions as usize,
+        )
+    });
     trace_stage("spawn_control_proxy", "");
     let control_proxy = spawn_control_proxy(
         Arc::clone(&provider),
@@ -236,7 +294,7 @@ async fn run() -> Result<(), String> {
     )?;
 
     trace_stage("open_guest_page_start", "");
-    let result = match open_guest_page(
+    let mut result = match open_guest_page(
         Arc::clone(&provider),
         &handle,
         paths.control_port,
@@ -257,21 +315,67 @@ async fn run() -> Result<(), String> {
             return Err(error);
         }
     };
+    if let Some(transport) = transport.as_ref() {
+        if result.get("page_id") != transport.authority.get("page_id") {
+            shutdown.store(true, Ordering::Relaxed);
+            let _ = provider.stop(&handle).await;
+            return Err("Browser VZ guest page identity changed".to_string());
+        }
+        result["vm_id"] = transport
+            .authority
+            .get("vm_id")
+            .cloned()
+            .expect("validated Browser VZ vm_id");
+        result["transport_authority"] = transport.authority.clone();
+        result["transport_receipt"] = vz_transport_effect_receipt(
+            transport,
+            guest_transport_receipt
+                .as_ref()
+                .expect("Browser VZ guest transport bootstrap receipt"),
+        )?;
+        if let Some(display) = result
+            .get_mut("display_session")
+            .and_then(Value::as_object_mut)
+        {
+            display.remove("ice_servers");
+            display.insert(
+                "ice_connection_policy".to_string(),
+                json!("engine_relay_only"),
+            );
+        }
+    }
     trace_stage("open_guest_page_done", "");
 
     println!(
         "{}",
         serde_json::to_string(&result).map_err(|err| err.to_string())?
     );
-    wait_for_shutdown_signal().await;
+    wait_for_shutdown_or_transport_expiry(transport.as_ref()).await;
     shutdown.store(true, Ordering::Relaxed);
     let _ = control_proxy.join();
     let _ = egress.await;
+    if let Some(media) = media {
+        let _ = media.await;
+    }
     save_browser_vm_hibernation(Arc::clone(&provider), &handle, hibernation.as_ref()).await;
     let _ = provider.stop(&handle).await;
+    drop(turn);
     let _ = fs::remove_file(&paths.control_socket_path);
     let _ = fs::remove_dir_all(&paths.session_dir);
     Ok(())
+}
+
+fn browser_vm_id(transport: Option<&VzTransportLaunch>) -> Result<String, String> {
+    match transport {
+        Some(transport) => transport
+            .authority
+            .get("vm_id")
+            .and_then(Value::as_str)
+            .filter(|vm_id| safe_id(vm_id))
+            .map(str::to_string)
+            .ok_or_else(|| "Browser VZ transport VM identity is invalid".to_string()),
+        None => Ok(format!("browser-vm-{}", uuid::Uuid::new_v4())),
+    }
 }
 
 fn trace_stage(stage: &str, detail: impl AsRef<str>) {
@@ -288,21 +392,35 @@ fn trace_stage(stage: &str, detail: impl AsRef<str>) {
     }
 }
 
-fn read_open_request() -> Result<Value, String> {
+fn read_open_request() -> Result<(Value, bool), String> {
     let mut stdin = String::new();
     std::io::stdin()
         .read_to_string(&mut stdin)
         .map_err(|err| err.to_string())?;
-    let raw = if stdin.trim().is_empty() {
-        std::env::var(OPEN_REQUEST_ENV).map_err(|_| format!("{OPEN_REQUEST_ENV} is required"))?
+    let (raw, from_stdin) = if stdin.trim().is_empty() {
+        (
+            std::env::var(OPEN_REQUEST_ENV)
+                .map_err(|_| format!("{OPEN_REQUEST_ENV} is required"))?,
+            false,
+        )
     } else {
-        stdin
+        (stdin, true)
     };
     serde_json::from_str(&raw)
+        .map(|request| (request, from_stdin))
         .map_err(|err| format!("Browser VM open request is invalid JSON: {err}"))
 }
 
-fn validate_launch_request(launch: &Value) -> Result<(), String> {
+#[derive(Debug, Clone)]
+struct VzTransportLaunch {
+    authority: Value,
+    secret: Value,
+}
+
+fn validate_launch_request(
+    launch: &Value,
+    request_from_stdin: bool,
+) -> Result<Option<VzTransportLaunch>, String> {
     if launch.get("schema").and_then(Value::as_str)
         != Some("elastos.browser.engine.launch-request/v1")
     {
@@ -351,7 +469,389 @@ fn validate_launch_request(launch: &Value) -> Result<(), String> {
             "Browser VZ launcher requires adapter_ipc.runtime_stream_path for Runtime-mediated egress".to_string()
         })?;
     validate_absolute_path("adapter_ipc.runtime_stream_path", runtime_stream_path)?;
+    validate_vz_transport_launch(launch, request_from_stdin)
+}
+
+fn validate_vz_transport_launch(
+    launch: &Value,
+    request_from_stdin: bool,
+) -> Result<Option<VzTransportLaunch>, String> {
+    let fields = [
+        launch.get("page_id"),
+        launch.get("vm_id"),
+        launch.get("transport_authority"),
+        launch.get("transport_secret"),
+    ];
+    if fields.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if fields.iter().any(Option::is_none) {
+        return Err("Browser VZ transport launch binding is incomplete".to_string());
+    }
+    if !request_from_stdin {
+        return Err(
+            "Browser VZ transport secrets are accepted only through the private stdin launch pipe"
+                .to_string(),
+        );
+    }
+    let authority = launch
+        .get("transport_authority")
+        .cloned()
+        .expect("checked Browser VZ authority");
+    let secret = launch
+        .get("transport_secret")
+        .cloned()
+        .expect("checked Browser VZ secret");
+    validate_vz_transport_authority(&authority, true)?;
+    validate_vz_transport_secret(&authority, &secret)?;
+    if launch.get("lifecycle_generation") != authority.get("generation")
+        || launch.get("page_id") != authority.get("page_id")
+        || launch.get("vm_id") != authority.get("vm_id")
+        || launch.get("stream_id") != authority.pointer("/egress/stream_id")
+        || launch.get("principal_id") != authority.get("principal_id")
+        || launch.pointer("/adapter_ipc/runtime_stream_path")
+            != authority.pointer("/egress/runtime_socket_path")
+    {
+        return Err("Browser VZ transport launch identity changed".to_string());
+    }
+    Ok(Some(VzTransportLaunch { authority, secret }))
+}
+
+fn validate_vz_transport_authority(authority: &Value, require_live: bool) -> Result<(), String> {
+    let object = authority
+        .as_object()
+        .ok_or_else(|| "Browser VZ transport authority must be an object".to_string())?;
+    let keys = [
+        "schema",
+        "binding_hash",
+        "generation",
+        "page_id",
+        "vm_id",
+        "principal_id",
+        "egress",
+        "media",
+        "turn",
+        "bootstrap_vsock_port",
+        "expires_at_unix_ms",
+    ];
+    if object.len() != keys.len()
+        || keys.iter().any(|key| !object.contains_key(*key))
+        || authority.get("schema").and_then(Value::as_str) != Some(VZ_TRANSPORT_AUTHORITY_SCHEMA)
+        || !sha256_label_is_safe(authority.get("binding_hash"))
+        || !sha256_label_is_safe(authority.get("generation"))
+    {
+        return Err("Browser VZ transport authority shape is invalid".to_string());
+    }
+    for field in ["page_id", "vm_id", "principal_id"] {
+        let value = authority
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 512 && safe_id(value))
+            .ok_or_else(|| format!("Browser VZ transport {field} is invalid"))?;
+        let _ = value;
+    }
+    let egress = validate_vz_transport_stream(authority.get("egress"), false)?;
+    let media = validate_vz_transport_stream(authority.get("media"), true)?;
+    let bootstrap_port = authority
+        .get("bootstrap_vsock_port")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Browser VZ bootstrap vsock port is invalid".to_string())?;
+    if egress.0 == media.0
+        || egress.1 == media.1
+        || egress.2 == media.2
+        || bootstrap_port == egress.2
+        || bootstrap_port == media.2
+    {
+        return Err("Browser VZ transport bindings must be distinct".to_string());
+    }
+    let expires_at = authority
+        .get("expires_at_unix_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Browser VZ transport expiry is invalid".to_string())?;
+    let now = current_unix_millis()?;
+    if expires_at > now.saturating_add(24 * 60 * 60 * 1_000) || (require_live && expires_at <= now)
+    {
+        return Err("Browser VZ transport authority expiry is invalid".to_string());
+    }
+    validate_vz_turn_authority(authority.get("turn"), expires_at)?;
+    let mut unsigned = authority.clone();
+    unsigned
+        .as_object_mut()
+        .expect("validated Browser VZ authority object")
+        .remove("binding_hash");
+    let expected = sha256_label(&canonical_json_bytes(&unsigned)?);
+    if authority.get("binding_hash").and_then(Value::as_str) != Some(expected.as_str())
+        || serde_json::to_vec(authority).map_or(true, |bytes| bytes.len() > 32 * 1024)
+    {
+        return Err("Browser VZ transport authority binding hash mismatch".to_string());
+    }
     Ok(())
+}
+
+fn validate_vz_transport_secret(authority: &Value, secret: &Value) -> Result<(), String> {
+    let object = secret
+        .as_object()
+        .ok_or_else(|| "Browser VZ transport secret must be an object".to_string())?;
+    if object.len() != 4
+        || !["schema", "binding_hash", "credential", "auth_secret"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+        || secret.get("schema").and_then(Value::as_str) != Some(VZ_TRANSPORT_SECRET_SCHEMA)
+        || secret.get("binding_hash") != authority.get("binding_hash")
+    {
+        return Err("Browser VZ transport secret binding is invalid".to_string());
+    }
+    let credential = bounded_transport_secret(secret.get("credential"), "credential")?;
+    let auth_secret = bounded_transport_secret(secret.get("auth_secret"), "auth_secret")?;
+    if authority
+        .pointer("/turn/credential_hash")
+        .and_then(Value::as_str)
+        != Some(sha256_label(credential.as_bytes()).as_str())
+        || authority
+            .pointer("/turn/auth_secret_hash")
+            .and_then(Value::as_str)
+            != Some(sha256_label(auth_secret.as_bytes()).as_str())
+    {
+        return Err("Browser VZ transport secret hash mismatch".to_string());
+    }
+    let username = authority
+        .pointer("/turn/username")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Browser VZ TURN username is missing".to_string())?;
+    let mut mac = Hmac::<Sha1>::new_from_slice(auth_secret.as_bytes())
+        .map_err(|_| "Browser VZ TURN auth secret is invalid".to_string())?;
+    mac.update(username.as_bytes());
+    let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    if expected != credential {
+        return Err("Browser VZ TURN credential mismatch".to_string());
+    }
+    Ok(())
+}
+
+fn validate_vz_transport_stream(
+    value: Option<&Value>,
+    loopback_target: bool,
+) -> Result<(String, String, u32), String> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Browser VZ transport stream must be an object".to_string())?;
+    let keys = [
+        "schema",
+        "stream_id",
+        "target",
+        "runtime_socket_path",
+        "vsock_port",
+    ];
+    if object.len() != keys.len()
+        || keys.iter().any(|key| !object.contains_key(*key))
+        || object.get("schema").and_then(Value::as_str)
+            != Some("elastos.browser.vz-transport-stream/v1")
+    {
+        return Err("Browser VZ transport stream shape is invalid".to_string());
+    }
+    let stream_id = object
+        .get("stream_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 512 && safe_id(value))
+        .ok_or_else(|| "Browser VZ transport stream_id is invalid".to_string())?;
+    let target = object
+        .get("target")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Browser VZ transport target is missing".to_string())?;
+    let parsed = url::Url::parse(target)
+        .map_err(|err| format!("Browser VZ transport target is invalid: {err}"))?;
+    if !matches!(parsed.scheme(), "tcp" | "tls")
+        || parsed.port().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("Browser VZ transport target is invalid".to_string());
+    }
+    if loopback_target
+        && !parsed
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback())
+    {
+        return Err("Browser VZ media target must be loopback".to_string());
+    }
+    let runtime_path = object
+        .get("runtime_socket_path")
+        .and_then(Value::as_str)
+        .filter(|path| {
+            path.starts_with('/') && path.len() <= 103 && !path.contains(['\0', '\r', '\n'])
+        })
+        .ok_or_else(|| "Browser VZ transport Runtime socket is invalid".to_string())?;
+    let port = object
+        .get("vsock_port")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Browser VZ transport vsock port is invalid".to_string())?;
+    Ok((
+        stream_id.to_string(),
+        format!("{}\n{runtime_path}", parsed.as_str()),
+        port,
+    ))
+}
+
+fn validate_vz_turn_authority(
+    value: Option<&Value>,
+    expires_at_unix_ms: u64,
+) -> Result<(), String> {
+    let turn = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Browser VZ TURN authority must be an object".to_string())?;
+    let keys = [
+        "schema",
+        "guest_url",
+        "guest_host",
+        "guest_port",
+        "listen_host",
+        "listen_port",
+        "advertised_host",
+        "relay_host",
+        "relay_port_min",
+        "relay_port_max",
+        "protocols",
+        "username",
+        "credential_hash",
+        "auth_secret_hash",
+    ];
+    if turn.len() != keys.len()
+        || keys.iter().any(|key| !turn.contains_key(*key))
+        || turn.get("schema").and_then(Value::as_str)
+            != Some("elastos.browser.vz-turn-authority/v1")
+    {
+        return Err("Browser VZ TURN authority shape is invalid".to_string());
+    }
+    let guest_host = require_loopback_ip(turn.get("guest_host"), "guest_host")?;
+    require_loopback_ip(turn.get("listen_host"), "listen_host")?;
+    let guest_port = require_json_port(turn.get("guest_port"), "guest_port")?;
+    require_json_port(turn.get("listen_port"), "listen_port")?;
+    let advertised_host = turn
+        .get("advertised_host")
+        .and_then(Value::as_str)
+        .filter(|host| {
+            !host.is_empty()
+                && host.len() <= 253
+                && !host.contains(['\0', '\r', '\n', '/', '\\', ' ', '\t'])
+        })
+        .ok_or_else(|| "Browser VZ TURN advertised host is invalid".to_string())?;
+    let _ = advertised_host;
+    let relay_host = turn
+        .get("relay_host")
+        .and_then(Value::as_str)
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .filter(|host| !host.is_unspecified() && !host.is_multicast())
+        .ok_or_else(|| "Browser VZ TURN relay host is invalid".to_string())?;
+    let _ = relay_host;
+    let relay_min = require_json_port(turn.get("relay_port_min"), "relay_port_min")?;
+    let relay_max = require_json_port(turn.get("relay_port_max"), "relay_port_max")?;
+    if relay_min > relay_max
+        || u32::from(relay_max) - u32::from(relay_min) + 1 > 64
+        || turn.get("guest_url").and_then(Value::as_str)
+            != Some(format!("turn:{guest_host}:{guest_port}?transport=tcp").as_str())
+        || turn.get("protocols") != Some(&json!(["turn", "tcp"]))
+    {
+        return Err("Browser VZ TURN endpoint binding is invalid".to_string());
+    }
+    let username = turn
+        .get("username")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.contains(['\0', '\r', '\n'])
+        })
+        .ok_or_else(|| "Browser VZ TURN username is invalid".to_string())?;
+    let username_expiry = username
+        .split_once(':')
+        .and_then(|(expiry, suffix)| (!suffix.is_empty()).then_some(expiry))
+        .and_then(|expiry| expiry.parse::<u64>().ok())
+        .and_then(|expiry| expiry.checked_mul(1_000))
+        .ok_or_else(|| "Browser VZ TURN username expiry is invalid".to_string())?;
+    if username_expiry != expires_at_unix_ms
+        || !sha256_label_is_safe(turn.get("credential_hash"))
+        || !sha256_label_is_safe(turn.get("auth_secret_hash"))
+    {
+        return Err("Browser VZ TURN authority hash or expiry changed".to_string());
+    }
+    Ok(())
+}
+
+fn require_loopback_ip(value: Option<&Value>, field: &str) -> Result<String, String> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|text| {
+            text.parse::<std::net::IpAddr>()
+                .ok()
+                .filter(std::net::IpAddr::is_loopback)
+                .map(|_| text.to_string())
+        })
+        .ok_or_else(|| format!("Browser VZ TURN {field} must be loopback"))
+}
+
+fn require_json_port(value: Option<&Value>, field: &str) -> Result<u16, String> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("Browser VZ TURN {field} is invalid"))
+}
+
+fn bounded_transport_secret<'a>(value: Option<&'a Value>, field: &str) -> Result<&'a str, String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 512 && !value.contains(['\0', '\r', '\n'])
+        })
+        .ok_or_else(|| format!("Browser VZ transport secret {field} is invalid"))
+}
+
+fn sha256_label_is_safe(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|value| {
+        value.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    })
+}
+
+fn sha256_label(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex_encode(&Sha256::digest(bytes)))
+}
+
+fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, String> {
+    fn canonical(value: &Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.iter().map(canonical).collect()),
+            Value::Object(values) => {
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                let mut sorted = serde_json::Map::new();
+                for key in keys {
+                    sorted.insert(key.clone(), canonical(&values[key]));
+                }
+                Value::Object(sorted)
+            }
+            value => value.clone(),
+        }
+    }
+    serde_json::to_vec(&canonical(value)).map_err(|err| err.to_string())
+}
+
+fn current_unix_millis() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| err.to_string())
+        .and_then(|duration| {
+            u64::try_from(duration.as_millis())
+                .map_err(|_| "current Unix time is too large".to_string())
+        })
 }
 
 fn launch_viewport(launch: &Value) -> Result<Option<(u64, u64)>, String> {
@@ -372,7 +872,25 @@ fn launch_viewport(launch: &Value) -> Result<Option<(u64, u64)>, String> {
     Ok(Some((width, height)))
 }
 
-fn append_browser_display_boot_args(boot_args: &mut String, launch: &Value) -> Result<(), String> {
+fn append_browser_display_boot_args(
+    boot_args: &mut String,
+    launch: &Value,
+    transport: Option<&VzTransportLaunch>,
+) -> Result<(), String> {
+    if let Some(transport) = transport {
+        append_browser_display_boot_args_with_ice_config(boot_args, launch, true, None)?;
+        let bootstrap_port = transport
+            .authority
+            .get("bootstrap_vsock_port")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "Browser VZ bootstrap port is missing".to_string())?;
+        write!(
+            boot_args,
+            " elastos.browser_vz_transport=vsock_v1 elastos.browser_bootstrap_port={bootstrap_port}"
+        )
+        .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
     let display_mode = launch
         .get("display_mode")
         .and_then(Value::as_str)
@@ -561,6 +1079,149 @@ struct LaunchPaths {
     relay_port: u32,
     memory_mib: u32,
     vcpu_count: u8,
+}
+
+struct LaunchTurn {
+    child: std::process::Child,
+    config_path: PathBuf,
+}
+
+impl LaunchTurn {
+    fn start(paths: &LaunchPaths, transport: &VzTransportLaunch) -> Result<Self, String> {
+        let program = env_path("ELASTOS_BROWSER_VM_TURN_PROGRAM")
+            .ok_or_else(|| "ELASTOS_BROWSER_VM_TURN_PROGRAM is required".to_string())?;
+        let metadata = fs::metadata(&program)
+            .map_err(|err| format!("Browser VZ TURN program is unavailable: {err}"))?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err("Browser VZ TURN program must be an executable regular file".to_string());
+        }
+        let turn = transport
+            .authority
+            .get("turn")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "Browser VZ TURN authority is missing".to_string())?;
+        let secret = transport
+            .secret
+            .get("auth_secret")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Browser VZ TURN private launch secret is missing".to_string())?;
+        let listen_host = turn
+            .get("listen_host")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Browser VZ TURN listen host is missing".to_string())?;
+        let listen_port = require_json_port(turn.get("listen_port"), "listen_port")?;
+        let advertised_host = turn
+            .get("advertised_host")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Browser VZ TURN advertised host is missing".to_string())?;
+        let relay_host = turn
+            .get("relay_host")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Browser VZ TURN relay host is missing".to_string())?;
+        let relay_min = require_json_port(turn.get("relay_port_min"), "relay_port_min")?;
+        let relay_max = require_json_port(turn.get("relay_port_max"), "relay_port_max")?;
+        let expires_at = transport
+            .authority
+            .get("expires_at_unix_ms")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "Browser VZ TURN expiry is missing".to_string())?;
+        let remaining_secs = expires_at
+            .checked_sub(current_unix_millis()?)
+            .map(|millis| millis.div_ceil(1_000))
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(|| "Browser VZ TURN authority is expired".to_string())?;
+        let config_path = paths.session_dir.join("turnserver.conf");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config_path)
+            .map_err(|err| format!("Browser VZ TURN config creation failed: {err}"))?;
+        let realm_suffix = transport
+            .authority
+            .get("binding_hash")
+            .and_then(Value::as_str)
+            .and_then(|value| value.strip_prefix("sha256:"))
+            .unwrap_or("invalid")
+            .chars()
+            .take(16)
+            .collect::<String>();
+        let config = format!(
+            "listening-ip={listen_host}\n\
+             relay-ip={relay_host}\n\
+             listening-port={listen_port}\n\
+             external-ip={advertised_host}/{relay_host}\n\
+             min-port={relay_min}\n\
+             max-port={relay_max}\n\
+             realm=elastos-browser-{realm_suffix}\n\
+             fingerprint\n\
+             use-auth-secret\n\
+             static-auth-secret={secret}\n\
+             no-udp\n\
+             no-tls\n\
+             no-dtls\n\
+             no-cli\n\
+             no-daemon\n\
+             stale-nonce=120\n\
+             max-allocate-lifetime={remaining_secs}\n\
+             channel-lifetime={remaining_secs}\n\
+             permission-lifetime={remaining_secs}\n"
+        );
+        file.write_all(config.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|err| format!("Browser VZ TURN config write failed: {err}"))?;
+        drop(file);
+        let child = std::process::Command::new(&program)
+            .arg("-c")
+            .arg(&config_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|err| format!("Browser VZ TURN process failed to start: {err}"))?;
+        let mut turn = Self { child, config_path };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = turn
+                .child
+                .try_wait()
+                .map_err(|err| format!("Browser VZ TURN process status failed: {err}"))?
+            {
+                let _ = fs::remove_file(&turn.config_path);
+                return Err(format!(
+                    "Browser VZ TURN process exited before readiness: {status}"
+                ));
+            }
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::new(
+                    listen_host
+                        .parse()
+                        .map_err(|_| "Browser VZ TURN listen host is invalid".to_string())?,
+                    listen_port,
+                ),
+                Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("Browser VZ TURN listener did not become ready".to_string());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        fs::remove_file(&turn.config_path)
+            .map_err(|err| format!("Browser VZ TURN config retirement failed: {err}"))?;
+        Ok(turn)
+    }
+}
+
+impl Drop for LaunchTurn {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.config_path);
+    }
 }
 
 impl LaunchPaths {
@@ -1702,6 +2363,14 @@ fn guest_control_open_request(request: &Value) -> Value {
     let mut guest_request = request.clone();
     guest_request["schema"] = json!("elastos.browser.vm-guest.open/v1");
     guest_request["launch_request"]["engine"] = json!("selkies_gstreamer");
+    if let Some(launch) = guest_request
+        .get_mut("launch_request")
+        .and_then(Value::as_object_mut)
+    {
+        launch.remove("transport_authority");
+        launch.remove("transport_secret");
+        launch.remove("vm_id");
+    }
     guest_request
 }
 
@@ -1780,6 +2449,215 @@ async fn connect_vsock_with_retry(
     Err(format!(
         "timed out connecting to Browser VM guest vsock port {port}: {last_error}"
     ))
+}
+
+async fn bootstrap_vz_transport(
+    provider: Arc<VzProvider>,
+    handle: &CapsuleHandle,
+    transport: &VzTransportLaunch,
+) -> Result<Value, String> {
+    let port = transport
+        .authority
+        .get("bootstrap_vsock_port")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "Browser VZ bootstrap vsock port is missing".to_string())?;
+    let timeout = Duration::from_millis(env_u32(
+        "ELASTOS_BROWSER_VM_TRANSPORT_BOOTSTRAP_TIMEOUT_MS",
+        90_000,
+    )? as u64);
+    let fd = connect_vsock_with_retry(provider, handle, port, timeout).await?;
+    let mut stream = File::from(fd);
+    set_file_read_timeout(&stream, timeout)?;
+    set_file_write_timeout(&stream, timeout)?;
+    let request = json!({
+        "schema": "elastos.browser.vz-transport-bootstrap/v1",
+        "authority": transport.authority,
+        "secret": transport.secret,
+    });
+    let mut bytes = serde_json::to_vec(&request).map_err(|err| err.to_string())?;
+    if bytes.len() > 64 * 1024 {
+        return Err("Browser VZ transport bootstrap request is too large".to_string());
+    }
+    bytes.push(b'\n');
+    stream
+        .write_all(&bytes)
+        .and_then(|_| stream.flush())
+        .map_err(|err| format!("Browser VZ transport bootstrap write failed: {err}"))?;
+    let mut response = Vec::new();
+    stream
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut response)
+        .map_err(|err| format!("Browser VZ transport bootstrap read failed: {err}"))?;
+    if response.len() > 64 * 1024 {
+        return Err("Browser VZ transport bootstrap receipt is too large".to_string());
+    }
+    let receipt: Value = serde_json::from_slice(
+        response
+            .split(|byte| *byte == b'\n')
+            .find(|line| !line.is_empty())
+            .ok_or_else(|| "Browser VZ transport bootstrap receipt is empty".to_string())?,
+    )
+    .map_err(|err| format!("Browser VZ transport bootstrap receipt is invalid JSON: {err}"))?;
+    validate_vz_transport_bootstrap_receipt(&receipt, &transport.authority)?;
+    Ok(receipt)
+}
+
+fn validate_vz_transport_bootstrap_receipt(
+    receipt: &Value,
+    authority: &Value,
+) -> Result<(), String> {
+    let object = receipt
+        .as_object()
+        .ok_or_else(|| "Browser VZ transport bootstrap receipt must be an object".to_string())?;
+    let keys = [
+        "schema",
+        "binding_hash",
+        "generation",
+        "page_id",
+        "vm_id",
+        "expires_at_unix_ms",
+        "terminal",
+        "effects",
+    ];
+    let effects = receipt
+        .get("effects")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Browser VZ transport bootstrap effects are missing".to_string())?;
+    let effect_keys = [
+        "descriptor_validated",
+        "authority_owner_only",
+        "ice_config_owner_only",
+        "loopback_only",
+        "interfaces",
+        "default_route_absent",
+        "direct_network_probe_failed",
+    ];
+    if object.len() != keys.len()
+        || keys.iter().any(|key| !object.contains_key(*key))
+        || effects.len() != effect_keys.len()
+        || effect_keys.iter().any(|key| !effects.contains_key(*key))
+        || receipt.get("schema").and_then(Value::as_str)
+            != Some("elastos.browser.vz-transport-bootstrap-receipt/v1")
+        || receipt.get("binding_hash") != authority.get("binding_hash")
+        || receipt.get("generation") != authority.get("generation")
+        || receipt.get("page_id") != authority.get("page_id")
+        || receipt.get("vm_id") != authority.get("vm_id")
+        || receipt.get("expires_at_unix_ms") != authority.get("expires_at_unix_ms")
+        || receipt.get("terminal").and_then(Value::as_bool) != Some(true)
+        || effects.get("interfaces") != Some(&json!(["lo"]))
+        || effect_keys
+            .iter()
+            .filter(|key| **key != "interfaces")
+            .any(|key| effects.get(*key).and_then(Value::as_bool) != Some(true))
+        || value_contains_transport_secret(receipt)
+    {
+        return Err(
+            "Browser VZ guest did not return an exact transport bootstrap receipt".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn vz_transport_effect_receipt(
+    transport: &VzTransportLaunch,
+    guest_receipt: &Value,
+) -> Result<Value, String> {
+    validate_vz_transport_bootstrap_receipt(guest_receipt, &transport.authority)?;
+    let receipt = json!({
+        "schema": "elastos.browser.vz-transport-effect-receipt/v1",
+        "binding_hash": transport.authority["binding_hash"],
+        "generation": transport.authority["generation"],
+        "page_id": transport.authority["page_id"],
+        "vm_id": transport.authority["vm_id"],
+        "expires_at_unix_ms": transport.authority["expires_at_unix_ms"],
+        "terminal": true,
+        "effects": {
+            "vz_network_devices_zero": true,
+            "guest_bootstrap_validated": true,
+            "guest_loopback_only": true,
+            "guest_interfaces": ["lo"],
+            "guest_default_route_absent": true,
+            "guest_direct_network_absent": true,
+            "ordinary_stream_fixed_target": true,
+            "media_stream_fixed_target": true,
+            "turn_launch_owned": true,
+            "turn_listener_loopback": true,
+            "hibernation_disabled": true,
+        },
+    });
+    validate_vz_transport_effect_receipt(&receipt, &transport.authority)?;
+    Ok(receipt)
+}
+
+fn validate_vz_transport_effect_receipt(receipt: &Value, authority: &Value) -> Result<(), String> {
+    let object = receipt
+        .as_object()
+        .ok_or_else(|| "Browser VZ transport effect receipt must be an object".to_string())?;
+    let keys = [
+        "schema",
+        "binding_hash",
+        "generation",
+        "page_id",
+        "vm_id",
+        "expires_at_unix_ms",
+        "terminal",
+        "effects",
+    ];
+    let effects = receipt
+        .get("effects")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Browser VZ transport effect receipt is missing effects".to_string())?;
+    let effect_keys = [
+        "vz_network_devices_zero",
+        "guest_bootstrap_validated",
+        "guest_loopback_only",
+        "guest_interfaces",
+        "guest_default_route_absent",
+        "guest_direct_network_absent",
+        "ordinary_stream_fixed_target",
+        "media_stream_fixed_target",
+        "turn_launch_owned",
+        "turn_listener_loopback",
+        "hibernation_disabled",
+    ];
+    if object.len() != keys.len()
+        || keys.iter().any(|key| !object.contains_key(*key))
+        || effects.len() != effect_keys.len()
+        || effect_keys.iter().any(|key| !effects.contains_key(*key))
+        || receipt.get("schema").and_then(Value::as_str)
+            != Some("elastos.browser.vz-transport-effect-receipt/v1")
+        || receipt.get("binding_hash") != authority.get("binding_hash")
+        || receipt.get("generation") != authority.get("generation")
+        || receipt.get("page_id") != authority.get("page_id")
+        || receipt.get("vm_id") != authority.get("vm_id")
+        || receipt.get("expires_at_unix_ms") != authority.get("expires_at_unix_ms")
+        || receipt.get("terminal").and_then(Value::as_bool) != Some(true)
+        || effects.get("guest_interfaces") != Some(&json!(["lo"]))
+        || effect_keys
+            .iter()
+            .filter(|key| **key != "guest_interfaces")
+            .any(|key| effects.get(*key).and_then(Value::as_bool) != Some(true))
+        || value_contains_transport_secret(receipt)
+    {
+        return Err(
+            "Browser VZ supervisor did not produce an exact transport effect receipt".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn value_contains_transport_secret(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(value_contains_transport_secret),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "credential" | "auth_secret" | "transport_secret"
+            ) || value_contains_transport_secret(value)
+        }),
+        _ => false,
+    }
 }
 
 async fn connect_vsock_once(
@@ -2400,6 +3278,26 @@ async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+async fn wait_for_shutdown_or_transport_expiry(transport: Option<&VzTransportLaunch>) {
+    let Some(transport) = transport else {
+        wait_for_shutdown_signal().await;
+        return;
+    };
+    let expires_at = transport
+        .authority
+        .get("expires_at_unix_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let remaining = current_unix_millis()
+        .ok()
+        .and_then(|now| expires_at.checked_sub(now))
+        .unwrap_or(0);
+    tokio::select! {
+        _ = wait_for_shutdown_signal() => {}
+        _ = tokio::time::sleep(Duration::from_millis(remaining)) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2408,6 +3306,148 @@ mod tests {
     use std::sync::{mpsc, Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn transport_fixture(suffix: char) -> VzTransportLaunch {
+        let expires_at = (current_unix_millis().unwrap() / 1_000 + 300) * 1_000;
+        let generation = format!("sha256:{}", suffix.to_string().repeat(64));
+        let username = format!("{}:{}", expires_at / 1_000, suffix.to_string().repeat(16));
+        let auth_secret = format!("transport-secret-{}", suffix.to_string().repeat(32));
+        let mut mac = Hmac::<Sha1>::new_from_slice(auth_secret.as_bytes()).unwrap();
+        mac.update(username.as_bytes());
+        let credential =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let mut authority = json!({
+            "schema": "elastos.browser.vz-transport-authority/v1",
+            "generation": generation,
+            "page_id": format!("page:vz-{suffix}"),
+            "vm_id": format!("vm:vz-{suffix}"),
+            "principal_id": format!("person:local:{suffix}"),
+            "egress": {
+                "schema": "elastos.browser.vz-transport-stream/v1",
+                "stream_id": format!("stream:egress-{suffix}"),
+                "target": "tls://example.invalid:443",
+                "runtime_socket_path": format!("/tmp/vz-egress-{suffix}.sock"),
+                "vsock_port": 19091,
+            },
+            "media": {
+                "schema": "elastos.browser.vz-transport-stream/v1",
+                "stream_id": format!("stream:media-{suffix}"),
+                "target": "tcp://127.0.0.1:49160",
+                "runtime_socket_path": format!("/tmp/vz-media-{suffix}.sock"),
+                "vsock_port": 19094,
+            },
+            "turn": {
+                "schema": "elastos.browser.vz-turn-authority/v1",
+                "guest_url": "turn:127.0.0.1:3478?transport=tcp",
+                "guest_host": "127.0.0.1",
+                "guest_port": 3478,
+                "listen_host": "127.0.0.1",
+                "listen_port": 49160,
+                "advertised_host": "192.0.2.10",
+                "relay_host": "192.0.2.10",
+                "relay_port_min": 55000,
+                "relay_port_max": 55019,
+                "protocols": ["turn", "tcp"],
+                "username": username,
+                "credential_hash": sha256_label(credential.as_bytes()),
+                "auth_secret_hash": sha256_label(auth_secret.as_bytes()),
+            },
+            "bootstrap_vsock_port": 19093,
+            "expires_at_unix_ms": expires_at,
+        });
+        let binding_hash = sha256_label(&canonical_json_bytes(&authority).unwrap());
+        authority["binding_hash"] = json!(binding_hash);
+        let secret = json!({
+            "schema": "elastos.browser.vz-transport-secret/v1",
+            "binding_hash": binding_hash,
+            "credential": credential,
+            "auth_secret": auth_secret,
+        });
+        VzTransportLaunch { authority, secret }
+    }
+
+    fn guest_transport_receipt(authority: &Value) -> Value {
+        json!({
+            "schema": "elastos.browser.vz-transport-bootstrap-receipt/v1",
+            "binding_hash": authority["binding_hash"],
+            "generation": authority["generation"],
+            "page_id": authority["page_id"],
+            "vm_id": authority["vm_id"],
+            "expires_at_unix_ms": authority["expires_at_unix_ms"],
+            "terminal": true,
+            "effects": {
+                "descriptor_validated": true,
+                "authority_owner_only": true,
+                "ice_config_owner_only": true,
+                "loopback_only": true,
+                "interfaces": ["lo"],
+                "default_route_absent": true,
+                "direct_network_probe_failed": true,
+            },
+        })
+    }
+
+    #[test]
+    fn vz_transport_rejects_substitution_replay_expiry_and_malformed_receipts() {
+        let first = transport_fixture('a');
+        let second = transport_fixture('b');
+        validate_vz_transport_authority(&first.authority, true).unwrap();
+        validate_vz_transport_secret(&first.authority, &first.secret).unwrap();
+        assert_eq!(
+            browser_vm_id(Some(&first)).unwrap(),
+            first.authority["vm_id"].as_str().unwrap()
+        );
+
+        let mut substituted = first.authority.clone();
+        substituted["vm_id"] = json!("vm:vz-substituted");
+        assert!(validate_vz_transport_authority(&substituted, true).is_err());
+        assert!(validate_vz_transport_secret(&first.authority, &second.secret).is_err());
+
+        let mut expired = first.authority.clone();
+        expired["expires_at_unix_ms"] = json!(1);
+        assert!(validate_vz_transport_authority(&expired, true).is_err());
+
+        let guest = guest_transport_receipt(&first.authority);
+        let effect = vz_transport_effect_receipt(&first, &guest).unwrap();
+        validate_vz_transport_effect_receipt(&effect, &first.authority).unwrap();
+        let mut malformed = effect;
+        malformed["effects"]["media_stream_fixed_target"] = json!(false);
+        assert!(validate_vz_transport_effect_receipt(&malformed, &first.authority).is_err());
+    }
+
+    #[test]
+    fn launch_owned_turn_failure_is_typed_and_retires_private_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _turn_program = EnvVarRestore::capture("ELASTOS_BROWSER_VM_TURN_PROGRAM");
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("turn-failure.sh");
+        fs::write(&program, "#!/bin/sh\nexit 17\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("ELASTOS_BROWSER_VM_TURN_PROGRAM", &program);
+        let session_dir = root.path().join("session");
+        fs::create_dir_all(&session_dir).unwrap();
+        let paths = LaunchPaths {
+            data_dir: root.path().to_path_buf(),
+            kernel_path: root.path().join("kernel"),
+            rootfs_path: root.path().join("rootfs"),
+            initramfs_path: None,
+            state_dir: root.path().join("state"),
+            rootfs_cache_dir: root.path().join("cache"),
+            session_dir: session_dir.clone(),
+            control_socket_path: session_dir.join("control.sock"),
+            runtime_stream_path: session_dir.join("runtime.sock"),
+            control_port: 19092,
+            relay_port: 19091,
+            memory_mib: 2048,
+            vcpu_count: 2,
+        };
+        let error = match LaunchTurn::start(&paths, &transport_fixture('c')) {
+            Ok(_) => panic!("failing TURN fixture unexpectedly started"),
+            Err(error) => error,
+        };
+        assert!(error.contains("exited before readiness"));
+        assert!(!session_dir.join("turnserver.conf").exists());
+    }
 
     struct EnvVarRestore {
         name: &'static str,
@@ -2578,7 +3618,7 @@ mod tests {
                 "height": 758
             }
         });
-        validate_launch_request(&launch).unwrap();
+        validate_launch_request(&launch, false).unwrap();
         let mut boot_args = "console=hvc0".to_string();
 
         append_browser_display_boot_args_with_ice_config(&mut boot_args, &launch, true, None)
@@ -2607,7 +3647,7 @@ mod tests {
             }
         });
 
-        let err = validate_launch_request(&launch).unwrap_err();
+        let err = validate_launch_request(&launch, false).unwrap_err();
 
         assert!(err.contains("adapter_ipc.runtime_stream_path"));
     }
@@ -2700,6 +3740,7 @@ mod tests {
             data_disk_path: None,
             vsock_cid: 3,
             network: None,
+            network_disabled: false,
             interactive_stdio: false,
             carrier_socket_path: None,
             initramfs_path: None,

@@ -2137,7 +2137,11 @@ class SelkiesPage {
   constructor(config, launchRequest, onClosed = () => {}, options = {}) {
     this.config = config;
     this.launchRequest = launchRequest;
-    this.pageId = pageIdFor(launchRequest.url, launchRequest.stream_id);
+    this.pageId =
+      safeId(launchRequest.page_id) &&
+      launchRequest.page_id.length <= 256
+        ? launchRequest.page_id
+        : pageIdFor(launchRequest.url, launchRequest.stream_id);
     this.onClosed = onClosed;
     this.forceNewTarget = options.forceNewTarget === true;
     this.ws = null;
@@ -4323,6 +4327,13 @@ function validateOpenRequest(body) {
   }
   if (!safeId(launch.adapter) || !safeId(launch.stream_id)) {
     throw new Error("launch request adapter and stream_id must be safe identifiers");
+  }
+  if (
+    body.schema === VM_GUEST_OPEN_SCHEMA &&
+    launch.page_id !== undefined &&
+    (!safeId(launch.page_id) || launch.page_id.length > 256)
+  ) {
+    throw new Error("VM guest launch page_id must be a bounded safe identifier");
   }
   return launch;
 }

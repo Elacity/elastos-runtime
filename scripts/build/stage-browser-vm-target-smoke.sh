@@ -60,6 +60,22 @@ if (result.preflight?.manifest?.control_transport !== "vsock_relay") throw new E
 if (result.preflight?.manifest?.media_transport !== "runtime_relay") throw new Error("missing runtime relay");
 const fs = require("node:fs");
 const start = fs.readFileSync(`${result.rootfs}/opt/elastos/bin/browser-vm-selkies-start`, "utf8");
+const init = fs.readFileSync(`${result.rootfs}/opt/elastos/bin/browser-vm-init`, "utf8");
+const bootstrap = `${result.rootfs}/opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs`;
+if (!fs.statSync(bootstrap).isFile()) throw new Error("missing VZ transport bootstrap");
+for (const expected of [
+  "elastos.browser_vz_transport",
+  "browser-vm-bootstrap-relay.json",
+  "guest_loopback_tcp",
+  "browser-vm-media-relay.json",
+]) {
+  if (!init.includes(expected)) throw new Error(`VZ init is missing ${expected}`);
+}
+for (const forbidden of ["nft", "iptables", "pfctl", "guest_network_policy"]) {
+  if (init.includes(forbidden)) {
+    throw new Error(`VZ init introduced forbidden policy surface ${forbidden}`);
+  }
+}
 if (!start.includes("elastos.browser_profile_disk")) throw new Error("missing profile disk boot contract");
 if (!start.includes("/dev/vdb")) throw new Error("missing Browser profile data disk mount");
 if (!start.includes("--user-data-dir=${ELASTOS_BROWSER_VM_PROFILE_DIR}")) throw new Error("Chromium profile dir is not Runtime-owned");

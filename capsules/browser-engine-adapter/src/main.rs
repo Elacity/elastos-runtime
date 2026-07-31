@@ -13,11 +13,13 @@ use std::io::{self, BufRead, Write};
 mod display;
 mod ids;
 mod supervisor;
+mod transport;
 mod validation;
 
 use display::*;
 use ids::*;
 use supervisor::*;
+use transport::*;
 use validation::*;
 
 const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
@@ -53,6 +55,8 @@ enum Request {
         stream_id: Option<String>,
         #[serde(default)]
         adapter_id: Option<String>,
+        #[serde(default)]
+        transport_authority: Option<Value>,
     },
     Launch {
         url: String,
@@ -71,6 +75,14 @@ enum Request {
         viewport: Option<ViewportRequest>,
         display_mode: BrowserDisplayMode,
         guarantee_level: BrowserGuaranteeLevel,
+        #[serde(default)]
+        page_id: Option<String>,
+        #[serde(default)]
+        vm_id: Option<String>,
+        #[serde(default)]
+        transport_authority: Option<Value>,
+        #[serde(default)]
+        transport_secret: Option<Value>,
     },
     AttachStream {
         page_id: String,
@@ -170,6 +182,10 @@ struct EngineCleanupBinding {
     control_service: Option<ControlServiceIdentity>,
     #[serde(default)]
     process: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_authority: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_receipt: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -192,6 +208,12 @@ struct DurableControlLaunchIdentity {
     principal_id: Option<String>,
     display_mode: BrowserDisplayMode,
     guarantee_level: BrowserGuaranteeLevel,
+    #[serde(default)]
+    page_id: Option<String>,
+    #[serde(default)]
+    vm_id: Option<String>,
+    #[serde(default)]
+    transport_authority: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +232,8 @@ struct PageControlSession {
     isolation_kind: Option<String>,
     control_service: Option<ControlServiceIdentity>,
     process: Option<Value>,
+    transport_authority: Option<Value>,
+    transport_receipt: Option<Value>,
 }
 
 fn engine_cleanup_binding(page_id: &str, session: &PageControlSession) -> EngineCleanupBinding {
@@ -237,6 +261,8 @@ fn engine_cleanup_binding(page_id: &str, session: &PageControlSession) -> Engine
             }),
         control_service: session.control_service.clone(),
         process: session.process.clone(),
+        transport_authority: session.transport_authority.clone(),
+        transport_receipt: session.transport_receipt.clone(),
     }
 }
 
@@ -265,6 +291,8 @@ fn page_control_session_from_cleanup(
             .map(|isolation| isolation.kind.clone()),
         control_service: binding.control_service.clone(),
         process: binding.process.clone(),
+        transport_authority: binding.transport_authority.clone(),
+        transport_receipt: binding.transport_receipt.clone(),
     })
 }
 
@@ -287,6 +315,26 @@ fn validate_engine_cleanup_binding(binding: &EngineCleanupBinding) -> Result<(),
     }
     if binding.isolated_session != binding.isolation.is_some() {
         return Err("Browser cleanup isolation binding is inconsistent".to_string());
+    }
+    if let Some(authority) = &binding.transport_authority {
+        validate_vz_transport_authority(authority)?;
+        validate_vz_transport_effect_receipt(
+            binding.transport_receipt.as_ref().ok_or_else(|| {
+                "Browser cleanup omitted its VZ transport effect receipt".to_string()
+            })?,
+            authority,
+        )?;
+        if authority.get("generation").and_then(Value::as_str) != Some(binding.generation.as_str())
+            || authority.get("page_id").and_then(Value::as_str) != Some(binding.page_id.as_str())
+            || authority
+                .pointer("/egress/stream_id")
+                .and_then(Value::as_str)
+                != Some(binding.stream_id.as_str())
+        {
+            return Err("Browser cleanup transport authority changed".to_string());
+        }
+    } else if binding.transport_receipt.is_some() {
+        return Err("Browser cleanup has an unexpected VZ transport receipt".to_string());
     }
     if let Some(isolation) = &binding.isolation {
         if isolation.schema != "elastos.browser.engine.isolation/v1"
@@ -430,15 +478,28 @@ fn optional_process_id_is_safe(value: Option<&Value>) -> bool {
     value.is_some_and(|value| value.is_null() || process_id_is_safe(Some(value)))
 }
 
+struct DurableReconciliationBinding<'a> {
+    control_socket_path: &'a str,
+    live_control_service: &'a ControlServiceIdentity,
+    principal_id: Option<&'a str>,
+    lifecycle_generation: &'a str,
+    stream_id: &'a str,
+    transport_authority: Option<&'a Value>,
+}
+
 fn page_control_session_from_durable_reconciliation(
     reconciliation: &Value,
     adapter: &AdapterConfig,
-    control_socket_path: &str,
-    live_control_service: &ControlServiceIdentity,
-    principal_id: Option<&str>,
-    lifecycle_generation: &str,
-    stream_id: &str,
+    expected: DurableReconciliationBinding<'_>,
 ) -> Result<(String, PageControlSession), String> {
+    let DurableReconciliationBinding {
+        control_socket_path,
+        live_control_service,
+        principal_id,
+        lifecycle_generation,
+        stream_id,
+        transport_authority,
+    } = expected;
     let launch = serde_json::from_value::<DurableControlLaunchIdentity>(
         reconciliation.get("launch").cloned().unwrap_or(Value::Null),
     )
@@ -469,6 +530,14 @@ fn page_control_session_from_durable_reconciliation(
         || launch.stream_id != stream_id
         || launch.principal_id.as_deref() != principal_id
         || launch.adapter != adapter.id
+        || launch.transport_authority.as_ref() != transport_authority
+        || match transport_authority {
+            Some(authority) => {
+                launch.page_id.as_deref() != Some(binding.page_id.as_str())
+                    || launch.vm_id.as_deref() != authority.get("vm_id").and_then(Value::as_str)
+            }
+            None => launch.page_id.is_some() || launch.vm_id.is_some(),
+        }
         || binding.generation != lifecycle_generation
         || binding.stream_id != stream_id
         || binding.principal_id.as_deref() != principal_id
@@ -476,6 +545,7 @@ fn page_control_session_from_durable_reconciliation(
         || binding.engine != launch.engine
         || binding.display_mode != launch.display_mode
         || binding.guarantee_level != launch.guarantee_level
+        || binding.transport_authority.as_ref() != transport_authority
         || binding.control_service.as_ref() != Some(live_control_service)
         || recorded_control_service != *live_control_service
         || responder_control_service != *live_control_service
@@ -514,6 +584,25 @@ fn engine_terminal_cleanup_result(
     binding: &EngineCleanupBinding,
     supervisor_receipt: Value,
 ) -> Result<Value, String> {
+    validate_engine_cleanup_binding(binding)?;
+    let transport_effects_terminal = binding.transport_authority.is_none()
+        || [
+            "transport_session_absent",
+            "turn_process_absent",
+            "turn_listener_absent",
+            "turn_relay_ports_absent",
+            "ordinary_vsock_bridge_absent",
+            "media_vsock_bridge_absent",
+            "bootstrap_vsock_bridge_absent",
+            "hibernation_state_absent",
+        ]
+        .iter()
+        .all(|effect| {
+            supervisor_receipt
+                .pointer(&format!("/effects/{effect}"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
     if supervisor_receipt.get("schema").and_then(Value::as_str)
         != Some(BROWSER_SUPERVISOR_CLEANUP_RESULT_SCHEMA)
         || supervisor_receipt.get("page_id").and_then(Value::as_str)
@@ -543,6 +632,7 @@ fn engine_terminal_cleanup_result(
             .pointer("/effects/socket_absent")
             .and_then(Value::as_bool)
             != Some(true)
+        || !transport_effects_terminal
     {
         return Err(
             "Browser supervisor did not return an exact typed terminal cleanup receipt".to_string(),
@@ -571,6 +661,36 @@ struct LaunchContext<'a> {
     guarantee_level: BrowserGuaranteeLevel,
 }
 
+struct VzTransportLaunchContext {
+    page_id: String,
+    vm_id: String,
+    authority: Value,
+    secret: Value,
+}
+
+fn vz_transport_launch_context(
+    page_id: Option<String>,
+    vm_id: Option<String>,
+    authority: Option<Value>,
+    secret: Option<Value>,
+) -> Result<Option<VzTransportLaunchContext>, String> {
+    match (page_id, vm_id, authority, secret) {
+        (None, None, None, None) => Ok(None),
+        (Some(page_id), Some(vm_id), Some(authority), Some(secret)) => {
+            Ok(Some(VzTransportLaunchContext {
+                page_id,
+                vm_id,
+                authority,
+                secret,
+            }))
+        }
+        _ => Err(
+            "Browser VZ launch requires page_id, vm_id, transport_authority, and transport_secret together"
+                .to_string(),
+        ),
+    }
+}
+
 impl BrowserEngineAdapter {
     fn new() -> Self {
         Self {
@@ -588,7 +708,14 @@ impl BrowserEngineAdapter {
                 lifecycle_generation,
                 stream_id,
                 adapter_id,
-            } => self.status_request(principal_id, lifecycle_generation, stream_id, adapter_id),
+                transport_authority,
+            } => self.status_request(
+                principal_id,
+                lifecycle_generation,
+                stream_id,
+                adapter_id,
+                transport_authority,
+            ),
             Request::Launch {
                 url,
                 stream_session,
@@ -601,21 +728,37 @@ impl BrowserEngineAdapter {
                 viewport,
                 display_mode,
                 guarantee_level,
-            } => self.launch_with_generation(
-                LaunchContext {
-                    url: &url,
-                    stream_session: &stream_session,
-                    profile,
-                    adapter_id,
-                    principal_id,
-                    reason,
-                    wallet,
-                    viewport,
-                    display_mode,
-                    guarantee_level,
-                },
-                &lifecycle_generation,
-            ),
+                page_id,
+                vm_id,
+                transport_authority,
+                transport_secret,
+            } => {
+                let transport = match vz_transport_launch_context(
+                    page_id,
+                    vm_id,
+                    transport_authority,
+                    transport_secret,
+                ) {
+                    Ok(transport) => transport,
+                    Err(message) => return Response::error("invalid_request", message),
+                };
+                self.launch_with_generation(
+                    LaunchContext {
+                        url: &url,
+                        stream_session: &stream_session,
+                        profile,
+                        adapter_id,
+                        principal_id,
+                        reason,
+                        wallet,
+                        viewport,
+                        display_mode,
+                        guarantee_level,
+                    },
+                    &lifecycle_generation,
+                    transport,
+                )
+            }
             Request::AttachStream {
                 page_id,
                 stream_session,
@@ -705,6 +848,7 @@ impl BrowserEngineAdapter {
         lifecycle_generation: Option<String>,
         stream_id: Option<String>,
         adapter_id: Option<String>,
+        transport_authority: Option<Value>,
     ) -> Response {
         if lifecycle_generation.is_some() || stream_id.is_some() {
             let (Some(lifecycle_generation), Some(stream_id)) = (lifecycle_generation, stream_id)
@@ -719,6 +863,7 @@ impl BrowserEngineAdapter {
                 &lifecycle_generation,
                 &stream_id,
                 adapter_id.as_deref(),
+                transport_authority.as_ref(),
             );
         }
         self.status(principal_id)
@@ -754,6 +899,7 @@ impl BrowserEngineAdapter {
         lifecycle_generation: &str,
         stream_id: &str,
         adapter_id: Option<&str>,
+        transport_authority: Option<&Value>,
     ) -> Response {
         if !is_safe_id(lifecycle_generation)
             || lifecycle_generation.len() > 256
@@ -767,9 +913,30 @@ impl BrowserEngineAdapter {
                 "Browser launch reconciliation identity is invalid",
             );
         }
+        if let Some(authority) = transport_authority {
+            if validate_vz_transport_authority(authority).is_err()
+                || authority.get("generation").and_then(Value::as_str) != Some(lifecycle_generation)
+                || authority
+                    .pointer("/egress/stream_id")
+                    .and_then(Value::as_str)
+                    != Some(stream_id)
+                || authority.get("principal_id").and_then(Value::as_str) != principal_id.as_deref()
+            {
+                return Response::error(
+                    "invalid_request",
+                    "Browser VZ transport reconciliation binding is invalid",
+                );
+            }
+        }
+        let reconcile_ok = |mut data: Value| {
+            if let (Some(data), Some(authority)) = (data.as_object_mut(), transport_authority) {
+                data.insert("transport_authority".to_string(), authority.clone());
+            }
+            Response::ok(data)
+        };
 
         let Some(adapter_id) = adapter_id else {
-            return Response::ok(json!({
+            return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                 "state": "cleanup_pending",
                 "lifecycle_generation": lifecycle_generation,
@@ -778,7 +945,7 @@ impl BrowserEngineAdapter {
             }));
         };
         let Some(selected_adapter) = self.select_adapter(Some(adapter_id)) else {
-            return Response::ok(json!({
+            return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                 "state": "cleanup_pending",
                 "lifecycle_generation": lifecycle_generation,
@@ -790,7 +957,7 @@ impl BrowserEngineAdapter {
             match live_vm_control_service_identity(&selected_adapter) {
                 Ok(identity) => Some(identity),
                 Err(_) => {
-                    return Response::ok(json!({
+                    return reconcile_ok(json!({
                         "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                         "state": "cleanup_pending",
                         "lifecycle_generation": lifecycle_generation,
@@ -811,7 +978,7 @@ impl BrowserEngineAdapter {
             .map(|(page_id, session)| (page_id.clone(), session.clone()))
             .collect::<Vec<_>>();
         if exact_sessions.len() > 1 {
-            return Response::ok(json!({
+            return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                 "state": "cleanup_pending",
                 "lifecycle_generation": lifecycle_generation,
@@ -837,7 +1004,7 @@ impl BrowserEngineAdapter {
                     },
                 )
             {
-                return Response::ok(json!({
+                return reconcile_ok(json!({
                     "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                     "state": "cleanup_pending",
                     "lifecycle_generation": lifecycle_generation,
@@ -845,7 +1012,7 @@ impl BrowserEngineAdapter {
                     "reason": "selected Browser Engine Adapter or cleanup identity changed",
                 }));
             }
-            return Response::ok(json!({
+            return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                 "state": "effect_acquired",
                 "lifecycle_generation": lifecycle_generation,
@@ -857,6 +1024,8 @@ impl BrowserEngineAdapter {
                     "adapter": session.adapter_id,
                     "engine": session.engine,
                     "stream_id": session.stream_id,
+                    "transport_authority": session.transport_authority,
+                    "transport_receipt": session.transport_receipt,
                     "runtime_cleanup": engine_cleanup_binding(&page_id, &session),
                 },
             }));
@@ -864,7 +1033,7 @@ impl BrowserEngineAdapter {
         if self.page_control_sessions.values().any(|session| {
             session.generation == lifecycle_generation || session.stream_id == stream_id
         }) {
-            return Response::ok(json!({
+            return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                 "state": "cleanup_pending",
                 "lifecycle_generation": lifecycle_generation,
@@ -874,7 +1043,7 @@ impl BrowserEngineAdapter {
         }
 
         let Some((control_socket_path, live_control_service)) = live_vm_control_service else {
-            return Response::ok(json!({
+            return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                 "state": "cleanup_pending",
                 "lifecycle_generation": lifecycle_generation,
@@ -882,20 +1051,24 @@ impl BrowserEngineAdapter {
                 "reason": "selected Browser control service is unavailable",
             }));
         };
+        let mut control_reconciliation_request = json!({
+            "schema": "elastos.browser.vm-control-service.reconcile-launch/v1",
+            "lifecycle_generation": lifecycle_generation,
+            "stream_id": stream_id,
+        });
+        if let Some(authority) = transport_authority {
+            control_reconciliation_request["transport_authority"] = authority.clone();
+        }
         let reconciliation = supervisor_control_json_bounded(
             &control_socket_path,
             "POST",
             "/launches/reconcile",
-            Some(json!({
-                "schema": "elastos.browser.vm-control-service.reconcile-launch/v1",
-                "lifecycle_generation": lifecycle_generation,
-                "stream_id": stream_id,
-            })),
+            Some(control_reconciliation_request),
             BROWSER_ENGINE_RECONCILIATION_TIMEOUT,
             MAX_BROWSER_ENGINE_RECONCILIATION_RESPONSE_BYTES,
         );
         let Ok(reconciliation) = reconciliation else {
-            return Response::ok(json!({
+            return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                 "state": "cleanup_pending",
                 "lifecycle_generation": lifecycle_generation,
@@ -925,10 +1098,12 @@ impl BrowserEngineAdapter {
                 .pointer("/launch/stream_id")
                 .and_then(Value::as_str)
                 != Some(stream_id)
+            || reconciliation.get("transport_authority") != transport_authority
+            || reconciliation.pointer("/launch/transport_authority") != transport_authority
             || response_identity.as_ref().ok() != Some(&live_control_service)
             || record_identity.as_ref().ok() != Some(&live_control_service)
         {
-            return Response::ok(json!({
+            return reconcile_ok(json!({
                 "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                 "state": "cleanup_pending",
                 "lifecycle_generation": lifecycle_generation,
@@ -947,7 +1122,7 @@ impl BrowserEngineAdapter {
                         .and_then(Value::as_bool)
                         == Some(false) =>
             {
-                return Response::ok(json!({
+                return reconcile_ok(json!({
                     "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                     "state": "did_not_act",
                     "lifecycle_generation": lifecycle_generation,
@@ -963,7 +1138,7 @@ impl BrowserEngineAdapter {
                     .pointer("/effects/page_acquired")
                     .and_then(Value::as_bool)
                 else {
-                    return Response::ok(json!({
+                    return reconcile_ok(json!({
                         "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                         "state": "cleanup_pending",
                         "lifecycle_generation": lifecycle_generation,
@@ -975,7 +1150,7 @@ impl BrowserEngineAdapter {
                     .pointer("/effects/vm_acquired")
                     .and_then(Value::as_bool)
                 else {
-                    return Response::ok(json!({
+                    return reconcile_ok(json!({
                         "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                         "state": "cleanup_pending",
                         "lifecycle_generation": lifecycle_generation,
@@ -983,7 +1158,80 @@ impl BrowserEngineAdapter {
                         "reason": "terminal Browser cleanup effects are incomplete",
                     }));
                 };
-                return Response::ok(json!({
+                let terminal_cleanup_receipt = match transport_authority {
+                    Some(authority) => {
+                        let binding =
+                            reconciliation
+                                .get("cleanup_binding")
+                                .cloned()
+                                .and_then(|value| {
+                                    serde_json::from_value::<EngineCleanupBinding>(value).ok()
+                                });
+                        let Some(binding) = binding else {
+                            return reconcile_ok(json!({
+                                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                                "state": "cleanup_pending",
+                                "lifecycle_generation": lifecycle_generation,
+                                "stream_id": stream_id,
+                                "reason": "terminal Browser cleanup binding is unavailable",
+                            }));
+                        };
+                        if binding.page_id
+                            != authority
+                                .get("page_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                            || binding.generation != lifecycle_generation
+                            || binding.stream_id != stream_id
+                            || binding.adapter != selected_adapter.id
+                            || binding.engine != selected_adapter.kind
+                            || binding.principal_id.as_deref() != principal_id.as_deref()
+                            || binding.transport_authority.as_ref() != Some(authority)
+                            || binding.control_service.as_ref() != Some(&live_control_service)
+                            || binding.shutdown_socket_path.as_deref()
+                                != Some(control_socket_path.as_str())
+                        {
+                            return reconcile_ok(json!({
+                                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                                "state": "cleanup_pending",
+                                "lifecycle_generation": lifecycle_generation,
+                                "stream_id": stream_id,
+                                "reason": "terminal Browser cleanup identity changed",
+                            }));
+                        }
+                        match engine_terminal_cleanup_result(
+                            &binding,
+                            reconciliation
+                                .get("terminal_cleanup_receipt")
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        ) {
+                            Ok(receipt) => Some(receipt),
+                            Err(_) => {
+                                return reconcile_ok(json!({
+                                    "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                                    "state": "cleanup_pending",
+                                    "lifecycle_generation": lifecycle_generation,
+                                    "stream_id": stream_id,
+                                    "reason": "terminal Browser cleanup receipt is invalid",
+                                }));
+                            }
+                        }
+                    }
+                    None => {
+                        if reconciliation.get("terminal_cleanup_receipt").is_some() {
+                            return reconcile_ok(json!({
+                                "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
+                                "state": "cleanup_pending",
+                                "lifecycle_generation": lifecycle_generation,
+                                "stream_id": stream_id,
+                                "reason": "unexpected terminal Browser transport receipt",
+                            }));
+                        }
+                        None
+                    }
+                };
+                return reconcile_ok(json!({
                     "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                     "state": "terminal_post_effect_cleanup",
                     "lifecycle_generation": lifecycle_generation,
@@ -992,17 +1240,21 @@ impl BrowserEngineAdapter {
                         "page_acquired": page_acquired,
                         "vm_acquired": vm_acquired,
                     },
+                    "terminal_cleanup_receipt": terminal_cleanup_receipt,
                 }));
             }
             Some("cleanup_pending") | Some("effect_acquired") => {
                 if let Ok((page_id, session)) = page_control_session_from_durable_reconciliation(
                     &reconciliation,
                     &selected_adapter,
-                    &control_socket_path,
-                    &live_control_service,
-                    principal_id.as_deref(),
-                    lifecycle_generation,
-                    stream_id,
+                    DurableReconciliationBinding {
+                        control_socket_path: &control_socket_path,
+                        live_control_service: &live_control_service,
+                        principal_id: principal_id.as_deref(),
+                        lifecycle_generation,
+                        stream_id,
+                        transport_authority,
+                    },
                 ) {
                     if !self.page_control_sessions.contains_key(&page_id) {
                         self.page_control_sessions.insert(page_id.clone(), session);
@@ -1010,7 +1262,7 @@ impl BrowserEngineAdapter {
                             .page_control_sessions
                             .get(&page_id)
                             .expect("reconciled Browser page session");
-                        return Response::ok(json!({
+                        return reconcile_ok(json!({
                             "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
                             "state": "effect_acquired",
                             "lifecycle_generation": lifecycle_generation,
@@ -1022,6 +1274,8 @@ impl BrowserEngineAdapter {
                                 "adapter": session.adapter_id,
                                 "engine": session.engine,
                                 "stream_id": session.stream_id,
+                                "transport_authority": session.transport_authority,
+                                "transport_receipt": session.transport_receipt,
                                 "runtime_cleanup": engine_cleanup_binding(&page_id, session),
                             },
                         }));
@@ -1031,7 +1285,7 @@ impl BrowserEngineAdapter {
             _ => {}
         }
 
-        Response::ok(json!({
+        reconcile_ok(json!({
             "schema": BROWSER_ENGINE_LAUNCH_RECONCILIATION_SCHEMA,
             "state": "cleanup_pending",
             "lifecycle_generation": lifecycle_generation,
@@ -1084,13 +1338,14 @@ impl BrowserEngineAdapter {
 
     #[cfg(test)]
     fn launch_with_viewport(&mut self, context: LaunchContext<'_>) -> Response {
-        self.launch_with_generation(context, "sha256:test-lifecycle-generation")
+        self.launch_with_generation(context, "sha256:test-lifecycle-generation", None)
     }
 
     fn launch_with_generation(
         &mut self,
         context: LaunchContext<'_>,
         lifecycle_generation: &str,
+        transport: Option<VzTransportLaunchContext>,
     ) -> Response {
         if !is_safe_id(lifecycle_generation) || lifecycle_generation.len() > 256 {
             return Response::error(
@@ -1115,6 +1370,25 @@ impl BrowserEngineAdapter {
             };
             return Response::error("engine_unavailable", message);
         };
+        if let Some(transport) = transport.as_ref() {
+            if adapter.kind != AdapterKind::ChromiumMicrovm {
+                return Response::error(
+                    "invalid_request",
+                    "Browser VZ transport authority is valid only for chromium_microvm",
+                );
+            }
+            if let Err(message) = validate_vz_transport_launch(
+                &transport.authority,
+                &transport.secret,
+                lifecycle_generation,
+                &context.stream_session.stream_id,
+                &transport.page_id,
+                &transport.vm_id,
+                context.principal_id.as_deref(),
+            ) {
+                return Response::error("invalid_request", message);
+            }
+        }
         if let Err(err) = validate_url(context.url) {
             return Response::error("invalid_request", err);
         }
@@ -1166,7 +1440,12 @@ impl BrowserEngineAdapter {
             );
         }
         if adapter.kind != AdapterKind::ContractProof {
-            return self.launch_with_supervisor(&adapter, context, lifecycle_generation);
+            return self.launch_with_supervisor(
+                &adapter,
+                context,
+                lifecycle_generation,
+                transport.as_ref(),
+            );
         }
         let page_id = stable_page_id(context.url, &context.stream_session.stream_id);
         let view = context.viewport.map(|viewport| {
@@ -1202,6 +1481,7 @@ impl BrowserEngineAdapter {
         adapter: &AdapterConfig,
         context: LaunchContext<'_>,
         lifecycle_generation: &str,
+        transport: Option<&VzTransportLaunchContext>,
     ) -> Response {
         let Some(supervisor) = &adapter.supervisor else {
             return Response::error(
@@ -1209,16 +1489,22 @@ impl BrowserEngineAdapter {
                 "Native Browser Engine Adapter requires an operator-approved supervisor",
             );
         };
-        let result =
-            match run_supervisor_launch(supervisor, adapter, &context, lifecycle_generation) {
-                Ok(result) => result,
-                Err(err) => return Response::error(&err.code, err.message),
-            };
+        let result = match run_supervisor_launch(
+            supervisor,
+            adapter,
+            &context,
+            lifecycle_generation,
+            transport,
+        ) {
+            Ok(result) => result,
+            Err(err) => return Response::error(&err.code, err.message),
+        };
         if let Err(err) = validate_supervisor_result(
             &result,
             adapter,
             &context.stream_session.stream_id,
             context.display_mode,
+            transport,
         ) {
             return Response::error("invalid_supervisor_result", err);
         }
@@ -1320,6 +1606,8 @@ impl BrowserEngineAdapter {
                         .map(|isolation| isolation.kind.clone()),
                     control_service,
                     process: result.process.clone(),
+                    transport_authority: result.transport_authority.clone(),
+                    transport_receipt: result.transport_receipt.clone(),
                 },
             );
         }
@@ -1350,6 +1638,8 @@ impl BrowserEngineAdapter {
             "engine_control": if control_socket_path.is_some() { "page_scoped" } else { "unavailable" },
             "isolated_engine_session": result.isolated_session,
             "isolation": result.isolation,
+            "transport_authority": result.transport_authority,
+            "transport_receipt": result.transport_receipt,
             "runtime_cleanup": runtime_cleanup,
         }))
     }
@@ -1528,20 +1818,39 @@ impl BrowserEngineAdapter {
             None,
         ) {
             Ok(mut data) => {
+                let transport_proof = match (
+                    session.transport_authority.as_ref(),
+                    session.transport_receipt.as_ref(),
+                ) {
+                    (Some(authority), Some(receipt)) => {
+                        match vz_public_transport_proof(authority, receipt) {
+                            Ok(proof) => Some(proof),
+                            Err(err) => return Response::error("engine_process_unavailable", err),
+                        }
+                    }
+                    (None, None) => None,
+                    _ => {
+                        return Response::error(
+                            "engine_process_unavailable",
+                            "Browser VZ transport proof is incomplete",
+                        )
+                    }
+                };
                 if let Some(object) = data.as_object_mut() {
-                    object.insert(
-                        "engine_identity".to_string(),
-                        json!({
-                            "schema": "elastos.browser.engine.identity/v1",
-                            "adapter": session.adapter_id.as_str(),
-                            "engine": session.engine,
-                            "display_mode": session.display_mode.as_str(),
-                            "guarantee_level": session.guarantee_level.as_str(),
-                            "engine_control": "page_scoped",
-                            "isolated_engine_session": session.isolated_session,
-                            "isolation_kind": session.isolation_kind.as_deref(),
-                        }),
-                    );
+                    let mut identity = json!({
+                        "schema": "elastos.browser.engine.identity/v1",
+                        "adapter": session.adapter_id.as_str(),
+                        "engine": session.engine,
+                        "display_mode": session.display_mode.as_str(),
+                        "guarantee_level": session.guarantee_level.as_str(),
+                        "engine_control": "page_scoped",
+                        "isolated_engine_session": session.isolated_session,
+                        "isolation_kind": session.isolation_kind.as_deref(),
+                    });
+                    if let Some(proof) = transport_proof {
+                        identity["transport_proof"] = proof;
+                    }
+                    object.insert("engine_identity".to_string(), identity);
                 }
                 Response::ok(data)
             }
@@ -1995,6 +2304,8 @@ struct SupervisorLaunchResult {
     engine: AdapterKind,
     stream_id: String,
     #[serde(default)]
+    vm_id: Option<String>,
+    #[serde(default)]
     actual_url: Option<String>,
     #[serde(default)]
     title: Option<String>,
@@ -2016,6 +2327,10 @@ struct SupervisorLaunchResult {
     control_service: Option<ControlServiceIdentity>,
     #[serde(default)]
     process: Option<Value>,
+    #[serde(default)]
+    transport_authority: Option<Value>,
+    #[serde(default)]
+    transport_receipt: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

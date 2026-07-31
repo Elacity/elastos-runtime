@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 
@@ -22,10 +23,14 @@ const VM_DIAGNOSTIC_ENV_KEYS = [
   "ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS",
   "ELASTOS_BROWSER_VM_DEBUG_HOLD_ON_OPEN_ERROR_MS",
 ];
-const VM_LAUNCHER_ENV_KEYS = ["ELASTOS_BROWSER_VM_TURNSERVER_BIN"];
+const VM_LAUNCHER_ENV_KEYS = [
+  "ELASTOS_BROWSER_VM_TURN_PROGRAM",
+  "ELASTOS_BROWSER_VM_TURNSERVER_BIN",
+];
 const REMOTE_VZ_PATH_ENV_KEYS = [
   "ELASTOS_BROWSER_REMOTE_VZ_DATA_DIR",
   "ELASTOS_BROWSER_REMOTE_VZ_TURN_ENV",
+  "ELASTOS_BROWSER_REMOTE_VZ_TURN_PROGRAM",
   "ELASTOS_BROWSER_REMOTE_VZ_PROFILE_ROOT",
 ];
 const VM_GUEST_READY_TIMEOUT_MS = "120000";
@@ -123,6 +128,14 @@ function isRemoteVzControlLauncher(launcher) {
   return path.basename(String(launcher || "")).startsWith("browser-vm-remote-vz-launcher");
 }
 
+function isVzControlLauncher(launcher) {
+  const name = path.basename(String(launcher || ""));
+  return (
+    name === "browser-vz-engine-supervisor" ||
+    name.startsWith("browser-vm-remote-vz-launcher")
+  );
+}
+
 function runtimeTurnEnvCandidates(args, env = process.env) {
   const candidates = [];
   if (env.ELASTOS_BROWSER_RUNTIME_TURN_ENV) {
@@ -207,6 +220,17 @@ function copyVmLauncherEnv(env, sourceEnv = process.env) {
     }
     env[key] = value;
   }
+}
+
+function copyVmVzTurnProgram(env, sourceEnv = process.env) {
+  const value = sourceEnv.ELASTOS_BROWSER_VM_TURN_PROGRAM;
+  if (value == null || value === "") return;
+  if (/[\r\n\0]/.test(value) || !path.isAbsolute(value)) {
+    throw new Error(
+      "ELASTOS_BROWSER_VM_TURN_PROGRAM must be an absolute path without control characters",
+    );
+  }
+  env.ELASTOS_BROWSER_VM_TURN_PROGRAM = value;
 }
 
 function copyRemoteVzPathEnv(env, sourceEnv = process.env) {
@@ -331,6 +355,147 @@ function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function writeOwnerOnlyJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  fs.chmodSync(file, 0o600);
+}
+
+function boundedIntegerEnv(env, name, fallback, minimum, maximum) {
+  const raw = env[name];
+  const value = raw == null || raw === "" ? fallback : Number(raw);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be ${minimum}..${maximum}`);
+  }
+  return value;
+}
+
+function browserVzTransportConfig(
+  platform,
+  env = process.env,
+  vzControlLauncher = false,
+  remoteVzControlLauncher = false,
+) {
+  if (
+    !vzControlLauncher ||
+    (platform !== "darwin-arm64" && !remoteVzControlLauncher)
+  ) {
+    return null;
+  }
+  const advertisedHost = String(
+    env.ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST ||
+      (platform === "darwin-arm64" && !remoteVzControlLauncher
+        ? "127.0.0.1"
+        : ""),
+  ).trim();
+  const relayHost = String(
+    env.ELASTOS_BROWSER_VZ_TURN_RELAY_HOST || advertisedHost,
+  ).trim();
+  if (!advertisedHost) {
+    throw new Error(
+      "remote VZ transport requires ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST",
+    );
+  }
+  if (
+    advertisedHost.length > 253 ||
+    /[\s\r\n\0/\\]/.test(advertisedHost)
+  ) {
+    throw new Error(
+      "ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST is invalid",
+    );
+  }
+  if (
+    net.isIP(relayHost) === 0 ||
+    relayHost.length > 253 ||
+    /[\s\r\n\0/\\]/.test(relayHost)
+  ) {
+    throw new Error(
+      "ELASTOS_BROWSER_VZ_TURN_RELAY_HOST must be a literal host IP",
+    );
+  }
+  return {
+    schema: "elastos.browser.vz-transport-config/v1",
+    enabled: true,
+    turn_listen_host: "127.0.0.1",
+    turn_advertised_host: advertisedHost,
+    turn_relay_host: relayHost,
+    turn_port_start: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_TURN_PORT_START",
+      49160,
+      1024,
+      65535,
+    ),
+    turn_port_end: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_TURN_PORT_END",
+      49223,
+      1024,
+      65535,
+    ),
+    turn_relay_port_start: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_TURN_RELAY_PORT_START",
+      55000,
+      1024,
+      65535,
+    ),
+    turn_relay_port_end: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_TURN_RELAY_PORT_END",
+      55999,
+      1024,
+      65535,
+    ),
+    turn_relay_block_size: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_TURN_RELAY_BLOCK_SIZE",
+      20,
+      2,
+      64,
+    ),
+    guest_turn_host: "127.0.0.1",
+    guest_turn_port: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_GUEST_TURN_PORT",
+      3478,
+      1,
+      65535,
+    ),
+    bootstrap_vsock_port: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_BOOTSTRAP_VSOCK_PORT",
+      19093,
+      1,
+      0xffffffff,
+    ),
+    egress_vsock_port: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_EGRESS_VSOCK_PORT",
+      19091,
+      1,
+      0xffffffff,
+    ),
+    media_vsock_port: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_MEDIA_VSOCK_PORT",
+      19094,
+      1,
+      0xffffffff,
+    ),
+    ttl_secs: boundedIntegerEnv(
+      env,
+      "ELASTOS_BROWSER_VZ_TRANSPORT_TTL_SECS",
+      600,
+      120,
+      3600,
+    ),
+  };
+}
+
 function runtimeGatewayPrivateTargets(env = process.env) {
   const raw = env.ELASTOS_BROWSER_RUNTIME_GATEWAY_PORTS || env.ELASTOS_BROWSER_RUNTIME_GATEWAY_PORT || "8090,61180";
   const ports = [...new Set(String(raw)
@@ -407,7 +572,7 @@ function browserLocalExit(relaySocket, { allowPrivateTargets = false } = {}) {
   };
 }
 
-function vmBrowserEngineAdapter(args, sourceEnv = process.env) {
+function vmBrowserEngineAdapter(args, sourceEnv = process.env, vzTransport = null) {
   const supervisor = args.vmSupervisor || path.join(args.dataDir, "bin/browser-vm-engine-supervisor");
   validateAbsolute("--vm-supervisor", supervisor);
   const controlSocket = args.vmControlSocket || `/tmp/elastos-browser-vm-control-${args.platform}.sock`;
@@ -445,19 +610,24 @@ function vmBrowserEngineAdapter(args, sourceEnv = process.env) {
     ELASTOS_BROWSER_VM_REUSE_IDLE_VMS: args.platform.startsWith("linux-")
       ? VM_LINUX_REUSE_IDLE_VMS
       : VM_REUSE_IDLE_VMS,
-    ELASTOS_BROWSER_VM_HIBERNATION: args.platform === "darwin-arm64" ? "1" : "0",
+    ELASTOS_BROWSER_VM_HIBERNATION:
+      args.platform === "darwin-arm64" && !vzTransport ? "1" : "0",
     ELASTOS_BROWSER_VM_HIBERNATION_DIR: path.join(args.dataDir, "browser-vm/hibernation"),
     ELASTOS_BROWSER_VM_HIBERNATION_MAX_ENTRIES: VM_HIBERNATION_MAX_ENTRIES,
     ELASTOS_BROWSER_VM_HIBERNATION_MAX_AGE_SECS: VM_HIBERNATION_MAX_AGE_SECS,
     ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE: "1",
   };
-  if (!remoteVzControlLauncher) {
+  if (!remoteVzControlLauncher && !vzTransport) {
     copyVmIceEnv(env, sourceEnv);
     copyVmMediaRelayEnv(env, args.platform, sourceEnv);
   }
   copyVmDiagnosticEnv(env, sourceEnv);
   if (!remoteVzControlLauncher) {
-    copyVmLauncherEnv(env, sourceEnv);
+    if (vzTransport) {
+      copyVmVzTurnProgram(env, sourceEnv);
+    } else {
+      copyVmLauncherEnv(env, sourceEnv);
+    }
   }
   if (remoteVzControlLauncher) {
     env.ELASTOS_BROWSER_REMOTE_VZ_LAUNCH_TIMEOUT_MS = VM_REMOTE_VZ_LAUNCH_TIMEOUT_MS;
@@ -508,7 +678,24 @@ function main() {
     const adapterSocket = `/tmp/elastos-browser-source-home-${args.platform}.sock`;
     const relaySocket = `/tmp/elastos-browser-source-home-${args.platform}-relay.sock`;
     const sourceEnv = runtimeTurnEnv(args);
-    const browserEngineAdapter = vmBrowserEngineAdapter(args, sourceEnv);
+    const selectedControlLauncher =
+      args.vmControlLauncher ||
+      (args.platform === "darwin-arm64"
+        ? path.join(args.dataDir, "bin/browser-vz-engine-supervisor")
+        : args.platform.startsWith("linux-")
+          ? path.join(args.dataDir, "bin/browser-vm-local-crosvm-launcher")
+          : "");
+    const vzTransport = browserVzTransportConfig(
+      args.platform,
+      process.env,
+      isVzControlLauncher(selectedControlLauncher),
+      isRemoteVzControlLauncher(selectedControlLauncher),
+    );
+    const browserEngineAdapter = vmBrowserEngineAdapter(
+      args,
+      sourceEnv,
+      vzTransport,
+    );
     const exitProvider = commonExitProvider(adapterSocket, relaySocket, {
       allowPrivateTargets: args.allowPrivateTargets === true,
     });
@@ -524,6 +711,34 @@ function main() {
     writeJson(path.join(outDir, "exit-provider.json"), exitProvider);
     writeJson(path.join(outDir, "browser-local-exit.json"), localExit);
     const files = ["browser-engine-adapter.json", "exit-provider.json", "browser-local-exit.json"];
+    if (vzTransport) {
+      if (vzTransport.turn_port_start > vzTransport.turn_port_end) {
+        throw new Error("Browser VZ TURN listener port range is invalid");
+      }
+      if (
+        vzTransport.turn_relay_port_start >
+          vzTransport.turn_relay_port_end ||
+        vzTransport.turn_relay_block_size >
+          vzTransport.turn_relay_port_end -
+            vzTransport.turn_relay_port_start +
+              1
+      ) {
+        throw new Error("Browser VZ TURN relay port range is invalid");
+      }
+      const ports = [
+        vzTransport.bootstrap_vsock_port,
+        vzTransport.egress_vsock_port,
+        vzTransport.media_vsock_port,
+      ];
+      if (new Set(ports).size !== ports.length) {
+        throw new Error("Browser VZ vsock ports must be distinct");
+      }
+      writeOwnerOnlyJson(
+        path.join(outDir, "browser-vz-vsock-transport.json"),
+        vzTransport,
+      );
+      files.push("browser-vz-vsock-transport.json");
+    }
     console.log(JSON.stringify({
       ok: true,
       schema: "elastos.browser.source-home-config/v1",

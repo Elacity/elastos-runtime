@@ -332,6 +332,15 @@ function hasCredentialedTurnIceServer(iceServers) {
   });
 }
 
+function runtimeRelayIceContractOk(displaySession) {
+  if (displaySession?.ice_connection_policy === "engine_relay_only") {
+    return displaySession?.offerer === "engine" &&
+      displaySession?.ice_servers === undefined;
+  }
+  return hasTurnIceServer(displaySession?.ice_servers) &&
+    hasCredentialedTurnIceServer(displaySession?.ice_servers);
+}
+
 function summarizeDisplaySession(displaySession) {
   const iceServers = Array.isArray(displaySession?.ice_servers)
     ? displaySession.ice_servers
@@ -343,6 +352,8 @@ function summarizeDisplaySession(displaySession) {
     display_backend: displaySession?.display_backend || null,
     backend_class: displaySession?.backend_class || null,
     offerer: displaySession?.offerer || null,
+    ice_connection_policy:
+      displaySession?.ice_connection_policy || null,
     ice_servers: iceServers.map((server) => ({
       urls: Array.isArray(server?.urls) ? server.urls : [server?.urls].filter(Boolean),
       username_present: (typeof server?.username === "string" && server.username.trim() !== "") ||
@@ -1592,13 +1603,8 @@ async function checkBrowserUiInput(context, browserToken, route) {
         displaySession,
       );
       assert(
-        hasTurnIceServer(displaySession.ice_servers),
-        "Browser WebRTC UI Runtime relay is missing a TURN ICE server",
-        displaySession,
-      );
-      assert(
-        hasCredentialedTurnIceServer(displaySession.ice_servers),
-        "Browser WebRTC UI Runtime relay TURN server is missing credentials",
+        runtimeRelayIceContractOk(displaySession),
+        "Browser WebRTC UI Runtime relay ICE contract is invalid",
         summarizeDisplaySession(displaySession),
       );
       const videoReady = await waitForBrowserRemoteVideo(appPage, {
@@ -1904,8 +1910,8 @@ async function holdBrowserUiForSetup(context, browserToken, route) {
         displaySession,
       );
       assert(
-        hasCredentialedTurnIceServer(displaySession.ice_servers),
-        "Browser setup UI Runtime relay TURN server is missing credentials",
+        runtimeRelayIceContractOk(displaySession),
+        "Browser setup UI Runtime relay ICE contract is invalid",
         summarizeDisplaySession(displaySession),
       );
       try {
@@ -2058,13 +2064,8 @@ async function checkBrowserEmbeddedUiInput(page) {
         displaySession,
       );
       assert(
-        hasTurnIceServer(displaySession.ice_servers),
-        "Embedded Browser WebRTC UI Runtime relay is missing a TURN ICE server",
-        displaySession,
-      );
-      assert(
-        hasCredentialedTurnIceServer(displaySession.ice_servers),
-        "Embedded Browser WebRTC UI Runtime relay TURN server is missing credentials",
+        runtimeRelayIceContractOk(displaySession),
+        "Embedded Browser WebRTC UI Runtime relay ICE contract is invalid",
         displaySession,
       );
       const videoReady = await waitForBrowserRemoteVideo(appFrame, {

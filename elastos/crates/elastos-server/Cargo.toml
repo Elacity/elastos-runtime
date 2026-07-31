@@ -56,6 +56,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Crypto (for content hashing in publish/sign commands)
 sha2 = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
 hex = "0.4"
 rand = "0.8"
 aes-gcm = "0.10"

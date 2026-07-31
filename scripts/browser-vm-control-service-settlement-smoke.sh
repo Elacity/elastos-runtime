@@ -36,13 +36,16 @@ const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 const launch = body.launch_request;
 const proofDir = process.env.PERSISTENT_LAUNCHER_PROOF_DIR;
 const suffix = launch.stream_id.replace(/[^A-Za-z0-9_-]/g, "_");
-const pageId = `page:settlement-${suffix}`;
+const pageId = launch.page_id || `page:settlement-${suffix}`;
 const controlSocketPath = `${proofDir}/${suffix}.sock`;
 const pidPath = `${proofDir}/${suffix}.pid`;
 if (process.env.LAUNCH_MARKER_PATH) {
   fs.appendFileSync(process.env.LAUNCH_MARKER_PATH, `${launch.stream_id}\n`);
 }
 fs.writeFileSync(pidPath, `${process.pid}\n`, { mode: 0o600 });
+if (process.env.FAIL_TRANSPORT_LAUNCH === "1" && launch.transport_authority) {
+  process.exit(23);
+}
 
 const sendJson = (res, status, value) => {
   const bytes = Buffer.from(JSON.stringify(value));
@@ -75,12 +78,44 @@ process.once("SIGTERM", terminate);
 process.once("SIGINT", terminate);
 
 guest.listen(controlSocketPath, () => {
+  const transportReceipt = launch.transport_authority
+    ? {
+        schema: "elastos.browser.vz-transport-effect-receipt/v1",
+        binding_hash: launch.transport_authority.binding_hash,
+        generation: launch.transport_authority.generation,
+        page_id: launch.transport_authority.page_id,
+        vm_id: launch.transport_authority.vm_id,
+        expires_at_unix_ms:
+          launch.transport_authority.expires_at_unix_ms,
+        terminal: true,
+        effects: {
+          vz_network_devices_zero: true,
+          guest_bootstrap_validated: true,
+          guest_loopback_only: true,
+          guest_interfaces: ["lo"],
+          guest_default_route_absent: true,
+          guest_direct_network_absent: true,
+          ordinary_stream_fixed_target: true,
+          media_stream_fixed_target: true,
+          turn_launch_owned: true,
+          turn_listener_loopback: true,
+          hibernation_disabled: true,
+        },
+      }
+    : undefined;
   process.stdout.write(`${JSON.stringify({
     schema: "elastos.browser.engine.supervisor-result/v1",
     page_id: pageId,
     adapter: launch.adapter,
     engine: launch.engine,
     stream_id: launch.stream_id,
+    ...(launch.transport_authority
+      ? {
+          vm_id: launch.vm_id,
+          transport_authority: launch.transport_authority,
+          transport_receipt: transportReceipt,
+        }
+      : {}),
     actual_url: launch.url,
     title: "Browser VM Settlement Smoke",
     network_mode: "runtime_net_only",
@@ -118,6 +153,9 @@ guest.listen(controlSocketPath, () => {
       display_backend: "vm_selkies_gstreamer_webrtc",
       backend_class: "product_compositor",
       media_transport: "runtime_relay",
+      ...(launch.transport_authority
+        ? { ice_connection_policy: "engine_relay_only" }
+        : {}),
       audio: true,
       video: true,
       network_mode: "runtime_net_only",
@@ -175,6 +213,7 @@ start_service() {
   PERSISTENT_LAUNCHER_PROOF_DIR="$proof_dir" \
   SHUTDOWN_STATE_FILE="$tmp_dir/shutdown-state" \
   LAUNCH_MARKER_PATH="$launch_marker" \
+  FAIL_TRANSPORT_LAUNCH="${FAIL_TRANSPORT_LAUNCH:-}" \
     "$node_bin" "$repo_root/scripts/browser-vm-control-service.mjs" \
       > "$tmp_dir/${label}.out" 2> "$tmp_dir/${label}.err" &
   service_pid=$!
@@ -198,10 +237,101 @@ cat > "$client" <<'NODE'
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 
 const socketPath = process.env.CONTROL_SOCKET;
 const streamId = process.env.STREAM_ID;
 const principalId = "person:local:vm-settlement-smoke";
+const transportEnabled = process.env.TRANSPORT === "1";
+let issuedTransportSecret = null;
+let issuedTransportAuthority = null;
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalJson(value[key])]),
+    );
+  }
+  return value;
+}
+
+function sha256Label(value) {
+  return `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
+}
+
+function generation(id) {
+  return transportEnabled
+    ? sha256Label(Buffer.from(id))
+    : `sha256:${id}`;
+}
+
+function transportBinding(id) {
+  const expiresAtUnixMs = (Math.floor(Date.now() / 1000) + 300) * 1000;
+  const authSecret = crypto.randomBytes(32).toString("base64url");
+  const username = `${expiresAtUnixMs / 1000}:settlement`;
+  const credential = crypto
+    .createHmac("sha1", authSecret)
+    .update(username)
+    .digest("base64");
+  const authority = {
+    schema: "elastos.browser.vz-transport-authority/v1",
+    generation: generation(id),
+    page_id: `page:vz-${sha256Label(Buffer.from(id)).slice(7, 23)}`,
+    vm_id: `vm:vz-${sha256Label(Buffer.from(`${id}:vm`)).slice(7, 23)}`,
+    principal_id: principalId,
+    egress: {
+      schema: "elastos.browser.vz-transport-stream/v1",
+      stream_id: id,
+      target: "tls://settlement.invalid:443",
+      runtime_socket_path: "/tmp/vz-settlement-egress.sock",
+      vsock_port: 19091,
+    },
+    media: {
+      schema: "elastos.browser.vz-transport-stream/v1",
+      stream_id: `stream:vz-media-${sha256Label(Buffer.from(id)).slice(7, 23)}`,
+      target: "tcp://127.0.0.1:49991",
+      runtime_socket_path: "/tmp/vz-settlement-media.sock",
+      vsock_port: 19094,
+    },
+    turn: {
+      schema: "elastos.browser.vz-turn-authority/v1",
+      guest_url: "turn:127.0.0.1:3478?transport=tcp",
+      guest_host: "127.0.0.1",
+      guest_port: 3478,
+      listen_host: "127.0.0.1",
+      listen_port: 49991,
+      advertised_host: "127.0.0.1",
+      relay_host: "127.0.0.1",
+      relay_port_min: 49992,
+      relay_port_max: 49995,
+      protocols: ["turn", "tcp"],
+      username,
+      credential_hash: sha256Label(Buffer.from(credential)),
+      auth_secret_hash: sha256Label(Buffer.from(authSecret)),
+    },
+    bootstrap_vsock_port: 19093,
+    expires_at_unix_ms: expiresAtUnixMs,
+  };
+  authority.binding_hash = sha256Label(
+    Buffer.from(JSON.stringify(canonicalJson(authority))),
+  );
+  issuedTransportAuthority = authority;
+  issuedTransportSecret = { credential, auth_secret: authSecret };
+  return {
+    page_id: authority.page_id,
+    vm_id: authority.vm_id,
+    transport_authority: authority,
+    transport_secret: {
+      schema: "elastos.browser.vz-transport-secret/v1",
+      binding_hash: authority.binding_hash,
+      credential,
+      auth_secret: authSecret,
+    },
+  };
+}
 
 function requestRaw(method, route, body) {
   const bytes = body ? Buffer.from(JSON.stringify(body)) : Buffer.alloc(0);
@@ -245,6 +375,7 @@ function openBody(id) {
     disk_path: "/tmp/elastos-browser-settlement/profile.ext4",
     reset: "whole_profile",
   };
+  const transport = transportEnabled ? transportBinding(id) : {};
   return {
     schema: "elastos.browser.vm-engine.open/v1",
     launch_request: {
@@ -253,7 +384,7 @@ function openBody(id) {
       engine: "chromium_microvm",
       url: "https://settlement.invalid/",
       stream_id: id,
-      lifecycle_generation: `sha256:${id}`,
+      lifecycle_generation: generation(id),
       target: "tls://settlement.invalid:443",
       principal_id: principalId,
       profile,
@@ -262,6 +393,7 @@ function openBody(id) {
       wallet_injection: false,
       display_mode: "webrtc_remote_display",
       guarantee_level: "mechanism_microvm",
+      ...transport,
     },
     requirements: {
       substrate: "microvm",
@@ -279,7 +411,7 @@ function cleanupBinding(page) {
   return {
     schema: "elastos.browser.engine-cleanup-binding/v2",
     page_id: page.page_id,
-    generation: `sha256:${page.stream_id}`,
+    generation: generation(page.stream_id),
     stream_id: page.stream_id,
     adapter: page.adapter,
     engine: page.engine,
@@ -292,6 +424,12 @@ function cleanupBinding(page) {
     isolation: page.isolation,
     control_service: page.control_service,
     process: page.process,
+    ...(page.transport_authority
+      ? {
+          transport_authority: page.transport_authority,
+          transport_receipt: page.transport_receipt,
+        }
+      : {}),
   };
 }
 
@@ -306,8 +444,11 @@ function closeBody(page) {
 const reconcile = (id) =>
   request("POST", "/launches/reconcile", {
     schema: "elastos.browser.vm-control-service.reconcile-launch/v1",
-    lifecycle_generation: `sha256:${id}`,
+    lifecycle_generation: generation(id),
     stream_id: id,
+    ...(transportEnabled
+      ? { transport_authority: issuedTransportAuthority }
+      : {}),
   });
 
 const processAlive = (pid) => {
@@ -462,6 +603,162 @@ if (process.env.PHASE === "cleanup-retry") {
   if (fs.existsSync(process.env.LAUNCH_MARKER_PATH)) {
     throw new Error("capacity rejection dispatched the launcher");
   }
+} else if (process.env.PHASE === "transport-cleanup") {
+  const page = await request("POST", "/pages", openBody(streamId));
+  if (
+    page.page_id !== page.transport_authority?.page_id ||
+    page.transport_receipt?.terminal !== true ||
+    page.transport_receipt?.effects?.vz_network_devices_zero !== true
+  ) {
+    throw new Error(
+      `transport launch did not echo its exact effect receipt: ${JSON.stringify(page)}`,
+    );
+  }
+  const journalBefore = fs.readFileSync(process.env.JOURNAL_PATH, "utf8");
+  if (
+    journalBefore.includes(
+      page.transport_authority.turn.credential_hash,
+    ) === false ||
+    journalBefore.includes('"auth_secret":') ||
+    journalBefore.includes('"transport_secret":') ||
+    journalBefore.includes(issuedTransportSecret.credential) ||
+    journalBefore.includes(issuedTransportSecret.auth_secret)
+  ) {
+    throw new Error("transport journal secret posture is invalid");
+  }
+
+  const malformedClose = structuredClone(closeBody(page));
+  malformedClose.runtime_cleanup.transport_receipt.effects.turn_launch_owned =
+    false;
+  const rejected = await requestRaw(
+    "POST",
+    "/shutdown",
+    malformedClose,
+  );
+  if (
+    rejected.status !== 400 ||
+    !String(rejected.body.error || "").includes(
+      "transport effect receipt",
+    )
+  ) {
+    throw new Error(
+      `malformed transport cleanup receipt did not fail closed: ${JSON.stringify(rejected)}`,
+    );
+  }
+  const retained = await request("GET", "/status");
+  if (
+    retained.active_pages !== 1 ||
+    !processAlive(page.process.pid) ||
+    !fs.existsSync(page.control_socket_path)
+  ) {
+    throw new Error(
+      `malformed transport receipt released cleanup ownership: ${JSON.stringify(retained)}`,
+    );
+  }
+
+  const unexpectedTurnListener = net.createServer();
+  await new Promise((resolve, reject) => {
+    unexpectedTurnListener.once("error", reject);
+    unexpectedTurnListener.listen(
+      page.transport_authority.turn.listen_port,
+      page.transport_authority.turn.listen_host,
+      resolve,
+    );
+  });
+  const indeterminate = await requestRaw(
+    "POST",
+    "/shutdown",
+    closeBody(page),
+  );
+  if (
+    indeterminate.status !== 400 ||
+    !String(indeterminate.body.error || "").includes(
+      "turn_listener_absent",
+    )
+  ) {
+    throw new Error(
+      `live TURN listener did not retain cleanup ownership: ${JSON.stringify(indeterminate)}`,
+    );
+  }
+  await new Promise((resolve) =>
+    unexpectedTurnListener.close(resolve),
+  );
+
+  const terminal = await request("POST", "/shutdown", closeBody(page));
+  const requiredEffects = [
+    "transport_session_absent",
+    "turn_process_absent",
+    "turn_listener_absent",
+    "turn_relay_ports_absent",
+    "ordinary_vsock_bridge_absent",
+    "media_vsock_bridge_absent",
+    "bootstrap_vsock_bridge_absent",
+    "hibernation_state_absent",
+  ];
+  if (
+    terminal.terminal !== true ||
+    requiredEffects.some((key) => terminal.effects?.[key] !== true)
+  ) {
+    throw new Error(
+      `transport cleanup was not terminal: ${JSON.stringify(terminal)}`,
+    );
+  }
+  const durable = await reconcile(streamId);
+  if (
+    durable.state !== "terminal_post_effect_cleanup" ||
+    durable.terminal_cleanup_receipt?.schema !==
+      "elastos.browser.supervisor-cleanup-result/v2" ||
+    requiredEffects.some(
+      (key) =>
+        durable.terminal_cleanup_receipt?.effects?.[key] !== true,
+    ) ||
+    durable.terminal_cleanup_receipt?.binding?.transport_authority
+      ?.binding_hash !== page.transport_authority.binding_hash
+  ) {
+    throw new Error(
+      `transport terminal cleanup was not durable: ${JSON.stringify(durable)}`,
+    );
+  }
+  const journalAfter = fs.readFileSync(process.env.JOURNAL_PATH, "utf8");
+  if (
+    journalAfter.includes('"auth_secret":') ||
+    journalAfter.includes('"transport_secret":')
+  ) {
+    throw new Error("transport terminal journal persisted a launch secret");
+  }
+} else if (process.env.PHASE === "transport-launch-failure") {
+  const failed = await requestRaw("POST", "/pages", openBody(streamId));
+  if (
+    failed.status !== 400 ||
+    !String(failed.body.error || "").includes(
+      "persistent launcher exited before readiness",
+    )
+  ) {
+    throw new Error(
+      `injected transport launcher failure was not surfaced: ${JSON.stringify(failed)}`,
+    );
+  }
+  const pending = await reconcile(streamId);
+  if (
+    pending.state !== "cleanup_pending" ||
+    pending.launch.lifecycle_generation !== generation(streamId) ||
+    pending.transport_authority?.binding_hash !==
+      issuedTransportAuthority.binding_hash
+  ) {
+    throw new Error(
+      `dispatched transport failure did not retain exact cleanup ownership: ${JSON.stringify(pending)}`,
+    );
+  }
+  const journal = fs.readFileSync(process.env.JOURNAL_PATH, "utf8");
+  if (
+    !journal.includes(issuedTransportAuthority.binding_hash) ||
+    journal.includes(issuedTransportSecret.credential) ||
+    journal.includes(issuedTransportSecret.auth_secret)
+  ) {
+    throw new Error(
+      "dispatched transport failure journal lost its binding or persisted a secret",
+    );
+  }
 } else {
   throw new Error(`unknown settlement phase: ${process.env.PHASE}`);
 }
@@ -542,6 +839,30 @@ STREAM_ID="stream:capacity-overflow-130" \
 JOURNAL_PATH="$capacity_journal" \
 LAUNCH_MARKER_PATH="$launch_marker" \
 PHASE="capacity" \
+  "$node_bin" "$client"
+stop_service
+
+transport_failure_socket="$tmp_dir/transport-failure-control.sock"
+transport_failure_journal="${transport_failure_socket}.launch-reconciliations.json"
+FAIL_TRANSPORT_LAUNCH=1 \
+  start_service "$transport_failure_socket" "" "transport-failure-service"
+CONTROL_SOCKET="$transport_failure_socket" \
+STREAM_ID="stream:transport-launch-failure" \
+JOURNAL_PATH="$transport_failure_journal" \
+PHASE="transport-launch-failure" \
+TRANSPORT=1 \
+  "$node_bin" "$client"
+stop_service
+unset FAIL_TRANSPORT_LAUNCH
+
+transport_socket="$tmp_dir/transport-control.sock"
+transport_journal="${transport_socket}.launch-reconciliations.json"
+start_service "$transport_socket" "" "transport-service"
+CONTROL_SOCKET="$transport_socket" \
+STREAM_ID="stream:transport-settlement" \
+JOURNAL_PATH="$transport_journal" \
+PHASE="transport-cleanup" \
+TRANSPORT=1 \
   "$node_bin" "$client"
 stop_service
 

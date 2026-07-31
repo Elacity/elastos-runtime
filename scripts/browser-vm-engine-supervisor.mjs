@@ -17,6 +17,7 @@ const CONTROL_LAUNCHER_ENV = "ELASTOS_BROWSER_VM_CONTROL_LAUNCHER";
 const ROOT_ENV = "ELASTOS_BROWSER_VM_ROOT";
 const DATA_DIR_ENV = "ELASTOS_BROWSER_VM_DATA_DIR";
 const PLATFORM_ENV = "ELASTOS_BROWSER_VM_PLATFORM";
+const MAX_ENGINE_LAUNCH_REQUEST_BYTES = 64 * 1024;
 const STARTUP_LOCK_WAIT_MS = 7000;
 const INVOCATION_ONLY_VM_ENV = new Set([
   "ELASTOS_BROWSER_VM_OPEN_REQUEST",
@@ -49,13 +50,56 @@ function fail(error) {
   process.exit(1);
 }
 
-function parseJsonEnv(name) {
-  const raw = process.env[name];
-  if (!raw) fail(`${name} is required`);
+function parseJson(raw, label) {
+  if (Buffer.byteLength(raw) > MAX_ENGINE_LAUNCH_REQUEST_BYTES) {
+    fail(`${label} exceeds its bounded size`);
+  }
   try {
     return JSON.parse(raw);
   } catch (error) {
-    fail(`${name} is invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    fail(`${label} is invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function parseJsonEnv(name) {
+  const raw = process.env[name];
+  if (!raw) fail(`${name} is required`);
+  return parseJson(raw, name);
+}
+
+async function readPrivateTransportRequest() {
+  const chunks = [];
+  let length = 0;
+  for await (const chunk of process.stdin) {
+    length += chunk.length;
+    if (length > MAX_ENGINE_LAUNCH_REQUEST_BYTES) {
+      fail("Browser VZ private launch request exceeds its bounded size");
+    }
+    chunks.push(chunk);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) fail("Browser VZ private launch request is required");
+  return parseJson(raw, "Browser VZ private launch request");
+}
+
+function validateRequestTransport(request, fromPrivateStdin) {
+  const transportFields = [
+    "page_id",
+    "vm_id",
+    "transport_authority",
+    "transport_secret",
+  ];
+  const present = transportFields.filter((field) =>
+    Object.prototype.hasOwnProperty.call(request, field)
+  );
+  if (present.length !== 0 && present.length !== transportFields.length) {
+    fail("Browser VZ transport launch request is incomplete");
+  }
+  if (fromPrivateStdin && present.length !== transportFields.length) {
+    fail("Browser VM private stdin is reserved for VZ transport launches");
+  }
+  if (!fromPrivateStdin && present.length !== 0) {
+    fail("Browser VZ transport launch request must use private stdin");
   }
 }
 
@@ -965,7 +1009,11 @@ async function main() {
     return;
   }
 
-  const request = parseJsonEnv(REQUEST_ENV);
+  const fromPrivateStdin = !hasLaunchRequest;
+  const request = fromPrivateStdin
+    ? await readPrivateTransportRequest()
+    : parseJsonEnv(REQUEST_ENV);
+  validateRequestTransport(request, fromPrivateStdin);
   validateLaunchRequest(request);
 
   const sessionDir = path.join(root, sessionSuffix(request.stream_id));

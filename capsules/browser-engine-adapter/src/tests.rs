@@ -1349,6 +1349,8 @@ fn launch_reaps_stale_isolated_vm_session_before_capacity_check() {
             isolation_kind: Some("per_launch_vm_target".to_string()),
             control_service: None,
             process: None,
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -1401,6 +1403,8 @@ fn status_reaps_isolated_vm_session_when_control_socket_is_gone() {
             isolation_kind: Some("per_launch_vm_target".to_string()),
             control_service: None,
             process: None,
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -1446,6 +1450,7 @@ fn launch_reconciliation_recovers_durable_cleanup_binding_without_supervisor_res
         generation,
         stream_id,
         Some("browser-vm-product"),
+        None,
     ))
     .unwrap();
 
@@ -1558,6 +1563,7 @@ fn launch_reconciliation_rejects_durable_cleanup_binding_substitutions() {
             &generation,
             &stream_id,
             Some("browser-vm-product"),
+            None,
         ))
         .unwrap();
 
@@ -1623,6 +1629,7 @@ fn launch_reconciliation_uses_only_the_selected_durable_effect_candidate() {
         generation,
         stream_id,
         Some("browser-vm-a"),
+        None,
     ))
     .unwrap();
 
@@ -1684,6 +1691,7 @@ fn launch_reconciliation_ignores_an_unrelated_service_outage() {
         generation,
         stream_id,
         Some("browser-vm-a"),
+        None,
     ))
     .unwrap();
 
@@ -1752,6 +1760,7 @@ fn launch_reconciliation_did_not_act_uses_only_the_selected_control_service() {
         generation,
         stream_id,
         Some("browser-vm-a"),
+        None,
     ))
     .unwrap();
 
@@ -1797,6 +1806,7 @@ fn launch_reconciliation_accepts_exact_selected_did_not_act_proof() {
         generation,
         stream_id,
         Some("browser-vm-product"),
+        None,
     ))
     .unwrap();
 
@@ -1827,6 +1837,7 @@ fn launch_reconciliation_without_selected_adapter_stays_pending() {
         None,
         "sha256:legacy-unbound-adapter",
         "stream:legacy-unbound-adapter",
+        None,
         None,
     ))
     .unwrap();
@@ -1884,6 +1895,8 @@ fn launch_reconciliation_with_stale_in_memory_service_identity_stays_pending() {
                 config_fingerprint: None,
             }),
             process: Some(test_host_process_binding()),
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -1892,6 +1905,7 @@ fn launch_reconciliation_with_stale_in_memory_service_identity_stays_pending() {
         generation,
         stream_id,
         Some("browser-vm-product"),
+        None,
     ))
     .unwrap();
 
@@ -1937,6 +1951,7 @@ fn launch_reconciliation_accepts_restart_persistent_terminal_cleanup_proof() {
         generation,
         stream_id,
         Some("browser-vm-product"),
+        None,
     ))
     .unwrap();
 
@@ -1970,6 +1985,7 @@ fn launch_reconciliation_is_bounded_when_control_service_is_unresponsive() {
         "sha256:unresponsive-reconciliation",
         "stream:unresponsive-reconciliation",
         Some("browser-vm-product"),
+        None,
     ))
     .unwrap();
 
@@ -2059,6 +2075,8 @@ fn close_page_missing_adapter_map_with_live_child_remains_indeterminate() {
         isolation: None,
         control_service: None,
         process: Some(json!({"pid": child.id(), "stream_bridge_pid": null})),
+        transport_authority: None,
+        transport_receipt: None,
     };
     let mut provider = BrowserEngineAdapter::new();
 
@@ -2095,6 +2113,8 @@ fn exact_typed_already_absent_supervisor_proof_is_terminal() {
         isolation_kind: None,
         control_service: None,
         process: None,
+        transport_authority: None,
+        transport_receipt: None,
     };
     let binding = engine_cleanup_binding("page:typed-absent", &session);
     let receipt = json!({
@@ -2137,6 +2157,8 @@ fn page_operations_reject_mismatched_principal() {
             isolation_kind: None,
             control_service: None,
             process: None,
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -2196,6 +2218,8 @@ fn close_page_retains_non_isolated_session_when_close_fails() {
             isolation_kind: None,
             control_service: None,
             process: None,
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -2235,6 +2259,8 @@ fn close_page_retains_isolated_session_when_shutdown_and_cleanup_fail() {
             isolation_kind: Some("per_launch_selkies_target".to_string()),
             control_service: None,
             process: None,
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -2287,6 +2313,8 @@ fn page_status_includes_redacted_engine_identity() {
             isolation_kind: Some("per_launch_vm_target".to_string()),
             control_service: None,
             process: None,
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -2390,6 +2418,8 @@ fn isolated_close_uses_target_shutdown_contract() {
             isolation_kind: Some("per_launch_selkies_target".to_string()),
             control_service: None,
             process: None,
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -2479,6 +2509,8 @@ fn vm_isolated_close_uses_global_shutdown_socket() {
             isolation_kind: Some("per_launch_vm_target".to_string()),
             control_service: Some(test_control_service_identity_typed(&socket_path)),
             process: Some(test_host_process_binding()),
+            transport_authority: None,
+            transport_receipt: None,
         },
     );
 
@@ -2503,6 +2535,9 @@ fn supervisor_accepts_vm_isolation_kind() {
         adapter: "browser-vm-product".to_string(),
         engine: AdapterKind::ChromiumMicrovm,
         stream_id: "stream:proof:test".to_string(),
+        vm_id: None,
+        transport_authority: None,
+        transport_receipt: None,
         actual_url: None,
         title: None,
         network_mode: AdapterNetworkMode::RuntimeNetOnly,
@@ -2551,6 +2586,7 @@ fn supervisor_accepts_vm_isolation_kind() {
         &adapter,
         "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
+        None,
     )
     .unwrap();
 }
@@ -2563,6 +2599,9 @@ fn supervisor_rejects_video_only_vm_product_display() {
         adapter: "browser-vm-product".to_string(),
         engine: AdapterKind::ChromiumMicrovm,
         stream_id: "stream:proof:test".to_string(),
+        vm_id: None,
+        transport_authority: None,
+        transport_receipt: None,
         actual_url: None,
         title: None,
         network_mode: AdapterNetworkMode::RuntimeNetOnly,
@@ -2611,6 +2650,7 @@ fn supervisor_rejects_video_only_vm_product_display() {
         &adapter,
         "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
+        None,
     )
     .unwrap_err();
     assert_eq!(
@@ -2627,6 +2667,9 @@ fn supervisor_rejects_vm_product_display_without_video() {
         adapter: "browser-vm-product".to_string(),
         engine: AdapterKind::ChromiumMicrovm,
         stream_id: "stream:proof:test".to_string(),
+        vm_id: None,
+        transport_authority: None,
+        transport_receipt: None,
         actual_url: None,
         title: None,
         network_mode: AdapterNetworkMode::RuntimeNetOnly,
@@ -2675,6 +2718,7 @@ fn supervisor_rejects_vm_product_display_without_video() {
         &adapter,
         "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
+        None,
     )
     .unwrap_err();
     assert_eq!(
@@ -2691,6 +2735,9 @@ fn supervisor_rejects_non_relay_vm_media_transport() {
         adapter: "browser-vm-product".to_string(),
         engine: AdapterKind::ChromiumMicrovm,
         stream_id: "stream:proof:test".to_string(),
+        vm_id: None,
+        transport_authority: None,
+        transport_receipt: None,
         actual_url: None,
         title: None,
         network_mode: AdapterNetworkMode::RuntimeNetOnly,
@@ -2740,6 +2787,7 @@ fn supervisor_rejects_non_relay_vm_media_transport() {
         &adapter,
         "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
+        None,
     )
     .unwrap_err();
     assert_eq!(
@@ -2756,6 +2804,9 @@ fn vm_isolation_requires_runtime_relay_media_transport() {
         adapter: "browser-vm-product".to_string(),
         engine: AdapterKind::ChromiumMicrovm,
         stream_id: "stream:proof:test".to_string(),
+        vm_id: None,
+        transport_authority: None,
+        transport_receipt: None,
         actual_url: None,
         title: None,
         network_mode: AdapterNetworkMode::RuntimeNetOnly,
@@ -2803,6 +2854,7 @@ fn vm_isolation_requires_runtime_relay_media_transport() {
         &adapter,
         "stream:proof:test",
         BrowserDisplayMode::WebrtcRemoteDisplay,
+        None,
     )
     .unwrap_err();
     assert_eq!(
@@ -2940,6 +2992,9 @@ fn native_surface_supervisor_result_requires_view_geometry() {
         adapter: "linux-cef".to_string(),
         engine: AdapterKind::Cef,
         stream_id: "stream:proof:test".to_string(),
+        vm_id: None,
+        transport_authority: None,
+        transport_receipt: None,
         actual_url: None,
         title: None,
         network_mode: AdapterNetworkMode::RuntimeNetOnly,
@@ -2979,6 +3034,7 @@ fn native_surface_supervisor_result_requires_view_geometry() {
         &adapter,
         "stream:proof:test",
         BrowserDisplayMode::NativeSurface,
+        None,
     )
     .unwrap_err();
     assert_eq!(

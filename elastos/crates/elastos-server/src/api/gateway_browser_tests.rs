@@ -21,6 +21,7 @@ fn test_browser_engine_cleanup(page_id: &str) -> BrowserEngineCleanup {
         engine_adapter: "mock-adapter".to_string(),
         engine: "mock-engine".to_string(),
         stream_id: "stream:test".to_string(),
+        transport_authority: None,
         provider_cleanup: json!({
             "schema": BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
             page_id: page_id.to_string(),

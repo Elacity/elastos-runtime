@@ -762,6 +762,7 @@ mod tests {
             data_disk_path: None,
             vsock_cid: 3,
             network: None,
+            network_disabled: false,
             interactive_stdio: false,
             carrier_socket_path: None,
             initramfs_path: None,

@@ -124,21 +124,31 @@ impl BuiltMachine {
         //   typed fail-closed. NO silent NAT downgrade — the
         //   capsule explicitly asked for routable networking
         //   and must either get it or be told why it can't.
-        let network = match vm.network.as_ref() {
-            None => build_nat_network(),
-            Some(net_cfg) => {
-                if !has_vm_networking_entitlement() {
-                    return Err(format!(
-                        "vz machine builder: capsule '{}' requested guest_network (bridged \
+        if vm.network_disabled && vm.network.is_some() {
+            return Err(
+                "vz machine builder: network_disabled conflicts with guest_network".to_string(),
+            );
+        }
+        let network = if vm.network_disabled {
+            None
+        } else {
+            Some(match vm.network.as_ref() {
+                None => build_nat_network(),
+                Some(net_cfg) => {
+                    if !has_vm_networking_entitlement() {
+                        return Err(format!(
+                            "vz machine builder: capsule '{}' requested guest_network (bridged \
                          attachment) but this binary lacks the `com.apple.vm.networking` Apple \
                          entitlement. Drop `permissions.guest_network` from the manifest, OR \
                          install the signed dev build that carries the entitlement. See \
                          docs/MAC.md.",
-                        vm.vm_id
-                    ));
+                            vm.vm_id
+                        ));
+                    }
+                    build_bridged_network(net_cfg)
+                        .map_err(|e| format!("vz machine builder: {e}"))?
                 }
-                build_bridged_network(net_cfg).map_err(|e| format!("vz machine builder: {e}"))?
-            }
+            })
         };
         let entropy = build_entropy_device();
         let balloon = build_balloon_device();
@@ -184,8 +194,12 @@ impl BuiltMachine {
         let socket_devices = NSArray::from_retained_slice(&[vsock.clone().into_super()]);
         unsafe { cfg.setSocketDevices(&socket_devices) };
 
-        // Network — NAT by default; bridged when explicitly configured.
-        let network_devices = NSArray::from_retained_slice(&[network.clone().into_super()]);
+        // Network — explicitly empty for no-NIC VMs, otherwise NAT by default
+        // or bridged when explicitly configured.
+        let network_devices = match network.as_ref() {
+            Some(network) => NSArray::from_retained_slice(&[network.clone().into_super()]),
+            None => NSArray::new(),
+        };
         unsafe { cfg.setNetworkDevices(&network_devices) };
 
         // Entropy.
@@ -251,6 +265,7 @@ mod tests {
             data_disk_path: None,
             vsock_cid: 3,
             network: None,
+            network_disabled: false,
             interactive_stdio: false,
             carrier_socket_path: None,
             initramfs_path: None,
@@ -404,6 +419,20 @@ mod tests {
         assert_eq!(unsafe { cfg.networkDevices() }.count(), 1);
         assert_eq!(unsafe { cfg.entropyDevices() }.count(), 1);
         assert_eq!(unsafe { cfg.memoryBalloonDevices() }.count(), 1);
+    }
+
+    #[test]
+    fn from_vm_config_can_attach_zero_network_devices() {
+        let tmp = TempDir::new().unwrap();
+        let kernel = write_fake_kernel(tmp.path());
+        let rootfs = write_fake_disk(tmp.path(), "rootfs.img");
+        let mut vm = make_vm_config(&kernel, &rootfs);
+        vm.network_disabled = true;
+        let provider = make_vz_config(tmp.path().join("vz-state"), kernel);
+
+        let built = BuiltMachine::from_vm_config(&vm, &provider).unwrap();
+
+        assert_eq!(unsafe { built.vz_config.networkDevices() }.count(), 0);
     }
 
     // --------------------------------------------------------------

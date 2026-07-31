@@ -385,7 +385,8 @@ assert(
       "Runtime cleanup is pending for the acquired Browser session.",
     ) &&
     browserSource.includes('const iceTransportPolicy =') &&
-    browserSource.includes('displaySession.media_transport === "runtime_relay" ? "relay" : "all"') &&
+    browserSource.includes('displaySession.media_transport === "runtime_relay" && !engineRelayOnly') &&
+    browserSource.includes('displaySession.ice_connection_policy === "engine_relay_only"') &&
     browserSource.includes("iceTransportPolicy,") &&
     browserSource.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
     browserSource.includes("await onRecoveryRequired(message, options)") &&
