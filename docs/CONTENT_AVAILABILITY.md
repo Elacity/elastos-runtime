@@ -31,7 +31,7 @@ Clean placement:
 | Layer | Responsibility |
 |---|---|
 | Runtime | capability checks, principal/session binding, provider dispatch, audit |
-| Carrier | secure peer discovery, coordination, object/message/stream transport |
+| Carrier | endpoint-authenticated peer discovery, coordination, and object/message/stream transport |
 | Content provider | publish/fetch/status/replicate/repair policy and receipts |
 | IPLD | content-addressed object graph and manifest data model |
 | IPFS/Kubo | first block/CID backend for local add, pin, cat, and fetch |

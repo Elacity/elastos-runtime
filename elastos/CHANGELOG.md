@@ -61,9 +61,6 @@ continuation. These changes are not part of the 0.5.0 release history.
 - Browser is included in 0.6.0, but is not claimed fully reliable. The accepted
   localhost proof covers launch, display, navigation, and injected account
   access; it is not a general product-readiness claim for every target or site.
-- A user-observed account-access attempt produced the yellow approval
-  notification without a visible Inbox item even though deterministic proof
-  separately confirmed exactly one pending Wallet approval.
 - Browser restart remains intermittent: one observed restart failed and the
   next opened. The `ela.city` login did not survive the restart, and current
   Browser performance is slow.

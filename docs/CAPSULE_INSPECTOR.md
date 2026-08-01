@@ -1,162 +1,83 @@
 # Capsule Inspector
 
-Capsule Inspector is the Runtime-owned live object mirror for ElastOS capsules
-and providers. It borrows the useful part of Self's object world: running
-objects should be inspectable as objects, with identity, authority, provenance,
-state, and affordances visible in one place.
+Capsule Inspector is Runtime's permissioned, metadata-only view of capsules and
+providers. It exposes facts and action previews without giving the viewer
+provider authority.
 
-It does not copy Self's trusted-process security model. Inspector is
-fail-closed and permissioned:
+## Scope
 
-- `elastos://inspect/*` is the privileged System-wide mirror.
-- `elastos://inspect/self` is the pure SelfOnly scope rule and cannot cross
-  capsule boundaries.
-- Current product routing keeps `/api/provider/inspect/self` System-only until a
-  caller-bound ordinary-capsule SelfOnly route is explicitly wired and tested.
-- System can read object metadata and request an action approval.
-- Ordinary capsules cannot call approved dispatch directly.
-- `revoke` is intentionally not implemented.
+- `elastos://inspect/*` is the System-wide view.
+- `elastos://inspect/self` defines the pure SelfOnly scope rule.
+- Current product routing keeps `/api/provider/inspect/self` System-only.
+  Ordinary capsules do not yet have a caller-bound SelfOnly route.
+- System can read facts, preview an operation, and request approval.
+- System cannot approve, dispatch, or revoke an Inspector action.
 
-The pure scope rules live in
-[elastos-runtime/src/inspect/mod.rs](../elastos/crates/elastos-runtime/src/inspect/mod.rs).
-The Runtime provider projection and gate preview live in
-[inspect_provider/](../elastos/crates/elastos-server/src/inspect_provider/).
-The Inbox approval and dispatch path lives in
-[gateway_inspect_actions.rs](../elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs).
+## Projection
 
-## Object Model
+Inspector may return:
 
-Self maps neatly onto the ElastOS runtime model:
+- capsule or provider identity, kind, and state
+- a redacted manifest slice
+- declared capabilities, actions, operations, and audit events
+- CID, signature presence, and a signature fingerprint
+- process, storage, and Carrier summaries
 
-| Self idea | ElastOS shape |
-| --- | --- |
-| live object | capsule or provider |
-| slot/message | typed affordance or provider operation |
-| mirror | permissioned Inspector view |
-| transporter | signed capsule package/provenance |
-| Morphic world | Home/System live desktop |
-| VM | Runtime execution substrate |
+Inspector reports manifest signature evidence as declared but unverified:
+`verified=false`, while `verified_by` and `signed_by` are `null`. Granted
+capabilities, audit summary, spend budget, intent proof, and audit-chain
+attestation are not projected today and return `null`.
 
-The Inspector projection returns metadata only:
+Projection recursively removes known secret-bearing fields and strings,
+including Runtime-private metadata, Carrier tickets and routes, IPC and control
+socket paths, absolute host paths, raw signatures and tokens, private keys, and
+mutation handles. Declared provider capabilities remain visible after this
+redaction; visibility does not grant authority.
 
-- identity: capsule/provider id, name, kind, state
-- manifest slice: schema, version, role, entrypoint, provided namespace,
-  redacted before projection
-- provider authority: capabilities, actions, operations, audit events
-- provenance: CID plus signature presence/fingerprint
-- trust evidence: CID/signature declaration state, with verification fields null
-  until the Runtime has verified signer evidence
-- storage/carrier/process summary
-- granted capabilities, audit summary, spend budget, intent proof, and
-  audit-chain attestation are `null` until the Runtime has direct evidence for
-  them
+## Preview and approval
 
-Raw signatures, bearer tokens, host paths, Carrier tickets, runtime stream
-descriptors, wallet/node authority, and mutation handles are not projected.
-Manifest-derived fields are redacted recursively so future interface schemas,
-authority metadata, or storage declarations cannot smuggle those values into
-Inspector facts.
+`plan` runs the same authority planner used by Runtime provider invocation. It
+returns the required resources, actions, audit events, and these fixed
+properties:
 
-## Gate Preview
+```text
+mode=preview_only
+can_dispatch=false
+can_mutate=false
+dispatch=false
+```
 
-`plan` is the preview half. It reflects what a provider operation would require
-before anything executes.
+`request_act` stores the principal, session, target, operation, request body,
+preview, and canonical request-binding hash in a pending action record. Runtime
+builds the Inbox notification from that record.
+The notification includes a concise gate-preview summary.
 
-For manifest-backed providers, Inspector calls the same authority planner used
-by Runtime provider invocation. A successful preview returns
-`elastos.inspect.gate-preview/v1` with:
+Approval happens in Inbox. A System launch token can create a request.
+It cannot call the Inbox action endpoint.
+Inbox requires a fresh same-principal passkey Home token. On approval, Runtime:
 
-- the target provider/capsule
-- the operation
-- required resources and actions
-- audit events
-- execution policy `mode=preview_only`
-- `can_dispatch=false`
-- `can_mutate=false`
-- `dispatch=false`
+1. Loads the pending record.
+2. Verifies the passkey token and principal.
+3. Recomputes the request binding.
+4. Recomputes the authority plan.
+5. Dispatches through the internal Inspect provider and `ProviderRegistry`.
+6. Stores the result or error and appends signed audit.
 
-Provider-resource previews can also be built from a scheme and operation using
-the canonical provider resource helpers. This keeps previews tied to the same
-capability vocabulary as real provider calls.
+A changed request or authority plan fails stale. Denial dispatches nothing.
+Each request has a nonce, so two otherwise identical requests remain distinct.
 
-## Act Path
+The public Inspector gateway allows only `capsules`, `capsule`, `self`, `plan`,
+and `request_act`. `dispatch_approved` is internal. `revoke` is not implemented.
+Requests containing `_runtime_invocation`, `_runtime_transfer`,
+`connect_ticket`, `carrier_route`, or `carrier` are rejected before Inbox.
 
-`request_act` is the only System-callable act entrypoint. It creates an Inbox
-approval request and stores a pending record with:
+## Source and proof
 
-- requesting principal and session
-- target id and operation
-- provider request body
-- original gate preview
-- canonical request binding hash
-- pending status
-
-The Inbox notification is generated from that stored pending record and includes
-a concise gate-preview summary: capability resource, actions, audit events, and
-request hash. Approval therefore stays tied to the same reflected authority that
-System previewed before creating the request.
-
-Approval happens through Inbox, not through System. A System launch token can
-create the action request but cannot call the Inbox action endpoint to approve
-it. Inbox approval must also include a fresh same-principal passkey Home token,
-matching the Wallet signing approval boundary. On approval, Runtime:
-
-1. Loads the pending Inspector action record.
-2. Verifies the fresh passkey Home token belongs to the same principal.
-3. Confirms the approver is the same principal.
-4. Recomputes the request binding and rejects tampering.
-5. Recomputes the authority plan and rejects stale authority.
-6. Calls `dispatch_approved` on the internal Inspect provider.
-7. Dispatches to the target provider through `ProviderRegistry`.
-8. Stores completed or failed status and appends signed audit.
-
-Successful approvals persist the target provider's typed result in the
-Inspector action record and append an `inspect.action.completed` audit event.
-Failed approved dispatches persist the provider error and append
-`inspect.action.failed`.
-
-Denied requests are marked denied and never dispatch. Duplicate requests remain
-distinct because request ids include a nonce.
-
-`dispatch_approved` is intentionally not exposed through
-`/api/provider/inspect/*`. The gateway allowlist exposes only:
-
-- `capsules`
-- `capsule`
-- `self`
-- `plan`
-- `request_act`
-
-Any attempt to predeclare Runtime metadata such as `_runtime_invocation`,
-`_runtime_transfer`, `connect_ticket`, `carrier_route`, or `carrier` is rejected
-before an Inbox request is created.
-
-## Security Invariants
-
-- Preview never mutates.
-- Approved dispatch requires Inbox approval.
-- Approval revalidates both request body and authority plan.
-- Action records are principal-bound.
-- Dispatch uses Runtime provider invocation, not app-supplied routes.
-- Hidden Runtime metadata is stripped or rejected before dispatch.
-- Failed dispatch is audited as a failed approved action.
-- Direct revoke remains unsupported.
-- System UI can request approval but cannot directly dispatch.
-
-## Review Hooks
-
-The focused source tests are in
-[gateway_tests/inspect.rs](../elastos/crates/elastos-server/src/api/gateway_tests/inspect.rs)
-and cover:
-
-- approval before dispatch
-- denial without dispatch
-- dispatch failure audit
-- runtime metadata rejection before Inbox
-- raw Carrier route metadata rejection before Inbox
-- stale authority plan rejection
-- changed request binding rejection
-- duplicate pending records
-
-The broad alignment sentinel is in
-[home-entropy-check.mjs](../scripts/home-entropy-check.mjs).
+- Pure scope rules:
+  [inspect/mod.rs](../elastos/crates/elastos-runtime/src/inspect/mod.rs)
+- Projection, planning, and dispatch:
+  [inspect_provider](../elastos/crates/elastos-server/src/inspect_provider/)
+- Inbox action flow:
+  [gateway_inspect_actions.rs](../elastos/crates/elastos-server/src/api/gateway_inspect_actions.rs)
+- Local proof:
+  [Inspector testing](INSPECTOR_TESTING.md)

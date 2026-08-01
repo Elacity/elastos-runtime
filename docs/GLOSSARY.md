@@ -3,8 +3,8 @@
 > Supplemental vocabulary note.
 >
 > This file is for term lookup, not for the primary repo narrative or current
-> behavior contract. Use [OVERVIEW.md](OVERVIEW.md) for the system summary and
-> [state.md](../state.md), [COMMAND_MATRIX.md](COMMAND_MATRIX.md), and
+> behavior contract. Use [ARCHITECTURE.md](ARCHITECTURE.md) for the system
+> summary and [state.md](../state.md), [COMMAND_MATRIX.md](COMMAND_MATRIX.md), and
 > [RUNTIME_REPO_USER_STORY_CHECKLIST.md](RUNTIME_REPO_USER_STORY_CHECKLIST.md) for current truth.
 
 Key terms used in the ElastOS codebase and documentation.
@@ -127,7 +127,12 @@ long-term dKMS security root.
 
 ## Carrier
 
-The decentralized communication and content substrate of an ElastOS node. Carrier covers peer discovery, messaging, relay, and peer-to-peer content transfer for native `elastos://` operations. Carrier is hosted by the runtime, but it is not identical to the whole runtime or control plane. See [CARRIER.md](CARRIER.md) for the full framing.
+The authenticated off-box communication and content transport of an ElastOS
+node. Carrier can carry peer discovery, messaging, streams, replication, and
+content transfer when Runtime routing selects it. It is not the capsule API,
+the authority system, or the whole Runtime. Transport-peer authentication does
+not by itself prove application-message authorship. See
+[CARRIER.md](CARRIER.md) for the full framing.
 
 ## `elastos://`
 
@@ -153,7 +158,11 @@ Trust still comes from capabilities, hashes, and signatures, not from HTTP itsel
 
 ## Guest Network
 
-An explicit compatibility mode where a capsule gets conventional guest networking instead of relying only on the Capsule Runtime bridge and Carrier/provider calls. This is useful for provider capsules or legacy workloads that truly need raw TCP or guest-facing services, but it is not the preferred default for normal app capsules.
+An explicit compatibility mode where a capsule gets conventional guest
+networking instead of using its typed Runtime resources and substrate adapter.
+This is useful for provider capsules or legacy workloads that truly need raw
+TCP or guest-facing services, but it is not the preferred default for ordinary
+Apps.
 
 ## iroh
 
@@ -165,7 +174,12 @@ The Elastos Foundation's native Carrier protocol. A future transport target for 
 
 ## TAP Device
 
-A virtual network interface used only when a microVM capsule is explicitly placed into guest-network compatibility mode. It provides an isolated point-to-point link between the VM and the host. Normal app capsules use the Carrier-only serial bridge model and should not require TAP or sudo at launch. TAP remains a runtime-owned escape hatch for workloads that still need a real guest NIC and is currently managed by `elastos-crosvm/network.rs`.
+A virtual network interface used only when a microVM capsule is explicitly
+placed into guest-network compatibility mode. It provides an isolated
+point-to-point link between the VM and the host. Ordinary Apps use their typed
+Runtime resources through the selected substrate adapter and should not require
+TAP or `sudo` at launch. TAP remains a Runtime-owned compatibility path for
+workloads that genuinely need a guest NIC.
 
 ## Capability Token
 

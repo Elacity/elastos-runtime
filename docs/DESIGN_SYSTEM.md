@@ -1,62 +1,52 @@
-# ElastOS Design System
+# ElastOS design system
 
-This is the active visual contract for Home and the first-party browser capsules.
-It is intentionally small: one brand layer, one capsule layer, and no per-app
-color personality unless the app has a functional reason.
+The linked source files own their token values. The repository has several
+first-party palettes rather than one global token package.
 
-## Color Contract
+## Current token families
 
-Home sits on the user wallpaper and ElastOS mark. It uses a dark glass layer with
-the ElastOS orange as brand emphasis:
+- The [Home shell host](../capsules/home/browser/style.css) and
+  [Home GUI](../capsules/home-gui/browser/style.css) define the same core roles
+  with dark glass, neutral text, and ElastOS orange. Either surface can render
+  independently.
+- [Chat Room](../capsules/chat-room/browser/style.css) and the
+  [Documents page](../capsules/documents/browser/index.html)
+  share the lavender content palette.
+- [Inbox](../capsules/inbox/browser/index.html),
+  [Library](../capsules/library/browser/library.css), and
+  [System](../capsules/system/browser/style.css) use related neutral utility
+  styling. Each has its own values and token names.
+- Other capsules keep local palettes when their content, contrast, or theme
+  model requires one. A local palette is not a shared contract.
 
-| Token | Value | Use |
-|------|-------|-----|
-| `--brand` | `#f6921a` | ElastOS logo-adjacent emphasis, badges, selected chrome |
-| `--brand-strong` | `#ffb457` | hover/focus brand emphasis |
-| `--bg` | `#050608` | Home base behind wallpaper |
-| `--text` | `#f5f7fa` | Home foreground text |
+Within a family, tokens describe roles rather than colors: background, surface,
+border, primary and muted text, action or selection, brand, and feedback.
+`soft` and `strong` variants are relative to their family. ElastOS orange marks
+product identity; it is not the default color for every action.
 
-First-party capsules use a light, document-like layer over the same product
-world. The palette is shared by Chat Room, Documents, Inbox, Library, System,
-and GBA:
+## Implementation baseline
 
-| Token | Value | Use |
-|------|-------|-----|
-| `--bg` | `#edf1fb` | capsule background |
-| `--bg-strong` | `#e3e9fb` | stronger capsule wash |
-| `--panel` | `rgba(255, 255, 255, 0.9)` | primary glass cards |
-| `--panel-strong` | `#ffffff` | solid cards and inputs |
-| `--panel-soft` | `#eef2ff` | secondary controls |
-| `--line` | `rgba(83, 103, 164, 0.14)` | normal borders |
-| `--line-strong` | `rgba(83, 103, 164, 0.22)` | focusable borders |
-| `--ink` | `#1d2438` | foreground text |
-| `--muted` | `#66708a` | secondary text |
-| `--accent` | `#5f76d8` | primary action and selected state |
-| `--accent-soft` | `#e8edff` | selected/soft action background |
-| `--accent-deep` | `#3c53a7` | strong accent text |
-| `--danger` | `#b14c5a` | destructive actions |
-| `--brand` | `#f6921a` | ElastOS brand accent, used sparingly |
-| `--brand-soft` | `#fff1dc` | soft brand background |
+First-party browser surfaces start with
+plain ES modules or native Web Components. A framework or compiler such as
+Svelte stays capsule-local and optional. It must not become a dependency of
+Runtime, ESP, or shared contract packages.
 
-The capsule accent is blue-lavender because it holds contrast against the pale
-wallpaper and lets the orange logo remain the brand anchor instead of competing
-with every button.
+Framework choice does not change authority. Browser code still uses the
+capsule's declared Runtime interfaces and cannot gain privileges from its DOM,
+router, or build system.
 
-## Interaction Contract
+## Interaction
 
-Every visible action must have the same contract for humans and agents:
+Every visible action must have the same contract for humans and agents.
+[Principle 7](../PRINCIPLES.md#7-humans-and-agents-share-one-authority-model)
+owns that authority rule. Visual controls must still have readable names,
+keyboard focus, sufficient contrast, and in-surface confirmation for destructive
+actions.
 
-- A human can use it with pointer, keyboard, and readable labels.
-- An agent can use the same capability-scoped API, action id, or Home message.
-- DOM visibility or route shape is never authority.
-- Destructive actions use in-surface confirmation and provider/runtime calls,
-  not browser alerts or hidden privileged paths.
-- First-party surfaces expose state in simple product nouns before raw paths,
-  CIDs, or provider details.
+## Verification
 
-## Drift Checks
-
-`scripts/home-entropy-check.mjs` enforces the active token set, stale-copy
-removal, and the basic human/agent interaction contract for first-party browser
-surfaces. Update this document and the check together when the design language
-intentionally changes.
+The [Home entropy check](../scripts/home-entropy-check.mjs) freezes selected
+token values for Home, Chat Room, Documents, Inbox, Library, and System. It also
+checks accessible names and stale copy across selected active surfaces. Its
+coverage is limited to those files and does not define a repository-wide
+palette.

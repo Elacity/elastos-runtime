@@ -1,7 +1,7 @@
 # People, Pairing, Friends, and Conversations
 
-Status: current product/UX contract. The implemented path covers conversation
-copy, signed peer invite links, a principal profile-card object, signed profile
+The current implementation covers conversation copy, signed peer invite links,
+a principal profile-card object, signed profile
 propagation, `people.contacts[]`, and a standalone People app with opt-in peer
 discovery. Full FriendRequest objects, Inbox acceptance, timed discoverability,
 deny/block handling, and separate direct-conversation objects remain planned.

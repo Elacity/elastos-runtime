@@ -12,16 +12,19 @@ the public repository.
 
 - `main` is the 0.5.0 baseline. Active feature branches must state whether they
   are preserving 0.5.0 behavior or intentionally moving the product architecture.
-- `fix/elastos-shell-protocol-browser-wallet-consolidation` is the 0.6.0
-  release-candidate line. It preserves `upstream/0.6-dev` as its base, includes
-  the reviewed ESP, Wallet, Recovery, and Browser continuation, and keeps the
-  accepted implementation history intact.
+- `fix/elastos-shell-protocol-browser-wallet-consolidation` is the published
+  0.6.0 review line. It is based on `feat/elastos-shell-protocol`, which
+  descends from `upstream/0.6-dev`; it includes the reviewed ESP, Wallet,
+  Recovery, and Browser continuation and keeps the accepted implementation
+  history intact. It is not merged to `main`.
 - Carrier reconciliation, shell UI redesign, and extended AI UI work are not
   included in 0.6.0. Carrier moves to 0.7; the UI work requires an independent
   compatibility and product review before a later release.
-- Executable product capsules target the WASM Component Model through
-  `elastos.component/v1` and use the Runtime-mediated `elastos:bus@v1`
-  authority contract. WASI Preview 1 is not a supported product capsule ABI.
+- The Runtime implements the WASM Component Model path through
+  `elastos.component/v1` and the Runtime-mediated `elastos:bus@v1` authority
+  contract. The conformance fixture and authoring template exercise it; all 18
+  shipped first-party UI Apps still use `elastos.runtime-projection/v1` web
+  projections. WASI Preview 1 is rejected at product capsule admission.
 - Source/review proof must cite concrete reusable commands: `git diff --check`,
   `node scripts/home-entropy-check.mjs`, `node scripts/browser-entropy-check.mjs`,
   `bash scripts/check-wci-alignment.sh`, `just candidate-command-audit`, and the
@@ -33,7 +36,8 @@ the public repository.
 - ElastOS Bus v1 deliberately omits streams because no shared
   capability/audit/lifecycle implementation exists yet. Its checked-in WIT hash
   is `7a026e0a641c8c04214576dc85a677e0b52c9f02866d231119f9a3ba609d49e2`;
-  all first-party component artifacts and manifests are bound to that hash.
+  the conformance fixture and Component authoring template are bound to that
+  hash. No shipped first-party product Component proves adoption end to end.
 - [docs/CAPSULE_AUTHORING.md](docs/CAPSULE_AUTHORING.md),
   [templates/capsules](templates/capsules), and `elastos init` are the canonical
   capsule authoring paths. Their manifests are validated by repository gates;
@@ -53,14 +57,15 @@ the public repository.
 
 ## Capsule Execution Truth
 
-- [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#isolated-capsule-execution-contract)
+- [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#isolation-boundary)
   defines the cross-branch isolated-execution contract. It is a 0.6
   architecture requirement, not an additional product claim for the 0.5.0
   `main` line.
-- The ESP branch proves a useful first slice: product WASM capsules are
-  Components with no linked WASI, environment, filesystem preopen, FIFO, raw
-  socket, or gateway authority, and every guest effect is linked through
-  `elastos:bus@v1`.
+- The ESP branch proves a useful substrate slice: the Component runner and
+  conformance fixture use no linked WASI, environment, filesystem preopen,
+  FIFO, raw socket, or gateway authority, and every guest effect is linked
+  through `elastos:bus@v1`. This is contract proof, not first-party product-App
+  adoption.
 - The Component runner is bounded today, but not yet by each manifest's declared
   resources: it uses a fixed 128 MiB memory ceiling and fixed fuel budget.
   `component/v1` is a bounded activation contract and cannot cancel or stop an
@@ -122,10 +127,9 @@ the public repository.
   `isElastOS=true`, `isMetaMask=true`, the Runtime Wallet binding, chain `0x14`,
   and exactly one `eth_requestAccounts` handoff producing one pending Wallet
   account-access approval.
-- User observation found an approval-notification/Inbox-visibility mismatch,
-  one failed Browser restart followed by a successful open, lost `ela.city`
-  login state across restart, and slow performance. These are explicit
-  post-0.6 follow-ups; they are not repaired or retested in this release slice.
+- One failed Browser restart followed by a successful open, lost `ela.city`
+  login state across restart, and slow performance remain explicit post-0.6
+  follow-ups.
 - Runtime owns Browser launch settlement and exact cleanup obligations. The
   close path acknowledges authority renewal, binds close to the exact Browser
   instance, and keeps nonterminal cleanup ownership durable.

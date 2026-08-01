@@ -1696,7 +1696,7 @@ assert(
     browserVmTargetDoc.includes("not a claim that Chromium cookies") &&
     browserVmTargetDoc.includes("storage_posture=principal_owned_reset_scoped_unprotected") &&
     browserVmTargetDoc.includes("protected_storage=false") &&
-    browserCapsuleDoc.includes("0.5.0 truth boundary") &&
+    browserCapsuleDoc.includes("0.6.0 truth boundary") &&
     browserCapsuleDoc.includes("not yet a protected principal-root") &&
     browserCapsuleDoc.includes("object envelope") &&
     browserCapsuleDoc.includes("not yet exported/imported by Recovery Kit") &&

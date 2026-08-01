@@ -8760,7 +8760,7 @@ assert(
     remoteCarrierExitSourceConfig.includes("exit_config_sha256") &&
     remoteCarrierExitSourceConfigSmoke.includes("readiness hashes must match") &&
     currentState.includes("hash-bound remote route readiness") &&
-    read("TASKS.md").includes("Compose Inspector, Carrier-only authority") &&
+    read("TASKS.md").includes("Compose Inspector, typed Runtime authority") &&
     read("TASKS.md").includes("route-readiness, operator evidence, Browser handoff"),
   "Remote Carrier Exit readiness must remain hash-bound without requiring private goal-completion meta tooling",
 );
@@ -10758,7 +10758,6 @@ const principles = read("PRINCIPLES.md");
 const architecture = read("docs/ARCHITECTURE.md");
 const contentAvailabilityDoc = read("docs/CONTENT_AVAILABILITY.md");
 const roadmap = read("ROADMAP.md");
-const overviewDoc = read("docs/OVERVIEW.md");
 const designSystem = read("docs/DESIGN_SYSTEM.md");
 const commandMatrix = read("docs/COMMAND_MATRIX.md");
 const shellSmoke = homeSmoke;
@@ -10771,73 +10770,42 @@ assertMarkdownLocalLinksResolve();
 assertMarkdownScriptReferencesResolve();
 assertOrdinaryCapsulesDoNotReferenceRawBlockchainAuthority();
 assert(
-    installDoc.includes("## Handoff Verification") &&
-    installDoc.includes("just candidate-command-audit") &&
-    installDoc.includes("ELASTOS_PUBLISHER_GATEWAY=<candidate-url>") &&
-    installDoc.includes("ELASTOS_BIN_OVERRIDE=\"$PWD/elastos/target/release/elastos\"") &&
-    installDoc.includes("0.6.0-compatible manifest") &&
-    installDoc.includes("home profile and checksummed artifacts") &&
-    installDoc.includes("scripts/local-carrier-setup-smoke.sh") &&
-    installDoc.includes("scripts/public-install-identity-smoke.sh") &&
-    installDoc.includes("scripts/public-install-home-frontdoor-smoke.sh") &&
-    installDoc.includes("Final public install path after publishing 0.6.0") &&
-    installDoc.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
-    installDoc.includes("--min-active-crosvm-seconds 3600") &&
-    installDoc.includes("manual installed-device check is still separate") &&
-    installDoc.includes("Source-home and seed-node proofs do not replace this") &&
-    installDoc.includes("installed-path check") &&
-    runtimeChecklist.includes("## 0.6.0 Handoff Order") &&
-    runtimeChecklist.includes("just candidate-command-audit") &&
-    runtimeChecklist.includes("ELASTOS_PUBLISHER_GATEWAY=<candidate-url>") &&
-    runtimeChecklist.includes("ELASTOS_BIN_OVERRIDE=\"$PWD/elastos/target/release/elastos\"") &&
-    runtimeChecklist.includes("0.6.0-compatible manifest") &&
-    runtimeChecklist.includes("home profile and checksummed artifacts") &&
-    runtimeChecklist.includes("scripts/local-carrier-setup-smoke.sh") &&
+    installDoc.includes("## Install from the publisher") &&
+    installDoc.includes("elastos setup") &&
+    installDoc.includes("Only one live host may own an ElastOS data home") &&
+    installDoc.includes("components.json") &&
+    installDoc.includes("## Trust model") &&
+    runtimeChecklist.includes("## Candidate identity") &&
+    runtimeChecklist.includes("## Source gate") &&
+    runtimeChecklist.includes("## Installed acceptance") &&
+    runtimeChecklist.includes("## Release gate") &&
+    runtimeChecklist.includes("source, installed-product behavior, and public deployment as separate") &&
+    runtimeChecklist.includes("fix/elastos-shell-protocol-browser-wallet-consolidation") &&
+    runtimeChecklist.includes("just verify") &&
     runtimeChecklist.includes("scripts/public-install-identity-smoke.sh") &&
     runtimeChecklist.includes("scripts/public-install-home-frontdoor-smoke.sh") &&
-    runtimeChecklist.includes("Final public install path after publishing 0.6.0") &&
-    runtimeChecklist.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
-    runtimeChecklist.includes("--min-active-crosvm-seconds 3600") &&
-    runtimeChecklist.includes("Do not") &&
-    runtimeChecklist.includes("count source-home or seed-node proof as installed-host acceptance") &&
+    runtimeChecklist.includes("scripts/public-install-operator-smoke.sh") &&
     scriptsReadme.includes("ELASTOS_BIN_OVERRIDE=<path-to-branch-elastos>") &&
-    scriptsReadme.includes("0.6.0-compatible manifest") &&
     scriptsReadme.includes("current `home` setup profile") &&
-    scriptsReadme.includes("checksummed artifacts") &&
+    includesNormalized(scriptsReadme, "checksummed artifacts") &&
     includesNormalized(scriptsReadme, "pin the installer-selected components manifest") &&
     includesNormalized(scriptsReadme, "source checkout metadata cannot leak") &&
     scriptsReadme.includes("scripts/local-carrier-setup-smoke.sh") &&
     scriptsReadme.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
-    scriptsReadme.includes("stricter publisher relay-health check") &&
     publicInstallHomeFrontdoorSmoke.includes("guard_branch_binary_requires_checksummed_public_manifest") &&
     publicInstallHomeFrontdoorSmoke.includes("ELASTOS_COMPONENTS_MANIFEST") &&
     read("scripts/lib/public-install-guards.sh").includes("current 'home' setup profile") &&
-    publicInstallHomeFrontdoorSmoke.includes('FORCE_RELAY_ONLY="${ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY:-0}"') &&
-    publicInstallHomeFrontdoorSmoke.includes('"$RUN_BIN" setup >/tmp/elastos-public-home-setup.log') &&
     !publicInstallHomeFrontdoorSmoke.includes("setup --profile home") &&
     publicInstallIdentitySmoke.includes("guard_branch_binary_requires_checksummed_public_manifest") &&
     publicInstallIdentitySmoke.includes("ELASTOS_COMPONENTS_MANIFEST") &&
-    publicInstallIdentitySmoke.includes('FORCE_RELAY_ONLY="${ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY:-0}"') &&
-    publicInstallIdentitySmoke.includes('"${RUN_BIN}" setup >/tmp/elastos-public-identity-setup.log') &&
     !publicInstallIdentitySmoke.includes("setup --profile home") &&
     currentState.includes("pin the installer-selected components manifest") &&
     currentState.includes("source checkout `components.json` from leaking") &&
     currentState.includes("lacks the current `home` setup profile") &&
-    currentState.includes("Branch-override public smokes require a staged or published 0.6.0-compatible") &&
-    includesNormalized(currentState, "Source/local Carrier setup proof stays in") &&
-    includesNormalized(
-      currentState,
-      "require a staged or published 0.6.0-compatible manifest with the current `home` profile",
-    ) &&
-    currentState.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
-    currentState.includes("Final public installed-path proof waits for publishing the 0.6.0") &&
     tasks.includes("Keep source/local Carrier setup proof green") &&
-    tasks.includes("Candidate public install proof with the branch binary needs a staged or") &&
-    tasks.includes("0.6.0-compatible manifest") &&
-    tasks.includes("current `home` profile") &&
     tasks.includes("scripts/local-carrier-setup-smoke.sh") &&
     tasks.includes("publish the 0.6.0 binary/artifact set so no-override public installed-path smokes use current code"),
-  "Install and runtime checklist docs must preserve the branch, public install, candidate gateway, target closeout, and manual installed-device handoff boundaries",
+  "Install docs, release checklist, state, tasks, and executable smokes must preserve separate source, installed, and public-release proof boundaries",
 );
 assert(
   !tasks.includes("- [x]"),
@@ -10960,7 +10928,7 @@ assert(
   "Architecture must define interaction equality",
 );
 assert(
-  ![architecture, roadmap, namespacesDoc, overviewDoc].some((doc) =>
+  ![architecture, roadmap, namespacesDoc].some((doc) =>
     doc.includes("localhost://Users/self"),
   ),
   "Canonical namespace docs must present principal-root storage, not shared Users/self examples",

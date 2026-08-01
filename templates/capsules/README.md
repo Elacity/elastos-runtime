@@ -1,21 +1,23 @@
-# Capsule Templates
+# Capsule templates
 
 Copy one template to `capsules/<name>` and rename every `example-*` identifier.
 Do not combine templates unless the resulting package still has one role and
 one authority boundary.
 
-For the smallest Component scaffold, `elastos init <name>` generates the
-same no-WASI manifest shape. Replace its `local-development` author before
-publishing. Use these repository templates when adding a web projection,
-viewer/content pair, or provider contract.
+`elastos init <name>` generates the minimal no-WASI Component scaffold. Replace
+its `local-development` author before publishing. The checked-in templates also
+cover a web projection, a viewer/content pair, and a provider contract.
 
-- `component-app`: executable no-WASI Component using the ElastOS Bus.
-- `web-app`: browser projection over app-scoped Runtime facts and intents.
-- `viewer-content`: matched viewer and content manifests showing truthful
-  accepted-content declarations.
-- `provider-contract`: provider manifest contract. It is not a provider
-  implementation and must not become active without Runtime registration,
-  capability mapping, denial tests, and audit tests.
+- [`component-app`](component-app/) is an executable no-WASI Component that
+  uses the ElastOS Bus.
+- [`web-app`](web-app/) is a web projection over capsule-scoped Runtime facts
+  and intents.
+- [`viewer-content`](viewer-content/) contains matching viewer and content
+  manifests with explicit accepted-content declarations.
+- [`provider-contract`](provider-contract/) defines a provider manifest
+  contract. Activation requires Runtime registration, capability mapping,
+  denial tests, and audit tests.
 
 Read [Capsule Authoring](../../docs/CAPSULE_AUTHORING.md) before using a
-template. Run `node scripts/check-capsule-templates.mjs` after editing them.
+template. From the repository root, run
+`node scripts/check-capsule-templates.mjs` after editing them.

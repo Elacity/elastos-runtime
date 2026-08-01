@@ -926,7 +926,7 @@ Browser profile state must follow the same authority boundary. Cookies,
 localStorage, IndexedDB, service workers, bookmarks, and history are principal
 profile state and should be rooted under
 `localhost://Users/<principal>/BrowserProfiles/<profile>/...`, not in a shared
-container profile. This prevents admin/guest leakage, but in 0.5.0 it is not a
+container profile. This prevents admin/guest leakage, but in 0.6.0 it is not a
 claim that Chromium cookies or localStorage are protected principal-root objects
 or Recovery Kit state.
 
@@ -940,7 +940,7 @@ high-level reset route, `POST /api/apps/browser/profile/reset`, with its Browser
 launch token. Runtime refuses reset while that principal has live Browser pages
 and deletes only the matching profile disk.
 
-0.5.0 truth boundary: the current Browser VM profile disk is
+0.6.0 truth boundary: the current Browser VM profile disk is
 principal-owned and reset-scoped, but it is not yet a protected principal-root
 object envelope and is not yet exported/imported by Recovery Kit. The Browser
 capsule and web pages still never receive host paths or profile keys, but
@@ -1296,8 +1296,8 @@ Before calling the browser capsule real:
   browser engine.
 - Do not implement fallback display modes. A selected display mode either starts
   or fails closed.
-- Do not allow browser engines to keep ambient host network access while claiming
-  Carrier-only networking.
+- Do not allow browser engines to keep ambient host network access while
+  claiming Runtime-only networking.
 - Do not make HTTP-fetch proxying the default for arbitrary browsing.
 - Do not let web pages call Runtime APIs directly.
 - Do not put MetaMask, WalletConnect, chain RPC, node RPC, or IPFS SDK authority
