@@ -7,6 +7,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
