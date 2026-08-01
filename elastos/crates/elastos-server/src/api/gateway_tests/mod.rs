@@ -383,7 +383,12 @@ async fn browser_engine_reconciliation_test_state(
     )
 }
 
-type MockExitClosePlan = (Arc<TokioMutex<Vec<serde_json::Value>>>, usize, usize);
+struct MockExitClosePlan {
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_failures: usize,
+    close_hangs: usize,
+    close_started: Option<Arc<tokio::sync::Notify>>,
+}
 
 async fn browser_engine_retrying_close_test_state(
     cache_dir: &std::path::Path,
@@ -399,14 +404,10 @@ async fn browser_engine_retrying_close_test_state(
         .register_sub_provider("net", Arc::new(MockNetProvider))
         .await
         .unwrap();
-    if let Some((close_calls, close_failures, close_hangs)) = exit_close {
-        let provider: Arc<dyn Provider> =
-            Arc::new(MockRemoteCarrierExitProvider::with_close_behavior(
-                close_calls,
-                close_failures,
-                close_hangs,
-                ownership.clone(),
-            ));
+    if let Some(exit_close) = exit_close {
+        let provider: Arc<dyn Provider> = Arc::new(
+            MockRemoteCarrierExitProvider::with_close_behavior(exit_close, ownership.clone()),
+        );
         registry
             .register_sub_provider("exit", provider)
             .await

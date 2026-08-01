@@ -389,12 +389,18 @@ async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
     let dir = tempfile::tempdir().unwrap();
     let engine_close_calls = Arc::new(TokioMutex::new(Vec::new()));
     let exit_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let exit_close_started = Arc::new(tokio::sync::Notify::new());
     let state = browser_engine_retrying_close_test_state(
         dir.path(),
         engine_close_calls,
         MockBrowserEngineCloseFailure::Adapter,
         0,
-        Some((exit_close_calls.clone(), 0, 1)),
+        Some(MockExitClosePlan {
+            close_calls: exit_close_calls.clone(),
+            close_failures: 0,
+            close_hangs: 1,
+            close_started: Some(exit_close_started.clone()),
+        }),
         None,
     )
     .await;
@@ -417,7 +423,7 @@ async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
     tokio::time::advance(ACTIVE_HEARTBEAT_STALE_TTL + Duration::from_millis(1)).await;
     notify_browser_lifecycle_reconciler(&state.data_dir);
     reconciler.resume_sweeps();
-    yield_until_close_count(&exit_close_calls, 1).await;
+    exit_close_started.notified().await;
     let blocked = reserve_browser_launch(
         &state.data_dir,
         principal_id,
@@ -483,12 +489,18 @@ async fn hanging_stream_timeout_releases_exact_claim_for_retry_without_restart()
     let dir = tempfile::tempdir().unwrap();
     let engine_close_calls = Arc::new(TokioMutex::new(Vec::new()));
     let exit_close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let exit_close_started = Arc::new(tokio::sync::Notify::new());
     let state = browser_engine_retrying_close_test_state(
         dir.path(),
         engine_close_calls,
         MockBrowserEngineCloseFailure::Adapter,
         0,
-        Some((exit_close_calls.clone(), 0, 1)),
+        Some(MockExitClosePlan {
+            close_calls: exit_close_calls.clone(),
+            close_failures: 0,
+            close_hangs: 1,
+            close_started: Some(exit_close_started.clone()),
+        }),
         None,
     )
     .await;
@@ -503,7 +515,7 @@ async fn hanging_stream_timeout_releases_exact_claim_for_retry_without_restart()
     let reconciler = start_controlled_browser_lifecycle_reconciler(state.clone())
         .expect("controlled Runtime reconciler");
 
-    yield_until_close_count(&exit_close_calls, 1).await;
+    exit_close_started.notified().await;
     let blocked = reserve_browser_launch(
         &state.data_dir,
         principal_id,

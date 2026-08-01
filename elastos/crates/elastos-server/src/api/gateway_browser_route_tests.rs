@@ -5081,7 +5081,12 @@ async fn test_browser_no_first_frame_cleanup_retries_exact_effect_without_replac
             engine_close_calls.clone(),
             MockBrowserEngineCloseFailure::Transport,
             2,
-            Some((exit_close_calls.clone(), 0, 0)),
+            Some(MockExitClosePlan {
+                close_calls: exit_close_calls.clone(),
+                close_failures: 0,
+                close_hangs: 0,
+                close_started: None,
+            }),
             Some(ownership.clone()),
         )
         .await,
@@ -5359,7 +5364,12 @@ async fn test_browser_close_transport_and_exit_failures_retry_independent_cleanu
             engine_close_calls.clone(),
             MockBrowserEngineCloseFailure::Transport,
             1,
-            Some((exit_close_calls.clone(), 1, 0)),
+            Some(MockExitClosePlan {
+                close_calls: exit_close_calls.clone(),
+                close_failures: 1,
+                close_hangs: 0,
+                close_started: None,
+            }),
             None,
         )
         .await,

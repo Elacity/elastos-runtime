@@ -2067,29 +2067,37 @@ struct MockRemoteCarrierExitProvider {
     close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
     close_failures_remaining: Arc<TokioMutex<usize>>,
     close_hangs_remaining: std::sync::atomic::AtomicUsize,
+    close_started: Option<Arc<tokio::sync::Notify>>,
     ownership: Option<Arc<MockBrowserOwnershipCounts>>,
 }
 
 impl MockRemoteCarrierExitProvider {
     fn with_close_behavior(
-        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
-        failures: usize,
-        hangs: usize,
+        close_plan: MockExitClosePlan,
         ownership: Option<Arc<MockBrowserOwnershipCounts>>,
     ) -> Self {
         Self {
-            close_calls,
-            close_failures_remaining: Arc::new(TokioMutex::new(failures)),
-            close_hangs_remaining: std::sync::atomic::AtomicUsize::new(hangs),
+            close_calls: close_plan.close_calls,
+            close_failures_remaining: Arc::new(TokioMutex::new(close_plan.close_failures)),
+            close_hangs_remaining: std::sync::atomic::AtomicUsize::new(close_plan.close_hangs),
+            close_started: close_plan.close_started,
             ownership,
         }
     }
 
     fn with_close_failures(
         close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
-        failures: usize,
+        close_failures: usize,
     ) -> Self {
-        Self::with_close_behavior(close_calls, failures, 0, None)
+        Self::with_close_behavior(
+            MockExitClosePlan {
+                close_calls,
+                close_failures,
+                close_hangs: 0,
+                close_started: None,
+            },
+            None,
+        )
     }
 }
 
@@ -2221,6 +2229,9 @@ impl Provider for MockRemoteCarrierExitProvider {
             .unwrap_or("did:elastos:test");
         if request.get("op").and_then(|value| value.as_str()) == Some("close_stream") {
             self.close_calls.lock().await.push(request.clone());
+            if let Some(close_started) = &self.close_started {
+                close_started.notify_one();
+            }
             let should_hang = self
                 .close_hangs_remaining
                 .fetch_update(
