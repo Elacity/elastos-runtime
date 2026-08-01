@@ -647,19 +647,25 @@ struct HomeTerminalPty {
 fn open_home_terminal_pty(size: HomeTerminalSize) -> anyhow::Result<HomeTerminalPty> {
     let mut master_fd: libc::c_int = -1;
     let mut slave_fd: libc::c_int = -1;
-    let mut winsize = libc::winsize {
+    let winsize = libc::winsize {
         ws_row: size.rows,
         ws_col: size.cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    #[cfg(target_os = "macos")]
+    let mut winsize = winsize;
+    #[cfg(target_os = "macos")]
+    let winsize_ptr = &mut winsize;
+    #[cfg(not(target_os = "macos"))]
+    let winsize_ptr = &winsize;
     let rc = unsafe {
         libc::openpty(
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut winsize,
+            winsize_ptr,
         )
     };
     if rc != 0 {
