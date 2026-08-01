@@ -1827,6 +1827,10 @@ fn validate_private_stdin_descriptor(fd: RawFd) -> Result<(), String> {
     }
     let stat = unsafe { stat.assume_init() };
     let file_kind = stat.st_mode & libc::S_IFMT;
+    #[cfg(target_os = "linux")]
+    let anonymous_pipe = (file_kind == libc::S_IFIFO && is_linux_pipefs_descriptor(fd))
+        || (file_kind == libc::S_IFSOCK && is_anonymous_unix_stream_socket(fd));
+    #[cfg(not(target_os = "linux"))]
     let anonymous_pipe = (file_kind == libc::S_IFIFO && stat.st_nlink == 0)
         || (file_kind == libc::S_IFSOCK
             && stat.st_nlink == 0
@@ -1839,6 +1843,18 @@ fn validate_private_stdin_descriptor(fd: RawFd) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_pipefs_descriptor(fd: RawFd) -> bool {
+    const PIPEFS_MAGIC: libc::c_long = 0x5049_5045;
+
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(fd, stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let stat = unsafe { stat.assume_init() };
+    stat.f_type == PIPEFS_MAGIC
 }
 
 fn is_anonymous_unix_stream_socket(fd: RawFd) -> bool {
@@ -1864,7 +1880,17 @@ fn is_anonymous_unix_stream_socket(fd: RawFd) -> bool {
         return false;
     }
     let address = unsafe { address.assume_init() };
-    address.sun_family as libc::c_int == libc::AF_UNIX && address.sun_path[0] == 0
+    if address.sun_family as libc::c_int != libc::AF_UNIX {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        address_length as usize == std::mem::offset_of!(libc::sockaddr_un, sun_path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        address.sun_path[0] == 0
+    }
 }
 
 fn validate_owner_only_root_if_present(label: &str, root: &Path) -> Result<(), String> {
@@ -3545,7 +3571,9 @@ async fn wait_for_shutdown_or_transport_expiry(transport: Option<&VzTransportLau
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
     use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::sync::{mpsc, Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -3731,6 +3759,19 @@ mod tests {
         drop((socket_read, socket_write));
 
         let root = tempfile::tempdir().unwrap();
+        let named_fifo_path = root.path().join("named.fifo");
+        let named_fifo_path_c = CString::new(named_fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(named_fifo_path_c.as_ptr(), 0o600) },
+            0
+        );
+        let named_fifo = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&named_fifo_path)
+            .unwrap();
+        assert!(validate_private_stdin_descriptor(named_fifo.as_raw_fd()).is_err());
+
         let named_socket_path = root.path().join("named.sock");
         let named_socket = std::os::unix::net::UnixListener::bind(&named_socket_path).unwrap();
         assert!(validate_private_stdin_descriptor(named_socket.as_raw_fd()).is_err());
