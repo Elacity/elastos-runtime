@@ -1,9 +1,9 @@
 # State
 
-Last updated: 2026-07-16 UTC
+Last updated: 2026-07-31 UTC
 
-This file records public-safe current truth for the 0.5.0 line and active
-feature branches. Historical
+This file records public-safe current truth for the 0.5.0 baseline, the 0.6.0
+release candidate, and active feature branches. Historical
 local proof logs, private SSH aliases, tunnel ports, operator usernames, key
 paths, worktree paths, and target backup paths are intentionally not tracked in
 the public repository.
@@ -12,9 +12,13 @@ the public repository.
 
 - `main` is the 0.5.0 baseline. Active feature branches must state whether they
   are preserving 0.5.0 behavior or intentionally moving the product architecture.
-- `feat/elastos-shell-protocol` is the current Components, ElastOS Bus, and shell-protocol
-  work branch based on `upstream/0.6-dev`. Its review-readiness requirements are
-  tracked in [TASKS.md](TASKS.md).
+- `fix/elastos-shell-protocol-browser-wallet-consolidation` is the 0.6.0
+  release-candidate line. It preserves `upstream/0.6-dev` as its base, includes
+  the reviewed ESP, Wallet, Recovery, and Browser continuation, and keeps the
+  accepted implementation history intact.
+- Carrier reconciliation, shell UI redesign, and extended AI UI work are not
+  included in 0.6.0. Carrier moves to 0.7; the UI work requires an independent
+  compatibility and product review before a later release.
 - Executable product capsules target the WASM Component Model through
   `elastos.component/v1` and use the Runtime-mediated `elastos:bus@v1`
   authority contract. WASI Preview 1 is not a supported product capsule ABI.
@@ -79,6 +83,24 @@ the public repository.
   algorithm identifier, golden vectors, and a signed transition anchor rather
   than rewriting retained history.
 
+## Authority And Wallet Truth
+
+- Home authority uses signed `elastos.home.launch-token/v4` envelopes. Runtime
+  validation binds resource, actors, principal, proof, grant, session,
+  lifetime, and non-delegatability; callers cannot supply Wallet authority.
+- Wallet Bus v2.3 is the typed Runtime/Wallet Provider boundary. Wallet Provider
+  owns keys, accounts, proofs, approval execution, and validated outcomes;
+  Runtime owns launch authorization, orchestration, durable effects, and the
+  private provider adapter.
+- Passkey step-up is durable, one-shot, and bound to the original launch,
+  operation, and canonical request digest. Managed recovery verifies the exact
+  Wallet set and root reassignment before returning terminal success.
+- Runtime creates durable transaction-effect state before dispatch and
+  reconciles recorded or uncertain Chain outcomes without rebroadcasting.
+- Browser account access is an explicit Wallet approval. The injected provider
+  can request accounts, but the page receives no selected address until the
+  Runtime-mediated request is approved through the trusted review path.
+
 ## Proof Path Ledger
 
 - Installed operator/update proof path: `public-install-operator-smoke.sh`.
@@ -91,29 +113,41 @@ the public repository.
 
 ## Browser Truth
 
-- Browser architecture is coherent enough to preserve.
-- Runtime now owns autonomous Browser launch settlement: startup scans and
-  commit notifications drive bounded, single-lane reconciliation until exact
-  terminal cleanup, and the Adapter can reconstruct canonical close ownership
-  from the control journal's validated durable cleanup binding without a
-  persisted supervisor result.
-- The Browser objective still fails product audio proof and hash-bound manual UX evidence.
-- Docker/Selkies is only `managed_baseline_not_final_product`.
-- The hosted Selkies/GStreamer service is a managed baseline, not accepted as the final Browser.
-- The current hosted baseline is single-session; active pages are a serialization blocker.
-- This server is not a product native-browser proof target because it lacks a real host compositor/display, host audio service, and working network namespace support.
-- Kasm Workspaces, BrowserBox, or KasmVNC cannot replace Selkies until the
-  operator_control_socket not provisioned blocker is cleared and their
-  operator prerequisites plus product-compositor evidence pass.
+- Browser is included in 0.6.0 as a bounded Runtime Browser, not as a fully
+  reliable general-purpose Browser claim.
+- Accepted localhost evidence covers the installed macOS VZ candidate's launch,
+  decoded display, navigation through Runtime-only networking, and injected
+  provider availability.
+- Deterministic proof confirmed `window.ethereum`, one EIP-6963 provider,
+  `isElastOS=true`, `isMetaMask=true`, the Runtime Wallet binding, chain `0x14`,
+  and exactly one `eth_requestAccounts` handoff producing one pending Wallet
+  account-access approval.
+- User observation found an approval-notification/Inbox-visibility mismatch,
+  one failed Browser restart followed by a successful open, lost `ela.city`
+  login state across restart, and slow performance. These are explicit
+  post-0.6 follow-ups; they are not repaired or retested in this release slice.
+- Runtime owns Browser launch settlement and exact cleanup obligations. The
+  close path acknowledges authority renewal, binds close to the exact Browser
+  instance, and keeps nonterminal cleanup ownership durable.
 - Browser profile state is principal-owned and reset-scoped, but it still lacks
   protected/recoverable Browser profile storage.
 - Browser VM Chromium profile disks are principal-owned and reset-scoped, but they are not protected principal-root envelopes or Recovery Kit-packaged state yet.
 - Browser profile receipts must continue to report
   `storage_posture=principal_owned_reset_scoped_unprotected`.
 - Principal-root object protection exists for selected Home/runtime state; this does not include Browser VM Chromium profile disks yet.
+- Product-readiness claims remain gated on target-specific objective audit and
+  matching manual UX evidence; inclusion in 0.6.0 does not waive that gate.
 
 ## Browser Provider Evidence
 
+- Browser architecture is coherent enough to preserve, but the objective still
+  fails product audio proof and hash-bound manual UX evidence.
+- Docker/Selkies is only `managed_baseline_not_final_product`; the hosted Selkies/GStreamer service is a managed baseline, not accepted as the final Browser.
+- The hosted baseline is single-session; active pages are a serialization blocker.
+- This server is not a product native-browser proof target because it lacks a real host compositor/display, host audio service, and working network namespace support.
+- Kasm Workspaces, BrowserBox, or KasmVNC cannot replace Selkies until the
+  operator_control_socket not provisioned blocker and their operator evidence
+  requirements are cleared.
 - `scripts/browser-provider-decision-report.mjs` summarizes supplied `hosted_bakeoff` and `native_preflight` artifacts and keeps generated placeholder configs out of operator instructions.
 - `scripts/browser-provider-runbook.mjs` is read-only guidance. Its operator guidance is generated from the actual evidence and should not be treated as a deployment action.
 - Current Browser runbooks must keep the stop condition visible: do not keep

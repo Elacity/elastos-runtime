@@ -15,11 +15,28 @@ Do not add new product surface area until the `Now` section is materially tighte
 Read this section as strict priority order for this branch. Do not start a lower
 section if a higher section is incoherent, unverified, or too large to review.
 
+### 0.6 release follow-up boundary
+
+- [ ] Keep Browser included but explicitly limited: resolve the observed yellow
+  approval notification with no visible Inbox item, intermittent restart,
+  non-retained `ela.city` login, and slow performance before claiming full
+  Browser reliability. Preserve one-request/exact-once Wallet approval and
+  Runtime-only networking while fixing these issues.
+- [ ] Replace administrative Browser cleanup retirement with provider-owned
+  durable child/process identities and idempotent terminal cleanup receipts.
+  Restart recovery must settle exact obligations from explicit retained
+  identity, not process-list, port-availability, or socket-inactivity inference.
+- [ ] Review `feat/shell-ui-esp-on-protocol` as a post-0.6 product line. Do not
+  replay its obsolete protocol/auth history or extended AI work; require small,
+  independently testable UI commits against the released ESP contracts.
+- [ ] Resume Carrier reconciliation for 0.7 only after its provider generation,
+  multi-node physical evidence, cleanup, and release boundaries are reviewed.
+
 ### 0. Branch readiness and reviewability
-- [ ] Keep branch assumptions current: `main` is the 0.5.0 baseline,
-  `feat/elastos-shell-protocol` is the active Components, ElastOS Bus, and shell-protocol work
-  branch based on `upstream/0.6-dev`; require tested, clean, reviewable slices
-  before publishing it for review.
+- [ ] Keep branch assumptions current: `main` is the 0.5.0 baseline and
+  `fix/elastos-shell-protocol-browser-wallet-consolidation` is the unpublished
+  0.6.0 release-candidate line based on `upstream/0.6-dev`; publish only its
+  reviewed ordered commits after the release matrix passes.
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
 - [ ] Keep oversized-file cleanup frozen unless branch review exposes a concrete no-behavior blocker. The existing Browser/Wallet/provider cleanup is already split into focused sibling modules: Browser gateway, Wallet gateway, Wallet UI send/receive/create/request/state/preference flows, wallet-provider EVM crypto, and wallet-provider approval test groups. Keep those seams stable and verified. Do not split `capsules/browser/browser/browser.js` further unless a diagnostic-frame/session seam is proven mechanical and behavior-free. Treat `gateway_tests/room.rs`, `gateway_room.rs`, `gateway_tests/home_system.rs`, `room_service.rs`, `auth_gateway.rs`, and `home_cmd.rs` as later cleanup unless they become direct release-review blockers. Keep `scripts/home-entropy-check.mjs` as a broad alignment gate for now, but do not let it accumulate new product logic. Each future split must be no-behavior, separately testable, and covered by the narrow Rust/JS smoke commands for that surface.
 - [ ] Review this branch in authority-bound slices, not as one Browser mega-diff: content availability/protected content providers, chain provider core, auth/recovery core, Wallet authority surface, Home/System UX, Chat/Carrier updates, capsule authority manifests, Browser ABI/adapter, Browser proof tooling, shared runtime/gateway, then release/registry/docs. Each slice must be a coherent commit with its own verification commands. Shared runtime/gateway hunks require manual hunk-level review because they cross provider boundaries. Keep `chain_provider_core` separate from Browser: typed proof, prepare, broadcast, sync health, and node lifecycle are blockchain-quadrant provider work, even when Browser consumes them through Wallet. Keep `auth_recovery_core` separate from route wiring: passkey/WebAuthn verification, proof-bound sessions, principal roots, and Recovery Kit helpers are authority primitives consumed by Home/System/Wallet gateway routes. The Wallet authority surface should be reviewed as provider authority core, Wallet app and connector capsules, then gateway/Inbox/audit wiring only after shared gateway hunks are isolated. For Home/System UX, run `node scripts/home-passkey-virtual-auth-smoke.mjs` on loopback Home to prove signed passkey journeys without a human cookie, then run the Camofox smokes for layout coverage. For Browser ABI/provider work, run the Browser Rust tests, `scripts/check-wci-alignment.sh`, `node scripts/home-entropy-check.mjs`, `node scripts/browser-display-mode-smoke.mjs`, `scripts/browser-wallet-bridge-smoke.sh`, and `scripts/browser-glide-wallet-smoke.sh`. Browser proof tooling must keep provider decision reports, objective audits, and runbooks structured and fail closed while product media/manual evidence is missing. Each slice must name its verification commands and must not claim Browser completion unless `scripts/browser-objective-audit.mjs` passes with accepted product media plus matching manual UX evidence.
