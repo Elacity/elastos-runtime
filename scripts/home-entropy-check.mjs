@@ -10775,33 +10775,33 @@ assert(
     installDoc.includes("just candidate-command-audit") &&
     installDoc.includes("ELASTOS_PUBLISHER_GATEWAY=<candidate-url>") &&
     installDoc.includes("ELASTOS_BIN_OVERRIDE=\"$PWD/elastos/target/release/elastos\"") &&
-    installDoc.includes("0.5.0-compatible manifest") &&
+    installDoc.includes("0.6.0-compatible manifest") &&
     installDoc.includes("home profile and checksummed artifacts") &&
     installDoc.includes("scripts/local-carrier-setup-smoke.sh") &&
     installDoc.includes("scripts/public-install-identity-smoke.sh") &&
     installDoc.includes("scripts/public-install-home-frontdoor-smoke.sh") &&
-    installDoc.includes("Final public install path after publishing 0.5.0") &&
+    installDoc.includes("Final public install path after publishing 0.6.0") &&
     installDoc.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
     installDoc.includes("--min-active-crosvm-seconds 3600") &&
     installDoc.includes("manual installed-device check is still separate") &&
     installDoc.includes("Source-home and seed-node proofs do not replace this") &&
     installDoc.includes("installed-path check") &&
-    runtimeChecklist.includes("## 0.5.0 Handoff Order") &&
+    runtimeChecklist.includes("## 0.6.0 Handoff Order") &&
     runtimeChecklist.includes("just candidate-command-audit") &&
     runtimeChecklist.includes("ELASTOS_PUBLISHER_GATEWAY=<candidate-url>") &&
     runtimeChecklist.includes("ELASTOS_BIN_OVERRIDE=\"$PWD/elastos/target/release/elastos\"") &&
-    runtimeChecklist.includes("0.5.0-compatible manifest") &&
+    runtimeChecklist.includes("0.6.0-compatible manifest") &&
     runtimeChecklist.includes("home profile and checksummed artifacts") &&
     runtimeChecklist.includes("scripts/local-carrier-setup-smoke.sh") &&
     runtimeChecklist.includes("scripts/public-install-identity-smoke.sh") &&
     runtimeChecklist.includes("scripts/public-install-home-frontdoor-smoke.sh") &&
-    runtimeChecklist.includes("Final public install path after publishing 0.5.0") &&
+    runtimeChecklist.includes("Final public install path after publishing 0.6.0") &&
     runtimeChecklist.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
     runtimeChecklist.includes("--min-active-crosvm-seconds 3600") &&
     runtimeChecklist.includes("Do not") &&
     runtimeChecklist.includes("count source-home or seed-node proof as installed-host acceptance") &&
     scriptsReadme.includes("ELASTOS_BIN_OVERRIDE=<path-to-branch-elastos>") &&
-    scriptsReadme.includes("0.5.0-compatible manifest") &&
+    scriptsReadme.includes("0.6.0-compatible manifest") &&
     scriptsReadme.includes("current `home` setup profile") &&
     scriptsReadme.includes("checksummed artifacts") &&
     includesNormalized(scriptsReadme, "pin the installer-selected components manifest") &&
@@ -10823,20 +10823,20 @@ assert(
     currentState.includes("pin the installer-selected components manifest") &&
     currentState.includes("source checkout `components.json` from leaking") &&
     currentState.includes("lacks the current `home` setup profile") &&
-    currentState.includes("Branch-override public smokes require a staged or published 0.5.0-compatible") &&
+    currentState.includes("Branch-override public smokes require a staged or published 0.6.0-compatible") &&
     includesNormalized(currentState, "Source/local Carrier setup proof stays in") &&
     includesNormalized(
       currentState,
-      "require a staged or published 0.5.0-compatible manifest with the current `home` profile",
+      "require a staged or published 0.6.0-compatible manifest with the current `home` profile",
     ) &&
     currentState.includes("ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1") &&
-    currentState.includes("Final public installed-path proof waits for publishing the 0.5.0") &&
+    currentState.includes("Final public installed-path proof waits for publishing the 0.6.0") &&
     tasks.includes("Keep source/local Carrier setup proof green") &&
     tasks.includes("Candidate public install proof with the branch binary needs a staged or") &&
-    tasks.includes("0.5.0-compatible manifest") &&
+    tasks.includes("0.6.0-compatible manifest") &&
     tasks.includes("current `home` profile") &&
     tasks.includes("scripts/local-carrier-setup-smoke.sh") &&
-    tasks.includes("publish the 0.5.0 binary/artifact set so no-override public installed-path smokes use current code"),
+    tasks.includes("publish the 0.6.0 binary/artifact set so no-override public installed-path smokes use current code"),
   "Install and runtime checklist docs must preserve the branch, public install, candidate gateway, target closeout, and manual installed-device handoff boundaries",
 );
 assert(

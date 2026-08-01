@@ -182,8 +182,8 @@ bash scripts/check-wci-alignment.sh
 # Current checkout: installed-style command behavior in a clean home
 just candidate-command-audit
 
-# Current 0.5.0 baseline through the canonical public installer/source path.
-# Requires a staged or published 0.5.0-compatible manifest with the current
+# Current 0.6.0 release through the canonical public installer/source path.
+# Requires a staged or published 0.6.0-compatible manifest with the current
 # home profile and checksummed artifacts.
 ELASTOS_PUBLISHER_GATEWAY=<candidate-url> \
 ELASTOS_BIN_OVERRIDE="$PWD/elastos/target/release/elastos" \
@@ -195,14 +195,14 @@ ELASTOS_BIN_OVERRIDE="$PWD/elastos/target/release/elastos" \
 # Source/local Carrier setup proof before a candidate gateway exists
 scripts/local-carrier-setup-smoke.sh
 
-# Final public install path after publishing 0.5.0
+# Final public install path after publishing 0.6.0
 bash scripts/public-install-identity-smoke.sh
 bash scripts/public-install-home-frontdoor-smoke.sh
 
 # Stricter Carrier relay-only setup path, when publisher relay health is under review
 ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1 bash scripts/public-install-home-frontdoor-smoke.sh
 
-# Candidate publisher/gateway after staging a 0.5.0 artifact set
+# Candidate publisher/gateway after staging a 0.6.0 artifact set
 ELASTOS_PUBLISHER_GATEWAY=<candidate-url> bash scripts/public-install-home-frontdoor-smoke.sh
 
 # Target closeout from the operator host when a Home-authorized Browser page is active

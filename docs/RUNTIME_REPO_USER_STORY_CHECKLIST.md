@@ -26,7 +26,7 @@ Rules:
 - Installed arm64 host:
   - installed target-machine proof
 
-## 0.5.0 Handoff Order
+## 0.6.0 Handoff Order
 
 Use this order for the reconciliation branch so source proof, public install
 proof, and target-device proof do not get mixed together:
@@ -41,8 +41,8 @@ bash scripts/check-wci-alignment.sh
 # 2. Current branch, installed-style command surface
 just candidate-command-audit
 
-# 3. Current 0.5.0 baseline through the canonical public installer/source path.
-# Requires a staged or published 0.5.0-compatible manifest with the current
+# 3. Current 0.6.0 release through the canonical public installer/source path.
+# Requires a staged or published 0.6.0-compatible manifest with the current
 # home profile and checksummed artifacts.
 ELASTOS_PUBLISHER_GATEWAY=<candidate-url> \
 ELASTOS_BIN_OVERRIDE="$PWD/elastos/target/release/elastos" \
@@ -54,14 +54,14 @@ ELASTOS_BIN_OVERRIDE="$PWD/elastos/target/release/elastos" \
 # Source/local Carrier setup proof before a candidate gateway exists
 scripts/local-carrier-setup-smoke.sh
 
-# Final public install path after publishing 0.5.0
+# Final public install path after publishing 0.6.0
 bash scripts/public-install-identity-smoke.sh
 bash scripts/public-install-home-frontdoor-smoke.sh
 
 # Optional stricter publisher relay check
 ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1 bash scripts/public-install-home-frontdoor-smoke.sh
 
-# 4. Candidate gateway after staging a 0.5.0 artifact set
+# 4. Candidate gateway after staging a 0.6.0 artifact set
 ELASTOS_PUBLISHER_GATEWAY=<candidate-url> bash scripts/public-install-home-frontdoor-smoke.sh
 
 # 5. Target closeout while a Home-authorized Browser page is open

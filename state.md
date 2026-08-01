@@ -336,13 +336,15 @@ the public repository.
 - Public-install branch-binary smokes must pin the installer-selected components manifest.
 - Public-install branch-binary smokes prevent source checkout `components.json` from leaking into installed-path proof.
 - Public-install branch-binary smokes fail if the selected gateway lacks the current `home` setup profile.
-- Branch-override public smokes require a staged or published 0.5.0-compatible
+- Branch-override public smokes require a staged or published 0.6.0-compatible
   manifest with the current `home` profile and checksummed artifacts.
 - Source/local Carrier setup proof stays in `scripts/local-carrier-setup-smoke.sh`.
-- Public install proof must require a staged or published 0.5.0-compatible manifest with the current `home` profile and checksummed artifacts.
+- Public install proof for this candidate requires a staged or published
+  0.6.0-compatible manifest with the current `home` profile and checksummed
+  artifacts.
 - Set `ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only when the publisher relay
   path itself is under review.
-- Final public installed-path proof waits for publishing the 0.5.0
+- Final public installed-path proof waits for publishing the 0.6.0
   binary/artifact set.
 
 ## Open Blockers

@@ -67,9 +67,9 @@ Proof, smoke, and audit helpers also currently live at the root. Common examples
 These are review and release helpers, not automatically part of the stable
 end-user command contract. The `public-install-*.sh` helpers can target a
 published candidate gateway by setting `ELASTOS_PUBLISHER_GATEWAY=<url>`. They
-use the stamped trusted-source transports by default. During 0.5.0 baseline
+use the stamped trusted-source transports by default. During 0.6.0 release
 review, `ELASTOS_BIN_OVERRIDE=<path-to-branch-elastos>` swaps in the current
-branch binary only when the selected gateway serves a 0.5.0-compatible manifest
+branch binary only when the selected gateway serves a 0.6.0-compatible manifest
 with the current `home` setup profile and checksummed artifacts. The helpers pin
 the installer-selected components manifest so source checkout metadata cannot
 leak into the installed-path smoke. Use `scripts/local-carrier-setup-smoke.sh`

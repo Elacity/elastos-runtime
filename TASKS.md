@@ -52,9 +52,9 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Keep the Browser provider proof language explicit: Selkies is the current self-hosted baseline, not the acceptance answer. Native/browser-product proof must stay tied to `browser-native-supervisor-smoke.sh`, `browser-native-proxy-engine-smoke.sh`, `browser-native-supervisor-proxy-smoke.sh`, `browser-native-operator-config.mjs`, and `browser-native-target-preflight.sh`; Browser wallet connector effects must keep `wallet-connector-transaction-smoke.mjs` in the verification set.
 - [ ] Keep protected-content release claims exact: `scripts/browser-ela-city-protected-content-open-smoke.sh` proves that Runtime Browser can open the known `ela.city` protected-content route and cleanly release the page session, and the current branch has a funded live purchase/playback proof for the known test path. Release notes may cite that current user journey, but must not claim arbitrary protected-content readiness, production dDRM completeness, dKMS readiness, or generic decrypt/render provider completion.
 
-### 0.5.0 baseline preservation on the 0.6-dev integration line
-- [ ] Review execution order for preserving 0.5.0 behavior while reviewing
-  `feat/elastos-shell-protocol` on its `upstream/0.6-dev` base:
+### 0.6.0 release-candidate preservation
+- [ ] Review execution order for preserving the accepted 0.6.0 candidate on
+  its `upstream/0.6-dev` base:
   1. Keep reusable source/review gates green on this branch:
      `git diff --check`, `node scripts/home-entropy-check.mjs`,
      `node scripts/browser-entropy-check.mjs`,
@@ -78,7 +78,7 @@ section if a higher section is incoherent, unverified, or too large to review.
   5. Keep source/local Carrier setup proof green with
      `scripts/local-carrier-setup-smoke.sh` before a candidate gateway exists.
      Candidate public install proof with the branch binary needs a staged or
-     published 0.5.0-compatible manifest with the current `home` profile and
+     published 0.6.0-compatible manifest with the current `home` profile and
      checksummed artifacts; then rerun `scripts/public-install-identity-smoke.sh`
      and `scripts/public-install-home-frontdoor-smoke.sh` with
      `ELASTOS_PUBLISHER_GATEWAY=<candidate-url>` and the branch binary override.
@@ -98,14 +98,16 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Browser wallet/product UX slice: prove Browser wallet dapp flows through Runtime-mediated Wallet/Inbox authority, including the known `ela.city` buy-result mismatch, EIP-1193 `eth_sendTransaction` return/receipt shape, account discovery/chain switching, and explicit audio/video/input manual evidence. Run `scripts/auth-wallet-focus-smoke.sh`, Browser wallet smokes, and the manual UX report before any Browser product-readiness claim.
   Current source smokes must be rerun before release proof; manual audio/video/input UX evidence remains open.
 - [ ] Installed Home/device proof slice: prove installed `elastos -> Home -> app -> Home` on Mac and Jetson, including live `/apps/home/`, app launch/focus/close, return-home behavior, provider manifest availability, and no source-tree-only assumptions. Keep host adapters behind Runtime contracts instead of branching product behavior per machine.
-- [ ] Release package/registry slice: stamp or verify provider component checksums, keep the current `home` publish preflight/dry-run receipt valid, verify installed provider manifests on the target data dirs, decide whether Browser VM helper/rootfs/initrd artifacts remain source-home generated via `scripts/setup-source-home.sh` plus `scripts/browser-vm-target-refresh.sh` or become explicit `components.json` release components, publish the 0.5.0 binary/artifact set so no-override public installed-path smokes use current code, and make changelog/release claims match only the proofs that passed on real target hosts.
+- [ ] Release package/registry slice: stamp or verify provider component checksums, keep the current `home` publish preflight/dry-run receipt valid, verify installed provider manifests on the target data dirs, decide whether Browser VM helper/rootfs/initrd artifacts remain source-home generated via `scripts/setup-source-home.sh` plus `scripts/browser-vm-target-refresh.sh` or become explicit `components.json` release components, publish the 0.6.0 binary/artifact set so no-override public installed-path smokes use current code, and make changelog/release claims match only the proofs that passed on real target hosts.
 - [ ] Final entropy slice: remove only proven-unused reconciliation leftovers, stale display paths, stale work logs, duplicate truth surfaces, generated artifacts, and target backups after they are either archived or intentionally retained. Do not add compatibility shims for removed `runtime_frame`, `diagnostic_frame`, screenshot, image-polling, or host-specific browser paths unless a current shipped caller is proven.
 
 ### 1. Blockchain quadrant: identity, wallet, auth, node capsules
 - [ ] Enforce the blockchain quadrant contract in code before UI: runtime principal, verified proof bindings, short-lived session grants, scoped capabilities, provider-mediated effects, signed audit, and fail-closed behavior.
 - [ ] Keep `scripts/wallet-product-safety-smoke.sh` green before release publish. It is the product-level Wallet safety gate for MetaMask multi-account link/remove, passkey-gated built-in account delete and recovery-key export/import, WalletConnect disabled without pinned operator config, Ledger hidden until implemented, and no hosted Browser UniSat injection path.
 - [ ] Make recovery semantics impossible to misunderstand before release publish: System's `Download Recovery Kit` must export one password-protectable full bundle containing the principal-owned Home/user data root plus every recoverable built-in Wallet key for that principal. Individual `elastos.wallet.recovery-key/v1` export/import remains an advanced per-account escape hatch. External wallets such as MetaMask, WalletConnect, Ledger, Essentials, and UniSat can only restore links/metadata because their private keys live outside ElastOS. Deleting a built-in wallet must warn when no full bundle or individual Wallet key has been saved, and the main Wallet view must offer both `Create account` and `Import Wallet key` without sending users to Settings.
-- [ ] Make "capsules know only Carrier" enforceable for blockchain work: wallet, DID, and node operations must be invoked through Carrier-style capability envelopes even when routed locally.
+- [ ] Keep the capsule boundary canonical: capsules invoke typed ElastOS Bus
+  resources for Wallet, DID, Chain, and other effects. Carrier is an optional
+  authenticated transport adapter behind those resources, not the capsule API.
 - [ ] Keep app/viewer/content capsules away from wallet RPC, node RPC, raw HTTP ports, chain SDKs, and private-key material; only wallet/node provider capsules may hold those authorities.
 - [ ] Keep principals, proof bindings, and sessions separate. Principals are people, agents, devices, capsules, and providers. Wallet addresses, BTC addresses, `did:key`, and `did:elastos` are proof bindings. Sessions are ephemeral grant contexts, not identities.
 - [ ] Separate signing roles explicitly: device DID, human/persona DID, agent DID, capsule/provider DID, publisher DID, optional object/head identity, and session grant. Define which identity signs launch grants, Carrier envelopes, package manifests, published objects, credentials, global name claims, and access rights.
@@ -258,7 +260,10 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 ### Runtime primitives missing for the PC2 world-computer model
 - [ ] Replace hardcoded `Users/self` assumptions with first-class principals: passkey-owned user roots, user DID, device DID, personas, agents, active session, and capability tokens bound to principal + capsule + session.
-- [ ] Add authenticated Carrier envelopes as the default application contract: sender DID, object identity, signature, capability context, replay protection, and verified delivery status. Keep raw gossip/transport as an explicit unsafe/provider-level lane.
+- [ ] Add authenticated Carrier envelopes as an optional transport adapter
+  behind typed ElastOS Bus resources: sender DID, object identity, signature,
+  capability context, replay protection, and verified delivery status. Keep raw
+  gossip/transport as an explicit unsafe provider-level lane.
 - [ ] Keep the `object-provider` / `content-provider` ontology stable while completing the remaining World Computer object/content work: `object-provider` owns mutable principal-root objects, and `content-provider` owns published content identity, availability, and Carrier-backed delivery authority.
 - [ ] Extract pure object-provider core out of `elastos-server::library` into a smaller provider-core crate when modularity becomes the release bar: preserve the existing `object-provider` capsule/API boundary, move principal-root object request handling, path rules, archive/event helpers, and tests without changing Library behavior, and keep publish/share/availability authority separated through `content-provider` and Runtime coordination.
 - [ ] Keep Public placement and Published content separate in every Library/Home/Spaces surface: `Public` is a user-facing placement/projection under the active principal root, while `published_cid`/`elastos://<cid>` is the only public content-link truth. Do not add hidden auto-publish side effects for rename/move/copy/upload into Public; if auto-publish is desired later, make it an explicit user policy prompt backed by content-provider receipts.
