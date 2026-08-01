@@ -317,6 +317,12 @@ impl VzLaunchOwner {
         };
         let turn_cleanup =
             std::mem::replace(&mut self.turn_cleanup, TurnCleanupEvidence::Indeterminate);
+        // Port availability is evidence only when this launch may have started TURN.
+        // A foreign listener cannot create a cleanup obligation for this owner.
+        let probe_turn_ports = matches!(
+            &turn_cleanup,
+            TurnCleanupEvidence::Owned(_) | TurnCleanupEvidence::Indeterminate
+        );
         let turn_child_absent = match turn_cleanup {
             TurnCleanupEvidence::Owned(mut turn) => turn.terminate_and_reap(),
             TurnCleanupEvidence::AbsenceProved => true,
@@ -336,8 +342,14 @@ impl VzLaunchOwner {
             .vm_id
             .as_str()
             .is_some_and(|vm_id| remove_owned_vm_state(&self.paths, vm_id, vm_absent));
-        let turn_listener_absent = turn_listener_port_absent(&self.transport);
-        let turn_relay_ports_absent = turn_relay_ports_absent(&self.transport);
+        let (turn_listener_absent, turn_relay_ports_absent) = if probe_turn_ports {
+            (
+                turn_listener_port_absent(&self.transport),
+                turn_relay_ports_absent(&self.transport),
+            )
+        } else {
+            (true, true)
+        };
         let child_absent = turn_child_absent
             && control_proxy_absent
             && ordinary_stream_bridge_absent
@@ -3838,6 +3850,9 @@ mod tests {
     async fn post_effect_failure_emits_exact_terminal_cleanup() {
         let mut transport = transport_fixture('f');
         transport.authority["turn"]["relay_host"] = json!("127.0.0.1");
+        let foreign_turn_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        transport.authority["turn"]["listen_port"] =
+            json!(foreign_turn_listener.local_addr().unwrap().port());
         transport
             .authority
             .as_object_mut()
@@ -3880,8 +3895,10 @@ mod tests {
         assert_eq!(settlement["state"], "terminal_post_effect_cleanup");
         assert_eq!(settlement["effects"]["session_directory"], true);
         assert_eq!(settlement["effects"]["control_socket"], true);
+        assert_eq!(settlement["effects"]["turn_process"], false);
         assert_eq!(settlement["absence"]["session_directory_absent"], true);
         assert_eq!(settlement["absence"]["control_socket_absent"], true);
+        assert_eq!(settlement["absence"]["turn_listener_absent"], true);
         assert_eq!(
             settlement["binding_hash"],
             launch["transport_authority"]["binding_hash"]
