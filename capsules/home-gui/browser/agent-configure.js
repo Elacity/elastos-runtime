@@ -1,5 +1,5 @@
 /* Agent Settings / Usage pages + workbench panels.
-   Bound from agent-harness.js (ctx + host). Tip: home-20260804aq
+   Bound from agent-harness.js (ctx + host). Tip: home-20260804ar
    UI ≠ authority (Principle 16): pages never mint grants. */
 
 import {
@@ -12,7 +12,7 @@ import {
   getHardwareEstimate,
   getPlanMarkdown,
   getTruthSnapshot,
-} from "./mock-agent-provider.js?v=home-20260804aq";
+} from "./mock-agent-provider.js?v=home-20260804ar";
 import {
   DEFAULT_LIVE_SYSTEM_PROMPT,
   MAX_LIVE_SYSTEM_PROMPT_CHARS,
@@ -22,7 +22,7 @@ import {
   fetchAgentBackends,
   saveAgentBackends,
   getAgentBackendsCache,
-} from "./agent-live.js?v=home-20260804aq";
+} from "./agent-live.js?v=home-20260804ar";
 
 /** @type {null | object} */
 let ctx = null;
@@ -731,5 +731,10 @@ export function syncWorkbenchPanels() {
   }
   /* Status / Tools left the rail — Settings is the one ops path. */
   renderHarnessPage();
+  try {
+    host?.renderLibraryWorkbench?.();
+  } catch {
+    /* harness may bind later */
+  }
 }
 

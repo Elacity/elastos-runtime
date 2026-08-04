@@ -6,13 +6,13 @@ import {
   listProjects,
   replaceProjects,
   setReasoningVisible,
-} from "./mock-agent-provider.js?v=home-20260804aq";
+} from "./mock-agent-provider.js?v=home-20260804ar";
 import {
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
-} from "./agent-live.js?v=home-20260804aq";
-import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804aq";
+} from "./agent-live.js?v=home-20260804ar";
+import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804ar";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;

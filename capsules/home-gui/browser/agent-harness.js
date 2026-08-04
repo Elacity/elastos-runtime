@@ -10,7 +10,13 @@ import {
   agentShelfFaceActive,
   snapAgentShelfFace,
   snapAppsShelfFace,
-} from "./agent-shelf.js?v=home-20260804aq";
+  bindShelfAttachHost,
+  addComposerAttachment,
+} from "./agent-shelf.js?v=home-20260804ar";
+import {
+  shellState,
+  desktopObjects,
+} from "./shell-core.js?v=home-20260804ar";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -20,8 +26,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260804aq";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804aq";
+} from "./shell-stages.js?v=home-20260804ar";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804ar";
 import {
   resetMockCapabilities,
   getSelectedModel,
@@ -38,18 +44,18 @@ import {
   maybeUpdatePlanFromPrompt,
   requestModelGet,
   removeProject,
-} from "./mock-agent-provider.js?v=home-20260804aq";
+} from "./mock-agent-provider.js?v=home-20260804ar";
 import {
   bindAgentWorkspaceSnapshot,
-} from "./shell-windows.js?v=home-20260804aq";
-import { TIP } from "./agent-tip.js?v=home-20260804aq";
-import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804aq";
+} from "./shell-windows.js?v=home-20260804ar";
+import { TIP } from "./agent-tip.js?v=home-20260804ar";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804ar";
 import {
   bindAgentWorkspaceStore,
   getAgentWorkspaceSnapshot,
   applyAgentWorkspaceSnapshot,
   persistAgentWorkspaceSoon,
-} from "./agent-workspace.js?v=home-20260804aq";
+} from "./agent-workspace.js?v=home-20260804ar";
 import {
   bindAgentConfigure,
   harnessPageOpen,
@@ -62,7 +68,7 @@ import {
   setWorkbenchTab,
   syncWorkbenchPanels,
   syncWorkbenchOpenUi,
-} from "./agent-configure.js?v=home-20260804aq";
+} from "./agent-configure.js?v=home-20260804ar";
 import {
   bindAgentGrants,
   syncTruthStrip,
@@ -72,7 +78,7 @@ import {
   sessionAlreadyHasGrant,
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804aq";
+} from "./agent-grants.js?v=home-20260804ar";
 import {
   bindAgentStream,
   clearStreamTimer,
@@ -101,7 +107,7 @@ import {
   updateJumpToLatestVisibility,
   ensureJumpToLatest,
   setStreamStatus,
-} from "./agent-stream.js?v=home-20260804aq";
+} from "./agent-stream.js?v=home-20260804ar";
 import {
   getLiveInferenceState,
   probeLiveInference,
@@ -109,7 +115,7 @@ import {
   setLiveChatPair,
   fetchAgentBackends,
   getAgentBackendsCache,
-} from "./agent-live.js?v=home-20260804aq";
+} from "./agent-live.js?v=home-20260804ar";
 import {
   bindAgentSessions,
   relativeTime,
@@ -137,7 +143,7 @@ import {
   closeSessionActions,
   openSessionActions,
   runSessionAction,
-} from "./agent-sessions.js?v=home-20260804aq";
+} from "./agent-sessions.js?v=home-20260804ar";
 export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
 let workbenchTab = "outputs";
@@ -351,6 +357,13 @@ bindAgentConfigure(
     syncModelMenu: () => {
       try {
         renderModelMenu();
+      } catch {
+        /* optional during early boot */
+      }
+    },
+    renderLibraryWorkbench: () => {
+      try {
+        renderLibraryWorkbench();
       } catch {
         /* optional during early boot */
       }
@@ -1585,11 +1598,73 @@ let sessionActionsId = null;
 /** When creating a project from a chat’s menu, file that chat into it. */
 let pendingProjectAssignSessionId = null;
 
+function renderDesktopAttachOptions(menu) {
+  const list = menu?.querySelector?.("[data-attach-desktop-list]");
+  if (!list) {
+    return;
+  }
+  list.replaceChildren();
+  const objects = desktopObjects(shellState.currentSummary).slice(0, 24);
+  if (!objects.length) {
+    const empty = document.createElement("p");
+    empty.className = "agent-attach-menu-empty";
+    empty.textContent = "No Desktop objects yet — choose a local file or open Library later.";
+    list.append(empty);
+    return;
+  }
+  for (const object of objects) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "agent-attach-menu-item";
+    btn.dataset.attachDesktopUri = object.uri;
+    btn.dataset.attachDesktopName = object.name;
+    btn.dataset.attachDesktopSize = String(object.size || object.byte_size || 0);
+    btn.textContent = object.name;
+    btn.title = object.uri;
+    list.append(btn);
+  }
+}
+
+export function renderLibraryWorkbench() {
+  const host = document.querySelector("[data-library-chips]");
+  if (!host) {
+    return;
+  }
+  host.replaceChildren();
+  const objects = desktopObjects(shellState.currentSummary).slice(0, 32);
+  if (!objects.length) {
+    const empty = document.createElement("p");
+    empty.className = "agent-library-empty";
+    empty.dataset.libraryEmpty = "1";
+    empty.textContent =
+      "Desktop objects appear here. Attach from the composer — content extract needs a library.read grant (Inbox; UI ≠ authority).";
+    host.append(empty);
+    return;
+  }
+  for (const object of objects) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "agent-library-chip";
+    btn.dataset.libraryAttachUri = object.uri;
+    btn.dataset.libraryAttachName = object.name;
+    btn.textContent = object.name;
+    btn.title = `${object.uri} · attach (content needs library.read)`;
+    host.append(btn);
+  }
+  const note = document.createElement("p");
+  note.className = "agent-library-empty";
+  note.textContent =
+    "Attach adds a Desktop reference. Extracted text for Desktop objects waits on library.read (no ambient authority).";
+  host.append(note);
+}
+
 export function bindAgentHarness() {
   if (bound) {
     return;
   }
   bound = true;
+  bindShelfAttachHost({ renderDesktopAttachOptions });
+  renderLibraryWorkbench();
   refreshHarnessDomCache();
   const newChatBtn = document.querySelector("#agent-harness-new-chat");
   if (newChatBtn && newChatBtn.dataset.boundNewChat !== "1") {
@@ -2102,19 +2177,18 @@ export function bindAgentHarness() {
       syncWorkbenchPanels();
       return;
     }
-    const lib = event.target.closest?.("[data-library-attach]");
-    if (lib?.dataset.libraryAttach) {
+    const lib = event.target.closest?.("[data-library-attach-uri]");
+    if (lib?.dataset.libraryAttachUri) {
       event.preventDefault();
+      addComposerAttachment({
+        kind: "desktop",
+        name: lib.dataset.libraryAttachName || "Desktop object",
+        uri: lib.dataset.libraryAttachUri,
+      });
       openWorkbench({ tab: "library", force: true });
-      const noun = lib.dataset.libraryAttach;
       const input = shelfComposerInput();
-      if (input) {
-        const chip = `@${noun}`;
-        input.value = input.value ? `${input.value.trim()} ${chip}` : chip;
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        syncAgentSendButton();
-        input.focus({ preventScroll: true });
-      }
+      input?.focus?.({ preventScroll: true });
+      syncAgentSendButton();
       return;
     }
     const out = event.target.closest?.("[data-output-id]");

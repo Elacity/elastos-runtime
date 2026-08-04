@@ -46,8 +46,13 @@
  * [ ] Model menu pair rows come from GET /agent/backends
  * [ ] Auto-title strips markdown / takes first sentence
  *
+ * Wave 3 attach/context (§AR):
+ * [ ] Attach menu lists Desktop objects + device files
+ * [ ] Text files size-capped into Live message; Desktop needs grant note
+ * [ ] Workbench Library shows Desktop objects (not fake name chips)
+ *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804aq";
+export const TIP = "home-20260804ar";

@@ -7,15 +7,15 @@
 
    Send opens Agent Harness (Home drops, dock stays) — see agent-harness.js. */
 
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804aq";
-import { TIP } from "./agent-tip.js?v=home-20260804aq";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804ar";
+import { TIP } from "./agent-tip.js?v=home-20260804ar";
 import {
   agentHarnessActive,
   hideAgentHarness,
   sendToAgentHarness,
   showAgentHarness,
   stopAgentHarnessStream,
-} from "./agent-send.js?v=home-20260804aq";
+} from "./agent-send.js?v=home-20260804ar";
 
 let bound = false;
 let morphGeneration = 0;
@@ -23,6 +23,10 @@ let morphTimer = 0;
 /** @type {{ id: string, name: string, size: number }[]} */
 let composerAttachments = [];
 let attachSeq = 0;
+const MAX_ATTACH_TEXT_CHARS = 24_000;
+const MAX_ATTACH_READ_BYTES = 200_000;
+const TEXT_ATTACH_RE =
+  /^(text\/|application\/(json|xml|javascript|x-yaml|yaml|toml|csv|sql))/i;
 
 /** Real dock width/height stretch — both directions, even ease-in-out. */
 const MORPH_STRETCH_MS = 950;
@@ -315,6 +319,28 @@ function calmDockIconsForMorph(taskbar) {
   });
 }
 
+function formatAttachmentContext(attachments) {
+  const parts = [];
+  for (const item of attachments) {
+    const name = item.name || "file";
+    if (item.text) {
+      parts.push(
+        `Attached «${name}» (size-capped local extract · not a Library grant):\n${item.text}`,
+      );
+      continue;
+    }
+    if (item.uri) {
+      parts.push(
+        `Attached desktop object «${name}» (${item.uri}). ` +
+          `Content was not extracted — a library.read grant is required (Inbox; UI ≠ authority).`,
+      );
+      continue;
+    }
+    parts.push(`Attached «${name}» (name only · binary/unsupported for extract).`);
+  }
+  return parts.join("\n\n");
+}
+
 export async function sendAgentComposerMessage() {
   const input = composerInput();
   const taskbar = taskbarEl();
@@ -337,10 +363,14 @@ export async function sendAgentComposerMessage() {
     showAgentShelfFace();
   }
 
+  const attached = composerAttachments.slice();
+  const context = formatAttachmentContext(attached);
+  const outbound = context ? `${prompt}\n\n---\n${context}` : prompt;
+
   input.value = "";
   autosizeComposer(input);
-  /* Attachments are preview chips only — the turn consumed them. */
   clearComposerAttachments();
+  closeAttachMenu();
 
   const waitReady = () =>
     new Promise((resolve) => {
@@ -366,7 +396,7 @@ export async function sendAgentComposerMessage() {
     });
 
   await waitReady();
-  await sendToAgentHarness(prompt);
+  await sendToAgentHarness(outbound);
 }
 
 function openHarnessWithShelf() {
@@ -774,14 +804,18 @@ function renderComposerAttachments() {
     chip.type = "button";
     chip.className = "agent-attach-chip";
     chip.dataset.attachId = file.id;
-    chip.title = "Remove attachment (preview)";
+    chip.title = "Remove attachment";
     chip.innerHTML =
       `<span class="agent-attach-chip-name"></span>` +
       `<span class="agent-attach-chip-meta"></span>` +
       `<span class="agent-attach-chip-x" aria-hidden="true">×</span>`;
     chip.querySelector(".agent-attach-chip-name").textContent = file.name;
-    const kb = Math.max(1, Math.round(file.size / 1024));
-    chip.querySelector(".agent-attach-chip-meta").textContent = `${kb} KB · preview`;
+    const meta = file.text
+      ? `extract · ${Math.max(1, Math.round(file.text.length / 1024))} KB`
+      : file.uri
+        ? "desktop · needs grant"
+        : `${Math.max(1, Math.round((file.size || 0) / 1024))} KB`;
+    chip.querySelector(".agent-attach-chip-meta").textContent = meta;
     host.append(chip);
   }
 }
@@ -791,7 +825,41 @@ export function clearComposerAttachments() {
   renderComposerAttachments();
 }
 
-function openAttachPicker() {
+export function addComposerAttachment(entry) {
+  if (!entry?.name) {
+    return;
+  }
+  attachSeq += 1;
+  composerAttachments.push({
+    id: `att-${attachSeq}`,
+    name: String(entry.name).slice(0, 180),
+    size: Number(entry.size) || 0,
+    uri: entry.uri ? String(entry.uri).slice(0, 1024) : "",
+    text: entry.text ? String(entry.text).slice(0, MAX_ATTACH_TEXT_CHARS) : "",
+    kind: entry.kind || (entry.uri ? "desktop" : "file"),
+  });
+  if (composerAttachments.length > 8) {
+    composerAttachments = composerAttachments.slice(-8);
+  }
+  renderComposerAttachments();
+  const field = composerInput();
+  if (field && !field.value.trim()) {
+    field.placeholder = `Ask about ${entry.name}…`;
+  }
+}
+
+function attachMenuEl() {
+  return document.querySelector("[data-agent-attach-menu]");
+}
+
+function closeAttachMenu() {
+  const menu = attachMenuEl();
+  if (menu) {
+    menu.hidden = true;
+  }
+}
+
+function openDeviceFilePicker() {
   const input = attachInput();
   if (!input) {
     return;
@@ -800,29 +868,65 @@ function openAttachPicker() {
   input.click();
 }
 
-function onAttachFilesSelected(event) {
+export function openAttachPicker() {
+  const menu = attachMenuEl();
+  if (!menu) {
+    openDeviceFilePicker();
+    return;
+  }
+  menu.hidden = !menu.hidden;
+  if (!menu.hidden) {
+    hostRenderDesktopAttachOptions?.(menu);
+  }
+}
+
+/** Filled by harness bind — lists Desktop objects into the attach menu. */
+let hostRenderDesktopAttachOptions = null;
+
+export function bindShelfAttachHost(api = {}) {
+  hostRenderDesktopAttachOptions = typeof api.renderDesktopAttachOptions === "function"
+    ? api.renderDesktopAttachOptions
+    : null;
+}
+
+async function readTextAttachment(file) {
+  if (!file || file.size > MAX_ATTACH_READ_BYTES) {
+    return "";
+  }
+  const type = String(file.type || "");
+  const name = String(file.name || "");
+  const looksText =
+    TEXT_ATTACH_RE.test(type) ||
+    /\.(txt|md|markdown|json|csv|tsv|log|yml|yaml|toml|rs|js|ts|tsx|jsx|py|go|c|h|cpp|html|css|svg)$/i.test(
+      name,
+    );
+  if (!looksText) {
+    return "";
+  }
+  try {
+    const raw = await file.text();
+    return String(raw || "").slice(0, MAX_ATTACH_TEXT_CHARS);
+  } catch {
+    return "";
+  }
+}
+
+async function onAttachFilesSelected(event) {
   const input = event.target;
   const files = [...(input?.files || [])];
   if (!files.length) {
     return;
   }
   for (const file of files.slice(0, 8)) {
-    attachSeq += 1;
-    composerAttachments.push({
-      id: `att-${attachSeq}`,
+    const text = await readTextAttachment(file);
+    addComposerAttachment({
+      kind: "file",
       name: file.name || "file",
       size: Number(file.size) || 0,
+      text,
     });
   }
-  if (composerAttachments.length > 8) {
-    composerAttachments = composerAttachments.slice(-8);
-  }
-  renderComposerAttachments();
-  /* Preview only — names in the composer, no Library/Carrier grant. */
-  const field = composerInput();
-  if (field && !field.value.trim() && files[0]?.name) {
-    field.placeholder = `Ask about ${files[0].name}…`;
-  }
+  closeAttachMenu();
 }
 
 export function bindAgentShelf() {
@@ -861,6 +965,30 @@ export function bindAgentShelf() {
       event.preventDefault();
       openAttachPicker();
       return;
+    }
+    if (event.target.closest?.("[data-attach-device-files]")) {
+      event.preventDefault();
+      closeAttachMenu();
+      openDeviceFilePicker();
+      return;
+    }
+    const desktopOpt = event.target.closest?.("[data-attach-desktop-uri]");
+    if (desktopOpt?.dataset.attachDesktopUri) {
+      event.preventDefault();
+      addComposerAttachment({
+        kind: "desktop",
+        name: desktopOpt.dataset.attachDesktopName || "Desktop object",
+        uri: desktopOpt.dataset.attachDesktopUri,
+        size: Number(desktopOpt.dataset.attachDesktopSize) || 0,
+      });
+      closeAttachMenu();
+      return;
+    }
+    if (
+      !event.target.closest?.("[data-agent-attach-menu]") &&
+      !event.target.closest?.("#agent-attach-btn")
+    ) {
+      closeAttachMenu();
     }
     const chip = event.target.closest?.(".agent-attach-chip[data-attach-id]");
     if (chip?.dataset.attachId) {

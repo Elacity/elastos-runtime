@@ -1,5 +1,5 @@
 /* Agent grant cards + truth strip (preview mock).
-   Bound from agent-harness.js. Tip: home-20260804aq
+   Bound from agent-harness.js. Tip: home-20260804ar
    UI ≠ authority (Principle 16): Allow once is one-shot; never ambient. */
 
 import {
@@ -9,7 +9,7 @@ import {
   applyCapabilityState,
   wantsLibraryTool,
   wantsWalletTool,
-} from "./mock-agent-provider.js?v=home-20260804aq";
+} from "./mock-agent-provider.js?v=home-20260804ar";
 
 /** @type {null | Record<string, Function>} */
 let store = null;

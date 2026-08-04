@@ -977,9 +977,10 @@
       </div>
       <div class="agent-workbench-panel" data-workbench-panel="library" role="tabpanel" hidden>
         <div class="agent-library-chips" data-library-chips>
-          <button type="button" class="agent-library-chip" data-library-attach="Documents">Documents</button>
-          <button type="button" class="agent-library-chip" data-library-attach="Downloads">Downloads</button>
-          <button type="button" class="agent-library-chip" data-library-attach="Notes">Notes</button>
+          <p class="agent-library-empty" data-library-empty>
+            Desktop objects appear here. Attach from the composer — content extract needs a
+            library.read grant (Inbox; UI ≠ authority).
+          </p>
         </div>
         <p class="agent-workbench-hint">Rooted nouns only · no host filesystem</p>
       </div>
@@ -1130,6 +1131,16 @@
             tabindex="-1"
             aria-hidden="true"
           />
+          <div class="agent-attach-menu" data-agent-attach-menu hidden>
+            <p class="agent-attach-menu-label">Attach</p>
+            <div class="agent-attach-menu-list" data-attach-desktop-list></div>
+            <button type="button" class="agent-attach-menu-item" data-attach-device-files>
+              Choose files on this device…
+            </button>
+            <p class="agent-attach-menu-foot">
+              Text extracts are size-capped · Desktop content needs library.read
+            </p>
+          </div>
           <div class="agent-composer-toolbar shelf-morph-enter" data-morph-enter="1">
             <!-- ChatGPT-like: left = Home + attach + tool intent; right = model + mic + send -->
             <div class="agent-composer-tools-left">
@@ -1146,8 +1157,8 @@
                 id="agent-attach-btn"
                 class="agent-tool-btn"
                 type="button"
-                aria-label="Add files"
-                title="Attach files (preview — browser picker only, not a Library grant)"
+                aria-label="Attach"
+                title="Attach Desktop object or local file (UI ≠ authority)"
               >
                 <span aria-hidden="true">+</span>
               </button>
