@@ -703,6 +703,13 @@
       >
         Preview · not live inference — mock replies until a local model is wired
       </p>
+      <p
+        class="agent-stream-status"
+        data-agent-stream-status
+        data-tone="idle"
+        role="status"
+        hidden
+      ></p>
       <div
         id="agent-harness-stream"
         class="agent-harness-stream"
@@ -711,6 +718,14 @@
         aria-relevant="additions"
       >
         <div class="agent-harness-stream-column" id="agent-harness-stream-column"></div>
+        <button
+          type="button"
+          class="agent-jump-latest"
+          data-agent-jump-latest
+          hidden
+        >
+          Jump to latest
+        </button>
       </div>
     </div>
     <section
@@ -746,6 +761,9 @@
             </button>
             <button type="button" class="agent-configure-chip" data-configure-section="models">
               Models
+            </button>
+            <button type="button" class="agent-configure-chip" data-configure-section="prompt">
+              Prompt
             </button>
             <button type="button" class="agent-configure-chip" data-configure-section="tools">
               Tools
@@ -790,6 +808,54 @@
             <p class="agent-harness-page-foot">
               Get is preview only — in-session stub, not a real weight download until runtime grants exist.
             </p>
+          </div>
+
+          <div data-configure-panel="prompt" hidden>
+            <div class="agent-prompt-panel" data-prompt-panel>
+              <label class="agent-prompt-label" for="agent-system-prompt">System prompt</label>
+              <textarea
+                id="agent-system-prompt"
+                class="agent-prompt-textarea"
+                data-system-prompt
+                rows="8"
+                maxlength="8000"
+                spellcheck="true"
+                placeholder="Principles-safe default — knowledge only, no tools."
+              ></textarea>
+              <div class="agent-prompt-actions">
+                <button type="button" class="agent-prompt-reset" data-system-prompt-reset>
+                  Reset to default
+                </button>
+                <span class="agent-prompt-count" data-system-prompt-count></span>
+              </div>
+              <div class="agent-prompt-params">
+                <label class="agent-prompt-param">
+                  <span>Temperature</span>
+                  <input
+                    type="number"
+                    min="0"
+                    max="2"
+                    step="0.05"
+                    data-agent-temperature
+                    inputmode="decimal"
+                  />
+                </label>
+                <label class="agent-prompt-param">
+                  <span>Max tokens</span>
+                  <input
+                    type="number"
+                    min="16"
+                    max="8192"
+                    step="16"
+                    data-agent-max-tokens
+                    inputmode="numeric"
+                  />
+                </label>
+              </div>
+              <p class="agent-harness-page-foot">
+                Host-persisted prefs · gateway clamps values · UI ≠ authority
+              </p>
+            </div>
           </div>
 
           <div data-configure-panel="tools" hidden>

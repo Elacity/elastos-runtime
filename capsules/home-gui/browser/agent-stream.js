@@ -1,31 +1,31 @@
 /* Agent message stream + turn theatre.
-   Bound from agent-harness.js. Tip: home-20260728ag
-   w1: live local chat_completions when the probe says live (one-shot reply,
-   progressive reveal — providers have no token stream, §AL.2); mock remains
-   the honest fallback. UI ≠ authority (Principle 16) — chat carries no tool
-   or grant power either way. */
+   Bound from agent-harness.js. Tip: home-20260804ap
+   Live: gateway SSE (/api/apps/home/agent/chat/stream) with AbortController
+   stop; mock remains the honest fallback when Live is down.
+   UI ≠ authority (Principle 16) — chat carries no tool or grant power.
+   Wave 1: edit/resubmit, per-msg delete, markdown, stream status, Stop persist. */
 
 import {
   MOCK_REPLY,
   getMockTurn,
   noteMockTurnTokens,
-  firstReasoningField,
   splitThinkTaggedContent,
-} from "./mock-agent-provider.js?v=home-20260728ag";
+} from "./mock-agent-provider.js?v=home-20260804ap";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
-  requestLiveChatCompletion,
-} from "./agent-live.js?v=home-20260728ag";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260728ag";
+  streamLiveChatCompletion,
+  abortLiveChatStream,
+} from "./agent-live.js?v=home-20260804ap";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804ap";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260728ag";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260728ag";
+} from "./agent-grants.js?v=home-20260804ap";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804ap";
 
 /** @type {null | object} */
 let ctx = null;
@@ -61,11 +61,20 @@ export function escapeHtml(text) {
     .replaceAll('"', "&quot;");
 }
 
-/** Tiny markdown for MOCK_REPLY only — escapeHtml on fences/inlines.
- *  SEAM (live model / Carrier-backed replies): sanitize or use a text-safe
- *  path before innerHTML. UI must never treat model HTML as authority. */
-export function renderMarkdown(text) {
-  const parts = String(text).split(/```([\s\S]*?)```/g);
+/** GFM-safe markdown subset — escape first, then format.
+ *  Tables, lists, links, headings, fences, inline code/bold/italic.
+ *  UI must never treat model HTML as authority (Principle 16).
+ *  `streaming: true` virtually closes an open fence so mid-reply code blocks
+ *  paint as code instead of raw ``` until the model finishes the fence. */
+export function renderMarkdown(text, { streaming = false } = {}) {
+  let source = String(text ?? "");
+  if (streaming) {
+    const fenceMarks = source.split("```").length - 1;
+    if (fenceMarks % 2 === 1) {
+      source += "\n```";
+    }
+  }
+  const parts = source.split(/```([\s\S]*?)```/g);
   let html = "";
   for (let i = 0; i < parts.length; i += 1) {
     if (i % 2 === 1) {
@@ -81,20 +90,221 @@ export function renderMarkdown(text) {
         `<pre><code>${safe}</code></pre></div>`;
       continue;
     }
-    const blocks = parts[i].split(/\n{2,}/);
-    for (const block of blocks) {
-      const trimmed = block.trim();
-      if (!trimmed) {
-        continue;
-      }
-      let line = escapeHtml(trimmed)
-        .replaceAll(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-        .replaceAll(/`([^`]+)`/g, "<code class=\"agent-md-inline\">$1</code>")
-        .replaceAll(/\n/g, "<br>");
-      html += `<p class="agent-md-p">${line}</p>`;
-    }
+    html += renderMarkdownBlocks(parts[i]);
   }
   return html;
+}
+
+/** Keep raw markdown on the node so Stop/Copy don't lose markers after HTML paint. */
+function paintAgentMessageBody(body, text, { streaming = false } = {}) {
+  if (!body) {
+    return;
+  }
+  const raw = String(text ?? "");
+  body.dataset.mdSource = raw;
+  body.innerHTML = renderMarkdown(raw, { streaming });
+}
+
+function formatInlineMarkdown(escaped) {
+  return escaped
+    .replaceAll(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, href) => {
+      return `<a class="agent-md-a" href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    })
+    .replaceAll(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replaceAll(/\*([^*\n]+)\*/g, "<em>$1</em>")
+    .replaceAll(/`([^`]+)`/g, '<code class="agent-md-inline">$1</code>');
+}
+
+function renderMarkdownBlocks(raw) {
+  const lines = String(raw).replace(/\r\n/g, "\n").split("\n");
+  let html = "";
+  let i = 0;
+  const flushParagraph = (buf) => {
+    const trimmed = buf.join("\n").trim();
+    if (!trimmed) {
+      return;
+    }
+    html += `<p class="agent-md-p">${formatInlineMarkdown(escapeHtml(trimmed)).replaceAll("\n", "<br>")}</p>`;
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i += 1;
+      continue;
+    }
+    /* Table: header | --- | rows */
+    if (
+      line.includes("|") &&
+      i + 1 < lines.length &&
+      /^\s*\|?[\s:-|]+\|?\s*$/.test(lines[i + 1])
+    ) {
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|")) {
+        rows.push(lines[i]);
+        i += 1;
+        if (rows.length === 1 && i < lines.length && /^\s*\|?[\s:-|]+\|?\s*$/.test(lines[i])) {
+          i += 1; /* skip separator */
+        } else if (rows.length > 1 && (!lines[i] || !lines[i].includes("|"))) {
+          break;
+        }
+      }
+      if (rows.length) {
+        const cells = (row) =>
+          row
+            .trim()
+            .replace(/^\|/, "")
+            .replace(/\|$/, "")
+            .split("|")
+            .map((c) => formatInlineMarkdown(escapeHtml(c.trim())));
+        const head = cells(rows[0]);
+        html += `<div class="agent-md-table-wrap"><table class="agent-md-table"><thead><tr>${head
+          .map((c) => `<th>${c}</th>`)
+          .join("")}</tr></thead><tbody>`;
+        for (const row of rows.slice(1)) {
+          html += `<tr>${cells(row)
+            .map((c) => `<td>${c}</td>`)
+            .join("")}</tr>`;
+        }
+        html += `</tbody></table></div>`;
+        continue;
+      }
+    }
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line.trim());
+    if (heading) {
+      const level = heading[1].length;
+      html += `<h${level} class="agent-md-h agent-md-h${level}">${formatInlineMarkdown(
+        escapeHtml(heading[2]),
+      )}</h${level}>`;
+      i += 1;
+      continue;
+    }
+    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+      const ordered = /^\s*\d+\.\s+/.test(line);
+      const tag = ordered ? "ol" : "ul";
+      html += `<${tag} class="agent-md-list">`;
+      while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
+        const item = lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, "");
+        html += `<li>${formatInlineMarkdown(escapeHtml(item))}</li>`;
+        i += 1;
+      }
+      html += `</${tag}>`;
+      continue;
+    }
+    if (/^>\s?/.test(line.trim())) {
+      const quote = [];
+      while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
+        quote.push(lines[i].replace(/^\s*>\s?/, ""));
+        i += 1;
+      }
+      html += `<blockquote class="agent-md-quote">${formatInlineMarkdown(
+        escapeHtml(quote.join("\n")),
+      ).replaceAll("\n", "<br>")}</blockquote>`;
+      continue;
+    }
+    const para = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !lines[i].includes("|") &&
+      !/^(#{1,3})\s+/.test(lines[i].trim()) &&
+      !/^\s*([-*+]|\d+\.)\s+/.test(lines[i]) &&
+      !/^>\s?/.test(lines[i].trim())
+    ) {
+      para.push(lines[i]);
+      i += 1;
+    }
+    flushParagraph(para);
+  }
+  return html;
+}
+
+export function formatStreamError(err) {
+  const code = err?.code || "";
+  if (code === "aborted") {
+    return "Stopped";
+  }
+  if (code === "missing-home-launch-token") {
+    return "Live unavailable — Home launch token missing (unlock Home and reopen Agent)";
+  }
+  if (code === "upstream_http") {
+    const status = err?.status ? ` (${err.status})` : "";
+    return `Live upstream error${status} — check Sparks / OLLAMA_URL, then retry`;
+  }
+  if (code === "no_body") {
+    return "Live stream had no body — gateway or upstream misconfigured";
+  }
+  if (String(err?.name || "") === "TimeoutError" || /timeout/i.test(String(err?.message || ""))) {
+    return "Live timed out — retry, or switch pair A/B";
+  }
+  return err?.message
+    ? `Live failed: ${String(err.message).slice(0, 160)}`
+    : "Live failed — falling back to labeled Preview mock";
+}
+
+export function setStreamStatus(label, { tone = "idle" } = {}) {
+  const el = document.querySelector("[data-agent-stream-status]");
+  if (!el) {
+    return;
+  }
+  const text = String(label || "").trim();
+  el.hidden = !text;
+  el.dataset.tone = tone;
+  el.textContent = text;
+}
+
+export function ensureJumpToLatest() {
+  let btn = document.querySelector("[data-agent-jump-latest]");
+  if (btn) {
+    return btn;
+  }
+  const viewport = host.streamViewportEl?.() || document.querySelector(".agent-harness-stream-viewport");
+  if (!viewport) {
+    return null;
+  }
+  btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "agent-jump-latest";
+  btn.dataset.agentJumpLatest = "1";
+  btn.hidden = true;
+  btn.textContent = "Jump to latest";
+  viewport.append(btn);
+  return btn;
+}
+
+export function updateJumpToLatestVisibility() {
+  const scroller = host.streamScrollEl?.();
+  const btn = ensureJumpToLatest();
+  if (!scroller || !btn) {
+    return;
+  }
+  const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+  btn.hidden = distance < 96 || !ctx?.turnBusy && distance < 160;
+  /* Show whenever user is meaningfully above bottom during/after turns. */
+  btn.hidden = distance < 120;
+}
+
+export function persistPartialAgentReply(text, thinking = "") {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  const answer = String(text || "").trim();
+  if (!session || !answer) {
+    return;
+  }
+  const last = session.messages[session.messages.length - 1];
+  if (last?.role === "agent" && last.text === answer) {
+    return;
+  }
+  session.messages.push(
+    thinking
+      ? { role: "agent", text: answer, thinking, partial: true }
+      : { role: "agent", text: answer, partial: true },
+  );
+  session.updatedAt = Date.now();
+  host.renderSessions?.();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
 }
 
 export function setTitle(title) {
@@ -185,7 +395,7 @@ export function renderFollowUpQueue() {
   root.replaceChildren();
   root.hidden = ctx.followUpQueue.length === 0;
   if (!ctx.followUpQueue.length) {
-    requestAnimationFrame(syncComposerGeometry);
+    requestAnimationFrame(() => host.syncComposerGeometry?.());
     return;
   }
   for (const item of ctx.followUpQueue) {
@@ -207,7 +417,7 @@ export function renderFollowUpQueue() {
     root.append(row);
   }
   /* Dock grew — remeasure stream clearance under the taller Shelf. */
-  requestAnimationFrame(syncComposerGeometry);
+  requestAnimationFrame(() => host.syncComposerGeometry?.());
 }
 
 export function enqueueFollowUp(text) {
@@ -260,8 +470,9 @@ export function showEmptyState() {
     ctx.sessionMode === "build"
       ? "Build mode · plan & outputs theatre · no write authority yet"
       : "Private on this machine · tools start at zero · grants ask once";
-  const teach =
-    "Preview path · not live inference yet · Deny / Allow once never mint Capsule power";
+  const teach = getLiveInferenceState().live
+    ? "Live on this Home · tools still ask once · Deny / Allow never mint Capsule power"
+    : "Preview path when Live is down · Deny / Allow once never mint Capsule power";
   empty.innerHTML =
     `<p class="agent-harness-empty-greeting"></p>` +
     `<p class="agent-harness-empty-sub"></p>` +
@@ -273,6 +484,26 @@ export function showEmptyState() {
   viewport.append(empty);
 }
 
+function clearVisibleTranscript() {
+  host.clearEmptyState?.();
+  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
+  const column = host.streamEl?.();
+  const scroll = host.streamScrollEl?.();
+  if (column) {
+    column.replaceChildren();
+  }
+  /* Live/mock turns must never leave sibling nodes beside the column — those
+     survive column.replaceChildren() and make New chat look like a no-op. */
+  if (scroll && scroll !== column) {
+    for (const node of [...scroll.children]) {
+      if (node === column || node.id === "agent-harness-stream-column") {
+        continue;
+      }
+      node.remove();
+    }
+  }
+}
+
 export function renderActiveSession() {
   const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
   const stream = host.streamEl();
@@ -281,25 +512,28 @@ export function renderActiveSession() {
   }
   if (!session) {
     setTitle("New chat");
+    clearVisibleTranscript();
     showEmptyState();
     return;
   }
   setTitle(session.title);
-  stream.replaceChildren();
+  clearVisibleTranscript();
   if (!session.messages.length) {
     showEmptyState();
     return;
   }
   host.clearEmptyState();
   hydrateCapabilitiesFromSession(session);
-  for (const msg of session.messages) {
+  session.messages.forEach((msg, index) => {
     if (msg.role === "grant") {
       appendGrantCard(msg);
     } else {
-      appendMessage(msg.role, msg.text);
+      appendMessage(msg.role, msg.text, { msgIndex: index });
     }
-  }
+  });
   syncTruthStrip();
+  setStreamStatus("");
+  updateJumpToLatestVisibility();
 }
 
 /** Re-bind mock capability map to this session’s grant messages (preview). */
@@ -348,7 +582,11 @@ export function finishToolTimelineRow(row, { status = "done", statusLabel = "Don
   }
 }
 
-export function appendMessage(role, text, { streaming = false, asHtml = false } = {}) {
+export function appendMessage(
+  role,
+  text,
+  { streaming = false, asHtml = false, msgIndex = null } = {},
+) {
   const stream = host.streamEl();
   if (!stream) {
     return null;
@@ -358,13 +596,16 @@ export function appendMessage(role, text, { streaming = false, asHtml = false } 
   const row = document.createElement("div");
   row.className = `agent-msg agent-msg-${role}${streaming ? " is-streaming" : ""}`;
   row.dataset.role = role;
+  if (msgIndex != null) {
+    row.dataset.msgIndex = String(msgIndex);
+  }
 
   const body = document.createElement("div");
   body.className = "agent-msg-body";
   if (asHtml) {
     body.innerHTML = text;
-  } else if (role === "agent" && !streaming) {
-    body.innerHTML = renderMarkdown(text);
+  } else if (role === "agent") {
+    paintAgentMessageBody(body, text, { streaming });
   } else {
     body.textContent = text;
   }
@@ -377,14 +618,37 @@ export function appendMessage(role, text, { streaming = false, asHtml = false } 
   copyBtn.dataset.copyMessage = "1";
   copyBtn.textContent = "Copy";
   copyBtn.title = "Copy message";
-  const regen = document.createElement("button");
-  regen.type = "button";
-  regen.className = "agent-msg-action";
-  regen.dataset.regenerate = "1";
-  regen.disabled = role !== "agent" || streaming;
-  regen.title = role === "agent" ? "Regenerate reply" : "Regenerate — agent only";
-  regen.textContent = "Regenerate";
-  actions.append(copyBtn, regen);
+  actions.append(copyBtn);
+  if (role === "user" && !streaming) {
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "agent-msg-action";
+    edit.dataset.editMessage = "1";
+    edit.textContent = "Edit";
+    edit.title = "Edit and resubmit";
+    edit.disabled = Boolean(ctx.turnBusy);
+    actions.append(edit);
+  }
+  if (role === "agent") {
+    const regen = document.createElement("button");
+    regen.type = "button";
+    regen.className = "agent-msg-action";
+    regen.dataset.regenerate = "1";
+    regen.disabled = streaming || Boolean(ctx.turnBusy);
+    regen.title = "Regenerate reply";
+    regen.textContent = "Regenerate";
+    actions.append(regen);
+  }
+  if (!streaming) {
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "agent-msg-action is-danger";
+    del.dataset.deleteMessage = "1";
+    del.textContent = "Delete";
+    del.title = "Delete message";
+    del.disabled = Boolean(ctx.turnBusy);
+    actions.append(del);
+  }
 
   if (!streaming) {
     row.classList.add("agent-msg-enter");
@@ -392,31 +656,192 @@ export function appendMessage(role, text, { streaming = false, asHtml = false } 
   row.append(body, actions);
   stream.append(row);
   host.scrollStreamToEnd();
+  updateJumpToLatestVisibility();
   return row;
 }
 
-export function stopMockStream({ keepPartial = true } = {}) {
+export function deleteMessageAt(msgIndex) {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (!session || ctx.turnBusy) {
+    return false;
+  }
+  const index = Number(msgIndex);
+  if (!Number.isInteger(index) || index < 0 || index >= session.messages.length) {
+    return false;
+  }
+  if (!window.confirm("Delete this message from the chat?")) {
+    return false;
+  }
+  session.messages.splice(index, 1);
+  session.updatedAt = Date.now();
+  host.renderSessions?.();
+  renderActiveSession();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+  return true;
+}
+
+export function beginEditUserMessage(msgIndex) {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (!session || ctx.turnBusy) {
+    return false;
+  }
+  const index = Number(msgIndex);
+  const msg = session.messages[index];
+  if (!msg || msg.role !== "user") {
+    return false;
+  }
+  const row = host.streamEl()?.querySelector(`.agent-msg-user[data-msg-index="${index}"]`);
+  if (!row || row.querySelector("[data-edit-form]")) {
+    return false;
+  }
+  const body = row.querySelector(".agent-msg-body");
+  const actions = row.querySelector(".agent-msg-actions");
+  if (!body) {
+    return false;
+  }
+  if (actions) {
+    actions.hidden = true;
+  }
+  const form = document.createElement("form");
+  form.className = "agent-msg-edit-form";
+  form.dataset.editForm = "1";
+  const ta = document.createElement("textarea");
+  ta.className = "agent-msg-edit-input";
+  ta.value = msg.text;
+  ta.rows = Math.min(8, Math.max(2, msg.text.split("\n").length + 1));
+  const bar = document.createElement("div");
+  bar.className = "agent-msg-edit-bar";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "agent-msg-action";
+  cancel.dataset.editCancel = "1";
+  cancel.textContent = "Cancel";
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "agent-msg-action";
+  save.textContent = "Save & submit";
+  bar.append(cancel, save);
+  form.append(ta, bar);
+  body.replaceWith(form);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  return true;
+}
+
+export function cancelEditUserMessage(msgIndex) {
+  renderActiveSession();
+  return true;
+}
+
+export function submitEditUserMessage(msgIndex, nextText) {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  const text = String(nextText || "").trim();
+  if (!session || !text || ctx.turnBusy) {
+    return false;
+  }
+  const index = Number(msgIndex);
+  const msg = session.messages[index];
+  if (!msg || msg.role !== "user") {
+    return false;
+  }
+  session.messages = session.messages.slice(0, index);
+  session.messages.push({ role: "user", text });
+  if (session.title === "New chat" || index === 0) {
+    session.title = titleFromPrompt(text);
+  }
+  session.updatedAt = Date.now();
+  host.renderSessions?.();
+  renderActiveSession();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+  startTurnForPrompt(text);
+  return true;
+}
+
+/** Drop trailing agent turns after the last user message, then restream. */
+export function regenerateLastAgentTurn() {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (!session || ctx.turnBusy) {
+    return false;
+  }
+  let lastUser = -1;
+  for (let i = session.messages.length - 1; i >= 0; i -= 1) {
+    if (session.messages[i].role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  if (lastUser < 0) {
+    return false;
+  }
+  const prompt = session.messages[lastUser].text;
+  session.messages = session.messages.slice(0, lastUser + 1);
+  session.updatedAt = Date.now();
+  host.renderSessions?.();
+  renderActiveSession();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+  startTurnForPrompt(prompt);
+  return true;
+}
+
+export function stopMockStream({ keepPartial = true, drainQueue = false } = {}) {
+  abortLiveChatStream();
   clearStreamTimer();
   ctx.streamGeneration += 1;
   ctx.turnBusy = false;
   setAgentComposerProcessing(false);
+  setStreamStatus("");
+  const thinking = host.streamEl()?.querySelector(".agent-thinking.is-streaming");
+  let thinkingText = "";
+  if (thinking) {
+    thinkingText = thinking.querySelector(".agent-thinking-body")?.textContent || "";
+    finishThinkingBlock(thinking, Number(thinking.dataset.startedAt) || Date.now());
+  }
   const streaming = host.streamEl()?.querySelector(".agent-msg-agent.is-streaming");
   if (streaming) {
     streaming.classList.remove("is-streaming");
     if (!keepPartial) {
       streaming.remove();
+      thinking?.remove();
     } else {
       const body = streaming.querySelector(".agent-msg-body");
-      if (body && body.textContent.trim()) {
-        body.innerHTML = renderMarkdown(body.textContent);
-        const note = document.createElement("div");
-        note.className = "agent-msg-stopped";
-        note.innerHTML =
-          `<span>Stopped</span>` +
-          `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
-        streaming.append(note);
+      const raw = String(body?.dataset.mdSource || body?.textContent || "").trim();
+      if (body && raw) {
+        paintAgentMessageBody(body, raw, { streaming: false });
+        const regen = streaming.querySelector("[data-regenerate]");
+        if (regen) {
+          regen.disabled = false;
+        }
+        persistPartialAgentReply(raw, thinkingText);
+        if (!streaming.querySelector(".agent-msg-stopped")) {
+          const note = document.createElement("div");
+          note.className = "agent-msg-stopped";
+          note.innerHTML =
+            `<span>Stopped</span>` +
+            `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
+          streaming.append(note);
+        }
+      } else {
+        streaming.remove();
+        if (!thinkingText.trim()) {
+          thinking?.remove();
+        }
       }
     }
+  }
+  if (drainQueue) {
+    window.requestAnimationFrame(() => drainFollowUpQueue());
   }
 }
 
@@ -434,62 +859,228 @@ export function startTurnForPrompt(userText) {
   startMockStreamForPrompt(userText);
 }
 
-/** w1 live turn: fetch the full local completion, then reveal it through the
- *  same theatre. Any failure falls back to mock with preview labels intact. */
+/** Live turn: gateway SSE proxy → incremental Thinking + answer (OWUI-feel,
+ *  ElastOS authority path). Stop aborts the fetch. Failure → labeled mock. */
 async function startLiveTurnForPrompt(userText) {
-  stopMockStream({ keepPartial: true });
+  abortLiveChatStream();
+  clearStreamTimer();
   document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
   const generation = (ctx.streamGeneration += 1);
   ctx.turnBusy = true;
   setAgentComposerProcessing(true);
-
-  /* Honest wait shimmer while the local model computes the full reply. */
-  const placeholder = appendThinkingBlock("", {
-    streaming: true,
-    open: false,
-  });
+  setStreamStatus("Connecting…", { tone: "connecting" });
+  ensureJumpToLatest();
 
   const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
-  let turn = null;
-  try {
-    const { message, usage } = await requestLiveChatCompletion(
-      buildLiveMessages(session?.messages || []),
-    );
-    if (generation !== ctx.streamGeneration) {
-      placeholder?.remove();
-      return;
-    }
-    /* fx13: normalize reasoning_content / think-tags into the Thinking UI. */
-    const reasoned = firstReasoningField(message);
-    const split = splitThinkTaggedContent(String(message?.content || ""));
-    turn = {
-      thinking: reasoned || split.thinking,
-      answer: split.answer,
-      approxTokens: usage?.completion_tokens || null,
-    };
-  } catch {
-    if (generation !== ctx.streamGeneration) {
-      placeholder?.remove();
-      return;
-    }
+  const thinkStartedAt = Date.now();
+  let thinkingEl = appendThinkingBlock("", {
+    streaming: true,
+    open: Boolean(ctx.reasoningVisible),
+  });
+  if (thinkingEl && !ctx.reasoningVisible) {
+    thinkingEl.hidden = true;
   }
-  placeholder?.remove();
+  let answerRow = null;
+  let answerBody = null;
+  let lastPaint = 0;
+  let finalReasoning = "";
+  let finalContent = "";
+  let sawFirstToken = false;
 
-  if (!turn || !turn.answer) {
-    /* Model unreachable or empty — re-probe so status copy flips honestly,
-       then fall back to the labeled mock path. */
+  const paint = (reasoning, content, { force = false } = {}) => {
+    const now = Date.now();
+    if (!force && now - lastPaint < 40) {
+      return;
+    }
+    lastPaint = now;
+    if ((reasoning || content) && !sawFirstToken) {
+      sawFirstToken = true;
+      setStreamStatus("Generating…", { tone: "generating" });
+    }
+    if (reasoning) {
+      if (!thinkingEl) {
+        thinkingEl = appendThinkingBlock(reasoning, {
+          streaming: true,
+          open: Boolean(ctx.reasoningVisible),
+        });
+      } else {
+        const body = thinkingEl.querySelector(".agent-thinking-body");
+        if (body) {
+          body.textContent = reasoning;
+        }
+        thinkingEl.hidden = !ctx.reasoningVisible && !content;
+        if (ctx.reasoningVisible) {
+          thinkingEl.open = true;
+        }
+      }
+    }
+    if (content) {
+      if (!answerRow) {
+        answerRow = appendMessage("agent", content, { streaming: true });
+        answerBody = answerRow?.querySelector(".agent-msg-body") || null;
+      } else if (answerBody) {
+        paintAgentMessageBody(answerBody, content, { streaming: true });
+      }
+      const scroller = host.streamScrollEl?.();
+      if (scroller) {
+        const distance =
+          scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+        if (distance < 140) {
+          host.scrollStreamToEnd?.();
+        } else {
+          updateJumpToLatestVisibility();
+        }
+      } else {
+        host.scrollStreamToEnd?.();
+      }
+    }
+  };
+
+  try {
+    const result = await streamLiveChatCompletion(
+      buildLiveMessages(session?.messages || [], {
+        systemPrompt: ctx.systemPrompt,
+      }),
+      {
+        maxTokens: ctx.maxTokens,
+        temperature: ctx.temperature,
+        onDelta: ({ reasoning, content }) => {
+          if (generation !== ctx.streamGeneration) {
+            return;
+          }
+          finalReasoning = reasoning || finalReasoning;
+          finalContent = content || finalContent;
+          paint(finalReasoning, finalContent);
+        },
+      },
+    );
+    finalReasoning = result.reasoning || finalReasoning;
+    finalContent = result.content || finalContent;
+    paint(finalReasoning, finalContent, { force: true });
+
+    let answer = String(finalContent || "").trim();
+    let thinking = String(finalReasoning || "").trim();
+    if (!answer && thinking) {
+      /* Flash often spends the budget in reasoning — surface it honestly. */
+      answer = thinking;
+      thinking = "";
+    }
+    const split = splitThinkTaggedContent(answer);
+    if (split.thinking && !thinking) {
+      thinking = split.thinking;
+      answer = split.answer || answer;
+    }
+
+    const superseded = generation !== ctx.streamGeneration;
+    const stoppedEarly = result.aborted || superseded;
+    /* Stop already finalized DOM + partial persist via stopMockStream. */
+    if (superseded) {
+      return;
+    }
+
+    if (thinkingEl) {
+      if (thinking) {
+        const body = thinkingEl.querySelector(".agent-thinking-body");
+        if (body) {
+          body.textContent = thinking;
+        }
+        thinkingEl.hidden = false;
+        finishThinkingBlock(thinkingEl, thinkStartedAt);
+      } else {
+        thinkingEl.remove();
+        thinkingEl = null;
+      }
+    }
+
+    if (!answer) {
+      thinkingEl?.remove();
+      answerRow?.remove();
+      if (!stoppedEarly) {
+        setStreamStatus("Live returned empty — labeled Preview mock", {
+          tone: "error",
+        });
+        void probeLiveInference({ force: true }).then(() => host.syncInferenceStatus?.());
+        startMockStreamForPrompt(userText);
+      }
+      return;
+    }
+
+    if (!answerRow) {
+      answerRow = appendMessage("agent", answer, { streaming: true });
+      answerBody = answerRow?.querySelector(".agent-msg-body") || null;
+    }
+    if (answerBody) {
+      paintAgentMessageBody(answerBody, answer, { streaming: false });
+    }
+    answerRow?.classList.remove("is-streaming");
+    const regen = answerRow?.querySelector("[data-regenerate]");
+    if (regen) {
+      regen.disabled = false;
+    }
+
+    if (session) {
+      session.messages.push(
+        thinking
+          ? { role: "agent", text: answer, thinking, ...(stoppedEarly ? { partial: true } : {}) }
+          : { role: "agent", text: answer, ...(stoppedEarly ? { partial: true } : {}) },
+      );
+      session.updatedAt = Date.now();
+      host.renderSessions?.();
+      try {
+        host.persistAgentWorkspaceSoon?.();
+      } catch {
+        /* optional */
+      }
+    }
+    if (stoppedEarly && answerRow && !answerRow.querySelector(".agent-msg-stopped")) {
+      const note = document.createElement("div");
+      note.className = "agent-msg-stopped";
+      note.innerHTML =
+        `<span>Stopped</span>` +
+        `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
+      answerRow.append(note);
+    }
+    /* Collapse thinking once an answer exists (Wave 1.07). */
+    if (thinkingEl && answer && thinkingEl.open && ctx.reasoningVisible) {
+      finishThinkingBlock(thinkingEl, thinkStartedAt);
+    }
+    syncTruthStrip();
+    syncWorkbenchPanels();
+    if (!stoppedEarly) {
+      maybeOfferToolAfterReply(userText);
+    }
+  } catch (err) {
+    if (generation !== ctx.streamGeneration) {
+      return;
+    }
+    if (err?.code === "aborted") {
+      const partial = String(finalContent || finalReasoning || "").trim();
+      if (partial) {
+        persistPartialAgentReply(
+          String(finalContent || "").trim() || partial,
+          String(finalReasoning || "").trim(),
+        );
+      }
+      setStreamStatus("Stopped", { tone: "idle" });
+      return;
+    }
+    const honest = formatStreamError(err);
+    setStreamStatus(`${honest} · Preview mock`, { tone: "error" });
+    thinkingEl?.remove();
+    answerRow?.remove();
     void probeLiveInference({ force: true }).then(() => host.syncInferenceStatus?.());
     startMockStreamForPrompt(userText);
     return;
+  } finally {
+    if (generation === ctx.streamGeneration) {
+      ctx.turnBusy = false;
+      setAgentComposerProcessing(false);
+      if (!document.querySelector("[data-agent-stream-status]")?.textContent?.includes("Preview mock")) {
+        setStreamStatus("");
+      }
+      window.requestAnimationFrame(() => drainFollowUpQueue());
+    }
   }
-  startTurnReveal({
-    thinkingText: turn.thinking,
-    replyText: turn.answer,
-    toolPreview: null,
-    followUps: [],
-    approxTokens: turn.approxTokens,
-    live: true,
-  });
 }
 
 export function startMockStreamForPrompt(userText, replyOverride) {
@@ -607,7 +1198,10 @@ function startTurnReveal({
     }
 
     answerIndex = Math.min(replyText.length, answerIndex + 2 + (answerIndex % 3));
-    answerBody.textContent = replyText.slice(0, answerIndex);
+    const partial = replyText.slice(0, answerIndex);
+    paintAgentMessageBody(answerBody, partial, {
+      streaming: answerIndex < replyText.length,
+    });
     if (scroller) {
       scroller.scrollTop = scroller.scrollHeight;
     }
@@ -615,7 +1209,7 @@ function startTurnReveal({
       clearStreamTimer();
       answerRow?.classList.remove("is-streaming");
       answerRow?.classList.add("agent-msg-enter");
-      answerBody.innerHTML = renderMarkdown(replyText);
+      paintAgentMessageBody(answerBody, replyText, { streaming: false });
       const regen = answerRow?.querySelector("[data-regenerate]");
       if (regen) {
         regen.disabled = false;

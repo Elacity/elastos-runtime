@@ -2,7 +2,7 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-import { TIP } from "./agent-tip.js?v=home-20260728ag";
+import { TIP } from "./agent-tip.js?v=home-20260804ap";
 
 let planMarkdown = `### To-dos
 - [ ] Clarify what to build
@@ -716,6 +716,14 @@ export function getConfigureOverviewSnapshot() {
       statusTitle: "Selected model for this room",
       detail: "Mine · Picks · Get",
       section: "models",
+    },
+    {
+      id: "prompt",
+      title: "Prompt",
+      status: "Editable",
+      statusTitle: "System prompt + sampling prefs",
+      detail: "System prompt · temperature · max tokens",
+      section: "prompt",
     },
     {
       id: "tools",

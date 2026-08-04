@@ -18,13 +18,33 @@
  * [ ] Brand reads Agent · On this Home (Home harness, not CLI operator)
  * [ ] Shelf/Home enter-leave still works; no ambient grant path
  *
- * w1 live chat acceptance (§AL) — manual checklist with llama-server running:
- * [ ] Status shows Live · local model — <name> only after real probe
- * [ ] Prompt answered by the local model (full reply, progressive reveal)
- * [ ] Reasoning (<think>/reasoning_content) lands in the Thinking disclosure
- * [ ] Kill llama-server → next turn falls back to mock, banner back to Preview
- * [ ] Model switcher / Mine shows the real GGUF as Live; stubs stay preview
+ * w1 live chat acceptance (§AL) — llama-server OR Sparks OpenAI-compat:
+ * [ ] Status shows Live only after real probe (llama healthy or ai ping)
+ * [ ] Prompt answered by the live model (full reply, progressive reveal)
+ * [ ] Reasoning (<think>/reasoning_content) lands in Thinking; content:null
+ *     Flash replies still show text (reasoning fallback)
+ * [ ] Kill backend → next turn falls back to mock, banner back to Preview
+ * [ ] Model switcher / Mine shows the live model; stubs stay preview
  * [ ] Grant cards unchanged — live chat mints no tool or capsule authority
+ *
+ * Wave 1 chat-feel (§AM):
+ * [ ] Edit user message → truncate trailing turns → restream Live
+ * [ ] Per-message Delete with confirm; persists session.agent
+ * [ ] Markdown tables/lists/links/fences + Copy
+ * [ ] Live stream paints markdown (not only on complete)
+ * [ ] Connecting / Generating status; Jump to latest when scrolled up
+ * [ ] Stop persists partial; no stuck busy; queue can drain
+ * [ ] Regenerate replaces last agent turn (does not append duplicate)
+ * [ ] Archive soft-hide; Export/Import JSON; search titles+bodies
+ * [ ] Live errors honest (not silent mock without label)
+ *
+ * Wave 2 prompt/params (§AP):
+ * [ ] Settings → Prompt edits system prompt; Reset restores default
+ * [ ] Temperature + max tokens pass through Live stream body
+ * [ ] Prefs persist across reload via session.agent
+ *
+ * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
+ * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260728ag";
+export const TIP = "home-20260804ap";

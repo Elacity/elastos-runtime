@@ -10,7 +10,7 @@ import {
   agentShelfFaceActive,
   snapAgentShelfFace,
   snapAppsShelfFace,
-} from "./agent-shelf.js?v=home-20260728ag";
+} from "./agent-shelf.js?v=home-20260804ap";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -20,8 +20,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260728ag";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260728ag";
+} from "./shell-stages.js?v=home-20260804ap";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804ap";
 import {
   resetMockCapabilities,
   getSelectedModel,
@@ -38,18 +38,18 @@ import {
   maybeUpdatePlanFromPrompt,
   requestModelGet,
   removeProject,
-} from "./mock-agent-provider.js?v=home-20260728ag";
+} from "./mock-agent-provider.js?v=home-20260804ap";
 import {
   bindAgentWorkspaceSnapshot,
-} from "./shell-windows.js?v=home-20260728ag";
-import { TIP } from "./agent-tip.js?v=home-20260728ag";
-import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260728ag";
+} from "./shell-windows.js?v=home-20260804ap";
+import { TIP } from "./agent-tip.js?v=home-20260804ap";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804ap";
 import {
   bindAgentWorkspaceStore,
   getAgentWorkspaceSnapshot,
   applyAgentWorkspaceSnapshot,
   persistAgentWorkspaceSoon,
-} from "./agent-workspace.js?v=home-20260728ag";
+} from "./agent-workspace.js?v=home-20260804ap";
 import {
   bindAgentConfigure,
   harnessPageOpen,
@@ -62,7 +62,7 @@ import {
   setWorkbenchTab,
   syncWorkbenchPanels,
   syncWorkbenchOpenUi,
-} from "./agent-configure.js?v=home-20260728ag";
+} from "./agent-configure.js?v=home-20260804ap";
 import {
   bindAgentGrants,
   syncTruthStrip,
@@ -72,7 +72,7 @@ import {
   sessionAlreadyHasGrant,
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260728ag";
+} from "./agent-grants.js?v=home-20260804ap";
 import {
   bindAgentStream,
   clearStreamTimer,
@@ -93,11 +93,21 @@ import {
   renderActiveSession,
   stopMockStream,
   startTurnForPrompt,
-} from "./agent-stream.js?v=home-20260728ag";
+  deleteMessageAt,
+  beginEditUserMessage,
+  cancelEditUserMessage,
+  submitEditUserMessage,
+  regenerateLastAgentTurn,
+  updateJumpToLatestVisibility,
+  ensureJumpToLatest,
+  setStreamStatus,
+} from "./agent-stream.js?v=home-20260804ap";
 import {
   getLiveInferenceState,
   probeLiveInference,
-} from "./agent-live.js?v=home-20260728ag";
+  getLiveChatPair,
+  setLiveChatPair,
+} from "./agent-live.js?v=home-20260804ap";
 import {
   bindAgentSessions,
   relativeTime,
@@ -125,7 +135,7 @@ import {
   closeSessionActions,
   openSessionActions,
   runSessionAction,
-} from "./agent-sessions.js?v=home-20260728ag";
+} from "./agent-sessions.js?v=home-20260804ap";
 export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
 let workbenchTab = "outputs";
@@ -223,6 +233,10 @@ let turnBusy = false;
 let sessionMode = "chat";
 /** Tool intent chips: read | ask | full — not grants (fx8). */
 let toolMode = "read";
+/** Wave 2 — prompt + sampling prefs (host-persisted; gateway clamps). */
+let systemPrompt = "";
+let maxTokens = 2048;
+let temperature = 0.7;
 
 
 bindAgentWorkspaceStore({
@@ -241,6 +255,18 @@ bindAgentWorkspaceStore({
   getToolMode: () => toolMode,
   setToolMode: (v) => {
     toolMode = v;
+  },
+  getSystemPrompt: () => systemPrompt,
+  setSystemPrompt: (v) => {
+    systemPrompt = String(v ?? "");
+  },
+  getMaxTokens: () => maxTokens,
+  setMaxTokens: (v) => {
+    maxTokens = Number(v) || 2048;
+  },
+  getTemperature: () => temperature,
+  setTemperature: (v) => {
+    temperature = Number(v);
   },
   getWorkbenchOpen: () => workbenchOpen,
   setWorkbenchOpen: (v) => {
@@ -295,12 +321,31 @@ bindAgentConfigure(
     set toolMode(v) {
       toolMode = v;
     },
+    get systemPrompt() {
+      return systemPrompt;
+    },
+    set systemPrompt(v) {
+      systemPrompt = String(v ?? "");
+    },
+    get maxTokens() {
+      return maxTokens;
+    },
+    set maxTokens(v) {
+      maxTokens = Number(v) || 2048;
+    },
+    get temperature() {
+      return temperature;
+    },
+    set temperature(v) {
+      temperature = Number(v);
+    },
   },
   {
     closeApproveMenu,
     closeModelMenu,
     isNarrowHarness,
     closeHarnessDrawer,
+    persistAgentWorkspaceSoon,
   },
 );
 
@@ -338,6 +383,9 @@ bindAgentStream(
     set activeSessionId(v) { activeSessionId = v; },
     get active() { return active; },
     set active(v) { active = v; },
+    get systemPrompt() { return systemPrompt; },
+    get maxTokens() { return maxTokens; },
+    get temperature() { return temperature; },
   },
   {
     streamEl,
@@ -352,6 +400,7 @@ bindAgentStream(
     ensureSessionForPrompt,
     renderSessions,
     syncInferenceStatus: () => syncAgentInferenceStatus(),
+    persistAgentWorkspaceSoon,
   },
 );
 
@@ -380,6 +429,7 @@ bindAgentSessions(
     closeModelMenu,
     positionFloatingMenu,
     sessionListEl,
+    refreshHarnessDomCache,
   },
 );
 
@@ -543,17 +593,29 @@ function harnessEl() {
 }
 
 function streamEl() {
-  /* Messages live in the dock-width column so edges match the Shelf composer. */
-  return (
-    cachedStreamColumnEl ||
-    document.querySelector("#agent-harness-stream-column") ||
-    cachedStreamScrollEl ||
-    document.querySelector("#agent-harness-stream")
-  );
+  /* Messages live in the dock-width column so edges match the Shelf composer.
+     Drop detached cache nodes after template remounts — otherwise newChat /
+     selectSession mutate a ghost tree and the visible transcript stays put. */
+  if (cachedStreamColumnEl?.isConnected) {
+    return cachedStreamColumnEl;
+  }
+  cachedStreamColumnEl = document.querySelector("#agent-harness-stream-column");
+  if (cachedStreamColumnEl) {
+    return cachedStreamColumnEl;
+  }
+  if (cachedStreamScrollEl?.isConnected) {
+    return cachedStreamScrollEl;
+  }
+  cachedStreamScrollEl = document.querySelector("#agent-harness-stream");
+  return cachedStreamScrollEl;
 }
 
 function streamScrollEl() {
-  return cachedStreamScrollEl || document.querySelector("#agent-harness-stream");
+  if (cachedStreamScrollEl?.isConnected) {
+    return cachedStreamScrollEl;
+  }
+  cachedStreamScrollEl = document.querySelector("#agent-harness-stream");
+  return cachedStreamScrollEl;
 }
 
 function streamViewportEl() {
@@ -861,8 +923,34 @@ function buildInstalledModelRows(host, emptyText) {
         `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
       row.querySelector(".agent-model-option-title").textContent = model.label;
       row.querySelector(".agent-model-option-desc").textContent =
-        model.detail || "Live · llama-server on this machine";
+        model.detail || "Live · on this Home via gateway";
       host.append(row);
+    }
+    if (liveInference.endpointState === "openai-compat") {
+      const activePair = getLiveChatPair();
+      for (const pair of [
+        { id: "a", title: "Sparks pair A", desc: "192.168.1.147 · primary Flash" },
+        { id: "b", title: "Sparks pair B", desc: "192.168.1.145 · failover Flash" },
+      ]) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "agent-model-option";
+        row.setAttribute("role", "option");
+        row.dataset.livePair = pair.id;
+        row.setAttribute("aria-selected", activePair === pair.id ? "true" : "false");
+        if (activePair === pair.id) {
+          row.classList.add("is-active");
+        }
+        row.innerHTML =
+          `<span class="agent-model-option-copy">` +
+          `<span class="agent-model-option-title"></span>` +
+          `<span class="agent-model-option-desc"></span>` +
+          `</span>` +
+          `<span class="agent-approve-option-check" aria-hidden="true"></span>`;
+        row.querySelector(".agent-model-option-title").textContent = pair.title;
+        row.querySelector(".agent-model-option-desc").textContent = pair.desc;
+        host.append(row);
+      }
     }
   }
   for (const model of listInstalledModels()) {
@@ -1180,11 +1268,10 @@ function syncAgentInferenceStatus() {
   const state = getLiveInferenceState();
   const live = state.live === true;
   if (live) {
-    el.hidden = false;
+    /* Live is the expected dogfood path — don't billboard model/transport chrome. */
+    el.hidden = true;
     el.dataset.state = "live";
-    el.textContent = state.model
-      ? `Live · local model on this machine — ${state.model}`
-      : "Live · local model on this machine";
+    el.textContent = "";
     document.body.dataset.agentInference = "live";
     return;
   }
@@ -1198,8 +1285,9 @@ function syncAgentInferenceStatus() {
   }
   el.hidden = false;
   el.dataset.state = "preview";
+  const why = state.reason && state.reason !== "unprobed" ? ` · ${state.reason}` : "";
   el.textContent =
-    "Preview · not live inference — mock replies until a local model is wired";
+    `Preview · not live inference — mock replies until a model is wired${why}`;
   document.body.dataset.agentInference = "preview";
 }
 
@@ -1294,7 +1382,7 @@ export function showAgentHarness({
   syncSessionModeUi();
   syncWorkbenchOpenUi();
   syncAgentInferenceStatus();
-  void probeLiveInference().then(() => {
+  void probeLiveInference({ force: true }).then(() => {
     if (active) {
       syncAgentInferenceStatus();
       syncModelTrigger();
@@ -1419,7 +1507,8 @@ export function hideAgentHarness({ restoreShelfApps = true, syncStage = true } =
    hydrateCapabilitiesFromSession re-binds when a session is painted again. */
 
 export function stopAgentHarnessStream() {
-  stopMockStream({ keepPartial: true });
+  stopMockStream({ keepPartial: true, drainQueue: true });
+  setStreamStatus("");
 }
 
 export function sendToAgentHarness(prompt) {
@@ -1480,6 +1569,18 @@ export function bindAgentHarness() {
   }
   bound = true;
   refreshHarnessDomCache();
+  const newChatBtn = document.querySelector("#agent-harness-new-chat");
+  if (newChatBtn && newChatBtn.dataset.boundNewChat !== "1") {
+    newChatBtn.dataset.boundNewChat = "1";
+    newChatBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      newChat();
+      if (isNarrowHarness()) {
+        closeHarnessDrawer();
+      }
+    });
+  }
   registerAgentHarnessApi({
     agentHarnessActive,
     showAgentHarness,
@@ -1739,12 +1840,44 @@ export function bindAgentHarness() {
     if (copyMsg) {
       event.preventDefault();
       const body = copyMsg.closest(".agent-msg")?.querySelector(".agent-msg-body");
-      const text = body?.innerText || body?.textContent || "";
+      const text =
+        body?.dataset?.mdSource || body?.innerText || body?.textContent || "";
       navigator.clipboard?.writeText(text).catch(() => {});
       copyMsg.textContent = "Copied";
       window.setTimeout(() => {
         copyMsg.textContent = "Copy";
       }, 1200);
+      return;
+    }
+    if (event.target.closest?.("[data-agent-jump-latest]")) {
+      event.preventDefault();
+      scrollStreamToEnd();
+      updateJumpToLatestVisibility();
+      return;
+    }
+    const editCancel = event.target.closest?.("[data-edit-cancel]");
+    if (editCancel) {
+      event.preventDefault();
+      const idx = editCancel.closest(".agent-msg")?.dataset.msgIndex;
+      cancelEditUserMessage(idx);
+      return;
+    }
+    const editBtn = event.target.closest?.("[data-edit-message]");
+    if (editBtn) {
+      event.preventDefault();
+      if (turnBusy) {
+        return;
+      }
+      beginEditUserMessage(editBtn.closest(".agent-msg")?.dataset.msgIndex);
+      return;
+    }
+    const deleteBtn = event.target.closest?.("[data-delete-message]");
+    if (deleteBtn) {
+      event.preventDefault();
+      if (turnBusy) {
+        return;
+      }
+      deleteMessageAt(deleteBtn.closest(".agent-msg")?.dataset.msgIndex);
       return;
     }
     if (event.target.closest?.("[data-retry]") || event.target.closest?.("[data-regenerate]")) {
@@ -1753,11 +1886,7 @@ export function bindAgentHarness() {
       if (turnBusy) {
         return;
       }
-      const session = sessions.find((s) => s.id === activeSessionId);
-      const lastUser = [...(session?.messages || [])]
-        .reverse()
-        .find((m) => m.role === "user");
-      startTurnForPrompt(lastUser?.text || "");
+      regenerateLastAgentTurn();
       return;
     }
     const thinkToggle = event.target.closest?.("[data-truth-thinking-toggle]");
@@ -1882,6 +2011,15 @@ export function bindAgentHarness() {
     if (modelUse?.dataset.modelUse) {
       event.preventDefault();
       selectAgentModel(modelUse.dataset.modelUse);
+      return;
+    }
+    const pairOpt = event.target.closest?.(".agent-model-option[data-live-pair]");
+    if (pairOpt?.dataset.livePair) {
+      event.preventDefault();
+      setLiveChatPair(pairOpt.dataset.livePair);
+      syncModelTrigger();
+      renderModelMenu();
+      repositionModelMenu();
       return;
     }
     const modelOpt = event.target.closest?.(".agent-model-option[data-model-id]");
@@ -2047,4 +2185,30 @@ export function bindAgentHarness() {
       requestAnimationFrame(syncComposerGeometry);
     }
   });
+
+  document.addEventListener("submit", (event) => {
+    const form = event.target?.closest?.("[data-edit-form]");
+    if (!form || !active) {
+      return;
+    }
+    event.preventDefault();
+    const idx = form.closest(".agent-msg")?.dataset.msgIndex;
+    const text = form.querySelector(".agent-msg-edit-input")?.value || "";
+    submitEditUserMessage(idx, text);
+  });
+
+  document.addEventListener(
+    "scroll",
+    (event) => {
+      if (!active) {
+        return;
+      }
+      if (event.target?.id === "agent-harness-stream") {
+        updateJumpToLatestVisibility();
+      }
+    },
+    true,
+  );
+
+  ensureJumpToLatest();
 }

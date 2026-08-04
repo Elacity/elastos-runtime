@@ -1,5 +1,5 @@
 /* Agent Settings / Usage pages + workbench panels.
-   Bound from agent-harness.js (ctx + host). Tip: home-20260728ag
+   Bound from agent-harness.js (ctx + host). Tip: home-20260804ap
    UI ≠ authority (Principle 16): pages never mint grants. */
 
 import {
@@ -12,16 +12,25 @@ import {
   getHardwareEstimate,
   getPlanMarkdown,
   getTruthSnapshot,
-} from "./mock-agent-provider.js?v=home-20260728ag";
+} from "./mock-agent-provider.js?v=home-20260804ap";
+import {
+  DEFAULT_LIVE_SYSTEM_PROMPT,
+  MAX_LIVE_SYSTEM_PROMPT_CHARS,
+  clampLiveMaxTokens,
+  clampLiveTemperature,
+  normalizeLiveSystemPrompt,
+} from "./agent-live.js?v=home-20260804ap";
 
 /** @type {null | object} */
 let ctx = null;
 /** @type {null | Record<string, Function>} */
 let host = null;
+let promptPanelBound = false;
 
 export function bindAgentConfigure(nextCtx, nextHost = {}) {
   ctx = nextCtx;
   host = nextHost;
+  bindPromptPanelOnce();
 }
 
 export const HARNESS_PAGES = {
@@ -34,9 +43,114 @@ export const HARNESS_PAGES = {
     sub: "On this device.",
   },
 };
-export const CONFIGURE_SECTIONS = new Set(["overview", "machine", "models", "tools", "runtime"]);
+export const CONFIGURE_SECTIONS = new Set([
+  "overview",
+  "machine",
+  "models",
+  "prompt",
+  "tools",
+  "runtime",
+]);
 let harnessPage = null;
 let configureSection = "overview";
+
+function persistPromptPrefsSoon() {
+  try {
+    host?.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+}
+
+function bindPromptPanelOnce() {
+  if (promptPanelBound) {
+    return;
+  }
+  const panel = document.querySelector("[data-prompt-panel]");
+  if (!panel) {
+    return;
+  }
+  promptPanelBound = true;
+  panel.addEventListener("input", (event) => {
+    if (!ctx) {
+      return;
+    }
+    const target = event.target;
+    if (target?.matches?.("[data-system-prompt]")) {
+      ctx.systemPrompt = normalizeLiveSystemPrompt(target.value);
+      const count = panel.querySelector("[data-system-prompt-count]");
+      if (count) {
+        count.textContent = `${String(ctx.systemPrompt).length}/${MAX_LIVE_SYSTEM_PROMPT_CHARS}`;
+      }
+      persistPromptPrefsSoon();
+      return;
+    }
+    if (target?.matches?.("[data-agent-temperature]")) {
+      ctx.temperature = clampLiveTemperature(target.value);
+      persistPromptPrefsSoon();
+      return;
+    }
+    if (target?.matches?.("[data-agent-max-tokens]")) {
+      ctx.maxTokens = clampLiveMaxTokens(target.value);
+      persistPromptPrefsSoon();
+    }
+  });
+  panel.addEventListener("change", (event) => {
+    if (!ctx) {
+      return;
+    }
+    const target = event.target;
+    if (target?.matches?.("[data-agent-temperature]")) {
+      target.value = String(clampLiveTemperature(target.value));
+      ctx.temperature = clampLiveTemperature(target.value);
+      persistPromptPrefsSoon();
+    }
+    if (target?.matches?.("[data-agent-max-tokens]")) {
+      target.value = String(clampLiveMaxTokens(target.value));
+      ctx.maxTokens = clampLiveMaxTokens(target.value);
+      persistPromptPrefsSoon();
+    }
+  });
+  panel.addEventListener("click", (event) => {
+    if (!ctx || !event.target?.closest?.("[data-system-prompt-reset]")) {
+      return;
+    }
+    event.preventDefault();
+    ctx.systemPrompt = DEFAULT_LIVE_SYSTEM_PROMPT;
+    renderPromptPanel();
+    persistPromptPrefsSoon();
+  });
+}
+
+function renderPromptPanel() {
+  bindPromptPanelOnce();
+  if (!ctx) {
+    return;
+  }
+  const prompt =
+    normalizeLiveSystemPrompt(ctx.systemPrompt || DEFAULT_LIVE_SYSTEM_PROMPT);
+  const temperature = clampLiveTemperature(ctx.temperature);
+  const maxTokens = clampLiveMaxTokens(ctx.maxTokens);
+  ctx.systemPrompt = prompt;
+  ctx.temperature = temperature;
+  ctx.maxTokens = maxTokens;
+  const ta = document.querySelector("[data-system-prompt]");
+  if (ta && ta.value !== prompt) {
+    ta.value = prompt;
+  }
+  const count = document.querySelector("[data-system-prompt-count]");
+  if (count) {
+    count.textContent = `${prompt.length}/${MAX_LIVE_SYSTEM_PROMPT_CHARS}`;
+  }
+  const temp = document.querySelector("[data-agent-temperature]");
+  if (temp) {
+    temp.value = String(temperature);
+  }
+  const tokens = document.querySelector("[data-agent-max-tokens]");
+  if (tokens) {
+    tokens.value = String(maxTokens);
+  }
+}
 
 function harnessPageEl() {
   return document.querySelector("[data-harness-page]");
@@ -347,6 +461,8 @@ export function renderHarnessPage() {
       renderMachinePanel();
     } else if (configureSection === "models") {
       renderConfigureModels();
+    } else if (configureSection === "prompt") {
+      renderPromptPanel();
     } else if (configureSection === "tools") {
       const list = page.querySelector("[data-page-tools]");
       if (list) {

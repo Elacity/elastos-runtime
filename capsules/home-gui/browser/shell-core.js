@@ -1,4 +1,4 @@
-import { TIP as APP_ICON_ASSET_VERSION } from "./agent-tip.js?v=home-20260728ag";
+import { TIP as APP_ICON_ASSET_VERSION } from "./agent-tip.js?v=home-20260804ap";
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");
 export let desktopWorkspace = document.querySelector(".desktop-workspace");
@@ -64,19 +64,44 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260725a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260804ap", import.meta.url).href;
 const HOME_GUI_UI_STYLESHEET_ID = "home-gui-elastos-ui";
-const HOME_GUI_UI_STYLESHEET_URL = new URL("./elastos-ui.css?v=home-20260728ag", import.meta.url).href;
+const HOME_GUI_UI_STYLESHEET_URL = new URL("./elastos-ui.css?v=home-20260804ap", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
 const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260725a", import.meta.url).href;
 const HOME_GUI_AGENT_STYLESHEET_ID = "home-gui-agent-stylesheet";
 const HOME_GUI_AGENT_STYLESHEET_URL = new URL(
-  "./agent-harness.css?v=home-20260728ag",
+  "./agent-harness.css?v=home-20260804ap",
   import.meta.url,
 ).href;
 
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
+
+export function getHomeGuiLaunchToken() {
+  if (homeGuiLaunchToken) {
+    return homeGuiLaunchToken;
+  }
+  try {
+    const fromGlobal = globalThis.__elastosHomeGuiLaunchToken;
+    if (typeof fromGlobal === "string" && fromGlobal.trim()) {
+      homeGuiLaunchToken = fromGlobal.trim();
+      return homeGuiLaunchToken;
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const fromSession = sessionStorage.getItem("elastos.home-gui.launch-token");
+    if (typeof fromSession === "string" && fromSession.trim()) {
+      homeGuiLaunchToken = fromSession.trim();
+      return homeGuiLaunchToken;
+    }
+  } catch {
+    /* opaque / blocked storage */
+  }
+  return "";
+}
 
 export function setHomeGuiLaunchToken(token) {
   const normalized = typeof token === "string" ? token.trim() : "";
@@ -84,6 +109,16 @@ export function setHomeGuiLaunchToken(token) {
     throw new Error("Home GUI launch token is required");
   }
   homeGuiLaunchToken = normalized;
+  try {
+    globalThis.__elastosHomeGuiLaunchToken = normalized;
+  } catch {
+    /* ignore */
+  }
+  try {
+    sessionStorage.setItem("elastos.home-gui.launch-token", normalized);
+  } catch {
+    /* opaque / blocked storage */
+  }
 }
 
 export const shellState = {
@@ -329,13 +364,21 @@ export function shellInteractionActive(graceMs = 250) {
 }
 
 export async function fetchJson(url, init) {
+  const token = getHomeGuiLaunchToken();
+  const headers = {
+    "content-type": "application/json",
+    ...(token ? { "x-elastos-home-token": token } : {}),
+  };
+  if (init?.headers && typeof init.headers === "object" && !(init.headers instanceof Headers)) {
+    Object.assign(headers, init.headers);
+  } else if (init?.headers instanceof Headers) {
+    init.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+  }
   const response = await fetch(url, {
     ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(homeGuiLaunchToken ? { "x-elastos-home-token": homeGuiLaunchToken } : {}),
-      ...(init && init.headers ? init.headers : {}),
-    },
+    headers,
   });
   if (!response.ok) {
     const detail = await response.text().catch(() => "");

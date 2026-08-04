@@ -6,8 +6,13 @@ import {
   listProjects,
   replaceProjects,
   setReasoningVisible,
-} from "./mock-agent-provider.js?v=home-20260728ag";
-import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260728ag";
+} from "./mock-agent-provider.js?v=home-20260804ap";
+import {
+  clampLiveMaxTokens,
+  clampLiveTemperature,
+  normalizeLiveSystemPrompt,
+} from "./agent-live.js?v=home-20260804ap";
+import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804ap";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;
@@ -91,6 +96,9 @@ export function getAgentWorkspaceSnapshot() {
     activeSessionId: store.getActiveSessionId(),
     sessionMode: sessionMode === "build" ? "build" : "chat",
     toolMode: toolMode === "ask" || toolMode === "full" ? toolMode : "read",
+    systemPrompt: normalizeLiveSystemPrompt(store.getSystemPrompt?.() || ""),
+    maxTokens: clampLiveMaxTokens(store.getMaxTokens?.()),
+    temperature: clampLiveTemperature(store.getTemperature?.()),
     workbenchOpen: Boolean(store.getWorkbenchOpen()),
     workbenchTab: clampWorkbenchTab(store.getWorkbenchTab()),
     reasoningVisible: Boolean(store.getReasoningVisible()),
@@ -123,6 +131,15 @@ export function applyAgentWorkspaceSnapshot(raw) {
   }
   store.setSessionMode(raw.sessionMode === "build" ? "build" : "chat");
   store.setToolMode(raw.toolMode === "ask" || raw.toolMode === "full" ? raw.toolMode : "read");
+  if (typeof raw.systemPrompt === "string") {
+    store.setSystemPrompt?.(normalizeLiveSystemPrompt(raw.systemPrompt));
+  }
+  if (raw.maxTokens != null) {
+    store.setMaxTokens?.(clampLiveMaxTokens(raw.maxTokens));
+  }
+  if (raw.temperature != null) {
+    store.setTemperature?.(clampLiveTemperature(raw.temperature));
+  }
   if (typeof raw.workbenchOpen === "boolean") {
     store.setWorkbenchOpen(raw.workbenchOpen);
     store.setWorkbenchUserClosed(!raw.workbenchOpen);

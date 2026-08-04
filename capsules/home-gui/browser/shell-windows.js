@@ -30,8 +30,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260725a";
-import { playUiSound } from "./shell-sounds.js?v=home-20260728ag";
+} from "./shell-window-geometry.js?v=home-20260804ap";
+import { playUiSound } from "./shell-sounds.js?v=home-20260804ap";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -50,8 +50,8 @@ import {
   exitFullscreenStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260728ag";
-import { TIP as SHELL_TIP } from "./agent-tip.js?v=home-20260728ag";
+} from "./shell-stages.js?v=home-20260804ap";
+import { TIP as SHELL_TIP } from "./agent-tip.js?v=home-20260804ap";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -136,7 +136,7 @@ export function iframeSandboxForLaunch(launched) {
   return tokens.join(" ");
 }
 
-function iframeAllowForLaunch() {
+export function iframeAllowForLaunch() {
   return COMMON_IFRAME_ALLOW.join("; ");
 }
 

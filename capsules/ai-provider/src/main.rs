@@ -205,13 +205,16 @@ impl AiProvider {
         // Support both top-level keys (direct init) and nested under "extra" (runtime bridge).
         let extra = config.get("extra").unwrap_or(&config);
 
-        // Apply init config overrides (init > env > defaults)
-        // Priority: local_url (llama-provider) > ollama_url > env > defaults
+        // Apply init config overrides (init > env > defaults).
+        // Priority: ollama_url (explicit operator / Sparks) > local_url
+        // (llama-provider endpoint) > env-at-construct > defaults.
+        // Explicit OLLAMA_URL must win so remote OpenAI-compat dogfood is not
+        // silently overridden by a local llama endpoint.
         if let Some(local) = self.backends.get_mut("local") {
             if let BackendTransport::Http { api_url, .. } = &mut local.transport {
-                if let Some(url) = extra.get("local_url").and_then(|v| v.as_str()) {
+                if let Some(url) = extra.get("ollama_url").and_then(|v| v.as_str()) {
                     *api_url = url.to_string();
-                } else if let Some(url) = extra.get("ollama_url").and_then(|v| v.as_str()) {
+                } else if let Some(url) = extra.get("local_url").and_then(|v| v.as_str()) {
                     *api_url = url.to_string();
                 }
             }
@@ -858,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_url_overrides_ollama() {
+    fn test_ollama_url_overrides_local_url() {
         let mut provider = AiProvider::with_env(
             Some("http://ollama:11434/v1/chat/completions".to_string()),
             None,
@@ -868,16 +871,36 @@ mod tests {
             None,
         );
 
-        // local_url from llama-provider should take priority over ollama_url
+        // Explicit ollama_url (Sparks / operator) wins over llama local_url.
         provider.handle(Request::Init {
             config: serde_json::json!({
                 "local_url": "http://127.0.0.1:54321/v1/chat/completions",
-                "ollama_url": "http://should-not-use:11434/v1/chat/completions",
+                "ollama_url": "http://192.168.1.147:8888/v1/chat/completions",
             }),
         });
 
         let local = provider.backends.get("local").unwrap();
-        assert_eq!(local.target_label(), "http://127.0.0.1:54321/v1/chat/completions");
+        assert_eq!(
+            local.target_label(),
+            "http://192.168.1.147:8888/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_local_url_used_when_no_ollama_url() {
+        let mut provider = default_provider();
+
+        provider.handle(Request::Init {
+            config: serde_json::json!({
+                "local_url": "http://127.0.0.1:54321/v1/chat/completions",
+            }),
+        });
+
+        let local = provider.backends.get("local").unwrap();
+        assert_eq!(
+            local.target_label(),
+            "http://127.0.0.1:54321/v1/chat/completions"
+        );
     }
 
     #[test]

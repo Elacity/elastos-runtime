@@ -1,24 +1,25 @@
 /* Agent session nav, search, CRUD, project create.
-   Bound from agent-harness.js. Tip: home-20260728ag
-   Host session.agent persist only — UI ≠ authority (Principle 16). */
+   Bound from agent-harness.js. Tip: home-20260804ap
+   Host session.agent persist only — UI ≠ authority (Principle 16).
+   Wave 1: archive soft-hide, JSON import/export, body search (already). */
 
 import {
   listProjects,
   createProject,
-} from "./mock-agent-provider.js?v=home-20260728ag";
-import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260728ag";
-import { closeHarnessPage } from "./agent-configure.js?v=home-20260728ag";
+} from "./mock-agent-provider.js?v=home-20260804ap";
+import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260804ap";
+import { closeHarnessPage } from "./agent-configure.js?v=home-20260804ap";
 import {
   renderActiveSession,
   renderFollowUpQueue,
   stopMockStream,
   setTitle,
   titleFromPrompt,
-} from "./agent-stream.js?v=home-20260728ag";
+} from "./agent-stream.js?v=home-20260804ap";
 import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
-} from "./agent-shelf.js?v=home-20260728ag";
+} from "./agent-shelf.js?v=home-20260804ap";
 
 /** @type {null | object} */
 let ctx = null;
@@ -82,6 +83,108 @@ export function exportActiveSessionMarkdown() {
   URL.revokeObjectURL(url);
 }
 
+export function exportActiveSessionJson() {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (!session) {
+    return;
+  }
+  const payload = {
+    schema: "elastos.home.agent.session/v1",
+    exportedAt: Date.now(),
+    session: {
+      id: session.id,
+      title: session.title,
+      group: session.group,
+      mode: session.mode || ctx.sessionMode,
+      pinned: Boolean(session.pinned),
+      projectId: session.projectId || null,
+      archived: Boolean(session.archived),
+      updatedAt: session.updatedAt || Date.now(),
+      messages: session.messages || [],
+    },
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: "application/json;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${(session.title || "chat").replace(/[^\w\-]+/g, "_").slice(0, 48)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export function importSessionsFromJsonText(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(String(raw || ""));
+  } catch {
+    window.alert("Import failed — not valid JSON");
+    return 0;
+  }
+  const incoming = [];
+  if (parsed?.schema === "elastos.home.agent.session/v1" && parsed.session) {
+    incoming.push(parsed.session);
+  } else if (parsed?.schema === "elastos.home.agent.workspace/v1" && Array.isArray(parsed.sessions)) {
+    incoming.push(...parsed.sessions);
+  } else if (Array.isArray(parsed)) {
+    incoming.push(...parsed);
+  } else if (parsed?.id && parsed?.messages) {
+    incoming.push(parsed);
+  }
+  if (!incoming.length) {
+    window.alert("Import failed — no sessions found");
+    return 0;
+  }
+  let added = 0;
+  for (const src of incoming) {
+    if (!src || typeof src !== "object") {
+      continue;
+    }
+    const id = `s-import-${Date.now()}-${added}`;
+    ctx.sessions = [
+      {
+        id,
+        title: String(src.title || "Imported chat").slice(0, 64),
+        group: src.group || "Today",
+        mode: src.mode || "chat",
+        pinned: Boolean(src.pinned),
+        projectId: src.projectId || null,
+        archived: Boolean(src.archived),
+        updatedAt: Number(src.updatedAt) || Date.now(),
+        messages: Array.isArray(src.messages) ? src.messages : [],
+      },
+      ...ctx.sessions,
+    ];
+    added += 1;
+  }
+  if (added) {
+    ctx.activeSessionId = ctx.sessions[0]?.id || ctx.activeSessionId;
+    renderSessions();
+    renderActiveSession();
+    persistAgentWorkspaceSoon();
+  }
+  return added;
+}
+
+export function promptImportSessionsJson() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "application/json,.json";
+  input.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    if (!file) {
+      return;
+    }
+    const text = await file.text();
+    const n = importSessionsFromJsonText(text);
+    if (n > 0) {
+      window.alert(`Imported ${n} chat${n === 1 ? "" : "s"}`);
+    }
+  });
+  input.click();
+}
+
 export function sessionSearchOpen() {
   const root = document.querySelector("#agent-session-search");
   return Boolean(root) && !root.hidden;
@@ -95,14 +198,18 @@ export function renderSessionSearchResults(query = "") {
   host.replaceChildren();
   const q = String(query || "").trim().toLowerCase();
   const matches = ctx.sessions.filter((session) => {
-    if (!q) {
+    if (session.archived && !q.startsWith("archived:")) {
+      return false;
+    }
+    const needle = q.startsWith("archived:") ? q.slice("archived:".length).trim() : q;
+    if (!needle) {
       return true;
     }
-    if (session.title.toLowerCase().includes(q)) {
+    if (session.title.toLowerCase().includes(needle)) {
       return true;
     }
     return (session.messages || []).some((m) =>
-      String(m.text || "").toLowerCase().includes(q),
+      String(m.text || m.thinking || "").toLowerCase().includes(needle),
     );
   });
   if (!matches.length) {
@@ -116,7 +223,7 @@ export function renderSessionSearchResults(query = "") {
     const row = document.createElement("button");
     row.type = "button";
     row.className = `agent-session-search-row${
-      session.id === ctx.activeSessionId ? " is-ctx.active" : ""
+      session.id === ctx.activeSessionId ? " is-active" : ""
     }`;
     row.dataset.sessionId = session.id;
     row.setAttribute("role", "option");
@@ -166,7 +273,7 @@ export function closeSessionSearch() {
 
 export function appendSessionRow(host, session, { nested = false } = {}) {
   const row = document.createElement("div");
-  row.className = `agent-harness-session${session.id === ctx.activeSessionId ? " is-ctx.active" : ""}${
+  row.className = `agent-harness-session${session.id === ctx.activeSessionId ? " is-active" : ""}${
     nested ? " agent-projects-session" : ""
   }${session.pinned ? " is-pinned" : ""}`;
   row.dataset.sessionId = session.id;
@@ -237,10 +344,10 @@ export function renderProjectsNav() {
     remove.textContent = "×";
     head.append(toggle, remove);
     const nest = document.createElement("div");
-    nest.className = "agent-projects-ctx.sessions";
+    nest.className = "agent-projects-sessions";
     nest.dataset.projectSessions = project.id;
     const kids = ctx.sessions
-      .filter((s) => s.projectId === project.id)
+      .filter((s) => s.projectId === project.id && !s.archived)
       .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)));
     if (!kids.length) {
       const none = document.createElement("p");
@@ -264,7 +371,7 @@ export function renderSessions() {
   }
   list.replaceChildren();
   renderProjectsNav();
-  const ungrouped = ctx.sessions.filter((s) => !s.projectId);
+  const ungrouped = ctx.sessions.filter((s) => !s.projectId && !s.archived);
   const pinned = ungrouped.filter((s) => s.pinned);
   const groups = [
     { id: "Pinned", items: pinned },
@@ -344,7 +451,7 @@ export function submitProjectCreate() {
   }
   renderSessions();
   const item = document.querySelector(`.agent-projects-item[data-project-id="${project.id}"]`);
-  const nest = item?.querySelector("[data-project-ctx.sessions]");
+  const nest = item?.querySelector("[data-project-sessions]");
   const toggle = item?.querySelector("[data-project-toggle]");
   if (nest) {
     nest.hidden = false;
@@ -375,7 +482,7 @@ export function ensureSessionForPrompt(prompt) {
     group: "Today",
     messages: [],
   };
-  ctx.sessions = [session, ...sessions];
+  ctx.sessions = [session, ...ctx.sessions];
   ctx.activeSessionId = session.id;
   return session;
 }
@@ -396,15 +503,28 @@ export function newChat() {
   stopMockStream({ keepPartial: false });
   closeHarnessPage();
   ctx.followUpQueue = [];
-  renderFollowUpQueue();
-  const session = {
-    id: `s-${Date.now()}`,
-    title: "New chat",
-    group: "Today",
-    messages: [],
-  };
-  ctx.sessions = [session, ...sessions];
-  ctx.activeSessionId = session.id;
+  try {
+    renderFollowUpQueue();
+  } catch {
+    /* queue chrome is optional — never block starting a blank chat */
+  }
+  host.refreshHarnessDomCache?.();
+  const blank = ctx.sessions.find(
+    (s) => s.title === "New chat" && !(s.messages && s.messages.length),
+  );
+  if (blank) {
+    ctx.sessions = [blank, ...ctx.sessions.filter((s) => s.id !== blank.id)];
+    ctx.activeSessionId = blank.id;
+  } else {
+    const session = {
+      id: `s-${Date.now()}`,
+      title: "New chat",
+      group: "Today",
+      messages: [],
+    };
+    ctx.sessions = [session, ...ctx.sessions];
+    ctx.activeSessionId = session.id;
+  }
   renderSessions();
   renderActiveSession();
   shelfComposerInput()?.focus({ preventScroll: true });
@@ -528,7 +648,10 @@ export function openSessionActions(sessionId, anchor) {
   }
 
   addAction("Rename", "rename");
-  addAction("Export", "export");
+  addAction(session.archived ? "Unarchive" : "Archive", "archive");
+  addAction("Export Markdown", "export");
+  addAction("Export JSON", "export-json");
+  addAction("Import JSON…", "import-json");
   addAction("Delete", "delete", { danger: true });
 
   for (const btn of document.querySelectorAll("[data-session-menu]")) {
@@ -567,9 +690,29 @@ export function runSessionAction(action) {
     renameSession(id);
     return;
   }
+  if (action === "archive") {
+    session.archived = !session.archived;
+    if (session.archived && ctx.activeSessionId === id) {
+      ctx.activeSessionId =
+        ctx.sessions.find((s) => !s.archived && s.id !== id)?.id || null;
+      renderActiveSession();
+    }
+    renderSessions();
+    persistAgentWorkspaceSoon();
+    return;
+  }
   if (action === "export") {
     ctx.activeSessionId = id;
     exportActiveSessionMarkdown();
+    return;
+  }
+  if (action === "export-json") {
+    ctx.activeSessionId = id;
+    exportActiveSessionJson();
+    return;
+  }
+  if (action === "import-json") {
+    promptImportSessionsJson();
     return;
   }
   if (action === "delete") {

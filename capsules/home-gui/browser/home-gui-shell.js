@@ -1,19 +1,4 @@
 import {
-  applyHomeGuiUiPreferences,
-  bindHomeGuiInteractions,
-  attachAuthorizedHomeGuiTarget,
-  closeHomeGuiWindowForToken,
-  noteHomeGuiConnectorSheetSummaryRefresh,
-  openHomeGuiTarget,
-  relaunchHomeGuiWindowForToken,
-  renewHomeGuiBrowserWindowAuthority,
-  restoreHomeGuiSession,
-  setHomeGuiMenuManifest,
-  setHomeGuiMounted,
-  showHomeGuiDesktop,
-  syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260731b";
-import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
@@ -21,7 +6,7 @@ import {
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260731b";
+} from "./home-gui-authority.js?v=home-20260804ap";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -45,10 +30,28 @@ let restoredSession = false;
 if (!homeToken || !homeOrigin || window.parent === window) {
   throw new Error("Home GUI requires an isolated Home launch");
 }
+/* Token must be set before home-gui.js evaluates — bindAgentHarness() probes
+   live inference during module init, and a miss caches Preview for PROBE_TTL. */
 setHomeGuiLaunchToken(homeToken);
 
 route.hash = "";
 window.history.replaceState(null, "", `${route.pathname}${route.search}`);
+
+const {
+  applyHomeGuiUiPreferences,
+  bindHomeGuiInteractions,
+  attachAuthorizedHomeGuiTarget,
+  closeHomeGuiWindowForToken,
+  noteHomeGuiConnectorSheetSummaryRefresh,
+  openHomeGuiTarget,
+  relaunchHomeGuiWindowForToken,
+  renewHomeGuiBrowserWindowAuthority,
+  restoreHomeGuiSession,
+  setHomeGuiMenuManifest,
+  setHomeGuiMounted,
+  showHomeGuiDesktop,
+  syncHomeGuiProjection,
+} = await import("./home-gui.js?v=home-20260804ap");
 
 function requestId() {
   if (window.crypto?.randomUUID) {

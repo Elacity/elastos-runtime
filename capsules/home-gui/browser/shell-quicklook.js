@@ -13,14 +13,14 @@ import {
   mountGlyph,
   targetById,
   desktopObjectByEntryId,
-} from "./shell-core.js?v=home-20260728ag";
-import { openFileObject } from "./shell-surface.js?v=home-20260728ag";
-import { openTarget } from "./shell-windows.js?v=home-20260728ag";
+} from "./shell-core.js?v=home-20260804ap";
+import { openFileObject } from "./shell-surface.js?v=home-20260804ap";
+import { openTarget } from "./shell-windows.js?v=home-20260804ap";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260728ag";
+} from "./shell-popovers.js?v=home-20260804ap";
 
 /* Bound by bindQuickLook() once the lazy GUI template is in the DOM. */
 let panel = null;

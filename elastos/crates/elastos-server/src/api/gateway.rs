@@ -48,6 +48,8 @@ mod gateway_browser;
 mod gateway_capsule_catalog;
 #[path = "gateway_esp.rs"]
 mod gateway_esp;
+#[path = "gateway_home_agent.rs"]
+mod gateway_home_agent;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
@@ -85,6 +87,7 @@ use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
 use gateway_esp::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
+use gateway_home_agent::*;
 use gateway_home_runtime::*;
 
 pub(crate) fn principal_root_protected_object_inventory(
@@ -100,9 +103,6 @@ pub(crate) fn principal_root_protected_object_inventory(
 
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 use gateway_home_system::*;
-pub(crate) use gateway_home_system::{
-    login_avatar_bytes_for_credential, login_avatar_cid_for_principal,
-};
 use gateway_home_terminal::*;
 pub(super) use gateway_home_token::{
     home_launch_auth_data_dir, home_launch_token_header, home_session_clear_cookie_header,
@@ -538,10 +538,6 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/auth/passkey/status",
             get(super::auth_gateway::passkey_status),
         )
-        .route(
-            "/api/auth/passkey/account-avatar",
-            get(super::auth_gateway::passkey_account_avatar),
-        )
         .route("/api/auth/passkeys", get(super::auth_gateway::passkey_list))
         .route(
             "/api/auth/recovery/status",
@@ -863,6 +859,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/apps/home/summary", get(home_summary))
         .route("/api/apps/home/events", get(home_events))
         .route("/api/apps/home/events/stream", get(home_events_stream))
+        .route(
+            "/api/apps/home/agent/chat/stream",
+            post(home_agent_chat_stream),
+        )
         .route(
             "/api/apps/home/state",
             get(home_browser_state_get).post(home_browser_state_update),

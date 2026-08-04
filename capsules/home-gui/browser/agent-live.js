@@ -1,20 +1,51 @@
-/* Live local inference bridge (w1). Chat only — carries no tool, grant, or
-   capsule authority; grant cards remain fail-closed preview (Principle 16).
-   Path: gateway /api/provider/ai/* and /api/provider/llama/* (home-gui-only
-   allowlist, home launch token). §AL trust note: re-validate this route
-   against runtime launch-token/Bus semantics at w0. Tip: home-20260728ag */
+/* Live local inference bridge (w1 + Sparks OpenAI-compat). Chat only — carries
+   no tool, grant, or capsule authority; grant cards remain fail-closed preview
+   (Principle 16). Path: gateway /api/provider/ai/* and /api/provider/llama/*
+   (home-gui-only allowlist, home launch token).
+   Tip: home-20260804ap */
 
-import { fetchJson } from "./shell-core.js?v=home-20260728ag";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804ap";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
 /** Bound the history we send — local models have small contexts. */
 const LIVE_HISTORY_LIMIT = 12;
 
-const LIVE_SYSTEM_PROMPT =
+/** PRINCIPLES-safe default — no tools, no capsule authority (UI ≠ authority). */
+export const DEFAULT_LIVE_SYSTEM_PROMPT =
   "You are the ElastOS Home Agent, running privately on this machine. " +
   "You have no tools and no capsule authority in this session; answer from " +
   "knowledge only, and say so plainly when a task would need a tool or grant.";
+
+export const DEFAULT_LIVE_MAX_TOKENS = 2048;
+export const DEFAULT_LIVE_TEMPERATURE = 0.7;
+export const MAX_LIVE_SYSTEM_PROMPT_CHARS = 8_000;
+
+export function clampLiveMaxTokens(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return DEFAULT_LIVE_MAX_TOKENS;
+  }
+  return Math.min(8192, Math.max(16, Math.round(n)));
+}
+
+export function clampLiveTemperature(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return DEFAULT_LIVE_TEMPERATURE;
+  }
+  return Math.min(2, Math.max(0, Math.round(n * 100) / 100));
+}
+
+export function normalizeLiveSystemPrompt(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return DEFAULT_LIVE_SYSTEM_PROMPT;
+  }
+  return text.length > MAX_LIVE_SYSTEM_PROMPT_CHARS
+    ? text.slice(0, MAX_LIVE_SYSTEM_PROMPT_CHARS)
+    : text;
+}
 
 let liveState = {
   live: false,
@@ -23,7 +54,7 @@ let liveState = {
   endpointState: "",
   reason: "unprobed",
   checkedAt: 0,
-  /** Real llama-server models (one configured GGUF today). */
+  /** Live model rows (llama GGUF and/or remote OpenAI-compat). */
   models: [],
 };
 
@@ -33,10 +64,25 @@ export function getLiveInferenceState() {
   return { ...liveState, models: liveState.models.slice() };
 }
 
+function providerUrl(scheme, op) {
+  /* Opaque sandboxed home-gui resolves relative /api against the document URL
+     (localhost gateway). Keep absolute for clarity. */
+  return new URL(`/api/provider/${scheme}/${op}`, window.location.href).href;
+}
+
 async function providerCall(scheme, op, payload = {}) {
-  const response = await fetchJson(`/api/provider/${scheme}/${op}`, {
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    const error = new Error("missing home launch token in Home GUI shell");
+    error.code = "missing-home-launch-token";
+    throw error;
+  }
+  const response = await fetchJson(providerUrl(scheme, op), {
     method: "POST",
     body: JSON.stringify(payload),
+    headers: {
+      "x-elastos-home-token": token,
+    },
   });
   if (!response || response.status !== "ok") {
     const error = new Error(response?.message || `${scheme}.${op} failed`);
@@ -69,10 +115,61 @@ function liveModelsFromListing(listing) {
     .filter(Boolean);
 }
 
+function localBackendRow(backends) {
+  const rows = Array.isArray(backends?.backends) ? backends.backends : [];
+  return (
+    rows.find((b) => {
+      const name = typeof b === "string" ? b : b?.name || b?.id || "";
+      return name === "local";
+    }) || null
+  );
+}
+
+/** True when ai-provider local backend points at remote OpenAI-compat (Sparks). */
+function isRemoteOpenAiCompat(local) {
+  if (!local || typeof local !== "object") {
+    return false;
+  }
+  const apiUrl = String(local.api_url || "").toLowerCase();
+  if (!apiUrl.startsWith("http://") && !apiUrl.startsWith("https://")) {
+    return false;
+  }
+  /* On-box llama / ollama defaults — not Sparks. */
+  if (
+    apiUrl.includes("127.0.0.1") ||
+    apiUrl.includes("localhost") ||
+    apiUrl.includes("::1") ||
+    apiUrl.includes("0.0.0.0")
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function remoteLiveFromLocal(local) {
+  const remoteModel = String(local?.default_model || "").trim() || "remote";
+  const apiUrl = String(local?.api_url || "");
+  return {
+    model: remoteModel,
+    models: [
+      {
+        id: `live:${remoteModel}`,
+        label: remoteModel,
+        detail: apiUrl
+          ? `OpenAI-compat · ${apiUrl}`
+          : "OpenAI-compat (OLLAMA_URL)",
+      },
+    ],
+    endpointState: "openai-compat",
+    reason: "ready",
+  };
+}
+
 /**
- * Truth probe: live only when ai-provider lists a `local` backend AND
- * llama-server reports healthy. Conservative on any failure — the honest
- * default is preview, never an assumed live claim (§AL.3).
+ * Truth probe: live when ai-provider lists a `local` backend AND either
+ * (a) that backend is remote OpenAI-compat (Sparks via OLLAMA_URL) and pings, or
+ * (b) llama-server is healthy. Conservative on total failure — preview is the
+ * honest default (§AL.3).
  */
 export async function probeLiveInference({ force = false } = {}) {
   const now = Date.now();
@@ -86,29 +183,86 @@ export async function probeLiveInference({ force = false } = {}) {
       const names = (Array.isArray(backends?.backends) ? backends.backends : [])
         .map((b) => (typeof b === "string" ? b : b?.name || b?.id || ""))
         .filter(Boolean);
-      /* Conservative: live requires a declared `local` backend — never assumed. */
       const hasLocal = names.includes("local");
-      const health = await providerCall("llama", "health");
-      const healthy = hasLocal && health?.healthy === true;
+      if (!hasLocal) {
+        liveState = {
+          live: false,
+          checking: false,
+          model: "",
+          endpointState: "no-local-backend",
+          reason: "no-local-backend",
+          checkedAt: Date.now(),
+          models: [],
+        };
+        return;
+      }
+
+      const local = localBackendRow(backends);
+
+      /* Path B first when OLLAMA_URL points at Sparks — do not require llama. */
+      if (isRemoteOpenAiCompat(local)) {
+        await providerCall("ai", "ping");
+        const remote = remoteLiveFromLocal(local);
+        liveState = {
+          live: true,
+          checking: false,
+          model: remote.model,
+          endpointState: remote.endpointState,
+          reason: remote.reason,
+          checkedAt: Date.now(),
+          models: remote.models,
+        };
+        return;
+      }
+
+      let healthy = false;
       let model = "";
       let models = [];
-      if (healthy) {
-        const [status, listing] = await Promise.all([
-          providerCall("llama", "status").catch(() => null),
-          providerCall("llama", "list_models").catch(() => null),
-        ]);
-        model = String(status?.model || "").split("/").pop() || "";
-        models = liveModelsFromListing(listing);
-        if (!model && models[0]) {
-          model = models[0].label;
+      let endpointState = "";
+      let reason = "not-ready";
+
+      /* Path A: on-machine llama-server (existing w1). */
+      try {
+        const health = await providerCall("llama", "health");
+        if (health?.healthy === true) {
+          const [status, listing] = await Promise.all([
+            providerCall("llama", "status").catch(() => null),
+            providerCall("llama", "list_models").catch(() => null),
+          ]);
+          model = String(status?.model || "").split("/").pop() || "";
+          models = liveModelsFromListing(listing);
+          if (!model && models[0]) {
+            model = models[0].label;
+          }
+          healthy = true;
+          endpointState = String(health?.state || "llama-ready");
+          reason = "ready";
+        } else {
+          endpointState = String(health?.state || "llama-not-ready");
+          reason = String(health?.reason || health?.state || "llama-not-ready");
         }
+      } catch (error) {
+        endpointState = "llama-absent";
+        reason = String(error?.code || "llama-absent");
       }
+
+      /* Fallback: any listed local backend that answers ping. */
+      if (!healthy) {
+        await providerCall("ai", "ping");
+        const remote = remoteLiveFromLocal(local);
+        model = remote.model;
+        models = remote.models;
+        endpointState = remote.endpointState;
+        reason = remote.reason;
+        healthy = true;
+      }
+
       liveState = {
         live: healthy,
         checking: false,
         model,
-        endpointState: String(health?.state || ""),
-        reason: healthy ? "ready" : String(health?.reason || health?.state || "not-ready"),
+        endpointState,
+        reason,
         checkedAt: Date.now(),
         models,
       };
@@ -118,7 +272,7 @@ export async function probeLiveInference({ force = false } = {}) {
         checking: false,
         model: "",
         endpointState: "unreachable",
-        reason: String(error?.code || "unreachable"),
+        reason: String(error?.code || error?.message || "unreachable"),
         checkedAt: Date.now(),
         models: [],
       };
@@ -131,7 +285,7 @@ export async function probeLiveInference({ force = false } = {}) {
 }
 
 /** Session history → OpenAI-compat messages (user/assistant only, bounded). */
-export function buildLiveMessages(sessionMessages = []) {
+export function buildLiveMessages(sessionMessages = [], { systemPrompt } = {}) {
   const turns = sessionMessages
     .filter((m) => (m.role === "user" || m.role === "agent") && String(m.text || "").trim())
     .slice(-LIVE_HISTORY_LIMIT)
@@ -139,22 +293,251 @@ export function buildLiveMessages(sessionMessages = []) {
       role: m.role === "agent" ? "assistant" : "user",
       content: String(m.text),
     }));
-  return [{ role: "system", content: LIVE_SYSTEM_PROMPT }, ...turns];
+  return [
+    { role: "system", content: normalizeLiveSystemPrompt(systemPrompt) },
+    ...turns,
+  ];
 }
 
 /**
- * One live turn — full completion (no token stream; providers are one-shot,
- * see §AL.2). Throws with `code` on provider errors (`local_unavailable`,
- * `model_loading`, `timeout`, …) so callers can fall back to mock honestly.
+ * Assistant text from an OpenAI-compat message. Flash/vLLM may return
+ * content:null with the only text in reasoning / reasoning_content.
+ */
+export function assistantTextFromMessage(message = {}) {
+  const content = String(message?.content ?? "").trim();
+  if (content) {
+    return content;
+  }
+  for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+    const value = message?.[field];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * One live turn — full completion (legacy / probe fallback). Prefer
+ * streamLiveChatCompletion for Agent turns.
  */
 export async function requestLiveChatCompletion(messages) {
   const data = await providerCall("ai", "chat_completions", {
     backend: "local",
     messages,
+    max_tokens: 2048,
   });
   const message = data?.choices?.[0]?.message || {};
   return {
     message,
     usage: data?.usage || null,
   };
+}
+
+/** Sparks pair for dogfood streaming — server maps to allowlisted upstream. */
+let livePair = "a";
+let liveAbort = null;
+
+export function getLiveChatPair() {
+  return livePair === "b" ? "b" : "a";
+}
+
+export function setLiveChatPair(pair) {
+  livePair = pair === "b" ? "b" : "a";
+  try {
+    sessionStorage.setItem("elastos.home-gui.agent-pair", livePair);
+  } catch {
+    /* opaque / blocked */
+  }
+  return livePair;
+}
+
+try {
+  const stored = sessionStorage.getItem("elastos.home-gui.agent-pair");
+  if (stored === "a" || stored === "b") {
+    livePair = stored;
+  }
+} catch {
+  /* ignore */
+}
+
+export function abortLiveChatStream() {
+  if (liveAbort) {
+    try {
+      liveAbort.abort();
+    } catch {
+      /* ignore */
+    }
+    liveAbort = null;
+  }
+}
+
+function streamUrl() {
+  return new URL("/api/apps/home/agent/chat/stream", window.location.href).href;
+}
+
+function deltaFields(delta = {}) {
+  const content =
+    typeof delta.content === "string"
+      ? delta.content
+      : delta.content == null
+        ? ""
+        : String(delta.content);
+  let reasoning = "";
+  for (const field of ["reasoning", "reasoning_content", "thinking"]) {
+    if (typeof delta[field] === "string" && delta[field]) {
+      reasoning = delta[field];
+      break;
+    }
+  }
+  return { content, reasoning };
+}
+
+/**
+ * Stream a Live turn through the Home gateway SSE proxy (OpenAI-compat).
+ * onDelta({ reasoning, content, done }) is called as tokens arrive.
+ * Stop = abortLiveChatStream() / AbortController.
+ */
+export async function streamLiveChatCompletion(
+  messages,
+  {
+    onDelta,
+    maxTokens = DEFAULT_LIVE_MAX_TOKENS,
+    temperature = DEFAULT_LIVE_TEMPERATURE,
+  } = {},
+) {
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    const error = new Error("missing home launch token in Home GUI shell");
+    error.code = "missing-home-launch-token";
+    throw error;
+  }
+  abortLiveChatStream();
+  const controller = new AbortController();
+  liveAbort = controller;
+
+  let response;
+  try {
+    response = await fetch(streamUrl(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        "x-elastos-home-token": token,
+      },
+      body: JSON.stringify({
+        messages,
+        max_tokens: clampLiveMaxTokens(maxTokens),
+        temperature: clampLiveTemperature(temperature),
+        pair: getLiveChatPair(),
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      const error = new Error("stopped");
+      error.code = "aborted";
+      throw error;
+    }
+    throw err;
+  }
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    let message = detail;
+    try {
+      const parsed = JSON.parse(detail);
+      message = parsed?.message || detail;
+    } catch {
+      /* raw */
+    }
+    const error = new Error(
+      message || `stream failed: ${response.status} ${response.statusText}`,
+    );
+    error.code = "upstream_http";
+    error.status = response.status;
+    throw error;
+  }
+
+  if (!response.body) {
+    const error = new Error("stream body unavailable");
+    error.code = "no_body";
+    throw error;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let reasoning = "";
+  let content = "";
+  let sawDone = false;
+
+  const emit = (done = false) => {
+    onDelta?.({ reasoning, content, done });
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n");
+      buffer = parts.pop() || "";
+      for (const line of parts) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(":")) {
+          continue;
+        }
+        if (!trimmed.startsWith("data:")) {
+          continue;
+        }
+        const data = trimmed.slice(5).trim();
+        if (!data) {
+          continue;
+        }
+        if (data === "[DONE]") {
+          sawDone = true;
+          emit(true);
+          return { reasoning, content, aborted: false };
+        }
+        let chunk;
+        try {
+          chunk = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        const delta = chunk?.choices?.[0]?.delta || {};
+        const fields = deltaFields(delta);
+        if (fields.reasoning) {
+          reasoning += fields.reasoning;
+        }
+        if (fields.content) {
+          content += fields.content;
+        }
+        /* Some servers put final text on message instead of delta. */
+        const message = chunk?.choices?.[0]?.message;
+        if (message && typeof message === "object") {
+          const fromMsg = assistantTextFromMessage(message);
+          if (fromMsg && !content) {
+            content = fromMsg;
+          }
+        }
+        emit(false);
+      }
+    }
+    emit(true);
+    return { reasoning, content, aborted: false, incomplete: !sawDone };
+  } catch (err) {
+    if (controller.signal.aborted) {
+      emit(true);
+      return { reasoning, content, aborted: true };
+    }
+    throw err;
+  } finally {
+    if (liveAbort === controller) {
+      liveAbort = null;
+    }
+  }
 }
