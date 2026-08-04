@@ -51,8 +51,15 @@
  * [ ] Text files size-capped into Live message; Desktop needs grant note
  * [ ] Workbench Library shows Desktop objects (not fake name chips)
  *
+ * Wave 4 honesty (§AS):
+ * [ ] Live turn records usage (upstream or estimate); Usage page non-zero or honest omit
+ * [ ] Message meta shows latency · tokens · live/est
+ * [ ] Usage heatmap empty until Live — never invents preview activity
+ * [ ] Stream/probe failures surface on status strip; healthy Live stays quiet
+ * [ ] usageTurns persist via session.agent
+ *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804ar";
+export const TIP = "home-20260804as";

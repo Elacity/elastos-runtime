@@ -6,13 +6,15 @@ import {
   listProjects,
   replaceProjects,
   setReasoningVisible,
-} from "./mock-agent-provider.js?v=home-20260804ar";
+  getUsageLedger,
+  applyUsageLedger,
+} from "./mock-agent-provider.js?v=home-20260804as";
 import {
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
-} from "./agent-live.js?v=home-20260804ar";
-import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804ar";
+} from "./agent-live.js?v=home-20260804as";
+import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804as";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;
@@ -103,6 +105,7 @@ export function getAgentWorkspaceSnapshot() {
     workbenchTab: clampWorkbenchTab(store.getWorkbenchTab()),
     reasoningVisible: Boolean(store.getReasoningVisible()),
     projects: listProjects(),
+    usageTurns: getUsageLedger(),
     sessions: store
       .getSessions()
       .map(serializeSessionForPersist)
@@ -149,6 +152,9 @@ export function applyAgentWorkspaceSnapshot(raw) {
   }
   if (typeof raw.reasoningVisible === "boolean") {
     store.setReasoningVisible(setReasoningVisible(raw.reasoningVisible));
+  }
+  if (Array.isArray(raw.usageTurns)) {
+    applyUsageLedger(raw.usageTurns);
   }
   return true;
 }

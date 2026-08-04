@@ -1,5 +1,5 @@
 /* Agent message stream + turn theatre.
-   Bound from agent-harness.js. Tip: home-20260804ar
+   Bound from agent-harness.js. Tip: home-20260804as
    Live: gateway SSE (/api/apps/home/agent/chat/stream) with AbortController
    stop; mock remains the honest fallback when Live is down.
    UI ≠ authority (Principle 16) — chat carries no tool or grant power.
@@ -9,23 +9,27 @@ import {
   MOCK_REPLY,
   getMockTurn,
   noteMockTurnTokens,
+  noteLiveTurnUsage,
+  noteStreamFailure,
+  clearLastStreamFailure,
   splitThinkTaggedContent,
-} from "./mock-agent-provider.js?v=home-20260804ar";
+  getSelectedModel,
+} from "./mock-agent-provider.js?v=home-20260804as";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamLiveChatCompletion,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260804ar";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804ar";
+} from "./agent-live.js?v=home-20260804as";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804as";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804ar";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804ar";
+} from "./agent-grants.js?v=home-20260804as";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804as";
 
 /** @type {null | object} */
 let ctx = null;
@@ -112,6 +116,31 @@ function paintAgentMessageBody(body, text, { streaming = false } = {}) {
   const raw = String(text ?? "");
   body.dataset.mdSource = raw;
   body.innerHTML = renderMarkdown(raw, { streaming });
+}
+
+function paintTurnUsageMeta(row, turn) {
+  if (!row || !turn) {
+    return;
+  }
+  let meta = row.querySelector(".agent-msg-meta");
+  if (!meta) {
+    meta = document.createElement("div");
+    meta.className = "agent-msg-meta";
+    row.append(meta);
+  }
+  const latency = turn.latencyMs
+    ? turn.latencyMs >= 1000
+      ? `${(turn.latencyMs / 1000).toFixed(1)}s`
+      : `${turn.latencyMs}ms`
+    : "";
+  const tokens = turn.tokens ? `${turn.tokens} tok` : "";
+  const source =
+    turn.source === "estimated" || turn.omitted
+      ? "est."
+      : turn.source === "live"
+        ? "live"
+        : "preview";
+  meta.textContent = [latency, tokens, source].filter(Boolean).join(" · ");
 }
 
 function formatInlineMarkdown(escaped) {
@@ -1005,6 +1034,8 @@ async function startLiveTurnForPrompt(userText) {
       thinkingEl?.remove();
       answerRow?.remove();
       if (!stoppedEarly) {
+        noteStreamFailure("Live returned empty");
+        host.syncInferenceStatus?.();
         setStreamStatus("Live returned empty — labeled Preview mock", {
           tone: "error",
         });
@@ -1025,6 +1056,23 @@ async function startLiveTurnForPrompt(userText) {
     const regen = answerRow?.querySelector("[data-regenerate]");
     if (regen) {
       regen.disabled = false;
+    }
+
+    const turnUsage = noteLiveTurnUsage({
+      usage: result.usage || null,
+      latencyMs: result.latencyMs || 0,
+      model: getLiveInferenceState()?.model || getSelectedModel()?.label || "live",
+      content: answer,
+      reasoning: thinking,
+      source: "live",
+    });
+    clearLastStreamFailure();
+    paintTurnUsageMeta(answerRow, turnUsage);
+    host.syncInferenceStatus?.();
+    try {
+      host.renderHarnessPage?.();
+    } catch {
+      /* usage page refresh optional */
     }
 
     if (session) {
@@ -1074,6 +1122,8 @@ async function startLiveTurnForPrompt(userText) {
       return;
     }
     const honest = formatStreamError(err);
+    noteStreamFailure(honest);
+    host.syncInferenceStatus?.();
     setStreamStatus(`${honest} · Preview mock`, { tone: "error" });
     thinkingEl?.remove();
     answerRow?.remove();

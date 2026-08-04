@@ -2728,6 +2728,22 @@ html[data-agent-reasoning="off"] .agent-thinking {
   color: color-mix(in srgb, var(--text) 78%, transparent);
 }
 
+.agent-inference-status[data-state="error"] {
+  border: 0.5px solid color-mix(in srgb, #f87171 35%, transparent);
+  background: color-mix(in srgb, #f87171 10%, transparent);
+  color: color-mix(in srgb, var(--text) 78%, transparent);
+}
+
+.agent-msg-meta {
+  margin: 4px 2px 0;
+  padding: 0 2px;
+  color: color-mix(in srgb, var(--text) 42%, transparent);
+  font-size: 11px;
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
 .agent-preview-banner {
   margin: 0 0 14px;
   padding: 8px 12px;

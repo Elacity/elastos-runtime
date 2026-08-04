@@ -1,5 +1,5 @@
 /* Agent Settings / Usage pages + workbench panels.
-   Bound from agent-harness.js (ctx + host). Tip: home-20260804ar
+   Bound from agent-harness.js (ctx + host). Tip: home-20260804as
    UI ≠ authority (Principle 16): pages never mint grants. */
 
 import {
@@ -12,7 +12,7 @@ import {
   getHardwareEstimate,
   getPlanMarkdown,
   getTruthSnapshot,
-} from "./mock-agent-provider.js?v=home-20260804ar";
+} from "./mock-agent-provider.js?v=home-20260804as";
 import {
   DEFAULT_LIVE_SYSTEM_PROMPT,
   MAX_LIVE_SYSTEM_PROMPT_CHARS,
@@ -22,7 +22,7 @@ import {
   fetchAgentBackends,
   saveAgentBackends,
   getAgentBackendsCache,
-} from "./agent-live.js?v=home-20260804ar";
+} from "./agent-live.js?v=home-20260804as";
 
 /** @type {null | object} */
 let ctx = null;
@@ -423,18 +423,25 @@ function renderConfigureModels() {
   }
 }
 
-function renderUsageHeatmap(daily = []) {
+function renderUsageHeatmap(daily = [], { live = false } = {}) {
   const wrap = document.createElement("div");
   wrap.className = "agent-usage-heatmap";
   const head = document.createElement("div");
   head.className = "agent-usage-heatmap-head";
   head.innerHTML =
-    `<span class="agent-models-section-title">Token activity (preview)</span>` +
-    `<span class="agent-usage-heatmap-hint">Daily · past year · not live</span>`;
+    `<span class="agent-models-section-title">Token activity</span>` +
+    `<span class="agent-usage-heatmap-hint">${
+      live ? "Daily · on this Home" : "Daily · empty until Live"
+    }</span>`;
   const grid = document.createElement("div");
   grid.className = "agent-usage-heatmap-grid";
   grid.setAttribute("role", "img");
-  grid.setAttribute("aria-label", "Preview token activity heatmap — zeros until live metering exists");
+  grid.setAttribute(
+    "aria-label",
+    live
+      ? "Token activity heatmap from Live turns on this Home"
+      : "Empty heatmap — no Live turns recorded yet",
+  );
   const byDate = new Map((daily || []).map((d) => [d.date, d]));
   const end = new Date();
   end.setUTCHours(0, 0, 0, 0);
@@ -472,21 +479,26 @@ function renderUsagePage() {
   host.replaceChildren();
   const heroLabel = document.createElement("p");
   heroLabel.className = "agent-usage-kicker";
-  heroLabel.textContent = "Tokens used (preview)";
+  heroLabel.textContent = u.preview ? "Tokens used (waiting for Live)" : "Tokens used (this Home)";
   const hero = document.createElement("p");
   hero.className = "agent-usage-hero";
   hero.textContent = String(u.tokens);
   const note = document.createElement("p");
   note.className = "agent-usage-note";
-  note.textContent = u.preview
-    ? "Preview only — not live metering. Squares stay empty until inference accounting is wired."
-    : "";
+  note.textContent = u.note || "";
   const strip = document.createElement("div");
   strip.className = "agent-usage-strip";
   for (const [label, value] of [
     ["Requests", u.requests],
-    ["Sessions", u.sessions],
     ["Active days", u.activeDays],
+    [
+      "Last latency",
+      u.lastLatencyMs
+        ? u.lastLatencyMs >= 1000
+          ? `${(u.lastLatencyMs / 1000).toFixed(1)}s`
+          : `${u.lastLatencyMs}ms`
+        : "—",
+    ],
   ]) {
     const cell = document.createElement("div");
     cell.innerHTML = `<strong></strong><span></span>`;
@@ -494,22 +506,26 @@ function renderUsagePage() {
     cell.querySelector("span").textContent = label;
     strip.append(cell);
   }
-  const heat = renderUsageHeatmap(u.daily);
+  const heat = renderUsageHeatmap(u.daily, { live: !u.preview });
   const modelsTitle = document.createElement("p");
   modelsTitle.className = "agent-models-section-title";
-  modelsTitle.textContent = "Most used models (preview)";
+  modelsTitle.textContent = u.preview ? "Models" : "Most used models";
   const models = document.createElement("p");
   models.className = "agent-usage-models";
   models.textContent = u.byModel?.length ? u.byModel.join(" · ") : "—";
   const locality = document.createElement("p");
   locality.className = "agent-harness-page-foot";
   locality.textContent = `${u.locality} · ${u.note}`;
-  const banner = document.createElement("p");
-  banner.className = "agent-preview-banner";
-  banner.setAttribute("role", "status");
-  banner.textContent =
-    "Preview · Usage is literacy only until live inference accounting exists.";
-  host.append(banner, heroLabel, hero, note, strip, heat, modelsTitle, models, locality);
+  if (u.preview) {
+    const banner = document.createElement("p");
+    banner.className = "agent-preview-banner";
+    banner.setAttribute("role", "status");
+    banner.textContent =
+      "No Live turns yet — Usage stays empty rather than inventing heatmap activity.";
+    host.append(banner, heroLabel, hero, note, strip, heat, modelsTitle, models, locality);
+    return;
+  }
+  host.append(heroLabel, hero, note, strip, heat, modelsTitle, models, locality);
 }
 
 export function renderHarnessPage() {

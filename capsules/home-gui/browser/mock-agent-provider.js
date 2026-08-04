@@ -2,7 +2,7 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-import { TIP } from "./agent-tip.js?v=home-20260804ar";
+import { TIP } from "./agent-tip.js?v=home-20260804as";
 
 let planMarkdown = `### To-dos
 - [ ] Clarify what to build
@@ -788,17 +788,141 @@ function emptyUsageDaily() {
   return days;
 }
 
+/** Wave 4 — on-Home usage ledger (host-persisted via session.agent). */
+const MAX_USAGE_TURNS = 200;
+let usageTurns = [];
+let lastStreamFailure = "";
+
+function estimateTokensFromText(text) {
+  const chars = String(text || "").length;
+  return Math.max(1, Math.round(chars / 4));
+}
+
+export function noteLiveTurnUsage({
+  usage = null,
+  latencyMs = 0,
+  model = "",
+  content = "",
+  reasoning = "",
+  source = "live",
+} = {}) {
+  const promptTokens = Number(usage?.prompt_tokens);
+  const completionTokens = Number(usage?.completion_tokens);
+  const totalFromUpstream = Number(usage?.total_tokens);
+  let total = Number.isFinite(totalFromUpstream) ? totalFromUpstream : NaN;
+  let omitted = false;
+  if (!Number.isFinite(total) || total <= 0) {
+    const prompt = Number.isFinite(promptTokens) ? promptTokens : 0;
+    const completion = Number.isFinite(completionTokens)
+      ? completionTokens
+      : estimateTokensFromText(`${reasoning || ""}${content || ""}`);
+    total = prompt + completion;
+    omitted = !Number.isFinite(promptTokens) && !Number.isFinite(completionTokens);
+  }
+  const day = new Date().toISOString().slice(0, 10);
+  usageTurns.push({
+    at: Date.now(),
+    day,
+    tokens: Math.max(0, Math.round(total)),
+    promptTokens: Number.isFinite(promptTokens) ? Math.round(promptTokens) : null,
+    completionTokens: Number.isFinite(completionTokens)
+      ? Math.round(completionTokens)
+      : null,
+    latencyMs: Math.max(0, Math.round(Number(latencyMs) || 0)),
+    model: String(model || "live").slice(0, 80),
+    source: source === "mock" ? "mock" : omitted ? "estimated" : "live",
+    omitted,
+  });
+  if (usageTurns.length > MAX_USAGE_TURNS) {
+    usageTurns = usageTurns.slice(-MAX_USAGE_TURNS);
+  }
+  lastStreamFailure = "";
+  return usageTurns[usageTurns.length - 1];
+}
+
+export function noteStreamFailure(reason) {
+  lastStreamFailure = String(reason || "").slice(0, 240);
+}
+
+export function getLastStreamFailure() {
+  return lastStreamFailure;
+}
+
+export function clearLastStreamFailure() {
+  lastStreamFailure = "";
+}
+
+export function getUsageLedger() {
+  return usageTurns.map((t) => ({ ...t }));
+}
+
+export function applyUsageLedger(rawTurns) {
+  if (!Array.isArray(rawTurns)) {
+    return;
+  }
+  usageTurns = rawTurns
+    .filter((t) => t && typeof t === "object")
+    .map((t) => ({
+      at: Number(t.at) || Date.now(),
+      day: String(t.day || "").slice(0, 10),
+      tokens: Math.max(0, Math.round(Number(t.tokens) || 0)),
+      promptTokens: t.promptTokens == null ? null : Math.round(Number(t.promptTokens) || 0),
+      completionTokens:
+        t.completionTokens == null ? null : Math.round(Number(t.completionTokens) || 0),
+      latencyMs: Math.max(0, Math.round(Number(t.latencyMs) || 0)),
+      model: String(t.model || "live").slice(0, 80),
+      source: t.source === "mock" || t.source === "estimated" ? t.source : "live",
+      omitted: Boolean(t.omitted),
+    }))
+    .slice(-MAX_USAGE_TURNS);
+}
+
 export function getUsageSnapshot() {
+  const liveTurns = usageTurns.filter((t) => t.source !== "mock");
+  const hasLive = liveTurns.length > 0;
+  const turns = hasLive ? liveTurns : usageTurns;
+  const tokens = turns.reduce((sum, t) => sum + (t.tokens || 0), 0);
+  const requests = turns.length;
+  const days = new Set(turns.map((t) => t.day).filter(Boolean));
+  const byModelMap = new Map();
+  for (const t of turns) {
+    byModelMap.set(t.model, (byModelMap.get(t.model) || 0) + (t.tokens || 0));
+  }
+  const byModel = [...byModelMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([name, count]) => `${name} (${count})`);
+  const daily = emptyUsageDaily();
+  const byDate = new Map(daily.map((d) => [d.date, d]));
+  for (const t of turns) {
+    const row = byDate.get(t.day);
+    if (!row) {
+      continue;
+    }
+    row.total_tokens += t.tokens || 0;
+    row.requests += 1;
+  }
+  const last = turns[turns.length - 1];
+  const omittedCount = turns.filter((t) => t.omitted).length;
+  let note = "No Live turns yet — Usage stays empty until a Live reply lands";
+  if (hasLive) {
+    note = omittedCount
+      ? `Live metering · ${omittedCount} turn(s) estimated (upstream omitted usage)`
+      : "Live metering from gateway stream / estimates";
+  }
   return {
-    preview: true,
-    tokens: 0,
-    requests: 0,
-    sessions: 0,
-    activeDays: 0,
-    byModel: [],
-    daily: emptyUsageDaily(),
-    locality: "On this device",
-    note: "Metering when live inference accounting exists",
+    preview: !hasLive,
+    tokens,
+    requests,
+    sessions: days.size,
+    activeDays: days.size,
+    byModel,
+    daily,
+    locality: "On this Home",
+    note,
+    lastLatencyMs: last?.latencyMs || 0,
+    lastSource: last?.source || "",
+    lastStreamFailure,
   };
 }
 

@@ -2,9 +2,9 @@
    no tool, grant, or capsule authority; grant cards remain fail-closed preview
    (Principle 16). Path: gateway /api/provider/ai/* and /api/provider/llama/*
    (home-gui-only allowlist, home launch token).
-   Tip: home-20260804ar */
+   Tip: home-20260804as */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804ar";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804as";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
@@ -544,9 +544,23 @@ export async function streamLiveChatCompletion(
   let reasoning = "";
   let content = "";
   let sawDone = false;
+  let usage = null;
+  const startedAt = Date.now();
 
   const emit = (done = false) => {
-    onDelta?.({ reasoning, content, done });
+    onDelta?.({ reasoning, content, done, usage });
+  };
+
+  const finish = (extra = {}) => {
+    const latencyMs = Date.now() - startedAt;
+    return {
+      reasoning,
+      content,
+      usage,
+      latencyMs,
+      aborted: false,
+      ...extra,
+    };
   };
 
   try {
@@ -573,13 +587,16 @@ export async function streamLiveChatCompletion(
         if (data === "[DONE]") {
           sawDone = true;
           emit(true);
-          return { reasoning, content, aborted: false };
+          return finish();
         }
         let chunk;
         try {
           chunk = JSON.parse(data);
         } catch {
           continue;
+        }
+        if (chunk?.usage && typeof chunk.usage === "object") {
+          usage = chunk.usage;
         }
         const delta = chunk?.choices?.[0]?.delta || {};
         const fields = deltaFields(delta);
@@ -601,11 +618,17 @@ export async function streamLiveChatCompletion(
       }
     }
     emit(true);
-    return { reasoning, content, aborted: false, incomplete: !sawDone };
+    return finish({ incomplete: !sawDone });
   } catch (err) {
     if (controller.signal.aborted) {
       emit(true);
-      return { reasoning, content, aborted: true };
+      return {
+        reasoning,
+        content,
+        usage,
+        latencyMs: Date.now() - startedAt,
+        aborted: true,
+      };
     }
     throw err;
   } finally {

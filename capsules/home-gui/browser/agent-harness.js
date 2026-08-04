@@ -12,11 +12,11 @@ import {
   snapAppsShelfFace,
   bindShelfAttachHost,
   addComposerAttachment,
-} from "./agent-shelf.js?v=home-20260804ar";
+} from "./agent-shelf.js?v=home-20260804as";
 import {
   shellState,
   desktopObjects,
-} from "./shell-core.js?v=home-20260804ar";
+} from "./shell-core.js?v=home-20260804as";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -26,8 +26,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260804ar";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804ar";
+} from "./shell-stages.js?v=home-20260804as";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804as";
 import {
   resetMockCapabilities,
   getSelectedModel,
@@ -44,18 +44,19 @@ import {
   maybeUpdatePlanFromPrompt,
   requestModelGet,
   removeProject,
-} from "./mock-agent-provider.js?v=home-20260804ar";
+  getLastStreamFailure,
+} from "./mock-agent-provider.js?v=home-20260804as";
 import {
   bindAgentWorkspaceSnapshot,
-} from "./shell-windows.js?v=home-20260804ar";
-import { TIP } from "./agent-tip.js?v=home-20260804ar";
-import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804ar";
+} from "./shell-windows.js?v=home-20260804as";
+import { TIP } from "./agent-tip.js?v=home-20260804as";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804as";
 import {
   bindAgentWorkspaceStore,
   getAgentWorkspaceSnapshot,
   applyAgentWorkspaceSnapshot,
   persistAgentWorkspaceSoon,
-} from "./agent-workspace.js?v=home-20260804ar";
+} from "./agent-workspace.js?v=home-20260804as";
 import {
   bindAgentConfigure,
   harnessPageOpen,
@@ -68,7 +69,7 @@ import {
   setWorkbenchTab,
   syncWorkbenchPanels,
   syncWorkbenchOpenUi,
-} from "./agent-configure.js?v=home-20260804ar";
+} from "./agent-configure.js?v=home-20260804as";
 import {
   bindAgentGrants,
   syncTruthStrip,
@@ -78,7 +79,7 @@ import {
   sessionAlreadyHasGrant,
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804ar";
+} from "./agent-grants.js?v=home-20260804as";
 import {
   bindAgentStream,
   clearStreamTimer,
@@ -107,7 +108,7 @@ import {
   updateJumpToLatestVisibility,
   ensureJumpToLatest,
   setStreamStatus,
-} from "./agent-stream.js?v=home-20260804ar";
+} from "./agent-stream.js?v=home-20260804as";
 import {
   getLiveInferenceState,
   probeLiveInference,
@@ -115,7 +116,7 @@ import {
   setLiveChatPair,
   fetchAgentBackends,
   getAgentBackendsCache,
-} from "./agent-live.js?v=home-20260804ar";
+} from "./agent-live.js?v=home-20260804as";
 import {
   bindAgentSessions,
   relativeTime,
@@ -143,7 +144,7 @@ import {
   closeSessionActions,
   openSessionActions,
   runSessionAction,
-} from "./agent-sessions.js?v=home-20260804ar";
+} from "./agent-sessions.js?v=home-20260804as";
 export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
 let workbenchTab = "outputs";
@@ -423,6 +424,7 @@ bindAgentStream(
     renderSessions,
     syncInferenceStatus: () => syncAgentInferenceStatus(),
     persistAgentWorkspaceSoon,
+    renderHarnessPage,
   },
 );
 
@@ -1302,12 +1304,25 @@ function syncAgentInferenceStatus() {
   const offline = typeof navigator !== "undefined" && navigator.onLine === false;
   const state = getLiveInferenceState();
   const live = state.live === true;
-  if (live) {
+  let streamFail = "";
+  try {
+    streamFail = getLastStreamFailure() || "";
+  } catch {
+    streamFail = "";
+  }
+  if (live && !streamFail) {
     /* Live is the expected dogfood path — don't billboard model/transport chrome. */
     el.hidden = true;
     el.dataset.state = "live";
     el.textContent = "";
     document.body.dataset.agentInference = "live";
+    return;
+  }
+  if (live && streamFail) {
+    el.hidden = false;
+    el.dataset.state = "error";
+    el.textContent = `Live · last stream failed · ${streamFail}`;
+    document.body.dataset.agentInference = "live-degraded";
     return;
   }
   if (offline) {
@@ -1321,8 +1336,9 @@ function syncAgentInferenceStatus() {
   el.hidden = false;
   el.dataset.state = "preview";
   const why = state.reason && state.reason !== "unprobed" ? ` · ${state.reason}` : "";
+  const fail = streamFail ? ` · last error: ${streamFail}` : "";
   el.textContent =
-    `Preview · not live inference — mock replies until a model is wired${why}`;
+    `Preview · not live inference — mock replies until a model is wired${why}${fail}`;
   document.body.dataset.agentInference = "preview";
 }
 
