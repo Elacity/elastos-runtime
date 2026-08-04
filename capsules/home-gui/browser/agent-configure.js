@@ -1,5 +1,5 @@
 /* Agent Settings / Usage pages + workbench panels.
-   Bound from agent-harness.js (ctx + host). Tip: home-20260804ap
+   Bound from agent-harness.js (ctx + host). Tip: home-20260804aq
    UI ≠ authority (Principle 16): pages never mint grants. */
 
 import {
@@ -12,14 +12,17 @@ import {
   getHardwareEstimate,
   getPlanMarkdown,
   getTruthSnapshot,
-} from "./mock-agent-provider.js?v=home-20260804ap";
+} from "./mock-agent-provider.js?v=home-20260804aq";
 import {
   DEFAULT_LIVE_SYSTEM_PROMPT,
   MAX_LIVE_SYSTEM_PROMPT_CHARS,
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
-} from "./agent-live.js?v=home-20260804ap";
+  fetchAgentBackends,
+  saveAgentBackends,
+  getAgentBackendsCache,
+} from "./agent-live.js?v=home-20260804aq";
 
 /** @type {null | object} */
 let ctx = null;
@@ -112,14 +115,82 @@ function bindPromptPanelOnce() {
     }
   });
   panel.addEventListener("click", (event) => {
-    if (!ctx || !event.target?.closest?.("[data-system-prompt-reset]")) {
+    if (!ctx) {
       return;
     }
-    event.preventDefault();
-    ctx.systemPrompt = DEFAULT_LIVE_SYSTEM_PROMPT;
-    renderPromptPanel();
-    persistPromptPrefsSoon();
+    if (event.target?.closest?.("[data-system-prompt-reset]")) {
+      event.preventDefault();
+      ctx.systemPrompt = DEFAULT_LIVE_SYSTEM_PROMPT;
+      renderPromptPanel();
+      persistPromptPrefsSoon();
+      return;
+    }
+    if (event.target?.closest?.("[data-backends-save]")) {
+      event.preventDefault();
+      void saveBackendsFromPanel();
+    }
   });
+}
+
+function fillBackendsPanel(backends) {
+  if (!backends) {
+    return;
+  }
+  const model = document.querySelector("[data-backend-model]");
+  if (model) {
+    model.value = String(backends.model || "");
+  }
+  const pairs = Array.isArray(backends.pairs) ? backends.pairs : [];
+  const a = pairs.find((p) => p.id === "a") || pairs[0] || {};
+  const b = pairs.find((p) => p.id === "b") || pairs[1] || {};
+  const set = (sel, value) => {
+    const el = document.querySelector(sel);
+    if (el) {
+      el.value = String(value || "");
+    }
+  };
+  set("[data-backend-pair-a-label]", a.label);
+  set("[data-backend-pair-a-url]", a.url);
+  set("[data-backend-pair-b-label]", b.label);
+  set("[data-backend-pair-b-url]", b.url);
+  const status = document.querySelector("[data-backends-status]");
+  if (status) {
+    status.textContent =
+      backends.source === "file" ? "Saved on this Home" : "Env defaults";
+  }
+}
+
+async function saveBackendsFromPanel() {
+  const status = document.querySelector("[data-backends-status]");
+  const btn = document.querySelector("[data-backends-save]");
+  if (btn) {
+    btn.disabled = true;
+  }
+  if (status) {
+    status.textContent = "Saving…";
+  }
+  try {
+    const backends = await saveAgentBackends({
+      model: document.querySelector("[data-backend-model]")?.value || "",
+      pair_a_label: document.querySelector("[data-backend-pair-a-label]")?.value || "",
+      pair_a_url: document.querySelector("[data-backend-pair-a-url]")?.value || "",
+      pair_b_label: document.querySelector("[data-backend-pair-b-label]")?.value || "",
+      pair_b_url: document.querySelector("[data-backend-pair-b-url]")?.value || "",
+    });
+    fillBackendsPanel(backends);
+    if (status) {
+      status.textContent = "Saved · gateway validated";
+    }
+    host?.syncModelMenu?.();
+  } catch (error) {
+    if (status) {
+      status.textContent = String(error?.message || error);
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+    }
+  }
 }
 
 function renderPromptPanel() {
@@ -150,6 +221,12 @@ function renderPromptPanel() {
   if (tokens) {
     tokens.value = String(maxTokens);
   }
+  fillBackendsPanel(getAgentBackendsCache());
+  void fetchAgentBackends({ force: true }).then((backends) => {
+    if (configureSection === "prompt") {
+      fillBackendsPanel(backends);
+    }
+  });
 }
 
 function harnessPageEl() {

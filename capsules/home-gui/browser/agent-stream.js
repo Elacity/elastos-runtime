@@ -1,5 +1,5 @@
 /* Agent message stream + turn theatre.
-   Bound from agent-harness.js. Tip: home-20260804ap
+   Bound from agent-harness.js. Tip: home-20260804aq
    Live: gateway SSE (/api/apps/home/agent/chat/stream) with AbortController
    stop; mock remains the honest fallback when Live is down.
    UI ≠ authority (Principle 16) — chat carries no tool or grant power.
@@ -10,22 +10,22 @@ import {
   getMockTurn,
   noteMockTurnTokens,
   splitThinkTaggedContent,
-} from "./mock-agent-provider.js?v=home-20260804ap";
+} from "./mock-agent-provider.js?v=home-20260804aq";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamLiveChatCompletion,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260804ap";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804ap";
+} from "./agent-live.js?v=home-20260804aq";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804aq";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804ap";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804ap";
+} from "./agent-grants.js?v=home-20260804aq";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804aq";
 
 /** @type {null | object} */
 let ctx = null;
@@ -46,10 +46,19 @@ export function clearStreamTimer() {
 }
 
 export function titleFromPrompt(prompt) {
-  const cleaned = prompt.replace(/\s+/g, " ").trim();
+  let cleaned = String(prompt || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[*_>#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!cleaned) {
     return "New chat";
   }
+  const sentence = cleaned.split(/(?<=[.!?])\s+/)[0] || cleaned;
+  cleaned = sentence.length > 8 && sentence.length <= 64 ? sentence : cleaned;
   return cleaned.length > 42 ? `${cleaned.slice(0, 41)}…` : cleaned;
 }
 

@@ -2,9 +2,9 @@
    no tool, grant, or capsule authority; grant cards remain fail-closed preview
    (Principle 16). Path: gateway /api/provider/ai/* and /api/provider/llama/*
    (home-gui-only allowlist, home launch token).
-   Tip: home-20260804ap */
+   Tip: home-20260804aq */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804ap";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804aq";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
@@ -337,6 +337,9 @@ export async function requestLiveChatCompletion(messages) {
 /** Sparks pair for dogfood streaming — server maps to allowlisted upstream. */
 let livePair = "a";
 let liveAbort = null;
+/** Cached GET /api/apps/home/agent/backends — UI literacy only. */
+let backendsCache = null;
+let backendsPromise = null;
 
 export function getLiveChatPair() {
   return livePair === "b" ? "b" : "a";
@@ -359,6 +362,76 @@ try {
   }
 } catch {
   /* ignore */
+}
+
+function backendsUrl() {
+  return new URL("/api/apps/home/agent/backends", window.location.href).href;
+}
+
+export function getAgentBackendsCache() {
+  return backendsCache;
+}
+
+export async function fetchAgentBackends({ force = false } = {}) {
+  if (!force && backendsCache) {
+    return backendsCache;
+  }
+  if (!force && backendsPromise) {
+    return backendsPromise;
+  }
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    return backendsCache;
+  }
+  backendsPromise = (async () => {
+    const response = await fetch(backendsUrl(), {
+      headers: {
+        accept: "application/json",
+        "x-elastos-home-token": token,
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`backends failed: ${response.status}`);
+    }
+    const data = await response.json();
+    backendsCache = data;
+    return data;
+  })()
+    .catch((error) => {
+      console.warn("home agent backends fetch failed", error);
+      return backendsCache;
+    })
+    .finally(() => {
+      backendsPromise = null;
+    });
+  return backendsPromise;
+}
+
+export async function saveAgentBackends(patch = {}) {
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    const error = new Error("missing home launch token in Home GUI shell");
+    error.code = "missing-home-launch-token";
+    throw error;
+  }
+  const response = await fetch(backendsUrl(), {
+    method: "PUT",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json",
+      "x-elastos-home-token": token,
+    },
+    body: JSON.stringify(patch),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.message || `backends save failed: ${response.status}`);
+    error.code = data?.code || "backends_save_failed";
+    error.status = response.status;
+    throw error;
+  }
+  backendsCache = data?.backends || data;
+  return backendsCache;
 }
 
 export function abortLiveChatStream() {

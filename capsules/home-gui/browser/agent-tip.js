@@ -38,13 +38,16 @@
  * [ ] Archive soft-hide; Export/Import JSON; search titles+bodies
  * [ ] Live errors honest (not silent mock without label)
  *
- * Wave 2 prompt/params (§AP):
+ * Wave 2 prompt/params (§AQ):
  * [ ] Settings → Prompt edits system prompt; Reset restores default
  * [ ] Temperature + max tokens pass through Live stream body
  * [ ] Prefs persist across reload via session.agent
+ * [ ] Settings → backends PUT validates OpenAI-compat URLs (no SSRF)
+ * [ ] Model menu pair rows come from GET /agent/backends
+ * [ ] Auto-title strips markdown / takes first sentence
  *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804ap";
+export const TIP = "home-20260804aq";

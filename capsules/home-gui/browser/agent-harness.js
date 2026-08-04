@@ -10,7 +10,7 @@ import {
   agentShelfFaceActive,
   snapAgentShelfFace,
   snapAppsShelfFace,
-} from "./agent-shelf.js?v=home-20260804ap";
+} from "./agent-shelf.js?v=home-20260804aq";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -20,8 +20,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260804ap";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804ap";
+} from "./shell-stages.js?v=home-20260804aq";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804aq";
 import {
   resetMockCapabilities,
   getSelectedModel,
@@ -38,18 +38,18 @@ import {
   maybeUpdatePlanFromPrompt,
   requestModelGet,
   removeProject,
-} from "./mock-agent-provider.js?v=home-20260804ap";
+} from "./mock-agent-provider.js?v=home-20260804aq";
 import {
   bindAgentWorkspaceSnapshot,
-} from "./shell-windows.js?v=home-20260804ap";
-import { TIP } from "./agent-tip.js?v=home-20260804ap";
-import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804ap";
+} from "./shell-windows.js?v=home-20260804aq";
+import { TIP } from "./agent-tip.js?v=home-20260804aq";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804aq";
 import {
   bindAgentWorkspaceStore,
   getAgentWorkspaceSnapshot,
   applyAgentWorkspaceSnapshot,
   persistAgentWorkspaceSoon,
-} from "./agent-workspace.js?v=home-20260804ap";
+} from "./agent-workspace.js?v=home-20260804aq";
 import {
   bindAgentConfigure,
   harnessPageOpen,
@@ -62,7 +62,7 @@ import {
   setWorkbenchTab,
   syncWorkbenchPanels,
   syncWorkbenchOpenUi,
-} from "./agent-configure.js?v=home-20260804ap";
+} from "./agent-configure.js?v=home-20260804aq";
 import {
   bindAgentGrants,
   syncTruthStrip,
@@ -72,7 +72,7 @@ import {
   sessionAlreadyHasGrant,
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804ap";
+} from "./agent-grants.js?v=home-20260804aq";
 import {
   bindAgentStream,
   clearStreamTimer,
@@ -101,13 +101,15 @@ import {
   updateJumpToLatestVisibility,
   ensureJumpToLatest,
   setStreamStatus,
-} from "./agent-stream.js?v=home-20260804ap";
+} from "./agent-stream.js?v=home-20260804aq";
 import {
   getLiveInferenceState,
   probeLiveInference,
   getLiveChatPair,
   setLiveChatPair,
-} from "./agent-live.js?v=home-20260804ap";
+  fetchAgentBackends,
+  getAgentBackendsCache,
+} from "./agent-live.js?v=home-20260804aq";
 import {
   bindAgentSessions,
   relativeTime,
@@ -135,7 +137,7 @@ import {
   closeSessionActions,
   openSessionActions,
   runSessionAction,
-} from "./agent-sessions.js?v=home-20260804ap";
+} from "./agent-sessions.js?v=home-20260804aq";
 export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
 let workbenchTab = "outputs";
@@ -346,6 +348,13 @@ bindAgentConfigure(
     isNarrowHarness,
     closeHarnessDrawer,
     persistAgentWorkspaceSoon,
+    syncModelMenu: () => {
+      try {
+        renderModelMenu();
+      } catch {
+        /* optional during early boot */
+      }
+    },
   },
 );
 
@@ -928,10 +937,18 @@ function buildInstalledModelRows(host, emptyText) {
     }
     if (liveInference.endpointState === "openai-compat") {
       const activePair = getLiveChatPair();
-      for (const pair of [
-        { id: "a", title: "Sparks pair A", desc: "192.168.1.147 · primary Flash" },
-        { id: "b", title: "Sparks pair B", desc: "192.168.1.145 · failover Flash" },
-      ]) {
+      const backends = getAgentBackendsCache();
+      const pairs = Array.isArray(backends?.pairs) && backends.pairs.length
+        ? backends.pairs.map((p) => ({
+            id: p.id === "b" ? "b" : "a",
+            title: p.label || (p.id === "b" ? "Sparks pair B" : "Sparks pair A"),
+            desc: String(p.url || "").replace(/^https?:\/\//, ""),
+          }))
+        : [
+            { id: "a", title: "Sparks pair A", desc: "primary · gateway allowlist" },
+            { id: "b", title: "Sparks pair B", desc: "failover · gateway allowlist" },
+          ];
+      for (const pair of pairs) {
         const row = document.createElement("button");
         row.type = "button";
         row.className = "agent-model-option";
@@ -951,6 +968,11 @@ function buildInstalledModelRows(host, emptyText) {
         row.querySelector(".agent-model-option-desc").textContent = pair.desc;
         host.append(row);
       }
+      void fetchAgentBackends().then((next) => {
+        if (next && next !== backends) {
+          renderModelMenu();
+        }
+      });
     }
   }
   for (const model of listInstalledModels()) {

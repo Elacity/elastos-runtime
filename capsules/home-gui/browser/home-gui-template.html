@@ -852,8 +852,37 @@
                   />
                 </label>
               </div>
+              <div class="agent-backends-panel" data-backends-panel>
+                <p class="agent-prompt-label">Live backends (gateway allowlist)</p>
+                <label class="agent-prompt-param">
+                  <span>Model id</span>
+                  <input type="text" data-backend-model maxlength="128" spellcheck="false" />
+                </label>
+                <label class="agent-prompt-param">
+                  <span>Pair A label</span>
+                  <input type="text" data-backend-pair-a-label maxlength="64" />
+                </label>
+                <label class="agent-prompt-param">
+                  <span>Pair A OpenAI-compat URL</span>
+                  <input type="url" data-backend-pair-a-url maxlength="512" spellcheck="false" />
+                </label>
+                <label class="agent-prompt-param">
+                  <span>Pair B label</span>
+                  <input type="text" data-backend-pair-b-label maxlength="64" />
+                </label>
+                <label class="agent-prompt-param">
+                  <span>Pair B OpenAI-compat URL</span>
+                  <input type="url" data-backend-pair-b-url maxlength="512" spellcheck="false" />
+                </label>
+                <div class="agent-prompt-actions">
+                  <button type="button" class="agent-prompt-reset" data-backends-save>
+                    Save backends
+                  </button>
+                  <span class="agent-prompt-count" data-backends-status>Gateway-mediated</span>
+                </div>
+              </div>
               <p class="agent-harness-page-foot">
-                Host-persisted prefs · gateway clamps values · UI ≠ authority
+                Host-persisted prefs · gateway re-validates URLs · UI ≠ authority
               </p>
             </div>
           </div>

@@ -1730,6 +1730,19 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   }
 }
 
+.agent-backends-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+  padding-top: 14px;
+  border-top: 1px solid color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.agent-backends-panel .agent-prompt-param input {
+  font-size: 12px;
+}
+
 .agent-model-tier-blurb {
   margin: 14px 0 6px;
   color: color-mix(in srgb, var(--text) 48%, transparent);

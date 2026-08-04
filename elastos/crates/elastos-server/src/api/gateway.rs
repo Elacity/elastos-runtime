@@ -864,6 +864,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(home_agent_chat_stream),
         )
         .route(
+            "/api/apps/home/agent/backends",
+            get(home_agent_backends_get).put(home_agent_backends_put),
+        )
+        .route(
             "/api/apps/home/state",
             get(home_browser_state_get).post(home_browser_state_update),
         )
