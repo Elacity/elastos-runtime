@@ -63,8 +63,12 @@
  * [ ] Open Inbox / Deny cancel; Approve once → Desktop list on card
  * [ ] wallet.sign remains preview mock
  *
+ * Wave 5.02 ADE panels (§AU):
+ * [ ] Diff/Browser/Term stay disabled without ADE grant
+ * [ ] Copy says needs ADE — no Open Terminal / Pyodide identity
+ *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804at";
+export const TIP = "home-20260804au";

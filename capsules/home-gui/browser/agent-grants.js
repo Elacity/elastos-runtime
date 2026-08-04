@@ -1,5 +1,5 @@
 /* Agent grant cards + truth strip.
-   Bound from agent-harness.js. Tip: home-20260804at
+   Bound from agent-harness.js. Tip: home-20260804au
    UI ≠ authority (Principle 16): Allow once does not mint Capsule power.
    library.read → real Inbox capability (Wave 5.01); wallet.sign stays preview mock. */
 
@@ -10,13 +10,13 @@ import {
   applyCapabilityState,
   wantsLibraryTool,
   wantsWalletTool,
-} from "./mock-agent-provider.js?v=home-20260804at";
+} from "./mock-agent-provider.js?v=home-20260804au";
 import {
   requestAgentLibraryRead,
   fetchAgentLibraryReadStatus,
   cancelAgentLibraryRead,
-} from "./agent-live.js?v=home-20260804at";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804at";
+} from "./agent-live.js?v=home-20260804au";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804au";
 
 /** @type {null | Record<string, Function>} */
 let store = null;

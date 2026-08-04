@@ -1,25 +1,25 @@
 /* Agent session nav, search, CRUD, project create.
-   Bound from agent-harness.js. Tip: home-20260804at
+   Bound from agent-harness.js. Tip: home-20260804au
    Host session.agent persist only — UI ≠ authority (Principle 16).
    Wave 1: archive soft-hide, JSON import/export, body search (already). */
 
 import {
   listProjects,
   createProject,
-} from "./mock-agent-provider.js?v=home-20260804at";
-import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260804at";
-import { closeHarnessPage } from "./agent-configure.js?v=home-20260804at";
+} from "./mock-agent-provider.js?v=home-20260804au";
+import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260804au";
+import { closeHarnessPage } from "./agent-configure.js?v=home-20260804au";
 import {
   renderActiveSession,
   renderFollowUpQueue,
   stopMockStream,
   setTitle,
   titleFromPrompt,
-} from "./agent-stream.js?v=home-20260804at";
+} from "./agent-stream.js?v=home-20260804au";
 import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
-} from "./agent-shelf.js?v=home-20260804at";
+} from "./agent-shelf.js?v=home-20260804au";
 
 /** @type {null | object} */
 let ctx = null;
