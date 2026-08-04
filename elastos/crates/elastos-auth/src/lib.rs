@@ -781,6 +781,7 @@ pub fn verify_siwe_challenge(
     if challenge.expires_at <= now {
         return Err("auth challenge expired".to_string());
     }
+    validate_siwe_origin_binding(&challenge.domain, &challenge.uri)?;
     let parsed = parse_siwe_message(message)?;
     if parsed.domain != challenge.domain {
         return Err("SIWE domain does not match challenge".to_string());
@@ -896,10 +897,13 @@ pub fn parse_siwe_message(message: &str) -> Result<SiweMessage, String> {
         }
     }
 
+    let uri = uri.ok_or_else(|| "SIWE URI is required".to_string())?;
+    validate_siwe_origin_binding(&domain, &uri)?;
+
     Ok(SiweMessage {
         domain,
         address: normalize_evm_address(&address),
-        uri: uri.ok_or_else(|| "SIWE URI is required".to_string())?,
+        uri,
         version: version.ok_or_else(|| "SIWE version is required".to_string())?,
         chain_id: chain_id.ok_or_else(|| "SIWE chain ID is required".to_string())?,
         nonce: nonce.ok_or_else(|| "SIWE nonce is required".to_string())?,
@@ -907,6 +911,126 @@ pub fn parse_siwe_message(message: &str) -> Result<SiweMessage, String> {
         expires_at,
         resources,
     })
+}
+
+pub fn validate_siwe_origin_binding(origin: &str, uri: &str) -> Result<(), String> {
+    validate_explicit_siwe_origin(origin)?;
+    let uri_origin = raw_web_origin(uri, "SIWE URI")?;
+    if uri_origin != origin {
+        return Err("SIWE URI origin does not match SIWE domain".to_string());
+    }
+    Ok(())
+}
+
+fn validate_explicit_siwe_origin(origin: &str) -> Result<(), String> {
+    let raw_origin = raw_web_origin(origin, "SIWE domain")?;
+    if raw_origin != origin {
+        return Err("SIWE domain must contain only the explicit origin".to_string());
+    }
+    Ok(())
+}
+
+fn raw_web_origin<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
+    if value.is_empty()
+        || value.len() > 512
+        || !value.is_ascii()
+        || value
+            .chars()
+            .any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace())
+    {
+        return Err(format!("{field} is invalid"));
+    }
+    let (scheme, remainder) = value
+        .split_once("://")
+        .ok_or_else(|| format!("{field} must include an explicit scheme"))?;
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("{field} must use http or https"));
+    }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    validate_web_authority(authority, field)?;
+    let suffix = &remainder[authority_end..];
+    if suffix.contains('\\') || !valid_percent_encoding(suffix) {
+        return Err(format!("{field} is not a valid absolute URL"));
+    }
+    Ok(&value[..scheme.len() + 3 + authority.len()])
+}
+
+fn validate_web_authority(authority: &str, field: &str) -> Result<(), String> {
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return Err(format!("{field} has an invalid authority"));
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("{field} has an invalid authority"))?;
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("{field} has an invalid authority"))?;
+        if !suffix.is_empty() {
+            let port = suffix
+                .strip_prefix(':')
+                .ok_or_else(|| format!("{field} has an invalid authority"))?;
+            validate_web_port(port, field)?;
+        }
+        return Ok(());
+    }
+
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            if host.contains(':') {
+                return Err(format!("{field} has an invalid authority"));
+            }
+            (host, Some(port))
+        }
+        None => (authority, None),
+    };
+    if let Some(port) = port {
+        validate_web_port(port, field)?;
+    }
+    if host.is_empty()
+        || host.len() > 253
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(format!("{field} has an invalid authority"));
+    }
+    Ok(())
+}
+
+fn validate_web_port(port: &str, field: &str) -> Result<(), String> {
+    if port.is_empty()
+        || !port.bytes().all(|byte| byte.is_ascii_digit())
+        || port.parse::<u16>().is_err()
+    {
+        return Err(format!("{field} has an invalid authority"));
+    }
+    Ok(())
+}
+
+fn valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
 }
 
 pub fn recover_evm_address(
@@ -1041,7 +1165,7 @@ mod tests {
         let address = test_address(&signing_key);
         let challenge = AuthChallengeV1::new(AuthChallengeInput {
             challenge_id: "challenge-1".to_string(),
-            domain: "elastos.local".to_string(),
+            domain: "https://elastos.local".to_string(),
             uri: "https://elastos.local/apps/home/".to_string(),
             address,
             chain_id: 8453,
@@ -1081,7 +1205,7 @@ mod tests {
         let lower_address = address.to_ascii_lowercase();
         let challenge = AuthChallengeV1::new(AuthChallengeInput {
             challenge_id: "challenge-1".to_string(),
-            domain: "elastos.local".to_string(),
+            domain: "https://elastos.local".to_string(),
             uri: "https://elastos.local/apps/home/".to_string(),
             address: lower_address,
             chain_id: 8453,
@@ -1149,11 +1273,50 @@ mod tests {
     fn rejects_wrong_origin() {
         let (signing_key, challenge) = challenge();
         let mut message = challenge.siwe_message();
-        message = message.replace("elastos.local wants", "evil.example wants");
+        message = message.replace("https://elastos.local wants", "https://evil.example wants");
         let signature = sign_message(&signing_key, &message);
         let err = verify_siwe_challenge(&challenge, &message, &signature, 1_800_000_010)
             .expect_err("domain mismatch should fail");
         assert!(err.contains("domain"));
+    }
+
+    #[test]
+    fn accepts_scheme_explicit_localhost_http_origin() {
+        let (signing_key, mut challenge) = challenge();
+        challenge.domain = "http://localhost:61180".to_string();
+        challenge.uri = "http://localhost:61180/apps/home/".to_string();
+        let message = challenge.siwe_message();
+        assert!(message.starts_with(
+            "http://localhost:61180 wants you to sign in with your Ethereum account:"
+        ));
+        let signature = sign_message(&signing_key, &message);
+        verify_siwe_challenge(&challenge, &message, &signature, 1_800_000_010)
+            .expect("scheme-explicit localhost SIWE proof should verify");
+    }
+
+    #[test]
+    fn rejects_siwe_origin_component_substitutions_and_legacy_domain() {
+        let (signing_key, challenge) = challenge();
+        let expected = challenge.siwe_message();
+        for (from, to) in [
+            ("https://elastos.local wants", "http://elastos.local wants"),
+            ("https://elastos.local wants", "https://evil.example wants"),
+            (
+                "https://elastos.local wants",
+                "https://elastos.local:8443 wants",
+            ),
+            (
+                "URI: https://elastos.local/apps/home/",
+                "URI: https://elastos.local:8443/apps/home/",
+            ),
+            ("https://elastos.local wants", "elastos.local wants"),
+        ] {
+            let message = expected.replace(from, to);
+            assert_ne!(message, expected);
+            let signature = sign_message(&signing_key, &message);
+            verify_siwe_challenge(&challenge, &message, &signature, 1_800_000_010)
+                .expect_err("SIWE origin substitutions and legacy domains must fail closed");
+        }
     }
 
     #[test]

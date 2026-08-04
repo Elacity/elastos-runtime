@@ -4,13 +4,12 @@ pub(in crate::api::gateway) async fn system_wallet_approvals(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return system_error_response(err),
         };
-    Json(system_wallet_approvals_summary(&state, &context.principal_id, false).await)
-        .into_response()
+    Json(system_wallet_approvals_summary(&state, &authority, false).await).into_response()
 }
 
 pub(in crate::api::gateway) async fn system_wallet_approval_reject(
@@ -19,35 +18,44 @@ pub(in crate::api::gateway) async fn system_wallet_approval_reject(
     Path(request_id): Path<String>,
     Json(input): Json<WalletApprovalRejectRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return system_error_response(err),
         };
-    reject_wallet_approval_request(&state, &context, &request_id, input, SYSTEM_CAPSULE_ID).await
+    let context = authority.home_launch_context();
+    reject_wallet_approval_request(
+        &state,
+        &context,
+        &authority,
+        &request_id,
+        input,
+        SYSTEM_CAPSULE_ID,
+    )
+    .await
 }
 
 pub(in crate::api::gateway) async fn reject_wallet_approval_request(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
     input: WalletApprovalRejectRequest,
     capsule_id: &'static str,
 ) -> Response {
-    match crate::api::auth_gateway::wallet_provider_data(
+    match runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "reject_approval",
-            "principal_id": context.principal_id.clone(),
-            "request_id": request_id,
-            "reason": input.reason.unwrap_or_else(|| {
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RejectApproval {
+            request_id: request_id.to_string(),
+            reason: input.reason.unwrap_or_else(|| {
                 if capsule_id == SYSTEM_CAPSULE_ID {
                     "Rejected in System".to_string()
                 } else {
                     "Rejected in Wallet".to_string()
                 }
             }),
-        }),
+        },
     )
     .await
     {
@@ -64,8 +72,7 @@ pub(in crate::api::gateway) async fn reject_wallet_approval_request(
                     reason: "Wallet approval rejected through Runtime authority",
                 },
             );
-            Json(system_wallet_approvals_summary(state, &context.principal_id, false).await)
-                .into_response()
+            Json(system_wallet_approvals_summary(state, authority, false).await).into_response()
         }
         Err(err) => system_error_response(err),
     }
@@ -77,61 +84,84 @@ pub(in crate::api::gateway) async fn system_wallet_approval_approve(
     Path(request_id): Path<String>,
     Json(input): Json<WalletApprovalApproveRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
-            Ok(context) => context,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
+            Ok(launch) => launch,
             Err(err) => return system_error_response(err),
         };
-    approve_wallet_managed_request(&state, &context, &request_id, input, SYSTEM_CAPSULE_ID).await
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
+        Err(err) => return system_error_response(err),
+    };
+    let context = launch.context.clone();
+    approve_wallet_managed_request(
+        &state,
+        &launch,
+        &context,
+        &authority,
+        &request_id,
+        input,
+        SYSTEM_CAPSULE_ID,
+    )
+    .await
 }
 
 pub(in crate::api::gateway) async fn approve_wallet_managed_request(
     state: &GatewayState,
+    launch: &RequiredHomeLaunchToken,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
     input: WalletApprovalApproveRequest,
     capsule_id: &'static str,
 ) -> Response {
-    let Some(home_token) = input.home_token.as_deref() else {
+    let request = match pending_wallet_approval_request(state, authority, request_id).await {
+        Ok(request) => request,
+        Err(err) => return system_error_response(err),
+    };
+    if request.intent == "browser_account_access" && capsule_id != WALLET_CAPSULE_ID {
+        return system_error_response(anyhow::anyhow!(
+            "Review Browser account access in Wallet before allowing it"
+        ));
+    }
+    let Some(step_up_token) = input.step_up_token.as_deref() else {
         return system_error_response(anyhow::anyhow!(
             "fresh passkey verification is required to sign with a built-in wallet"
         ));
     };
-    if let Err(err) = consume_fresh_passkey_home_token(
-        &state.data_dir,
-        home_token,
-        context,
-        capsule_id,
-        180,
-        "wallet.approve",
-        &serde_json::json!({
-            "request_id": request_id,
-            "reason": input.reason,
-        }),
-    ) {
-        return system_error_response(err);
-    }
-    let reason = input.reason.unwrap_or_else(|| {
+    let reason = input.reason.clone().unwrap_or_else(|| {
         if capsule_id == SYSTEM_CAPSULE_ID {
             "Approved in System".to_string()
         } else {
             "Approved in Wallet".to_string()
         }
     });
-    match approve_managed_wallet_request(
+    if let Err(err) = consume_passkey_step_up_token(
+        &state.data_dir,
+        step_up_token,
+        launch,
+        180,
+        "wallet.approve",
+        &serde_json::json!({
+            "request_id": request_id,
+            "reason": reason,
+        }),
+    ) {
+        return system_error_response(err);
+    }
+    match approve_pending_managed_wallet_request(
         state,
         &state.data_dir,
-        &context.principal_id,
-        &context.session_id,
-        request_id,
+        context,
+        authority,
+        request,
         &reason,
         capsule_id,
     )
     .await
     {
         Ok(outcome) => {
-            let mut summary =
-                system_wallet_approvals_summary(state, &context.principal_id, false).await;
+            let mut summary = system_wallet_approvals_summary(state, authority, false).await;
             summary.note = Some(outcome.message);
             Json(summary).into_response()
         }
@@ -142,48 +172,48 @@ pub(in crate::api::gateway) async fn approve_wallet_managed_request(
 pub(in crate::api::gateway) struct WalletApprovalReviewOutcome {
     pub(in crate::api::gateway) message: String,
     pub(in crate::api::gateway) handoff: Option<serde_json::Value>,
-    pub(in crate::api::gateway) signed_result: Option<serde_json::Value>,
-    pub(in crate::api::gateway) signed_transaction: Option<String>,
+    pub(in crate::api::gateway) approval_request: Option<serde_json::Value>,
 }
 
 pub(in crate::api::gateway) async fn approve_managed_wallet_request(
     state: &GatewayState,
     data_dir: &FsPath,
-    principal_id: &str,
-    session_id: &str,
+    context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
     reason: &str,
     capsule_id: &'static str,
 ) -> anyhow::Result<WalletApprovalReviewOutcome> {
-    let request = pending_wallet_approval_request(state, principal_id, request_id).await?;
+    let request = pending_wallet_approval_request(state, authority, request_id).await?;
+    approve_pending_managed_wallet_request(
+        state, data_dir, context, authority, request, reason, capsule_id,
+    )
+    .await
+}
+
+pub(in crate::api::gateway) async fn approve_pending_managed_wallet_request(
+    state: &GatewayState,
+    data_dir: &FsPath,
+    context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
+    request: SystemWalletApprovalSummary,
+    reason: &str,
+    capsule_id: &'static str,
+) -> anyhow::Result<WalletApprovalReviewOutcome> {
+    if request.intent == "browser_account_access" && capsule_id != WALLET_CAPSULE_ID {
+        anyhow::bail!("Review Browser account access in Wallet before allowing it");
+    }
     if !is_managed_wallet_proof_type(&request.proof_type) {
         anyhow::bail!("Open the approval method to approve external wallet requests");
     }
-    let data = crate::api::auth_gateway::wallet_provider_data(
+    let request_id = request.request_id.as_str();
+    let signed = runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "approve_approval",
-            "principal_id": principal_id,
-            "request_id": request_id,
-            "reason": reason,
-        }),
-    )
-    .await?;
-    let proof_type = data
-        .get("approval_request")
-        .and_then(|value| value.get("proof_type"))
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    if !is_managed_wallet_proof_type(proof_type) {
-        anyhow::bail!("wallet approval is not a built-in wallet request");
-    }
-    let signed = crate::api::auth_gateway::wallet_provider_data(
-        state,
-        serde_json::json!({
-            "op": "sign_approved",
-            "principal_id": principal_id,
-            "request_id": request_id,
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ApproveAndSignManaged {
+            request_id: request_id.to_string(),
+            reason: reason.to_string(),
+        },
     )
     .await?;
     append_wallet_approval_audit(
@@ -191,8 +221,8 @@ pub(in crate::api::gateway) async fn approve_managed_wallet_request(
         WalletApprovalAuditInput {
             capsule_id,
             event_type: "wallet.approval.completed",
-            principal_id,
-            session_id,
+            principal_id: &context.principal_id,
+            session_id: &context.session_id,
             request_id,
             result: "completed",
             reason: "Built-in managed wallet signed after Runtime approval",
@@ -201,43 +231,36 @@ pub(in crate::api::gateway) async fn approve_managed_wallet_request(
     Ok(WalletApprovalReviewOutcome {
         message: "Approved and signed by built-in wallet.".to_string(),
         handoff: None,
-        signed_result: signed.get("approval_request").and_then(|request| {
-            request
-                .get("signed_result")
-                .filter(|value| value.is_object())
-                .cloned()
-        }),
-        signed_transaction: signed
-            .get("signed_transaction")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string),
+        approval_request: signed
+            .get("approval_request")
+            .filter(|value| value.is_object())
+            .cloned(),
     })
 }
 
 pub(in crate::api::gateway) async fn approve_external_wallet_request(
     state: &GatewayState,
     data_dir: &FsPath,
-    principal_id: &str,
-    session_id: &str,
+    context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
     reason: &str,
     capsule_id: &str,
 ) -> anyhow::Result<WalletApprovalReviewOutcome> {
-    let request = pending_wallet_approval_request(state, principal_id, request_id).await?;
+    let request = pending_wallet_approval_request(state, authority, request_id).await?;
     if is_managed_wallet_proof_type(&request.proof_type) {
         anyhow::bail!("Use System to approve built-in wallet requests");
     }
     if request.connector_id.as_deref() != Some(capsule_id) {
         anyhow::bail!("wallet approval belongs to a different connector");
     }
-    let data = crate::api::auth_gateway::wallet_provider_data(
+    let data = runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "approve_approval",
-            "principal_id": principal_id,
-            "request_id": request_id,
-            "reason": reason,
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ApproveConnectorHandoff {
+            request_id: request_id.to_string(),
+            reason: reason.to_string(),
+        },
     )
     .await?;
     let handoff = data.get("handoff").cloned();
@@ -246,8 +269,8 @@ pub(in crate::api::gateway) async fn approve_external_wallet_request(
         WalletApprovalAuditInput {
             capsule_id,
             event_type: "wallet.approval.approved",
-            principal_id,
-            session_id,
+            principal_id: &context.principal_id,
+            session_id: &context.session_id,
             request_id,
             result: "approved",
             reason: "External wallet approval reviewed through approval method",
@@ -259,40 +282,33 @@ pub(in crate::api::gateway) async fn approve_external_wallet_request(
             wallet_connector_label(capsule_id)
         ),
         handoff,
-        signed_result: None,
-        signed_transaction: None,
+        approval_request: None,
     })
 }
 
 pub(in crate::api::gateway) async fn complete_external_wallet_approval(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
     input: WalletApprovalCompleteRequest,
     capsule_id: &str,
     audit_reason: &str,
 ) -> anyhow::Result<SystemWalletApprovalsSummary> {
-    let mut completion = serde_json::json!({
-        "op": "complete_approval",
-        "principal_id": context.principal_id.clone(),
-        "request_id": request_id,
-        "connector_id": capsule_id,
-        "payload_hash": input.payload_hash,
-        "signer": input.signer,
-    });
-    if let Some(signature) = input.signature {
-        completion["signature"] = serde_json::json!(signature);
-    }
-    if let Some(signature_type) = input.signature_type {
-        completion["signature_type"] = serde_json::json!(signature_type);
-    }
-    if let Some(public_key) = input.public_key {
-        completion["public_key"] = serde_json::json!(public_key);
-    }
-    if let Some(transaction_hash) = input.transaction_hash {
-        completion["transaction_hash"] = serde_json::json!(transaction_hash);
-    }
-    crate::api::auth_gateway::wallet_provider_data(state, completion).await?;
+    runtime_wallet_data(
+        state,
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::CompleteConnectorHandoff {
+            request_id: request_id.to_string(),
+            payload_hash: input.payload_hash,
+            signature: input.signature,
+            signature_type: input.signature_type,
+            public_key: input.public_key,
+            signer: input.signer,
+            transaction_hash: input.transaction_hash,
+        },
+    )
+    .await?;
     append_wallet_approval_audit(
         &state.data_dir,
         WalletApprovalAuditInput {
@@ -305,15 +321,15 @@ pub(in crate::api::gateway) async fn complete_external_wallet_approval(
             reason: audit_reason,
         },
     )?;
-    Ok(system_wallet_approvals_summary(state, &context.principal_id, false).await)
+    Ok(system_wallet_approvals_summary(state, authority, false).await)
 }
 
 pub(in crate::api::gateway) async fn pending_wallet_approval_request(
     state: &GatewayState,
-    principal_id: &str,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
 ) -> anyhow::Result<SystemWalletApprovalSummary> {
-    let summary = system_wallet_approvals_summary(state, principal_id, false).await;
+    let summary = system_wallet_approvals_summary(state, authority, false).await;
     if !summary.available {
         anyhow::bail!(
             "{}",
@@ -331,16 +347,13 @@ pub(in crate::api::gateway) async fn pending_wallet_approval_request(
 
 pub(in crate::api::gateway) async fn system_wallet_approvals_summary(
     state: &GatewayState,
-    principal_id: &str,
+    authority: &RuntimeWalletAuthority,
     include_resolved: bool,
 ) -> SystemWalletApprovalsSummary {
-    let response = crate::api::auth_gateway::wallet_provider_data(
+    let response = runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "approval_requests",
-            "principal_id": principal_id,
-            "include_resolved": include_resolved,
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ListApprovals { include_resolved },
     )
     .await;
     match response {
@@ -486,7 +499,11 @@ pub(in crate::api::gateway) fn system_wallet_approval_summary(
         request_id: value.get("request_id")?.as_str()?.to_string(),
         status: value.get("status")?.as_str()?.to_string(),
         intent: value.get("intent")?.as_str()?.to_string(),
-        capsule_id: value.get("capsule_id")?.as_str()?.to_string(),
+        capsule_id: value
+            .get("requested_by_actor")
+            .or_else(|| value.get("capsule_id"))?
+            .as_str()?
+            .to_string(),
         resource: value.get("resource")?.as_str()?.to_string(),
         reason: value.get("reason")?.as_str()?.to_string(),
         account_id: value.get("account_id")?.as_str()?.to_string(),
@@ -500,6 +517,7 @@ pub(in crate::api::gateway) fn system_wallet_approval_summary(
             .get("connector_id")
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
+        review: wallet_account_access_review(value),
         created_at: value.get("created_at")?.as_u64()?,
         expires_at: value.get("expires_at")?.as_u64()?,
         completed_at: value
@@ -515,4 +533,75 @@ pub(in crate::api::gateway) fn system_wallet_approval_summary(
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
     })
+}
+
+fn wallet_account_access_review(value: &serde_json::Value) -> Option<serde_json::Value> {
+    if value.get("intent")?.as_str()? != "browser_account_access" {
+        return None;
+    }
+    if value
+        .get("requested_by_actor")
+        .or_else(|| value.get("capsule_id"))?
+        .as_str()?
+        != BROWSER_CAPSULE_ID
+    {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    let text = |field: &str| payload.get(field).and_then(|value| value.as_str());
+    if text("schema")? != "elastos.browser.account-access-request/v1"
+        || text("permission")? != "eth_accounts"
+        || text("principal_id")? != value.get("principal_id")?.as_str()?
+        || text("session_id")? != value.get("session_id")?.as_str()?
+        || text("launch_id")? != value.get("launch_id")?.as_str()?
+        || text("account_id")? != value.get("account_id")?.as_str()?
+        || text("requested_chain_namespace")? != value.get("chain_namespace")?.as_str()?
+        || !text("address")?.eq_ignore_ascii_case(value.get("address")?.as_str()?)
+        || text("proof_binding_id")?.trim().is_empty()
+        || payload
+            .get("requires_wallet_approval")
+            .and_then(|value| value.as_bool())
+            != Some(true)
+    {
+        return None;
+    }
+    let chain_namespaces = payload.get("chain_namespaces")?.as_array()?;
+    if chain_namespaces.len() != 2
+        || chain_namespaces[0].as_str() != Some("eip155:20")
+        || chain_namespaces[1].as_str() != Some("eip155:8453")
+        || !matches!(
+            text("requested_chain_namespace")?,
+            "eip155:20" | "eip155:8453"
+        )
+    {
+        return None;
+    }
+    let origin = text("origin")?;
+    let page_url = text("page_url")?;
+    let page = url::Url::parse(page_url).ok()?;
+    let parsed_origin = url::Url::parse(origin).ok()?;
+    if !matches!(page.scheme(), "http" | "https")
+        || page.host_str().is_none()
+        || !matches!(parsed_origin.scheme(), "http" | "https")
+        || parsed_origin.host_str().is_none()
+        || parsed_origin.origin().ascii_serialization() != origin
+        || page.origin() != parsed_origin.origin()
+    {
+        return None;
+    }
+    let grant_expires_at = payload.get("grant_expires_at")?.as_u64()?;
+    if grant_expires_at <= now_ts() || grant_expires_at > now_ts().saturating_add(12 * 60 * 60) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "kind": "account_access",
+        "permission": "eth_accounts",
+        "origin": origin,
+        "page_url": page_url,
+        "account_id": text("account_id")?,
+        "requested_chain_namespace": text("requested_chain_namespace")?,
+        "chain_namespaces": chain_namespaces,
+        "address": text("address")?,
+        "grant_expires_at": grant_expires_at,
+    }))
 }

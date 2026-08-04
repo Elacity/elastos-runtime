@@ -314,18 +314,12 @@ async function main() {
     outDir,
     "--adapter-id",
     request.adapter,
-    "--selkies-width",
-    process.env.ELASTOS_BROWSER_SELKIES_WIDTH || "1920",
-    "--selkies-height",
-    process.env.ELASTOS_BROWSER_SELKIES_HEIGHT || "1080",
     "--selkies-framerate",
     process.env.ELASTOS_BROWSER_SELKIES_FRAMERATE || "30",
     "--selkies-video-bitrate",
     process.env.ELASTOS_BROWSER_SELKIES_VIDEO_BITRATE || "16",
     "--selkies-h264-crf",
     process.env.ELASTOS_BROWSER_SELKIES_H264_CRF || "23",
-    "--selkies-resolution-mode",
-    process.env.ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE || "dynamic",
     "--timeout-seconds",
     process.env.ELASTOS_BROWSER_SELKIES_TIMEOUT_SECONDS || "300",
     "--profile-dir",
@@ -369,6 +363,10 @@ async function main() {
       schema: "elastos.browser.engine.isolation/v1",
       kind: "per_launch_selkies_target",
       session_dir: outDir,
+    };
+    result.process = {
+      pid: target.pid,
+      stream_bridge_pid: null,
     };
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) {

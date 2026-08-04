@@ -160,7 +160,7 @@ fn principal_from_launch_request(
                 )
             })?;
             headers.insert("x-elastos-home-token", header_value);
-            let (_, context) = super::gateway::require_home_launch_token_for_any_app_context(
+            let context = super::gateway::require_internal_shell_launch_grant_for_any_context(
                 data_dir,
                 &headers,
                 &[capsule_name.as_str()],
@@ -271,12 +271,7 @@ mod tests {
     fn principal_launch_rejects_raw_principal_id_even_with_grant() {
         let dir = tempfile::tempdir().unwrap();
         let capsule_dir = write_test_capsule(dir.path(), "chat-wasm");
-        let context = gateway::HomeLaunchTokenContext {
-            principal_id: "person:local:alice".to_string(),
-            session_id: "session:alice".to_string(),
-            proof_binding_id: None,
-            grant_id: "grant:alice".to_string(),
-        };
+        let context = gateway::local_home_launch_token_context(dir.path()).unwrap();
         let grant =
             gateway::issue_home_launch_token_with_context(dir.path(), "chat-wasm", &context)
                 .unwrap();
@@ -297,12 +292,7 @@ mod tests {
     fn principal_launch_accepts_home_launch_grant() {
         let dir = tempfile::tempdir().unwrap();
         let capsule_dir = write_test_capsule(dir.path(), "chat-wasm");
-        let context = gateway::HomeLaunchTokenContext {
-            principal_id: "person:local:alice".to_string(),
-            session_id: "session:alice".to_string(),
-            proof_binding_id: None,
-            grant_id: "grant:alice".to_string(),
-        };
+        let context = gateway::local_home_launch_token_context(dir.path()).unwrap();
         let grant =
             gateway::issue_home_launch_token_with_context(dir.path(), "chat-wasm", &context)
                 .unwrap();
@@ -311,19 +301,14 @@ mod tests {
             principal_from_launch_request(Some(dir.path()), &capsule_dir, None, Some(grant))
                 .unwrap();
 
-        assert_eq!(principal.as_deref(), Some("person:local:alice"));
+        assert_eq!(principal.as_deref(), Some(context.principal_id.as_str()));
     }
 
     #[test]
     fn principal_launch_rejects_grant_without_runtime_data_dir() {
         let dir = tempfile::tempdir().unwrap();
         let capsule_dir = write_test_capsule(dir.path(), "chat-wasm");
-        let context = gateway::HomeLaunchTokenContext {
-            principal_id: "person:local:alice".to_string(),
-            session_id: "session:alice".to_string(),
-            proof_binding_id: None,
-            grant_id: "grant:alice".to_string(),
-        };
+        let context = gateway::local_home_launch_token_context(dir.path()).unwrap();
         let grant =
             gateway::issue_home_launch_token_with_context(dir.path(), "chat-wasm", &context)
                 .unwrap();
@@ -338,12 +323,7 @@ mod tests {
     fn principal_launch_rejects_wrong_app_grant() {
         let dir = tempfile::tempdir().unwrap();
         let capsule_dir = write_test_capsule(dir.path(), "chat-wasm");
-        let context = gateway::HomeLaunchTokenContext {
-            principal_id: "person:local:alice".to_string(),
-            session_id: "session:alice".to_string(),
-            proof_binding_id: None,
-            grant_id: "grant:alice".to_string(),
-        };
+        let context = gateway::local_home_launch_token_context(dir.path()).unwrap();
         let grant =
             gateway::issue_home_launch_token_with_context(dir.path(), "system", &context).unwrap();
 

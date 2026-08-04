@@ -18,6 +18,8 @@ use elastos_runtime::capability::{
 };
 use elastos_runtime::session::Session;
 
+use crate::provider_resource::ensure_generic_wallet_capability;
+
 /// Shared state for capability handlers
 #[derive(Clone)]
 pub struct CapabilityState {
@@ -100,6 +102,15 @@ pub async fn request_capability(
             reason: Some(
                 "system backends are not app capabilities; use elastos://content".to_string(),
             ),
+        }));
+    }
+
+    if let Err(reason) = ensure_generic_wallet_capability(&input.resource, action) {
+        return Ok(Json(RequestCapabilityOutput {
+            status: "denied".to_string(),
+            request_id: None,
+            token: None,
+            reason: Some(reason),
         }));
     }
 
@@ -804,5 +815,72 @@ mod tests {
         assert_eq!(output.status, "pending");
         assert!(output.request_id.is_some());
         assert!(output.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn generic_wallet_capability_requests_fail_before_pending() {
+        let state = test_state();
+        for (resource, action) in [
+            ("elastos://wallet/*", "read"),
+            ("elastos://wallet/account/list", "read"),
+            ("elastos://wallet/proof/challenge", "read"),
+            ("elastos://wallet/approval", "write"),
+            ("elastos://wallet/meta/status", "write"),
+        ] {
+            let output = request_capability(
+                State(state.clone()),
+                Extension(Session::new_capsule("capsule-1".to_string())),
+                Json(RequestCapabilityInput {
+                    resource: resource.to_string(),
+                    action: action.to_string(),
+                    reason: "request generic Wallet authority".to_string(),
+                }),
+            )
+            .await
+            .expect("generic Wallet capability request should return a structured denial")
+            .0;
+
+            assert_eq!(output.status, "denied", "{resource} {action}");
+            assert_eq!(output.request_id, None, "{resource} {action}");
+            assert!(
+                output
+                    .reason
+                    .unwrap()
+                    .contains("private Runtime Wallet Bus"),
+                "{resource} {action}"
+            );
+        }
+
+        assert!(
+            state.pending_store.list_pending().await.is_empty(),
+            "rejected Wallet capability requests must not create pending approvals"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_wallet_status_capability_remains_requestable() {
+        let state = test_state();
+        let output = request_capability(
+            State(state.clone()),
+            Extension(Session::new_capsule("capsule-1".to_string())),
+            Json(RequestCapabilityInput {
+                resource: crate::provider_resource::WALLET_STATUS_RESOURCE.to_string(),
+                action: "read".to_string(),
+                reason: "read Wallet provider status".to_string(),
+            }),
+        )
+        .await
+        .expect("read-only Wallet status capability should remain requestable")
+        .0;
+
+        assert_eq!(output.status, "pending");
+        assert!(output.request_id.is_some());
+        let pending = state.pending_store.list_pending().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].resource.to_string(),
+            crate::provider_resource::WALLET_STATUS_RESOURCE
+        );
+        assert_eq!(pending[0].action, Action::Read);
     }
 }

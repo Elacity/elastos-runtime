@@ -1,71 +1,50 @@
-# ElastOS Workspace
+# ElastOS Rust workspace
 
-This workspace contains the runtime crates and core capsules that back the current public ElastOS flow.
-For install and product use, start with the repository root [README.md](../README.md).
+This directory contains the Cargo workspace for the Runtime libraries, the
+`elastos` host binary, and the Rust capsules maintained with them. For
+installation and product use, start with the repository
+[README](../README.md).
 
-## Overview
+Run Cargo workspace commands from this directory. From the repository root:
 
-- one host binary: `elastos`
-- signed install, setup, and update flow
-- capsule-native runtime with explicit capabilities
-- shared protocol crates under `crates/` and core capsules under `capsules/`
+```bash
+cd elastos
+```
 
-## Prerequisites
+When running Cargo from the repository root, pass
+`--manifest-path elastos/Cargo.toml`.
 
-### Required
-- Rust 1.89+ (2021 edition)
-- Linux
+## Requirements
+
+- Rust 1.89.0, pinned by the repository's
+  [`rust-toolchain.toml`](../rust-toolchain.toml)
 - Git
 
-### Optional
-- KVM (`/dev/kvm`) for microVM capsules
-- crosvm + `vmlinux` for supervisor-managed microVM launches
-- Node.js 18+ for JavaScript SDK work
+Platform requirements depend on the code path. Linux/crosvm microVM work
+requires Linux and KVM. macOS source staging uses VZ; see the
+[Mac runbook](../docs/MAC.md).
 
 ## Build
 
 ```bash
-git clone https://github.com/Elacity/elastos-runtime.git
-cd elastos-runtime/elastos
 cargo build --workspace --release
 ./target/release/elastos --help
 ```
 
-If you use `rustup`, the repository root includes a `rust-toolchain.toml` pin for the expected toolchain.
+The `elastos-server` package produces the `elastos` binary.
 
-## Developer Flow
+## Navigate the code
 
-```bash
-# From the workspace root
-cargo test --workspace
-
-# Explicit runtime for power-user commands
-./target/release/elastos serve
-```
-
-`elastos run` is the explicit path/CID launch surface. It is not part of the normal install -> setup -> Home user path, and it expects a built capsule directory or CID plus an already-running operator runtime.
-
-## Project Structure
-
-```text
-elastos/
-├── crates/
-│   ├── elastos-common/
-│   ├── elastos-compute/
-│   ├── elastos-crosvm/
-│   ├── elastos-guest/
-│   ├── elastos-identity/
-│   ├── elastos-namespace/
-│   ├── elastos-runtime/
-│   ├── elastos-server/
-│   ├── elastos-storage/
-│   └── elastos-tls/
-├── capsules/
-│   ├── localhost-provider/
-│   └── shell/
-└── tools/
-    └── vsock-proxy/
-```
+- [`Cargo.toml`](Cargo.toml) is the source of truth for workspace members and
+  shared Rust settings.
+- [`crates/`](crates/) contains the Runtime libraries and the `elastos-server`
+  host package.
+- [`capsules/`](capsules/) contains the Rust capsules included in this
+  workspace.
+- [`tools/`](tools/) contains standalone Rust and JavaScript utilities. They are
+  not built by `cargo build --workspace`; use each tool's own manifest or
+  package file.
+- [`wit/`](wit/) contains the checked-in ElastOS Bus interface.
 
 ## Testing
 
@@ -74,8 +53,11 @@ cargo test --workspace
 cargo test -p elastos-runtime
 ```
 
-## More
+The repository root also provides `just test`, `just test-crate <crate>`, and
+`just verify`.
 
-- [../docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
-- [../docs/COMMAND_MATRIX.md](../docs/COMMAND_MATRIX.md)
-- [CHANGELOG.md](CHANGELOG.md)
+## Related documentation
+
+- [Architecture](../docs/ARCHITECTURE.md)
+- [Command matrix](../docs/COMMAND_MATRIX.md)
+- [Changelog](CHANGELOG.md)

@@ -2,12 +2,16 @@
 
 use std::{
     fs::{File, OpenOptions},
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
+#[cfg(test)]
+use std::collections::HashMap;
+
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -40,19 +44,168 @@ const AUDIT_CHAIN_STATE_SCHEMA: &str = "elastos.audit.chain-state/v1";
 const AUDIT_CHAIN_STATE_DOMAIN: &str = "elastos.audit.chain-state.v1";
 const AUDIT_CHAIN_ANCHOR_SCHEMA: &str = "elastos.audit.chain-anchor/v1";
 const AUDIT_CHAIN_ANCHOR_DOMAIN: &str = "elastos.audit.chain-anchor.v1";
-const AUDIT_CHAIN_ACTIVATION_SCHEMA: &str = "elastos.audit.chain-activation/v1";
-const AUDIT_CHAIN_ACTIVATION_DOMAIN: &str = "elastos.audit.chain-activation.v1";
+const AUDIT_CHAIN_ACTIVATION_SCHEMA: &str = "elastos.audit.chain-activation/v2";
+const AUDIT_CHAIN_ACTIVATION_DOMAIN: &str = "elastos.audit.chain-activation.v2";
 const AUDIT_RETENTION_LIMIT: usize = 512;
 const RECOVERY_DESCRIPTOR_SCHEMA: &str = "elastos.principal.root-descriptor/v1";
 const PRINCIPAL_ROOT_OBJECT_SCHEMA: &str = "elastos.principal-root.object/v1";
 pub const PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED: &str =
     "protected principal-root object is not encrypted";
 const PRINCIPAL_ROOT_OBJECT_AAD_DOMAIN: &str = "elastos.principal-root.object.v1";
+pub const PRINCIPAL_ROOT_MIGRATION_REQUIRED_SCHEMA: &str =
+    "elastos.principal-root.migration-required/v1";
+pub const PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA: &str = "elastos.principal-root.migration-plan/v1";
+pub const PRINCIPAL_ROOT_MIGRATION_RECEIPT_SCHEMA: &str =
+    "elastos.principal-root.migration-receipt/v1";
+pub const PRINCIPAL_ROOT_UPGRADE_RECEIPT_SCHEMA: &str = "elastos.principal-root.upgrade-receipt/v1";
+const PRINCIPAL_ROOT_MIGRATION_JOURNAL_SCHEMA: &str = "elastos.principal-root.migration-journal/v1";
+const PRINCIPAL_ROOT_MIGRATION_JOURNAL_FILE: &str = "principal-root-migration-journal.json";
+const PRINCIPAL_ROOT_MIGRATION_RECEIPT_FILE: &str = "receipt.json";
+const PRINCIPAL_ROOT_UPGRADE_RECEIPT_FILE: &str = "upgrade-receipt.json";
+const MAX_PRINCIPAL_ROOT_INVENTORY_DECLARATIONS: usize = 128;
+const MAX_PRINCIPAL_ROOT_INVENTORY_OBJECTS: usize = 1024;
+const MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH: usize = 16;
+const MAX_MIGRATION_OBJECTS: usize = 64;
+const MAX_MIGRATION_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_MIGRATION_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 static AUTH_STATE_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static AUDIT_CHAIN_ACTIVATION_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PRINCIPAL_ROOT_OBJECT_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrincipalRootMigrationTestFault {
+    Backup(usize),
+    Stage(usize),
+    JournalPrepared,
+    JournalCommitting,
+    Commit(usize),
+    JournalCommitted,
+    CrashAfterCommit(usize),
+}
+
+#[cfg(test)]
+static PRINCIPAL_ROOT_MIGRATION_TEST_FAULTS: OnceLock<
+    Mutex<HashMap<PathBuf, PrincipalRootMigrationTestFault>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryReassignmentTestFault {
+    TokenPreparation,
+    AuditChainRejection,
+    AuthStateSave,
+    PostCommitOutcomeAudit,
+}
+
+#[cfg(test)]
+static RECOVERY_REASSIGNMENT_TEST_FAULTS: OnceLock<
+    Mutex<HashMap<PathBuf, RecoveryReassignmentTestFault>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn inject_recovery_reassignment_test_fault(
+    data_dir: &Path,
+    fault: RecoveryReassignmentTestFault,
+) {
+    RECOVERY_REASSIGNMENT_TEST_FAULTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("recovery reassignment test fault lock")
+        .insert(data_dir.to_path_buf(), fault);
+}
+
+#[cfg(test)]
+pub(crate) fn consume_recovery_reassignment_test_fault(
+    data_dir: &Path,
+    fault: RecoveryReassignmentTestFault,
+) -> anyhow::Result<()> {
+    let faults = RECOVERY_REASSIGNMENT_TEST_FAULTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut faults = faults
+        .lock()
+        .map_err(|_| anyhow!("recovery reassignment test fault lock poisoned"))?;
+    if faults.get(data_dir) == Some(&fault) {
+        faults.remove(data_dir);
+        anyhow::bail!("injected recovery reassignment {fault:?} failure");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn inject_principal_root_migration_test_fault(
+    data_dir: &Path,
+    fault: PrincipalRootMigrationTestFault,
+) {
+    PRINCIPAL_ROOT_MIGRATION_TEST_FAULTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("principal-root migration test fault lock")
+        .insert(data_dir.to_path_buf(), fault);
+}
+
+#[cfg(test)]
+fn consume_principal_root_migration_test_fault(
+    data_dir: &Path,
+    fault: PrincipalRootMigrationTestFault,
+) -> anyhow::Result<()> {
+    let faults = PRINCIPAL_ROOT_MIGRATION_TEST_FAULTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut faults = faults
+        .lock()
+        .map_err(|_| anyhow!("principal-root migration test fault lock poisoned"))?;
+    if faults.get(data_dir) == Some(&fault) {
+        faults.remove(data_dir);
+        if matches!(fault, PrincipalRootMigrationTestFault::CrashAfterCommit(_)) {
+            return Err(SimulatedPrincipalRootMigrationCrash.into());
+        }
+        anyhow::bail!("injected principal-root migration {fault:?} failure");
+    }
+    Ok(())
+}
+
+fn maybe_inject_principal_root_migration_indexed_fault(
+    data_dir: &Path,
+    stage: PrincipalRootMigrationIndexedFaultStage,
+    index: usize,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    {
+        let fault = match stage {
+            PrincipalRootMigrationIndexedFaultStage::Backup => {
+                PrincipalRootMigrationTestFault::Backup(index)
+            }
+            PrincipalRootMigrationIndexedFaultStage::Stage => {
+                PrincipalRootMigrationTestFault::Stage(index)
+            }
+            PrincipalRootMigrationIndexedFaultStage::Commit => {
+                PrincipalRootMigrationTestFault::Commit(index)
+            }
+        };
+        consume_principal_root_migration_test_fault(data_dir, fault)?;
+        if matches!(stage, PrincipalRootMigrationIndexedFaultStage::Commit) {
+            consume_principal_root_migration_test_fault(
+                data_dir,
+                PrincipalRootMigrationTestFault::CrashAfterCommit(index),
+            )?;
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (data_dir, stage, index);
+    }
+    Ok(())
+}
 
 fn auth_state_mutation_lock() -> &'static Mutex<()> {
     AUTH_STATE_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn audit_chain_activation_mutation_lock() -> &'static Mutex<()> {
+    AUDIT_CHAIN_ACTIVATION_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn principal_root_object_mutation_lock() -> &'static Mutex<()> {
+    PRINCIPAL_ROOT_OBJECT_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +220,169 @@ struct PrincipalRootObjectEnvelopeV1 {
     nonce: String,
     ciphertext: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PrincipalRootProtectedObjectDeclarationV1 {
+    Exact { object_uri: String },
+    Root { root_uri: String },
+}
+
+impl PrincipalRootProtectedObjectDeclarationV1 {
+    pub fn exact(object_uri: impl Into<String>) -> Self {
+        Self::Exact {
+            object_uri: object_uri.into(),
+        }
+    }
+
+    pub fn root(root_uri: impl Into<String>) -> Self {
+        Self::Root {
+            root_uri: root_uri.into(),
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::Exact { object_uri } => object_uri,
+            Self::Root { root_uri } => root_uri,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrincipalRootMigrationRequiredV1 {
+    pub schema: String,
+    pub status: String,
+    pub code: String,
+    pub principal_id: String,
+    pub localhost_root: String,
+    pub plaintext_object_count: usize,
+}
+
+impl std::fmt::Display for PrincipalRootMigrationRequiredV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "principal-root migration required for {} declared plaintext object(s)",
+            self.plaintext_object_count
+        )
+    }
+}
+
+impl std::error::Error for PrincipalRootMigrationRequiredV1 {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalRootMigrationPlanV1 {
+    pub schema: String,
+    pub principal_id: String,
+    pub localhost_root: String,
+    pub objects: Vec<PrincipalRootMigrationSelectionV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalRootMigrationSelectionV1 {
+    pub object_uri: String,
+    pub plaintext_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrincipalRootMigrationReceiptV1 {
+    pub schema: String,
+    pub status: String,
+    pub plan_sha256: String,
+    pub principal_binding_sha256: String,
+    pub object_count: usize,
+    pub objects: Vec<PrincipalRootMigrationObjectReceiptV1>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrincipalRootMigrationObjectReceiptV1 {
+    pub object_uri_sha256: String,
+    pub plaintext_sha256: String,
+    pub backup_sha256: String,
+    pub encrypted_sha256: String,
+    pub round_trip_verified: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrincipalRootUpgradeDeclarationV1 {
+    pub principal_id: String,
+    pub localhost_root: String,
+    pub inventory: Vec<PrincipalRootProtectedObjectDeclarationV1>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrincipalRootUpgradeReceiptV1 {
+    pub schema: String,
+    pub status: String,
+    pub root_count: usize,
+    pub object_count: usize,
+    pub roots: Vec<PrincipalRootMigrationReceiptV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PrincipalRootMigrationJournalPhaseV1 {
+    Prepared,
+    Committing,
+    Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalRootMigrationJournalV1 {
+    schema: String,
+    phase: PrincipalRootMigrationJournalPhaseV1,
+    plan_sha256: String,
+    principal_id: String,
+    localhost_root: String,
+    data_key_id: String,
+    backup_dir: PathBuf,
+    stage_dir: PathBuf,
+    objects: Vec<PrincipalRootMigrationJournalObjectV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrincipalRootMigrationJournalObjectV1 {
+    object_uri: String,
+    plaintext_sha256: String,
+    backup_path: PathBuf,
+    backup_sha256: String,
+    stage_path: PathBuf,
+    encrypted_sha256: String,
+    original_mode: u32,
+}
+
+#[derive(Debug)]
+struct PreparedPrincipalRootMigrationObject {
+    journal: PrincipalRootMigrationJournalObjectV1,
+    path: PathBuf,
+    plaintext: Vec<u8>,
+    encrypted: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PrincipalRootMigrationIndexedFaultStage {
+    Backup,
+    Stage,
+    Commit,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SimulatedPrincipalRootMigrationCrash;
+
+#[cfg(test)]
+impl std::fmt::Display for SimulatedPrincipalRootMigrationCrash {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("simulated principal-root migration crash")
+    }
+}
+
+#[cfg(test)]
+impl std::error::Error for SimulatedPrincipalRootMigrationCrash {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredAuthChallenge {
@@ -142,10 +458,23 @@ pub struct AuditChainAnchorV1 {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuditChainCheckpointV1 {
+    head_sequence: u64,
+    head_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AuditChainActivationV1 {
+#[serde(deny_unknown_fields)]
+struct AuditChainActivationV2 {
     schema: String,
     activated_at: u64,
+    checkpoint: AuditChainCheckpointV1,
     signer_did: String,
     signature: String,
 }
@@ -206,18 +535,78 @@ fn auth_state_lock_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
     auth_state_path(data_dir).map(|path| path.with_file_name(format!("{AUTH_STATE_FILE}.lock")))
 }
 
+fn audit_chain_activation_lock_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    audit_chain_activation_path(data_dir)
+        .map(|path| path.with_file_name(format!("{AUDIT_CHAIN_REQUIRED_FILE}.lock")))
+}
+
+fn open_new_secret_file(path: &Path) -> anyhow::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .with_context(|| format!("failed to create secret state file {path:?}"))
+}
+
+fn ensure_regular_auth_parent(data_dir: &Path, parent: &Path) -> anyhow::Result<()> {
+    let relative = parent
+        .strip_prefix(data_dir)
+        .map_err(|_| anyhow!("auth state path escaped its data root"))?;
+    let mut current = data_dir.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("failed to create auth state path {current:?}"))?;
+                std::fs::symlink_metadata(&current).with_context(|| {
+                    format!("failed to inspect created auth state path {current:?}")
+                })?
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect auth state path {current:?}"));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("auth state path must use regular non-symlink directories");
+        }
+    }
+    Ok(())
+}
+
+fn open_regular_lock_file(path: &Path, label: &str) -> anyhow::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {label} lock {path:?}"))?;
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("{label} lock must be a regular non-symlink file");
+    }
+    set_secret_file_permissions(path)?;
+    Ok(file)
+}
+
 fn open_auth_state_lock(data_dir: &Path) -> anyhow::Result<File> {
     let path = auth_state_lock_path(data_dir)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_regular_auth_parent(data_dir, parent)?;
     }
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("failed to open auth state lock {path:?}"))
+    open_regular_lock_file(&path, "auth state")
+}
+
+fn open_audit_chain_activation_lock(data_dir: &Path) -> anyhow::Result<File> {
+    let path = audit_chain_activation_lock_path(data_dir)?;
+    if let Some(parent) = path.parent() {
+        ensure_regular_auth_parent(data_dir, parent)?;
+    }
+    open_regular_lock_file(&path, "audit activation")
 }
 
 fn lock_auth_state_file(file: &File) -> anyhow::Result<()> {
@@ -259,6 +648,7 @@ fn mutate_auth_state<T>(
     lock_auth_state_file(&lock_file)?;
     let result = (|| {
         let mut state = load_auth_state(data_dir)?;
+        ensure_audit_chain_state(data_dir, &mut state)?;
         let value = mutation(&mut state)?;
         save_auth_state(data_dir, &state)?;
         Ok(value)
@@ -310,19 +700,46 @@ fn set_secret_file_permissions(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn audit_chain_activation_payload(activated_at: u64) -> anyhow::Result<Vec<u8>> {
+fn audit_chain_checkpoint(state: &AuthState) -> anyhow::Result<Option<AuditChainCheckpointV1>> {
+    let Some(chain_state) = state.audit_chain_state.as_ref() else {
+        return Ok(None);
+    };
+    let (anchor_sequence, anchor_hash) = match state.audit_chain_anchor.as_ref() {
+        Some(anchor) => (Some(anchor.sequence), Some(anchor.chain_hash.clone())),
+        None => (None, None),
+    };
+    Ok(Some(AuditChainCheckpointV1 {
+        head_sequence: chain_state.head_sequence,
+        head_hash: chain_state.head_hash.clone(),
+        anchor_sequence,
+        anchor_hash,
+    }))
+}
+
+fn audit_chain_activation_payload(
+    activated_at: u64,
+    checkpoint: &AuditChainCheckpointV1,
+) -> anyhow::Result<Vec<u8>> {
     Ok(serde_json::to_vec(&serde_json::json!({
         "schema": AUDIT_CHAIN_ACTIVATION_SCHEMA,
         "activated_at": activated_at,
+        "checkpoint": checkpoint,
     }))?)
 }
 
-fn load_audit_chain_activation(data_dir: &Path) -> anyhow::Result<Option<AuditChainActivationV1>> {
+fn load_audit_chain_activation_unlocked(
+    data_dir: &Path,
+) -> anyhow::Result<Option<AuditChainActivationV2>> {
     let path = audit_chain_activation_path(data_dir)?;
-    if !path.is_file() {
-        return Ok(None);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect audit chain activation record"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("audit chain activation record must be a regular non-symlink file");
     }
-    let activation: AuditChainActivationV1 = serde_json::from_slice(&std::fs::read(&path)?)
+    let activation: AuditChainActivationV2 = serde_json::from_slice(&std::fs::read(&path)?)
         .with_context(|| format!("failed to parse audit chain activation record {path:?}"))?;
     if activation.schema != AUDIT_CHAIN_ACTIVATION_SCHEMA {
         anyhow::bail!("unsupported audit chain activation schema");
@@ -334,77 +751,203 @@ fn load_audit_chain_activation(data_dir: &Path) -> anyhow::Result<Option<AuditCh
     crate::crypto::verify_domain_separated_signature(
         &activation.signer_did,
         AUDIT_CHAIN_ACTIVATION_DOMAIN,
-        &audit_chain_activation_payload(activation.activated_at)?,
+        &audit_chain_activation_payload(activation.activated_at, &activation.checkpoint)?,
         &activation.signature,
     )
     .context("audit chain activation signature is invalid")?;
     Ok(Some(activation))
 }
 
-fn persist_audit_chain_activation(data_dir: &Path, activated_at: u64) -> anyhow::Result<()> {
-    if let Some(existing) = load_audit_chain_activation(data_dir)? {
-        if existing.activated_at != activated_at {
-            anyhow::bail!("audit chain activation changed unexpectedly");
-        }
-        return Ok(());
+fn with_audit_chain_activation_lock<T>(
+    data_dir: &Path,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _guard = audit_chain_activation_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("audit activation lock poisoned"))?;
+    let lock_file = open_audit_chain_activation_lock(data_dir)?;
+    lock_auth_state_file(&lock_file)?;
+    let result = operation();
+    let unlock = unlock_auth_state_file(&lock_file);
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
     }
+}
+
+#[cfg(test)]
+fn load_audit_chain_activation(data_dir: &Path) -> anyhow::Result<Option<AuditChainActivationV2>> {
+    with_audit_chain_activation_lock(data_dir, || load_audit_chain_activation_unlocked(data_dir))
+}
+
+fn persist_audit_chain_activation_unlocked(
+    data_dir: &Path,
+    activated_at: u64,
+    checkpoint: &AuditChainCheckpointV1,
+) -> anyhow::Result<()> {
     let path = audit_chain_activation_path(data_dir)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_regular_auth_parent(data_dir, parent)?;
     }
     let (signing_key, signer_did) = elastos_identity::load_or_create_did(data_dir)?;
     let (signature, _) = crate::crypto::domain_separated_sign(
         &signing_key,
         AUDIT_CHAIN_ACTIVATION_DOMAIN,
-        &audit_chain_activation_payload(activated_at)?,
+        &audit_chain_activation_payload(activated_at, checkpoint)?,
     );
-    let activation = AuditChainActivationV1 {
+    let activation = AuditChainActivationV2 {
         schema: AUDIT_CHAIN_ACTIVATION_SCHEMA.to_string(),
         activated_at,
+        checkpoint: checkpoint.clone(),
         signer_did,
         signature,
     };
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&temp, serde_json::to_vec_pretty(&activation)?)?;
-    set_secret_file_permissions(&temp)?;
-    std::fs::rename(temp, path)?;
+    write_secret_json_atomic(&path, &activation)
+}
+
+fn validate_checkpoint_progress(
+    current: &AuditChainCheckpointV1,
+    next: &AuditChainCheckpointV1,
+) -> anyhow::Result<bool> {
+    if next.head_sequence < current.head_sequence {
+        anyhow::bail!("audit chain rollback detected by the activation checkpoint");
+    }
+    if next.head_sequence == current.head_sequence {
+        if next != current {
+            anyhow::bail!(
+                "audit chain truncation or substitution detected by the activation checkpoint"
+            );
+        }
+        return Ok(false);
+    }
+    match (current.anchor_sequence, next.anchor_sequence) {
+        (Some(_), None) => anyhow::bail!("retained audit chain anchor rollback detected"),
+        (Some(current_sequence), Some(next_sequence)) if next_sequence < current_sequence => {
+            anyhow::bail!("retained audit chain anchor rollback detected")
+        }
+        (Some(current_sequence), Some(next_sequence))
+            if next_sequence == current_sequence && current.anchor_hash != next.anchor_hash =>
+        {
+            anyhow::bail!("retained audit chain anchor substitution detected")
+        }
+        _ => {}
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
-pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
-    let state = load_auth_state_unverified(data_dir)?.unwrap_or_default();
-    let activation = load_audit_chain_activation(data_dir)?;
-    match (state.audit_chain_state.as_ref(), activation.as_ref()) {
-        (Some(chain_state), Some(activation)) => {
-            if chain_state.activated_at != activation.activated_at {
-                anyhow::bail!("audit chain state does not match its activation record");
-            }
-        }
-        (Some(_), None) => {
-            anyhow::bail!("audit chain activation record is required");
-        }
-        (None, Some(_)) => {
-            anyhow::bail!("audit chain state is required after activation");
-        }
-        (None, None)
-            if !state.audit.is_empty()
-                || !state.audit_chain.is_empty()
-                || state.audit_chain_anchor.is_some() =>
-        {
-            anyhow::bail!(
-                "unchained audit history is unsupported; delete the Runtime auth state or restore a valid anchored audit chain"
-            );
-        }
-        (None, None) => {}
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn write_secret_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("secret state path has no file name"))?;
+    let temp = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        unique
+    ));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = open_new_secret_file(&temp)?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        set_secret_file_permissions(path)?;
+        sync_parent_directory(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
-    verify_audit_chain(data_dir, &state)?;
-    Ok(state)
+    result
+}
+
+pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
+    with_audit_chain_activation_lock(data_dir, || {
+        let stored_state = load_auth_state_unverified(data_dir)?;
+        let state_was_present = stored_state.is_some();
+        let mut state = stored_state.unwrap_or_default();
+        let activation = load_audit_chain_activation_unlocked(data_dir)?;
+        match (state.audit_chain_state.as_ref(), activation.as_ref()) {
+            (Some(chain_state), Some(activation)) => {
+                verify_audit_chain(data_dir, &state)?;
+                if chain_state.activated_at != activation.activated_at {
+                    anyhow::bail!("audit chain state does not match its activation record");
+                }
+                let checkpoint = audit_chain_checkpoint(&state)?
+                    .expect("audit chain state must produce a checkpoint");
+                if validate_checkpoint_progress(&activation.checkpoint, &checkpoint)? {
+                    persist_audit_chain_activation_unlocked(
+                        data_dir,
+                        chain_state.activated_at,
+                        &checkpoint,
+                    )?;
+                }
+            }
+            (Some(chain_state), None) => {
+                verify_audit_chain(data_dir, &state)
+                    .context("cannot recover audit activation from invalid signed chain state")?;
+                let checkpoint = audit_chain_checkpoint(&state)?
+                    .expect("audit chain state must produce a checkpoint");
+                persist_audit_chain_activation_unlocked(
+                    data_dir,
+                    chain_state.activated_at,
+                    &checkpoint,
+                )?;
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("audit chain state is required after activation");
+            }
+            (None, None) if state_was_present && auth_state_requires_audit_chain(&state) => {
+                anyhow::bail!(
+                    "unchained auth state is unsupported; preserve and back up the existing data root, then use a fresh data root; no automatic migration or offline migration script is provided"
+                );
+            }
+            (None, None) => {}
+        }
+        verify_audit_chain(data_dir, &state)?;
+        prune_auth_state(&mut state, now_ts());
+        Ok(state)
+    })
+}
+
+fn auth_state_requires_audit_chain(state: &AuthState) -> bool {
+    !state.challenges.is_empty()
+        || !state.principals.is_empty()
+        || !state.sessions.is_empty()
+        || !state.principal_root_protections.is_empty()
+        || !state.audit.is_empty()
+        || !state.audit_chain.is_empty()
+        || state.audit_chain_anchor.is_some()
+        || state.guest_registration_enabled
 }
 
 fn load_auth_state_unverified(data_dir: &Path) -> anyhow::Result<Option<AuthState>> {
     let path = auth_state_path(data_dir)?;
-    if !path.is_file() {
-        return Ok(None);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect auth state"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("auth state must be a regular non-symlink file");
     }
     let bytes = std::fs::read(&path).with_context(|| format!("failed to read {path:?}"))?;
     let mut state: AuthState = serde_json::from_slice(&bytes)
@@ -413,7 +956,6 @@ fn load_auth_state_unverified(data_dir: &Path) -> anyhow::Result<Option<AuthStat
         anyhow::bail!("unsupported auth state schema");
     }
     normalize_principal_records(&mut state);
-    prune_auth_state(&mut state, now_ts());
     Ok(Some(state))
 }
 
@@ -422,25 +964,54 @@ pub fn verify_auth_audit_chain_ready(data_dir: &Path) -> anyhow::Result<()> {
 }
 
 pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
-    let path = auth_state_path(data_dir)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let temp = path.with_file_name(format!(
-        "{AUTH_STATE_FILE}.{}.{}.tmp",
-        std::process::id(),
-        unique
-    ));
-    std::fs::write(&temp, serde_json::to_vec_pretty(state)?)?;
-    std::fs::rename(temp, path)?;
-    if let Some(chain_state) = state.audit_chain_state.as_ref() {
-        persist_audit_chain_activation(data_dir, chain_state.activated_at)?;
-    }
-    Ok(())
+    #[cfg(test)]
+    consume_recovery_reassignment_test_fault(
+        data_dir,
+        RecoveryReassignmentTestFault::AuthStateSave,
+    )?;
+    with_audit_chain_activation_lock(data_dir, || {
+        verify_audit_chain(data_dir, state)?;
+        let path = auth_state_path(data_dir)?;
+        if let Some(parent) = path.parent() {
+            ensure_regular_auth_parent(data_dir, parent)?;
+        }
+        let activation = load_audit_chain_activation_unlocked(data_dir)?;
+        let checkpoint = audit_chain_checkpoint(state)?;
+        match (
+            activation.as_ref(),
+            state.audit_chain_state.as_ref(),
+            checkpoint.as_ref(),
+        ) {
+            (Some(_), None, None) => {
+                anyhow::bail!(
+                    "audit chain rollback detected: chain state was removed after activation"
+                )
+            }
+            (Some(activation), Some(chain_state), Some(checkpoint)) => {
+                if activation.activated_at != chain_state.activated_at {
+                    anyhow::bail!("audit chain activation changed unexpectedly");
+                }
+                validate_checkpoint_progress(&activation.checkpoint, checkpoint)?;
+            }
+            _ => {}
+        }
+        write_secret_json_atomic(&path, state)?;
+        if let (Some(chain_state), Some(checkpoint)) =
+            (state.audit_chain_state.as_ref(), checkpoint.as_ref())
+        {
+            let should_persist = activation
+                .as_ref()
+                .is_none_or(|activation| activation.checkpoint != *checkpoint);
+            if should_persist {
+                persist_audit_chain_activation_unlocked(
+                    data_dir,
+                    chain_state.activated_at,
+                    checkpoint,
+                )?;
+            }
+        }
+        Ok(())
+    })
 }
 
 pub fn store_challenge(data_dir: &Path, challenge: AuthChallengeV1) -> anyhow::Result<()> {
@@ -763,6 +1334,118 @@ pub fn load_principal_root_protection(
     Ok(Some(protection))
 }
 
+#[derive(Debug)]
+pub struct PrincipalRootProtectionActivationGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PrincipalRootProtectionInspection {
+    pub protection: Option<PrincipalRootProtectionV1>,
+    pub declared_object_count: usize,
+    pub encrypted_object_count: usize,
+    pub plaintext_object_count: usize,
+}
+
+pub fn begin_declarative_principal_root_protection_activation(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    inventory: &[PrincipalRootProtectedObjectDeclarationV1],
+) -> anyhow::Result<PrincipalRootProtectionActivationGuard> {
+    validate_principal_root_object_binding(principal_id, localhost_root, localhost_root)?;
+    let guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
+    let classified = classify_declared_principal_root_objects(
+        data_dir,
+        principal_id,
+        localhost_root,
+        inventory,
+    )?;
+    verify_classified_principal_root_objects_with_stored_protection(
+        data_dir,
+        protection.as_ref(),
+        &classified,
+    )?;
+    require_no_declared_principal_root_plaintext(
+        principal_id,
+        localhost_root,
+        classified.plaintext_object_count,
+    )?;
+    Ok(PrincipalRootProtectionActivationGuard { _guard: guard })
+}
+
+pub(crate) fn begin_declarative_principal_root_protection_activation_with_candidate(
+    data_dir: &Path,
+    candidate: &PrincipalRootProtectionV1,
+    data_key: &[u8; 32],
+    inventory: &[PrincipalRootProtectedObjectDeclarationV1],
+) -> anyhow::Result<PrincipalRootProtectionActivationGuard> {
+    validate_principal_root_protection(candidate).map_err(anyhow::Error::msg)?;
+    validate_principal_root_object_binding(
+        &candidate.principal_id,
+        &candidate.localhost_root,
+        &candidate.localhost_root,
+    )?;
+    if principal_data_key_id(data_key) != candidate.data_key_id {
+        anyhow::bail!("candidate principal-root protection data key binding mismatch");
+    }
+    let guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let classified = classify_declared_principal_root_objects(
+        data_dir,
+        &candidate.principal_id,
+        &candidate.localhost_root,
+        inventory,
+    )?;
+    require_no_declared_principal_root_plaintext(
+        &candidate.principal_id,
+        &candidate.localhost_root,
+        classified.plaintext_object_count,
+    )?;
+    verify_classified_principal_root_object_envelopes(
+        &classified,
+        &candidate.principal_id,
+        &candidate.localhost_root,
+        &candidate.data_key_id,
+        data_key,
+    )?;
+    Ok(PrincipalRootProtectionActivationGuard { _guard: guard })
+}
+
+pub(crate) fn inspect_declarative_principal_root_protection(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    inventory: &[PrincipalRootProtectedObjectDeclarationV1],
+) -> anyhow::Result<PrincipalRootProtectionInspection> {
+    validate_principal_root_object_binding(principal_id, localhost_root, localhost_root)?;
+    let _guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
+    let classified = classify_declared_principal_root_objects(
+        data_dir,
+        principal_id,
+        localhost_root,
+        inventory,
+    )?;
+    verify_classified_principal_root_objects_with_stored_protection(
+        data_dir,
+        protection.as_ref(),
+        &classified,
+    )?;
+    Ok(PrincipalRootProtectionInspection {
+        protection,
+        declared_object_count: classified.declared_object_count,
+        encrypted_object_count: classified.envelopes.len(),
+        plaintext_object_count: classified.plaintext_object_count,
+    })
+}
+
 pub fn read_principal_root_object(
     data_dir: &Path,
     principal_id: &str,
@@ -771,6 +1454,9 @@ pub fn read_principal_root_object(
     path: &Path,
 ) -> anyhow::Result<Vec<u8>> {
     validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
+    let _guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
     let bytes = std::fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
     let Some(protection) = load_principal_root_protection(data_dir, principal_id, localhost_root)?
     else {
@@ -811,9 +1497,11 @@ pub fn write_principal_root_object(
     plaintext: &[u8],
 ) -> anyhow::Result<()> {
     validate_principal_root_object_binding(principal_id, localhost_root, object_uri)?;
-    let bytes = if let Some(protection) =
-        load_principal_root_protection(data_dir, principal_id, localhost_root)?
-    {
+    let _guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let protection = load_principal_root_protection(data_dir, principal_id, localhost_root)?;
+    let bytes = if let Some(protection) = protection {
         let data_key = principal_root_data_key_from_protection(data_dir, &protection)?;
         let mut nonce = [0u8; 12];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -1174,21 +1862,65 @@ pub fn ensure_recovered_root_reassignable(
     Ok(())
 }
 
-pub fn reassign_passkey_binding_to_recovered_root(
+pub struct RecoveredRootReassignment {
+    pub proof_binding_id: String,
+    pub recovered_principal_id: String,
+    pub recovered_localhost_root: String,
+    pub protection: PrincipalRootProtectionV1,
+    pub replacement_grant: AuthSessionGrantV1,
+    pub signed_audit_event: RuntimeAuditEventV1,
+    pub updated_at: u64,
+}
+
+pub fn commit_recovered_root_reassignment(
     data_dir: &Path,
-    proof_binding_id: &str,
-    recovered_principal_id: &str,
-    recovered_localhost_root: &str,
-    updated_at: u64,
+    reassignment: RecoveredRootReassignment,
 ) -> anyhow::Result<PrincipalRecord> {
+    let RecoveredRootReassignment {
+        proof_binding_id,
+        recovered_principal_id,
+        recovered_localhost_root,
+        protection,
+        replacement_grant,
+        signed_audit_event,
+        updated_at,
+    } = reassignment;
+    validate_principal_root_protection(&protection).map_err(anyhow::Error::msg)?;
+    if protection.principal_id != recovered_principal_id
+        || protection.localhost_root != recovered_localhost_root
+    {
+        anyhow::bail!("recovery protection does not match the recovered root");
+    }
+    validate_recovery_replacement_grant(
+        &replacement_grant,
+        &proof_binding_id,
+        &recovered_principal_id,
+        updated_at,
+    )?;
+    validate_recovery_reassignment_audit(
+        &signed_audit_event,
+        &proof_binding_id,
+        &recovered_principal_id,
+        &replacement_grant.session_id,
+        updated_at,
+    )?;
+    let (_, runtime_did) = elastos_identity::load_or_create_did(data_dir)?;
+    verify_audit_event_signature(&signed_audit_event, &runtime_did)?;
+
     mutate_auth_state(data_dir, |state| {
         normalize_principal_records(state);
         ensure_recovered_root_reassignable_in_state(
             state,
-            proof_binding_id,
-            recovered_principal_id,
-            recovered_localhost_root,
+            &proof_binding_id,
+            &recovered_principal_id,
+            &recovered_localhost_root,
         )?;
+        if state.sessions.iter().any(|stored| {
+            stored.grant.session_id == replacement_grant.session_id
+                || stored.grant.grant_id == replacement_grant.grant_id
+        }) {
+            anyhow::bail!("replacement recovery session collides with existing auth state");
+        }
 
         let removed_proof_binding_ids = state
             .principals
@@ -1210,8 +1942,8 @@ pub fn reassign_passkey_binding_to_recovered_root(
             .iter_mut()
             .find(|principal| principal.proof_binding_id == proof_binding_id)
             .ok_or_else(|| anyhow!("passkey proof binding not found after reassignment cleanup"))?;
-        principal.principal_id = recovered_principal_id.to_string();
-        principal.localhost_root = recovered_localhost_root.to_string();
+        principal.principal_id = recovered_principal_id;
+        principal.localhost_root = recovered_localhost_root;
         principal.updated_at = updated_at;
         let record = principal.clone();
         for stored in &mut state.sessions {
@@ -1223,8 +1955,91 @@ pub fn reassign_passkey_binding_to_recovered_root(
                 stored.revoked_at = Some(updated_at);
             }
         }
+        state.principal_root_protections.retain(|stored| {
+            stored.principal_id != protection.principal_id
+                || stored.localhost_root != protection.localhost_root
+        });
+        state.principal_root_protections.push(protection);
+        state.sessions.push(StoredAuthSession {
+            grant: replacement_grant,
+            revoked_at: None,
+        });
+        #[cfg(test)]
+        consume_recovery_reassignment_test_fault(
+            data_dir,
+            RecoveryReassignmentTestFault::AuditChainRejection,
+        )?;
+        push_audit_event(data_dir, state, signed_audit_event)?;
         Ok(record)
     })
+}
+
+fn validate_recovery_replacement_grant(
+    grant: &AuthSessionGrantV1,
+    proof_binding_id: &str,
+    recovered_principal_id: &str,
+    updated_at: u64,
+) -> anyhow::Result<()> {
+    if grant.schema != AuthSessionGrantV1::SCHEMA
+        || grant.principal_id != recovered_principal_id
+        || grant.proof_binding_id != proof_binding_id
+        || grant.issued_at != updated_at
+        || grant.expires_at <= grant.issued_at
+    {
+        anyhow::bail!("invalid replacement recovery session grant");
+    }
+    for (label, value) in [
+        ("grant_id", grant.grant_id.as_str()),
+        ("session_id", grant.session_id.as_str()),
+        ("principal_id", grant.principal_id.as_str()),
+        ("proof_binding_id", grant.proof_binding_id.as_str()),
+    ] {
+        if value.is_empty()
+            || value.len() > 256
+            || value
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            anyhow::bail!("invalid replacement recovery {label}");
+        }
+    }
+    if grant.apps.is_empty()
+        || grant.apps.len() > 8
+        || grant.apps.iter().any(|app| {
+            app.is_empty()
+                || app.len() > 128
+                || app.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        })
+    {
+        anyhow::bail!("invalid replacement recovery session app scope");
+    }
+    let apps = grant.apps.iter().collect::<std::collections::BTreeSet<_>>();
+    if apps.len() != grant.apps.len() {
+        anyhow::bail!("replacement recovery session app scope contains duplicates");
+    }
+    Ok(())
+}
+
+fn validate_recovery_reassignment_audit(
+    event: &RuntimeAuditEventV1,
+    proof_binding_id: &str,
+    recovered_principal_id: &str,
+    replacement_session_id: &str,
+    updated_at: u64,
+) -> anyhow::Result<()> {
+    if event.schema != RuntimeAuditEventV1::SCHEMA
+        || event.event_type != "auth.recovery_kit.reassigned"
+        || event.principal_id.as_deref() != Some(recovered_principal_id)
+        || event.proof_binding_id.as_deref() != Some(proof_binding_id)
+        || event.session_id.as_deref() != Some(replacement_session_id)
+        || event.result != "ok"
+        || event.occurred_at != updated_at
+        || event.signer_did.as_deref().is_none_or(str::is_empty)
+        || event.signature.as_deref().is_none_or(str::is_empty)
+    {
+        anyhow::bail!("invalid signed recovery reassignment audit event");
+    }
+    Ok(())
 }
 
 fn ensure_recovered_root_reassignable_in_state(
@@ -1251,6 +2066,60 @@ pub fn append_audit_event(data_dir: &Path, event: RuntimeAuditEventV1) -> anyhow
         push_audit_event(data_dir, state, event)?;
         Ok(())
     })
+}
+
+pub fn append_signed_full_recovery_outcome_audit_event(
+    data_dir: &Path,
+    event: RuntimeAuditEventV1,
+) -> anyhow::Result<()> {
+    verify_signed_full_recovery_outcome_audit_event(data_dir, &event)?;
+    mutate_auth_state(data_dir, |state| {
+        if let Some(existing) = state
+            .audit
+            .iter()
+            .find(|existing| existing.event_id == event.event_id)
+        {
+            let same_outcome = existing.schema == event.schema
+                && existing.event_type == event.event_type
+                && existing.principal_id == event.principal_id
+                && existing.proof_binding_id == event.proof_binding_id
+                && existing.session_id == event.session_id
+                && existing.challenge_id == event.challenge_id
+                && existing.capsule_id == event.capsule_id
+                && existing.result == event.result
+                && existing.reason == event.reason
+                && existing.signer_did == event.signer_did;
+            if same_outcome {
+                return Ok(());
+            }
+            anyhow::bail!("full recovery outcome audit id collision");
+        }
+        push_audit_event(data_dir, state, event)?;
+        Ok(())
+    })
+}
+
+pub fn verify_signed_full_recovery_outcome_audit_event(
+    data_dir: &Path,
+    event: &RuntimeAuditEventV1,
+) -> anyhow::Result<()> {
+    let (_, runtime_did) = elastos_identity::load_or_create_did(data_dir)?;
+    verify_audit_event_signature(event, &runtime_did)
+}
+
+pub fn load_signed_full_recovery_outcome_audit_event(
+    data_dir: &Path,
+    event_id: &str,
+) -> anyhow::Result<Option<RuntimeAuditEventV1>> {
+    let event = load_auth_state(data_dir)?
+        .audit
+        .iter()
+        .find(|event| event.event_id == event_id)
+        .cloned();
+    if let Some(event) = event.as_ref() {
+        verify_signed_full_recovery_outcome_audit_event(data_dir, event)?;
+    }
+    Ok(event)
 }
 
 pub fn sign_audit_event(
@@ -1298,7 +2167,7 @@ fn ensure_audit_chain_state(data_dir: &Path, state: &mut AuthState) -> anyhow::R
         || state.audit_chain_anchor.is_some()
     {
         anyhow::bail!(
-            "unchained audit history is unsupported; delete the Runtime auth state or restore a valid anchored audit chain"
+            "unchained audit history is unsupported; preserve and back up the existing data root, then use a fresh data root or restore a valid anchored audit chain"
         );
     }
     state.audit_chain_state = Some(sign_audit_chain_state(
@@ -1702,6 +2571,295 @@ fn validate_principal_root_object_binding(
     Ok(())
 }
 
+#[derive(Debug)]
+struct DeclaredPrincipalRootObject {
+    object_uri: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ClassifiedDeclaredPrincipalRootObjects {
+    declared_object_count: usize,
+    plaintext_object_count: usize,
+    plaintext_objects: Vec<PrincipalRootMigrationSelectionV1>,
+    envelopes: Vec<(String, PrincipalRootObjectEnvelopeV1)>,
+}
+
+fn classify_declared_principal_root_objects(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    inventory: &[PrincipalRootProtectedObjectDeclarationV1],
+) -> anyhow::Result<ClassifiedDeclaredPrincipalRootObjects> {
+    let declared =
+        collect_declared_principal_root_objects(data_dir, principal_id, localhost_root, inventory)?;
+    let declared_object_count = declared.len();
+    let mut plaintext_object_count = 0usize;
+    let mut plaintext_objects = Vec::new();
+    let mut envelopes = Vec::new();
+    for object in declared {
+        match serde_json::from_slice::<PrincipalRootObjectEnvelopeV1>(&object.bytes) {
+            Ok(envelope) => envelopes.push((object.object_uri, envelope)),
+            Err(_) if looks_like_principal_root_object_envelope(&object.bytes) => {
+                anyhow::bail!("declared principal-root object envelope is malformed");
+            }
+            Err(_) => {
+                plaintext_object_count = plaintext_object_count.saturating_add(1);
+                plaintext_objects.push(PrincipalRootMigrationSelectionV1 {
+                    object_uri: object.object_uri,
+                    plaintext_sha256: sha256_label(&object.bytes),
+                });
+            }
+        }
+    }
+    Ok(ClassifiedDeclaredPrincipalRootObjects {
+        declared_object_count,
+        plaintext_object_count,
+        plaintext_objects,
+        envelopes,
+    })
+}
+
+fn require_no_declared_principal_root_plaintext(
+    principal_id: &str,
+    localhost_root: &str,
+    plaintext_object_count: usize,
+) -> anyhow::Result<()> {
+    if plaintext_object_count > 0 {
+        return Err(PrincipalRootMigrationRequiredV1 {
+            schema: PRINCIPAL_ROOT_MIGRATION_REQUIRED_SCHEMA.to_string(),
+            status: "migration_required".to_string(),
+            code: "declared_plaintext_objects".to_string(),
+            principal_id: principal_id.to_string(),
+            localhost_root: localhost_root.to_string(),
+            plaintext_object_count,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_classified_principal_root_objects_with_stored_protection(
+    data_dir: &Path,
+    protection: Option<&PrincipalRootProtectionV1>,
+    classified: &ClassifiedDeclaredPrincipalRootObjects,
+) -> anyhow::Result<()> {
+    if classified.envelopes.is_empty() {
+        return Ok(());
+    }
+    let protection = protection.ok_or_else(|| {
+        anyhow!(
+            "an exact verified protection binding is required for declared encrypted principal-root objects"
+        )
+    })?;
+    let data_key = principal_root_data_key_from_protection(data_dir, protection)?;
+    verify_classified_principal_root_object_envelopes(
+        classified,
+        &protection.principal_id,
+        &protection.localhost_root,
+        &protection.data_key_id,
+        &data_key,
+    )
+}
+
+fn verify_classified_principal_root_object_envelopes(
+    classified: &ClassifiedDeclaredPrincipalRootObjects,
+    principal_id: &str,
+    localhost_root: &str,
+    data_key_id: &str,
+    data_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    for (object_uri, envelope) in &classified.envelopes {
+        validate_principal_root_object_envelope(
+            envelope,
+            principal_id,
+            localhost_root,
+            data_key_id,
+            object_uri,
+        )
+        .context("declared principal-root object envelope binding is invalid")?;
+        let nonce = b64_url_decode(&envelope.nonce)
+            .context("declared principal-root object envelope nonce is invalid")?;
+        if nonce.len() != 12 {
+            anyhow::bail!("declared principal-root object envelope nonce must be 12 bytes");
+        }
+        let ciphertext = b64_url_decode(&envelope.ciphertext)
+            .context("declared principal-root object envelope ciphertext is invalid")?;
+        if ciphertext.is_empty() {
+            anyhow::bail!("declared principal-root object envelope ciphertext is empty");
+        }
+        decrypt_aes256_gcm_bytes_with_aad(
+            data_key,
+            &nonce,
+            &ciphertext,
+            principal_root_object_aad(envelope).as_bytes(),
+        )
+        .context("declared principal-root object envelope authentication failed")?;
+    }
+    Ok(())
+}
+
+fn looks_like_principal_root_object_envelope(bytes: &[u8]) -> bool {
+    if let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(bytes) {
+        return object
+            .get("schema")
+            .and_then(Value::as_str)
+            .is_some_and(|schema| schema.starts_with("elastos.principal-root.object/"))
+            || ["data_key_id", "nonce", "ciphertext"]
+                .iter()
+                .all(|field| object.contains_key(*field));
+    }
+    std::str::from_utf8(bytes).is_ok_and(|text| {
+        (text.contains("\"schema\"") && text.contains("elastos.principal-root.object/"))
+            || ["\"data_key_id\"", "\"nonce\"", "\"ciphertext\""]
+                .iter()
+                .all(|field| text.contains(field))
+    })
+}
+
+fn collect_declared_principal_root_objects(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    inventory: &[PrincipalRootProtectedObjectDeclarationV1],
+) -> anyhow::Result<Vec<DeclaredPrincipalRootObject>> {
+    if inventory.len() > MAX_PRINCIPAL_ROOT_INVENTORY_DECLARATIONS {
+        anyhow::bail!("principal-root protected-object inventory exceeds its declaration bound");
+    }
+    let mut declared = std::collections::BTreeMap::<String, PathBuf>::new();
+    for declaration in inventory {
+        let uri = declaration.uri();
+        validate_principal_root_object_binding(principal_id, localhost_root, uri)?;
+        let path = rooted_localhost_fs_path(data_dir, uri)
+            .ok_or_else(|| anyhow!("declared principal-root object path is invalid"))?;
+        ensure_no_symlink_components(data_dir, &path)?;
+        match declaration {
+            PrincipalRootProtectedObjectDeclarationV1::Exact { object_uri } => {
+                let metadata = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(err).context("failed to inspect declared principal-root object")
+                    }
+                };
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    anyhow::bail!(
+                        "declared principal-root object must be a regular non-symlink file"
+                    );
+                }
+                declared.insert(object_uri.clone(), path);
+            }
+            PrincipalRootProtectedObjectDeclarationV1::Root { root_uri } => {
+                collect_declared_principal_root_files(&path, root_uri, 0, &mut declared)?;
+            }
+        }
+        if declared.len() > MAX_PRINCIPAL_ROOT_INVENTORY_OBJECTS {
+            anyhow::bail!("principal-root protected-object inventory exceeds its object bound");
+        }
+    }
+
+    let mut objects = Vec::with_capacity(declared.len());
+    let mut total_bytes = 0u64;
+    for (object_uri, path) in declared {
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect declared object {path:?}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!("declared principal-root object must remain a regular non-symlink file");
+        }
+        if metadata.len() > MAX_MIGRATION_OBJECT_BYTES {
+            anyhow::bail!("declared principal-root object exceeds 16 MiB");
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| anyhow!("declared principal-root object byte total overflow"))?;
+        if total_bytes > MAX_MIGRATION_TOTAL_BYTES {
+            anyhow::bail!("declared principal-root objects exceed 64 MiB");
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("failed to read declared object {path:?}"))?;
+        objects.push(DeclaredPrincipalRootObject { object_uri, bytes });
+    }
+    Ok(objects)
+}
+
+fn collect_declared_principal_root_files(
+    path: &Path,
+    root_uri: &str,
+    depth: usize,
+    declared: &mut std::collections::BTreeMap<String, PathBuf>,
+) -> anyhow::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).context("failed to inspect declared principal-root root"),
+    };
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("declared principal-root inventory rejects symlinks");
+    }
+    if metadata.is_file() {
+        declared.insert(root_uri.to_string(), path.to_path_buf());
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("declared principal-root root must be a regular file or directory");
+    }
+    if depth >= MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH {
+        anyhow::bail!("principal-root protected-object inventory exceeds its depth bound");
+    }
+
+    let mut entries = std::fs::read_dir(path)?
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to enumerate declared principal-root root")?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("declared principal-root object name must be UTF-8"))?;
+        let child_uri = format!("{root_uri}/{name}");
+        let child_path = entry.path();
+        let child_metadata = std::fs::symlink_metadata(&child_path)?;
+        if child_metadata.file_type().is_symlink() {
+            anyhow::bail!("declared principal-root inventory rejects symlinks");
+        }
+        if child_metadata.is_dir() {
+            collect_declared_principal_root_files(&child_path, &child_uri, depth + 1, declared)?;
+        } else if child_metadata.is_file() {
+            declared.insert(child_uri, child_path);
+        } else {
+            anyhow::bail!("declared principal-root inventory rejects special files");
+        }
+        if declared.len() > MAX_PRINCIPAL_ROOT_INVENTORY_OBJECTS {
+            anyhow::bail!("principal-root protected-object inventory exceeds its object bound");
+        }
+    }
+    Ok(())
+}
+
+fn is_bound_principal_root_object_envelope(
+    bytes: &[u8],
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<PrincipalRootObjectEnvelopeV1>(bytes) else {
+        return false;
+    };
+    if validate_principal_root_object_envelope(
+        &envelope,
+        principal_id,
+        localhost_root,
+        &envelope.data_key_id,
+        object_uri,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    b64_url_decode(&envelope.nonce).is_ok_and(|nonce| nonce.len() == 12)
+        && b64_url_decode(&envelope.ciphertext).is_ok_and(|ciphertext| !ciphertext.is_empty())
+}
+
 fn validate_principal_root_object_envelope(
     envelope: &PrincipalRootObjectEnvelopeV1,
     principal_id: &str,
@@ -1795,6 +2953,1000 @@ fn decrypt_aes256_gcm_bytes_with_aad(
             },
         )
         .map_err(|_| anyhow!("principal-root decrypt failed"))
+}
+
+pub fn migrate_principal_root_objects_offline(
+    data_dir: &Path,
+    plan_path: &Path,
+    backup_dir: &Path,
+) -> anyhow::Result<PrincipalRootMigrationReceiptV1> {
+    if !data_dir.is_absolute() || !plan_path.is_absolute() || !backup_dir.is_absolute() {
+        anyhow::bail!("principal-root migration data, plan, and backup paths must all be absolute");
+    }
+    let _host_guard = crate::host_lock::acquire_host_process_lock(
+        data_dir,
+        "principal-root-migration",
+        "offline",
+    )?;
+    let _object_guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    recover_principal_root_migration_journal(data_dir)?;
+
+    match migrate_principal_root_objects_offline_locked(data_dir, plan_path, backup_dir) {
+        Ok(receipt) => Ok(receipt),
+        Err(error) => {
+            #[cfg(test)]
+            if error
+                .downcast_ref::<SimulatedPrincipalRootMigrationCrash>()
+                .is_some()
+            {
+                return Err(error);
+            }
+            if let Err(recovery_error) = recover_principal_root_migration_journal(data_dir) {
+                return Err(anyhow!(
+                    "{error}; principal-root migration recovery also failed: {recovery_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn migrate_principal_root_objects_offline_locked(
+    data_dir: &Path,
+    plan_path: &Path,
+    backup_dir: &Path,
+) -> anyhow::Result<PrincipalRootMigrationReceiptV1> {
+    let plan_metadata = std::fs::symlink_metadata(plan_path)
+        .with_context(|| format!("failed to inspect migration plan {plan_path:?}"))?;
+    if plan_metadata.file_type().is_symlink() || !plan_metadata.is_file() {
+        anyhow::bail!("principal-root migration plan must be a regular non-symlink file");
+    }
+    if plan_metadata.len() > 256 * 1024 {
+        anyhow::bail!("principal-root migration plan exceeds 256 KiB");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if plan_metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("principal-root migration plan must be owner-only");
+        }
+    }
+    let plan_bytes = std::fs::read(plan_path)?;
+    let plan_sha256 = sha256_label(&plan_bytes);
+    let plan: PrincipalRootMigrationPlanV1 = serde_json::from_slice(&plan_bytes)
+        .context("failed to decode principal-root migration plan")?;
+    validate_principal_root_migration_plan(&plan)?;
+    migrate_principal_root_objects_plan_locked(data_dir, &plan, &plan_sha256, backup_dir)
+}
+
+fn migrate_principal_root_objects_plan_locked(
+    data_dir: &Path,
+    plan: &PrincipalRootMigrationPlanV1,
+    plan_sha256: &str,
+    backup_dir: &Path,
+) -> anyhow::Result<PrincipalRootMigrationReceiptV1> {
+    let protection =
+        load_principal_root_protection(data_dir, &plan.principal_id, &plan.localhost_root)?
+            .ok_or_else(|| {
+                anyhow!("principal-root migration requires existing verified Runtime protection")
+            })?;
+    let data_key = principal_root_data_key_from_protection(data_dir, &protection)?;
+
+    if backup_dir.exists() {
+        anyhow::bail!("principal-root migration backup directory must not already exist");
+    }
+    let journal_path = principal_root_migration_journal_path(data_dir)?;
+    if journal_path.exists() {
+        anyhow::bail!("principal-root migration journal already exists");
+    }
+    let stage_dir = journal_path.with_file_name(format!(
+        ".principal-root-migration-{}.stage",
+        &plan_sha256["sha256:".len()..][..24]
+    ));
+    if stage_dir.exists() {
+        anyhow::bail!("principal-root migration stage directory already exists");
+    }
+
+    let mut prepared = Vec::with_capacity(plan.objects.len());
+    let mut total_bytes = 0u64;
+    for (index, selection) in plan.objects.iter().enumerate() {
+        let path = rooted_localhost_fs_path(data_dir, &selection.object_uri)
+            .ok_or_else(|| anyhow!("migration object path is invalid"))?;
+        ensure_no_symlink_components(data_dir, &path)?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect selected migration object {path:?}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!("selected migration object must be a regular non-symlink file");
+        }
+        if metadata.len() > MAX_MIGRATION_OBJECT_BYTES {
+            anyhow::bail!("selected migration object exceeds 16 MiB");
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| anyhow!("migration object byte total overflow"))?;
+        if total_bytes > MAX_MIGRATION_TOTAL_BYTES {
+            anyhow::bail!("selected migration objects exceed 64 MiB");
+        }
+        let plaintext = std::fs::read(&path)?;
+        let plaintext_sha256 = sha256_label(&plaintext);
+        if plaintext_sha256 != selection.plaintext_sha256 {
+            anyhow::bail!("selected migration object plaintext hash mismatch");
+        }
+        if is_bound_principal_root_object_envelope(
+            &plaintext,
+            &plan.principal_id,
+            &plan.localhost_root,
+            &selection.object_uri,
+        ) {
+            anyhow::bail!("selected migration object is already encrypted");
+        }
+        let backup_name = format!(
+            "{index:03}-{}.plaintext.backup",
+            &hex::encode(Sha256::digest(selection.object_uri.as_bytes()))[..24]
+        );
+        let backup_path = backup_dir.join(backup_name);
+        let stage_path = stage_dir.join(format!("{index:03}.encrypted"));
+        let encrypted = encrypt_principal_root_object_bytes(
+            &plan.principal_id,
+            &plan.localhost_root,
+            &selection.object_uri,
+            &protection,
+            &data_key,
+            &plaintext,
+        )?;
+        verify_migrated_principal_root_object(
+            &encrypted,
+            &plan.principal_id,
+            &plan.localhost_root,
+            &selection.object_uri,
+            &protection,
+            &data_key,
+            &selection.plaintext_sha256,
+        )?;
+        prepared.push(PreparedPrincipalRootMigrationObject {
+            journal: PrincipalRootMigrationJournalObjectV1 {
+                object_uri: selection.object_uri.clone(),
+                plaintext_sha256: selection.plaintext_sha256.clone(),
+                backup_path,
+                backup_sha256: plaintext_sha256,
+                stage_path,
+                encrypted_sha256: sha256_label(&encrypted),
+                original_mode: principal_root_file_mode(&metadata),
+            },
+            path,
+            plaintext,
+            encrypted,
+        });
+    }
+
+    create_owner_only_dir(backup_dir)?;
+    create_owner_only_dir(&stage_dir)?;
+    let mut journal = PrincipalRootMigrationJournalV1 {
+        schema: PRINCIPAL_ROOT_MIGRATION_JOURNAL_SCHEMA.to_string(),
+        phase: PrincipalRootMigrationJournalPhaseV1::Prepared,
+        plan_sha256: plan_sha256.to_string(),
+        principal_id: plan.principal_id.clone(),
+        localhost_root: plan.localhost_root.clone(),
+        data_key_id: protection.data_key_id.clone(),
+        backup_dir: backup_dir.to_path_buf(),
+        stage_dir,
+        objects: prepared
+            .iter()
+            .map(|object| object.journal.clone())
+            .collect(),
+    };
+    write_principal_root_migration_journal(data_dir, &journal)?;
+    #[cfg(test)]
+    consume_principal_root_migration_test_fault(
+        data_dir,
+        PrincipalRootMigrationTestFault::JournalPrepared,
+    )?;
+
+    for (index, object) in prepared.iter().enumerate() {
+        write_owner_only_new_file(&object.journal.backup_path, &object.plaintext)?;
+        if sha256_label(&std::fs::read(&object.journal.backup_path)?)
+            != object.journal.backup_sha256
+        {
+            anyhow::bail!("principal-root migration backup verification failed");
+        }
+        maybe_inject_principal_root_migration_indexed_fault(
+            data_dir,
+            PrincipalRootMigrationIndexedFaultStage::Backup,
+            index,
+        )?;
+    }
+    for (index, object) in prepared.iter().enumerate() {
+        write_owner_only_new_file(&object.journal.stage_path, &object.encrypted)?;
+        let staged = std::fs::read(&object.journal.stage_path)?;
+        if sha256_label(&staged) != object.journal.encrypted_sha256 {
+            anyhow::bail!("principal-root migration staged ciphertext hash mismatch");
+        }
+        verify_migrated_principal_root_object(
+            &staged,
+            &plan.principal_id,
+            &plan.localhost_root,
+            &object.journal.object_uri,
+            &protection,
+            &data_key,
+            &object.journal.plaintext_sha256,
+        )?;
+        maybe_inject_principal_root_migration_indexed_fault(
+            data_dir,
+            PrincipalRootMigrationIndexedFaultStage::Stage,
+            index,
+        )?;
+    }
+
+    journal.phase = PrincipalRootMigrationJournalPhaseV1::Committing;
+    write_principal_root_migration_journal(data_dir, &journal)?;
+    #[cfg(test)]
+    consume_principal_root_migration_test_fault(
+        data_dir,
+        PrincipalRootMigrationTestFault::JournalCommitting,
+    )?;
+
+    for (index, object) in prepared.iter().enumerate() {
+        verify_plaintext_migration_target(data_dir, object)?;
+        let staged = std::fs::read(&object.journal.stage_path)?;
+        if sha256_label(&staged) != object.journal.encrypted_sha256 {
+            anyhow::bail!("principal-root migration stage changed before commit");
+        }
+        verify_migrated_principal_root_object(
+            &staged,
+            &journal.principal_id,
+            &journal.localhost_root,
+            &object.journal.object_uri,
+            &protection,
+            &data_key,
+            &object.journal.plaintext_sha256,
+        )?;
+        tempfile::TempPath::try_from_path(object.journal.stage_path.clone())?
+            .persist(&object.path)
+            .map_err(|error| error.error)
+            .context("failed to atomically commit staged principal-root object")?;
+        sync_parent_directory(&object.path)?;
+        maybe_inject_principal_root_migration_indexed_fault(
+            data_dir,
+            PrincipalRootMigrationIndexedFaultStage::Commit,
+            index,
+        )?;
+    }
+
+    for object in &journal.objects {
+        verify_journal_encrypted_object(data_dir, &journal, object, &protection, &data_key)?;
+    }
+    journal.phase = PrincipalRootMigrationJournalPhaseV1::Committed;
+    write_principal_root_migration_journal(data_dir, &journal)?;
+    #[cfg(test)]
+    consume_principal_root_migration_test_fault(
+        data_dir,
+        PrincipalRootMigrationTestFault::JournalCommitted,
+    )?;
+
+    let receipt = principal_root_migration_receipt_from_journal(&journal);
+    write_principal_root_migration_receipt(&journal, &receipt)?;
+    cleanup_principal_root_migration_journal(data_dir, &journal)?;
+    Ok(receipt)
+}
+
+pub fn verify_declared_principal_roots_ready(
+    data_dir: &Path,
+    declarations: &[PrincipalRootUpgradeDeclarationV1],
+) -> anyhow::Result<()> {
+    let _object_guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    require_no_principal_root_migration_journal(data_dir)?;
+    let plans = preflight_declared_principal_root_upgrade(data_dir, declarations)?;
+    if let Some(plan) = plans.first() {
+        require_no_declared_principal_root_plaintext(
+            &plan.principal_id,
+            &plan.localhost_root,
+            plan.objects.len(),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn migrate_declared_principal_roots_offline<F>(
+    data_dir: &Path,
+    backup_dir: &Path,
+    declarations: F,
+) -> anyhow::Result<PrincipalRootUpgradeReceiptV1>
+where
+    F: FnOnce() -> anyhow::Result<Vec<PrincipalRootUpgradeDeclarationV1>>,
+{
+    if !data_dir.is_absolute() || !backup_dir.is_absolute() {
+        anyhow::bail!("principal-root upgrade data and backup paths must be absolute");
+    }
+    let expected_backup_parent = data_dir.join("backups");
+    if backup_dir.parent() != Some(expected_backup_parent.as_path()) {
+        anyhow::bail!("principal-root upgrade backup must be a direct child of data-dir/backups");
+    }
+    let _host_guard =
+        crate::host_lock::acquire_host_process_lock(data_dir, "principal-root-upgrade", "offline")?;
+    let _object_guard = principal_root_object_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("principal-root object mutation lock poisoned"))?;
+    let declarations = declarations()?;
+    if recover_principal_root_migration_journal(data_dir)? {
+        anyhow::bail!(
+            "recovered an incomplete principal-root migration; rerun the upgrade after reviewing the retained owner-only backup"
+        );
+    }
+
+    let plans = preflight_declared_principal_root_upgrade(data_dir, &declarations)?;
+    if plans.is_empty() {
+        return Ok(PrincipalRootUpgradeReceiptV1 {
+            schema: PRINCIPAL_ROOT_UPGRADE_RECEIPT_SCHEMA.to_string(),
+            status: "already_ready".to_string(),
+            root_count: 0,
+            object_count: 0,
+            roots: Vec::new(),
+        });
+    }
+    if backup_dir.exists() {
+        anyhow::bail!("principal-root upgrade backup directory must not already exist");
+    }
+    ensure_no_symlink_components(data_dir, backup_dir)?;
+    ensure_safe_backup_parent(&expected_backup_parent)?;
+    create_owner_only_dir(backup_dir)?;
+
+    let mut roots = Vec::with_capacity(plans.len());
+    for (index, plan) in plans.iter().enumerate() {
+        let plan_bytes = serde_json::to_vec_pretty(plan)?;
+        let plan_sha256 = sha256_label(&plan_bytes);
+        let root_backup_dir = backup_dir.join(format!("root-{index:03}"));
+        match migrate_principal_root_objects_plan_locked(
+            data_dir,
+            plan,
+            &plan_sha256,
+            &root_backup_dir,
+        ) {
+            Ok(receipt) => roots.push(receipt),
+            Err(error) => {
+                if let Err(recovery_error) = recover_principal_root_migration_journal(data_dir) {
+                    return Err(anyhow!(
+                        "{error}; principal-root upgrade recovery also failed: {recovery_error}"
+                    ));
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    let remaining = preflight_declared_principal_root_upgrade(data_dir, &declarations)?;
+    if !remaining.is_empty() {
+        anyhow::bail!("principal-root upgrade left declared plaintext objects");
+    }
+    let receipt = PrincipalRootUpgradeReceiptV1 {
+        schema: PRINCIPAL_ROOT_UPGRADE_RECEIPT_SCHEMA.to_string(),
+        status: "migrated".to_string(),
+        root_count: roots.len(),
+        object_count: roots.iter().map(|root| root.object_count).sum(),
+        roots,
+    };
+    let receipt_path = backup_dir.join(PRINCIPAL_ROOT_UPGRADE_RECEIPT_FILE);
+    write_owner_only_new_file(&receipt_path, &serde_json::to_vec_pretty(&receipt)?)?;
+    sync_parent_directory(&receipt_path)?;
+    Ok(receipt)
+}
+
+fn preflight_declared_principal_root_upgrade(
+    data_dir: &Path,
+    declarations: &[PrincipalRootUpgradeDeclarationV1],
+) -> anyhow::Result<Vec<PrincipalRootMigrationPlanV1>> {
+    let state = load_auth_state(data_dir)?;
+    let mut protections = std::collections::BTreeMap::new();
+    for protection in state.principal_root_protections {
+        validate_principal_root_protection(&protection).map_err(anyhow::Error::msg)?;
+        let key = (
+            protection.principal_id.clone(),
+            protection.localhost_root.clone(),
+        );
+        if protections.insert(key, protection).is_some() {
+            anyhow::bail!("configured principal-root protections contain a duplicate binding");
+        }
+    }
+    let mut declared = std::collections::BTreeMap::new();
+    for declaration in declarations {
+        let key = (
+            declaration.principal_id.clone(),
+            declaration.localhost_root.clone(),
+        );
+        if declared.insert(key, declaration).is_some() {
+            anyhow::bail!("principal-root upgrade declarations contain a duplicate binding");
+        }
+    }
+    if protections.keys().ne(declared.keys()) {
+        anyhow::bail!(
+            "principal-root upgrade declarations must exactly match configured protections"
+        );
+    }
+
+    let mut plans = Vec::new();
+    for (key, protection) in protections {
+        let declaration = declared
+            .get(&key)
+            .ok_or_else(|| anyhow!("principal-root upgrade declaration disappeared"))?;
+        let classified = classify_declared_principal_root_objects(
+            data_dir,
+            &declaration.principal_id,
+            &declaration.localhost_root,
+            &declaration.inventory,
+        )?;
+        verify_classified_principal_root_objects_with_stored_protection(
+            data_dir,
+            Some(&protection),
+            &classified,
+        )?;
+        if !classified.plaintext_objects.is_empty() {
+            let plan = PrincipalRootMigrationPlanV1 {
+                schema: PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA.to_string(),
+                principal_id: declaration.principal_id.clone(),
+                localhost_root: declaration.localhost_root.clone(),
+                objects: classified.plaintext_objects,
+            };
+            validate_principal_root_migration_plan(&plan)?;
+            plans.push(plan);
+        }
+    }
+    Ok(plans)
+}
+
+fn require_no_principal_root_migration_journal(data_dir: &Path) -> anyhow::Result<()> {
+    let journal_path = principal_root_migration_journal_path(data_dir)?;
+    match std::fs::symlink_metadata(&journal_path) {
+        Ok(_) => {
+            anyhow::bail!(
+                "principal-root migration is incomplete; Home readiness is blocked until offline recovery completes"
+            )
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).context("failed to inspect the principal-root migration readiness journal")
+        }
+    }
+}
+
+fn ensure_safe_backup_parent(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!(
+                    "principal-root upgrade backup parent must be a non-symlink directory"
+                );
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => create_owner_only_dir(path),
+        Err(error) => Err(error).context("failed to inspect principal-root upgrade backup parent"),
+    }
+}
+
+fn validate_principal_root_migration_plan(
+    plan: &PrincipalRootMigrationPlanV1,
+) -> anyhow::Result<()> {
+    if plan.schema != PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA {
+        anyhow::bail!("unsupported principal-root migration plan schema");
+    }
+    validate_principal_root_object_binding(
+        &plan.principal_id,
+        &plan.localhost_root,
+        &plan.localhost_root,
+    )?;
+    if plan.objects.is_empty() || plan.objects.len() > MAX_MIGRATION_OBJECTS {
+        anyhow::bail!("migration plan must select 1-64 objects");
+    }
+    let mut uris = std::collections::BTreeSet::new();
+    for selection in &plan.objects {
+        validate_principal_root_object_binding(
+            &plan.principal_id,
+            &plan.localhost_root,
+            &selection.object_uri,
+        )?;
+        if !is_sha256_label(&selection.plaintext_sha256) {
+            anyhow::bail!("migration plaintext hash must be sha256:<64 lowercase hex>");
+        }
+        if !uris.insert(selection.object_uri.as_str()) {
+            anyhow::bail!("migration plan contains duplicate object URIs");
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_principal_root_object_bytes(
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    protection: &PrincipalRootProtectionV1,
+    data_key: &[u8; 32],
+    plaintext: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let mut envelope = PrincipalRootObjectEnvelopeV1 {
+        schema: PRINCIPAL_ROOT_OBJECT_SCHEMA.to_string(),
+        principal_id: principal_id.to_string(),
+        localhost_root: localhost_root.to_string(),
+        data_key_id: protection.data_key_id.clone(),
+        object_uri: object_uri.to_string(),
+        cipher: DEFAULT_PRINCIPAL_ROOT_CIPHER.to_string(),
+        nonce: b64_url(&nonce),
+        ciphertext: String::new(),
+    };
+    envelope.ciphertext = encrypt_aes256_gcm_bytes_with_aad(
+        data_key,
+        &nonce,
+        plaintext,
+        principal_root_object_aad(&envelope).as_bytes(),
+    )?;
+    serde_json::to_vec_pretty(&envelope).map_err(Into::into)
+}
+
+fn verify_migrated_principal_root_object(
+    encrypted: &[u8],
+    principal_id: &str,
+    localhost_root: &str,
+    object_uri: &str,
+    protection: &PrincipalRootProtectionV1,
+    data_key: &[u8; 32],
+    plaintext_sha256: &str,
+) -> anyhow::Result<()> {
+    let envelope: PrincipalRootObjectEnvelopeV1 = serde_json::from_slice(encrypted)?;
+    validate_principal_root_object_envelope(
+        &envelope,
+        principal_id,
+        localhost_root,
+        &protection.data_key_id,
+        object_uri,
+    )?;
+    let nonce = b64_url_decode(&envelope.nonce)?;
+    if nonce.len() != 12 {
+        anyhow::bail!("principal-root object nonce must be 12 bytes");
+    }
+    let ciphertext = b64_url_decode(&envelope.ciphertext)?;
+    let plaintext = decrypt_aes256_gcm_bytes_with_aad(
+        data_key,
+        &nonce,
+        &ciphertext,
+        principal_root_object_aad(&envelope).as_bytes(),
+    )?;
+    if sha256_label(&plaintext) != plaintext_sha256 {
+        anyhow::bail!("principal-root migration round-trip verification failed");
+    }
+    Ok(())
+}
+
+fn verify_plaintext_migration_target(
+    data_dir: &Path,
+    object: &PreparedPrincipalRootMigrationObject,
+) -> anyhow::Result<()> {
+    ensure_no_symlink_components(data_dir, &object.path)?;
+    let metadata = std::fs::symlink_metadata(&object.path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("selected migration object changed type before commit");
+    }
+    if sha256_label(&std::fs::read(&object.path)?) != object.journal.plaintext_sha256 {
+        anyhow::bail!("selected migration object changed before commit");
+    }
+    Ok(())
+}
+
+fn principal_root_migration_journal_path(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let auth_state = auth_state_path(data_dir)?;
+    Ok(auth_state.with_file_name(PRINCIPAL_ROOT_MIGRATION_JOURNAL_FILE))
+}
+
+fn write_principal_root_migration_journal(
+    data_dir: &Path,
+    journal: &PrincipalRootMigrationJournalV1,
+) -> anyhow::Result<()> {
+    validate_principal_root_migration_journal(journal)?;
+    let bytes = serde_json::to_vec_pretty(journal)?;
+    if bytes.len() > 256 * 1024 {
+        anyhow::bail!("principal-root migration journal exceeds 256 KiB");
+    }
+    durable_atomic_replace(
+        &principal_root_migration_journal_path(data_dir)?,
+        &bytes,
+        0o600,
+    )
+}
+
+fn validate_principal_root_migration_journal(
+    journal: &PrincipalRootMigrationJournalV1,
+) -> anyhow::Result<()> {
+    if journal.schema != PRINCIPAL_ROOT_MIGRATION_JOURNAL_SCHEMA {
+        anyhow::bail!("unsupported principal-root migration journal schema");
+    }
+    if !is_sha256_label(&journal.plan_sha256) {
+        anyhow::bail!("principal-root migration journal plan hash is invalid");
+    }
+    validate_principal_root_object_binding(
+        &journal.principal_id,
+        &journal.localhost_root,
+        &journal.localhost_root,
+    )?;
+    if journal.objects.is_empty() || journal.objects.len() > MAX_MIGRATION_OBJECTS {
+        anyhow::bail!("principal-root migration journal object count is invalid");
+    }
+    let mut uris = std::collections::BTreeSet::new();
+    for object in &journal.objects {
+        validate_principal_root_object_binding(
+            &journal.principal_id,
+            &journal.localhost_root,
+            &object.object_uri,
+        )?;
+        if !uris.insert(object.object_uri.as_str())
+            || !is_sha256_label(&object.plaintext_sha256)
+            || !is_sha256_label(&object.backup_sha256)
+            || !is_sha256_label(&object.encrypted_sha256)
+            || object.backup_path.parent() != Some(journal.backup_dir.as_path())
+            || object.stage_path.parent() != Some(journal.stage_dir.as_path())
+        {
+            anyhow::bail!("principal-root migration journal object is invalid");
+        }
+    }
+    Ok(())
+}
+
+fn recover_principal_root_migration_journal(data_dir: &Path) -> anyhow::Result<bool> {
+    let path = principal_root_migration_journal_path(data_dir)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).context("failed to inspect principal-root migration journal"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("principal-root migration journal must be a regular non-symlink file");
+    }
+    if metadata.len() > 256 * 1024 {
+        anyhow::bail!("principal-root migration journal exceeds 256 KiB");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("principal-root migration journal must be owner-only");
+        }
+    }
+    let journal: PrincipalRootMigrationJournalV1 =
+        serde_json::from_slice(&std::fs::read(&path)?)
+            .context("failed to decode principal-root migration journal")?;
+    validate_principal_root_migration_journal(&journal)?;
+    let protection =
+        load_principal_root_protection(data_dir, &journal.principal_id, &journal.localhost_root)?
+            .ok_or_else(|| anyhow!("principal-root migration journal has no existing protection"))?;
+    if protection.data_key_id != journal.data_key_id {
+        anyhow::bail!("principal-root migration journal protection binding mismatch");
+    }
+    let data_key = principal_root_data_key_from_protection(data_dir, &protection)?;
+
+    match journal.phase {
+        PrincipalRootMigrationJournalPhaseV1::Prepared => {
+            for object in &journal.objects {
+                verify_journal_plaintext_object(data_dir, &journal, object)?;
+            }
+        }
+        PrincipalRootMigrationJournalPhaseV1::Committing => {
+            for object in &journal.objects {
+                restore_journal_plaintext_object(data_dir, &journal, object)?;
+            }
+        }
+        PrincipalRootMigrationJournalPhaseV1::Committed => {
+            let retain_encrypted = journal.objects.iter().all(|object| {
+                verify_journal_encrypted_object(data_dir, &journal, object, &protection, &data_key)
+                    .is_ok()
+            });
+            if retain_encrypted {
+                let receipt = principal_root_migration_receipt_from_journal(&journal);
+                write_principal_root_migration_receipt(&journal, &receipt)?;
+            } else {
+                for object in &journal.objects {
+                    restore_journal_plaintext_object(data_dir, &journal, object)?;
+                }
+                remove_principal_root_migration_receipt(&journal)?;
+            }
+        }
+    }
+    cleanup_principal_root_migration_journal(data_dir, &journal)?;
+    Ok(true)
+}
+
+fn principal_root_migration_receipt_from_journal(
+    journal: &PrincipalRootMigrationJournalV1,
+) -> PrincipalRootMigrationReceiptV1 {
+    let objects = journal
+        .objects
+        .iter()
+        .map(|object| PrincipalRootMigrationObjectReceiptV1 {
+            object_uri_sha256: sha256_label(object.object_uri.as_bytes()),
+            plaintext_sha256: object.plaintext_sha256.clone(),
+            backup_sha256: object.backup_sha256.clone(),
+            encrypted_sha256: object.encrypted_sha256.clone(),
+            round_trip_verified: true,
+        })
+        .collect::<Vec<_>>();
+    PrincipalRootMigrationReceiptV1 {
+        schema: PRINCIPAL_ROOT_MIGRATION_RECEIPT_SCHEMA.to_string(),
+        status: "migrated".to_string(),
+        plan_sha256: journal.plan_sha256.clone(),
+        principal_binding_sha256: sha256_label(
+            format!("{}\n{}", journal.principal_id, journal.localhost_root).as_bytes(),
+        ),
+        object_count: objects.len(),
+        objects,
+    }
+}
+
+fn write_principal_root_migration_receipt(
+    journal: &PrincipalRootMigrationJournalV1,
+    receipt: &PrincipalRootMigrationReceiptV1,
+) -> anyhow::Result<()> {
+    let path = journal
+        .backup_dir
+        .join(PRINCIPAL_ROOT_MIGRATION_RECEIPT_FILE);
+    let bytes = serde_json::to_vec_pretty(receipt)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!(
+                    "principal-root migration receipt must be a regular non-symlink file"
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    anyhow::bail!("principal-root migration receipt must be owner-only");
+                }
+            }
+            if std::fs::read(&path)? != bytes {
+                anyhow::bail!("principal-root migration receipt changed unexpectedly");
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            write_owner_only_new_file(&path, &bytes)?;
+            sync_parent_directory(&path)?;
+        }
+        Err(error) => {
+            return Err(error).context("failed to inspect principal-root migration receipt")
+        }
+    }
+    Ok(())
+}
+
+fn remove_principal_root_migration_receipt(
+    journal: &PrincipalRootMigrationJournalV1,
+) -> anyhow::Result<()> {
+    let path = journal
+        .backup_dir
+        .join(PRINCIPAL_ROOT_MIGRATION_RECEIPT_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                anyhow::bail!(
+                    "principal-root migration receipt must be a regular non-symlink file"
+                );
+            }
+            std::fs::remove_file(&path)?;
+            sync_parent_directory(&path)?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("failed to inspect principal-root migration receipt")
+        }
+    }
+    Ok(())
+}
+
+fn verify_journal_plaintext_object(
+    data_dir: &Path,
+    journal: &PrincipalRootMigrationJournalV1,
+    object: &PrincipalRootMigrationJournalObjectV1,
+) -> anyhow::Result<()> {
+    let path = rooted_localhost_fs_path(data_dir, &object.object_uri)
+        .ok_or_else(|| anyhow!("principal-root migration journal object path is invalid"))?;
+    ensure_no_symlink_components(data_dir, &path)?;
+    validate_principal_root_object_binding(
+        &journal.principal_id,
+        &journal.localhost_root,
+        &object.object_uri,
+    )?;
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("selected migration object changed type before recovery");
+    }
+    if sha256_label(&std::fs::read(path)?) != object.plaintext_sha256 {
+        anyhow::bail!("selected migration object changed before recovery");
+    }
+    Ok(())
+}
+
+fn verify_journal_encrypted_object(
+    data_dir: &Path,
+    journal: &PrincipalRootMigrationJournalV1,
+    object: &PrincipalRootMigrationJournalObjectV1,
+    protection: &PrincipalRootProtectionV1,
+    data_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    let path = rooted_localhost_fs_path(data_dir, &object.object_uri)
+        .ok_or_else(|| anyhow!("principal-root migration journal object path is invalid"))?;
+    ensure_no_symlink_components(data_dir, &path)?;
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("migrated principal-root object must be a regular non-symlink file");
+    }
+    let encrypted = std::fs::read(&path)?;
+    if sha256_label(&encrypted) != object.encrypted_sha256 {
+        anyhow::bail!("migrated principal-root object ciphertext hash mismatch");
+    }
+    verify_migrated_principal_root_object(
+        &encrypted,
+        &journal.principal_id,
+        &journal.localhost_root,
+        &object.object_uri,
+        protection,
+        data_key,
+        &object.plaintext_sha256,
+    )
+}
+
+fn restore_journal_plaintext_object(
+    data_dir: &Path,
+    journal: &PrincipalRootMigrationJournalV1,
+    object: &PrincipalRootMigrationJournalObjectV1,
+) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(&object.backup_path)
+        .context("failed to inspect principal-root migration backup")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("principal-root migration backup must be a regular non-symlink file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("principal-root migration backup must be owner-only");
+        }
+    }
+    let plaintext = std::fs::read(&object.backup_path)?;
+    if sha256_label(&plaintext) != object.backup_sha256
+        || object.backup_sha256 != object.plaintext_sha256
+    {
+        anyhow::bail!("principal-root migration backup hash mismatch");
+    }
+    let path = rooted_localhost_fs_path(data_dir, &object.object_uri)
+        .ok_or_else(|| anyhow!("principal-root migration journal object path is invalid"))?;
+    ensure_no_symlink_components(data_dir, &path)?;
+    validate_principal_root_object_binding(
+        &journal.principal_id,
+        &journal.localhost_root,
+        &object.object_uri,
+    )?;
+    durable_atomic_replace(&path, &plaintext, object.original_mode)?;
+    if sha256_label(&std::fs::read(path)?) != object.plaintext_sha256 {
+        anyhow::bail!("principal-root migration rollback verification failed");
+    }
+    Ok(())
+}
+
+fn cleanup_principal_root_migration_journal(
+    data_dir: &Path,
+    journal: &PrincipalRootMigrationJournalV1,
+) -> anyhow::Result<()> {
+    for object in &journal.objects {
+        match std::fs::remove_file(&object.stage_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(err).context("failed to remove migration stage object"),
+        }
+    }
+    match std::fs::remove_dir(&journal.stage_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("failed to remove migration stage directory"),
+    }
+    let journal_path = principal_root_migration_journal_path(data_dir)?;
+    std::fs::remove_file(&journal_path)?;
+    sync_parent_directory(&journal_path)
+}
+
+fn create_owner_only_dir(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir(path)?;
+    Ok(())
+}
+
+fn durable_atomic_replace(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("durable replacement path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(if mode == 0 {
+                0o600
+            } else {
+                mode
+            }))?;
+    }
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| error.error)
+        .context("failed to durably replace file")?;
+    sync_parent_directory(path)
+}
+
+fn principal_root_file_mode(metadata: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
+}
+
+fn ensure_no_symlink_components(data_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    let relative = path
+        .strip_prefix(data_dir)
+        .map_err(|_| anyhow!("principal-root object path escapes the Runtime data root"))?;
+    let mut current = data_dir.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("principal-root object path rejects symlink components")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error).context("failed to inspect principal-root object path")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_owner_only_new_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn sha256_label(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn is_sha256_label(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -1963,6 +4115,132 @@ mod tests {
             last_used_at,
             revoked_at: None,
         })
+    }
+
+    fn recovered_root_reassignment_fixture(
+        data_dir: &Path,
+    ) -> (
+        RecoveredRootReassignment,
+        PrincipalRecord,
+        AuthSessionGrantV1,
+    ) {
+        let updated_at = now_ts();
+        let current = upsert_principal_for_binding_as_role(
+            data_dir,
+            passkey_binding(1, updated_at, updated_at),
+            "person:local:current-passkey".to_string(),
+            RuntimePrincipalRole::Guest,
+            updated_at,
+        )
+        .unwrap();
+        let current_grant = AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: "grant:current-passkey".to_string(),
+            session_id: "auth:current-passkey".to_string(),
+            principal_id: current.principal_id.clone(),
+            proof_binding_id: current.proof_binding_id.clone(),
+            issued_at: updated_at,
+            expires_at: updated_at + 3_600,
+            apps: vec!["home".to_string(), "system".to_string()],
+        };
+        store_session_grant(data_dir, current_grant.clone()).unwrap();
+
+        let recovered_principal_id = "person:local:recovered-signature-test".to_string();
+        let protection = store_test_principal_root_protection(data_dir, &recovered_principal_id);
+        let replacement_grant = AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: "grant:recovered-signature-test".to_string(),
+            session_id: "auth:recovered-signature-test".to_string(),
+            principal_id: recovered_principal_id.clone(),
+            proof_binding_id: current.proof_binding_id.clone(),
+            issued_at: updated_at,
+            expires_at: updated_at + 3_600,
+            apps: vec!["home".to_string(), "system".to_string()],
+        };
+        let signed_audit_event = sign_audit_event(
+            data_dir,
+            RuntimeAuditEventV1 {
+                schema: RuntimeAuditEventV1::SCHEMA.to_string(),
+                event_id: "audit:recovered-signature-test".to_string(),
+                event_type: "auth.recovery_kit.reassigned".to_string(),
+                principal_id: Some(recovered_principal_id.clone()),
+                proof_binding_id: Some(current.proof_binding_id.clone()),
+                session_id: Some(replacement_grant.session_id.clone()),
+                challenge_id: None,
+                capsule_id: None,
+                result: "ok".to_string(),
+                reason: "principal root reassigned from verified Recovery Kit and session reissued"
+                    .to_string(),
+                occurred_at: updated_at,
+                signer_did: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        (
+            RecoveredRootReassignment {
+                proof_binding_id: current.proof_binding_id.clone(),
+                recovered_principal_id,
+                recovered_localhost_root: protection.localhost_root.clone(),
+                protection,
+                replacement_grant,
+                signed_audit_event,
+                updated_at,
+            },
+            current,
+            current_grant,
+        )
+    }
+
+    #[test]
+    fn recovered_root_reassignment_rejects_invalid_audit_signatures_before_mutation() {
+        for case in ["malformed", "substituted", "wrong-runtime-signer"] {
+            let data_dir = tempfile::tempdir().unwrap();
+            let (mut reassignment, current, current_grant) =
+                recovered_root_reassignment_fixture(data_dir.path());
+            match case {
+                "malformed" => {
+                    reassignment.signed_audit_event.signature =
+                        Some("not-a-valid-signature".to_string());
+                }
+                "substituted" => {
+                    reassignment.signed_audit_event.reason =
+                        "substituted after Runtime signing".to_string();
+                }
+                "wrong-runtime-signer" => {
+                    let foreign_dir = tempfile::tempdir().unwrap();
+                    reassignment.signed_audit_event =
+                        sign_audit_event(foreign_dir.path(), reassignment.signed_audit_event)
+                            .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let replacement_session_id = reassignment.replacement_grant.session_id.clone();
+            let before = serde_json::to_value(load_auth_state(data_dir.path()).unwrap()).unwrap();
+
+            let error = commit_recovered_root_reassignment(data_dir.path(), reassignment)
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("signature") || error.contains("signer"),
+                "{case} failed for an unexpected reason: {error}"
+            );
+            let after = serde_json::to_value(load_auth_state(data_dir.path()).unwrap()).unwrap();
+            assert_eq!(after, before, "{case} mutated auth state");
+            let retained =
+                load_principal_for_proof_binding(data_dir.path(), &current.proof_binding_id)
+                    .unwrap();
+            assert_eq!(retained.principal_id, current.principal_id);
+            assert!(
+                is_auth_session_active(data_dir.path(), &current_grant.session_id, now_ts())
+                    .unwrap()
+            );
+            assert!(
+                !is_auth_session_active(data_dir.path(), &replacement_session_id, now_ts())
+                    .unwrap()
+            );
+        }
     }
 
     #[test]
@@ -2239,7 +4517,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_chain_activation_is_fail_closed() {
+    fn audit_chain_activation_recovers_and_rejects_signed_state_rollback() {
         let data_dir = tempfile::tempdir().unwrap();
         append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
 
@@ -2247,27 +4525,77 @@ mod tests {
         let marker = std::fs::read(&marker_path).unwrap();
 
         std::fs::remove_file(&marker_path).unwrap();
-        let err = verify_auth_audit_chain_ready(data_dir.path()).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("audit chain activation record is required"));
-        std::fs::write(&marker_path, marker).unwrap();
+        verify_auth_audit_chain_ready(data_dir.path()).unwrap();
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker);
 
-        let mut tampered = load_auth_state(data_dir.path()).unwrap();
-        tampered.audit_chain.clear();
-        save_auth_state(data_dir.path(), &tampered).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let first_state = std::fs::read(&auth_path).unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(2)).unwrap();
+        std::fs::write(&auth_path, first_state).unwrap();
+
         let err = load_auth_state(data_dir.path()).unwrap_err().to_string();
-        assert!(err.contains("does not match the persisted chain head"));
+        assert!(err.contains("audit chain rollback detected"));
+    }
 
-        let mut unchained = tampered;
-        unchained.audit_chain_state = None;
-        unchained.audit_chain_anchor = None;
-        std::fs::remove_file(&marker_path).unwrap();
-        save_auth_state(data_dir.path(), &unchained).unwrap();
-        let err = load_auth_state(data_dir.path()).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("unchained audit history is unsupported"));
+    #[test]
+    fn audit_chain_activation_advances_after_an_interrupted_checkpoint_publish() {
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
+
+        let marker_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let stale_marker = std::fs::read(&marker_path).unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(2)).unwrap();
+        let advanced_marker = std::fs::read(&marker_path).unwrap();
+        assert_ne!(stale_marker, advanced_marker);
+
+        std::fs::write(&marker_path, stale_marker).unwrap();
+        verify_auth_audit_chain_ready(data_dir.path()).unwrap();
+        assert_eq!(std::fs::read(&marker_path).unwrap(), advanced_marker);
+    }
+
+    #[test]
+    fn audit_chain_activation_rejects_same_sequence_substitution() {
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
+        let activated_at = load_auth_state(data_dir.path())
+            .unwrap()
+            .audit_chain_state
+            .unwrap()
+            .activated_at;
+
+        let mut substituted = AuthState {
+            audit_chain_state: Some(
+                sign_audit_chain_state(data_dir.path(), activated_at, None).unwrap(),
+            ),
+            ..AuthState::default()
+        };
+        let mut event = test_audit_event(1);
+        event.reason = "substituted-at-the-same-sequence".to_string();
+        let event = sign_audit_event(data_dir.path(), event).unwrap();
+        push_audit_event(data_dir.path(), &mut substituted, event).unwrap();
+        std::fs::write(
+            auth_state_path(data_dir.path()).unwrap(),
+            serde_json::to_vec_pretty(&substituted).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(error.contains("truncation or substitution detected"));
+    }
+
+    #[test]
+    fn first_authority_write_activates_the_signed_audit_checkpoint() {
+        let data_dir = tempfile::tempdir().unwrap();
+        upsert_principal_for_binding(data_dir.path(), passkey_binding(1, 10, 10), 10).unwrap();
+
+        let state = load_auth_state(data_dir.path()).unwrap();
+        let activation = load_audit_chain_activation(data_dir.path())
+            .unwrap()
+            .unwrap();
+        let chain_state = state.audit_chain_state.as_ref().unwrap();
+        assert_eq!(activation.activated_at, chain_state.activated_at);
+        assert_eq!(activation.checkpoint.head_sequence, 0);
+        assert_eq!(activation.checkpoint.head_hash, AUDIT_CHAIN_GENESIS);
     }
 
     #[test]
@@ -2283,14 +4611,12 @@ mod tests {
             sign_audit_chain_state(data_dir.path(), activated_at, state.audit_chain.last())
                 .unwrap(),
         );
-        save_auth_state(data_dir.path(), &state).unwrap();
-        let state = load_auth_state(data_dir.path()).unwrap();
         let foreign_dir = tempfile::tempdir().unwrap();
         let (_, foreign_did) = elastos_identity::load_or_create_did(foreign_dir.path()).unwrap();
 
         let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
         let activation_bytes = std::fs::read(&activation_path).unwrap();
-        let mut foreign_activation: AuditChainActivationV1 =
+        let mut foreign_activation: AuditChainActivationV2 =
             serde_json::from_slice(&activation_bytes).unwrap();
         foreign_activation.signer_did = foreign_did.clone();
         std::fs::write(
@@ -2340,11 +4666,13 @@ mod tests {
     #[test]
     fn retained_audit_chain_requires_its_signed_anchor() {
         let data_dir = tempfile::tempdir().unwrap();
+        let mut state = AuthState::default();
+        ensure_audit_chain_state(data_dir.path(), &mut state).unwrap();
+        save_auth_state(data_dir.path(), &state).unwrap();
         for index in 1..=3 {
-            append_audit_event(data_dir.path(), test_audit_event(index)).unwrap();
+            let event = sign_audit_event(data_dir.path(), test_audit_event(index)).unwrap();
+            push_audit_event(data_dir.path(), &mut state, event).unwrap();
         }
-
-        let mut state = load_auth_state(data_dir.path()).unwrap();
         retain_audit_tail(data_dir.path(), &mut state, 2).unwrap();
         let activated_at = state.audit_chain_state.as_ref().unwrap().activated_at;
         state.audit_chain_state = Some(
@@ -2367,9 +4695,92 @@ mod tests {
             sign_audit_chain_state(data_dir.path(), activated_at, truncated.audit_chain.last())
                 .unwrap(),
         );
-        save_auth_state(data_dir.path(), &truncated).unwrap();
-        let err = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        let err = save_auth_state(data_dir.path(), &truncated)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not continue from its retained anchor"));
+    }
+
+    #[test]
+    fn legacy_unchained_authority_is_rejected_before_expiry_pruning() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut legacy = AuthState::default();
+        legacy.challenges.push(StoredAuthChallenge {
+            challenge: AuthChallengeV1 {
+                schema: AuthChallengeV1::SCHEMA.to_string(),
+                challenge_id: "challenge:legacy-expired".to_string(),
+                domain: "localhost".to_string(),
+                uri: "http://localhost/apps/home/".to_string(),
+                statement: "Sign in to ElastOS Runtime.".to_string(),
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                chain_id: 20,
+                nonce: "legacy-expired".to_string(),
+                issued_at: 0,
+                expires_at: 1,
+                resources: vec!["elastos://auth/challenge/legacy-expired".to_string()],
+            },
+            consumed_at: None,
+        });
+        let path = auth_state_path(data_dir.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let err = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(err.contains("unchained auth state is unsupported"));
+        assert!(err.contains("fresh data root"));
+        assert!(err.contains("no automatic migration"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_secret_files_are_private_and_symlink_paths_fail_closed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let data_dir = tempfile::tempdir().unwrap();
+        append_audit_event(data_dir.path(), test_audit_event(1)).unwrap();
+        for path in [
+            auth_state_path(data_dir.path()).unwrap(),
+            audit_chain_activation_path(data_dir.path()).unwrap(),
+            auth_state_lock_path(data_dir.path()).unwrap(),
+            audit_chain_activation_lock_path(data_dir.path()).unwrap(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let marker = audit_chain_activation_path(data_dir.path()).unwrap();
+        let target = marker.with_file_name("attacker-activation.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        symlink(&target, &marker).unwrap();
+        let error = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(error.contains("regular non-symlink file"));
+
+        let poisoned_data_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let relative_auth_parent = auth_state_path(poisoned_data_dir.path())
+            .unwrap()
+            .parent()
+            .unwrap()
+            .strip_prefix(poisoned_data_dir.path())
+            .unwrap()
+            .to_path_buf();
+        let first_component = relative_auth_parent
+            .components()
+            .next()
+            .expect("auth path must be below the data root");
+        symlink(
+            outside.path(),
+            poisoned_data_dir.path().join(first_component.as_os_str()),
+        )
+        .unwrap();
+        let error = append_audit_event(poisoned_data_dir.path(), test_audit_event(1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("regular non-symlink directories"));
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -2543,6 +4954,838 @@ mod tests {
         assert!(err
             .to_string()
             .contains("protected principal-root object is not encrypted"));
+    }
+
+    #[test]
+    fn root_protection_activation_rejects_untouched_declared_plaintext_without_mutation() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:gba-transition";
+        let localhost_root = principal_localhost_root(principal_id);
+        let object_uri = format!("{localhost_root}/.AppData/LocalHost/GBA/ucity/rom-id.sav");
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"existing uCity save").unwrap();
+        let inventory = [PrincipalRootProtectedObjectDeclarationV1::root(format!(
+            "{localhost_root}/.AppData/LocalHost/GBA"
+        ))];
+        let before = std::fs::read(
+            auth_state_path(data_dir.path())
+                .unwrap_or_else(|_| data_dir.path().join("missing-auth-state")),
+        )
+        .ok();
+
+        let err = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            &inventory,
+        )
+        .expect_err("untouched declared plaintext must block root protection");
+        let outcome = err
+            .downcast_ref::<PrincipalRootMigrationRequiredV1>()
+            .expect("typed migration-required outcome");
+
+        assert_eq!(outcome.schema, PRINCIPAL_ROOT_MIGRATION_REQUIRED_SCHEMA);
+        assert_eq!(outcome.code, "declared_plaintext_objects");
+        assert_eq!(outcome.plaintext_object_count, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing uCity save");
+        assert_eq!(
+            std::fs::read(auth_state_path(data_dir.path()).unwrap()).ok(),
+            before
+        );
+        assert!(
+            load_principal_root_protection(data_dir.path(), principal_id, &localhost_root)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn root_protection_activation_rejects_plaintext_despite_existing_protection() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:configured-plaintext";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Documents/plaintext.md", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"legacy plaintext").unwrap();
+        let before = std::fs::read(auth_state_path(data_dir.path()).unwrap()).unwrap();
+
+        let err = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &[PrincipalRootProtectedObjectDeclarationV1::exact(object_uri)],
+        )
+        .expect_err("a protection record must not excuse declared plaintext");
+        let outcome = err
+            .downcast_ref::<PrincipalRootMigrationRequiredV1>()
+            .expect("typed migration-required outcome");
+
+        assert_eq!(outcome.code, "declared_plaintext_objects");
+        assert_eq!(outcome.plaintext_object_count, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"legacy plaintext");
+        assert_eq!(
+            std::fs::read(auth_state_path(data_dir.path()).unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn root_protection_activation_accepts_exact_retained_key_binding() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:retained-binding";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Documents/exact.md", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        write_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            b"exact retained key",
+        )
+        .unwrap();
+
+        let _activation = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &[PrincipalRootProtectedObjectDeclarationV1::exact(object_uri)],
+        )
+        .expect("the exact retained protection must authenticate its envelope");
+    }
+
+    #[test]
+    fn root_protection_activation_rejects_substituted_data_key_binding() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:retained-key";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let other_data_dir = tempfile::tempdir().unwrap();
+        let other_protection =
+            store_test_principal_root_protection(other_data_dir.path(), "person:local:other-key");
+        let other_data_key =
+            principal_root_data_key_from_protection(other_data_dir.path(), &other_protection)
+                .unwrap();
+        let object_uri = format!("{}/Documents/substituted.md", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let encrypted = encrypt_principal_root_object_bytes(
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &other_protection,
+            &other_data_key,
+            b"wrong key",
+        )
+        .unwrap();
+        std::fs::write(&path, &encrypted).unwrap();
+
+        let err = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &[PrincipalRootProtectedObjectDeclarationV1::exact(object_uri)],
+        )
+        .expect_err("a substituted data-key id must fail closed");
+
+        assert!(err.to_string().contains("envelope binding is invalid"));
+        assert_eq!(std::fs::read(path).unwrap(), encrypted);
+    }
+
+    #[test]
+    fn root_protection_activation_rejects_tampered_ciphertext() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:tampered-envelope";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Documents/tampered.md", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        write_principal_root_object(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &object_uri,
+            &path,
+            b"authenticated body",
+        )
+        .unwrap();
+        let mut envelope: PrincipalRootObjectEnvelopeV1 =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut ciphertext = b64_url_decode(&envelope.ciphertext).unwrap();
+        ciphertext[0] ^= 0x01;
+        envelope.ciphertext = b64_url(&ciphertext);
+        let tampered = serde_json::to_vec_pretty(&envelope).unwrap();
+        std::fs::write(&path, &tampered).unwrap();
+
+        let err = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &[PrincipalRootProtectedObjectDeclarationV1::exact(object_uri)],
+        )
+        .expect_err("tampered ciphertext must fail authentication");
+
+        assert!(err.to_string().contains("envelope authentication failed"));
+        assert_eq!(std::fs::read(path).unwrap(), tampered);
+    }
+
+    #[test]
+    fn root_protection_activation_rejects_malformed_envelope_distinctly() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:malformed-envelope";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!("{}/Documents/malformed.json", protection.localhost_root);
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let malformed = format!(
+            "{{\"schema\":\"{PRINCIPAL_ROOT_OBJECT_SCHEMA}\",\"data_key_id\":\"{}\",\"nonce\":\"AAAAAAAAAAAAAAAA\",\"ciphertext\":",
+            protection.data_key_id
+        )
+        .into_bytes();
+        std::fs::write(&path, &malformed).unwrap();
+
+        let err = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &[PrincipalRootProtectedObjectDeclarationV1::exact(object_uri)],
+        )
+        .expect_err("a malformed envelope must not be classified as plaintext");
+
+        assert!(err.to_string().contains("envelope is malformed"));
+        assert!(err
+            .downcast_ref::<PrincipalRootMigrationRequiredV1>()
+            .is_none());
+        assert_eq!(std::fs::read(path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn fresh_root_protection_rejects_preexisting_envelope_shaped_data() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:fresh-envelope";
+        let localhost_root = principal_localhost_root(principal_id);
+        let other_data_dir = tempfile::tempdir().unwrap();
+        let other_protection =
+            store_test_principal_root_protection(other_data_dir.path(), "person:local:source-key");
+        let other_data_key =
+            principal_root_data_key_from_protection(other_data_dir.path(), &other_protection)
+                .unwrap();
+        let object_uri = format!("{localhost_root}/Documents/envelope.json");
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let encrypted = encrypt_principal_root_object_bytes(
+            principal_id,
+            &localhost_root,
+            &object_uri,
+            &other_protection,
+            &other_data_key,
+            b"unbound encrypted body",
+        )
+        .unwrap();
+        std::fs::write(&path, &encrypted).unwrap();
+
+        let err = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            &[PrincipalRootProtectedObjectDeclarationV1::exact(object_uri)],
+        )
+        .expect_err("fresh activation requires an empty declared inventory");
+
+        assert!(err
+            .to_string()
+            .contains("exact verified protection binding is required"));
+        assert_eq!(std::fs::read(path).unwrap(), encrypted);
+    }
+
+    #[test]
+    fn declarative_preflight_verifies_envelopes_even_when_plaintext_exists() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:mixed-tamper";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let data_key =
+            principal_root_data_key_from_protection(data_dir.path(), &protection).unwrap();
+        let plaintext_uri = format!("{}/Documents/plain.txt", protection.localhost_root);
+        let encrypted_uri = format!("{}/Documents/encrypted.txt", protection.localhost_root);
+        let plaintext_path = rooted_localhost_fs_path(data_dir.path(), &plaintext_uri).unwrap();
+        let encrypted_path = rooted_localhost_fs_path(data_dir.path(), &encrypted_uri).unwrap();
+        std::fs::create_dir_all(plaintext_path.parent().unwrap()).unwrap();
+        std::fs::write(&plaintext_path, b"legacy plaintext").unwrap();
+        let mut envelope: PrincipalRootObjectEnvelopeV1 = serde_json::from_slice(
+            &encrypt_principal_root_object_bytes(
+                principal_id,
+                &protection.localhost_root,
+                &encrypted_uri,
+                &protection,
+                &data_key,
+                b"protected bytes",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let replacement = if envelope.ciphertext.starts_with('A') {
+            "B"
+        } else {
+            "A"
+        };
+        envelope.ciphertext.replace_range(..1, replacement);
+        let tampered = serde_json::to_vec_pretty(&envelope).unwrap();
+        std::fs::write(&encrypted_path, &tampered).unwrap();
+
+        let error = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &protection.localhost_root,
+            &[
+                PrincipalRootProtectedObjectDeclarationV1::exact(plaintext_uri),
+                PrincipalRootProtectedObjectDeclarationV1::exact(encrypted_uri),
+            ],
+        )
+        .expect_err("tampering must fail before plaintext migration is considered");
+
+        assert!(error.to_string().contains("envelope authentication failed"));
+        assert!(error
+            .downcast_ref::<PrincipalRootMigrationRequiredV1>()
+            .is_none());
+        assert_eq!(std::fs::read(plaintext_path).unwrap(), b"legacy plaintext");
+        assert_eq!(std::fs::read(encrypted_path).unwrap(), tampered);
+    }
+
+    #[test]
+    fn offline_migration_uses_explicit_hashes_owner_only_backups_and_round_trip() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let operator_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:offline-migration";
+        let protection = store_test_principal_root_protection(data_dir.path(), principal_id);
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            protection.localhost_root
+        );
+        let path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let plaintext = b"legacy save bytes";
+        std::fs::write(&path, plaintext).unwrap();
+        let plan = PrincipalRootMigrationPlanV1 {
+            schema: PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA.to_string(),
+            principal_id: principal_id.to_string(),
+            localhost_root: protection.localhost_root.clone(),
+            objects: vec![PrincipalRootMigrationSelectionV1 {
+                object_uri: object_uri.clone(),
+                plaintext_sha256: sha256_label(plaintext),
+            }],
+        };
+        let plan_path = operator_dir.path().join("migration-plan.json");
+        let plan_bytes = serde_json::to_vec_pretty(&plan).unwrap();
+        let plan_text = String::from_utf8(plan_bytes.clone()).unwrap();
+        assert!(!plan_text.contains("recovery_kit"));
+        assert!(!plan_text.contains("recovery_phrase"));
+        assert!(!plan_text.contains("wrapped_data_key"));
+        assert!(!plan_text.contains("encrypted_root_descriptor"));
+        let mut plan_with_secret = serde_json::to_value(&plan).unwrap();
+        plan_with_secret["recovery_kit"] =
+            serde_json::json!({"recovery_phrase": "must never enter a plan"});
+        assert!(serde_json::from_value::<PrincipalRootMigrationPlanV1>(plan_with_secret).is_err());
+        write_owner_only_new_file(&plan_path, &plan_bytes).unwrap();
+        let backup_dir = operator_dir.path().join("backups");
+
+        let receipt =
+            migrate_principal_root_objects_offline(data_dir.path(), &plan_path, &backup_dir)
+                .unwrap();
+
+        assert_eq!(receipt.schema, PRINCIPAL_ROOT_MIGRATION_RECEIPT_SCHEMA);
+        assert_eq!(receipt.object_count, 1);
+        assert!(receipt.objects[0].round_trip_verified);
+        assert!(!serde_json::to_string(&receipt)
+            .unwrap()
+            .contains(&object_uri));
+        assert_ne!(std::fs::read(&path).unwrap(), plaintext);
+        assert_eq!(
+            read_principal_root_object(
+                data_dir.path(),
+                principal_id,
+                &protection.localhost_root,
+                &object_uri,
+                &path,
+            )
+            .unwrap(),
+            plaintext
+        );
+        let backups = std::fs::read_dir(&backup_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".plaintext.backup")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert!(backup_dir
+            .join(PRINCIPAL_ROOT_MIGRATION_RECEIPT_FILE)
+            .is_file());
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), plaintext);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                backups[0].metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    struct OfflineMigrationFixture {
+        data_dir: tempfile::TempDir,
+        operator_dir: tempfile::TempDir,
+        principal_id: String,
+        localhost_root: String,
+        object_uris: Vec<String>,
+        object_paths: Vec<PathBuf>,
+        plaintexts: Vec<Vec<u8>>,
+        plan_path: PathBuf,
+        backup_dir: PathBuf,
+    }
+
+    impl OfflineMigrationFixture {
+        fn new(object_count: usize) -> Self {
+            let data_dir = tempfile::tempdir().unwrap();
+            let operator_dir = tempfile::tempdir().unwrap();
+            let principal_id = "person:local:migration-fixture".to_string();
+            let protection = store_test_principal_root_protection(data_dir.path(), &principal_id);
+            let mut object_uris = Vec::new();
+            let mut object_paths = Vec::new();
+            let mut plaintexts = Vec::new();
+            let mut objects = Vec::new();
+            for index in 0..object_count {
+                let object_uri = format!(
+                    "{}/.AppData/LocalHost/GBA/ucity/save-{index}.sav",
+                    protection.localhost_root
+                );
+                let object_path = rooted_localhost_fs_path(data_dir.path(), &object_uri).unwrap();
+                std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+                let plaintext = format!("legacy save {index}").into_bytes();
+                std::fs::write(&object_path, &plaintext).unwrap();
+                objects.push(PrincipalRootMigrationSelectionV1 {
+                    object_uri: object_uri.clone(),
+                    plaintext_sha256: sha256_label(&plaintext),
+                });
+                object_uris.push(object_uri);
+                object_paths.push(object_path);
+                plaintexts.push(plaintext);
+            }
+            let plan = PrincipalRootMigrationPlanV1 {
+                schema: PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA.to_string(),
+                principal_id: principal_id.clone(),
+                localhost_root: protection.localhost_root.clone(),
+                objects,
+            };
+            let plan_path = operator_dir.path().join("migration-plan.json");
+            write_owner_only_new_file(&plan_path, &serde_json::to_vec_pretty(&plan).unwrap())
+                .unwrap();
+            let backup_dir = operator_dir.path().join("backups");
+            Self {
+                data_dir,
+                operator_dir,
+                principal_id,
+                localhost_root: protection.localhost_root,
+                object_uris,
+                object_paths,
+                plaintexts,
+                plan_path,
+                backup_dir,
+            }
+        }
+
+        fn assert_all_plaintext(&self) {
+            for (path, plaintext) in self.object_paths.iter().zip(&self.plaintexts) {
+                assert_eq!(std::fs::read(path).unwrap(), *plaintext);
+            }
+        }
+
+        fn assert_all_encrypted(&self) {
+            for ((uri, path), plaintext) in self
+                .object_uris
+                .iter()
+                .zip(&self.object_paths)
+                .zip(&self.plaintexts)
+            {
+                let stored = std::fs::read(path).unwrap();
+                assert_ne!(stored, *plaintext);
+                assert_eq!(
+                    read_principal_root_object(
+                        self.data_dir.path(),
+                        &self.principal_id,
+                        &self.localhost_root,
+                        uri,
+                        path,
+                    )
+                    .unwrap(),
+                    *plaintext
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offline_migration_changes_only_exactly_selected_objects() {
+        let fixture = OfflineMigrationFixture::new(1);
+        let unselected_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/unselected.sav",
+            fixture.localhost_root
+        );
+        let unselected_path =
+            rooted_localhost_fs_path(fixture.data_dir.path(), &unselected_uri).unwrap();
+        std::fs::write(&unselected_path, b"unselected legacy save").unwrap();
+
+        migrate_principal_root_objects_offline(
+            fixture.data_dir.path(),
+            &fixture.plan_path,
+            &fixture.backup_dir,
+        )
+        .unwrap();
+
+        fixture.assert_all_encrypted();
+        assert_eq!(
+            std::fs::read(unselected_path).unwrap(),
+            b"unselected legacy save"
+        );
+    }
+
+    #[test]
+    fn offline_migration_faults_leave_all_plaintext_or_all_verified_encrypted() {
+        for fault in [
+            PrincipalRootMigrationTestFault::Backup(0),
+            PrincipalRootMigrationTestFault::Backup(1),
+            PrincipalRootMigrationTestFault::Stage(0),
+            PrincipalRootMigrationTestFault::Stage(1),
+            PrincipalRootMigrationTestFault::JournalPrepared,
+            PrincipalRootMigrationTestFault::JournalCommitting,
+            PrincipalRootMigrationTestFault::Commit(0),
+            PrincipalRootMigrationTestFault::Commit(1),
+            PrincipalRootMigrationTestFault::JournalCommitted,
+        ] {
+            let fixture = OfflineMigrationFixture::new(2);
+            inject_principal_root_migration_test_fault(fixture.data_dir.path(), fault);
+            migrate_principal_root_objects_offline(
+                fixture.data_dir.path(),
+                &fixture.plan_path,
+                &fixture.backup_dir,
+            )
+            .expect_err("injected migration fault must fail");
+
+            if fault == PrincipalRootMigrationTestFault::JournalCommitted {
+                fixture.assert_all_encrypted();
+            } else {
+                fixture.assert_all_plaintext();
+            }
+            assert!(
+                !principal_root_migration_journal_path(fixture.data_dir.path())
+                    .unwrap()
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn offline_migration_recovers_partial_commit_after_restart() {
+        let fixture = OfflineMigrationFixture::new(2);
+        inject_principal_root_migration_test_fault(
+            fixture.data_dir.path(),
+            PrincipalRootMigrationTestFault::CrashAfterCommit(0),
+        );
+        migrate_principal_root_objects_offline(
+            fixture.data_dir.path(),
+            &fixture.plan_path,
+            &fixture.backup_dir,
+        )
+        .expect_err("simulated crash must interrupt migration");
+        assert!(
+            principal_root_migration_journal_path(fixture.data_dir.path())
+                .unwrap()
+                .exists()
+        );
+        assert_ne!(
+            std::fs::read(&fixture.object_paths[0]).unwrap(),
+            fixture.plaintexts[0]
+        );
+        assert_eq!(
+            std::fs::read(&fixture.object_paths[1]).unwrap(),
+            fixture.plaintexts[1]
+        );
+
+        migrate_principal_root_objects_offline(
+            fixture.data_dir.path(),
+            &fixture.plan_path,
+            &fixture.backup_dir,
+        )
+        .expect_err("recovered backups remain operator-owned and require a fresh target");
+
+        fixture.assert_all_plaintext();
+        assert!(
+            !principal_root_migration_journal_path(fixture.data_dir.path())
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[test]
+    fn offline_upgrade_preflights_every_configured_root_before_mutation() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let first =
+            store_test_principal_root_protection(data_dir.path(), "person:local:first-root");
+        let second =
+            store_test_principal_root_protection(data_dir.path(), "person:local:second-root");
+        let first_uri = format!("{}/Documents/first.txt", first.localhost_root);
+        let first_path = rooted_localhost_fs_path(data_dir.path(), &first_uri).unwrap();
+        std::fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        std::fs::write(&first_path, b"first plaintext").unwrap();
+        let backup_dir = data_dir
+            .path()
+            .join("backups/principal-root-upgrade-missing-root");
+        let declarations = vec![PrincipalRootUpgradeDeclarationV1 {
+            principal_id: first.principal_id.clone(),
+            localhost_root: first.localhost_root.clone(),
+            inventory: vec![PrincipalRootProtectedObjectDeclarationV1::exact(first_uri)],
+        }];
+
+        let error = migrate_declared_principal_roots_offline(data_dir.path(), &backup_dir, || {
+            Ok(declarations)
+        })
+        .expect_err("omitting a configured protected root must fail before migration");
+
+        assert!(error
+            .to_string()
+            .contains("must exactly match configured protections"));
+        assert_eq!(std::fs::read(first_path).unwrap(), b"first plaintext");
+        assert!(!backup_dir.exists());
+        assert_eq!(
+            load_principal_root_protection(
+                data_dir.path(),
+                &second.principal_id,
+                &second.localhost_root,
+            )
+            .unwrap(),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn offline_upgrade_rejects_tampered_later_root_before_first_root_mutates() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let first =
+            store_test_principal_root_protection(data_dir.path(), "person:local:first-plaintext");
+        let second =
+            store_test_principal_root_protection(data_dir.path(), "person:local:second-tampered");
+        let first_uri = format!("{}/Documents/first.txt", first.localhost_root);
+        let second_uri = format!("{}/Documents/second.txt", second.localhost_root);
+        let first_path = rooted_localhost_fs_path(data_dir.path(), &first_uri).unwrap();
+        let second_path = rooted_localhost_fs_path(data_dir.path(), &second_uri).unwrap();
+        std::fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+        std::fs::write(&first_path, b"first plaintext").unwrap();
+        let second_data_key =
+            principal_root_data_key_from_protection(data_dir.path(), &second).unwrap();
+        let mut second_envelope: PrincipalRootObjectEnvelopeV1 = serde_json::from_slice(
+            &encrypt_principal_root_object_bytes(
+                &second.principal_id,
+                &second.localhost_root,
+                &second_uri,
+                &second,
+                &second_data_key,
+                b"second protected",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let replacement = if second_envelope.ciphertext.starts_with('A') {
+            "B"
+        } else {
+            "A"
+        };
+        second_envelope.ciphertext.replace_range(..1, replacement);
+        let tampered = serde_json::to_vec_pretty(&second_envelope).unwrap();
+        std::fs::write(&second_path, &tampered).unwrap();
+        let declarations = vec![
+            PrincipalRootUpgradeDeclarationV1 {
+                principal_id: first.principal_id.clone(),
+                localhost_root: first.localhost_root.clone(),
+                inventory: vec![PrincipalRootProtectedObjectDeclarationV1::exact(first_uri)],
+            },
+            PrincipalRootUpgradeDeclarationV1 {
+                principal_id: second.principal_id.clone(),
+                localhost_root: second.localhost_root.clone(),
+                inventory: vec![PrincipalRootProtectedObjectDeclarationV1::exact(second_uri)],
+            },
+        ];
+        let backup_dir = data_dir
+            .path()
+            .join("backups/principal-root-upgrade-tampered-root");
+
+        let error = migrate_declared_principal_roots_offline(data_dir.path(), &backup_dir, || {
+            Ok(declarations)
+        })
+        .expect_err("tampering in a later root must fail the complete preflight");
+
+        assert!(error.to_string().contains("envelope authentication failed"));
+        assert_eq!(std::fs::read(first_path).unwrap(), b"first plaintext");
+        assert_eq!(std::fs::read(second_path).unwrap(), tampered);
+        assert!(!backup_dir.exists());
+    }
+
+    #[test]
+    fn offline_upgrade_recovers_incomplete_journal_and_requires_an_explicit_rerun() {
+        let fixture = OfflineMigrationFixture::new(2);
+        inject_principal_root_migration_test_fault(
+            fixture.data_dir.path(),
+            PrincipalRootMigrationTestFault::CrashAfterCommit(0),
+        );
+        migrate_principal_root_objects_offline(
+            fixture.data_dir.path(),
+            &fixture.plan_path,
+            &fixture.backup_dir,
+        )
+        .expect_err("simulated crash must leave a journal");
+        assert!(
+            principal_root_migration_journal_path(fixture.data_dir.path())
+                .unwrap()
+                .exists()
+        );
+        let backup_dir = fixture
+            .data_dir
+            .path()
+            .join("backups/principal-root-upgrade-rerun");
+        let declaration = PrincipalRootUpgradeDeclarationV1 {
+            principal_id: fixture.principal_id.clone(),
+            localhost_root: fixture.localhost_root.clone(),
+            inventory: vec![PrincipalRootProtectedObjectDeclarationV1::root(format!(
+                "{}/.AppData/LocalHost/GBA",
+                fixture.localhost_root
+            ))],
+        };
+        let readiness_error = verify_declared_principal_roots_ready(
+            fixture.data_dir.path(),
+            std::slice::from_ref(&declaration),
+        )
+        .expect_err("startup readiness must reject an incomplete journal");
+        assert!(readiness_error
+            .to_string()
+            .contains("migration is incomplete"));
+
+        let error =
+            migrate_declared_principal_roots_offline(fixture.data_dir.path(), &backup_dir, || {
+                Ok(vec![declaration])
+            })
+            .expect_err("recovery must stop this upgrade attempt");
+
+        assert!(error
+            .to_string()
+            .contains("recovered an incomplete principal-root migration"));
+        fixture.assert_all_plaintext();
+        assert!(
+            !principal_root_migration_journal_path(fixture.data_dir.path())
+                .unwrap()
+                .exists()
+        );
+        assert!(!backup_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declarative_inventory_and_migration_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:inventory-symlink";
+        let localhost_root = principal_localhost_root(principal_id);
+        let root_uri = format!("{localhost_root}/.AppData/LocalHost/GBA");
+        let root_path = rooted_localhost_fs_path(data_dir.path(), &root_uri).unwrap();
+        std::fs::create_dir_all(&root_path).unwrap();
+        let outside = data_dir.path().join("outside.sav");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, root_path.join("linked.sav")).unwrap();
+        let error = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            &[PrincipalRootProtectedObjectDeclarationV1::root(root_uri)],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("rejects symlinks"));
+
+        let fixture = OfflineMigrationFixture::new(1);
+        std::fs::remove_file(&fixture.object_paths[0]).unwrap();
+        let outside = fixture.operator_dir.path().join("outside.sav");
+        std::fs::write(&outside, &fixture.plaintexts[0]).unwrap();
+        symlink(outside, &fixture.object_paths[0]).unwrap();
+        let error = migrate_principal_root_objects_offline(
+            fixture.data_dir.path(),
+            &fixture.plan_path,
+            &fixture.backup_dir,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn declarative_inventory_and_migration_plans_are_bounded() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:inventory-bound";
+        let localhost_root = principal_localhost_root(principal_id);
+        let inventory = (0..=MAX_PRINCIPAL_ROOT_INVENTORY_DECLARATIONS)
+            .map(|index| {
+                PrincipalRootProtectedObjectDeclarationV1::exact(format!(
+                    "{localhost_root}/Documents/{index}.txt"
+                ))
+            })
+            .collect::<Vec<_>>();
+        let error = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            &inventory,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("declaration bound"));
+
+        let deep_root_uri = format!("{localhost_root}/.AppData/Deep");
+        let mut deep_path = rooted_localhost_fs_path(data_dir.path(), &deep_root_uri).unwrap();
+        for index in 0..=MAX_PRINCIPAL_ROOT_INVENTORY_DEPTH {
+            deep_path.push(index.to_string());
+        }
+        std::fs::create_dir_all(&deep_path).unwrap();
+        std::fs::write(deep_path.join("object.bin"), b"deep").unwrap();
+        let error = begin_declarative_principal_root_protection_activation(
+            data_dir.path(),
+            principal_id,
+            &localhost_root,
+            &[PrincipalRootProtectedObjectDeclarationV1::root(
+                deep_root_uri,
+            )],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("depth bound"));
+
+        let plan = PrincipalRootMigrationPlanV1 {
+            schema: PRINCIPAL_ROOT_MIGRATION_PLAN_SCHEMA.to_string(),
+            principal_id: principal_id.to_string(),
+            localhost_root: localhost_root.clone(),
+            objects: (0..=MAX_MIGRATION_OBJECTS)
+                .map(|index| PrincipalRootMigrationSelectionV1 {
+                    object_uri: format!("{localhost_root}/Documents/{index}.txt"),
+                    plaintext_sha256: sha256_label(format!("{index}").as_bytes()),
+                })
+                .collect(),
+        };
+        let error = validate_principal_root_migration_plan(&plan).unwrap_err();
+        assert!(error.to_string().contains("1-64 objects"));
     }
 
     #[test]

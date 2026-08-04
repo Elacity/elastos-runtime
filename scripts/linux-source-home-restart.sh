@@ -325,6 +325,16 @@ pkill -TERM -f "${gateway_bin} gateway --addr ${addr}" 2>/dev/null || true
 sleep 2
 kill_port_listeners "$port" "$gateway_bin" "$addr"
 
+principal_root_backup_dir="${data_dir}/backups/principal-root-upgrade-$(date -u +%s)-$$"
+principal_root_upgrade_log="${gateway_log%.log}-principal-root-upgrade.json"
+(
+  umask 077
+  "$gateway_bin" principal-root-upgrade \
+    --data-dir "$data_dir" \
+    --backup-dir "$principal_root_backup_dir" \
+    >"$principal_root_upgrade_log"
+)
+
 python3 - "$source_home" "$xdg_data_home" "$gateway_bin" "$addr" "$gateway_log" "$pid_file" <<'PY'
 import os
 import pathlib

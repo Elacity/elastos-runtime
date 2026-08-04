@@ -8,6 +8,8 @@ use elastos_common::localhost::rooted_localhost_uri;
 use elastos_runtime::capability::Action;
 use serde_json::Value;
 
+pub const WALLET_STATUS_RESOURCE: &str = "elastos://wallet/meta/status";
+
 /// Build the capability resource string for a provider request.
 ///
 /// First-party `elastos://` sub-providers use `elastos://<scheme>/...`.
@@ -88,7 +90,7 @@ pub fn build_capability_resource(
         "rights" => rights_resource(op),
         "key" => key_resource(op),
         "decrypt" => decrypt_resource(op),
-        "wallet" => wallet_resource(op, request),
+        "wallet" => wallet_resource(op),
         "did" => did_resource(op),
         "ipfs" => ipfs_resource(op),
         "llama" => simple_elastos_resource(
@@ -265,25 +267,7 @@ fn read_only_provider_action(op: &str) -> Option<Action> {
 
 fn wallet_op_required_action(op: &str) -> Option<Action> {
     match op {
-        "status"
-        | "accounts"
-        | "default_account"
-        | "challenge"
-        | "bitcoin_challenge"
-        | "verify_proof"
-        | "verify_bip322_proof"
-        | "verify_contract_proof"
-        | "approval_requests" => Some(Action::Read),
-        "link_account"
-        | "set_default_account"
-        | "rename_account"
-        | "reject_approval"
-        | "approve_approval"
-        | "complete_approval" => Some(Action::Write),
-        "create_managed_account" | "revoke_account" | "request_signature" | "sign_approved" => {
-            Some(Action::Execute)
-        }
-        "export_managed_secret" => Some(Action::Execute),
+        "status" => Some(Action::Read),
         _ => None,
     }
 }
@@ -369,24 +353,6 @@ fn localhost_resource(op: &str, request: &Value) -> Result<String, String> {
             .ok_or_else(|| format!("Invalid rooted localhost path: {}", path)),
         None => Err("localhost provider request missing path".to_string()),
     }
-}
-
-fn validate_wallet_chain_namespace(value: &str) -> Result<(), String> {
-    if !value.is_empty()
-        && value != "."
-        && value != ".."
-        && !value.chars().any(|ch| {
-            ch.is_control()
-                || ch == '/'
-                || ch == '\\'
-                || ch == '"'
-                || ch == '\''
-                || ch.is_whitespace()
-        })
-    {
-        return Ok(());
-    }
-    Err(format!("Invalid wallet chain namespace: {value}"))
 }
 
 fn did_resource(op: &str) -> Result<String, String> {
@@ -516,42 +482,30 @@ fn net_resource(op: &str) -> Result<String, String> {
     }
 }
 
-fn wallet_resource(op: &str, request: &Value) -> Result<String, String> {
+fn wallet_resource(op: &str) -> Result<String, String> {
     match op {
-        "status" => Ok("elastos://wallet/meta/status".to_string()),
-        "challenge" => Ok("elastos://wallet/proof/challenge".to_string()),
-        "bitcoin_challenge" => Ok("elastos://wallet/proof/bip322/challenge".to_string()),
-        "verify_proof" => Ok("elastos://wallet/proof/verify".to_string()),
-        "verify_bip322_proof" => Ok("elastos://wallet/proof/bip322/verify".to_string()),
-        "verify_contract_proof" => Ok("elastos://wallet/proof/verify_contract".to_string()),
-        "link_account" => Ok("elastos://wallet/account/link".to_string()),
-        "create_managed_account" => Ok("elastos://wallet/account/create_managed".to_string()),
-        "accounts" => Ok("elastos://wallet/account/list".to_string()),
-        "revoke_account" => Ok("elastos://wallet/account/revoke".to_string()),
-        "rename_account" => Ok("elastos://wallet/account/rename".to_string()),
-        "export_managed_secret" => Ok("elastos://wallet/account/export_managed_secret".to_string()),
-        "set_default_account" => Ok("elastos://wallet/account/set_default".to_string()),
-        "default_account" => Ok("elastos://wallet/account/default".to_string()),
-        "approval_requests" => Ok("elastos://wallet/approval/list".to_string()),
-        "reject_approval" => Ok("elastos://wallet/approval/reject".to_string()),
-        "approve_approval" => Ok("elastos://wallet/approval/approve".to_string()),
-        "complete_approval" => Ok("elastos://wallet/approval/complete".to_string()),
-        "sign_approved" => Ok("elastos://wallet/approval/sign_approved".to_string()),
-        "request_signature" => {
-            let intent = request
-                .get("intent")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| "wallet signature request missing intent".to_string())?;
-            let chain_namespace = request
-                .get("chain_namespace")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| "wallet signature request missing chain_namespace".to_string())?;
-            validate_segment(intent, "wallet signing intent")?;
-            validate_wallet_chain_namespace(chain_namespace)?;
-            Ok(format!("elastos://wallet/{chain_namespace}/sign/{intent}"))
-        }
+        "status" => Ok(WALLET_STATUS_RESOURCE.to_string()),
         _ => Err(format!("Unsupported wallet provider operation: {op}")),
     }
+}
+
+pub fn is_wallet_resource(resource: &str) -> bool {
+    resource
+        .strip_prefix("elastos://")
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        == Some("wallet")
+}
+
+pub fn ensure_generic_wallet_capability(resource: &str, action: Action) -> Result<(), String> {
+    if !is_wallet_resource(resource)
+        || (resource == WALLET_STATUS_RESOURCE && action == Action::Read)
+    {
+        return Ok(());
+    }
+    Err(
+        "generic Wallet access is limited to read-only elastos://wallet/meta/status; use the private Runtime Wallet Bus for authority-bound operations"
+            .to_string(),
+    )
 }
 
 fn drm_resource(op: &str) -> Result<String, String> {
@@ -710,16 +664,7 @@ mod tests {
                 "discover_remote_carrier_exits",
                 "elastos://exit/discover_remote_carrier_exits",
             ),
-            (
-                "wallet",
-                "rename_account",
-                "elastos://wallet/account/rename",
-            ),
-            (
-                "wallet",
-                "export_managed_secret",
-                "elastos://wallet/account/export_managed_secret",
-            ),
+            ("wallet", "status", "elastos://wallet/meta/status"),
         ] {
             assert_eq!(
                 build_capability_resource(scheme, op, &request).unwrap(),
@@ -1171,102 +1116,74 @@ mod tests {
     }
 
     #[test]
-    fn wallet_resource_uses_documented_scopes() {
+    fn wallet_resource_exposes_only_read_only_status() {
         assert_eq!(
             build_capability_resource("wallet", "status", &serde_json::json!({})).unwrap(),
             "elastos://wallet/meta/status"
         );
         assert_eq!(
-            build_capability_resource("wallet", "challenge", &serde_json::json!({})).unwrap(),
-            "elastos://wallet/proof/challenge"
+            provider_operation_action("wallet", "status"),
+            Some(Action::Read)
         );
-        assert_eq!(
-            build_capability_resource("wallet", "bitcoin_challenge", &serde_json::json!({}))
-                .unwrap(),
-            "elastos://wallet/proof/bip322/challenge"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "verify_bip322_proof", &serde_json::json!({}))
-                .unwrap(),
-            "elastos://wallet/proof/bip322/verify"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "verify_contract_proof", &serde_json::json!({}))
-                .unwrap(),
-            "elastos://wallet/proof/verify_contract"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "link_account", &serde_json::json!({})).unwrap(),
-            "elastos://wallet/account/link"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "create_managed_account", &serde_json::json!({}))
-                .unwrap(),
-            "elastos://wallet/account/create_managed"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "approval_requests", &serde_json::json!({}))
-                .unwrap(),
-            "elastos://wallet/approval/list"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "set_default_account", &serde_json::json!({}))
-                .unwrap(),
-            "elastos://wallet/account/set_default"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "approve_approval", &serde_json::json!({}))
-                .unwrap(),
-            "elastos://wallet/approval/approve"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "complete_approval", &serde_json::json!({}))
-                .unwrap(),
-            "elastos://wallet/approval/complete"
-        );
-        assert_eq!(
-            build_capability_resource("wallet", "sign_approved", &serde_json::json!({})).unwrap(),
-            "elastos://wallet/approval/sign_approved"
-        );
-        assert_eq!(
-            build_capability_resource(
-                "wallet",
-                "request_signature",
-                &serde_json::json!({
-                    "chain_namespace": "eip155:20",
-                    "intent": "publish_envelope"
-                })
-            )
-            .unwrap(),
-            "elastos://wallet/eip155:20/sign/publish_envelope"
-        );
+        assert!(ensure_generic_wallet_capability(WALLET_STATUS_RESOURCE, Action::Read).is_ok());
+        assert!(ensure_generic_wallet_capability(WALLET_STATUS_RESOURCE, Action::Write).is_err());
     }
 
     #[test]
-    fn wallet_resource_fails_closed_for_unknown_or_broad_signing() {
-        assert!(
-            build_capability_resource("wallet", "request_signature", &serde_json::json!({}))
-                .is_err()
-        );
-        assert!(build_capability_resource(
-            "wallet",
+    fn wallet_resource_rejects_all_principal_sensitive_operations() {
+        for operation in [
+            "wallet_contract",
+            "challenge",
+            "bitcoin_challenge",
+            "verify_proof",
+            "verify_bip322_proof",
+            "verify_contract_proof",
+            "link_account",
+            "create_managed_account",
+            "accounts",
+            "revoke_account",
+            "rename_account",
+            "export_managed_secret",
+            "import_managed_secret",
+            "export_managed_recovery_set",
+            "import_managed_recovery_set",
+            "set_default_account",
+            "default_account",
             "request_signature",
-            &serde_json::json!({"intent": "publish_envelope"})
-        )
-        .is_err());
-        assert!(build_capability_resource(
-            "wallet",
-            "request_signature",
-            &serde_json::json!({"chain_namespace": "eip155:20", "intent": "../raw"})
-        )
-        .is_err());
-        assert!(build_capability_resource(
-            "wallet",
-            "request_signature",
-            &serde_json::json!({"chain_namespace": "../esc", "intent": "publish_envelope"})
-        )
-        .is_err());
-        assert!(build_capability_resource("wallet", "sign", &serde_json::json!({})).is_err());
+            "approval_requests",
+            "reject_approval",
+            "approve_approval",
+            "complete_approval",
+            "sign_approved",
+            "prepare_transaction",
+            "broadcast_transaction",
+            "raw_proof",
+            "raw_secret",
+            "sign",
+        ] {
+            assert!(
+                build_capability_resource("wallet", operation, &serde_json::json!({})).is_err(),
+                "generic Wallet operation {operation} must fail closed"
+            );
+            assert_eq!(
+                provider_operation_action("wallet", operation),
+                None,
+                "generic Wallet operation {operation} must not have an action mapping"
+            );
+        }
+
+        for resource in [
+            "elastos://wallet",
+            "elastos://wallet/*",
+            "elastos://wallet/account/list",
+            "elastos://wallet/approval",
+            "elastos://wallet/meta/status?principal=other",
+        ] {
+            assert!(
+                ensure_generic_wallet_capability(resource, Action::Read).is_err(),
+                "generic Wallet resource {resource} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -1307,23 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn pc2_wallet_bridge_authority_classes_have_typed_runtime_surfaces() {
-        assert_eq!(
-            build_capability_resource("wallet", "accounts", &serde_json::json!({})).unwrap(),
-            "elastos://wallet/account/list"
-        );
-        assert_eq!(
-            build_capability_resource(
-                "wallet",
-                "request_signature",
-                &serde_json::json!({
-                    "chain_namespace": "eip155:20",
-                    "intent": "transaction_intent"
-                })
-            )
-            .unwrap(),
-            "elastos://wallet/eip155:20/sign/transaction_intent"
-        );
+    fn pc2_wallet_bridge_network_effects_stay_on_typed_chain_resources() {
         assert_eq!(
             build_capability_resource(
                 "chain",

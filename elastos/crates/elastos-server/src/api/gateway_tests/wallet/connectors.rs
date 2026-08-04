@@ -11,7 +11,7 @@ async fn test_wallet_connector_route_requires_connector_launch_token() {
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-metamask/wallet/approvals")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())
@@ -33,7 +33,7 @@ async fn test_wallet_connector_route_rejects_unknown_connector_capsule() {
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-unknown/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -50,6 +50,302 @@ async fn test_wallet_connector_route_rejects_unknown_connector_capsule() {
 }
 
 #[tokio::test]
+async fn test_home_wallet_connector_bridge_rejects_invalid_authority_before_wallet_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let context = HomeLaunchTokenContext {
+        principal_id: authority.principal_id.clone(),
+        session_id: authority.session_id.clone(),
+        proof_binding_id: Some(authority.proof_binding_id.clone()),
+        grant_id: authority.grant_id.clone(),
+    };
+    let valid_connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
+    let token_for = |context: HomeLaunchTokenContext| {
+        issue_home_projection_launch_token_with_context(
+            dir.path(),
+            WALLET_METAMASK_CAPSULE_ID,
+            WALLET_METAMASK_CAPSULE_ID,
+            &context,
+        )
+        .unwrap()
+    };
+    let wrong_principal = token_for(HomeLaunchTokenContext {
+        principal_id: "principal:wrong".to_string(),
+        ..context.clone()
+    });
+    let wrong_session = token_for(HomeLaunchTokenContext {
+        session_id: "auth:wrong".to_string(),
+        ..context.clone()
+    });
+    let wrong_proof_binding = token_for(HomeLaunchTokenContext {
+        proof_binding_id: Some("proof:wrong".to_string()),
+        ..context.clone()
+    });
+    let wrong_grant = token_for(HomeLaunchTokenContext {
+        grant_id: "grant:wrong".to_string(),
+        ..context.clone()
+    });
+    let wrong_selected_resource = issue_home_projection_launch_token_with_context(
+        dir.path(),
+        WALLET_UNISAT_CAPSULE_ID,
+        WALLET_METAMASK_CAPSULE_ID,
+        &context,
+    )
+    .unwrap();
+    let wrong_executable_actor = issue_home_projection_launch_token_with_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        WALLET_UNISAT_CAPSULE_ID,
+        &context,
+    )
+    .unwrap();
+    let direct_connector_token =
+        launch_token_for_authority_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let other_authority = passkey_authority_with_name(dir.path(), Some("other"));
+    let mismatched_home_token = other_authority.home_token;
+    let walletconnect_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_WALLETCONNECT_CAPSULE_ID,
+        &authority,
+    );
+    let provider = MockWalletProvider::default();
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
+    let address = "0x1111111111111111111111111111111111111111";
+
+    let cases = [
+        (
+            "wrong origin",
+            authority.home_token.clone(),
+            "null",
+            WALLET_METAMASK_CAPSULE_ID,
+            valid_connector_token.clone(),
+        ),
+        (
+            "wrong Home token authority",
+            mismatched_home_token,
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            valid_connector_token.clone(),
+        ),
+        (
+            "wrong principal",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            wrong_principal,
+        ),
+        (
+            "wrong session",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            wrong_session,
+        ),
+        (
+            "wrong proof binding",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            wrong_proof_binding,
+        ),
+        (
+            "wrong grant",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            wrong_grant,
+        ),
+        (
+            "wrong selected resource",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            wrong_selected_resource,
+        ),
+        (
+            "wrong executable actor",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            wrong_executable_actor,
+        ),
+        (
+            "direct connector token",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            direct_connector_token,
+        ),
+        (
+            "wrong connector",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_UNISAT_CAPSULE_ID,
+            valid_connector_token.clone(),
+        ),
+        (
+            "WalletConnect is not an injected connector",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_WALLETCONNECT_CAPSULE_ID,
+            walletconnect_token,
+        ),
+        (
+            "invalid connector token",
+            authority.home_token.clone(),
+            "https://elastos.elacitylabs.com",
+            WALLET_METAMASK_CAPSULE_ID,
+            "not-a-launch-token".to_string(),
+        ),
+    ];
+
+    for (label, home_token, origin, connector_id, connector_token) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request("elastos.elacitylabs.com", origin)
+                    .method("POST")
+                    .uri("/api/apps/home/wallet-connector/evm/link/challenge")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("x-elastos-home-token", home_token)
+                    .body(Body::from(
+                        json!({
+                            "schema": "elastos.home.wallet-connector.effect.request/v1",
+                            "connector_id": connector_id,
+                            "connector_token": connector_token,
+                            "address": address,
+                            "chain_id": 20,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "{label} unexpectedly returned {}",
+            response.status()
+        );
+    }
+
+    for forbidden_field in ["method", "message", "transaction"] {
+        let mut body = json!({
+            "schema": "elastos.home.wallet-connector.effect.request/v1",
+            "connector_id": WALLET_METAMASK_CAPSULE_ID,
+            "connector_token": valid_connector_token,
+        });
+        body[forbidden_field] = json!("attacker-controlled");
+        let response = app
+            .clone()
+            .oneshot(
+                test_browser_request(
+                    "elastos.elacitylabs.com",
+                    "https://elastos.elacitylabs.com",
+                )
+                .method("POST")
+                .uri(
+                    "/api/apps/home/wallet-connector/approvals/wallet-approval%3Aexternal/handoff",
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-elastos-home-token", authority.home_token.clone())
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let oversized_request_id = "x".repeat(257);
+    let response = app
+        .oneshot(
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
+                .method("POST")
+                .uri(format!(
+                    "/api/apps/home/wallet-connector/approvals/{oversized_request_id}/handoff"
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-elastos-home-token", authority.home_token)
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": valid_connector_token,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_client_error());
+    wallet_provider.assert_no_requests().await;
+}
+
+#[tokio::test]
+async fn test_injected_connector_direct_effect_routes_reach_neither_wallet_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let metamask_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
+    let unisat_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_UNISAT_CAPSULE_ID,
+        &authority,
+    );
+    let provider = MockWalletProvider::default();
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
+
+    let metamask = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(
+                    "/api/apps/wallet-metamask/wallet/approvals/wallet-approval%3Aexternal/approve",
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-elastos-home-token", metamask_token)
+                .body(Body::from(r#"{"reason":"attacker controlled"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(metamask.status().is_client_error());
+
+    let unisat = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri(
+                    "/api/apps/wallet-unisat/wallet/approvals/wallet-approval%3Aexternal/complete",
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-elastos-home-token", unisat_token)
+                .body(Body::from(
+                    r#"{"payload_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signature":"attacker","signature_type":"bip322_simple","signer":"attacker"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(unisat.status().is_client_error());
+    wallet_provider.assert_no_requests().await;
+}
+
+#[tokio::test]
 async fn test_walletconnect_connector_requires_pinned_config() {
     let dir = tempfile::tempdir().unwrap();
     let context = local_home_launch_token_context(dir.path()).unwrap();
@@ -61,7 +357,7 @@ async fn test_walletconnect_connector_requires_pinned_config() {
 
     let resp = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-walletconnect/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -93,7 +389,7 @@ async fn test_walletconnect_connector_accepts_pinned_config() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-walletconnect/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -123,7 +419,7 @@ async fn test_walletconnect_connector_config_returns_pinned_sdk_contract() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-walletconnect/wallet/config")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -167,7 +463,7 @@ async fn test_wallet_summary_reports_walletconnect_available_only_when_pinned() 
     let without_config = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -193,7 +489,7 @@ async fn test_wallet_summary_reports_walletconnect_available_only_when_pinned() 
 
     let with_config = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet/wallet/summary")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -225,7 +521,7 @@ async fn test_metamask_connector_config_returns_runtime_evm_chain_metadata() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-metamask/wallet/config")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -270,17 +566,17 @@ fn seed_walletconnect_connector_config(data_dir: &std::path::Path) {
 #[tokio::test]
 async fn test_metamask_connector_lists_external_wallet_accounts() {
     let dir = tempfile::tempdir().unwrap();
-    let context = local_home_launch_token_context(dir.path()).unwrap();
-    let token =
-        issue_home_launch_token_with_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &context)
-            .unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), WALLET_METAMASK_CAPSULE_ID, &authority);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_METAMASK_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
         accounts: TokioMutex::new(vec![
             json!({
                 "account_id": "wallet:eip155:20:0x1111111111111111111111111111111111111111",
-                "principal_id": context.principal_id.clone(),
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:managed:eip155:20:0x1111111111111111111111111111111111111111",
                 "chain_namespace": "eip155:20",
                 "address": "0x1111111111111111111111111111111111111111",
@@ -289,7 +585,7 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
             }),
             json!({
                 "account_id": "wallet:eip155:8453:0xA4C02dB8653DD0cA18A8736D693B0dB85C5b246C",
-                "principal_id": context.principal_id.clone(),
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:siwe:eip155:8453:0xa4c02db8653dd0ca18a8736d693b0db85c5b246c",
                 "chain_namespace": "eip155:8453",
                 "address": "0xA4C02dB8653DD0cA18A8736D693B0dB85C5b246C",
@@ -299,7 +595,7 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
             }),
             json!({
                 "account_id": "wallet:bip122:000000000019d6689c085ae165831e93:bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
-                "principal_id": context.principal_id,
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:bip122:000000000019d6689c085ae165831e93:bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
                 "chain_namespace": "bip122:000000000019d6689c085ae165831e93",
                 "address": "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
@@ -311,11 +607,13 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
         approvals: TokioMutex::default(),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-metamask/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -336,6 +634,9 @@ async fn test_metamask_connector_lists_external_wallet_accounts() {
     );
     assert_eq!(json["accounts"][0]["proof_type"], "siwe");
     assert_eq!(json["accounts"][0]["connector_id"], "wallet-metamask");
+    wallet_provider
+        .assert_v2_account_reads(&wallet_read_authority, 1)
+        .await;
 }
 
 #[tokio::test]
@@ -345,6 +646,8 @@ async fn test_wallet_connector_approvals_are_scoped_to_connector() {
     let token =
         issue_home_launch_token_with_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &context)
             .unwrap();
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_METAMASK_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -383,11 +686,13 @@ async fn test_wallet_connector_approvals_are_scoped_to_connector() {
         ]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-metamask/wallet/approvals")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -409,22 +714,25 @@ async fn test_wallet_connector_approvals_are_scoped_to_connector() {
         json["approval_requests"][0]["connector_id"],
         "wallet-metamask"
     );
+    wallet_provider
+        .assert_v2_approval_operations(&wallet_authority, &[WalletOperationKind::ListApprovals])
+        .await;
 }
 
 #[tokio::test]
 async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
     let dir = tempfile::tempdir().unwrap();
-    let context = local_home_launch_token_context(dir.path()).unwrap();
-    let token =
-        issue_home_launch_token_with_context(dir.path(), WALLET_UNISAT_CAPSULE_ID, &context)
-            .unwrap();
+    let authority = passkey_authority(dir.path());
+    let token = app_token_for_authority(dir.path(), WALLET_UNISAT_CAPSULE_ID, &authority);
+    let wallet_read_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_UNISAT_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
         accounts: TokioMutex::new(vec![
             json!({
                 "account_id": "wallet:bip122:000000000019d6689c085ae165831e93:bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
-                "principal_id": context.principal_id.clone(),
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:bip122:000000000019d6689c085ae165831e93:bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
                 "chain_namespace": "bip122:000000000019d6689c085ae165831e93",
                 "address": "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l",
@@ -434,7 +742,7 @@ async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
             }),
             json!({
                 "account_id": "wallet:bip122:000000000019d6689c085ae165831e93:bc1q0000000000000000000000000000000000000",
-                "principal_id": context.principal_id,
+                "principal_id": authority.principal_id.clone(),
                 "proof_binding_id": "proof:wallet:bip122:000000000019d6689c085ae165831e93:bc1q0000000000000000000000000000000000000",
                 "chain_namespace": "bip122:000000000019d6689c085ae165831e93",
                 "address": "bc1q0000000000000000000000000000000000000",
@@ -446,11 +754,13 @@ async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
         approvals: TokioMutex::default(),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/wallet-unisat/wallet/accounts")
                 .header("x-elastos-home-token", token)
                 .body(Body::empty())
@@ -469,6 +779,9 @@ async fn test_unisat_connector_lists_only_unisat_bitcoin_accounts() {
         json["accounts"][0]["address"],
         "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l"
     );
+    wallet_provider
+        .assert_v2_account_reads(&wallet_read_authority, 1)
+        .await;
 }
 
 #[tokio::test]
@@ -478,6 +791,8 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
     let principal_id = context.principal_id.clone();
     let token =
         issue_home_launch_token_with_context(dir.path(), WALLET_CAPSULE_ID, &context).unwrap();
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), WALLET_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -500,12 +815,14 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
         })]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/approvals/wallet-approval%3Abitcoin/approve")
                 .header("x-elastos-home-token", token.clone())
@@ -526,12 +843,12 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
 
     let completed = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/wallet/wallet/approvals/wallet-approval%3Abitcoin/complete")
                 .header("x-elastos-home-token", token)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"payload_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signature":"mock-bip322-signature","signer":"bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l"}"#))
+                .body(Body::from(r#"{"payload_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signature":"mock-bip322-signature","signature_type":"bip322_simple","signer":"bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l"}"#))
                 .unwrap(),
         )
         .await
@@ -543,17 +860,31 @@ async fn test_wallet_app_can_approve_wallet_scoped_external_request() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["pending_count"], 0);
     assert_eq!(json["note"], "Signed by Wallet.");
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_authority,
+            &[
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveConnectorHandoff,
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::CompleteConnectorHandoff,
+                WalletOperationKind::ListApprovals,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]
 async fn test_metamask_connector_approves_external_wallet_request_with_handoff() {
     let dir = tempfile::tempdir().unwrap();
-    let context = local_home_launch_token_context(dir.path()).unwrap();
-    let principal_id = context.principal_id.clone();
-    let session_id = context.session_id.clone();
-    let token =
-        issue_home_launch_token_with_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &context)
-            .unwrap();
+    let authority = passkey_authority(dir.path());
+    let principal_id = authority.principal_id.clone();
+    let session_id = authority.session_id.clone();
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -580,14 +911,19 @@ async fn test_metamask_connector_approves_external_wallet_request_with_handoff()
 
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri(
-                    "/api/apps/wallet-metamask/wallet/approvals/wallet-approval%3Aexternal/approve",
-                )
-                .header("x-elastos-home-token", token)
+                .uri("/api/apps/home/wallet-connector/approvals/wallet-approval%3Aexternal/handoff")
+                .header("x-elastos-home-token", authority.home_token)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"reason":"Looks correct"}"#))
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token,
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -597,8 +933,13 @@ async fn test_metamask_connector_approves_external_wallet_request_with_handoff()
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["pending_count"], 0);
-    assert_eq!(json["note"], "Approved. Continue in MetaMask.");
+    assert_eq!(
+        json["schema"],
+        "elastos.home.wallet-connector.effect.result/v1"
+    );
+    assert_eq!(json["action"], "approval_handoff");
+    assert_eq!(json["connector_id"], WALLET_METAMASK_CAPSULE_ID);
+    assert_eq!(json["request_id"], "wallet-approval:external");
     assert_eq!(json["handoff"]["status"], "awaiting_wallet_signature");
     assert_eq!(
         json["handoff"]["payload_hash"],
@@ -636,12 +977,19 @@ async fn test_metamask_connector_approves_external_wallet_request_with_handoff()
 #[tokio::test]
 async fn test_metamask_connector_completes_external_wallet_handoff() {
     let dir = tempfile::tempdir().unwrap();
-    let context = local_home_launch_token_context(dir.path()).unwrap();
-    let principal_id = context.principal_id.clone();
-    let session_id = context.session_id.clone();
-    let token =
-        issue_home_launch_token_with_context(dir.path(), WALLET_METAMASK_CAPSULE_ID, &context)
-            .unwrap();
+    let authority = passkey_authority(dir.path());
+    let principal_id = authority.principal_id.clone();
+    let session_id = authority.session_id.clone();
+    let connector_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &authority,
+    );
+    let wallet_authority = runtime_wallet_authority_for_app_token(
+        dir.path(),
+        WALLET_METAMASK_CAPSULE_ID,
+        &connector_token,
+    );
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -664,19 +1012,26 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
         })]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("elastos.elacitylabs.com", "https://elastos.elacitylabs.com")
                 .method("POST")
-                .uri(
-                    "/api/apps/wallet-metamask/wallet/approvals/wallet-approval%3Aexternal/approve",
-                )
-                .header("x-elastos-home-token", token.clone())
+                .uri("/api/apps/home/wallet-connector/approvals/wallet-approval%3Aexternal/handoff")
+                .header("x-elastos-home-token", authority.home_token.clone())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"reason":"Looks correct"}"#))
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token.clone(),
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -685,12 +1040,26 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
 
     let completed = app
         .oneshot(
-            Request::builder()
+            test_browser_request(
+                "elastos.elacitylabs.com",
+                "https://elastos.elacitylabs.com",
+            )
                 .method("POST")
-                .uri("/api/apps/wallet-metamask/wallet/approvals/wallet-approval%3Aexternal/complete")
-                .header("x-elastos-home-token", token)
+                .uri("/api/apps/home/wallet-connector/approvals/wallet-approval%3Aexternal/complete")
+                .header("x-elastos-home-token", authority.home_token)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"payload_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","signature":"0xsigned","signer":"0xabc"}"#))
+                .body(Body::from(
+                    json!({
+                        "schema": "elastos.home.wallet-connector.effect.request/v1",
+                        "connector_id": WALLET_METAMASK_CAPSULE_ID,
+                        "connector_token": connector_token,
+                        "payload_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "signature": "0xsigned",
+                        "signature_type": "eip191",
+                        "signer": "0xabc",
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -700,8 +1069,23 @@ async fn test_metamask_connector_completes_external_wallet_handoff() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["pending_count"], 0);
-    assert_eq!(json["note"], "Signed by MetaMask.");
+    assert_eq!(
+        json["schema"],
+        "elastos.home.wallet-connector.effect.result/v1"
+    );
+    assert_eq!(json["action"], "approval_complete");
+    assert_eq!(json["status"], "completed");
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_authority,
+            &[
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveConnectorHandoff,
+                WalletOperationKind::CompleteConnectorHandoff,
+                WalletOperationKind::ListApprovals,
+            ],
+        )
+        .await;
 
     let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
     let approved_event = auth_state

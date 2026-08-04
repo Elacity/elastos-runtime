@@ -1698,13 +1698,16 @@ dependencies = [
  "elastos-runtime",
  "elastos-storage",
  "elastos-tls",
+ "elastos-wallet-contract",
  "flate2",
  "futures-lite",
  "getrandom 0.2.17",
  "hex",
  "hkdf",
+ "hmac",
  "iroh",
  "iroh-gossip",
+ "k256",
  "libc",
  "qrcodegen",
  "rand 0.8.6",
@@ -1712,7 +1715,9 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
+ "sha3",
  "tar",
  "tempfile",
  "tokio",
@@ -1756,6 +1761,16 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+]
+
+[[package]]
+name = "elastos-wallet-contract"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

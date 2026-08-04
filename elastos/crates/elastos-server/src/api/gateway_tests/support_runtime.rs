@@ -300,6 +300,11 @@ fn write_test_viewer_capsule(
 ) {
     activate_test_capsule(data_dir, name);
     let capsule_dir = data_dir.join("capsules").join(name);
+    let storage = if name == "gba-ucity" {
+        "localhost://Users/self/.AppData/LocalHost/GBA/ucity/*"
+    } else {
+        "localhost://Users/self/.AppData/LocalHost/GBA/test/*"
+    };
     std::fs::create_dir_all(&capsule_dir).unwrap();
     std::fs::write(
         capsule_dir.join("capsule.json"),
@@ -314,7 +319,7 @@ fn write_test_viewer_capsule(
             "entrypoint": entrypoint,
             "viewer": viewer,
             "permissions": {
-                "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/test/*"]
+                "storage": [storage]
             }
         }))
         .unwrap(),
@@ -477,15 +482,14 @@ fn launch_token_for_authority_context(
     .unwrap()
 }
 
-fn intent_token_for_authority_context(
+fn projection_launch_token_for_authority_context(
     data_dir: &std::path::Path,
     app: &str,
     authority: &TestPasskeyAuthority,
-    operation: &str,
-    request: &serde_json::Value,
 ) -> String {
-    issue_home_launch_token_with_intent(
+    issue_home_projection_launch_token_with_context(
         data_dir,
+        app,
         app,
         &HomeLaunchTokenContext {
             principal_id: authority.principal_id.clone(),
@@ -493,26 +497,36 @@ fn intent_token_for_authority_context(
             proof_binding_id: Some(authority.proof_binding_id.clone()),
             grant_id: authority.grant_id.clone(),
         },
-        operation,
-        request,
     )
     .unwrap()
 }
 
-fn intent_token_for_app_context(
+fn step_up_token_for_app_context(
     data_dir: &std::path::Path,
     app: &str,
     app_token: &str,
     operation: &str,
     request: &serde_json::Value,
 ) -> String {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-elastos-home-token",
-        HeaderValue::from_str(app_token).unwrap(),
-    );
-    let context = require_home_launch_token_context(data_dir, &headers, app).unwrap();
-    issue_home_launch_token_with_intent(data_dir, app, &context, operation, request).unwrap()
+    issue_passkey_step_up_token_for_test(data_dir, app_token, app, operation, request).unwrap()
+}
+
+fn stale_step_up_token_for_app_context(
+    data_dir: &std::path::Path,
+    app: &str,
+    app_token: &str,
+    operation: &str,
+    request: &serde_json::Value,
+) -> String {
+    issue_passkey_step_up_token_at_for_test(
+        data_dir,
+        app_token,
+        app,
+        operation,
+        request,
+        crate::auth::now_ts().saturating_sub(181),
+    )
+    .unwrap()
 }
 
 fn app_token_for_authority(
@@ -533,6 +547,21 @@ fn app_token_for_authority(
     };
     crate::auth::store_session_grant(data_dir, grant.clone()).unwrap();
     issue_home_launch_token_for_auth_grant(data_dir, app, &grant).unwrap()
+}
+
+fn runtime_wallet_authority_for_app_token(
+    data_dir: &std::path::Path,
+    app: &str,
+    token: &str,
+) -> RuntimeWalletAuthority {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("localhost:61180"));
+    headers.insert("origin", HeaderValue::from_static("null"));
+    headers.insert(
+        "x-elastos-home-token",
+        HeaderValue::from_str(token).unwrap(),
+    );
+    require_runtime_wallet_authority(data_dir, &headers, &[app]).unwrap()
 }
 
 fn evm_test_address(signing_key: &EvmSigningKey) -> String {

@@ -1,9 +1,9 @@
 # State
 
-Last updated: 2026-07-18 UTC
+Last updated: 2026-07-31 UTC
 
-This file records public-safe current truth for the 0.5.0 line and active
-feature branches. Historical
+This file records public-safe current truth for the 0.5.0 baseline, the 0.6.0
+release candidate, and active feature branches. Historical
 local proof logs, private SSH aliases, tunnel ports, operator usernames, key
 paths, worktree paths, and target backup paths are intentionally not tracked in
 the public repository.
@@ -12,19 +12,19 @@ the public repository.
 
 - `main` is the 0.5.0 baseline. Active feature branches must state whether they
   are preserving 0.5.0 behavior or intentionally moving the product architecture.
-- `feat/elastos-shell-protocol` is the current Components, ElastOS Bus, and shell-protocol
-  work branch based on `upstream/0.6-dev`. Its review-readiness requirements are
-  tracked in [TASKS.md](TASKS.md).
-- `feat/shell-ui-esp-on-protocol` is the UX-on-protocol integration branch cut from
-  Anders tip `70ef68532`: Home GUI iframe bridge + People-as-capsule + Wallet
-  passkey mediation stay Anders-owned; shell chrome / Wallet rail / design tokens
-  are Katie-owned. `just verify` is green on this tip (entropy union included).
-  Pre-align UX backup: `backup/shell-ui-esp-pre-anders-align` / tag
-  `backup/shell-ui-esp-4ee88d690`. Do not retarget `feat/shell-ui-esp` without
-  explicit approval.
-- Executable product capsules target the WASM Component Model through
-  `elastos.component/v1` and use the Runtime-mediated `elastos:bus@v1`
-  authority contract. WASI Preview 1 is not a supported product capsule ABI.
+- `fix/elastos-shell-protocol-browser-wallet-consolidation` is the published
+  0.6.0 review line. It is based on `feat/elastos-shell-protocol`, which
+  descends from `upstream/0.6-dev`; it includes the reviewed ESP, Wallet,
+  Recovery, and Browser continuation and keeps the accepted implementation
+  history intact. It is not merged to `main`.
+- Carrier reconciliation, shell UI redesign, and extended AI UI work are not
+  included in 0.6.0. Carrier moves to 0.7; the UI work requires an independent
+  compatibility and product review before a later release.
+- The Runtime implements the WASM Component Model path through
+  `elastos.component/v1` and the Runtime-mediated `elastos:bus@v1` authority
+  contract. The conformance fixture and authoring template exercise it; all 18
+  shipped first-party UI Apps still use `elastos.runtime-projection/v1` web
+  projections. WASI Preview 1 is rejected at product capsule admission.
 - Source/review proof must cite concrete reusable commands: `git diff --check`,
   `node scripts/home-entropy-check.mjs`, `node scripts/browser-entropy-check.mjs`,
   `bash scripts/check-wci-alignment.sh`, `just candidate-command-audit`, and the
@@ -36,7 +36,8 @@ the public repository.
 - ElastOS Bus v1 deliberately omits streams because no shared
   capability/audit/lifecycle implementation exists yet. Its checked-in WIT hash
   is `7a026e0a641c8c04214576dc85a677e0b52c9f02866d231119f9a3ba609d49e2`;
-  all first-party component artifacts and manifests are bound to that hash.
+  the conformance fixture and Component authoring template are bound to that
+  hash. No shipped first-party product Component proves adoption end to end.
 - [docs/CAPSULE_AUTHORING.md](docs/CAPSULE_AUTHORING.md),
   [templates/capsules](templates/capsules), and `elastos init` are the canonical
   capsule authoring paths. Their manifests are validated by repository gates;
@@ -56,14 +57,15 @@ the public repository.
 
 ## Capsule Execution Truth
 
-- [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#isolated-capsule-execution-contract)
+- [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#isolation-boundary)
   defines the cross-branch isolated-execution contract. It is a 0.6
   architecture requirement, not an additional product claim for the 0.5.0
   `main` line.
-- The ESP branch proves a useful first slice: product WASM capsules are
-  Components with no linked WASI, environment, filesystem preopen, FIFO, raw
-  socket, or gateway authority, and every guest effect is linked through
-  `elastos:bus@v1`.
+- The ESP branch proves a useful substrate slice: the Component runner and
+  conformance fixture use no linked WASI, environment, filesystem preopen,
+  FIFO, raw socket, or gateway authority, and every guest effect is linked
+  through `elastos:bus@v1`. This is contract proof, not first-party product-App
+  adoption.
 - The Component runner is bounded today, but not yet by each manifest's declared
   resources: it uses a fixed 128 MiB memory ceiling and fixed fuel budget.
   `component/v1` is a bounded activation contract and cannot cancel or stop an
@@ -86,6 +88,24 @@ the public repository.
   algorithm identifier, golden vectors, and a signed transition anchor rather
   than rewriting retained history.
 
+## Authority And Wallet Truth
+
+- Home authority uses signed `elastos.home.launch-token/v4` envelopes. Runtime
+  validation binds resource, actors, principal, proof, grant, session,
+  lifetime, and non-delegatability; callers cannot supply Wallet authority.
+- Wallet Bus v2.3 is the typed Runtime/Wallet Provider boundary. Wallet Provider
+  owns keys, accounts, proofs, approval execution, and validated outcomes;
+  Runtime owns launch authorization, orchestration, durable effects, and the
+  private provider adapter.
+- Passkey step-up is durable, one-shot, and bound to the original launch,
+  operation, and canonical request digest. Managed recovery verifies the exact
+  Wallet set and root reassignment before returning terminal success.
+- Runtime creates durable transaction-effect state before dispatch and
+  reconciles recorded or uncertain Chain outcomes without rebroadcasting.
+- Browser account access is an explicit Wallet approval. The injected provider
+  can request accounts, but the page receives no selected address until the
+  Runtime-mediated request is approved through the trusted review path.
+
 ## Proof Path Ledger
 
 - Installed operator/update proof path: `public-install-operator-smoke.sh`.
@@ -98,24 +118,40 @@ the public repository.
 
 ## Browser Truth
 
-- Browser architecture is coherent enough to preserve.
-- The Browser objective still fails product audio proof and hash-bound manual UX evidence.
-- Docker/Selkies is only `managed_baseline_not_final_product`.
-- The hosted Selkies/GStreamer service is a managed baseline, not accepted as the final Browser.
-- The current hosted baseline is single-session; active pages are a serialization blocker.
-- This server is not a product native-browser proof target because it lacks a real host compositor/display, host audio service, and working network namespace support.
-- Kasm Workspaces, BrowserBox, or KasmVNC cannot replace Selkies until the
-  operator_control_socket not provisioned blocker is cleared and their
-  operator prerequisites plus product-compositor evidence pass.
+- Browser is included in 0.6.0 as a bounded Runtime Browser, not as a fully
+  reliable general-purpose Browser claim.
+- Accepted localhost evidence covers the installed macOS VZ candidate's launch,
+  decoded display, navigation through Runtime-only networking, and injected
+  provider availability.
+- Deterministic proof confirmed `window.ethereum`, one EIP-6963 provider,
+  `isElastOS=true`, `isMetaMask=true`, the Runtime Wallet binding, chain `0x14`,
+  and exactly one `eth_requestAccounts` handoff producing one pending Wallet
+  account-access approval.
+- One failed Browser restart followed by a successful open, lost `ela.city`
+  login state across restart, and slow performance remain explicit post-0.6
+  follow-ups.
+- Runtime owns Browser launch settlement and exact cleanup obligations. The
+  close path acknowledges authority renewal, binds close to the exact Browser
+  instance, and keeps nonterminal cleanup ownership durable.
 - Browser profile state is principal-owned and reset-scoped, but it still lacks
   protected/recoverable Browser profile storage.
 - Browser VM Chromium profile disks are principal-owned and reset-scoped, but they are not protected principal-root envelopes or Recovery Kit-packaged state yet.
 - Browser profile receipts must continue to report
   `storage_posture=principal_owned_reset_scoped_unprotected`.
 - Principal-root object protection exists for selected Home/runtime state; this does not include Browser VM Chromium profile disks yet.
+- Product-readiness claims remain gated on target-specific objective audit and
+  matching manual UX evidence; inclusion in 0.6.0 does not waive that gate.
 
 ## Browser Provider Evidence
 
+- Browser architecture is coherent enough to preserve, but the objective still
+  fails product audio proof and hash-bound manual UX evidence.
+- Docker/Selkies is only `managed_baseline_not_final_product`; the hosted Selkies/GStreamer service is a managed baseline, not accepted as the final Browser.
+- The hosted baseline is single-session; active pages are a serialization blocker.
+- This server is not a product native-browser proof target because it lacks a real host compositor/display, host audio service, and working network namespace support.
+- Kasm Workspaces, BrowserBox, or KasmVNC cannot replace Selkies until the
+  operator_control_socket not provisioned blocker and their operator evidence
+  requirements are cleared.
 - `scripts/browser-provider-decision-report.mjs` summarizes supplied `hosted_bakeoff` and `native_preflight` artifacts and keeps generated placeholder configs out of operator instructions.
 - `scripts/browser-provider-runbook.mjs` is read-only guidance. Its operator guidance is generated from the actual evidence and should not be treated as a deployment action.
 - Current Browser runbooks must keep the stop condition visible: do not keep
@@ -145,10 +181,11 @@ the public repository.
   `capsule.local.memfs.v1` boundary. The product artifact imports only that
   local module and its bundled Emscripten environment.
 - `scripts/gba-demo-smoke.sh` proves manifest, Runtime route, authorization,
-  storage, input-map, and artifact invariants. `scripts/gba-linux-browser-smoke.sh`
-  proves the same capsule assets in disposable Linux Chromium: rendered
-  canvas, trusted keyboard and audio input, on-screen controls, 32 KiB save,
-  reload/restore, and process/container cleanup.
+  storage, input-map, and artifact invariants.
+  `scripts/gba-opaque-frame-browser-smoke.sh` proves the same capsule assets in
+  disposable Chromium: opaque `Origin: null` topology, parent DOM denial,
+  changing nonzero framebuffer writes, trusted keyboard input, nonzero emulator
+  audio output, on-screen controls, save/reload persistence, and process cleanup.
 - Installed macOS proof covers uCity and Library `.gba` launch, moving frames,
   keyboard/on-screen input, user-enabled audio, save/reload, source-installed-
   served artifact parity, and view cleanup. GBA remains outside the default
@@ -303,13 +340,15 @@ the public repository.
 - Public-install branch-binary smokes must pin the installer-selected components manifest.
 - Public-install branch-binary smokes prevent source checkout `components.json` from leaking into installed-path proof.
 - Public-install branch-binary smokes fail if the selected gateway lacks the current `home` setup profile.
-- Branch-override public smokes require a staged or published 0.5.0-compatible
+- Branch-override public smokes require a staged or published 0.6.0-compatible
   manifest with the current `home` profile and checksummed artifacts.
 - Source/local Carrier setup proof stays in `scripts/local-carrier-setup-smoke.sh`.
-- Public install proof must require a staged or published 0.5.0-compatible manifest with the current `home` profile and checksummed artifacts.
+- Public install proof for this candidate requires a staged or published
+  0.6.0-compatible manifest with the current `home` profile and checksummed
+  artifacts.
 - Set `ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only when the publisher relay
   path itself is under review.
-- Final public installed-path proof waits for publishing the 0.5.0
+- Final public installed-path proof waits for publishing the 0.6.0
   binary/artifact set.
 
 ## Open Blockers

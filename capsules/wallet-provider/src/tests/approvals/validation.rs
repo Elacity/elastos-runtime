@@ -9,28 +9,34 @@ fn approval_completion_fails_closed_before_approval_or_with_wrong_hash() {
     let account_id = "wallet:eip155:20:0xabc";
 
     assert!(matches!(
-        provider.handle(Request::LinkAccount {
-            principal_id: principal_id.into(),
-            proof_binding_id: "proof:eip155:20:0xabc".into(),
-            chain_namespace: "eip155:20".into(),
-            address: "0xabc".into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: None,
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:0xabc".into(),
+                chain_namespace: "eip155:20".into(),
+                address: "0xabc".into(),
+                proof_type: "siwe".into(),
+                label: None,
+            },
+        ),
         Response::Ok { .. }
     ));
-    let request_id = match provider.handle(Request::Signature {
-        principal_id: principal_id.into(),
-        account_id: Some(account_id.into()),
-        chain_namespace: Some("eip155:20".into()),
-        intent: "credential".into(),
-        capsule_id: "system".into(),
-        resource: "elastos://wallet/eip155:20/sign/credential".into(),
-        reason: "Issue credential".into(),
-        payload: json!({"credential": "test"}),
-        expires_at: None,
-    }) {
+    let request_id = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "system",
+        WalletProviderOperationV2::RequestApproval {
+            account_id: account_id.into(),
+            chain_namespace: "eip155:20".into(),
+            intent: "credential".into(),
+            resource: "elastos://wallet/eip155:20/sign/credential".into(),
+            reason: "Issue credential".into(),
+            payload: json!({"credential": "test"}),
+            expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+        },
+    ) {
         Response::Ok { data: Some(data) } => data["approval_request"]["request_id"]
             .as_str()
             .unwrap()
@@ -39,17 +45,20 @@ fn approval_completion_fails_closed_before_approval_or_with_wrong_hash() {
     };
 
     let wrong_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
-    match provider.handle(Request::CompleteApproval {
-        principal_id: principal_id.into(),
-        request_id: request_id.clone(),
-        connector_id: "wallet-metamask".into(),
-        payload_hash: wrong_hash.into(),
-        signature: Some("0xsigned-wallet-result".into()),
-        signature_type: None,
-        public_key: None,
-        signer: "0xabc".into(),
-        transaction_hash: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet-metamask",
+        WalletProviderOperationV2::CompleteConnectorHandoff {
+            request_id: request_id.clone(),
+            payload_hash: wrong_hash.into(),
+            signature: Some("0xsigned-wallet-result".into()),
+            signature_type: Some("personal_sign".into()),
+            public_key: None,
+            signer: "0xabc".into(),
+            transaction_hash: None,
+        },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "invalid_request");
             assert!(message.contains("approved before completion"));
@@ -58,24 +67,31 @@ fn approval_completion_fails_closed_before_approval_or_with_wrong_hash() {
     }
 
     assert!(matches!(
-        provider.handle(Request::ApproveApproval {
-            principal_id: principal_id.into(),
-            request_id: request_id.clone(),
-            reason: None,
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::ApproveConnectorHandoff {
+                request_id: request_id.clone(),
+                reason: "approved".to_string(),
+            },
+        ),
         Response::Ok { .. }
     ));
-    match provider.handle(Request::CompleteApproval {
-        principal_id: principal_id.into(),
-        request_id,
-        connector_id: "wallet-metamask".into(),
-        payload_hash: wrong_hash.into(),
-        signature: Some("0xsigned-wallet-result".into()),
-        signature_type: None,
-        public_key: None,
-        signer: "0xabc".into(),
-        transaction_hash: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet-metamask",
+        WalletProviderOperationV2::CompleteConnectorHandoff {
+            request_id,
+            payload_hash: wrong_hash.into(),
+            signature: Some("0xsigned-wallet-result".into()),
+            signature_type: Some("personal_sign".into()),
+            public_key: None,
+            signer: "0xabc".into(),
+            transaction_hash: None,
+        },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "invalid_request");
             assert!(message.contains("payload hash mismatch"));
@@ -93,23 +109,98 @@ fn signature_request_rejects_unknown_intent_and_unlinked_account() {
         ("raw_sign", "wallet:eip155:20:0xabc"),
         ("publish_envelope", "wallet:eip155:20:missing"),
     ] {
-        match provider.handle(Request::Signature {
-            principal_id: "person:local:alice".into(),
-            account_id: Some(account_id.into()),
-            chain_namespace: Some("eip155:20".into()),
-            intent: intent.into(),
-            capsule_id: "documents".into(),
-            resource: "elastos://content/publish".into(),
-            reason: "Publish document revision".into(),
-            payload: json!({"cid": "bafy-test"}),
-            expires_at: None,
-        }) {
+        match invoke_wallet(
+            &mut provider,
+            "person:local:alice",
+            "documents",
+            WalletProviderOperationV2::RequestApproval {
+                account_id: account_id.into(),
+                chain_namespace: "eip155:20".into(),
+                intent: intent.into(),
+                resource: "elastos://content/publish".into(),
+                reason: "Publish document revision".into(),
+                payload: json!({"cid": "bafy-test"}),
+                expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+            },
+        ) {
             Response::Error { code, .. } => {
                 assert!(code == "invalid_request" || code == "not_found")
             }
             other => panic!("expected request rejection, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn approval_request_preserves_valid_expiry_and_rejects_invalid_lifetimes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = init_provider(dir.path());
+    let principal_id = "person:local:alice";
+    let (account_id, address) = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet",
+        WalletProviderOperationV2::CreateManagedAccount {
+            chain_namespace: "eip155:20".into(),
+            label: None,
+            create_new: false,
+        },
+    ) {
+        Response::Ok { data: Some(data) } => (
+            data["account"]["account_id"].as_str().unwrap().to_string(),
+            data["account"]["address"].as_str().unwrap().to_string(),
+        ),
+        other => panic!("expected managed account, got {other:?}"),
+    };
+    let valid_expires_at = now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS);
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "documents",
+        WalletProviderOperationV2::RequestApproval {
+            account_id: account_id.clone(),
+            chain_namespace: "eip155:20".into(),
+            intent: "browser_personal_sign".into(),
+            resource: "elastos://wallet/eip155:20/sign/browser_personal_sign".into(),
+            reason: "Browser page requests personal_sign".into(),
+            payload: browser_personal_sign_payload(&account_id, &address, "Valid expiry"),
+            expires_at: valid_expires_at,
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["approval_request"]["expires_at"], valid_expires_at)
+        }
+        other => panic!("expected approval request, got {other:?}"),
+    }
+
+    for expires_at in [
+        1,
+        now_ts()
+            .saturating_add(MAX_APPROVAL_REQUEST_TTL_SECS)
+            .saturating_add(60),
+    ] {
+        match invoke_wallet(
+            &mut provider,
+            principal_id,
+            "documents",
+            WalletProviderOperationV2::RequestApproval {
+                account_id: account_id.clone(),
+                chain_namespace: "eip155:20".into(),
+                intent: "browser_personal_sign".into(),
+                resource: "elastos://wallet/eip155:20/sign/browser_personal_sign".into(),
+                reason: "Invalid approval lifetime".into(),
+                payload: browser_personal_sign_payload(&account_id, &address, "Invalid expiry"),
+                expires_at,
+            },
+        ) {
+            Response::Error { code, message } => {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("expires_at") || message.contains("lifetime"));
+            }
+            other => panic!("expected invalid approval lifetime, got {other:?}"),
+        }
+    }
+    assert_eq!(provider.store.approval_requests.len(), 1);
 }
 
 #[test]
@@ -120,29 +211,35 @@ fn signature_request_rejects_explicit_account_on_incompatible_chain() {
     let account_id = "wallet:eip155:20:0xabc";
 
     assert!(matches!(
-        provider.handle(Request::LinkAccount {
-            principal_id: principal_id.into(),
-            proof_binding_id: "proof:eip155:20:0xabc".into(),
-            chain_namespace: "eip155:20".into(),
-            address: "0xabc".into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: None,
-        }),
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:0xabc".into(),
+                chain_namespace: "eip155:20".into(),
+                address: "0xabc".into(),
+                proof_type: "siwe".into(),
+                label: None,
+            },
+        ),
         Response::Ok { .. }
     ));
 
-    match provider.handle(Request::Signature {
-        principal_id: principal_id.into(),
-        account_id: Some(account_id.into()),
-        chain_namespace: Some(BITCOIN_MAINNET_CHAIN_NAMESPACE.into()),
-        intent: "publish_envelope".into(),
-        capsule_id: "documents".into(),
-        resource: "elastos://content/publish".into(),
-        reason: "Publish document revision".into(),
-        payload: json!({"cid": "bafy-test"}),
-        expires_at: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "documents",
+        WalletProviderOperationV2::RequestApproval {
+            account_id: account_id.into(),
+            chain_namespace: BITCOIN_MAINNET_CHAIN_NAMESPACE.into(),
+            intent: "publish_envelope".into(),
+            resource: "elastos://content/publish".into(),
+            reason: "Publish document revision".into(),
+            payload: json!({"cid": "bafy-test"}),
+            expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+        },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "invalid_request");
             assert!(message.contains("chain_namespace"));
@@ -156,15 +253,18 @@ fn rejects_path_like_identifiers() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
 
-    match provider.handle(Request::LinkAccount {
-        principal_id: "../alice".into(),
-        proof_binding_id: "proof:eip155:20:0xabc".into(),
-        chain_namespace: "eip155:20".into(),
-        address: "0xabc".into(),
-        proof_type: "siwe".into(),
-        connector_id: Some("wallet-metamask".into()),
-        label: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        "../alice",
+        "wallet-metamask",
+        WalletProviderOperationV2::LinkVerifiedAccount {
+            proof_binding_id: "proof:eip155:20:0xabc".into(),
+            chain_namespace: "eip155:20".into(),
+            address: "0xabc".into(),
+            proof_type: "siwe".into(),
+            label: None,
+        },
+    ) {
         Response::Error { code, .. } => assert_eq!(code, "invalid_request"),
         other => panic!("expected invalid request, got {other:?}"),
     }
@@ -175,20 +275,34 @@ fn account_operations_fail_before_init() {
     let mut provider = WalletProvider::new();
 
     for response in [
-        provider.accounts("person:local:alice", false),
-        provider.handle(Request::LinkAccount {
-            principal_id: "person:local:alice".into(),
-            proof_binding_id: "proof:eip155:20:0xabc".into(),
-            chain_namespace: "eip155:20".into(),
-            address: "0xabc".into(),
-            proof_type: "siwe".into(),
-            connector_id: Some("wallet-metamask".into()),
-            label: None,
-        }),
-        provider.handle(Request::RevokeAccount {
-            principal_id: "person:local:alice".into(),
-            account_id: "wallet:eip155:20:0xabc".into(),
-        }),
+        invoke_wallet(
+            &mut provider,
+            "person:local:alice",
+            "wallet",
+            WalletProviderOperationV2::ListAccounts {
+                include_revoked: false,
+            },
+        ),
+        invoke_wallet(
+            &mut provider,
+            "person:local:alice",
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: "proof:eip155:20:0xabc".into(),
+                chain_namespace: "eip155:20".into(),
+                address: "0xabc".into(),
+                proof_type: "siwe".into(),
+                label: None,
+            },
+        ),
+        invoke_wallet(
+            &mut provider,
+            "person:local:alice",
+            "wallet",
+            WalletProviderOperationV2::RevokeAccount {
+                account_id: "wallet:eip155:20:0xabc".into(),
+            },
+        ),
     ] {
         match response {
             Response::Error { code, .. } => assert_eq!(code, "not_initialized"),

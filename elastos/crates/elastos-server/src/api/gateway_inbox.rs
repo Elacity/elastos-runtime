@@ -4,11 +4,12 @@ pub(super) async fn inbox_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, INBOX_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[INBOX_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return inbox_error_response(err),
         };
+    let context = authority.home_launch_context();
 
     let data_dir = state.data_dir.clone();
     let sync_context = context.clone();
@@ -20,8 +21,7 @@ pub(super) async fn inbox_summary(
     let home_state = home_state(&state.data_dir);
     let mut notifications = home_state.notifications;
     append_home_service_access_notifications(&state.data_dir, &context, &mut notifications);
-    let wallet_approvals =
-        system_wallet_approvals_summary(&state, &context.principal_id, false).await;
+    let wallet_approvals = system_wallet_approvals_summary(&state, &authority, false).await;
     append_wallet_approval_notifications(&mut notifications, wallet_approvals.approval_requests);
     if let Ok(capability_requests) = runtime_capability_pending_requests(&state.data_dir).await {
         append_runtime_capability_notifications(&mut notifications, capability_requests);
@@ -64,7 +64,15 @@ pub(super) fn append_wallet_approval_notifications(
             ),
             action_ref: Some(HomeNotificationActionSummary {
                 app: WALLET_CAPSULE_ID.to_string(),
-                action_id: format!("wallet-approve-request:{}", request.request_id),
+                action_id: format!(
+                    "{}:{}",
+                    if request.intent == "browser_account_access" {
+                        "wallet-review-request"
+                    } else {
+                        "wallet-approve-request"
+                    },
+                    request.request_id
+                ),
             }),
             severity: "attention".to_string(),
             read: false,
@@ -140,6 +148,7 @@ fn wallet_approval_title(intent: &str) -> String {
         "credential" => "Credential signing request".to_string(),
         "publish_envelope" => "Publish approval request".to_string(),
         "transaction_intent" => "Transaction approval request".to_string(),
+        "browser_account_access" => "Browser account access request".to_string(),
         "browser_personal_sign" => "Browser signature request".to_string(),
         "browser_typed_data_sign" => "Browser typed data signature request".to_string(),
         "bitcoin_bip322_proof" => "Bitcoin proof request".to_string(),
@@ -153,17 +162,22 @@ pub(super) async fn inbox_action(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, INBOX_CAPSULE_ID) {
-            Ok(context) => context,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[INBOX_CAPSULE_ID]) {
+            Ok(launch) => launch,
             Err(err) => return inbox_error_response(err),
         };
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
+        Err(err) => return inbox_error_response(err),
+    };
+    let context = launch.context.clone();
 
     let action = match parse_inbox_action_request(&headers, &body).map_err(anyhow::Error::msg) {
         Ok(req) => req,
         Err(err) => return inbox_error_response(err),
     };
-    match dispatch_inbox_action(&state, &context, &action).await {
+    match dispatch_inbox_action(&state, &launch, &context, &authority, &action).await {
         Ok(message) => {
             let result = inspect_action_request_id_from_action(&action.action_id)
                 .map(|request_id| inspect_action_result_receipt(&state.data_dir, request_id))
@@ -200,7 +214,7 @@ fn parse_inbox_action_request(
             .ok_or_else(|| "missing action_id".to_string())?;
         Ok(InboxActionRequest {
             action_id,
-            home_token: None,
+            step_up_token: None,
         })
     } else {
         Err("unsupported inbox action content type".to_string())
@@ -209,7 +223,9 @@ fn parse_inbox_action_request(
 
 async fn dispatch_inbox_action(
     state: &GatewayState,
+    launch: &RequiredHomeLaunchToken,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     action: &InboxActionRequest,
 ) -> anyhow::Result<String> {
     let action_id = action.action_id.as_str();
@@ -272,14 +288,17 @@ async fn dispatch_inbox_action(
         return Ok(message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-approve-request:") {
-        let Some(home_token) = action.home_token.as_deref() else {
+        let pending = pending_wallet_approval_request(state, authority, request_id).await?;
+        if pending.intent == "browser_account_access" {
+            anyhow::bail!("Review Browser account access in Wallet before allowing it");
+        }
+        let Some(step_up_token) = action.step_up_token.as_deref() else {
             anyhow::bail!("fresh passkey verification is required to sign with a built-in wallet");
         };
-        consume_fresh_passkey_home_token(
+        consume_passkey_step_up_token(
             data_dir,
-            home_token,
-            context,
-            INBOX_CAPSULE_ID,
+            step_up_token,
+            launch,
             180,
             "wallet.approve",
             &serde_json::json!({
@@ -287,12 +306,12 @@ async fn dispatch_inbox_action(
                 "reason": "Approved in Inbox",
             }),
         )?;
-        let outcome = approve_managed_wallet_request(
+        let outcome = approve_pending_managed_wallet_request(
             state,
             data_dir,
-            &context.principal_id,
-            &context.session_id,
-            request_id,
+            context,
+            authority,
+            pending,
             "Approved in Inbox",
             INBOX_CAPSULE_ID,
         )
@@ -301,14 +320,13 @@ async fn dispatch_inbox_action(
         return Ok(outcome.message);
     }
     if let Some(request_id) = action_id.strip_prefix("wallet-reject-request:") {
-        crate::api::auth_gateway::wallet_provider_data(
+        runtime_wallet_data(
             state,
-            serde_json::json!({
-                "op": "reject_approval",
-                "principal_id": context.principal_id.clone(),
-                "request_id": request_id,
-                "reason": "Rejected in Inbox",
-            }),
+            authority,
+            elastos_wallet_contract::WalletProviderOperationV2::RejectApproval {
+                request_id: request_id.to_string(),
+                reason: "Rejected in Inbox".to_string(),
+            },
         )
         .await?;
         append_wallet_approval_audit(
@@ -380,10 +398,11 @@ async fn dispatch_inbox_action(
         .map_err(|err| anyhow::anyhow!(err))?;
     }
     if let Some(request_id) = action_id.strip_prefix("inspect-approve-request:") {
-        let Some(home_token) = action.home_token.as_deref() else {
+        let Some(step_up_token) = action.step_up_token.as_deref() else {
             anyhow::bail!("fresh passkey verification is required to approve an Inspector action");
         };
-        return approve_inspect_action_request(state, context, request_id, home_token).await;
+        return approve_inspect_action_request(state, launch, context, request_id, step_up_token)
+            .await;
     }
     if let Some(request_id) = action_id.strip_prefix("inspect-deny-request:") {
         return deny_inspect_action_request(state, context, request_id);

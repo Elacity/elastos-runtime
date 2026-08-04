@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260728ag";
+} from "./shell-core.js?v=home-20260725a";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,7 +64,7 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260728ag";
+} from "./shell-windows.js?v=home-20260731b";
 import { playUiSound } from "./shell-sounds.js?v=home-20260728ag";
 import {
   closeOtherShellPopovers,
@@ -3376,7 +3376,10 @@ function walletApprovalEntries(summary) {
     const actionId = entry?.action_ref?.action_id;
     return entry?.kind === "wallet_approval_request"
       && typeof actionId === "string"
-      && actionId.startsWith("wallet-approve-request:");
+      && (
+        actionId.startsWith("wallet-approve-request:")
+        || actionId.startsWith("wallet-review-request:")
+      );
   });
 }
 

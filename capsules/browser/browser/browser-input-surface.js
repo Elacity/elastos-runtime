@@ -1,5 +1,18 @@
 const WHEEL_FLUSH_MS = 80;
 
+export function plainTextFromClipboardEvent(event) {
+  const clipboardData = event?.clipboardData;
+  if (!clipboardData || typeof clipboardData.getData !== "function") {
+    return "";
+  }
+  const types = Array.from(clipboardData.types || []);
+  if (!types.includes("text/plain")) {
+    return "";
+  }
+  const text = clipboardData.getData("text/plain");
+  return typeof text === "string" ? text : "";
+}
+
 export function bindBrowserInputSurface({
   copyRemoteClipboardToHost,
   friendlyOpenError,
@@ -7,6 +20,7 @@ export function bindBrowserInputSurface({
   getCurrentView,
   keyboardCapture,
   pasteHostClipboardIntoRemote,
+  readHostClipboardText,
   remoteVideo,
   renderPanel,
   sendBrowserInput,
@@ -70,15 +84,10 @@ export function bindBrowserInputSurface({
   }
 
   function pasteFromHostClipboard() {
-    if (!navigator.clipboard?.readText) {
-      showStatus("Clipboard access is unavailable.", { sticky: true });
-      return;
-    }
-    navigator.clipboard
-      .readText()
+    readHostClipboardText()
       .then((text) => pasteHostClipboardIntoRemote(text))
-      .catch((error) => {
-        showStatus("Clipboard access is unavailable.", {
+      .catch(() => {
+        showStatus("Clipboard paste was cancelled or unavailable.", {
           sticky: true,
         });
       });
@@ -392,7 +401,7 @@ export function bindBrowserInputSurface({
   });
 
   renderPanel.addEventListener("paste", (event) => {
-    const text = event.clipboardData?.getData("text");
+    const text = plainTextFromClipboardEvent(event);
     if (!getCurrentPage() || !text) {
       return;
     }

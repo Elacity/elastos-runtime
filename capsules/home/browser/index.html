@@ -10,29 +10,23 @@
     <meta name="apple-mobile-web-app-title" content="ElastOS Home" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Home · ElastOS</title>
-    <script src="./home-boot-hint.js?v=home-20260723a"></script>
-    <script src="./elastos-theme.js?v=home-20260723a"></script>
-    <link rel="manifest" href="./manifest.webmanifest?v=home-20260723a" />
+    <script src="./home-boot-hint.js?v=home-20260725a"></script>
+    <link rel="manifest" href="./manifest.webmanifest?v=home-20260725a" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
-    <link rel="stylesheet" href="./style.css?v=home-20260723a" />
+    <link rel="stylesheet" href="./style.css?v=home-20260726a" />
   </head>
   <body data-home-status="booting" data-home-shell="resolving" data-home-gui="resolving">
     <div class="home-host-shell">
       <div id="home-shell-boot-mask" class="home-shell-boot-mask" aria-hidden="true"></div>
 
       <section id="active-shell-root" class="active-shell-root" aria-live="polite" hidden>
-        <!-- Opaque sandboxing isolates the shell without DNS or ambient Home authority.
-             Popup grants exist for the wallet connector ceremony only: nested sandboxes
-             intersect, so without them here the connector frames' allow-popups is inert
-             and extension wallets (which cannot inject into opaque frames) have no
-             top-level window to complete in. escape-sandbox keeps that popup a normal
-             page — an opaque popup would break the extension the same way. -->
+        <!-- Opaque sandboxing isolates the shell without DNS or ambient Home authority. -->
         <iframe
           id="active-shell-frame"
           class="active-shell-frame"
           title="Active Home shell"
-          sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-popups allow-popups-to-escape-sandbox allow-scripts"
+          sandbox="allow-downloads allow-forms allow-modals allow-pointer-lock allow-scripts"
           allow="autoplay; fullscreen"
         ></iframe>
         <section
@@ -67,49 +61,62 @@
       </section>
 
       <section id="home-unlock" class="home-unlock" aria-labelledby="home-unlock-title" aria-hidden="true" data-surface="neutral" hidden>
-        <div class="home-unlock-stage">
-          <div class="home-unlock-wallpaper" aria-hidden="true"></div>
-          <div class="home-unlock-vignette" aria-hidden="true"></div>
-          <div class="home-unlock-card" role="dialog" aria-modal="true">
-            <div class="home-unlock-brand">
-              <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
-            </div>
-            <div id="home-unlock-clock" class="home-unlock-clock" hidden>
-              <p id="home-unlock-date" class="home-unlock-date"></p>
-              <p id="home-unlock-time" class="home-unlock-time"></p>
-            </div>
-            <h1 id="home-unlock-title">Sign in</h1>
-            <p id="home-unlock-copy" class="home-unlock-copy">Use your passkey to unlock Home.</p>
-            <div class="home-unlock-users">
-              <div
-                id="home-unlock-accounts"
-                class="home-unlock-accounts"
-                role="radiogroup"
-                aria-label="Local accounts"
-                hidden
-              ></div>
-            </div>
-            <label class="visually-hidden" for="home-unlock-name">Name this passkey</label>
-            <input
-              id="home-unlock-name"
-              class="home-unlock-input"
-              type="text"
-              maxlength="64"
-              autocomplete="name"
-              placeholder="Your name"
-              hidden
-            />
-            <div class="home-unlock-actions">
-              <button id="home-unlock-primary" class="home-unlock-button" type="button">Use passkey</button>
-              <button id="home-unlock-secondary" class="home-unlock-button home-unlock-button-secondary" type="button" hidden>Back</button>
-            </div>
-            <button id="home-unlock-add-guest" class="home-unlock-add-guest" type="button" hidden>Add Guest…</button>
-            <p id="home-unlock-status" class="home-unlock-status" data-tone="muted" role="status" aria-live="polite">One moment.</p>
+        <div class="home-unlock-card" role="dialog" aria-modal="true">
+          <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />
+          <h1 id="home-unlock-title">Sign in</h1>
+          <p id="home-unlock-copy">Use your passkey to unlock your data, apps and desktop.</p>
+          <label class="visually-hidden" for="home-unlock-name">Name this passkey</label>
+          <input
+            id="home-unlock-name"
+            class="home-unlock-input"
+            type="text"
+            maxlength="64"
+            autocomplete="name"
+            placeholder="Your name"
+            hidden
+          />
+          <div class="home-unlock-actions">
+            <button id="home-unlock-primary" class="home-unlock-button" type="button">Use passkey</button>
+            <button id="home-unlock-secondary" class="home-unlock-button home-unlock-button-secondary" type="button" hidden>Create guest account</button>
+          </div>
+          <p id="home-unlock-status" class="home-unlock-status" data-tone="muted" role="status">One moment.</p>
+        </div>
+      </section>
+
+      <section
+        id="home-clipboard-prompt"
+        class="home-clipboard-prompt"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="home-clipboard-title"
+        aria-describedby="home-clipboard-copy"
+        aria-hidden="true"
+        hidden
+      >
+        <div class="home-clipboard-card">
+          <p class="home-clipboard-eyebrow">ElastOS Clipboard</p>
+          <h1 id="home-clipboard-title">Clipboard request</h1>
+          <p id="home-clipboard-copy"></p>
+          <div class="home-clipboard-actions">
+            <button
+              id="home-clipboard-allow"
+              class="home-clipboard-button"
+              type="button"
+            >
+              Continue
+            </button>
+            <button
+              id="home-clipboard-cancel"
+              class="home-clipboard-button home-clipboard-button-secondary"
+              type="button"
+            >
+              Cancel
+            </button>
           </div>
         </div>
       </section>
     </div>
 
-    <script type="module" src="./home-shell-host.js?v=home-20260723a"></script>
+    <script type="module" src="./home-shell-host.js?v=home-20260731b"></script>
   </body>
 </html>

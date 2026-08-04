@@ -803,6 +803,12 @@ stop_stale_runtime_if_needed "${DATA_DIR}/home-runtime-coords.json" "Home runtim
 stop_stale_installed_elastos_processes "Room gateway" "${BINARY_SHA256}" room open
 stop_stale_installed_elastos_processes "gateway" "${BINARY_SHA256}" gateway
 
+PRINCIPAL_ROOT_BACKUP_DIR="${DATA_DIR}/backups/principal-root-upgrade-$(date -u +%s)-$$"
+info "Verifying and upgrading configured protected roots while Runtime is stopped..."
+"${INSTALL_DIR}/elastos" principal-root-upgrade \
+    --data-dir "${DATA_DIR}" \
+    --backup-dir "${PRINCIPAL_ROOT_BACKUP_DIR}"
+
 # ── Save Carrier contact + release metadata for `elastos upgrade` ────
 
 refresh_source_bootstrap_from_publisher

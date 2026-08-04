@@ -1,11 +1,133 @@
 use super::*;
 use bitcoin::key::TapTweak;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_WALLET_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+pub(super) fn runtime_invocation_envelope() -> Value {
+    json!({
+        "schema": "elastos.provider.invocation/v1",
+        "source": "runtime",
+        "target": "wallet",
+        "op": "wallet_contract",
+        "capability": "provider:runtime->wallet:wallet_contract",
+        "transport": "runtime-local-provider-plane",
+        "carrier": null,
+        "transfer": "json",
+        "range": null,
+        "progress": null,
+        "abi": {
+            "schema": "elastos.provider.transfer-abi/v1",
+            "transfer": "json",
+            "transport": "runtime-local-provider-plane",
+            "range_supported": false,
+            "progress_supported": false,
+            "progress_mode": "none",
+            "transport_native_stream": false,
+            "backpressure": "not_applicable",
+            "cancel_supported": false
+        }
+    })
+}
+
+pub(super) fn wallet_context(principal_id: &str, actor: &str) -> VerifiedWalletInvocationContext {
+    wallet_context_in_session(principal_id, actor, &format!("session:{principal_id}"))
+}
+
+pub(super) fn wallet_context_in_session(
+    principal_id: &str,
+    actor: &str,
+    session_id: &str,
+) -> VerifiedWalletInvocationContext {
+    VerifiedWalletInvocationContext::new(
+        principal_id,
+        session_id,
+        Some(format!("proof:{principal_id}")),
+        format!("grant:{principal_id}"),
+        actor,
+        format!("launch:{actor}"),
+    )
+    .expect("test Wallet authority must be valid")
+}
+
+pub(super) fn wallet_request(
+    context: &VerifiedWalletInvocationContext,
+    operation: WalletProviderOperationV2,
+) -> WalletProviderRequestV2 {
+    let sequence = NEXT_WALLET_REQUEST.fetch_add(1, Ordering::Relaxed);
+    let now = now_ts();
+    WalletProviderRequestV2::new(
+        context,
+        format!("wallet-request:{sequence:032x}"),
+        now,
+        now.saturating_add(120),
+        operation,
+    )
+    .expect("test Wallet request must be valid")
+}
+
+pub(super) fn invoke_wallet(
+    provider: &mut WalletProvider,
+    principal_id: &str,
+    actor: &str,
+    operation: WalletProviderOperationV2,
+) -> Response {
+    let context = wallet_context(principal_id, actor);
+    invoke_wallet_with_context(provider, &context, operation)
+}
+
+pub(super) fn invoke_wallet_with_context(
+    provider: &mut WalletProvider,
+    context: &VerifiedWalletInvocationContext,
+    operation: WalletProviderOperationV2,
+) -> Response {
+    let request = wallet_request(context, operation);
+    invoke_wallet_request(provider, &request)
+}
+
+pub(super) fn invoke_wallet_request(
+    provider: &mut WalletProvider,
+    request: &WalletProviderRequestV2,
+) -> Response {
+    let outer: Request = serde_json::from_value(json!({
+        "op": "wallet_contract",
+        "request": request,
+        "_runtime_invocation": runtime_invocation_envelope(),
+    }))
+    .expect("production outer Wallet decoder must accept the test request");
+    match provider.handle(outer) {
+        Response::Ok { data: Some(data) } => {
+            let bytes = serde_json::to_vec(&data).expect("serialize Wallet v2 response");
+            let response = WalletProviderResponseV2::decode_for_request(&bytes, request)
+                .expect("Wallet v2 response must bind exactly to its request");
+            match response.result {
+                WalletResultV2::Ok { data } => Response::ok(data),
+                WalletResultV2::Error { code, message } => Response::Error { code, message },
+            }
+        }
+        Response::Ok { data: None } => {
+            panic!("wallet_contract returned no authority-bound response")
+        }
+        error @ Response::Error { .. } => error,
+    }
+}
+
+pub(super) fn decode_and_handle_outer(provider: &mut WalletProvider, value: Value) -> Response {
+    match serde_json::from_value::<Request>(value) {
+        Ok(request) => provider.handle(request),
+        Err(err) => Response::error("invalid_request", err.to_string()),
+    }
+}
 
 pub(super) fn init_provider(dir: &Path) -> WalletProvider {
     let mut provider = WalletProvider::new();
-    let response = provider.handle(Request::Init {
-        config: json!({ "base_path": dir.display().to_string() }),
-    });
+    let response = decode_and_handle_outer(
+        &mut provider,
+        json!({
+            "op": "init",
+            "config": { "base_path": dir.display().to_string() }
+        }),
+    );
     match response {
         Response::Ok { .. } => provider,
         other => panic!("expected init ok, got {other:?}"),
@@ -184,6 +306,25 @@ pub(super) fn transaction_intent_payload(from: &str) -> Value {
     })
 }
 
+pub(super) fn browser_personal_sign_payload(
+    account_id: &str,
+    address: &str,
+    message: &str,
+) -> Value {
+    json!({
+        "schema": "elastos.browser.wallet-signature-request/v1",
+        "method": "personal_sign",
+        "params": [message, address],
+        "message": message,
+        "address": address,
+        "account_id": account_id,
+        "chain_namespace": "eip155:20",
+        "page_url": "https://dapp.example/sign",
+        "origin": "https://dapp.example",
+        "requires_wallet_approval": true
+    })
+}
+
 pub(super) fn bitcoin_bip322_payload(address: &str, message: &str) -> Value {
     json!({
         "schema": "elastos.wallet.bitcoin_bip322_request/v1",
@@ -199,10 +340,7 @@ pub(super) fn erc1271_proof(message: &str, signature: &str, contract: &str, vali
     let signature_bytes = hex_prefixed_bytes(signature, None, "signature").unwrap();
     json!({
         "schema": "elastos.chain.erc1271_proof/v1",
-        "network": {
-            "id": "esc-local",
-            "chain_id": 20
-        },
+        "network": "esc-local",
         "chain_id": 20,
         "contract": normalize_evm_address(contract),
         "message_hash": format!("0x{}", hex::encode(message_hash)),

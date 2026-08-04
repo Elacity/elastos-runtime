@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260723a";
+const moduleVersion = "home-20260725a";
 const requests = [];
 const localStorageValues = new Map([
   ["elastos.home.active-shell-hint", "home-gui"],
@@ -20,6 +20,11 @@ const hostStaticSelectors = new Set([
   "#home-unlock-secondary",
   "#home-unlock-status",
   "#home-unlock-title",
+  "#home-clipboard-prompt",
+  "#home-clipboard-title",
+  "#home-clipboard-copy",
+  "#home-clipboard-allow",
+  "#home-clipboard-cancel",
   "#shell-host-recovery",
   "#shell-host-recovery-copy",
   "#shell-host-recovery-detail",
@@ -44,6 +49,7 @@ const homeGuiSelectors = [
   "#launcher-empty-state",
   "#launcher-search",
   "#launcher-toggle",
+  "#close-launcher",
   "#toolbar-home",
   "#toolbar-inbox",
   "#toolbar-inbox-count",
@@ -129,10 +135,6 @@ class FakeElement {
       this.listeners.set(type, []);
     }
     this.listeners.get(type).push(callback);
-  }
-
-  append(...children) {
-    for (const child of children) this.appendChild(child);
   }
 
   appendChild(child) {
@@ -251,7 +253,7 @@ function summaryFor(activeShell) {
     appearance: {},
     browser_state: {
       principal_id: "principal:home-shell-no-hint-boot",
-      layout: { desktop: {}, taskbar: [], desktopApps: [], desktopIconsVisible: true },
+      layout: { desktop: {}, taskbar: [], desktopHidden: [], desktopIconsVisible: true },
       recent_targets: [],
       session: { windows: [] },
     },
@@ -306,6 +308,7 @@ elementForSelector("#active-shell-root").hidden = true;
 elementForSelector("#active-shell-frame").hidden = true;
 elementForSelector("#shell-host-recovery").hidden = true;
 elementForSelector("#shell-host-recovery-detail").hidden = true;
+elementForSelector("#home-clipboard-prompt").hidden = true;
 elementForSelector("#home-unlock").hidden = true;
 
 globalThis.fetch = async (url, init = {}) => {

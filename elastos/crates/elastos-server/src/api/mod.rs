@@ -7,6 +7,7 @@
 
 pub mod auth_gateway;
 pub mod browser_capsules;
+pub mod browser_engine_protocol;
 pub mod browser_sessions;
 pub(crate) mod capsule_inventory;
 pub mod gateway;

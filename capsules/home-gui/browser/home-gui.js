@@ -24,13 +24,12 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260728ag";
+} from "./shell-core.js?v=home-20260725a";
 import {
-  bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260728ag";
+} from "./shell-chrome.js?v=home-20260725a";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -58,20 +57,22 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260728ag";
+} from "./shell-surface.js?v=home-20260731b";
 import { bindAgentShelf } from "./agent-shelf.js?v=home-20260728ag";
 import { bindAgentHarness } from "./agent-harness.js?v=home-20260728ag";
 import {
+  attachAuthorizedTarget,
   closeWindow,
   cleanupBeforeUnload,
   configureWindowHooks,
   handleShellResize,
   openTarget,
   focusWindow,
+  renewBrowserWindowAuthority,
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260728ag";
+} from "./shell-windows.js?v=home-20260731b";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
@@ -107,7 +108,7 @@ import {
   toggleActiveFullscreenStage,
 } from "./shell-stages.js?v=home-20260728ag";
 import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260728ag";
-import { setFocusModeEnabled } from "./shell-core.js?v=home-20260728ag";
+import { setFocusModeEnabled } from "./shell-core.js?v=home-20260725a";
 import {
   bindControlCentre,
   hideControlCentre,
@@ -145,7 +146,6 @@ const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
 
 await ensureHomeGuiDom();
-bindIdentityMenu();
 bindShellSurfaceDom();
 bindAgentShelf();
 bindAgentHarness();
@@ -395,9 +395,12 @@ export function closeHomeGuiWindow(windowId) {
   closeWindow(windowId);
 }
 
-export function relaunchHomeGuiTarget(windowId, target) {
-  closeWindow(windowId);
+export async function relaunchHomeGuiTarget(windowId, target) {
+  if (await closeWindow(windowId) !== true) {
+    return false;
+  }
   window.setTimeout(() => openTarget(target), 0);
+  return true;
 }
 
 export function deliverMessageToHomeGuiTargetFrame(target, payload, options = null) {
@@ -655,6 +658,14 @@ function homeLaunchTokenFromRoute(route) {
   }
 }
 
+function browserInstanceFromRoute(route) {
+  try {
+    return new URL(route, window.location.href).searchParams.get("browser_instance") || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
 function homeGuiWindowEntryForToken(homeToken) {
   if (!homeToken) {
     return null;
@@ -680,15 +691,49 @@ export function closeHomeGuiWindowForToken(homeToken) {
   return true;
 }
 
-export function relaunchHomeGuiWindowForToken(homeToken) {
+export function openHomeGuiTarget(target, options = {}) {
+  return openTarget(target, options);
+}
+
+export function attachAuthorizedHomeGuiTarget(launched) {
+  return attachAuthorizedTarget(launched);
+}
+
+export async function relaunchHomeGuiWindowForToken(homeToken) {
+
   const entry = homeGuiWindowEntryForToken(homeToken);
   if (!entry) {
     return false;
   }
   const { id, targetId, launchQuery } = entry;
-  closeWindow(id);
+  if (targetId === "browser") {
+    return renewBrowserWindowAuthority(id);
+  }
+  if (await closeWindow(id) !== true) {
+    return false;
+  }
   window.setTimeout(() => openTarget(targetId, { query: launchQuery || {} }), 0);
   return true;
+}
+
+export function renewHomeGuiBrowserWindowAuthority(
+  homeToken,
+  browserInstance,
+  options = {},
+) {
+  const entry = homeGuiWindowEntryForToken(homeToken);
+  const frame = entry?.node?.querySelector(".window-frame");
+  const route = frame?.dataset?.route || frame?.getAttribute("src") || "";
+  if (
+    !entry ||
+    entry.targetId !== "browser" ||
+    !browserInstance ||
+    entry.launchQuery?.browser_instance !== browserInstance ||
+    browserInstanceFromRoute(route) !== browserInstance
+  ) {
+    return Promise.resolve(false);
+  }
+  return renewBrowserWindowAuthority(entry.id, options);
 }
 
 export function hideHomeGuiLauncher() {

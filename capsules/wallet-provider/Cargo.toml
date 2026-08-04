@@ -1,6 +1,6 @@
 [package]
 name = "wallet-provider"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "ElastOS wallet provider capsule - account-link metadata and typed wallet authority"
 license = "MIT"
@@ -14,6 +14,7 @@ aes-gcm = "0.10"
 base64 = "0.22"
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 elastos-auth = { path = "../../elastos/crates/elastos-auth" }
+elastos-wallet-contract = { path = "../../elastos/crates/elastos-wallet-contract" }
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"

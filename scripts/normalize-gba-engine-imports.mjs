@@ -12,10 +12,10 @@ const wasmPath = resolve(browserRoot, "mgba.wasm");
 const upstreamModule = "wasi_snapshot_preview1";
 const localModule = "capsule.local.memfs.v1";
 const expected = {
-  upstreamJs: "78e30a6542173e349e27b3cd3652f20d69b41ed742d1a80e64e253d17e25918a",
-  upstreamWasm: "546a99648d2ef52cb04e34e19a4d0ad2d5dc6bcf0f6749bbaba7d5771226f002",
-  productJs: "7ddadd7c564293bd6552fd9640e2ae85d927a2d756323c0f4e526aa4ccc72111",
-  productWasm: "69b9fccd6cc616682a92866c2a3ad846ded3618661e3258da6582fbf54a2482e",
+  upstreamJs: "18a379a8a316c58fff601253673862d3c9015adb5adc318e2b395c7cc7ec6c0c",
+  upstreamWasm: "bed02835f672a48b8be59f4e4cd65594109f2b54f30100539c6fd12c022d4bf9",
+  productJs: "0f37463aa2b7248564fd590fddf917ef3d8052ed0ed62d10b46717bb320bf3ea",
+  productWasm: "9e43a33a8477cca6c277cbaa809ea2c519d6085dd844758b5cbe8e9503251a27",
 };
 
 function hash(bytes) {
@@ -43,11 +43,16 @@ function validateProduct(js, wasm) {
     throw new Error("normalized GBA engine still imports the upstream WASI namespace");
   }
   const localImports = imports.filter((item) => item.module === localModule);
-  if (localImports.length !== 9) {
-    throw new Error(`expected 9 capsule-local MEMFS imports, found ${localImports.length}`);
+  if (localImports.length !== 7) {
+    throw new Error(`expected 7 capsule-local MEMFS imports, found ${localImports.length}`);
   }
   if (!js.includes(`'${localModule}': wasmImports`)) {
     throw new Error("GBA JavaScript does not provide the capsule-local MEMFS imports");
+  }
+  for (const threadedRuntime of ["SharedArrayBuffer", "Atomics.", "new Worker("]) {
+    if (js.includes(threadedRuntime)) {
+      throw new Error(`GBA JavaScript unexpectedly contains ${threadedRuntime}`);
+    }
   }
 }
 
@@ -64,10 +69,10 @@ if (hash(js) === expected.upstreamJs && hash(wasm) === expected.upstreamWasm) {
       .toString("utf8")
       .replace(`'${upstreamModule}': wasmImports`, `'${localModule}': wasmImports`),
   );
-  wasm = replaceExact(wasm, upstreamModule, localModule, 9);
+  wasm = replaceExact(wasm, upstreamModule, localModule, 7);
   await writeFile(jsPath, js);
   await writeFile(wasmPath, wasm);
 }
 
 validateProduct(js, wasm);
-console.log("[gba-engine-imports] OK namespace=capsule.local.memfs.v1 imports=9");
+console.log("[gba-engine-imports] OK namespace=capsule.local.memfs.v1 imports=7 threads=none");

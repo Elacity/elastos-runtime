@@ -55,6 +55,7 @@ function assertNoForbidden(source, label, forbidden) {
 const browserManifest = read("capsules/browser/capsule.json");
 const browserCapsuleManifest = JSON.parse(browserManifest);
 const browser = read("capsules/browser/browser/index.html");
+const browserMain = read("capsules/browser/browser/browser.js");
 const browserJs = readAll([
   "capsules/browser/browser/browser.js",
   "capsules/browser/browser/browser-clipboard.js",
@@ -62,6 +63,7 @@ const browserJs = readAll([
   "capsules/browser/browser/browser-input.js",
   "capsules/browser/browser/browser-input-surface.js",
   "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-page-cleanup.js",
   "capsules/browser/browser/browser-remote-display.js",
   "capsules/browser/browser/browser-runtime-api.js",
   "capsules/browser/browser/browser-status.js",
@@ -71,6 +73,26 @@ const browserInputSurface = read("capsules/browser/browser/browser-input-surface
 const browserRemoteDisplay = read("capsules/browser/browser/browser-remote-display.js");
 const browserStyle = read("capsules/browser/browser/style.css");
 const homeGuiWindowsSource = read("capsules/home-gui/browser/shell-windows.js");
+const homeClipboardHost = read(
+  "capsules/home/browser/home-clipboard-host.js",
+);
+const homeClipboardClient = read(
+  "capsules/home/browser/home-clipboard-client.js",
+);
+const homeClipboardProtocol = read(
+  "capsules/home/browser/home-clipboard-protocol.js",
+);
+const homeShellHostSource = read("capsules/home/browser/home-shell-host.js");
+const homeShellHostContract = read("docs/HOME_SHELL_HOST_CONTRACT.md");
+const homeClipboardHeadlessSmoke = read(
+  "scripts/home-clipboard-headless-smoke.mjs",
+);
+const browserWindowCloseHeadlessSmoke = read(
+  "scripts/browser-window-close-headless-smoke.mjs",
+);
+const browserWindowCloseHandshakeTest = read(
+  "scripts/browser-window-close-handshake.test.mjs",
+);
 const netProvider = read("capsules/net-provider/src/main.rs");
 const exitProvider = read("capsules/exit-provider/src/main.rs");
 const browserEngineAdapter = readAll([
@@ -87,12 +109,21 @@ const browserEngineSupervisor = read(
 const browserPlaywrightEngine = read(
   "elastos/tools/browser-playwright-engine/src/supervisor.mjs",
 );
+const browserPlaywrightWalletApproval = read(
+  "elastos/tools/browser-playwright-engine/src/wallet-approval.mjs",
+);
 const browserLocalExit = read("elastos/tools/browser-local-exit/src/main.rs");
 const browserRuntimeProxySmoke = read("scripts/browser-runtime-proxy-smoke.sh");
 const browserNativeOperatorConfig = read(
   "scripts/browser-native-operator-config.mjs",
 );
 const browserDisplayModeSmoke = read("scripts/browser-display-mode-smoke.mjs");
+const browserFixedProductRasterChromiumTest = read(
+  "scripts/browser-fixed-product-raster-chromium.test.mjs",
+);
+const browserRuntimeTurnCapabilitySmoke = read(
+  "scripts/browser-runtime-turn-capability-smoke.mjs",
+);
 const browserObjectiveAudit = read("scripts/browser-objective-audit.mjs");
 const browserProviderDecisionReport = read(
   "scripts/browser-provider-decision-report.mjs",
@@ -114,6 +145,9 @@ const browserSelkiesControlService = read(
 );
 const browserSelkiesControlServiceSmoke = read(
   "scripts/browser-selkies-control-service-smoke.sh",
+);
+const browserWalletApprovalDeadlineSmoke = read(
+  "scripts/browser-wallet-approval-deadline-smoke.mjs",
 );
 const browserSelkiesRuntimeExitTarget = read(
   "scripts/browser-selkies-runtime-exit-target.sh",
@@ -138,11 +172,20 @@ const browserVmArtifactPreflightSmoke = read(
 );
 const browserVmControlService = read("scripts/browser-vm-control-service.mjs");
 const browserVmRemoteVzLauncher = read("scripts/browser-vm-remote-vz-launcher.mjs");
+const browserVmRemoteVzLauncherIntegration = read(
+  "scripts/browser-vm-remote-vz-launcher.integration.mjs",
+);
+const browserVzSupervisorProcessTest = read(
+  "elastos/crates/elastos-vz/tests/browser_vz_engine_supervisor_process.rs",
+);
 const browserVmControlServiceSmoke = read(
   "scripts/browser-vm-control-service-smoke.sh",
 );
 const browserVmControlServicePersistentSmoke = read(
   "scripts/browser-vm-control-service-persistent-smoke.sh",
+);
+const browserVmControlServiceSettlementSmoke = read(
+  "scripts/browser-vm-control-service-settlement-smoke.sh",
 );
 const remoteCarrierExitArtifactReadiness = read(
   "scripts/remote-carrier-exit-artifact-readiness.mjs",
@@ -238,12 +281,19 @@ const gatewayBrowserApi = readAll([
   "elastos/crates/elastos-server/src/api/gateway_browser.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_engine.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_response.rs",
+  "elastos/crates/elastos-server/src/api/gateway_browser_sessions.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_stream.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_validation.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_wallet.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_wallet_bridge.rs",
   "elastos/crates/elastos-server/src/api/gateway_browser_wallet_reads.rs",
 ]);
+const gatewayBrowserRouteTests = read(
+  "elastos/crates/elastos-server/src/api/gateway_browser_route_tests.rs",
+);
+const homeBrowserRestoredLifecycleHeadlessSmoke = read(
+  "scripts/home-browser-restored-lifecycle-headless-smoke.mjs",
+);
 const browserProfileResetRoute = sourceBlock(
   gatewayBrowserApi,
   "pub(super) async fn browser_app_profile_reset",
@@ -337,12 +387,13 @@ assertNoForbidden(browserJs, "Browser UI", [
 ]);
 
 assert(
-  browserJs.includes("normalizeUrl") &&
+    browserJs.includes("normalizeUrl") &&
     browserJs.includes("streamTargetForUrl") &&
-    browserJs.includes("browserInstanceId") &&
-    browserJs.includes(
-      "elastos.browser.current_page_id:${browserInstanceId}",
-    ) &&
+    browserJs.includes("recoverableRuntimePage") &&
+    browserJs.includes("elastos.browser.cleanup-handle/v1") &&
+    browserJs.includes("elastos.browser.close-request/v2") &&
+    !browserJs.includes("runtime_close") &&
+    !browserJs.includes("sessionStorage") &&
     browserJs.includes("Only http and https addresses") &&
     browserJs.includes("/api/apps/browser/open") &&
     browserJs.includes("/api/apps/browser/summary") &&
@@ -367,25 +418,36 @@ assert(
 
 assert(
   browserJs.includes("isMissingRuntimePageError") &&
-    browserJs.includes("scheduleRemoteReconnect") &&
-    browserJs.includes("function scheduleRemoteReconnect(message, { retry = true } = {})") &&
-    browserRemoteDisplay.includes('onRecoveryRequired(message, { retry: false })') &&
+    browserJs.includes("settleRemoteDisplayFailure") &&
+    browserJs.includes("RUNTIME_OWNED_PAGE_FAILURE_KINDS") &&
+    browserJs.includes("runtimePageCleanup.fail") &&
+    browserJs.includes("retry: false") &&
+    !browserJs.includes("scheduleRemoteReplacementAfterTerminal") &&
+    !browserJs.includes("scheduleRemoteReconnect") &&
+    browserJs.includes(
+      "Runtime cleanup is pending; the existing page remains owned and no replacement will open until Runtime confirms a terminal close.",
+    ) &&
+    browserRemoteDisplay.includes('"no_first_frame" ? "no_first_frame" : "signaling"') &&
+    browserRemoteDisplay.includes(
+      "Runtime must close this session before another Browser Engine or Exit Node can open.",
+    ) &&
+    !browserRemoteDisplay.includes("Refresh Browser") &&
     browserJs.includes("recoverMissingRuntimePage") &&
-    browserJs.includes("Browser session heartbeat was lost.") &&
-    browserJs.includes("Browser session reconnected.") &&
+    browserJs.includes(
+      "Runtime confirmed the failed Browser session closed. You can open the address again or choose another Browser Engine.",
+    ) &&
+    !browserJs.includes("Browser session reconnected.") &&
     browserJs.includes("track.addEventListener(\"mute\"") &&
     browserJs.includes("track.addEventListener(\"ended\"") &&
-    !browserJs.includes("Browser session ended. Open the address again") &&
-    !browserJs.includes("Reopen the page to start a clean Runtime session") &&
     browserSelkiesControlService.includes("crypto.randomBytes(8)") &&
     !browserSelkiesControlService.includes("update(`${url}\\0${streamId}`)"),
-  "Browser sessions must use launch-unique provider page ids and reconnect missing pages instead of reusing stale deterministic ids or requiring manual reopen",
+  "Browser sessions must use launch-unique provider page ids, retain cleanup ownership, and stop after terminal display failure until an explicit user open",
 );
 
 assert(
   browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: var(--el-accent)") &&
+    browserStyle.includes("--accent: #d46f24") &&
     browserStyle.includes("overflow: hidden") &&
     browserStyle.includes("height: 100%") &&
     browserStyle.includes("min-height: 0") &&
@@ -456,6 +518,15 @@ assert(
 
 assert(
   browserEngineAdapter.includes("elastos.browser.engine.page/v1") &&
+    browserEngineAdapter.includes(
+      'const BROWSER_ENGINE_PROTOCOL_VERSION: &str = "2.0"',
+    ) &&
+    browserEngineAdapter.includes(
+      "elastos.browser.engine-cleanup-binding/v2",
+    ) &&
+    browserEngineAdapter.includes(
+      "elastos.browser.engine-cleanup-result/v2",
+    ) &&
     browserEngineAdapter.includes("elastos.adapter-ipc/v1") &&
     browserEngineAdapter.includes("runtime_stream_path") &&
     browserEngineAdapter.includes("elastos.browser.engine.launch-request/v1") &&
@@ -541,12 +612,11 @@ assert(
     browserJs.includes("prepareAudio(expectsAudio)") &&
     browserJs.includes("unlockRemoteAudioFromGesture") &&
     browserJs.includes('nextPeerConnection.addTransceiver("audio"') &&
-    browserJs.includes('event?.type === "resize"') &&
     browserJs.includes('event?.type === "paste_text"') &&
     browserJs.includes('event?.type === "file_upload"') &&
     browserJs.includes("Remote audio enabled.") &&
     browserDisplayModeSmoke.includes("audio_invariants_checked"),
-  "Browser UI must keep WebRTC audio explicit, user-gesture unlocked, resize protocol-aware, and covered by display-mode smoke",
+  "Browser UI must keep WebRTC audio explicit, user-gesture unlocked, and covered by display-mode smoke",
 );
 
 assert(
@@ -569,6 +639,9 @@ assert(
   gatewayBrowserApi.includes("BrowserProviderResourceCall") &&
     gatewayBrowserApi.includes("BrowserOpenRequest") &&
     gatewayBrowserApi.includes("browser_app_open") &&
+    gatewayBrowserApi.includes("owner_launch_id") &&
+    gatewayBrowserApi.includes("BrowserOpenJobReservation") &&
+    gatewayBrowserApi.includes("Browser lifecycle is already active or launching for this verified launch") &&
     gatewayBrowserApi.includes("browser.open.requested") &&
     gatewayBrowserApi.includes("browser.open.completed") &&
     gatewayBrowserApi.includes("browser.chain_read.requested") &&
@@ -583,6 +656,70 @@ assert(
     !gatewayApi.includes("fn create_browser_wallet_transaction_request(") &&
     !gatewayApi.includes("fn browser_engine_summary("),
   "Browser DTOs, provider-envelope helpers, and wallet bridge flows must stay out of the shared gateway module",
+);
+
+assert(
+  gatewayBrowserApi.includes("browser_open_job_for_owner") &&
+    gatewayBrowserApi.includes("job.owner_launch_id == owner_launch_id") &&
+    gatewayBrowserApi.includes("Browser lifecycle already owns a different open intent") &&
+    gatewayBrowserApi.includes("pending_engine_cleanups") &&
+    gatewayBrowserApi.includes("claim_pending_browser_engine_cleanups") &&
+    gatewayBrowserApi.includes("record_browser_engine_cleanup_obligation") &&
+    gatewayBrowserApi.includes("browser_terminal_close_receipt") &&
+    gatewayBrowserApi.includes("BrowserCleanupHandle") &&
+    gatewayBrowserApi.includes("BrowserDurableOwnership") &&
+    gatewayBrowserApi.includes("write_browser_durable_ownership") &&
+    gatewayBrowserApi.includes("secure_browser_lifecycle_dir") &&
+    gatewayBrowserApi.includes("claim_pending_browser_stream_cleanups") &&
+    gatewayBrowserApi.includes("browser_page_cleanup_for_principal") &&
+    gatewayBrowserApi.includes("require_browser_engine_provider_binding") &&
+    gatewayBrowserApi.includes(
+      "no replacement page may open before terminal provider closure",
+    ) &&
+    browserJs.includes("elastos.browser.cleanup-handle/v1") &&
+    browserJs.includes("elastos.browser.close-request/v2") &&
+    !browserJs.includes("engine_protocol_version") &&
+    !browserJs.includes("runtime_close") &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_async_duplicate_open_coalesces_by_verified_launch_owner",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_open_job_and_page_routes_require_exact_verified_launch_owner",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_close_transport_and_exit_failures_retry_independent_cleanup_obligations",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_no_first_frame_cleanup_retries_exact_effect_without_replacement",
+    ) &&
+    gatewayBrowserRouteTests.includes(
+      "test_browser_pending_cleanup_rejects_foreign_authority_and_effect_substitution",
+    ) &&
+    gatewayBrowserApi.includes(
+      "runtime_restart_recovers_exact_durable_cleanup_ownership",
+    ) &&
+    gatewayBrowserApi.includes(
+      "status_reads_preserve_90_second_launch_and_four_hour_active_owner",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "fixture_duplicate_open=1",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserOpenRequests === 2",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserOpenEffects === 1",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserCleanupEffects === 1",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserPageCount === 1",
+    ) &&
+    homeBrowserRestoredLifecycleHeadlessSmoke.includes(
+      "state.browserVmCount === 1",
+    ),
+  "Browser lifecycle must coalesce matching pending/completed owner intent, retain an exact provider/engine/stream cleanup binding after the active route retires, reject substituted authority or effects, block replacement before terminal closure, and keep a real Home-refresh regression",
 );
 
 assert(
@@ -666,6 +803,13 @@ assert(
     browserSelkiesControlService.includes("eth_sendTransaction") &&
     browserSelkiesControlService.includes("Runtime.addBinding") &&
     browserSelkiesControlService.includes("__elastosBrowserWalletRuntime") &&
+    browserSelkiesControlService.includes('const WALLET_RUNTIME_ORIGIN = "null"') &&
+    browserSelkiesControlService.includes("Origin: WALLET_RUNTIME_ORIGIN") &&
+    browserPlaywrightEngine.includes('const WALLET_RUNTIME_ORIGIN = "null"') &&
+    (browserPlaywrightEngine.match(/Origin: WALLET_RUNTIME_ORIGIN/g) || []).length === 5 &&
+    browserSelkiesControlServiceSmoke.includes('origin: req.headers.origin || ""') &&
+    browserSelkiesControlServiceSmoke.includes('req.headers.origin !== "null"') &&
+    browserSelkiesControlServiceSmoke.includes('request.origin !== "null"') &&
     browserSelkiesControlService.includes('runtimePost("approval"') &&
     browserSelkiesControlService.includes("walletApprovalPending") &&
     browserSelkiesControlService.includes("waitForCachedWalletApproval") &&
@@ -673,11 +817,11 @@ assert(
     browserSelkiesControlService.includes("request_suffix") &&
     !browserSelkiesControlService.includes("runtimePost(state.approvalUrl") &&
     browserSelkiesControlService.includes(
-      "if (status.transaction_hash) return status.transaction_hash",
+      'typeof status.transaction_hash === "string"',
     ) &&
     browserSelkiesControlService.includes('runtimePost("transactionBroadcast"') &&
     browserSelkiesControlService.includes(
-      "Runtime transaction broadcast completed without a transaction hash.",
+      "Runtime transaction broadcast did not return a transaction hash.",
     ) &&
     browserSelkiesControlService.includes("transaction_broadcast") &&
     !browserSelkiesControlService.includes("bridgeUrl:") &&
@@ -687,7 +831,7 @@ assert(
     !browserSelkiesControlService.includes("transactionBroadcastUrl:") &&
     !browserSelkiesControlService.includes("approvalStatusUrl:") &&
     !browserSelkiesControlService.includes("runtimePost(state.transactionBroadcastUrl") &&
-    browserSelkiesControlService.includes("waitForApproval") &&
+    browserSelkiesControlService.includes("waitForWalletApprovalStatus") &&
     browserSelkiesControlService.includes(
       "__elastosBrowserNavigationPolicyInstalled",
     ) &&
@@ -717,6 +861,57 @@ assert(
 );
 
 assert(
+  browserSelkiesControlService.includes(
+    "approval?.approval_request?.expires_at",
+  ) &&
+    browserPlaywrightEngine.includes(
+      "body?.approval_request?.expires_at",
+    ) &&
+    browserSelkiesControlService.includes("walletApprovalDeadlineMs") &&
+    browserPlaywrightWalletApproval.includes("walletApprovalDeadlineMs") &&
+    browserSelkiesControlService.includes("30 * 60 * 1000") &&
+    browserPlaywrightWalletApproval.includes("30 * 60 * 1000") &&
+    browserSelkiesControlService.includes(
+      "withWalletApprovalStatusTimeout",
+    ) &&
+    browserPlaywrightWalletApproval.includes(
+      "withWalletApprovalStatusTimeout",
+    ) &&
+    browserSelkiesControlService.includes("statusIoTimeoutMs = 3000") &&
+    browserPlaywrightWalletApproval.includes("statusIoTimeoutMs = 3000") &&
+    browserSelkiesControlService.includes("observeWalletApprovalStatus") &&
+    browserPlaywrightWalletApproval.includes("observeWalletApprovalStatus") &&
+    browserSelkiesControlService.includes("timeout_ms: timeoutMs") &&
+    browserSelkiesControlService.includes("enforceWallClockTimeout") &&
+    browserSelkiesControlService.includes("? setTimeout(() =>") &&
+    browserPlaywrightEngine.includes("new AbortController()") &&
+    browserPlaywrightEngine.includes("signal: controller.signal") &&
+    !browserSelkiesControlService.includes(
+      "Date.now() + 5 * 60 * 1000",
+    ) &&
+    !browserPlaywrightEngine.includes(
+      "Date.now() + 5 * 60 * 1000",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes("after-five-minutes") &&
+    browserWalletApprovalDeadlineSmoke.includes("provider-expiry") &&
+    browserWalletApprovalDeadlineSmoke.includes("final-status-race") &&
+    browserWalletApprovalDeadlineSmoke.includes("already-broadcast") &&
+    browserWalletApprovalDeadlineSmoke.includes("exact-request") &&
+    browserWalletApprovalDeadlineSmoke.includes("hanging-status") &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "transient-exact-request",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "deadline-final-observation-failure",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes(
+      "baseline_assertions: baselineAssertions",
+    ) &&
+    browserWalletApprovalDeadlineSmoke.includes("real_sleep_ms: 0"),
+  "Trusted Browser adapters must use bounded status I/O through Runtime expiry while retaining exact-request caches across indeterminate observations",
+);
+
+assert(
   gatewayBrowserApi.includes('"eth_getTransactionByHash" =>') &&
     gatewayBrowserApi.includes('.get("transaction")') &&
     gatewayBrowserApi.includes(
@@ -736,39 +931,32 @@ assert(
     browserSelkiesRuntimeExitTarget.includes('selkies_width="1920"') &&
     browserSelkiesRuntimeExitTarget.includes('selkies_height="1080"') &&
     browserSelkiesRuntimeExitTarget.includes(
-      '\\"--force-device-scale-factor=1.5\\"',
+      '\\"--force-device-scale-factor=1\\"',
     ) &&
-    browserSelkiesRuntimeExitTarget.includes(
+    !browserSelkiesRuntimeExitTarget.includes(
       "ELASTOS_SELKIES_INITIAL_RESOLUTION",
     ) &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-resolution-mode") &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-width") &&
+    !browserSelkiesRuntimeExitTarget.includes("--selkies-height") &&
     browserSelkiesRuntimeExitTarget.includes(
-      "needle = 'resize_display(' + quote + '1920x1080' + quote + ')'",
+      "--is-manual-resolution-mode=true",
     ) &&
-    browserSelkiesRuntimeExitTarget.includes(
-      'selkies_resolution_mode="dynamic"',
-    ) &&
-    browserSelkiesRuntimeExitTarget.includes("--selkies-resolution-mode") &&
-    browserSelkiesRuntimeExitTarget.includes(
-      "--is-manual-resolution-mode=false",
-    ) &&
-    browserSelkiesRuntimeExitTarget.includes("--enable-resize=true") &&
+    browserSelkiesRuntimeExitTarget.includes("--enable-resize=false") &&
     browserSelkiesRuntimeExitTarget.includes("--clipboard-enabled=true") &&
     browserSelkiesRuntimeExitTarget.includes(
       "browser-selkies-cargo-target",
     ) &&
-    browserSelkiesServiceWrapper.includes(
-      "ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE:-dynamic",
-    ) &&
-    browserSelkiesServiceWrapper.includes(
-      '--selkies-resolution-mode "$resolution_mode"',
-    ) &&
-    browserSelkiesServiceEnv.includes(
-      "ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE=dynamic",
-    ) &&
+    !browserSelkiesServiceWrapper.includes("ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE") &&
+    !browserSelkiesServiceWrapper.includes("ELASTOS_BROWSER_SELKIES_WIDTH") &&
+    !browserSelkiesServiceWrapper.includes("ELASTOS_BROWSER_SELKIES_HEIGHT") &&
+    !browserSelkiesServiceEnv.includes("ELASTOS_BROWSER_SELKIES_RESOLUTION_MODE") &&
+    !browserSelkiesServiceEnv.includes("ELASTOS_BROWSER_SELKIES_WIDTH") &&
+    !browserSelkiesServiceEnv.includes("ELASTOS_BROWSER_SELKIES_HEIGHT") &&
     browserCapsuleDoc.includes(
-      "1920x1080 stream with a stable 1280x720 CSS viewport",
+      "fixed 1920x1080 stream/page raster at DPR 1",
     ),
-  "Canonical hosted Browser launcher must default to tunable H.264 with an explicit normal-browser viewport scale and remote-resize gating, not fixed-compositor manual mode with zoomed-out CSS",
+  "Canonical hosted Browser launcher must keep one fixed 1920x1080 DPR-1 compositor/capture/page raster and expose only codec tuning",
 );
 
 assert(
@@ -925,7 +1113,7 @@ assert(
     browserSourceHomeConfigSmoke.includes("runtime-turn-user") &&
     browserSourceHomeConfigSmoke.includes("guest-control status probe diagnostics") &&
     browserSourceHomeConfigSmoke.includes("open-error debug hold diagnostics") &&
-    browserSourceHomeConfigSmoke.includes("Mac source-home Browser config must load runtime TURN credentials") &&
+    browserSourceHomeConfigSmoke.includes("Local Mac source-home Browser config must use no-NIC VZ transport by default") &&
     browserSourceHomeConfig.includes('engine_mode: "vm"') &&
     browserSourceHomeConfig.includes("source-home-browser-exit") &&
     !browserSourceHomeConfig.includes("--engine-mode") &&
@@ -1032,7 +1220,13 @@ assert(
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_PROFILE_ROOT") &&
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_TURN_ENV") &&
     browserVmRemoteVzLauncher.includes("optionalRemoteEnvExports") &&
-    browserVmRemoteVzLauncher.includes("remoteRuntimeTurnEnv") &&
+    browserVmRemoteVzLauncher.includes("rejectLegacyVzConfiguration") &&
+    browserVmRemoteVzLauncher.includes("elastos.browser.vz-transport-authority/v1") &&
+    browserVmRemoteVzLauncher.includes("elastos.browser.vz-launch-settlement/v1") &&
+    browserVmRemoteVzLauncher.includes("boundSocketPaths") &&
+    browserVmRemoteVzLauncher.includes("validateRemoteTransportResult") &&
+    browserVmRemoteVzLauncher.includes("routeAbsenceProved") &&
+    browserVmRemoteVzLauncher.includes("codesign --verify --strict") &&
     browserVmRemoteVzLauncher.includes("remoteProfileDiskPath") &&
     browserVmRemoteVzLauncher.includes("BrowserProfiles/default/profile.ext4") &&
     browserVmRemoteVzLauncher.includes('ELASTOS_BROWSER_VM_CONTROL_READY_TIMEOUT_MS') &&
@@ -1050,13 +1244,21 @@ assert(
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS") &&
     browserVmRemoteVzLauncher.includes('ELASTOS_BROWSER_REMOTE_VZ_RELAY_MAX_SESSIONS || "16"') &&
     browserVmRemoteVzLauncher.includes("remoteSupervisorCleanupCommand") &&
-    browserVmRemoteVzLauncher.includes("remoteStaleSupervisorCleanupCommand") &&
+    browserVmRemoteVzLauncher.includes("--elastos-vz-binding=") &&
+    browserVmRemoteVzLauncher.includes("ps -ww -axo command=") &&
+    browserVmRemoteVzLauncher.includes("ps -ww -axo pid=,command=") &&
+    browserVmRemoteVzLauncher.includes("terminate_owned_supervisor") &&
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_REAP_STALE_SUPERVISORS") &&
-    browserVmRemoteVzLauncher.includes("remoteStaleRelayCleanupCommand") &&
     browserVmRemoteVzLauncher.includes("ELASTOS_BROWSER_REMOTE_VZ_REAP_STALE_RELAYS") &&
-    browserVmRemoteVzLauncher.includes("[remote-vz cleanup] reaping stale relay shim") &&
-    browserVmRemoteVzLauncher.includes('proc_command=$(ps -p "$pid" -o command= 2>/dev/null || true)') &&
-    browserVmRemoteVzLauncher.includes("[remote-vz cleanup] reaping stale browser-vz-engine-supervisor") &&
+    !browserVmRemoteVzLauncher.includes("remoteStaleSupervisorCleanupCommand") &&
+    !browserVmRemoteVzLauncher.includes("remoteStaleRelayCleanupCommand") &&
+    browserVmRemoteVzLauncher.includes("remoteTransportAbsenceChecks") &&
+    browserVmRemoteVzLauncher.includes("${field} proof failed") &&
+    !browserVmRemoteVzLauncher.includes("let cleanupOk") &&
+    browserVmRemoteVzLauncher.includes("let cleanupPromise = null") &&
+    browserVmRemoteVzLauncher.includes("performOwnedResourceCleanup") &&
+    !browserVmRemoteVzLauncher.includes("if (cleanupStarted) return null") &&
+    browserVmRemoteVzLauncher.includes('proc_command=$(/bin/ps -ww -p "$pid" -o command= 2>/dev/null || true)') &&
     browserVmRemoteVzLauncher.includes("supervisor-${suffix}.pid") &&
     browserVmRemoteVzLauncher.includes("cleanup_supervisor") &&
     browserVmRemoteVzLauncher.includes("remoteRelayCleanupCommand") &&
@@ -1070,7 +1272,7 @@ assert(
     browserVmRemoteVzLauncher.includes('child.kill("SIGTERM")') &&
     browserVmRemoteVzLauncher.includes("/tmp/evzl") &&
     browserVmRemoteVzLauncher.includes("/tmp/evzs") &&
-    browserVmRemoteVzLauncher.includes("sessionSuffix") &&
+    browserVmRemoteVzLauncher.includes("bindingDigest") &&
     browserVmRemoteVzLauncher.includes("bvm-") &&
     browserVmRemoteVzLauncher.includes("validateUnixSocketPathBudget") &&
     browserVmRemoteVzLauncher.includes("adapter_ipc") &&
@@ -1078,6 +1280,15 @@ assert(
     browserVmRemoteVzLauncher.includes("control_socket_path") &&
     browserVmRemoteVzLauncher.includes("rm -f") &&
     browserVmRemoteVzLauncher.includes("per_launch_vm_target") &&
+    browserVmRemoteVzLauncherIntegration.includes("private_stdin_eof") &&
+    browserVmRemoteVzLauncherIntegration.includes("post_effect_cleanup") &&
+    browserVmRemoteVzLauncherIntegration.includes("zero_owned_residue") &&
+    browserVmRemoteVzLauncherIntegration.includes("long_roots") &&
+    browserVzSupervisorProcessTest.includes(
+      "missing_transport_exits_before_any_vz_or_path_effect",
+    ) &&
+    browserVzSupervisorProcessTest.includes('"load_vm_start"') &&
+    browserVzSupervisorProcessTest.includes('"start_vm_start"') &&
     !browserVmRemoteVzLauncher.includes("remote_provider:"),
   "Remote Browser VZ launcher must bridge Runtime stream IPC and VM control sockets with short macOS-safe socket paths",
 );
@@ -1091,8 +1302,9 @@ assert(
     browserVmEngineSupervisor.includes("delete env[REQUEST_ENV]") &&
     browserVmEngineSupervisor.includes('path.join(dataDir, "bvm")') &&
     browserVmEngineSupervisor.includes("/tmp/evzs") &&
-    browserVmEngineSupervisor.includes("sessionSuffix") &&
-    browserVmEngineSupervisor.includes("bvm-") &&
+    !browserVmEngineSupervisor.includes("function sessionSuffix") &&
+    !browserVmEngineSupervisor.includes("fs.mkdirSync(sessionDir") &&
+    browserVmEngineSupervisor.includes("Browser VM control isolation session_dir") &&
     browserVmEngineSupervisor.includes("elastos.browser.vm-engine.open/v1") &&
     browserVmEngineSupervisor.includes("chromium_microvm") &&
     browserVmEngineSupervisor.includes("per_launch_vm_target") &&
@@ -1151,28 +1363,38 @@ assert(
     browserVmControlService.includes("persistent_launcher") &&
     browserVmControlService.includes("runPersistentProgram") &&
     browserVmControlService.includes("terminatePersistentLauncher") &&
-    browserVmControlService.includes("sameLaunchIdentity") &&
+    !browserVmControlService.includes("sameLaunchIdentity") &&
+    !browserVmControlService.includes("launch_replacing") &&
     browserVmControlService.includes("reuse_idle_vms") &&
     browserVmControlService.includes("idleVmReuseEnabled") &&
     browserVmControlService.includes("idle_vm_reuse_disabled_retired") &&
     browserVmControlService.includes("retireNonReusableIdleVmsForSinglePageRuntime") &&
     browserVmControlService.includes("single_active_page_non_reusable_profile") &&
     browserVmControlService.includes("max_active_pages") &&
-    browserVmControlService.includes("launch_reused") &&
-    browserVmControlService.includes('reason: "same_stream"') &&
     browserVmControlService.includes("Browser VM active page capacity reached") &&
+    browserVmControlService.includes("page_close_forced_vm_retirement") &&
     browserVmControlService.includes("per_launch_vm_target") &&
+    browserVmControlService.includes("elastos.browser.vz-launch-settlement/v1") &&
+    browserVmControlService.includes("validateVzLaunchSettlementForLaunch") &&
+    browserVmControlService.includes("throw settledError") &&
+    browserVmControlService.includes("launch_settlement_result") &&
     browserVmControlServiceSmoke.includes("elastos.browser.vm-control-service-smoke/v1") &&
-    browserVmControlServiceSmoke.includes("second stream did not launch the new URL") &&
-    browserVmControlServiceSmoke.includes("single-page replacement did not preserve one active page") &&
+    browserVmControlServiceSmoke.includes("capacity conflict changed the healthy owner") &&
+    browserVmControlServiceSmoke.includes("explicit close did not permit the next lifecycle") &&
     browserVmControlServicePersistentSmoke.includes("elastos.browser.vm-control-service-persistent-smoke/v1") &&
-    browserVmControlServicePersistentSmoke.includes("same stream launch was not idempotent") &&
+    browserVmControlServicePersistentSmoke.includes("completed replay changed the healthy owner") &&
+    browserVmControlServicePersistentSmoke.includes("failed guest close did not force terminal VM retirement") &&
     browserVmControlServicePersistentSmoke.includes("wrong single-page persistent status") &&
     browserVmControlServicePersistentSmoke.includes("fake-invalid-persistent-vm-launcher") &&
-    browserVmControlServicePersistentSmoke.includes("idle keepalive retained a VM without explicit reuse opt-in") &&
+    browserVmControlServicePersistentSmoke.includes("terminal cleanup proof was incomplete") &&
+    browserVmControlServicePersistentSmoke.includes("same-profile route change reused a terminally closed VM control socket") &&
     browserVmControlServicePersistentSmoke.includes("different principal/profile launch did not terminate the previous idle VM") &&
     browserVmControlServicePersistentSmoke.includes('"reuse_idle_vms": True') &&
     browserVmControlServicePersistentSmoke.includes("Browser VM launcher output is not JSON") &&
+    browserVmControlServiceSettlementSmoke.includes("elastos.browser.vm-control-service-settlement-smoke/v1") &&
+    browserVmControlServiceSettlementSmoke.includes("verify-typed-restart") &&
+    browserVmControlServiceSettlementSmoke.includes("did_not_act cleanup_pending terminal_post_effect_cleanup") &&
+    browserVmControlServiceSettlementSmoke.includes("substituted transport settlement escaped cleanup ownership") &&
     browserVmEngineContractSmoke.includes("elastos.browser.vm-engine-contract-smoke/v1") &&
     browserVmRemoteControlPreflightSmoke.includes("elastos.browser.vm-remote-control-preflight-smoke/v1") &&
     browserVmRemoteControlPreflightSmoke.includes("remote_vm_control_socket") &&
@@ -1243,24 +1465,40 @@ assert(
     browserVzEngineSupervisor.includes("init=/opt/elastos/bin/browser-vm-init") &&
     browserVzEngineSupervisor.includes("root=/dev/vda rootfstype=ext4 rw") &&
     browserVzEngineSupervisor.includes("DEFAULT_CONTROL_PORT: u32 = 19092") &&
-    browserVzEngineSupervisor.includes("DEFAULT_RELAY_PORT: u32 = 19091") &&
+    !browserVzEngineSupervisor.includes("DEFAULT_RELAY_PORT") &&
     browserVzEngineSupervisor.includes("DEFAULT_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
     browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_CONTROL_PROXY_REQUEST_TIMEOUT_MS") &&
-    browserVzEngineSupervisor.includes("DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
-    browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
-    browserVzEngineSupervisor.includes("probe_guest_control_status") &&
-    browserVzEngineSupervisor.includes("guest control status probe") &&
+    !browserVzEngineSupervisor.includes("DEFAULT_CONTROL_STATUS_PROBE_TIMEOUT_MS") &&
+    !browserVzEngineSupervisor.includes("probe_guest_control_status") &&
+    !browserVzEngineSupervisor.includes("probe_guest_control_events") &&
+    !browserVzEngineSupervisor.includes("guest control status probe") &&
+    !browserVzEngineSupervisor.includes("guest control events probe") &&
     browserVzEngineSupervisor.includes("UNIX_SOCKET_PATH_BUDGET") &&
     browserVzEngineSupervisor.includes("validate_unix_socket_path_budget") &&
     browserVzEngineSupervisor.includes("/tmp/evzs") &&
     browserVzEngineSupervisor.includes("Browser VZ launcher requires adapter_ipc.runtime_stream_path") &&
     browserVzEngineSupervisor.includes("validate_runtime_stream_socket_path") &&
     browserVzEngineSupervisor.includes("launch_requires_runtime_owned_stream_path_for_egress") &&
-    browserVzEngineSupervisor.includes("Browser VZ webrtc_remote_display requires") &&
-    browserVzEngineSupervisor.includes("elastos.browser_ice_config_hex") &&
+    browserVzEngineSupervisor.includes("Browser VZ launcher requires display_mode=webrtc_remote_display") &&
+    browserVzEngineSupervisor.includes("VzTransportLaunch") &&
+    browserVzEngineSupervisor.includes("LEGACY_VZ_CONFIGURATION_KEYS") &&
+    browserVzEngineSupervisor.includes("VZ_AUTHORITY_BOOT_ARG_PREFIXES") &&
+    browserVzEngineSupervisor.includes("validate_vz_boot_args") &&
+    browserVzEngineSupervisor.includes("preflight_vz_launch") &&
+    browserVzEngineSupervisor.includes("bound_vz_launch_paths") &&
+    browserVzEngineSupervisor.includes("VzLaunchOwner") &&
+    browserVzEngineSupervisor.includes("TurnCleanupEvidence") &&
+    browserVzEngineSupervisor.includes("LaunchTurnStartError") &&
+    browserVzEngineSupervisor.includes("child_absent: self.terminate_and_reap()") &&
+    browserVzEngineSupervisor.includes("TurnCleanupEvidence::Indeterminate => false") &&
+    browserVzEngineSupervisor.includes("elastos.browser.vz-launch-settlement/v1") &&
+    browserVzEngineSupervisor.includes("network_disabled: true") &&
+    browserVzEngineSupervisor.includes("elastos.browser_ice_config_hex=") &&
     browserVzEngineSupervisor.includes("elastos.browser_width") &&
     browserVzEngineSupervisor.includes("elastos.browser_height") &&
-    browserVzEngineSupervisor.includes("display_boot_args_include_launch_viewport") &&
+    browserVzEngineSupervisor.includes("PRODUCT_STREAM_WIDTH: u64 = 1920") &&
+    browserVzEngineSupervisor.includes("PRODUCT_STREAM_HEIGHT: u64 = 1080") &&
+    browserVzEngineSupervisor.includes("display_boot_args_use_fixed_1080p_product_stream") &&
     browserVzEngineSupervisor.includes("engine=chromium_microvm") &&
     browserVzEngineSupervisor.includes("selkies_gstreamer") &&
     browserVzEngineSupervisor.includes("media_transport") &&
@@ -1276,20 +1514,17 @@ assert(
     browserVzEngineSupervisor.includes("DEFAULT_PROFILE_DISK_MIB") &&
     !browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
     browserVzEngineSupervisor.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_MIB") &&
-    browserVzEngineSupervisor.includes('env_u32("ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS", 16)') &&
+    browserVzEngineSupervisor.includes('"ELASTOS_BROWSER_VM_EGRESS_MAX_SESSIONS"') &&
+    browserVzEngineSupervisor.includes("post_effect_try!(env_u32(") &&
     browserVzEngineSupervisor.includes("attach_browser_profile_disk") &&
     browserVzEngineSupervisor.includes("profile_disk_from_request") &&
     browserVzEngineSupervisor.includes("validate_profile_disk_path") &&
     browserVzEngineSupervisor.includes("data_disk_path = Some") &&
     browserVzEngineSupervisor.includes("elastos.browser_profile_disk=required") &&
     browserVzEngineSupervisor.includes("browser_profile_uses_principal_owned_data_disk_descriptor") &&
-    browserVzEngineSupervisor.includes("BrowserVmHibernation::from_env") &&
-    browserVzEngineSupervisor.includes("discard_bad_hibernation_state") &&
-    browserVzEngineSupervisor.includes("discard_hibernation_tmp_state") &&
-    browserVzEngineSupervisor.includes("hibernation_key_changes_when_profile_artifacts_resources_or_boot_args_change") &&
-    browserVzEngineSupervisor.includes("hibernation_prepare_launch_rootfs_removes_stale_state_when_cache_is_missing") &&
-    browserVzEngineSupervisor.includes("hibernation_restore_failure_cleanup_removes_bad_state_file") &&
-    browserVzEngineSupervisor.includes("hibernation_save_failure_cleanup_removes_tmp_state_file") &&
+    !browserVzEngineSupervisor.includes("BrowserVmHibernation") &&
+    !browserVzEngineSupervisor.includes("discard_bad_hibernation_state") &&
+    !browserVzEngineSupervisor.includes("discard_hibernation_tmp_state") &&
     browserVzEngineSupervisor.includes('#[cfg(target_os = "macos")]') &&
     browserVmTargetStage.includes("elastos.browser.vm-target-stage/v1") &&
     browserVmTargetStage.includes("browser-vm-init") &&
@@ -1353,8 +1588,14 @@ assert(
     browserVmTargetStage.includes("ice-transport-policy") &&
     browserVmTargetStage.includes("elastos_ice_transport_policy") &&
     browserVmTargetStage.includes("confirmed ICE transport policy after TURN setup") &&
+    browserVmTargetStage.includes("_elastos_turn_transport_query") &&
+    browserVmTargetStage.includes("urllib.parse.parse_qs") &&
+    browserVmTargetStage.includes('"turn://%s:%s@%s:%s%s"') &&
+    browserVmTargetStage.includes('get_property("ice-agent")') &&
+    browserVmTargetStage.includes('ice_agent.emit("add-local-ip-address", "127.0.0.1")') &&
     browserVmTargetStage.includes("emitting ICE candidate") &&
-    browserVmTargetStage.includes("browser-vm-selkies-start: ICE config follows") &&
+    !browserVmTargetStage.includes("browser-vm-selkies-start: ICE config follows") &&
+    !browserVmTargetStage.includes("cat /run/elastos/browser-rtc.json") &&
     browserVmTargetStage.includes("ip addr show dev") &&
     browserVmTargetStage.includes("webrtc_remote_display requires at least one turn:/turns:") &&
     browserVmTargetStage.includes("browser-ice-servers.json") &&
@@ -1455,7 +1696,7 @@ assert(
     browserVmTargetDoc.includes("not a claim that Chromium cookies") &&
     browserVmTargetDoc.includes("storage_posture=principal_owned_reset_scoped_unprotected") &&
     browserVmTargetDoc.includes("protected_storage=false") &&
-    browserCapsuleDoc.includes("0.5.0 truth boundary") &&
+    browserCapsuleDoc.includes("0.6.0 truth boundary") &&
     browserCapsuleDoc.includes("not yet a protected principal-root") &&
     browserCapsuleDoc.includes("object envelope") &&
     browserCapsuleDoc.includes("not yet exported/imported by Recovery Kit") &&
@@ -1551,32 +1792,86 @@ assert(
 );
 assert(
   homeGuiWindowsSource.includes("function iframeAllowForLaunch") &&
-    homeGuiWindowsSource.includes('launched?.target === "browser"') &&
-    homeGuiWindowsSource.includes('"clipboard-read"') &&
-    homeGuiWindowsSource.includes('"clipboard-write"') &&
-    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"'),
-  "Home Browser iframe must explicitly grant clipboard-read/write so render-surface paste can use the Runtime clipboard bridge",
+    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"') &&
+    !homeGuiWindowsSource.includes('"clipboard-read"') &&
+    !homeGuiWindowsSource.includes('"clipboard-write"') &&
+    homeShellHostSource.includes("createHomeClipboardHost") &&
+    homeShellHostSource.includes("homeClipboardHost.handle(event, context, data)") &&
+    homeClipboardHost.includes("await clipboard.readText()") &&
+    homeClipboardHost.includes("await clipboard.writeText(clipboardText)") &&
+    homeClipboardHost.includes("await prompt.request") &&
+    homeClipboardHost.includes("context.targetId") &&
+    !homeClipboardHost.includes("data.targetId") &&
+    homeShellHostSource.includes(
+      "homeClipboardHost.resetFrame(context.clipboardState, context)",
+    ) &&
+    homeClipboardHost.includes(
+      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+    ) &&
+    homeClipboardClient.includes(
+      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+    ) &&
+    homeClipboardProtocol.includes(
+      "MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES = 65_536",
+    ),
+  "Only the visible trusted Home host may perform bounded Browser Clipboard reads or writes; the opaque Browser iframe must receive no Clipboard permission",
 );
 
 assert(
   browserJs.includes("browser-status-copy") &&
     browserJs.includes("Copy Browser status message") &&
-    browserJs.includes("navigator.clipboard.writeText(message)") &&
+    browserJs.includes("await homeClipboard.writeText(message)") &&
+    browserJs.includes("homeClipboard.canRequest()") &&
+    browserJs.includes("createHomeClipboardClient") &&
+    homeClipboardClient.includes("createHomeClipboardClient") &&
+    browserJs.includes("MAX_CLIPBOARD_TEXT_UTF8_BYTES = 65_536") &&
+    browserJs.includes("MAX_CLIPBOARD_ENCODED_BYTES") &&
+    browserJs.includes("MAX_CLIPBOARD_ENCODED_CHUNK_BYTES") &&
+    browserJs.includes("MAX_CLIPBOARD_CHUNK_COUNT") &&
+    browserJs.includes("CLIPBOARD_ASSEMBLY_TIMEOUT_MS") &&
+    browserJs.includes("CLIPBOARD_COPY_INTENT_TIMEOUT_MS") &&
+    browserJs.includes("pendingRemoteCopy") &&
+    browserJs.includes("readHostClipboardText()") &&
+    browserJs.includes('getData("text/plain")') &&
+    browserJs.includes("teardownRemoteClipboard") &&
+    browserJs.includes("homeClipboard.teardown()") &&
+    !browserJs.includes("navigator.clipboard") &&
+    !browserJs.includes("execCommand") &&
+    !browserJs.includes("isOpaqueClipboardFrame") &&
+    browserRemoteDisplay.includes("handleRemoteInputChannelTeardown();") &&
+    browserRemoteDisplay.includes(
+      'inputChannel.addEventListener("close", teardownBoundInputChannel)',
+    ) &&
+    browserRemoteDisplay.includes(
+      'inputChannel.addEventListener("error", teardownBoundInputChannel)',
+    ) &&
     browserStyle.includes('.browser-status[data-visible="true"][data-copyable="true"]') &&
     browserStyle.includes(".browser-status-copy") &&
-    browser.includes("browser.js?v=browser-20260719a") &&
-    !browser.includes("browser.js?v=browser-20260629b"),
-  "Browser sticky status/errors must be copyable so live product failures can produce actionable evidence",
+    browser.includes("browser.js?v=browser-20260731b") &&
+    !browser.includes("browser.js?v=browser-20260731a") &&
+    !browser.includes("browser.js?v=browser-20260730a") &&
+    !browser.includes("browser.js?v=browser-20260728a") &&
+    !browser.includes("browser.js?v=browser-20260727a") &&
+    !browser.includes("browser.js?v=browser-20260726b") &&
+    !browser.includes("browser.js?v=browser-20260726a") &&
+    !browser.includes("browser.js?v=browser-20260725a") &&
+    !browser.includes("browser.js?v=browser-20260724a") &&
+    !browser.includes("browser.js?v=browser-20260711c") &&
+    homeShellHostContract.includes("### First-party Clipboard edge") &&
+    homeShellHostContract.includes("not an ESP") &&
+    homeShellHostContract.includes("Unsolicited remote Clipboard messages cannot change the") &&
+    homeClipboardHeadlessSmoke.includes(
+      "elastos.home.clipboard-headless-smoke/v1",
+    ),
+  "Browser Clipboard must use the closed trusted-Home edge, bind guest content to explicit local intent, preserve strict bounds and teardown, and contain no opaque-frame Clipboard fallback",
 );
 
 assert(
   browserJs.includes("function resetBrowserProfile") &&
     browserJs.includes("/api/apps/browser/profile/reset") &&
-    browser.includes(
-      "Reset Browser cookies, local storage, history, and cache for this account?",
-    ) &&
-    browserJs.includes("await closeRuntimePage(activePage)") &&
-    browserJs.includes("await closeRuntimePage(stalePage)") &&
+    browserJs.includes("Reset Browser cookies, local storage, history, and cache for this account?") &&
+    browserJs.includes("await closeRuntimePage(activePage, {") &&
+    browserJs.includes("await closeRuntimePage(stalePage, {") &&
     browserJs.includes("publishRuntimePageForHost(null)") &&
     browserJs.includes("Browser profile reset. Open the address again.") &&
     !browserJs.includes("ELASTOS_BROWSER_VM_PROFILE_DISK_ROOT") &&
@@ -1598,8 +1893,10 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-status.js?v=browser-20260719a") &&
-    browserRemoteDisplay.includes("browser-status.js?v=browser-20260719a") &&
+  browserJs.includes("browser-status.js?v=browser-20260730b") &&
+    browserRemoteDisplay.includes("browser-status.js?v=browser-20260730b") &&
+    !browserJs.includes("browser-status.js?v=browser-20260711c") &&
+    !browserRemoteDisplay.includes("browser-status.js?v=browser-20260711c") &&
     !browserJs.includes("browser-status.js?v=browser-20260626e") &&
     !browserRemoteDisplay.includes("browser-status.js?v=browser-20260626e") &&
     !browserJs.includes("browser-status.js?v=browser-20260616c") &&
@@ -1612,7 +1909,12 @@ assert(
 );
 
 assert(
-  browserJs.includes("browser-remote-display.js?v=browser-20260711h") &&
+  browserJs.includes("browser-remote-display.js?v=browser-20260731a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260730b") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260728a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260727a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260724a") &&
+    !browserJs.includes("browser-remote-display.js?v=browser-20260711h") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260629a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260627a") &&
     !browserJs.includes("browser-remote-display.js?v=browser-20260618b") &&
@@ -1631,13 +1933,200 @@ assert(
     browserJs.includes("WEBRTC_ENGINE_CANDIDATE_POLL_ATTEMPTS") &&
     browserJs.includes("signalCandidate(null)") &&
     browserJs.includes('const iceTransportPolicy =') &&
-    browserJs.includes('displaySession.media_transport === "runtime_relay" ? "relay" : "all"') &&
+    browserJs.includes(
+      'displaySession.media_transport === "runtime_relay" && !engineRelayOnly',
+    ) &&
     browserJs.includes("iceTransportPolicy,") &&
+    browserRemoteDisplay.includes(
+      'displaySession.ice_connection_policy === "runtime_launch_relay_only"',
+    ) &&
+    browserRemoteDisplay.includes(
+      "validateRuntimeLaunchTurn(displaySession, enginePage)",
+    ) &&
+    browserRemoteDisplay.includes("runtimeLaunchRelayOnly ||") &&
+    browserRemoteDisplay.includes("sdpHasOnlyRelayCandidates") &&
+    browserRemoteDisplay.includes(
+      'iceCandidateType(normalized) !== "relay"',
+    ) &&
     browserJs.includes("The Browser Engine is running, but the secure display connection is not ready.") &&
-    browserJs.includes("Refresh Browser, or choose another Browser Engine or Exit Node.") &&
+    browserJs.includes(
+      "Runtime must close this session before another Browser Engine or Exit Node can open.",
+    ) &&
+    !browserRemoteDisplay.includes("Refresh Browser") &&
     browserJs.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
-    browserJs.includes("The stuck Browser session was closed"),
-  "Browser WebRTC must use relay-only ICE for runtime_relay sessions, poll late engine candidates, and recover without downgrading display modes or exposing relay internals to users",
+    browserJs.includes("createRuntimePageCleanupController") &&
+    browserJs.includes("sameRuntimePageOwner") &&
+    browserJs.includes("Runtime cleanup is pending") &&
+    browserJs.includes("Runtime confirmed the failed Browser session closed") &&
+    !browserJs.includes("The stuck Browser session was closed"),
+  "Browser WebRTC must use relay-only ICE for runtime_relay sessions, poll late engine candidates, and retain exact Runtime page ownership until terminal cleanup without downgrading display modes or exposing relay internals to users",
+);
+
+assert(
+  browserRuntimeTurnCapabilitySmoke.includes(
+    "validateRuntimeLaunchTurn",
+  ) &&
+    browserRuntimeTurnCapabilitySmoke.includes("substitution_rejected") &&
+    browserRuntimeTurnCapabilitySmoke.includes("expiry_rejected") &&
+    browserRuntimeTurnCapabilitySmoke.includes("credential_hash_verified") &&
+    browserRuntimeTurnCapabilitySmoke.includes("home_persistence_absent") &&
+    homePasskeyVirtualAuthSmoke.includes(
+      '["credential", "auth_secret", "transport_secret"].includes(key)',
+    ) &&
+    homePasskeyVirtualAuthSmoke.includes(
+      "JSON.stringify(redactSensitive(error.details), null, 2)",
+    ),
+  "Browser launch TURN must be hash-bound, expiry-bound, substitution-safe, relay-only, and redacted from persisted proof output",
+);
+
+const releaseRuntimePageForUnloadBlock = sourceBlock(
+  browserMain,
+  "function releaseRuntimePageForUnload()",
+  "Browser unload release",
+);
+const finalizeRuntimePageCloseBlock = sourceBlock(
+  browserMain,
+  "function finalizeRuntimePageClose(owner)",
+  "Browser terminal close finalizer",
+);
+const handleHomeBrowserWindowCloseRequestBlock = sourceBlock(
+  browserMain,
+  "async function handleHomeBrowserWindowCloseRequest(event)",
+  "Browser explicit Home window close",
+);
+const classifyFreshWindowCloseSummaryBlock = sourceBlock(
+  browserMain,
+  "function classifyFreshWindowCloseSummary(summary)",
+  "Browser fresh ownership probe",
+);
+const settleInitialRuntimeOpenPostFailureBlock = sourceBlock(
+  browserMain,
+  "function settleInitialRuntimeOpenPostFailure(settlement, error)",
+  "Browser initial open failure settlement",
+);
+const failRuntimeOwnedPageBlock = sourceBlock(
+  browserMain,
+  "async function failRuntimeOwnedPage(",
+  "Browser Runtime-owned failure cleanup",
+);
+assert(
+  releaseRuntimePageForUnloadBlock.includes("stopPageStatusPolling();") &&
+    releaseRuntimePageForUnloadBlock.includes("stopPageHeartbeat();") &&
+    !releaseRuntimePageForUnloadBlock.includes("resizeObserver") &&
+    !releaseRuntimePageForUnloadBlock.includes("closeRuntimePage(") &&
+    !releaseRuntimePageForUnloadBlock.includes("currentPage = null") &&
+    !releaseRuntimePageForUnloadBlock.includes("publishRuntimePageForHost(null)") &&
+    !releaseRuntimePageForUnloadBlock.includes("closeRemoteDisplay()") &&
+    failRuntimeOwnedPageBlock.includes("closeRemoteDisplay();") &&
+    !failRuntimeOwnedPageBlock.includes("currentPage = null") &&
+    !failRuntimeOwnedPageBlock.includes("publishRuntimePageForHost(null)") &&
+    finalizeRuntimePageCloseBlock.includes("currentPage = null;") &&
+    finalizeRuntimePageCloseBlock.includes("currentPageGeneration = 0;") &&
+    finalizeRuntimePageCloseBlock.includes("currentBrowserEngineId = \"\";") &&
+    finalizeRuntimePageCloseBlock.includes("currentRemoteExitId = \"\";") &&
+    finalizeRuntimePageCloseBlock.includes("publishRuntimePageForHost(null);") &&
+    finalizeRuntimePageCloseBlock.includes("closeRemoteDisplay();") &&
+    finalizeRuntimePageCloseBlock.includes(
+      "runtimeOwnershipTerminallyAbsent = true;",
+    ) &&
+    (browserMain.match(/currentPage = null;/g) || []).length === 2 &&
+    (browserMain.match(/publishRuntimePageForHost\(null\);/g) || []).length === 1 &&
+    (browserMain.match(/closeRemoteDisplay\(\);/g) || []).length === 2,
+  "Browser unload and post-ownership failure cleanup must retain Runtime ownership; only a Runtime-proven terminal close may clear the exact page generation, identities, or persistence",
+);
+
+assert(
+  browserMain.includes('"elastos.browser.window-close.request/v1"') &&
+    browserMain.includes('"elastos.browser.window-close.result/v1"') &&
+    browserMain.includes(
+      '"elastos.home.browser-authority-renew.request/v1"',
+    ) &&
+    browserMain.includes(
+      '"elastos.home.browser-authority-renew.result/v1"',
+    ) &&
+    browserMain.includes(
+      "const BROWSER_AUTHORITY_RENEWAL_ACK_TIMEOUT_MS = 40_000;",
+    ) &&
+    browserMain.includes("function handleHomeBrowserAuthorityRenewalResult(event)") &&
+    browserMain.includes("event.source !== window.top") &&
+    browserMain.includes("message.requestId !== request.requestId") &&
+    browserMain.includes("browserAuthorityRenewalAttempts = Math.min(") &&
+    browserMain.includes("BROWSER_AUTHORITY_RENEWAL_RETRY_DELAYS_MS.length - 1") &&
+    browserMain.includes("? { browser_instance: browserInstanceId }") &&
+    handleHomeBrowserWindowCloseRequestBlock.includes("runtimeOpenInFlight > 0") &&
+    handleHomeBrowserWindowCloseRequestBlock.includes(
+      "await closeRuntimePage(owner, { explicitRetry: true })",
+    ) &&
+    handleHomeBrowserWindowCloseRequestBlock.includes("recoverableRuntimePage()") &&
+    handleHomeBrowserWindowCloseRequestBlock.includes(
+      '"runtime_open_in_flight"',
+    ) &&
+    browserMain.includes("let unsettledRuntimeOpen = null;") &&
+    browserMain.includes("function requestFreshRuntimeAuthority(error)") &&
+    browserMain.includes("stopPageStatusPolling();") &&
+    browserMain.includes("stopPageHeartbeat();") &&
+    browserMain.includes("!relaunchRequested") &&
+    browserMain.includes(
+      "function proveRuntimeOwnershipAbsentBeforeDispatch()",
+    ) &&
+    browserMain.includes("const nextUrl = normalizeRuntimeOpenUrl(value);") &&
+    browserMain.includes(
+      'pendingWindowCloseOwnership("runtime_ownership_unproven")',
+    ) &&
+    browserMain.includes('"terminal_pre_effect_failure"') &&
+    browserMain.includes('"terminal_post_effect_cleanup"') &&
+    !classifyFreshWindowCloseSummaryBlock.includes(
+      "terminalWindowCloseAbsence()",
+    ) &&
+    settleInitialRuntimeOpenPostFailureBlock.includes(
+      "isAuthoritySessionError(error)",
+    ) &&
+    settleInitialRuntimeOpenPostFailureBlock.includes(
+      "terminalRuntimeOpenOutcome(error?.payload)",
+    ) &&
+    homeGuiWindowsSource.includes("pendingBrowserWindowCloses") &&
+    homeGuiWindowsSource.includes("event.source !== record.frameWindow") &&
+    homeGuiWindowsSource.includes("markBrowserWindowCloseState(record.entry, \"retry\")") &&
+    homeGuiWindowsSource.includes("Promise.all(entries.map((entry) => closeWindow(entry.id)))") &&
+    browserWindowCloseHeadlessSmoke.includes(
+      'schema: "elastos.browser.window-close-headless-smoke/v1"',
+    ) &&
+    browserWindowCloseHeadlessSmoke.includes("simulated lost open poll") &&
+    browserWindowCloseHeadlessSmoke.includes(
+      "ownerless close claimed terminal while the exact async open was pending",
+    ) &&
+    browserWindowCloseHeadlessSmoke.includes(
+      "old retained Browser frame did not accept the exact already-absent reap receipt",
+    ) &&
+    browserWindowCloseHeadlessSmoke.includes("generic Browser iframe navigation called Runtime close") &&
+    browserWindowCloseHandshakeTest.includes(
+      "ownership-changing open returns pending without closing or claiming terminal",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "recoverable Runtime owner is closed exactly when no current page exists",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "cleanup-pending outcome plus an empty summary never proves absence",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "initial 409 conflict never proves Browser ownership absent",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "initial normalization rejection before dispatch proves local absence",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "active authority expiry retries exact renewal and accepts only its bound success",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "authority renewal remains live at the capped retry interval",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "late Home launch response cannot resume a timed-out GUI renewal",
+    ) &&
+    browserWindowCloseHandshakeTest.includes(
+      "expired GUI renewal command cannot start a Browser launch",
+    ),
+  "Explicit Home Browser close must be source/token/instance bound, retain the frame through pending or ownership transitions, and remove it only after an exact terminal Runtime receipt",
 );
 
 assert(
@@ -1670,7 +2159,8 @@ assert(
 );
 
 assert(
-    browserJs.includes("browser-input-surface.js?v=browser-20260719a") &&
+    browserJs.includes("browser-input-surface.js?v=browser-20260725b") &&
+    !browserJs.includes("browser-input-surface.js?v=browser-20260711c") &&
     browserInputSurface.includes('renderPanel.addEventListener("click"') &&
     !browserJs.includes('renderImage.addEventListener("click"') &&
     browserInputSurface.includes('remoteVideo.addEventListener("click"') &&
@@ -1688,22 +2178,28 @@ assert(
   browserJs.includes("function recoverMissingRuntimePage") &&
     browserJs.includes('recoverMissingRuntimePage(error, "Browser session was released.")') &&
     !browserJs.includes("Browser Runtime frame was released.") &&
-    browserJs.includes('showStatus("Browser session reconnected.")'),
-  "Browser visible WebRTC pages must recover when the VM page was released behind the iframe",
+    browserJs.includes("settleRemoteDisplayFailure") &&
+    !browserJs.includes('showStatus("Browser session reconnected.")'),
+  "Browser visible WebRTC pages must settle exact Runtime ownership and require an explicit user open after the VM page is released",
 );
 
 assert(
-  !browserJs.includes('type: "resize"') &&
-    browserJs.includes("sendBrowserInput(") &&
-    browserJs.includes("function scheduleViewportResize()") &&
-    browserJs.includes("lastViewport = viewport;") &&
-    !browserJs.includes('event?.type === "resize" && event.viewport') &&
+  !browserJs.includes("scheduleViewportResize") &&
+    !browserJs.includes("ResizeObserver") &&
+    !browserJs.includes('{ type: "resize"') &&
     browserSelkiesControlService.includes(
       "Emulation.setDeviceMetricsOverride",
     ) &&
     browserSelkiesControlService.includes(
-      "deviceScaleFactor: config.displaySurface.deviceScaleFactor",
+      "deviceScaleFactor: 1",
     ) &&
+    browserSelkiesControlService.includes("function browserDisplayMetrics") &&
+    browserSelkiesControlService.includes("const PRODUCT_RASTER_WIDTH = 1920") &&
+    browserSelkiesControlService.includes("const PRODUCT_RASTER_HEIGHT = 1080") &&
+    browserSelkiesControlService.includes(
+      "Browser guest raster is fixed at 1920x1080",
+    ) &&
+    !browserSelkiesControlService.includes("function resizeBrowserPage") &&
     browserSelkiesControlService.includes("function mediaKindsForSdp") &&
     !browserSelkiesControlService.includes("isSelkiesAudioUnavailable") &&
     !browserSelkiesControlService.includes("audio_offer_unavailable") &&
@@ -1719,8 +2215,17 @@ assert(
     browserHostedProductSupervisor.includes("hosted product audio sessions must include an audio media section") &&
     !browserEngineAdapter.includes("supervisor_accepts_video_only_vm_product_display") &&
     browserEngineAdapter.includes("Browser VM product display sessions must advertise audio=true and video=true") &&
-    browserSelkiesControlService.includes('body?.event?.type === "resize"'),
-  "Browser viewport changes must never go through the Selkies pointer datachannel, VM staging must not force a zoomed CSS surface, and media flags must match the negotiated SDP",
+    browserDisplayModeSmoke.includes("contained video corners must map to all encoded corners after viewer resize") &&
+    browserFixedProductRasterChromiumTest.includes(
+      "installed-shaped Chromium fills the DPR-1 raster through a loopback proxy",
+    ) &&
+    browserFixedProductRasterChromiumTest.includes(
+      'corners: ["tl", "tr", "bl", "br"]',
+    ) &&
+    browserFixedProductRasterChromiumTest.includes(
+      "fixture navigation did not traverse the loopback Runtime-shaped proxy",
+    ),
+  "Browser must keep one fixed 1920x1080 DPR-1 guest raster, scale only the viewer, and keep media flags matched to negotiated SDP",
 );
 assert(
   browserJs.includes("const LIBRARY_FILE_PICKER_MAX_BYTES = 16 * 1024 * 1024") &&
@@ -1736,7 +2241,9 @@ assert(
 
 assert(
   browserJs.includes("function syncDisplayInputFromSession(displaySession)") &&
-    browserJs.includes("syncDisplayInputFromSession(page.display_session)") &&
+    browserJs.includes(
+      "syncDisplayInputFromSession(openedPage.display_session)",
+    ) &&
     browserJs.includes("currentPage?.display_session?.input === \"datachannel\"") &&
     browserJs.includes("currentPage?.display_session?.input_protocol === \"selkies_v1\"") &&
     browserJs.includes('currentInputTransport() === "datachannel"') &&

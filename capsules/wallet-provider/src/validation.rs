@@ -1,5 +1,5 @@
 use super::*;
-use elastos_auth::{normalize_evm_address, validate_evm_address};
+use elastos_auth::{normalize_evm_address, validate_evm_address, validate_siwe_origin_binding};
 use sha2::Digest;
 
 pub(super) struct LinkAccountInput {
@@ -26,7 +26,7 @@ pub(super) struct SetDefaultAccountInput {
     pub(super) account_id: String,
 }
 
-pub(super) struct ImportManagedSecretInput {
+pub(super) struct ImportManagedRecoveryKeyInput {
     pub(super) principal_id: String,
     pub(super) recovery_key: Value,
     pub(super) label: Option<String>,
@@ -49,21 +49,26 @@ pub(super) struct BitcoinChallengeInput {
 }
 
 pub(super) struct SignatureRequestInput {
+    pub(super) request_id: String,
+    pub(super) wallet_request_sha256: String,
+    pub(super) authority_binding: String,
     pub(super) principal_id: String,
-    pub(super) account_id: Option<String>,
-    pub(super) chain_namespace: Option<String>,
+    pub(super) session_id: String,
+    pub(super) launch_id: String,
+    pub(super) proof_binding_id: Option<String>,
+    pub(super) account_id: String,
+    pub(super) chain_namespace: String,
     pub(super) intent: String,
-    pub(super) capsule_id: String,
+    pub(super) requested_by_actor: String,
     pub(super) resource: String,
     pub(super) reason: String,
     pub(super) payload: Value,
-    pub(super) expires_at: Option<u64>,
+    pub(super) expires_at: u64,
 }
 
 impl ChallengeInput {
     pub(super) fn validate(&self) -> Result<(), String> {
-        validate_domain(&self.domain)?;
-        validate_uri(&self.uri)?;
+        validate_siwe_origin_binding(&self.domain, &self.uri)?;
         validate_evm_address(&self.address)?;
         if self.chain_id == 0 {
             return Err("chain_id must be non-zero".to_string());
@@ -89,18 +94,20 @@ impl BitcoinChallengeInput {
 }
 
 impl SignatureRequestInput {
-    pub(super) fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self, now: u64) -> Result<(), String> {
+        validate_opaque_id(&self.request_id, "request_id")?;
+        validate_opaque_id(&self.wallet_request_sha256, "wallet_request_sha256")?;
+        validate_hash(&self.authority_binding, "authority_binding")?;
         validate_opaque_id(&self.principal_id, "principal_id")?;
-        let chain_namespace = self
-            .chain_namespace
-            .as_deref()
-            .ok_or_else(|| "chain_namespace is required".to_string())?;
-        validate_opaque_id(chain_namespace, "chain_namespace")?;
-        if let Some(account_id) = self.account_id.as_deref() {
-            validate_opaque_id(account_id, "account_id")?;
+        validate_opaque_id(&self.session_id, "session_id")?;
+        validate_opaque_id(&self.launch_id, "launch_id")?;
+        if let Some(proof_binding_id) = &self.proof_binding_id {
+            validate_opaque_id(proof_binding_id, "proof_binding_id")?;
         }
+        validate_opaque_id(&self.account_id, "account_id")?;
+        validate_opaque_id(&self.chain_namespace, "chain_namespace")?;
         validate_signing_intent(&self.intent)?;
-        validate_opaque_id(&self.capsule_id, "capsule_id")?;
+        validate_opaque_id(&self.requested_by_actor, "requested_by_actor")?;
         validate_resource(&self.resource)?;
         validate_reason(&self.reason)?;
         let payload =
@@ -108,6 +115,14 @@ impl SignatureRequestInput {
         if payload.is_empty() || payload.len() > MAX_APPROVAL_PAYLOAD_BYTES {
             return Err(format!(
                 "payload must be 1-{MAX_APPROVAL_PAYLOAD_BYTES} bytes"
+            ));
+        }
+        if self.expires_at <= now {
+            return Err("approval expires_at must be in the future".to_string());
+        }
+        if self.expires_at > now.saturating_add(MAX_APPROVAL_REQUEST_TTL_SECS) {
+            return Err(format!(
+                "approval lifetime exceeds {MAX_APPROVAL_REQUEST_TTL_SECS} seconds"
             ));
         }
         Ok(())
@@ -158,7 +173,7 @@ impl SetDefaultAccountInput {
     }
 }
 
-impl ImportManagedSecretInput {
+impl ImportManagedRecoveryKeyInput {
     pub(super) fn validate(&self) -> Result<(), String> {
         validate_opaque_id(&self.principal_id, "principal_id")?;
         if let Some(label) = &self.label {
@@ -195,7 +210,7 @@ pub(super) fn validate_opaque_id(value: &str, label: &str) -> Result<(), String>
     Ok(())
 }
 
-pub(super) fn validate_evm_chain_namespace(value: &str) -> Result<(), String> {
+pub(super) fn eip155_chain_id(value: &str) -> Result<u64, String> {
     validate_opaque_id(value, "chain_namespace")?;
     let chain_id = value
         .strip_prefix("eip155:")
@@ -206,7 +221,11 @@ pub(super) fn validate_evm_chain_namespace(value: &str) -> Result<(), String> {
     if chain_id == 0 {
         return Err("managed wallet chain ID must be non-zero".to_string());
     }
-    Ok(())
+    Ok(chain_id)
+}
+
+pub(super) fn validate_evm_chain_namespace(value: &str) -> Result<(), String> {
+    eip155_chain_id(value).map(|_| ())
 }
 
 pub(super) fn validate_managed_chain_namespace(value: &str) -> Result<(), String> {
@@ -274,12 +293,24 @@ pub(super) fn validate_signing_intent(value: &str) -> Result<(), String> {
         | "publish_envelope"
         | "transaction_intent"
         | "browser_connect"
+        | "browser_account_access"
         | "browser_personal_sign"
         | "browser_typed_data_sign"
         | "bitcoin_bip322_proof"
         | "revocation" => Ok(()),
         _ => Err("unsupported signing intent".to_string()),
     }
+}
+
+pub(super) fn managed_signing_intent_is_supported(value: &str) -> bool {
+    matches!(
+        value,
+        "transaction_intent"
+            | "browser_account_access"
+            | "browser_personal_sign"
+            | "browser_typed_data_sign"
+            | "bitcoin_bip322_proof"
+    )
 }
 
 pub(super) fn validate_domain(value: &str) -> Result<(), String> {
@@ -341,19 +372,20 @@ pub(super) fn validate_signature(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn approval_expires_at(input: Option<u64>, now: u64) -> u64 {
-    match input {
-        Some(expires_at) if expires_at > now => {
-            let max = now.saturating_add(MAX_APPROVAL_REQUEST_TTL_SECS);
-            expires_at.min(max)
-        }
-        _ => now.saturating_add(APPROVAL_REQUEST_TTL_SECS),
-    }
-}
-
 pub(super) fn value_hash(value: &Value) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     bytes_hash(&bytes)
+}
+
+pub(super) fn wallet_authority_binding(authority: &WalletAuthorityV2) -> String {
+    value_hash(&json!({
+        "principal_id": authority.principal_id,
+        "session_id": authority.session_id,
+        "proof_binding_id": authority.proof_binding_id,
+        "grant_id": authority.grant_id,
+        "actor": authority.actor,
+        "launch_id": authority.launch_id,
+    }))
 }
 
 pub(super) fn bytes_hash(bytes: &[u8]) -> String {
@@ -377,10 +409,6 @@ pub(super) fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-pub(super) fn default_bitcoin_network() -> String {
-    "bitcoin".to_string()
 }
 
 pub(super) fn random_hex(bytes_len: usize) -> String {

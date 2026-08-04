@@ -2,10 +2,10 @@
 
 All notable changes to the public ElastOS Runtime repository.
 
-## [0.6.0-dev] - Unreleased
+## [0.6.0] - 2026-07-31
 
-Development changes on `feat/elastos-shell-protocol`. These changes are not
-part of the 0.5.0 release history.
+0.6.0 combines the reviewed ESP line with the Wallet, Recovery, and Browser
+continuation. These changes are not part of the 0.5.0 release history.
 
 ### Changed
 - Added the ESP v0 descriptor, Runtime-derived capsule/interface catalog, and
@@ -26,6 +26,15 @@ part of the 0.5.0 release history.
 - Extracted People from Home into a standalone first-party app capsule with an
   app-scoped launch token while keeping profile, discovery, requests, contacts,
   removal, and Chat handoff Runtime-mediated.
+- Added signed Home launch-token v4 authority, the typed Wallet Bus v2.3
+  boundary, durable exact-intent passkey step-up, managed Wallet recovery, and
+  Runtime-owned transaction effects that reconcile without rebroadcasting.
+- Added the macOS VZ Browser product path with Runtime-only networking,
+  WebRTC display, explicit Browser Engine and Exit selection, principal-scoped
+  profile ownership, and durable page/VM cleanup ownership.
+- Added a Runtime-mediated injected-wallet bridge. Deterministic localhost proof
+  confirmed `window.ethereum`, EIP-6963 discovery, the Runtime Wallet binding,
+  and one `eth_requestAccounts` call creating one pending account-access request.
 
 ### Fixed
 - Fixed Home launch classification so browser projections are attached as
@@ -41,6 +50,27 @@ part of the 0.5.0 release history.
   capsule bootstrap plus obsolete standalone Recovery Kit routes.
 - Rejected archive links and host-path escapes during capsule install and
   browser asset serving.
+- Bound Browser Wallet reads and approvals, exact EVM signing outcomes, managed
+  approval authority, and recovery state to the accepted Wallet contracts.
+- Made Browser close and authority renewal acknowledged and retryable, retained
+  exact Runtime cleanup ownership across interruption, gated the deterministic
+  close handshake in `just verify`, and removed a delayed terminal Home window
+  after the exact close result.
+
+### Known limitations
+- Browser is included in 0.6.0, but is not claimed fully reliable. The accepted
+  localhost proof covers launch, display, navigation, and injected account
+  access; it is not a general product-readiness claim for every target or site.
+- Browser restart remains intermittent: one observed restart failed and the
+  next opened. The `ela.city` login did not survive the restart, and current
+  Browser performance is slow.
+- Browser profile storage remains principal-owned and reset-scoped, but is not
+  yet protected or Recovery Kit-recoverable.
+
+### Deferred
+- Carrier reconciliation and physical multi-node evidence are deferred to 0.7.
+- The shell UI redesign and extended AI UI work are deferred unless reviewed as
+  independent post-release changes; they are not part of this 0.6.0 code tree.
 
 ## [0.5.0] - Unreleased
 

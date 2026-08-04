@@ -30,13 +30,31 @@ function sanitizedErrorText(error) {
     .slice(0, 420);
 }
 
-function browserLaunchFailureSummary(text) {
+export function runtimeOpenOutcome(error) {
+  const outcome = error?.payload?.outcome;
+  const effects = outcome?.effects;
+  const indeterminateLaunch =
+    outcome?.state === "cleanup_pending" &&
+    outcome?.ownership === "launch_reconciliation_pending" &&
+    effects?.page_acquired === null &&
+    effects?.vm_acquired === null &&
+    effects?.stream_acquired === true;
   if (
-    /browser engine supervisor exited|Browser VM persistent launcher exited|browser-vz-engine-supervisor|remote VZ supervisor/i.test(text)
+    outcome?.schema !== "elastos.browser.open-outcome/v1" ||
+    ![
+      "terminal_pre_effect_failure",
+      "terminal_post_effect_cleanup",
+      "cleanup_pending",
+    ].includes(outcome.state) ||
+    !effects ||
+    (!indeterminateLaunch &&
+      (typeof effects.page_acquired !== "boolean" ||
+        typeof effects.vm_acquired !== "boolean" ||
+        typeof effects.stream_acquired !== "boolean"))
   ) {
-    return "Browser Engine failed to start cleanly. The failed session was closed; refresh Browser, or choose another Browser Engine.";
+    return null;
   }
-  return "";
+  return outcome;
 }
 
 export function friendlyOpenError(error) {
@@ -44,9 +62,24 @@ export function friendlyOpenError(error) {
   if (isAuthoritySessionError(error)) {
     return "Browser session expired. Reopening from Home...";
   }
-  const launchFailure = browserLaunchFailureSummary(text);
-  if (launchFailure) {
-    return launchFailure;
+  const outcome = runtimeOpenOutcome(error);
+  if (outcome?.state === "terminal_pre_effect_failure") {
+    return "Browser Engine failed to start cleanly. No Browser page or VM was acquired.";
+  }
+  if (outcome?.state === "terminal_post_effect_cleanup") {
+    return "Browser Engine failed to start cleanly. Runtime confirmed the acquired Browser effects were closed.";
+  }
+  if (outcome?.state === "cleanup_pending") {
+    if (outcome.ownership === "launch_reconciliation_pending") {
+      return "Browser Engine returned no safe launch result. Runtime retained ownership and is reconciling before another Browser session can start.";
+    }
+    if (
+      outcome.effects.page_acquired === true ||
+      outcome.effects.vm_acquired === true
+    ) {
+      return "Browser Engine failed to start cleanly. Runtime cleanup is pending for the acquired Browser session.";
+    }
+    return "Browser Engine failed to start cleanly. Runtime is finishing cleanup; no Browser page or VM remains acquired.";
   }
   if (error.status === 403) {
     return "This page was blocked by your Exit Node settings.";
@@ -68,8 +101,14 @@ export async function collectWebrtcStats(peerConnection) {
     return null;
   }
   const report = await peerConnection.getStats();
+  const reportItems = [...report.values()];
+  const reportById = new Map(
+    reportItems
+      .filter((item) => typeof item?.id === "string")
+      .map((item) => [item.id, item]),
+  );
   const stats = {};
-  for (const item of report.values()) {
+  for (const item of reportItems) {
     const mediaKind = item.kind || item.mediaType;
     const isInboundVideo =
       item.type === "inbound-rtp" &&
@@ -88,15 +127,26 @@ export async function collectWebrtcStats(peerConnection) {
       stats.video_frames_dropped = Number(item.framesDropped || 0);
       stats.video_fps = Number(item.framesPerSecond || 0);
       stats.video_bytes_received = Number(item.bytesReceived || 0);
+      stats.video_packets_received = Number(item.packetsReceived || 0);
       stats.video_packets_lost = Number(item.packetsLost || 0);
       stats.video_jitter_ms = Number(item.jitter || 0) * 1000;
     } else if (isInboundAudio) {
       stats.audio_bytes_received = Number(item.bytesReceived || 0);
+      stats.audio_packets_received = Number(item.packetsReceived || 0);
       stats.audio_packets_lost = Number(item.packetsLost || 0);
       stats.audio_jitter_ms = Number(item.jitter || 0) * 1000;
     } else if (item.type === "candidate-pair" && item.state === "succeeded" && item.nominated) {
+      const localCandidate = reportById.get(item.localCandidateId);
+      const remoteCandidate = reportById.get(item.remoteCandidateId);
       stats.rtt_ms = Number(item.currentRoundTripTime || 0) * 1000;
       stats.available_incoming_bitrate = Number(item.availableIncomingBitrate || 0);
+      stats.selected_local_candidate_type =
+        String(localCandidate?.candidateType || "unknown");
+      stats.selected_remote_candidate_type =
+        String(remoteCandidate?.candidateType || "unknown");
+      stats.selected_protocol = String(
+        localCandidate?.protocol || remoteCandidate?.protocol || "unknown",
+      );
     }
   }
   return stats;

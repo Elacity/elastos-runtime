@@ -194,8 +194,9 @@ check_forbidden_in_path() {
   local pattern="$1"
   local path="$2"
   local label="$3"
+  shift 3
   local search_status=0
-  rg_search "$pattern" "$path" >"$tmp" 2>/dev/null || search_status=$?
+  rg_search "$pattern" "$path" "$@" >"$tmp" 2>/dev/null || search_status=$?
   if [[ "$search_status" -eq 0 ]]; then
     echo "[alignment] forbidden pattern found: $label"
     cat "$tmp"
@@ -283,6 +284,23 @@ check_required 'home:switch-shell-and-open-target' capsules/home-cli/browser/hom
 check_required 'print_cli_inspect' capsules/home-cli/src/line_views.rs 'Home CLI must render Runtime-derived capsule projection facts'
 check_required 'print_cli_contract' capsules/home-cli/src/line_views.rs 'Home CLI must render the shared capsule interface contract'
 check_required 'home-shell-boot-mask' capsules/home/browser/index.html 'Home shell host must neutral-mask first paint until Runtime selects the active shell'
+check_required 'HOME_BROWSER_CONTEXT_PATTERN' capsules/home/browser/home-browser-context.js 'trusted Home must bound its non-authoritative browser-profile correlation'
+check_required 'cryptoSource\.getRandomValues\(bytes\)' capsules/home/browser/home-browser-context.js 'trusted Home browser-profile correlation must use browser crypto'
+check_required 'type: "home:shell-context"' capsules/home/browser/home-shell-host.js 'trusted Home must hand the browser-profile correlation through the checked shell-ready path'
+check_required 'context\.targetId === HOME_GUI_SHELL_ID' capsules/home/browser/home-shell-host.js 'Home correlation handoff must target only the exact active GUI shell'
+check_required 'acceptHomeBrowserContextId' capsules/home-gui/browser/home-gui-shell.js 'opaque Home GUI must accept only the checked host correlation'
+check_required 'projectHomeGuiAuthority\(document\.body, summary\)' capsules/home-gui/browser/home-gui-shell.js 'opaque Home GUI must project trusted Runtime summary authority before rendering'
+check_required 'summary\?\.authority\?\.signed_in === true' capsules/home-gui/browser/home-gui-authority.js 'Home GUI sign-out visibility must require exact signed Runtime authority'
+check_required 'requestHome\("home:sign-out"\)' capsules/home-gui/browser/home-gui-shell.js 'Home GUI sign-out must remain a checked host request'
+check_forbidden_in_path '/api/auth/sessions/sign-out' capsules/home-gui/browser 'opaque Home GUI must not revoke Runtime sessions directly'
+check_required 'if \(!hasHomeBrowserContextId\(\)\)' capsules/home-gui/browser/shell-core.js 'Home GUI must refuse session restore and persistence before host correlation'
+check_forbidden_in_path 'localStorage|sessionStorage|indexedDB' capsules/home-gui/browser 'opaque Home GUI must not own browser-profile persistence'
+check_forbidden_in_path 'Math\.random' capsules/home-gui/browser 'opaque Home GUI must not keep weak random fallbacks'
+check_forbidden_in_path 'clearShellSessionState' capsules/home-gui/browser 'Home GUI state reads must not trigger cleanup writes'
+check_required 'assertions > 0' scripts/home-browser-context-smoke.mjs 'Home browser-context deterministic proof must execute assertions'
+check_required '\-\-headless=new' scripts/home-browser-context-opaque-frame-smoke.sh 'Home browser-context proof must use real headless Chromium'
+check_required 'only exact signed_in=true may project signed authority' scripts/home-gui-sign-out-smoke.mjs 'Home GUI authority projection must have deterministic exact-boolean proof'
+check_required '\-\-headless=new' scripts/home-gui-sign-out-opaque-frame-smoke.sh 'Home GUI sign-out proof must use real headless Chromium'
 check_required 'print_cli_gates' capsules/home-cli/src/line_views.rs 'Home CLI must render Runtime gate facts'
 check_required 'print_cli_affordances' capsules/home-cli/src/line_views.rs 'Home CLI must render capsule affordance facts'
 check_required 'print_cli_wallet' capsules/home-cli/src/line_views.rs 'Home CLI must render wallet approval hints from Runtime facts'
@@ -295,9 +313,9 @@ check_required '/api/apps/home/active-shell' capsules/system/browser/system.js '
 check_required 'home:refresh-summary' capsules/system/browser/system.js 'System shell setting must ask Home to swap the root shell after changes'
 check_forbidden_in_path 'esp-shell' components.json 'obsolete ESP Shell capsule must not be packaged'
 
-check_required 'Home front door' README.md 'README must teach Home front door'
-check_required 'No Ambient Authority' PRINCIPLES.md 'principles file must codify explicit authority boundaries'
-check_required 'Carrier Plane For Local And Off-Box' PRINCIPLES.md 'principles file must codify the Carrier capability plane for local and off-box transport'
+check_required 'Home is the user-facing front door' README.md 'README must teach Home front door'
+check_required 'No ambient authority' PRINCIPLES.md 'principles file must codify explicit authority boundaries'
+check_required 'Carrier is not the capsule contract' PRINCIPLES.md 'principles file must codify the Carrier transport boundary'
 check_required 'audit-linux-runtime-portability\.sh' scripts/publish-release.sh 'publish release must audit Linux runtime portability before publishing'
 check_forbidden_in_path 'using default: \$ELASTOS' scripts/publish-release.sh 'public Linux runtime publish must not silently fall back to the glibc host binary'
 check_required 'opens Home' docs/GETTING_STARTED.md 'Getting Started must teach Home front door'
@@ -366,12 +384,17 @@ check_required 'elastos://decrypt/session/open' elastos/crates/elastos-server/sr
 check_required 'elastos-auth' capsules/wallet-provider/Cargo.toml 'wallet-provider must share proof primitives through elastos-auth'
 check_forbidden_in_path 'elastos-runtime = ' capsules/wallet-provider/Cargo.toml 'wallet-provider must not depend on the full runtime execution stack'
 check_required 'pub use elastos_auth' elastos/crates/elastos-runtime/src/auth.rs 'runtime auth module must re-export shared elastos-auth primitives'
-check_required 'wallet_provider_data' elastos/crates/elastos-server/src/api/auth_gateway.rs 'EVM wallet auth must route proof operations through wallet-provider'
-check_required 'ApprovalRequests' capsules/wallet-provider/src/main.rs 'wallet-provider must expose explicit approval request state instead of raw signing'
-check_required 'CreateManagedAccount' capsules/wallet-provider/src/main.rs 'wallet-provider must expose provider-owned managed wallet creation behind runtime approval'
-check_required 'ApproveApproval' capsules/wallet-provider/src/main.rs 'wallet-provider must expose explicit approval state instead of raw signing'
-check_required 'CompleteApproval' capsules/wallet-provider/src/main.rs 'wallet-provider must expose signature completion receipts instead of raw app signing'
-check_required 'SignApproved' capsules/wallet-provider/src/main.rs 'wallet-provider must execute managed signatures only after approval'
+check_required 'WALLET_PROTOCOL_VERSION: &str = "2\.3"' elastos/crates/elastos-wallet-contract/src/lib.rs 'Wallet contract must pin Wallet Bus 2.3'
+check_required 'RuntimeWalletAdapter' elastos/crates/elastos-server/src/api/gateway_wallet_adapter.rs 'Runtime must keep Wallet authority behind its private typed adapter'
+check_required 'ProviderInvocationTransport::Local' elastos/crates/elastos-server/src/api/gateway_wallet_adapter.rs 'Wallet Bus dispatch must remain Runtime-local'
+check_required 'WalletProviderRequestV2' elastos/crates/elastos-server/src/api/gateway_wallet_adapter.rs 'Wallet adapter must dispatch typed Wallet Bus requests'
+check_forbidden_in_path 'wallet_provider_data' elastos/crates/elastos-server/src/api/auth_gateway.rs 'raw test Wallet dispatch helper must stay removed'
+check_required 'wallet_resource_rejects_all_principal_sensitive_operations' elastos/crates/elastos-server/src/provider_resource.rs 'generic Wallet resources must reject principal-sensitive operations'
+check_required 'generic_http_wallet_operations_fail_before_provider_invocation' elastos/crates/elastos-server/src/api/handlers/provider.rs 'generic HTTP Wallet operations must fail before provider invocation'
+check_required 'generic_wallet_capability_requests_fail_before_pending' elastos/crates/elastos-server/src/api/handlers/capability.rs 'generic Wallet capabilities must fail before pending approval'
+check_required 'component_bridge_wallet_contract_fails_before_provider_invocation' elastos/crates/elastos-server/src/carrier_bridge.rs 'component Wallet Bus attempts must fail before provider invocation'
+check_required 'attached_bridge_wallet_contract_fails_before_http_dispatch' elastos/crates/elastos-server/src/carrier_bridge.rs 'attached component Wallet Bus attempts must fail before HTTP dispatch'
+check_required 'inspect_planning_exposes_only_wallet_status_without_provider_invocation' elastos/crates/elastos-server/src/api/gateway_tests/inspect.rs 'Inspect planning must expose only Wallet status without invoking the provider'
 check_required 'recover_evm_address' capsules/wallet-provider/src/main.rs 'wallet-provider must verify external EVM approval signatures before completion receipts'
 check_required '/api/apps/system/wallet/approvals' elastos/crates/elastos-server/src/api/gateway.rs 'System must expose wallet approval review through the runtime surface'
 check_required '/api/apps/system/wallet/managed' elastos/crates/elastos-server/src/api/gateway.rs 'System must expose built-in wallet creation through the runtime surface'
@@ -405,7 +428,7 @@ check_required '/api/auth/sessions/refresh' capsules/home/browser/shell-auth.js 
 check_required 'home state save failed' capsules/home-gui/browser/shell-core.js 'Home GUI browser state writes must stay explicit and observable'
 check_required 'passkey the Home front door authority' elastos/CHANGELOG.md 'CHANGELOG must record the implemented passkey front-door authority model'
 check_forbidden_in_path 'HOME_BROWSER_STATE_ROOT|ElastOS/System/HomeState' elastos/crates/elastos-server/src/api 'Home browser state must be rooted in the active principal user area, not a shared system bucket'
-check_forbidden_in_path 'authority_id|authorityId|home_browser_authority_id' elastos/crates/elastos-server/src/api 'Home browser state must identify the runtime principal, not an ambiguous authority id'
+check_forbidden_in_path '"authority_id"[[:space:]]*:|authority_id[[:space:]]*:|authorityId[[:space:]]*:|home_browser_authority_id' elastos/crates/elastos-server/src/api 'Home browser state must identify the runtime principal, not an ambiguous authority id'
 check_required '.AppData/ElastOS/Home/browser-state.json' elastos/crates/elastos-server/src/api/gateway_home_system.rs 'Home browser state must materialize under the active principal localhost root'
 check_required 'wallet proof is not bound to this runtime principal' elastos/crates/elastos-server/src/api/auth_gateway.rs 'wallet proof must link to an existing Runtime principal, not mint login'
 check_required 'ELASTOS_WALLET_PRICE_HTTP_APPROVED' elastos/crates/elastos-server/src/api/gateway.rs 'wallet price HTTP access must require explicit operator approval'
@@ -444,7 +467,7 @@ check_required 'wallet-connector-transaction-smoke\.mjs' docs/BROWSER_CAPSULE.md
 check_required 'eth_sendTransaction' scripts/wallet-connector-transaction-smoke.mjs 'connector smoke must prove external transaction submission'
 check_required 'wallet_addEthereumChain' scripts/wallet-connector-transaction-smoke.mjs 'connector smoke must prove known-chain add handling'
 check_required 'transaction_hash' scripts/wallet-connector-transaction-smoke.mjs 'connector smoke must prove transaction-hash-only Runtime completion'
-check_forbidden_in_path 'fallback|frame preview|showing Runtime frame preview' capsules/browser 'Browser UI must not silently downgrade to fallback frame previews'
+check_forbidden_in_path 'fallback|frame preview|showing Runtime frame preview' capsules/browser 'Browser UI must not silently downgrade to fallback frame previews' --glob '!*.test.mjs'
 check_forbidden_in_path 'fallback|showing Runtime frame preview' capsules/browser-engine-adapter 'Browser Engine Adapter must fail closed instead of fallback display modes'
 check_forbidden_in_path 'fallback|showing Runtime frame preview' elastos/tools/browser-playwright-engine/src 'Browser proof engine must not present fallback display paths as normal browsing'
 check_required 'cdp_screencast_i420' elastos/tools/browser-playwright-engine/src/supervisor.mjs 'Playwright proof backend must identify itself as CDP screencast, not final compositor'
@@ -456,6 +479,11 @@ check_required 'elastos.browser.engine.page/v1' capsules/browser-engine-adapter/
 check_required 'elastos.adapter-ipc/v1' capsules/browser-engine-adapter/src 'browser-engine adapter must validate private adapter_ipc descriptors'
 check_required 'elastos.browser.engine.launch-request/v1' capsules/browser-engine-adapter/src 'browser-engine adapter must use a typed native supervisor launch request'
 check_required 'elastos.browser.engine.supervisor-result/v1' capsules/browser-engine-adapter/src 'browser-engine adapter must require typed native supervisor launch results'
+check_required 'BROWSER_ENGINE_PROTOCOL_VERSION.*2\.0' capsules/browser-engine-adapter/src 'browser-engine adapter must expose the breaking lifecycle protocol revision'
+check_required 'elastos.browser.engine-cleanup-binding/v2' capsules/browser-engine-adapter/src 'browser-engine adapter must require the exact v2 cleanup binding'
+check_required 'elastos.browser.engine-cleanup-result/v2' elastos/crates/elastos-server/src/api 'Runtime must require the exact v2 Browser Engine terminal cleanup receipt'
+check_required 'start_browser_engine_provider' elastos/crates/elastos-server/src/server_infra.rs 'Runtime must status-check Browser Engine before registration'
+check_forbidden_in_path 'elastos\.browser\.(engine-cleanup-binding|engine-cleanup-result|supervisor-cleanup-result)/v1' capsules/browser-engine-adapter/src 'browser-engine adapter must not retain the superseded cleanup wire revision'
 check_required 'webrtc_signal' capsules/browser-engine-adapter/src 'browser-engine adapter must route WebRTC signaling through Runtime provider operation'
 check_required 'ELASTOS_BROWSER_ENGINE_REQUEST' capsules/browser-engine-adapter/src 'browser-engine adapter must pass native supervisor launch requests through explicit environment contract'
 check_required 'ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG' elastos/tools/browser-engine-supervisor/src/main.rs 'browser-engine supervisor must require explicit operator config'
@@ -501,7 +529,7 @@ check_required 'browser_provider_resource_call' elastos/crates/elastos-server/sr
 check_required 'elastos://net/stream' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must reserve streams through the Net resource contract'
 check_required 'elastos://exit/open_stream' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must hand approved egress to the Exit resource contract'
 check_required 'elastos://browser-engine/launch' elastos/crates/elastos-server/src/api/gateway_browser.rs 'Browser open must bind streams through the Browser Engine resource contract'
-check_required 'elastos://chain/\{network\}/broadcast_transaction' elastos/crates/elastos-server/src/api/gateway_browser_wallet.rs 'Browser transaction approvals must expose the chain broadcast effect resource'
+check_required 'elastos://chain/\{\}/broadcast_transaction' elastos/crates/elastos-server/src/api/gateway_transaction_effects.rs 'Browser transaction approvals must expose the chain broadcast effect resource through the shared transaction coordinator'
 check_required 'browser_visible_stream_session' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must strip private adapter_ipc descriptors from UI responses'
 check_required 'browser_attach_runtime_stream_path' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must allocate Runtime-owned stream socket paths before engine launch'
 check_required 'browser_stream_relay' elastos/crates/elastos-server/src/api/gateway_browser_stream.rs 'Browser open must validate private Exit relay IPC descriptors before relaying bytes'
@@ -572,6 +600,7 @@ if rg_search 'elastos://chain|/api/provider/chain|chain-provider|blockchain prov
   --glob '!capsules/wallet-unisat/*' \
   --glob '!capsules/wallet/*' \
   --glob '!capsules/wallet-walletconnect/*' \
+  --glob '!capsules/home/browser/home-wallet-connector-host.js' \
   --glob '!**/capsule.json' \
   --glob '!**/tests/**' \
   --glob '!**/*test*' \
@@ -606,14 +635,14 @@ check_required 'if \[\[ \$\{#GATEWAYS\[@\]\} -gt 0 \]\]; then' scripts/install.s
 check_required 'current Linux `x86_64`/`aarch64` preview' README.md 'README install path must be scoped to Linux preview'
 check_required 'current Linux `x86_64`/`aarch64` preview' docs/INSTALL.md 'install docs must scope public installer to Linux preview'
 check_required 'current Linux `x86_64`/`aarch64`' docs/GETTING_STARTED.md 'getting started must scope binary install to Linux preview'
-check_required 'System, People, Services, Browser, Wallet, Documents, Library,' docs/INSTALL.md 'install docs must list the current default Home visible surfaces'
-check_required 'Marketplace, Archive, and Inbox' docs/INSTALL.md 'install docs must list Marketplace and Archive in the default Home visible surfaces'
-check_required 'People is installed as a separate app capsule' docs/INSTALL.md 'install docs must describe People as a separate installed capsule'
+check_required 'System, People, Services, Browser, Wallet' docs/INSTALL.md 'install docs must list the current default Home visible surfaces'
+check_required 'Documents, Library, Marketplace, Archive, and Inbox' docs/INSTALL.md 'install docs must list Marketplace and Archive in the default Home visible surfaces'
+check_required 'separate app capsule' docs/INSTALL.md 'install docs must describe People as a separate installed capsule'
 check_forbidden_in_path 'People is Home-owned state and UI|not a separate capsule' docs/INSTALL.md 'install docs must not preserve the obsolete Home-owned People exception'
-check_required 'System, People, Services, Browser, Wallet, Documents, Library, Marketplace,' docs/GETTING_STARTED.md 'getting started must list the current default Home visible surfaces'
+check_required 'System, People, Services, Browser, Wallet' docs/GETTING_STARTED.md 'getting started must list the current default Home visible surfaces'
+check_required 'Documents, Library, Marketplace, Archive, and Inbox' docs/GETTING_STARTED.md 'getting started must list Marketplace and Archive in the default Home visible surfaces'
 check_forbidden_in_path 'http://' elastos/crates/elastos-runtime/src/provider/registry.rs 'provider-registry tests/docs must not preserve http:// parity assumptions'
 check_forbidden_in_path 'localhost:// = ' README.md 'public docs must not flatten localhost:// into a single-root slogan'
-check_forbidden_in_path 'localhost:// = ' docs/OVERVIEW.md 'overview must describe rooted localhost spaces, not a flattened single-root slogan'
 check_forbidden_in_path 'did-provider' capsules/chat/capsule.json 'chat capsule should use the host did bridge instead of bundling a stale did-provider dependency'
 check_forbidden_in_path 'component\.as_os_str\(\) == "target"' elastos/crates/elastos-server/src/binaries.rs 'provider resolution must not auto-enable repo asset lookup just because the binary runs from target/'
 check_forbidden_in_path 'component\.as_os_str\(\) == "target"' elastos/crates/elastos-server/src/ipfs.rs 'viewer resolution must not auto-enable repo asset lookup just because the binary runs from target/'
@@ -628,7 +657,6 @@ check_forbidden_in_path 'guest SDK|SDK request|SDK response|mirror the guest' el
 check_forbidden_in_path 'get_ipfs_bridge|prepare_capsule_from_cid|send_raw\("ipfs"' elastos/crates/elastos-server/src/run_cmd.rs 'run --cid must materialize through elastos://content, not raw IPFS'
 check_forbidden_in_path 'get_ipfs_bridge|prepare_capsule_from_cid|send_raw\("ipfs"' elastos/crates/elastos-server/src/serve_cmd.rs 'serve --cid must materialize through elastos://content, not raw IPFS'
 check_forbidden_in_path 'send_raw\("ipfs"|ipfs_cat_via_provider|try_download_capsule_via_ipfs_provider' elastos/crates/elastos-server/src/supervisor.rs 'supervisor capsule downloads must use elastos://content/fetch, not raw IPFS'
-check_required 'managed dashboard runtime' docs/OVERVIEW.md 'overview must teach Home as the front door'
 
 python3 - <<'PY'
 import json, re, sys

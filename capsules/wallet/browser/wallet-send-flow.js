@@ -17,7 +17,7 @@ export function createWalletSendFlow({
   readText,
   refreshWalletState,
   renderActivity,
-  requestFreshPasskeyHomeToken,
+  requestPasskeyStepUp,
   selectedOrDefaultAccount,
   setBusy,
   setCurrentRequests,
@@ -244,13 +244,13 @@ export function createWalletSendFlow({
         to,
         amount,
       };
-      const homeToken = await requestFreshPasskeyHomeToken("wallet.send", intent);
+      const stepUpToken = await requestPasskeyStepUp("wallet.send", intent);
       const payload = await fetchJson("/api/apps/wallet/wallet/send", {
         method: "POST",
-        headers: shellHeaders({ "content-type": "application/json" }, homeToken),
+        headers: shellHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({
           ...intent,
-          home_token: homeToken,
+          step_up_token: stepUpToken,
         }),
       });
       const hash = readText(payload.transaction_hash);

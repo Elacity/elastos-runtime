@@ -8,8 +8,13 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{AeadCore, Aes256Gcm, KeyInit, Nonce};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use elastos_auth::{
-    ethereum_signed_message_hash, normalize_evm_address, recover_evm_address,
+    ethereum_signed_message_hash, normalize_evm_address, recover_evm_address, validate_evm_address,
     verify_siwe_challenge, AuthChallengeInput, AuthChallengeV1, ProofBinding,
+};
+use elastos_wallet_contract::{
+    ManagedRecoveryKeyEntryV1, ManagedRecoverySetV1, ValidatedChainOutcomeBindingV1,
+    ValidatedChainOutcomeV1, WalletAuthorityV2, WalletProviderOperationV2, WalletProviderRequestV2,
+    WalletProviderResponseV2, WalletResultV2, WALLET_BUS_OPERATION, WALLET_PROTOCOL_VERSION,
 };
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
@@ -17,7 +22,6 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
-use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,10 +46,14 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
 };
 const AUTH_CHALLENGE_TTL_SECS: u64 = 5 * 60;
+#[cfg(test)]
 const APPROVAL_REQUEST_TTL_SECS: u64 = 10 * 60;
 const MAX_APPROVAL_REQUEST_TTL_SECS: u64 = 30 * 60;
 const MAX_APPROVAL_PAYLOAD_BYTES: usize = 32 * 1024;
-const MAX_APPROVAL_HISTORY: usize = 100;
+const MAX_RESOLVED_APPROVAL_HISTORY_PER_PRINCIPAL: usize = 100;
+const MAX_ACTIVE_APPROVAL_REQUESTS_PER_PRINCIPAL: usize = 100;
+const MAX_BROWSER_ACCOUNT_ACCESS_TTL_SECS: u64 = 12 * 60 * 60;
+const MAX_EFFECTFUL_LIFECYCLE_HISTORY: usize = 512;
 const MANAGED_EVM_PROOF_TYPE: &str = "managed_evm";
 const MANAGED_BTC_P2WPKH_PROOF_TYPE: &str = "managed_btc_p2wpkh";
 const WALLET_KEY_FILE: &str = "wallet-key.hex";
@@ -57,6 +65,7 @@ struct WalletProvider {
     store_path: Option<PathBuf>,
     storage_key: Option<[u8; 32]>,
     store: WalletStore,
+    defer_save: bool,
 }
 
 impl WalletProvider {
@@ -65,6 +74,7 @@ impl WalletProvider {
             store_path: None,
             storage_key: None,
             store: WalletStore::default(),
+            defer_save: false,
         }
     }
 
@@ -72,189 +82,284 @@ impl WalletProvider {
         match request {
             Request::Init { config } => self.init(config),
             Request::Status => self.status(),
-            Request::Accounts {
-                principal_id,
-                include_revoked,
-            } => self.accounts(&principal_id, include_revoked),
-            Request::CreateManagedAccount {
-                principal_id,
+            Request::WalletContract {
+                request,
+                runtime_invocation,
+            } => self.handle_wallet_contract(request, *runtime_invocation),
+            Request::Shutdown => Response::empty_ok(),
+        }
+    }
+
+    fn handle_wallet_contract(
+        &mut self,
+        request_value: Value,
+        runtime_invocation: RuntimeInvocationEnvelope,
+    ) -> Response {
+        if let Err(err) = runtime_invocation.validate_wallet_contract() {
+            return Response::error("invalid_runtime_invocation", err);
+        }
+        let request_bytes = match serde_json::to_vec(&request_value) {
+            Ok(bytes) => bytes,
+            Err(err) => return Response::error("invalid_wallet_contract", err.to_string()),
+        };
+        let now = now_ts();
+        let request = match WalletProviderRequestV2::decode_at(&request_bytes, now) {
+            Ok(request) => request,
+            Err(err) => return Response::error("invalid_wallet_contract", err.to_string()),
+        };
+        let result = if request.is_effectful() {
+            self.execute_effectful_wallet_request(&request, now)
+        } else {
+            response_into_wallet_result(self.dispatch_wallet_operation(&request))
+        };
+        let response = WalletProviderResponseV2::for_request(&request, result);
+        match serde_json::to_value(response) {
+            Ok(value) => Response::ok(value),
+            Err(err) => Response::error("wallet_contract_response", err.to_string()),
+        }
+    }
+
+    fn execute_effectful_wallet_request(
+        &mut self,
+        request: &WalletProviderRequestV2,
+        now: u64,
+    ) -> WalletResultV2 {
+        prune_expired_lifecycles(&mut self.store, now);
+        if let Some(response) = self.idempotent_transaction_effect_replay(request) {
+            return response_into_wallet_result(response);
+        }
+        if self
+            .store
+            .consumed_lifecycles
+            .iter()
+            .any(|record| record.lifecycle_id == request.lifecycle_id)
+        {
+            return WalletResultV2::Error {
+                code: "lifecycle_replay".to_string(),
+                message: "Wallet effectful lifecycle was already consumed".to_string(),
+            };
+        }
+        if self.store.consumed_lifecycles.len() >= MAX_EFFECTFUL_LIFECYCLE_HISTORY {
+            return WalletResultV2::Error {
+                code: "lifecycle_capacity".to_string(),
+                message: "Wallet effectful lifecycle capacity is full".to_string(),
+            };
+        }
+
+        let snapshot = self.store.clone();
+        self.defer_save = true;
+        let response = self.dispatch_wallet_operation(request);
+        self.defer_save = false;
+        if !response.is_ok() {
+            self.store = snapshot;
+            return response_into_wallet_result(response);
+        }
+
+        self.store
+            .consumed_lifecycles
+            .push(ConsumedWalletLifecycle {
+                lifecycle_id: request.lifecycle_id.clone(),
+                request_sha256: request.request_sha256.clone(),
+                request_expires_at: request.expires_at,
+                consumed_at: now,
+            });
+        self.store = prune_store(std::mem::take(&mut self.store), now);
+        if let Err(err) = self.save() {
+            self.recover_store_after_save_failure(snapshot);
+            return WalletResultV2::Error {
+                code: "storage_error".to_string(),
+                message: err,
+            };
+        }
+        response_into_wallet_result(response)
+    }
+
+    fn dispatch_wallet_operation(&mut self, request: &WalletProviderRequestV2) -> Response {
+        let principal_id = request.authority.principal_id.as_str();
+        let session_id = request.authority.session_id.as_str();
+        let actor = request.authority.actor.as_str();
+        match &request.operation {
+            WalletProviderOperationV2::ListAccounts { include_revoked } => {
+                self.accounts(principal_id, *include_revoked)
+            }
+            WalletProviderOperationV2::CreateManagedAccount {
                 chain_namespace,
                 label,
                 create_new,
             } => self.create_managed_account(CreateManagedAccountInput {
-                principal_id,
-                chain_namespace,
-                label,
-                create_new,
+                principal_id: principal_id.to_string(),
+                chain_namespace: chain_namespace.clone(),
+                label: label.clone(),
+                create_new: *create_new,
             }),
-            Request::LinkAccount {
-                principal_id,
+            WalletProviderOperationV2::LinkVerifiedAccount {
                 proof_binding_id,
                 chain_namespace,
                 address,
                 proof_type,
-                connector_id,
                 label,
             } => self.link_account(LinkAccountInput {
-                principal_id,
-                proof_binding_id,
-                chain_namespace,
-                address,
-                proof_type,
-                connector_id,
-                label,
+                principal_id: principal_id.to_string(),
+                proof_binding_id: proof_binding_id.clone(),
+                chain_namespace: chain_namespace.clone(),
+                address: address.clone(),
+                proof_type: proof_type.clone(),
+                connector_id: Some(actor.to_string()),
+                label: label.clone(),
             }),
-            Request::RevokeAccount {
-                principal_id,
-                account_id,
-            } => self.revoke_account(&principal_id, &account_id),
-            Request::RenameAccount {
-                principal_id,
-                account_id,
-                label,
-            } => self.rename_account(&principal_id, &account_id, &label),
-            Request::ExportManagedSecret {
-                principal_id,
-                account_id,
-            } => self.export_managed_secret(&principal_id, &account_id),
-            Request::ImportManagedSecret {
-                principal_id,
-                recovery_key,
-                label,
-            } => self.import_managed_secret(ImportManagedSecretInput {
-                principal_id,
-                recovery_key,
-                label,
-            }),
-            Request::SetDefaultAccount {
-                principal_id,
+            WalletProviderOperationV2::RevokeAccount { account_id } => {
+                self.revoke_account(principal_id, account_id)
+            }
+            WalletProviderOperationV2::RenameAccount { account_id, label } => {
+                self.rename_account(principal_id, account_id, label)
+            }
+            WalletProviderOperationV2::SetDefaultAccount {
                 chain_namespace,
                 intent,
                 account_id,
             } => self.set_default_account(SetDefaultAccountInput {
-                principal_id,
-                chain_namespace,
-                intent,
-                account_id,
+                principal_id: principal_id.to_string(),
+                chain_namespace: chain_namespace.clone(),
+                intent: intent.clone(),
+                account_id: account_id.clone(),
             }),
-            Request::DefaultAccount {
-                principal_id,
+            WalletProviderOperationV2::DefaultAccount {
                 chain_namespace,
                 intent,
-            } => self.default_account(&principal_id, &chain_namespace, &intent),
-            Request::Challenge {
+            } => self.default_account(principal_id, chain_namespace, intent),
+            WalletProviderOperationV2::Challenge {
                 domain,
                 uri,
                 address,
                 chain_id,
                 resources,
             } => self.challenge(ChallengeInput {
-                domain,
-                uri,
-                address,
-                chain_id,
-                resources,
+                domain: domain.clone(),
+                uri: uri.clone(),
+                address: address.clone(),
+                chain_id: *chain_id,
+                resources: resources.clone(),
             }),
-            Request::BitcoinChallenge {
+            WalletProviderOperationV2::BitcoinChallenge {
                 domain,
                 uri,
                 address,
                 network,
                 resources,
             } => self.bitcoin_challenge(BitcoinChallengeInput {
-                domain,
-                uri,
-                address,
-                network,
-                resources,
+                domain: domain.clone(),
+                uri: uri.clone(),
+                address: address.clone(),
+                network: network.as_str().to_string(),
+                resources: resources.clone(),
             }),
-            Request::VerifyProof { message, signature } => self.verify_proof(&message, &signature),
-            Request::VerifyBip322Proof {
+            WalletProviderOperationV2::VerifyProof { message, signature } => {
+                self.verify_proof(message, signature)
+            }
+            WalletProviderOperationV2::VerifyContractProof {
+                message,
+                signature,
+                evidence,
+            } => match serde_json::to_value(evidence) {
+                Ok(evidence) => self.verify_contract_proof(message, signature, &evidence),
+                Err(err) => Response::error("invalid_contract_proof", err.to_string()),
+            },
+            WalletProviderOperationV2::VerifyBip322Proof {
                 message,
                 signature,
                 signature_type,
                 public_key,
             } => self.verify_bitcoin_proof(
-                &message,
-                &signature,
-                signature_type.as_deref(),
-                public_key.as_deref(),
-            ),
-            Request::VerifyContractProof {
                 message,
                 signature,
-                erc1271_proof,
-            } => self.verify_contract_proof(&message, &signature, &erc1271_proof),
-            Request::Signature {
-                principal_id,
+                Some(signature_type),
+                public_key.as_deref(),
+            ),
+            WalletProviderOperationV2::RequestApproval {
                 account_id,
                 chain_namespace,
                 intent,
-                capsule_id,
                 resource,
                 reason,
                 payload,
                 expires_at,
-            } => self.request_signature(SignatureRequestInput {
-                principal_id,
-                account_id,
-                chain_namespace,
-                intent,
-                capsule_id,
-                resource,
-                reason,
-                payload,
-                expires_at,
+            } => self.request_approval(SignatureRequestInput {
+                request_id: request.request_id.clone(),
+                wallet_request_sha256: request.request_sha256.clone(),
+                authority_binding: wallet_authority_binding(&request.authority),
+                principal_id: principal_id.to_string(),
+                session_id: session_id.to_string(),
+                launch_id: request.authority.launch_id.clone(),
+                proof_binding_id: request.authority.proof_binding_id.clone(),
+                account_id: account_id.clone(),
+                chain_namespace: chain_namespace.clone(),
+                intent: intent.clone(),
+                requested_by_actor: actor.to_string(),
+                resource: resource.clone(),
+                reason: reason.clone(),
+                payload: payload.clone(),
+                expires_at: *expires_at,
             }),
-            Request::ApprovalRequests {
-                principal_id,
-                include_resolved,
-            } => self.approval_requests(&principal_id, include_resolved),
-            Request::RejectApproval {
-                principal_id,
+            WalletProviderOperationV2::AttachValidatedChainOutcome { outcome } => {
+                self.attach_validated_chain_outcome(&request.authority, outcome)
+            }
+            WalletProviderOperationV2::ListApprovals { include_resolved } => {
+                self.approval_requests(principal_id, *include_resolved)
+            }
+            WalletProviderOperationV2::RejectApproval { request_id, reason } => {
+                self.reject_approval(principal_id, session_id, actor, request_id, reason)
+            }
+            WalletProviderOperationV2::ApproveAndSignManaged { request_id, reason } => {
+                self.approve_and_sign_managed(principal_id, session_id, request_id, reason)
+            }
+            WalletProviderOperationV2::ApproveConnectorHandoff { request_id, reason } => {
+                self.approve_connector_handoff(principal_id, session_id, actor, request_id, reason)
+            }
+            WalletProviderOperationV2::CompleteConnectorHandoff {
                 request_id,
-                reason,
-            } => self.reject_approval(&principal_id, &request_id, reason.as_deref()),
-            Request::ApproveApproval {
-                principal_id,
-                request_id,
-                reason,
-            } => self.approve_approval(&principal_id, &request_id, reason.as_deref()),
-            Request::CompleteApproval {
-                principal_id,
-                request_id,
-                connector_id,
                 payload_hash,
                 signature,
                 signature_type,
                 public_key,
                 signer,
                 transaction_hash,
-            } => self.complete_approval(CompleteApprovalCompletion {
-                principal_id: &principal_id,
-                request_id: &request_id,
-                connector_id: &connector_id,
-                payload_hash: &payload_hash,
+            } => self.complete_connector_handoff(ConnectorHandoffCompletion {
+                principal_id,
+                session_id,
+                request_id,
+                connector_id: actor,
+                payload_hash,
                 signature: signature.as_deref(),
                 signature_type: signature_type.as_deref(),
                 public_key: public_key.as_deref(),
-                signer: &signer,
+                signer,
                 transaction_hash: transaction_hash.as_deref(),
             }),
-            Request::RecordTransactionHash {
-                principal_id,
-                request_id,
-                transaction_hash,
-            } => self.record_transaction_hash(&principal_id, &request_id, &transaction_hash),
-            Request::SignApproved {
-                principal_id,
-                request_id,
-            } => self.sign_approved(&principal_id, &request_id),
-            Request::Shutdown => Response::empty_ok(),
+            WalletProviderOperationV2::ExportManagedRecoveryKey { account_id } => {
+                self.export_managed_recovery_key(principal_id, account_id)
+            }
+            WalletProviderOperationV2::ImportManagedRecoveryKey {
+                recovery_key,
+                label,
+            } => self.import_managed_recovery_key(ImportManagedRecoveryKeyInput {
+                principal_id: principal_id.to_string(),
+                recovery_key: recovery_key.clone(),
+                label: label.clone(),
+            }),
+            WalletProviderOperationV2::ExportManagedRecoverySet {} => {
+                self.export_managed_recovery_set(principal_id)
+            }
+            WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set } => {
+                self.import_managed_recovery_set(principal_id, recovery_set)
+            }
         }
     }
 
     fn init(&mut self, config: Value) -> Response {
+        self.store_path = None;
+        self.storage_key = None;
+        self.store = WalletStore::default();
+        self.defer_save = false;
         let Some(base_path) = config
             .get("base_path")
             .and_then(|value| value.as_str())
@@ -269,8 +374,8 @@ impl WalletProvider {
             .join("SystemServices")
             .join("Wallet");
         let store_path = wallet_dir.join("wallet-state.json");
-        if let Err(err) = fs::create_dir_all(&wallet_dir) {
-            return Response::error("storage_error", err.to_string());
+        if let Err(err) = create_wallet_dir_durable(&wallet_dir) {
+            return Response::error("storage_error", err);
         }
         let storage_key = match load_or_create_storage_key(&wallet_dir) {
             Ok(key) => key,
@@ -280,14 +385,23 @@ impl WalletProvider {
             Ok(store) => store,
             Err(err) => return Response::error("storage_error", err),
         };
+        let now = now_ts();
+        let mut store = prune_store(store, now);
+        let pre_v2_approvals_rejected = reject_pre_v2_pending_approvals(&mut store, now);
+        if pre_v2_approvals_rejected > 0 {
+            if let Err(err) = save_store(&store_path, &store) {
+                return Response::error("storage_error", err);
+            }
+        }
         self.store_path = Some(store_path);
         self.storage_key = Some(storage_key);
-        self.store = prune_store(store, now_ts());
+        self.store = store;
         Response::ok(json!({
             "provider": "wallet-provider",
-            "protocol_version": "1.0",
+            "protocol_version": WALLET_PROTOCOL_VERSION,
             "storage_configured": self.store_path.is_some(),
             "managed_wallets_configured": self.storage_key.is_some(),
+            "pre_v2_approvals_rejected": pre_v2_approvals_rejected,
         }))
     }
 
@@ -296,6 +410,7 @@ impl WalletProvider {
         Response::ok(json!({
             "provider": "wallet-provider",
             "version": PROVIDER_VERSION,
+            "protocol_version": WALLET_PROTOCOL_VERSION,
             "storage_configured": self.store_path.is_some(),
             "managed_wallets_configured": self.storage_key.is_some(),
             "active_account_count": self.store.accounts.iter().filter(|account| account.revoked_at.is_none()).count(),
@@ -303,7 +418,7 @@ impl WalletProvider {
             "pending_challenge_count": self.store.challenges.iter().filter(|stored| stored.consumed_at.is_none() && stored.challenge.expires_at > now).count(),
             "pending_bitcoin_challenge_count": self.store.bitcoin_challenges.iter().filter(|stored| stored.consumed_at.is_none() && stored.challenge.expires_at > now).count(),
             "pending_approval_count": self.store.approval_requests.iter().filter(|request| request.status == ApprovalStatus::Pending && request.expires_at > now).count(),
-            "supported_operations": ["status", "challenge", "bitcoin_challenge", "verify_proof", "verify_bip322_proof", "accounts", "create_managed_account", "link_account", "revoke_account", "rename_account", "export_managed_secret", "import_managed_secret", "set_default_account", "default_account", "request_signature", "approval_requests", "reject_approval", "approve_approval", "complete_approval", "record_transaction_hash", "sign_approved"],
+            "supported_operations": ["status"],
         }))
     }
 
@@ -667,6 +782,75 @@ impl WalletProvider {
         SigningKey::from_slice(&private_key).map_err(|err| err.to_string())
     }
 
+    fn managed_signing_key_for_account(
+        &self,
+        account: &LinkedAccount,
+    ) -> Result<SigningKey, String> {
+        if account.revoked_at.is_some() {
+            return Err("managed wallet account is revoked".to_string());
+        }
+        if account.connector_id.is_some() {
+            return Err("managed wallet account cannot carry connector authority".to_string());
+        }
+        let expected_proof_type = managed_proof_type(&account.chain_namespace)?;
+        if account.proof_type != expected_proof_type {
+            return Err("managed wallet account proof type does not match its chain".to_string());
+        }
+        let canonical_address = |address: &str| -> Result<String, String> {
+            if expected_proof_type == MANAGED_EVM_PROOF_TYPE {
+                validate_evm_address(address)?;
+                Ok(normalize_evm_address(address))
+            } else {
+                Ok(address.to_string())
+            }
+        };
+        let account_address = canonical_address(&account.address)?;
+        let mut matching_secrets = self.store.managed_wallets.iter().filter(|secret| {
+            secret.revoked_at.is_none()
+                && secret.principal_id == account.principal_id
+                && secret.account_id == account.account_id
+        });
+        let secret = matching_secrets
+            .next()
+            .ok_or_else(|| "managed wallet key not found".to_string())?;
+        if matching_secrets.next().is_some() {
+            return Err("managed wallet account has multiple active signing keys".to_string());
+        }
+        if secret.schema != "elastos.wallet.managed_secret/v1"
+            || secret.principal_id != account.principal_id
+            || secret.account_id != account.account_id
+            || secret.chain_namespace != account.chain_namespace
+        {
+            return Err("managed wallet key metadata does not match its account".to_string());
+        }
+        let secret_address = canonical_address(&secret.address)?;
+        if secret_address != account_address {
+            return Err("managed wallet key address does not match its account".to_string());
+        }
+        let signing_key = self.decrypt_managed_key(secret)?;
+        let derived_address = canonical_address(&managed_address_for_signing_key(
+            &signing_key,
+            &account.chain_namespace,
+        )?)?;
+        if derived_address != account_address || derived_address != secret_address {
+            return Err("managed wallet key derives a different account address".to_string());
+        }
+        let expected_account_id = account_id(&account.chain_namespace, &derived_address);
+        if account.account_id != expected_account_id || secret.account_id != expected_account_id {
+            return Err("managed wallet account id does not match its key authority".to_string());
+        }
+        let expected_proof_binding_id = format!(
+            "proof:wallet:managed:{}:{}",
+            account.chain_namespace, derived_address
+        );
+        if account.proof_binding_id != expected_proof_binding_id {
+            return Err(
+                "managed wallet proof binding does not match its key authority".to_string(),
+            );
+        }
+        Ok(signing_key)
+    }
+
     fn managed_storage_key(&self, principal_id: &str) -> Result<[u8; 32], String> {
         let storage_key = self
             .storage_key
@@ -680,72 +864,65 @@ impl WalletProvider {
     }
 
     fn save(&self) -> Result<(), String> {
+        if self.defer_save {
+            return Ok(());
+        }
         let Some(path) = &self.store_path else {
             return Err("wallet-provider is not initialized".to_string());
         };
         save_store(path, &self.store)
     }
 
+    fn recover_store_after_save_failure(&mut self, previous_store: WalletStore) {
+        let persisted_store = self
+            .store_path
+            .as_deref()
+            .and_then(|path| load_store_if_present(path).ok().flatten());
+        self.store = persisted_store.unwrap_or(previous_store);
+    }
+
     fn account_for_signature(
         &self,
         input: &SignatureRequestInput,
     ) -> Result<LinkedAccount, Response> {
-        let chain_namespace = input.chain_namespace.as_deref().ok_or_else(|| {
-            Response::error(
-                "invalid_request",
-                "chain_namespace is required for wallet signature requests",
-            )
-        })?;
-        if let Some(account_id) = input.account_id.as_deref() {
-            let account = self
-                .active_account(&input.principal_id, account_id)
-                .cloned()
-                .ok_or_else(|| Response::error("not_found", "active linked account not found"))?;
-            if !chain_namespaces_compatible(&account.chain_namespace, chain_namespace) {
-                return Err(Response::error(
-                    "invalid_request",
-                    "wallet account does not match requested chain_namespace",
-                ));
-            }
-            return Ok(account);
-        }
-        let Some(default) =
-            self.default_account_record(&input.principal_id, chain_namespace, &input.intent)
-        else {
-            return Err(Response::error(
-                "not_found",
-                "default linked account not set",
-            ));
-        };
-        self.active_account(&input.principal_id, &default.account_id)
+        let account = self
+            .active_account(&input.principal_id, &input.account_id)
             .cloned()
-            .ok_or_else(|| Response::error("not_found", "default linked account is not active"))
+            .ok_or_else(|| Response::error("not_found", "active linked account not found"))?;
+        if !chain_namespaces_compatible(&account.chain_namespace, &input.chain_namespace) {
+            return Err(Response::error(
+                "invalid_request",
+                "wallet account does not match requested chain_namespace",
+            ));
+        }
+        Ok(account)
     }
 
     fn ensure_managed_account_can_sign(&self, account: &LinkedAccount) -> Result<(), Response> {
         if !is_managed_proof_type(&account.proof_type) {
             return Ok(());
         }
-        let Some(secret) = self.store.managed_wallets.iter().find(|secret| {
-            secret.principal_id == account.principal_id
-                && secret.account_id == account.account_id
-                && secret.revoked_at.is_none()
-        }) else {
-            return Err(Response::error(
-                "managed_key_missing",
-                "managed wallet key not found",
-            ));
-        };
-        self.decrypt_managed_key(secret)
+        self.managed_signing_key_for_account(account)
             .map(|_| ())
-            .map_err(|err| Response::error("managed_key_unavailable", err))
+            .map_err(|err| {
+                let code = if err == "managed wallet key not found" {
+                    "managed_key_missing"
+                } else {
+                    "managed_key_unavailable"
+                };
+                Response::error(code, err)
+            })
     }
 
     fn ensure_initialized(&self) -> Result<(), Response> {
-        self.store_path
-            .as_ref()
-            .map(|_| ())
-            .ok_or_else(|| Response::error("not_initialized", "wallet-provider is not initialized"))
+        if self.store_path.is_some() && self.storage_key.is_some() {
+            Ok(())
+        } else {
+            Err(Response::error(
+                "not_initialized",
+                "wallet-provider is not initialized",
+            ))
+        }
     }
 
     fn validate_bitcoin_challenge_for_signing(
@@ -783,6 +960,15 @@ impl WalletProvider {
             return Err("Bitcoin proof message does not match challenge".to_string());
         }
         Ok(())
+    }
+}
+
+fn response_into_wallet_result(response: Response) -> WalletResultV2 {
+    match response {
+        Response::Ok { data } => WalletResultV2::Ok {
+            data: data.unwrap_or_else(|| json!({})),
+        },
+        Response::Error { code, message } => WalletResultV2::Error { code, message },
     }
 }
 

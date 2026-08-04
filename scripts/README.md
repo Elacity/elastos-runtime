@@ -1,215 +1,140 @@
 # Scripts
 
-The `scripts/` tree is organized around one rule:
+The `scripts/` root contains commands that developers or operators invoke
+directly. Subdirectories contain implementation helpers. A root script is not
+automatically a stable end-user command.
 
-- the `scripts/` root contains top-level commands a developer or operator may run directly
-- subdirectories contain lower-level support tooling
+## Main entry points
 
-Not every root script is a stable end-user entrypoint. Some root scripts are
-explicit proof, smoke, audit, or release helpers and should be documented as
-such.
+- `build.sh` builds Runtime and capsules.
+- `install.sh` runs the signed installer.
+- `setup-source-home.sh` builds and provisions a source Home.
+- `home-demo-local.sh` and `chat-demo-local.sh` start disposable local demos.
+- `agent.sh`, `chat.sh`, and `share-demo.sh` run focused demos.
+- `setup-crosvm.sh` installs VM prerequisites.
+- `publish-release.sh` is the low-level release publisher.
+- `vendor-walletconnect-adapter.sh` refreshes the pinned WalletConnect asset.
 
-## Root Entry Points
+Use the `justfile` for repository gates:
 
-Top-level directly-invoked entrypoints stay at the root:
+```bash
+just verify
+just verify-release
+```
 
-- `agent.sh` — run the agent capsule
-- `build.sh` — build runtime and capsules
-- `chat.sh` — launch the chat demo
-- `install.sh` — signed installer
-- `home-demo-local.sh` — prepare and launch the local source-based Home demo in a clean temp home
-- `chat-demo-local.sh` — prepare and launch the local Chat demo against a clean local runtime
-- `build-chat-room-ui.sh` — build the browser Chat Room UI bundle used by Chat smokes
-- `publish-release.sh` — low-level release publisher
-- `setup-crosvm.sh` — install runtime VM prerequisites
-- `setup-source-home.sh` — build/provision the source-home runtime and generated helper scripts
-- `share-demo.sh` — share project docs/content
-- `vendor-walletconnect-adapter.sh` — refresh the pinned local WalletConnect adapter asset
+`just verify` is the source gate. It runs documentation and product alignment,
+versioning, WIT and template checks, Home and Browser entropy checks, command
+audits, formatting, Clippy, and workspace tests. `just verify-release` adds the
+local Carrier setup and Home front-door proofs. Publishing trust and signer
+verification are separate release gates.
 
-If a script is something a human is expected to type from docs, it belongs here.
+## Public-install proof
 
-## Root Proof Helpers
+The three public-install wrappers cover separate installed paths:
 
-Proof, smoke, and audit helpers also currently live at the root. Common examples:
+- `public-install-identity-smoke.sh`: identity and profile
+- `public-install-home-frontdoor-smoke.sh`: setup and Home
+- `public-install-operator-smoke.sh`: installed operator and update commands
 
-- `command-smoke.sh`
-- `auth-wallet-focus-smoke.sh`
-- `wallet-product-safety-smoke.sh`
-- `installed-command-audit.sh`
-- `installed-provider-verify.sh`
-- `local-carrier-chat-smoke.sh`
-- `local-carrier-setup-smoke.sh`
-- `home-frontdoor-smoke.sh`
-- `system-camofox-smoke.sh`
-- `chat-room-gateway-camofox-smoke.sh`
-- `chat-room-session-reuse-camofox-smoke.sh`
-- `chat-room-guest-identity-camofox-smoke.sh`
-- `chat-room-runtime-activity-smoke.sh`
-- `browser-session-capacity-smoke.sh`
-- `browser-abi-provider-contract-smoke.sh`
-- `public-install-identity-smoke.sh`
-- `public-install-operator-smoke.sh`
-- `public-install-home-frontdoor-smoke.sh`
-- `public-root-site-smoke.sh`
-- `public-user-journey-smoke.sh`
-- `home-live-smoke.sh`
-- `installed-home-chat-reuse-smoke.sh`
-- `installed-native-chat-smoke.sh`
-- `protected-content-provider-contract-smoke.sh`
-- `publisher-bootstrap-integrity-smoke.sh`
-- `recovery-kit-live-smoke.sh`
-- `people-conversations-local-smoke.sh`
-- `browser-vm-target-refresh.sh`
-- `linux-source-home-restart.sh`
-- `source-home-capsule-inventory-smoke.py`
-- `capsule-live-parity-smoke.py`
+Set `ELASTOS_PUBLISHER_GATEWAY=<url>` to test a published candidate.
 
-These are review and release helpers, not automatically part of the stable
-end-user command contract. The `public-install-*.sh` helpers can target a
-published candidate gateway by setting `ELASTOS_PUBLISHER_GATEWAY=<url>`. They
-use the stamped trusted-source transports by default. During 0.5.0 baseline
-review, `ELASTOS_BIN_OVERRIDE=<path-to-branch-elastos>` swaps in the current
-branch binary only when the selected gateway serves a 0.5.0-compatible manifest
-with the current `home` setup profile and checksummed artifacts. The helpers pin
-the installer-selected components manifest so source checkout metadata cannot
-leak into the installed-path smoke. Use `scripts/local-carrier-setup-smoke.sh`
-for source/local Carrier setup proof before a candidate gateway exists. Set
-`ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` when you intentionally want to
-turn the public install proof into a stricter publisher relay-health check.
-`recovery-kit-live-smoke.sh` requires `ELASTOS_HOME_TOKEN` from a signed
-browser session and is non-mutating unless create/import flags are set.
-`people-conversations-local-smoke.sh` is a local review wrapper for the People
-and Chat conversation slice. It composes the Home entropy guard with the narrow
-Rust/WASM tests for join-object creation, launch-query preservation, profile
-cards, People contact projection, and Chat invite-query decoding.
-`browser-vm-target-refresh.sh` is the renewable drift-repair path for
-already-provisioned Browser VM targets. It refreshes installed helper scripts
-and guest script artifacts from the reviewed source checkout without pretending
-those helpers are standalone `components.json` release components.
-`linux-source-home-restart.sh` is the Linux source-home gateway restart/proof
-path for targets such as Jetson. Run it after full source-home setup replaces
-the gateway binary so the live front door comes back with a hash-bound Home and
-Services receipt.
-`source-home-capsule-inventory-smoke.py` proves source-home finalization removes
-only managed inactive capsules, preserves user state and unmanaged capsules,
-and stamps installed capsule metadata after all other manifest writers finish.
-`capsule-live-parity-smoke.py` is the final localhost artifact check: every
-active catalog entry must have one matching installed source tree, and every
-launchable browser projection must match the bytes served by the gateway.
-`auth-wallet-focus-smoke.sh` runs the current passkey, Recovery Kit,
-capsule-bridge principal storage, principal-launch, System managed-wallet route,
-wallet approval, managed-wallet, BTC, typed chain proof/prepare/broadcast,
-chain sync-health, node lifecycle, entropy, and alignment checks as one
-repeatable branch gate.
-`wallet-product-safety-smoke.sh` is the product-level Wallet release-safety
-gate: MetaMask multi-account link/remove, passkey-gated delete and recovery-key
-routes, WalletConnect pinned-config gating, hidden Ledger UI, and no hosted
-Browser UniSat injection path.
-`check-first-party-wasi-gate.mjs` reports every first-party capsule with WASI
-Preview 1 evidence, allows only explicit non-product fixture classifications,
-and fails on any first-party product WASI usage.
-`check-elastos-bus-wit.mjs` verifies the minimal `elastos:bus@v1` WIT world
-and fails if it grows raw filesystem, raw network, environment authority,
-gateway URL, provider-selection, or WASI import surfaces.
+During candidate review, the identity and Home wrappers accept
+`ELASTOS_BIN_OVERRIDE=<path-to-branch-elastos>` only when the gateway serves a
+compatible manifest with the current `home` setup profile and checksummed
+artifacts. They pin the installer-selected components manifest so source
+checkout metadata cannot leak into installed-path proof. The operator wrapper
+always uses installed binaries and does not accept the override.
 
-Some root `.mjs` files are script-local harnesses for same-named smoke wrappers
-or read-only report generators. Keep those at the root only when they are
-directly invoked by public smoke commands or by documented release gates;
-private target-maintenance commands should stay outside this repo.
+Before a candidate gateway exists, use
+`scripts/local-carrier-setup-smoke.sh`. Set
+`ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1` only for a stricter publisher
+relay-health check.
 
-Browser proof helpers are intentionally explicit because Browser is still a
-proof surface, not a completed product browser. The commonly referenced gates
-include:
+The full release order and manual target pass are in the
+[0.6.0 acceptance runbook](../docs/RUNTIME_REPO_USER_STORY_CHECKLIST.md).
 
-- `browser-wallet-bridge-smoke.sh`
-- `browser-glide-wallet-smoke.sh`
-- `browser-per-launch-selkies-supervisor-smoke.sh`
-- `browser-session-capacity-smoke.sh`
-- `browser-vm-engine-supervisor-autostart-smoke.sh`
-- `browser-home-session-smoke.sh`
-- `browser-ela-city-protected-content-open-smoke.sh`
-- `HOME_URL=http://localhost:8090/apps/home/ HOME_VIRTUAL_AUTH_BROWSER=1 HOME_VIRTUAL_AUTH_BROWSER_OPEN=1 node scripts/home-passkey-virtual-auth-smoke.mjs`
-- `browser-objective-audit.mjs`
-- `browser-provider-decision-report.mjs`
-- `browser-provider-runbook.mjs`
+## Focused proof
 
-The Browser operator service wrappers live under `scripts/system/`:
+Use the runbook that owns the surface:
 
-- `elastos-browser-selkies.env.example`
-- `elastos-browser-selkies.service`
-- `elastos-browser-selkies.sh`
+- [Browser capsule](../docs/BROWSER_CAPSULE.md)
+- [Browser VM target](../docs/BROWSER_VM_TARGET.md)
+- [Inspector testing](../docs/INSPECTOR_TESTING.md)
+- [People and conversations](../docs/PEOPLE_CONVERSATIONS.md)
+- [Protected content](../docs/PROTECTED_CONTENT.md)
+- [Capsule authoring](../docs/CAPSULE_AUTHORING.md)
 
-Those files are durable diagnostic/operator packaging for the hosted Browser
-proof baseline. They should not be installed as the live product Browser path,
-because that creates an always-on shared hosted session. Live Browser config
-should use `scripts/browser-per-launch-selkies-supervisor.mjs` so each Browser
-launch gets a separate target/control socket and cleans up through `/shutdown`.
-Use `scripts/browser-per-launch-selkies-supervisor-smoke.sh` to prove two
-independent hosted Browser launches can run concurrently with separate
-page-scoped control sockets under a service-style HOME.
-Use `HOME_VIRTUAL_AUTH_BROWSER_OPEN=1` on
-`home-passkey-virtual-auth-smoke.mjs` to prove the real Home-token path can
-open and close a Browser page through the live gateway.
-Use `HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT=2` and
-`HOME_VIRTUAL_AUTH_BROWSER_OPEN_HOLD_MS=30000` with the same smoke to prove
-multiple Runtime Browser pages can stay alive, receive heartbeats, appear in
-the Browser session-capacity receipt, and close without leaving capacity behind.
-Use `HOME_VIRTUAL_AUTH_BROWSER_OPEN=0 HOME_VIRTUAL_AUTH_BROWSER_SUMMARY=1` on
-`home-passkey-virtual-auth-smoke.mjs` when you only need to verify that a
-running gateway exposes `elastos.browser.session-capacity/v1` without opening a
-heavyweight Browser engine session.
-Use `scripts/browser-session-capacity-smoke.sh` to prove the active Browser
-capacity path. By default it opens one Browser page, holds heartbeats for
-30 seconds, verifies an additional open fails closed with structured
-`browser_capacity_unavailable`, then closes the page and checks the Browser
-session-capacity receipt returns to baseline. Override
-`HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT` only for a provider that truthfully
-supports more active pages than the current Mac VM single-page substrate.
-`scripts/browser-home-session-smoke.sh` is the named release gate wrapper for
-that proof. Override `HOME_URL`, `HOME_VIRTUAL_AUTH_BROWSER_OPEN_CONCURRENT`,
-and `HOME_VIRTUAL_AUTH_BROWSER_OPEN_HOLD_MS` when testing another runtime.
-The smoke intentionally fails if the running gateway does not expose
-`elastos.browser.session-capacity/v1`; that means the local/public service is
-older than the current Browser Session Manager code.
-Use `scripts/browser-ela-city-protected-content-open-smoke.sh` to prove the
-live Runtime Browser can open the known `ela.city` protected-content page
-through a disposable Home passkey and close the page cleanly. This is a Browser
-reachability and session-cleanup proof only; it does not prove purchase,
-license, key release, or dDRM playback success.
+Common branch gates include:
 
-Internal target-maintenance wrappers that depend on private SSH aliases,
-reverse tunnels, local usernames, or host-specific data roots should not live in
-the public repo. Keep those commands in local operator notes and leave reusable
-repo scripts parameterized through explicit environment variables or CLI flags.
+- `auth-wallet-focus-smoke.sh` for passkey, Recovery Kit, Wallet, chain, and
+  principal-bound launch checks
+- `wallet-product-safety-smoke.sh` for product Wallet release safety
+- `wallet-connector-transaction-smoke.mjs` for fake-DOM, fake-provider
+  connector handoff source proof, not hosted Browser acceptance
+- `protected-content-provider-contract-smoke.sh` for rights, key, decrypt, and
+  DRM provider boundaries
+- `people-conversations-local-smoke.sh` for profile, discovery, contacts, and
+  Chat handoff
+- `capsule-inspector-act-check.sh` for Inspector scope and Inbox approval
+- `installed-provider-verify.sh` for an installed provider manifest and binary
+- `source-home-capsule-inventory-smoke.py` for source-home capsule finalization
 
-## Support Subdirectories
+`public-copy-entropy-check.mjs` checks selected public manifests, static HTML,
+accessibility labels, and Home CLI command copy for Home, People, Spaces,
+Services, and System. `check-wci-alignment.sh` owns canonical architecture terms
+and retired product terms. Both run directly; this checkout has no separate
+`terminology-lint` recipe.
 
-- `build/` — lower-level build helpers
-  - `build-rootfs.sh`
-  - `build-vm-smoke-rootfs.sh`
-  - `build-llama-server.sh`
-  - `clean.sh`
-- `fetch/` — asset/tool fetchers
-  - `fetch-cloudflared.sh`
-  - `fetch-model.sh`
-- `lib/` — shared shell helpers sourced by top-level proof and release scripts
-  - `runtime-cleanup.sh`
-- `system/` — explicit operator service wrappers that may be installed by an
-  operator, but are not public CLI commands
-  - `elastos-browser-selkies.env.example`
-  - `elastos-browser-selkies.service`
-  - `elastos-browser-selkies.sh`
-- `dev/` — development/operator-only helpers that are not part of the public
-  command contract
-  - `sign-elastos-vz/`
+## Browser capacity proof
 
-Any deeper deployment or helper assets should stay out of the public root-script story unless they are part of the shipped public contract.
+The [Browser capsule](../docs/BROWSER_CAPSULE.md) and
+[Browser VM target](../docs/BROWSER_VM_TARGET.md) own the contract. These two
+proof modes are easy to confuse:
 
-## Design Rules
+```bash
+# Read the current capacity receipt without opening an engine session
+HOME_VIRTUAL_AUTH_BROWSER_OPEN=0 HOME_VIRTUAL_AUTH_BROWSER_SUMMARY=1 \
+  node scripts/home-passkey-virtual-auth-smoke.mjs
 
-- One canonical path per operation.
-- Root scripts should be obvious, stable entrypoints.
-- Root repo launchers use the repo binary by default.
-- Installed runtime mode must be explicit (`--installed`) where supported.
-- Support scripts should be grouped by job, not historical accident.
-- If a script is internal, its path should make that obvious.
+# Open a page and test active capacity
+scripts/browser-session-capacity-smoke.sh
+```
+
+The active smoke opens a page, holds heartbeats for 30 seconds, confirms that an
+extra open fails with `browser_capacity_unavailable`, closes the page, and
+checks that capacity returns to its starting value. Override concurrency only
+when the provider truthfully supports more active pages.
+
+Hosted Browser service files under `scripts/system/` are proof and operator
+packaging. They are not the product Browser path. Private SSH aliases, users,
+ports, and data roots belong in local operator notes.
+
+## Live and recovery helpers
+
+`linux-source-home-restart.sh` restarts a Linux source-home gateway after setup
+has installed the new binary. It checks the Home and Services artifacts before
+reporting success.
+
+`recovery-kit-live-smoke.sh` requires a signed Home or System session through
+`ELASTOS_HOME_TOKEN`, a Cookie header, or a cookie jar. Export also requires a
+fresh request-bound passkey token in
+`ELASTOS_FRESH_PASSKEY_HOME_TOKEN`. Import into the same root is opt-in through
+`ELASTOS_RECOVERY_KIT_IMPORT=1`.
+
+## Subdirectories
+
+- `build/`: build and staging helpers
+- `fetch/`: asset and tool fetchers
+- `fixtures/`: test-only proof fixtures
+- `lib/`: shared shell and JavaScript helpers
+- `system/`: installable operator-service files
+- `dev/`: local development helpers outside the public command contract
+
+## Placement rules
+
+- Keep one canonical path per operation.
+- Put directly invoked, reusable commands at the root.
+- Put shared implementation in a named subdirectory.
+- Keep installed mode explicit where a command supports both source and
+  installed paths.
+- Keep host-specific secrets and private maintenance commands outside the repo.

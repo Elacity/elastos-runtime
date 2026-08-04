@@ -17,29 +17,98 @@ const CONTROL_LAUNCHER_ENV = "ELASTOS_BROWSER_VM_CONTROL_LAUNCHER";
 const ROOT_ENV = "ELASTOS_BROWSER_VM_ROOT";
 const DATA_DIR_ENV = "ELASTOS_BROWSER_VM_DATA_DIR";
 const PLATFORM_ENV = "ELASTOS_BROWSER_VM_PLATFORM";
+const MAX_ENGINE_LAUNCH_REQUEST_BYTES = 64 * 1024;
+const STARTUP_LOCK_WAIT_MS = 7000;
+const INVOCATION_ONLY_VM_ENV = new Set([
+  "ELASTOS_BROWSER_VM_OPEN_REQUEST",
+  "ELASTOS_BROWSER_VM_PREWARM_CONTROL_SERVICE",
+  "ELASTOS_BROWSER_VM_SHUTDOWN_REQUEST",
+]);
 
-function fail(message) {
-  console.error(message);
+class BrowserLaunchError extends Error {
+  constructor(code, message, launchSettlementResult = undefined) {
+    super(message);
+    this.code = code;
+    this.launch_settlement_result = launchSettlementResult;
+  }
+}
+
+function launchError(code, message, launchSettlementResult = undefined) {
+  return new BrowserLaunchError(code, message, launchSettlementResult);
+}
+
+function fail(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof BrowserLaunchError) {
+    console.error(JSON.stringify({
+      schema: "elastos.browser.engine.launch-error/v1",
+      code: error.code,
+      message,
+      ...(error.launch_settlement_result === undefined
+        ? {}
+        : { launch_settlement_result: error.launch_settlement_result }),
+    }));
+  } else {
+    console.error(message);
+  }
   process.exit(1);
+}
+
+function parseJson(raw, label) {
+  if (Buffer.byteLength(raw) > MAX_ENGINE_LAUNCH_REQUEST_BYTES) {
+    fail(`${label} exceeds its bounded size`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    fail(`${label} is invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function parseJsonEnv(name) {
   const raw = process.env[name];
   if (!raw) fail(`${name} is required`);
-  try {
-    return JSON.parse(raw);
-  } catch (error) {
-    fail(`${name} is invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  return parseJson(raw, name);
+}
+
+async function readPrivateTransportRequest() {
+  const chunks = [];
+  let length = 0;
+  for await (const chunk of process.stdin) {
+    length += chunk.length;
+    if (length > MAX_ENGINE_LAUNCH_REQUEST_BYTES) {
+      fail("Browser VZ private launch request exceeds its bounded size");
+    }
+    chunks.push(chunk);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) fail("Browser VZ private launch request is required");
+  return parseJson(raw, "Browser VZ private launch request");
+}
+
+function validateRequestTransport(request, fromPrivateStdin) {
+  const transportFields = [
+    "page_id",
+    "vm_id",
+    "transport_authority",
+    "transport_secret",
+  ];
+  const present = transportFields.filter((field) =>
+    Object.prototype.hasOwnProperty.call(request, field)
+  );
+  if (present.length !== 0 && present.length !== transportFields.length) {
+    fail("Browser VZ transport launch request is incomplete");
+  }
+  if (fromPrivateStdin && present.length !== transportFields.length) {
+    fail("Browser VM private stdin is reserved for VZ transport launches");
+  }
+  if (!fromPrivateStdin && present.length !== 0) {
+    fail("Browser VZ transport launch request must use private stdin");
   }
 }
 
 function safeId(value) {
   return typeof value === "string" && /^[A-Za-z0-9:_-]+$/.test(value);
-}
-
-function sessionSuffix(value) {
-  const digest = crypto.createHash("sha256").update(String(value || "session")).digest("hex").slice(0, 16);
-  return `bvm-${digest}-${crypto.randomBytes(4).toString("hex")}`;
 }
 
 function validateAbsolutePath(value, label) {
@@ -52,8 +121,12 @@ function validateLaunchRequest(request) {
   if (request.schema !== "elastos.browser.engine.launch-request/v1") {
     fail("unsupported browser engine launch request schema");
   }
-  if (!safeId(request.adapter) || !safeId(request.stream_id)) {
-    fail("launch request adapter and stream_id must be safe identifiers");
+  if (
+    !safeId(request.adapter) ||
+    !safeId(request.stream_id) ||
+    !safeId(request.lifecycle_generation)
+  ) {
+    fail("launch request adapter, stream_id, and lifecycle_generation must be safe identifiers");
   }
   if (request.engine !== "chromium_microvm") {
     fail(`Browser VM supervisor expected chromium_microvm, got ${request.engine || "none"}`);
@@ -220,7 +293,7 @@ function vmControlEnvFingerprintFields({ dataDir, platform, root }) {
     ) {
       continue;
     }
-    if (key === CONTROL_SERVICE_CONFIG_ENV) continue;
+    if (key === CONTROL_SERVICE_CONFIG_ENV || INVOCATION_ONLY_VM_ENV.has(key)) continue;
     env[key] = value;
   }
   return env;
@@ -381,7 +454,15 @@ function postJsonOverUnix(socketPath, requestPath, body, timeoutMs) {
             return;
           }
           if ((response.statusCode || 500) < 200 || (response.statusCode || 500) >= 300) {
-            reject(new Error(parsed.error || parsed.message || `Browser VM control returned ${response.statusCode}`));
+            reject(
+              parsed.code || parsed.launch_settlement_result
+                ? launchError(
+                    parsed.code || "engine_process_unavailable",
+                    parsed.message || parsed.error || `Browser VM control returned ${response.statusCode}`,
+                    parsed.launch_settlement_result,
+                  )
+                : new Error(parsed.error || parsed.message || `Browser VM control returned ${response.statusCode}`),
+            );
             return;
           }
           resolve(parsed);
@@ -513,7 +594,6 @@ function startLocalVmControlService({ controlSocket, dataDir, platform, root, ex
     launcher_program: launcher,
     launcher_args: [],
     persistent_launcher: true,
-    replace_existing_socket: true,
     max_active_pages: vmControlMaxActivePages(),
     idle_vm_keepalive_ms: Number(process.env.ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS || "0"),
     reuse_idle_vms: process.env.ELASTOS_BROWSER_VM_REUSE_IDLE_VMS === "1",
@@ -544,14 +624,43 @@ function startLocalVmControlService({ controlSocket, dataDir, platform, root, ex
   return true;
 }
 
-async function vmControlStatusOrNull(controlSocket, timeoutMs = 1000) {
+function controlSocketPresence(controlSocket) {
+  try {
+    const stat = fs.lstatSync(controlSocket);
+    return stat.isSocket()
+      ? { kind: "present" }
+      : { kind: "unverified", error: "control path exists but is not a socket" };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { kind: "absent" };
+    return {
+      kind: "unverified",
+      error: `control socket presence could not be verified: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  }
+}
+
+async function probeVmControlSocket(controlSocket, timeoutMs = 1000) {
+  const presence = controlSocketPresence(controlSocket);
+  if (presence.kind !== "present") return presence;
   try {
     const status = await getJsonOverUnix(controlSocket, "/status", timeoutMs);
-    return status?.schema === "elastos.browser.vm-control-service.status/v1" && status.ok === true
-      ? status
-      : null;
-  } catch {
-    return null;
+    if (
+      status?.schema !== "elastos.browser.vm-control-service.status/v1" ||
+      status.ok !== true
+    ) {
+      return {
+        kind: "unverified",
+        error: "Browser VM control status returned an invalid schema",
+      };
+    }
+    return { kind: "verified", status };
+  } catch (error) {
+    return {
+      kind: "unverified",
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -559,40 +668,157 @@ function vmControlStatusMatches(status, expectedFingerprint) {
   return status?.config_fingerprint === expectedFingerprint;
 }
 
+function vmControlHasEffects(status) {
+  return [
+    "active_pages",
+    "active_vms",
+    "warm_vms",
+    "pending_launches",
+  ].some((field) => Number(status?.[field] || 0) > 0);
+}
+
 async function stopStaleVmControlService(status, controlSocket) {
-  const pid = Number(status?.pid || 0);
-  if (Number.isInteger(pid) && pid > 1 && pid !== process.pid) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {}
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      const current = await vmControlStatusOrNull(controlSocket, 100);
-      if (!current || Number(current.pid || 0) !== pid) {
-        return;
-      }
-      await sleep(100);
-    }
+  if (vmControlHasEffects(status)) {
+    throw launchError(
+      "resources_in_use",
+      "Browser VM control service owns active, warm, or pending VM effects",
+    );
   }
+  let shutdown;
   try {
-    fs.unlinkSync(controlSocket);
+    shutdown = await postJsonOverUnix(
+      controlSocket,
+      "/service/shutdown",
+      {
+        schema: "elastos.browser.vm-control-service.shutdown/v1",
+        config_fingerprint: status.config_fingerprint || null,
+        started_at: status.started_at || null,
+      },
+      3000,
+    );
   } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+    if (error instanceof BrowserLaunchError) throw error;
+    throw launchError(
+      "control_service_substitution",
+      `Browser VM control service could not prove an idle owned shutdown: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
+  if (
+    shutdown?.schema !== "elastos.browser.vm-control-service.shutdown-accepted/v1" ||
+    shutdown.accepted !== true
+  ) {
+    throw launchError(
+      "control_service_substitution",
+      "Browser VM control service returned an invalid shutdown proof",
+    );
+  }
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (controlSocketPresence(controlSocket).kind === "absent") return;
+    await sleep(100);
+  }
+  throw launchError(
+    "cleanup_pending",
+    "Browser VM control service did not finish its owned shutdown",
+  );
 }
 
 async function waitForMatchingVmControlStatus(controlSocket, expectedFingerprint, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let last = null;
+  let last = { kind: "absent" };
   while (Date.now() < deadline) {
-    last = await vmControlStatusOrNull(controlSocket, 1000);
-    if (vmControlStatusMatches(last, expectedFingerprint)) return last;
+    last = await probeVmControlSocket(controlSocket, 1000);
+    if (
+      last.kind === "verified" &&
+      vmControlStatusMatches(last.status, expectedFingerprint)
+    ) {
+      return last.status;
+    }
     await sleep(100);
   }
   throw new Error(
-    last
+    last.kind === "verified"
       ? "Browser VM control status did not match requested config fingerprint"
-      : "Browser VM control status did not become ready",
+      : last.kind === "unverified"
+        ? `Browser VM control status remained unverified: ${last.error}`
+        : "Browser VM control status did not become ready",
   );
+}
+
+function startupLockRecord(lockPath) {
+  let stat;
+  try {
+    stat = fs.lstatSync(lockPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { kind: "absent" };
+    throw error;
+  }
+  if (!stat.isFile()) {
+    throw launchError(
+      "control_service_startup_busy",
+      "Browser VM control startup lock is not a regular file",
+    );
+  }
+  try {
+    const record = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    if (
+      record?.schema === "elastos.browser.vm-control-startup-lock/v1" &&
+      Number.isInteger(record.pid) &&
+      record.pid > 1 &&
+      typeof record.token === "string" &&
+      /^[0-9a-f]{32}$/.test(record.token)
+    ) {
+      return { kind: "owned", record, stat };
+    }
+  } catch {}
+  return { kind: "incomplete", stat };
+}
+
+function tryAcquireStartupLock(lockPath) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
+  const token = crypto.randomBytes(16).toString("hex");
+  let fd;
+  try {
+    fd = fs.openSync(lockPath, "wx", 0o600);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    startupLockRecord(lockPath);
+    return null;
+  }
+  try {
+    fs.writeFileSync(fd, JSON.stringify({
+      schema: "elastos.browser.vm-control-startup-lock/v1",
+      pid: process.pid,
+      token,
+      created_at: new Date().toISOString(),
+    }));
+    fs.fsyncSync(fd);
+    return { fd, stat: fs.fstatSync(fd) };
+  } catch (error) {
+    fs.closeSync(fd);
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {}
+    throw error;
+  }
+}
+
+function releaseStartupLock(lockPath, lock) {
+  try {
+    const current = fs.lstatSync(lockPath);
+    if (
+      current.isFile() &&
+      current.dev === lock.stat.dev &&
+      current.ino === lock.stat.ino
+    ) {
+      fs.unlinkSync(lockPath);
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  } finally {
+    fs.closeSync(lock.fd);
+  }
 }
 
 async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root }) {
@@ -604,7 +830,6 @@ async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root
     launcher_program: launcher,
     launcher_args: [],
     persistent_launcher: true,
-    replace_existing_socket: true,
     max_active_pages: vmControlMaxActivePages(),
     idle_vm_keepalive_ms: Number(process.env.ELASTOS_BROWSER_VM_IDLE_KEEPALIVE_MS || "0"),
     reuse_idle_vms: process.env.ELASTOS_BROWSER_VM_REUSE_IDLE_VMS === "1",
@@ -622,49 +847,75 @@ async function ensureVmControlAvailable({ controlSocket, dataDir, platform, root
     root,
   });
 
-  const existing = await vmControlStatusOrNull(controlSocket, 1200);
-  if (vmControlStatusMatches(existing, expectedFingerprint)) {
+  const existing = await probeVmControlSocket(controlSocket, 1200);
+  if (
+    existing.kind === "verified" &&
+    vmControlStatusMatches(existing.status, expectedFingerprint)
+  ) {
     return;
   }
-  if (existing && !localVmControlServiceAvailable({ dataDir, platform })) {
+  if (
+    existing.kind === "verified" &&
+    !localVmControlServiceAvailable({ dataDir, platform })
+  ) {
     return;
+  }
+  if (existing.kind === "unverified") {
+    throw launchError(
+      "control_service_unverified",
+      `Browser VM control socket exists but its service identity is unverified: ${existing.error}`,
+    );
   }
 
-  const lockDir = `${controlSocket}.start.lock`;
-  let lockOwned = false;
-  try {
-    fs.mkdirSync(lockDir, { recursive: false, mode: 0o700 });
-    lockOwned = true;
-    const lockedExisting = await vmControlStatusOrNull(controlSocket, 1000);
-    if (vmControlStatusMatches(lockedExisting, expectedFingerprint)) {
+  const lockPath = `${controlSocket}.start.lock`;
+  const deadline = Date.now() + STARTUP_LOCK_WAIT_MS;
+  while (Date.now() < deadline) {
+    const startupLock = tryAcquireStartupLock(lockPath);
+    if (!startupLock) {
+      await sleep(100);
+      continue;
+    }
+    try {
+      const lockedExisting = await probeVmControlSocket(controlSocket, 1000);
+      if (
+        lockedExisting.kind === "verified" &&
+        vmControlStatusMatches(lockedExisting.status, expectedFingerprint)
+      ) {
+        return;
+      }
+      if (lockedExisting.kind === "verified") {
+        await stopStaleVmControlService(lockedExisting.status, controlSocket);
+      } else if (lockedExisting.kind === "unverified") {
+        throw launchError(
+          "control_service_unverified",
+          `Browser VM control socket exists but its service identity is unverified: ${lockedExisting.error}`,
+        );
+      }
+      if (controlSocketPresence(controlSocket).kind !== "absent") {
+        throw launchError(
+          "control_service_unverified",
+          "Browser VM control socket did not disappear after its exact owned shutdown",
+        );
+      }
+      if (!startLocalVmControlService({
+        controlSocket,
+        dataDir,
+        platform,
+        root,
+        expectedFingerprint,
+      })) {
+        throw new Error("Browser VM control socket is unavailable");
+      }
+      await waitForMatchingVmControlStatus(controlSocket, expectedFingerprint, 7000);
       return;
-    }
-    if (lockedExisting) {
-      await stopStaleVmControlService(lockedExisting, controlSocket);
-    }
-    if (!startLocalVmControlService({
-      controlSocket,
-      dataDir,
-      platform,
-      root,
-      expectedFingerprint,
-    })) {
-      throw new Error("Browser VM control socket is unavailable");
-    }
-  } catch (error) {
-    if (error?.code !== "EEXIST") {
-      throw error;
-    }
-  } finally {
-    if (lockOwned) {
-      fs.rmSync(lockDir, { recursive: true, force: true });
+    } finally {
+      releaseStartupLock(lockPath, startupLock);
     }
   }
-  try {
-    await waitForMatchingVmControlStatus(controlSocket, expectedFingerprint, 7000);
-  } catch (error) {
-    throw new Error(`Browser VM control service did not become ready: ${error.message}`);
-  }
+  throw launchError(
+    "control_service_startup_busy",
+    "Browser VM control service startup remained owned by another live process",
+  );
 }
 
 function validateSupervisorResult(result, request) {
@@ -686,9 +937,19 @@ function validateSupervisorResult(result, request) {
   if (result.display_session?.media_transport !== "runtime_relay") {
     throw new Error("Browser VM display sessions must report media_transport=runtime_relay");
   }
+  if (
+    result.isolation?.schema !== "elastos.browser.engine.isolation/v1" ||
+    result.isolation?.kind !== "per_launch_vm_target"
+  ) {
+    throw new Error("Browser VM control returned an invalid isolation binding");
+  }
+  validateAbsolutePath(
+    result.isolation.session_dir,
+    "Browser VM control isolation session_dir",
+  );
 }
 
-async function delegateToVmControl({ controlSocket, request, timeoutMs, platform, sessionDir }) {
+async function delegateToVmControl({ controlSocket, request, timeoutMs, platform }) {
   const result = await postJsonOverUnix(
     controlSocket,
     "/pages",
@@ -711,13 +972,6 @@ async function delegateToVmControl({ controlSocket, request, timeoutMs, platform
   validateSupervisorResult(result, request);
   if (!result.control_socket_path) result.control_socket_path = controlSocket;
   if (!result.isolated_session) result.isolated_session = true;
-  if (!result.isolation) {
-    result.isolation = {
-      schema: "elastos.browser.engine.isolation/v1",
-      kind: "per_launch_vm_target",
-      session_dir: sessionDir,
-    };
-  }
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
@@ -761,11 +1015,12 @@ async function main() {
     return;
   }
 
-  const request = parseJsonEnv(REQUEST_ENV);
+  const fromPrivateStdin = !hasLaunchRequest;
+  const request = fromPrivateStdin
+    ? await readPrivateTransportRequest()
+    : parseJsonEnv(REQUEST_ENV);
+  validateRequestTransport(request, fromPrivateStdin);
   validateLaunchRequest(request);
-
-  const sessionDir = path.join(root, sessionSuffix(request.stream_id));
-  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
 
   const controlSocket = process.env[CONTROL_SOCKET_ENV] || "";
   if (controlSocket) {
@@ -775,7 +1030,6 @@ async function main() {
       request,
       timeoutMs: Number(process.env.ELASTOS_BROWSER_VM_ENGINE_TIMEOUT_MS || "165000"),
       platform,
-      sessionDir,
     });
     return;
   }
@@ -784,6 +1038,4 @@ async function main() {
   fail(`Browser VM engine target is not launch-ready. ${preflight.reason} Set ${CONTROL_SOCKET_ENV} to a Browser VM control service; on no-KVM gateway hosts this should point at a remote/operator VM provider instead of requiring local KVM. Preflight: ${JSON.stringify(preflight)}`);
 }
 
-main().catch((error) => {
-  fail(error instanceof Error ? error.message : String(error));
-});
+main().catch(fail);

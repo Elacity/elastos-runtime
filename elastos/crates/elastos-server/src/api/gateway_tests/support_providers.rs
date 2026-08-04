@@ -1,5 +1,98 @@
 struct MockChainProvider;
 
+const MOCK_MANAGED_EVM_ADDRESS: &str = "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a";
+
+fn mock_trim_integer_bytes(bytes: &[u8]) -> &[u8] {
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    &bytes[first..]
+}
+
+fn mock_managed_evm_signing_key(index: usize) -> Result<EvmSigningKey, ProviderError> {
+    let byte = u8::try_from(index)
+        .ok()
+        .and_then(|value| value.checked_add(0x10))
+        .ok_or_else(|| ProviderError::Provider("mock managed EVM key index overflow".to_string()))?;
+    EvmSigningKey::from_bytes((&[byte; 32]).into())
+        .map_err(|err| ProviderError::Provider(err.to_string()))
+}
+
+fn mock_managed_evm_address(index: usize) -> Result<String, ProviderError> {
+    let key = mock_managed_evm_signing_key(index)?;
+    let point = key.verifying_key().to_encoded_point(false);
+    let digest = Keccak256::digest(&point.as_bytes()[1..]);
+    Ok(format!("0x{}", hex::encode(&digest[12..])))
+}
+
+fn mock_managed_evm_key_for_address(address: &str) -> Result<EvmSigningKey, ProviderError> {
+    for index in 1..=128 {
+        if mock_managed_evm_address(index)?.eq_ignore_ascii_case(address) {
+            return mock_managed_evm_signing_key(index);
+        }
+    }
+    Err(ProviderError::Provider(format!(
+        "mock has no managed EVM signing key for {address}"
+    )))
+}
+
+fn mock_sign_eip155_transaction(payload: &Value) -> Result<String, ProviderError> {
+    let quantity = |field: &str| {
+        exact_payload_quantity(payload, field)
+            .map_err(|err| ProviderError::Provider(err.to_string()))
+    };
+    let chain_id = payload
+        .get("chain_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProviderError::Provider("mock transaction missing chain_id".to_string()))?;
+    let nonce = quantity("nonce")?;
+    let gas_price = quantity("gas_price")?;
+    let gas_limit = quantity("gas_limit")?;
+    let to = exact_payload_bytes(payload, "to")
+        .map_err(|err| ProviderError::Provider(err.to_string()))?;
+    let value = quantity("value")?;
+    let data = exact_payload_bytes(payload, "data")
+        .map_err(|err| ProviderError::Provider(err.to_string()))?;
+    let chain_id_raw = mock_trim_integer_bytes(&chain_id.to_be_bytes()).to_vec();
+    let signing_payload = rlp_encode_list(&[
+        rlp_encode_bytes(&nonce),
+        rlp_encode_bytes(&gas_price),
+        rlp_encode_bytes(&gas_limit),
+        rlp_encode_bytes(&to),
+        rlp_encode_bytes(&value),
+        rlp_encode_bytes(&data),
+        rlp_encode_bytes(&chain_id_raw),
+        rlp_encode_bytes(&[]),
+        rlp_encode_bytes(&[]),
+    ]);
+    let from = required_test_str(payload, "from")?;
+    let signing_key = mock_managed_evm_key_for_address(from)?;
+    let signing_hash = Keccak256::digest(signing_payload);
+    let (signature, recovery_id) = signing_key
+        .sign_prehash_recoverable(&signing_hash)
+        .map_err(|err| ProviderError::Provider(err.to_string()))?;
+    let signature = signature.to_bytes();
+    let v = chain_id
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(35))
+        .and_then(|value| value.checked_add(u64::from(recovery_id.to_byte())))
+        .ok_or_else(|| ProviderError::Provider("mock transaction chain id overflow".to_string()))?;
+    let v_bytes = v.to_be_bytes();
+    let signed = rlp_encode_list(&[
+        rlp_encode_bytes(&nonce),
+        rlp_encode_bytes(&gas_price),
+        rlp_encode_bytes(&gas_limit),
+        rlp_encode_bytes(&to),
+        rlp_encode_bytes(&value),
+        rlp_encode_bytes(&data),
+        rlp_encode_bytes(mock_trim_integer_bytes(&v_bytes)),
+        rlp_encode_bytes(mock_trim_integer_bytes(&signature[..32])),
+        rlp_encode_bytes(mock_trim_integer_bytes(&signature[32..])),
+    ]);
+    Ok(format!("0x{}", hex::encode(signed)))
+}
+
 fn mock_chain_broadcast_counts() -> &'static std::sync::Mutex<HashMap<String, usize>> {
     static COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, usize>>> =
         std::sync::OnceLock::new();
@@ -9,11 +102,58 @@ fn mock_chain_broadcast_counts() -> &'static std::sync::Mutex<HashMap<String, us
 fn reset_mock_chain_broadcast_count(signed_transaction: &str) {
     let mut counts = mock_chain_broadcast_counts().lock().unwrap();
     counts.remove(signed_transaction);
+    drop(counts);
+    mock_chain_uncertain_broadcasts()
+        .lock()
+        .unwrap()
+        .remove(signed_transaction);
+    if signed_transaction.starts_with("0x")
+        && signed_transaction.len() % 2 == 0
+        && signed_transaction[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        mock_chain_hidden_transaction_hashes()
+            .lock()
+            .unwrap()
+            .remove(&signed_evm_transaction_hash_for_test(signed_transaction));
+    }
 }
 
 fn mock_chain_broadcast_count(signed_transaction: &str) -> usize {
     let counts = mock_chain_broadcast_counts().lock().unwrap();
     counts.get(signed_transaction).copied().unwrap_or(0)
+}
+
+fn mock_chain_uncertain_broadcasts() -> &'static std::sync::Mutex<HashSet<String>> {
+    static TRANSACTIONS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    TRANSACTIONS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn mock_chain_hidden_transaction_hashes() -> &'static std::sync::Mutex<HashSet<String>> {
+    static HASHES: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    HASHES.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn mark_mock_chain_broadcast_uncertain(signed_transaction: &str, visible: bool) {
+    mock_chain_uncertain_broadcasts()
+        .lock()
+        .unwrap()
+        .insert(signed_transaction.to_string());
+    let transaction_hash = signed_evm_transaction_hash_for_test(signed_transaction);
+    let mut hidden = mock_chain_hidden_transaction_hashes().lock().unwrap();
+    if visible {
+        hidden.remove(&transaction_hash);
+    } else {
+        hidden.insert(transaction_hash);
+    }
+}
+
+fn signed_evm_transaction_hash_for_test(signed_transaction: &str) -> String {
+    let raw = hex::decode(signed_transaction.trim_start_matches("0x")).unwrap();
+    format!("0x{}", hex::encode(Keccak256::digest(raw)))
 }
 
 #[async_trait::async_trait]
@@ -250,6 +390,39 @@ impl Provider for MockChainProvider {
             })),
             Some("transaction") => {
                 let hash = required_test_str(request, "hash")?;
+                if hash
+                    == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    || mock_chain_hidden_transaction_hashes()
+                        .lock()
+                        .unwrap()
+                        .contains(hash)
+                {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "network": required_test_str(request, "network")?,
+                            "hash": hash,
+                            "transaction": null
+                        }
+                    }));
+                }
+                let observed_hash = if hash
+                    == "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                {
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                } else {
+                    hash
+                };
+                let observed_from = match hash {
+                    "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                    | "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" => {
+                        "0x3333333333333333333333333333333333333333"
+                    }
+                    "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" => {
+                        "0x4444444444444444444444444444444444444444"
+                    }
+                    _ => "0x1111111111111111111111111111111111111111",
+                };
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -259,8 +432,8 @@ impl Provider for MockChainProvider {
                             .unwrap_or("esc-mainnet"),
                         "hash": hash,
                         "transaction": {
-                            "hash": hash,
-                            "from": "0x1111111111111111111111111111111111111111",
+                            "hash": observed_hash,
+                            "from": observed_from,
                             "to": "0x2222222222222222222222222222222222222222",
                             "value": "0x1",
                             "blockNumber": "0x2a"
@@ -270,6 +443,22 @@ impl Provider for MockChainProvider {
             }
             Some("receipt") => {
                 let hash = required_test_str(request, "hash")?;
+                if hash
+                    == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    || mock_chain_hidden_transaction_hashes()
+                        .lock()
+                        .unwrap()
+                        .contains(hash)
+                {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "network": required_test_str(request, "network")?,
+                            "hash": hash,
+                            "receipt": null
+                        }
+                    }));
+                }
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -321,12 +510,23 @@ impl Provider for MockChainProvider {
                 let signed_transaction = required_test_str(request, "signed_transaction")?;
                 let mut counts = mock_chain_broadcast_counts().lock().unwrap();
                 *counts.entry(signed_transaction.to_string()).or_insert(0) += 1;
+                drop(counts);
+                if mock_chain_uncertain_broadcasts()
+                    .lock()
+                    .unwrap()
+                    .contains(signed_transaction)
+                {
+                    return Err(ProviderError::Provider(
+                        "simulated uncertain Chain broadcast transport".to_string(),
+                    ));
+                }
+                let transaction_hash = signed_evm_transaction_hash_for_test(signed_transaction);
                 Ok(json!({
                     "status": "ok",
                     "data": {
                         "schema": "elastos.chain.broadcast_receipt/v1",
                         "network": required_test_str(request, "network")?,
-                        "transaction_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        "transaction_hash": transaction_hash
                     }
                 }))
             }
@@ -1805,20 +2005,99 @@ impl Provider for MockMalformedNetProvider {
 
 struct MockExitProvider;
 struct MockMalformedExitProvider;
+#[derive(Default)]
+struct MockBrowserOwnershipCounts {
+    launches: std::sync::atomic::AtomicUsize,
+    first_video_frames: std::sync::atomic::AtomicUsize,
+    active_pages: std::sync::atomic::AtomicUsize,
+    active_vms: std::sync::atomic::AtomicUsize,
+    active_streams: std::sync::atomic::AtomicUsize,
+    active_routes: std::sync::atomic::AtomicUsize,
+}
+
+impl MockBrowserOwnershipCounts {
+    fn observe_launch(&self) {
+        use std::sync::atomic::Ordering;
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        self.active_pages.fetch_add(1, Ordering::SeqCst);
+        self.active_vms.fetch_add(1, Ordering::SeqCst);
+        self.active_routes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn observe_terminal_close(&self) {
+        use std::sync::atomic::Ordering;
+        for count in [&self.active_pages, &self.active_vms, &self.active_routes] {
+            let _ = count.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_sub(1)
+            });
+        }
+    }
+
+    fn observe_stream_open(&self) {
+        self.active_streams
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn observe_stream_close(&self) {
+        let _ = self.active_streams.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |value| value.checked_sub(1),
+        );
+    }
+
+    fn snapshot(&self) -> (usize, usize, usize, usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.launches.load(Ordering::SeqCst),
+            self.active_pages.load(Ordering::SeqCst),
+            self.active_vms.load(Ordering::SeqCst),
+            self.active_streams.load(Ordering::SeqCst),
+            self.active_routes.load(Ordering::SeqCst),
+        )
+    }
+
+    fn first_video_frame_count(&self) -> usize {
+        self.first_video_frames
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 struct MockRemoteCarrierExitProvider {
     close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
     close_failures_remaining: Arc<TokioMutex<usize>>,
+    close_hangs_remaining: std::sync::atomic::AtomicUsize,
+    close_started: Option<Arc<tokio::sync::Notify>>,
+    ownership: Option<Arc<MockBrowserOwnershipCounts>>,
 }
 
 impl MockRemoteCarrierExitProvider {
-    fn with_close_failures(
-        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
-        failures: usize,
+    fn with_close_behavior(
+        close_plan: MockExitClosePlan,
+        ownership: Option<Arc<MockBrowserOwnershipCounts>>,
     ) -> Self {
         Self {
-            close_calls,
-            close_failures_remaining: Arc::new(TokioMutex::new(failures)),
+            close_calls: close_plan.close_calls,
+            close_failures_remaining: Arc::new(TokioMutex::new(close_plan.close_failures)),
+            close_hangs_remaining: std::sync::atomic::AtomicUsize::new(close_plan.close_hangs),
+            close_started: close_plan.close_started,
+            ownership,
         }
+    }
+
+    fn with_close_failures(
+        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+        close_failures: usize,
+    ) -> Self {
+        Self::with_close_behavior(
+            MockExitClosePlan {
+                close_calls,
+                close_failures,
+                close_hangs: 0,
+                close_started: None,
+            },
+            None,
+        )
     }
 }
 
@@ -1950,6 +2229,21 @@ impl Provider for MockRemoteCarrierExitProvider {
             .unwrap_or("did:elastos:test");
         if request.get("op").and_then(|value| value.as_str()) == Some("close_stream") {
             self.close_calls.lock().await.push(request.clone());
+            if let Some(close_started) = &self.close_started {
+                close_started.notify_one();
+            }
+            let should_hang = self
+                .close_hangs_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok();
+            if should_hang {
+                std::future::pending::<()>().await;
+                unreachable!("hanging Exit close must be cancelled by Runtime timeout");
+            }
             let mut failures_remaining = self.close_failures_remaining.lock().await;
             if *failures_remaining > 0 {
                 *failures_remaining -= 1;
@@ -1958,6 +2252,9 @@ impl Provider for MockRemoteCarrierExitProvider {
                     "code": "close_stream_failed",
                     "message": "simulated remote Carrier Exit close_stream failure"
                 }));
+            }
+            if let Some(ownership) = &self.ownership {
+                ownership.observe_stream_close();
             }
             return Ok(json!({
                 "status": "ok",
@@ -1993,6 +2290,9 @@ impl Provider for MockRemoteCarrierExitProvider {
                 })
                 .map(|nonce| format!("remote-carrier:mock:test:{nonce}"))
                 .unwrap_or_else(|| "remote-carrier:mock:test".to_string());
+            if let Some(ownership) = &self.ownership {
+                ownership.observe_stream_open();
+            }
             return Ok(json!({
                 "status": "ok",
                 "data": {
@@ -2185,6 +2485,80 @@ struct MockBrowserEngineProvider;
 struct MockRejectingBrowserEngineProvider;
 struct MockMalformedBrowserEngineProvider;
 
+#[derive(Clone, Copy)]
+enum MockDispatchedBrowserLaunchFailure {
+    ResponseLoss,
+    MalformedSuccess,
+    PendingThenTerminal,
+    PendingThenLateSuccess,
+    TransientThenLateSuccess,
+    TimeoutThenLateSuccess,
+    ImmediateLateSuccess,
+    LateSuccessCleanupRetry,
+    AlwaysUnavailable,
+    HangingReconciliation,
+    DidNotActResourcesInUse,
+    ExactVzDidNotAct,
+    MismatchedVzDidNotAct,
+    TerminalVzSettlement,
+    MismatchedTerminalVzSettlement,
+}
+
+struct MockReconciliatingBrowserEngineProvider {
+    failure: MockDispatchedBrowserLaunchFailure,
+    effect: TokioMutex<Option<serde_json::Value>>,
+    launch_calls: std::sync::atomic::AtomicUsize,
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    reconciliation_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum MockBrowserEngineCloseFailure {
+    Transport,
+    Adapter,
+    AlreadyClosed,
+}
+
+struct MockRetryingBrowserEngineProvider {
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_failures_remaining: std::sync::atomic::AtomicUsize,
+    failure: MockBrowserEngineCloseFailure,
+    ownership: Option<Arc<MockBrowserOwnershipCounts>>,
+}
+
+struct MockForeignIdentityBrowserEngineProvider {
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+}
+
+impl MockRetryingBrowserEngineProvider {
+    fn new(
+        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+        failure: MockBrowserEngineCloseFailure,
+        close_failures: usize,
+    ) -> Self {
+        Self {
+            close_calls,
+            close_failures_remaining: std::sync::atomic::AtomicUsize::new(close_failures),
+            failure,
+            ownership: None,
+        }
+    }
+
+    fn with_ownership(
+        close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+        failure: MockBrowserEngineCloseFailure,
+        close_failures: usize,
+        ownership: Arc<MockBrowserOwnershipCounts>,
+    ) -> Self {
+        Self {
+            close_calls,
+            close_failures_remaining: std::sync::atomic::AtomicUsize::new(close_failures),
+            failure,
+            ownership: Some(ownership),
+        }
+    }
+}
+
 fn mock_browser_launch_page_id(request: &serde_json::Value) -> String {
     let url = request
         .get("url")
@@ -2212,6 +2586,56 @@ fn mock_browser_requested_page_id(request: &serde_json::Value) -> String {
         .to_string()
 }
 
+fn mock_browser_terminal_cleanup_response(request: &serde_json::Value) -> serde_json::Value {
+    let binding = request
+        .get("runtime_cleanup")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    json!({
+        "status": "ok",
+        "data": {
+            "schema": "elastos.browser.engine-cleanup-result/v2",
+            "page_id": binding.get("page_id").cloned().unwrap_or(serde_json::Value::Null),
+            "generation": binding.get("generation").cloned().unwrap_or(serde_json::Value::Null),
+            "binding": binding,
+            "terminal": true,
+            "effects": {
+                "page_absent": true,
+                "child_absent": true,
+                "vm_absent": true,
+                "route_absent": true,
+                "socket_absent": true
+            }
+        }
+    })
+}
+
+fn assert_browser_close_request_contract(request: &serde_json::Value) {
+    let request = request
+        .as_object()
+        .expect("Browser close request must be an object");
+    assert_eq!(
+        request.len(),
+        4,
+        "Browser close request must match the adapter's strict shape"
+    );
+    assert_eq!(
+        request.get("op").and_then(serde_json::Value::as_str),
+        Some("close_page")
+    );
+    assert!(request
+        .get("page_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
+    assert!(request
+        .get("principal_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some());
+    assert!(request
+        .get("runtime_cleanup")
+        .is_some_and(serde_json::Value::is_object));
+}
+
 #[async_trait::async_trait]
 impl Provider for MockBrowserEngineProvider {
     async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
@@ -2236,6 +2660,23 @@ impl Provider for MockBrowserEngineProvider {
             .get("principal_id")
             .and_then(|value| value.as_str())
             .is_some());
+        if request.get("op").and_then(|value| value.as_str()) == Some("status")
+            && request.get("lifecycle_generation").is_some()
+        {
+            return Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                    "state": "did_not_act",
+                    "lifecycle_generation": request["lifecycle_generation"],
+                    "stream_id": request["stream_id"],
+                    "effects": {
+                        "page_acquired": false,
+                        "vm_acquired": false,
+                    },
+                }
+            }));
+        }
         if request.get("op").and_then(|value| value.as_str()) == Some("launch") {
             let profile = request
                 .get("profile")
@@ -2387,20 +2828,49 @@ impl Provider for MockBrowserEngineProvider {
                     "message": "Browser Engine Adapter has reached its active session limit (1)"
                 }));
             }
+            if request
+                .get("url")
+                .and_then(|value| value.as_str())
+                .is_some_and(|url| url.contains("resources-in-use.invalid"))
+            {
+                return Ok(json!({
+                    "status": "error",
+                    "code": "resources_in_use",
+                    "message": "Browser profile disk is already attached to an active VM"
+                }));
+            }
             let page_id = mock_browser_launch_page_id(request);
             let adapter = request
                 .get("adapter_id")
                 .and_then(|value| value.as_str())
                 .unwrap_or("mock-browser-engine");
+            let generation = request
+                .get("lifecycle_generation")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let stream_id = stream_session
+                .get("stream_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
             return Ok(json!({
                 "status": "ok",
                 "data": {
                     "schema": "elastos.browser.engine.page/v1",
+                    "provider": "browser-engine-adapter",
+                    "protocol_version": "2.0",
                     "page_id": page_id,
                     "adapter": adapter,
                     "engine": "selkies_gstreamer",
                     "url": request.get("url").cloned().unwrap_or_else(|| json!("")),
-                    "stream_id": stream_session.get("stream_id").cloned().unwrap_or_else(|| json!("")),
+                    "stream_id": stream_id,
+                    "runtime_cleanup": {
+                        "schema": "elastos.browser.engine-cleanup-binding/v2",
+                        "page_id": page_id,
+                        "generation": generation,
+                        "stream_id": stream_id,
+                        "adapter": adapter,
+                        "engine": "selkies_gstreamer"
+                    },
                     "network_mode": "runtime_net_only",
                     "direct_network": false,
                     "wallet_injection": false,
@@ -2517,6 +2987,7 @@ impl Provider for MockBrowserEngineProvider {
             }));
         }
         if request.get("op").and_then(|value| value.as_str()) == Some("close_page") {
+            assert_browser_close_request_contract(request);
             let page_id = mock_browser_requested_page_id(request);
             if page_id == "page:mock-browser-close-fails" {
                 return Ok(json!({
@@ -2525,14 +2996,7 @@ impl Provider for MockBrowserEngineProvider {
                     "message": "simulated unreconciled close failure"
                 }));
             }
-            return Ok(json!({
-                "status": "ok",
-                "data": {
-                    "schema": "elastos.browser.close-result/v1",
-                    "page_id": page_id,
-                    "closed": true
-                }
-            }));
+            return Ok(mock_browser_terminal_cleanup_response(request));
         }
         if request.get("op").and_then(|value| value.as_str()) == Some("webrtc_signal") {
             let page_id = mock_browser_requested_page_id(request);
@@ -2594,19 +3058,33 @@ impl Provider for MockBrowserEngineProvider {
             "status": "ok",
             "data": {
                 "provider": "browser-engine-adapter",
+                "protocol_version": "2.0",
                 "status": "configured",
-                "adapter_count": 1,
-                "adapters": [{
-                    "id": "mock-browser-engine",
-                    "engine": "selkies_gstreamer",
-                    "default": true,
-                    "backing_substrate": "operator_rbi",
-                    "supported_display_modes": ["webrtc_remote_display"],
-                    "supported_guarantee_levels": ["operator_rbi"],
-                    "network_mode": "runtime_net_only",
-                    "direct_network": false,
-                    "wallet_injection": false
-                }],
+                "adapter_count": 2,
+                "adapters": [
+                    {
+                        "id": "mock-browser-engine",
+                        "engine": "selkies_gstreamer",
+                        "default": true,
+                        "backing_substrate": "operator_rbi",
+                        "supported_display_modes": ["webrtc_remote_display"],
+                        "supported_guarantee_levels": ["operator_rbi"],
+                        "network_mode": "runtime_net_only",
+                        "direct_network": false,
+                        "wallet_injection": false
+                    },
+                    {
+                        "id": "mock-jetson-engine",
+                        "engine": "selkies_gstreamer",
+                        "default": false,
+                        "backing_substrate": "operator_rbi",
+                        "supported_display_modes": ["webrtc_remote_display"],
+                        "supported_guarantee_levels": ["operator_rbi"],
+                        "network_mode": "runtime_net_only",
+                        "direct_network": false,
+                        "wallet_injection": false
+                    }
+                ],
                 "direct_network": false,
                 "wallet_injection": false,
                 "stream_session_schema": "elastos.exit.stream-session/v1",
@@ -2615,6 +3093,539 @@ impl Provider for MockBrowserEngineProvider {
                 "supported_display_modes": ["webrtc_remote_display"],
                 "supported_guarantee_levels": ["operator_rbi"],
                 "operations": ["status", "launch", "attach_stream", "page_status", "diagnostics", "input", "webrtc_signal", "close_page"]
+            }
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockReconciliatingBrowserEngineProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock reconciling browser engine only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-browser-engine"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        match request.get("op").and_then(|value| value.as_str()) {
+            Some("launch") => {
+                let launch_call = self
+                    .launch_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse
+                ) {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "resources_in_use",
+                        "message": "simulated Browser VM resource lease conflict",
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::ExactVzDidNotAct
+                        | MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct
+                ) {
+                    let adapter = request
+                        .get("adapter_id")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("Runtime must bind the default Adapter before VZ dispatch");
+                    assert_eq!(adapter, "mock-browser-engine");
+                    let authority = request
+                        .get("transport_authority")
+                        .expect("VZ settlement test transport authority");
+                    let mut settlement = json!({
+                        "schema": "elastos.browser.vz-launch-settlement/v1",
+                        "state": "did_not_act",
+                        "message": "injected exact VZ pre-effect failure",
+                        "binding_hash": authority["binding_hash"],
+                        "generation": authority["generation"],
+                        "page_id": authority["page_id"],
+                        "vm_id": authority["vm_id"],
+                        "stream_id": authority["egress"]["stream_id"],
+                        "media_stream_id": authority["media"]["stream_id"],
+                        "effects": {
+                            "session_directory": false,
+                            "control_socket": false,
+                            "ordinary_stream_bridge": false,
+                            "media_stream_bridge": false,
+                            "turn_process": false,
+                            "supervisor_child": false,
+                            "vm": false,
+                        },
+                        "absence": {
+                            "child_absent": true,
+                            "supervisor_child_absent": true,
+                            "control_socket_absent": true,
+                            "route_absent": true,
+                            "turn_listener_absent": true,
+                            "turn_relay_ports_absent": true,
+                            "ordinary_stream_bridge_absent": true,
+                            "media_stream_bridge_absent": true,
+                            "session_directory_absent": true,
+                            "vm_absent": true,
+                        },
+                    });
+                    if matches!(
+                        self.failure,
+                        MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct
+                    ) {
+                        settlement["vm_id"] = json!("vm:vz-substituted");
+                    }
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "engine_process_unavailable",
+                        "message": "injected VZ pre-effect failure",
+                        "adapter": adapter,
+                        "launch_settlement_result": settlement,
+                    }));
+                }
+                if (matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::PendingThenTerminal
+                        | MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                        | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                ) && launch_call == 0)
+                {
+                    return Err(ProviderError::Provider(
+                        "simulated browser-engine provider crash during launch".to_string(),
+                    ));
+                }
+                let response = <MockBrowserEngineProvider as Provider>::send_raw(
+                    &MockBrowserEngineProvider,
+                    request,
+                )
+                .await?;
+                let effect = response
+                    .get("data")
+                    .cloned()
+                    .expect("mock launch effect");
+                *self.effect.lock().await = Some(effect);
+                match self.failure {
+                    MockDispatchedBrowserLaunchFailure::ResponseLoss => {
+                        Err(ProviderError::Provider(
+                            "simulated browser-engine launch response loss".to_string(),
+                        ))
+                    }
+                    MockDispatchedBrowserLaunchFailure::MalformedSuccess => Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.page/v1",
+                            "provider": "browser-engine-adapter",
+                            "protocol_version": "2.0",
+                            "page_id": "unsafe page id",
+                        }
+                    })),
+                    MockDispatchedBrowserLaunchFailure::PendingThenTerminal
+                    | MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
+                    | MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
+                    | MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
+                    | MockDispatchedBrowserLaunchFailure::ImmediateLateSuccess
+                    | MockDispatchedBrowserLaunchFailure::LateSuccessCleanupRetry
+                    | MockDispatchedBrowserLaunchFailure::AlwaysUnavailable
+                    | MockDispatchedBrowserLaunchFailure::HangingReconciliation => Ok(response),
+                    MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse => unreachable!(),
+                    MockDispatchedBrowserLaunchFailure::ExactVzDidNotAct
+                    | MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct => unreachable!(),
+                    MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                    | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement => {
+                        Ok(response)
+                    }
+                }
+            }
+            Some("status") if request.get("lifecycle_generation").is_some() => {
+                let reconciliation_call = self
+                    .reconciliation_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse
+                ) {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "did_not_act",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "effects": {
+                                "page_acquired": false,
+                                "vm_acquired": false,
+                            },
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::MismatchedVzDidNotAct
+                ) {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "cleanup_pending",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "transport_authority": request["transport_authority"],
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::TerminalVzSettlement
+                        | MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                ) {
+                    let authority = request
+                        .get("transport_authority")
+                        .expect("terminal VZ reconciliation authority");
+                    let mut settlement = json!({
+                        "schema": "elastos.browser.vz-launch-settlement/v1",
+                        "state": "terminal_post_effect_cleanup",
+                        "message": "injected exact terminal VZ cleanup",
+                        "binding_hash": authority["binding_hash"],
+                        "generation": authority["generation"],
+                        "page_id": authority["page_id"],
+                        "vm_id": authority["vm_id"],
+                        "stream_id": authority["egress"]["stream_id"],
+                        "media_stream_id": authority["media"]["stream_id"],
+                        "effects": {
+                            "session_directory": true,
+                            "control_socket": true,
+                            "ordinary_stream_bridge": true,
+                            "media_stream_bridge": true,
+                            "turn_process": true,
+                            "supervisor_child": false,
+                            "vm": true,
+                        },
+                        "absence": {
+                            "child_absent": true,
+                            "supervisor_child_absent": true,
+                            "control_socket_absent": true,
+                            "route_absent": true,
+                            "turn_listener_absent": true,
+                            "turn_relay_ports_absent": true,
+                            "ordinary_stream_bridge_absent": true,
+                            "media_stream_bridge_absent": true,
+                            "session_directory_absent": true,
+                            "vm_absent": true,
+                        },
+                    });
+                    if matches!(
+                        self.failure,
+                        MockDispatchedBrowserLaunchFailure::MismatchedTerminalVzSettlement
+                    ) {
+                        settlement["media_stream_id"] = json!("stream:vz-media-substituted");
+                    }
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "terminal_post_effect_cleanup",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "transport_authority": authority,
+                            "effects": {
+                                "page_acquired": false,
+                                "vm_acquired": true,
+                            },
+                            "terminal_cleanup_receipt": settlement,
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::PendingThenTerminal
+                ) {
+                    if reconciliation_call < 2 {
+                        return Ok(json!({
+                            "status": "ok",
+                            "data": {
+                                "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                                "state": "cleanup_pending",
+                                "lifecycle_generation": request["lifecycle_generation"],
+                                "stream_id": request["stream_id"],
+                            }
+                        }));
+                    }
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "terminal_post_effect_cleanup",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "effects": {
+                                "page_acquired": true,
+                                "vm_acquired": true,
+                            },
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::AlwaysUnavailable
+                ) {
+                    return Err(ProviderError::Provider(
+                        "simulated unavailable Browser reconciliation authority".to_string(),
+                    ));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::HangingReconciliation
+                ) {
+                    return std::future::pending::<
+                        Result<serde_json::Value, ProviderError>,
+                    >()
+                    .await;
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
+                ) && reconciliation_call == 0
+                {
+                    return std::future::pending::<
+                        Result<serde_json::Value, ProviderError>,
+                    >()
+                    .await;
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
+                ) && reconciliation_call == 0
+                {
+                    return Err(ProviderError::Provider(
+                        "simulated transient Browser reconciliation failure".to_string(),
+                    ));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
+                ) && reconciliation_call == 0
+                {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "cleanup_pending",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                        }
+                    }));
+                }
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::PendingThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TransientThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::ImmediateLateSuccess
+                        | MockDispatchedBrowserLaunchFailure::LateSuccessCleanupRetry
+                ) {
+                    let generation = request["lifecycle_generation"]
+                        .as_str()
+                        .expect("mock lifecycle generation");
+                    let stream_id = request["stream_id"].as_str().expect("mock stream id");
+                    let page_id = format!(
+                        "page:late-effect:{}",
+                        generation.trim_start_matches("sha256:")
+                    );
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "effect_acquired",
+                            "lifecycle_generation": generation,
+                            "stream_id": stream_id,
+                            "effect": {
+                                "provider": "browser-engine-adapter",
+                                "protocol_version": "2.0",
+                                "page_id": page_id,
+                                "adapter": "mock-browser-engine",
+                                "engine": "selkies_gstreamer",
+                                "stream_id": stream_id,
+                                "runtime_cleanup": {
+                                    "schema": "elastos.browser.engine-cleanup-binding/v2",
+                                    "page_id": page_id,
+                                    "generation": generation,
+                                    "stream_id": stream_id,
+                                    "adapter": "mock-browser-engine",
+                                    "engine": "selkies_gstreamer",
+                                    "control_socket_path": "/tmp/mock-browser-late-effect.sock"
+                                }
+                            }
+                        }
+                    }));
+                }
+                if let Some(effect) = self.effect.lock().await.clone() {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                            "state": "effect_acquired",
+                            "lifecycle_generation": request["lifecycle_generation"],
+                            "stream_id": request["stream_id"],
+                            "effect": effect,
+                        }
+                    }));
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                        "state": "cleanup_pending",
+                        "lifecycle_generation": request["lifecycle_generation"],
+                        "stream_id": request["stream_id"],
+                    }
+                }))
+            }
+            Some("close_page") => {
+                assert_browser_close_request_contract(request);
+                let close_call = {
+                    let mut close_calls = self.close_calls.lock().await;
+                    close_calls.push(request.clone());
+                    close_calls.len()
+                };
+                if matches!(
+                    self.failure,
+                    MockDispatchedBrowserLaunchFailure::LateSuccessCleanupRetry
+                ) && close_call <= 2
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "engine_cleanup_indeterminate",
+                        "message": "simulated nonterminal Browser cleanup"
+                    }));
+                }
+                *self.effect.lock().await = None;
+                Ok(mock_browser_terminal_cleanup_response(request))
+            }
+            _ => {
+                <MockBrowserEngineProvider as Provider>::send_raw(
+                    &MockBrowserEngineProvider,
+                    request,
+                )
+                .await
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockRetryingBrowserEngineProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock retrying browser engine only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-retrying-browser-engine"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("op").and_then(|value| value.as_str()) == Some("launch") {
+            let response =
+                <MockBrowserEngineProvider as Provider>::send_raw(&MockBrowserEngineProvider, request)
+                    .await?;
+            if response.get("status").and_then(|value| value.as_str()) == Some("ok") {
+                if let Some(ownership) = &self.ownership {
+                    ownership.observe_launch();
+                }
+            }
+            return Ok(response);
+        }
+        if request.get("op").and_then(|value| value.as_str()) == Some("close_page") {
+            assert_browser_close_request_contract(request);
+            self.close_calls.lock().await.push(request.clone());
+            let should_fail = self
+                .close_failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok();
+            if should_fail {
+                return match self.failure {
+                    MockBrowserEngineCloseFailure::Transport => Err(ProviderError::Provider(
+                        "simulated browser-engine close transport failure".to_string(),
+                    )),
+                    MockBrowserEngineCloseFailure::Adapter => Ok(json!({
+                        "status": "error",
+                        "code": "engine_close_indeterminate",
+                        "message": "simulated adapter close failure"
+                    })),
+                    MockBrowserEngineCloseFailure::AlreadyClosed => {
+                        Ok(mock_browser_terminal_cleanup_response(request))
+                    }
+                };
+            }
+            let response =
+                <MockBrowserEngineProvider as Provider>::send_raw(&MockBrowserEngineProvider, request)
+                    .await?;
+            if response.get("status").and_then(|value| value.as_str()) == Some("ok") {
+                if let Some(ownership) = &self.ownership {
+                    ownership.observe_terminal_close();
+                }
+            }
+            return Ok(response);
+        }
+        <MockBrowserEngineProvider as Provider>::send_raw(&MockBrowserEngineProvider, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for MockForeignIdentityBrowserEngineProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "mock foreign-identity browser engine only supports raw requests".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["browser-engine"]
+    }
+
+    fn name(&self) -> &'static str {
+        "mock-retrying-browser-engine"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("op").and_then(|value| value.as_str()) == Some("close_page") {
+            self.close_calls.lock().await.push(request.clone());
+        }
+        Ok(json!({
+            "status": "ok",
+            "data": {
+                "provider": "foreign-browser-engine",
+                "protocol_version": "9.9",
+                "status": "configured",
+                "direct_network": false,
+                "wallet_injection": false
             }
         }))
     }
@@ -2646,12 +3657,33 @@ impl Provider for MockRejectingBrowserEngineProvider {
                 "code": "display_session_unavailable",
                 "message": "Browser Engine Adapter rejected launch after stream reservation"
             })),
+            Some("status") if request.get("lifecycle_generation").is_some() => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.browser.engine.launch-reconciliation/v1",
+                    "state": "did_not_act",
+                    "lifecycle_generation": request["lifecycle_generation"],
+                    "stream_id": request["stream_id"],
+                    "effects": {
+                        "page_acquired": false,
+                        "vm_acquired": false,
+                    },
+                }
+            })),
             Some("status") => Ok(json!({
                 "status": "ok",
                 "data": {
                     "provider": "browser-engine-adapter",
+                    "protocol_version": "2.0",
                     "status": "configured",
                     "adapter_count": 1,
+                    "adapters": [{
+                        "id": "mock-browser-engine",
+                        "engine": "selkies_gstreamer",
+                        "default": true,
+                        "direct_network": false,
+                        "wallet_injection": false
+                    }],
                     "direct_network": false,
                     "wallet_injection": false,
                     "stream_session_schema": "elastos.exit.stream-session/v1",
@@ -2750,6 +3782,548 @@ impl Provider for MockWalletProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("op").and_then(|value| value.as_str()) == Some(WALLET_BUS_OPERATION) {
+            let request_bytes = serde_json::to_vec(request.get("request").ok_or_else(|| {
+                ProviderError::Provider("missing Wallet Bus v2 request".into())
+            })?)
+            .map_err(|err| ProviderError::Provider(err.to_string()))?;
+            let wallet_request = WalletProviderRequestV2::decode_at(
+                &request_bytes,
+                crate::auth::now_ts(),
+            )
+            .map_err(|err| ProviderError::Provider(err.to_string()))?;
+            let legacy_request = match &wallet_request.operation {
+                WalletProviderOperationV2::ListAccounts { include_revoked } => json!({
+                    "op": "accounts",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "include_revoked": include_revoked,
+                }),
+                WalletProviderOperationV2::CreateManagedAccount {
+                    chain_namespace,
+                    label,
+                    create_new,
+                } => json!({
+                    "op": "create_managed_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "chain_namespace": chain_namespace,
+                    "label": label,
+                    "create_new": create_new,
+                }),
+                WalletProviderOperationV2::RevokeAccount { account_id } => json!({
+                    "op": "revoke_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "account_id": account_id,
+                }),
+                WalletProviderOperationV2::RenameAccount { account_id, label } => json!({
+                    "op": "rename_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "account_id": account_id,
+                    "label": label,
+                }),
+                WalletProviderOperationV2::SetDefaultAccount {
+                    chain_namespace,
+                    intent,
+                    account_id,
+                } => json!({
+                    "op": "set_default_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "chain_namespace": chain_namespace,
+                    "intent": intent,
+                    "account_id": account_id,
+                }),
+                WalletProviderOperationV2::ExportManagedRecoveryKey { account_id } => json!({
+                    "op": "export_managed_secret",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "account_id": account_id,
+                }),
+                WalletProviderOperationV2::ImportManagedRecoveryKey {
+                    recovery_key,
+                    label,
+                } => json!({
+                    "op": "import_managed_secret",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "recovery_key": recovery_key,
+                    "label": label,
+                }),
+                WalletProviderOperationV2::ExportManagedRecoverySet {} => json!({
+                    "op": "export_managed_recovery_set",
+                    "principal_id": wallet_request.authority.principal_id,
+                }),
+                WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set } => json!({
+                    "op": "import_managed_recovery_set",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "recovery_set": recovery_set,
+                }),
+                WalletProviderOperationV2::Challenge {
+                    domain,
+                    uri,
+                    address,
+                    chain_id,
+                    resources,
+                } => json!({
+                    "op": "challenge",
+                    "domain": domain,
+                    "uri": uri,
+                    "address": address,
+                    "chain_id": chain_id,
+                    "resources": resources,
+                }),
+                WalletProviderOperationV2::BitcoinChallenge {
+                    domain,
+                    uri,
+                    address,
+                    network,
+                    resources,
+                } => json!({
+                    "op": "bitcoin_challenge",
+                    "domain": domain,
+                    "uri": uri,
+                    "address": address,
+                    "network": network.as_str(),
+                    "resources": resources,
+                }),
+                WalletProviderOperationV2::VerifyProof { message, signature } => json!({
+                    "op": "verify_proof",
+                    "message": message,
+                    "signature": signature,
+                }),
+                WalletProviderOperationV2::VerifyContractProof {
+                    message,
+                    signature,
+                    evidence,
+                } => json!({
+                    "op": "verify_contract_proof",
+                    "message": message,
+                    "signature": signature,
+                    "erc1271_proof": evidence,
+                }),
+                WalletProviderOperationV2::VerifyBip322Proof {
+                    message,
+                    signature,
+                    signature_type,
+                    public_key,
+                } => json!({
+                    "op": "verify_bip322_proof",
+                    "message": message,
+                    "signature": signature,
+                    "signature_type": signature_type,
+                    "public_key": public_key,
+                }),
+                WalletProviderOperationV2::LinkVerifiedAccount {
+                    proof_binding_id,
+                    chain_namespace,
+                    address,
+                    proof_type,
+                    ..
+                } => json!({
+                    "op": "link_account",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "proof_binding_id": proof_binding_id,
+                    "chain_namespace": chain_namespace,
+                    "address": address,
+                    "proof_type": proof_type,
+                    "connector_id": wallet_request.authority.actor,
+                }),
+                WalletProviderOperationV2::RequestApproval {
+                    account_id,
+                    chain_namespace,
+                    intent,
+                    resource,
+                    reason,
+                    payload,
+                    expires_at,
+                } => json!({
+                    "op": "request_signature",
+                    "request_id": wallet_request.request_id,
+                    "wallet_request_sha256": wallet_request.request_sha256,
+                    "authority_binding": wallet_request.session_binding,
+                    "principal_id": wallet_request.authority.principal_id,
+                    "session_id": wallet_request.authority.session_id,
+                    "launch_id": wallet_request.authority.launch_id,
+                    "account_id": account_id,
+                    "chain_namespace": chain_namespace,
+                    "intent": intent,
+                    "capsule_id": wallet_request.authority.actor,
+                    "resource": resource,
+                    "reason": reason,
+                    "payload": payload,
+                    "expires_at": expires_at,
+                }),
+                WalletProviderOperationV2::AttachValidatedChainOutcome { outcome } => json!({
+                    "op": "attach_validated_chain_outcome",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "session_id": wallet_request.authority.session_id,
+                    "launch_id": wallet_request.authority.launch_id,
+                    "capsule_id": wallet_request.authority.actor,
+                    "outcome": outcome,
+                }),
+                WalletProviderOperationV2::ListApprovals { include_resolved } => json!({
+                    "op": "approval_requests",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "include_resolved": include_resolved,
+                }),
+                WalletProviderOperationV2::RejectApproval { request_id, reason } => json!({
+                    "op": "reject_approval",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "request_id": request_id,
+                    "reason": reason,
+                }),
+                WalletProviderOperationV2::ApproveAndSignManaged { request_id, reason } => json!({
+                    "op": "approve_and_sign_managed",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "request_id": request_id,
+                    "reason": reason,
+                }),
+                WalletProviderOperationV2::ApproveConnectorHandoff { request_id, reason } => json!({
+                    "op": "approve_approval",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "request_id": request_id,
+                    "reason": reason,
+                }),
+                WalletProviderOperationV2::CompleteConnectorHandoff {
+                    request_id,
+                    payload_hash,
+                    signature,
+                    signature_type,
+                    public_key,
+                    signer,
+                    transaction_hash,
+                } => json!({
+                    "op": "complete_approval",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "request_id": request_id,
+                    "connector_id": wallet_request.authority.actor,
+                    "payload_hash": payload_hash,
+                    "signature": signature,
+                    "signature_type": signature_type,
+                    "public_key": public_key,
+                    "signer": signer,
+                    "transaction_hash": transaction_hash,
+                }),
+                _ => {
+                    let response = WalletProviderResponseV2::for_request(
+                        &wallet_request,
+                        WalletResultV2::Error {
+                            code: "unsupported_operation".to_string(),
+                            message: "mock Wallet Bus v2 does not support this operation"
+                                .to_string(),
+                        },
+                    );
+                    return Ok(json!({"status": "ok", "data": response}));
+                }
+            };
+            let legacy_response = self.send_legacy_raw(&legacy_request).await?;
+            let result = match legacy_response.get("status").and_then(Value::as_str) {
+                Some("ok") => WalletResultV2::Ok {
+                    data: legacy_response.get("data").cloned().unwrap_or(Value::Null),
+                },
+                Some("error") => WalletResultV2::Error {
+                    code: legacy_response
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("provider_error")
+                        .to_string(),
+                    message: legacy_response
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("mock Wallet provider rejected the request")
+                        .to_string(),
+                },
+                _ => {
+                    return Err(ProviderError::Provider(
+                        "mock Wallet provider returned malformed response".into(),
+                    ));
+                }
+            };
+            return Ok(json!({
+                "status": "ok",
+                "data": WalletProviderResponseV2::for_request(&wallet_request, result),
+            }));
+        }
+
+        self.send_legacy_raw(request).await
+    }
+}
+
+#[derive(Default)]
+struct RecordingWalletProvider {
+    provider: MockWalletProvider,
+    requests: TokioMutex<Vec<serde_json::Value>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for RecordingWalletProvider {
+    async fn handle(&self, request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        self.provider.handle(request).await
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        self.provider.schemes()
+    }
+
+    fn name(&self) -> &'static str {
+        "recording-mock-wallet-provider"
+    }
+
+    async fn send_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+        self.requests.lock().await.push(request.clone());
+        self.provider.send_raw(request).await
+    }
+}
+
+impl RecordingWalletProvider {
+    fn new(provider: MockWalletProvider) -> Self {
+        Self {
+            provider,
+            requests: TokioMutex::default(),
+        }
+    }
+
+    async fn assert_no_requests(&self) {
+        let requests = self.requests.lock().await;
+        assert!(
+            requests.is_empty(),
+            "request rejected at the Runtime boundary reached Wallet Provider: {requests:?}"
+        );
+    }
+
+    async fn assert_v2_operations(
+        &self,
+        expected_actor: &str,
+        expected_authority: &TestPasskeyAuthority,
+        expected: &[WalletOperationKind],
+    ) {
+        let requests = self.requests.lock().await;
+        let mut actual = Vec::with_capacity(requests.len());
+        let mut launch_id = None;
+        for request in requests.iter() {
+            assert_eq!(
+                request.get("op").and_then(Value::as_str),
+                Some(WALLET_BUS_OPERATION),
+                "migrated wallet-link route emitted a retired raw Wallet request: {request}"
+            );
+            let request_bytes = serde_json::to_vec(
+                request
+                    .get("request")
+                    .expect("Wallet Bus v2 request envelope"),
+            )
+            .unwrap();
+            let wallet_request =
+                WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts()).unwrap();
+            assert_eq!(wallet_request.authority.actor, expected_actor);
+            assert_eq!(
+                wallet_request.authority.principal_id,
+                expected_authority.principal_id
+            );
+            assert_eq!(
+                wallet_request.authority.session_id,
+                expected_authority.session_id
+            );
+            assert_eq!(
+                wallet_request.authority.proof_binding_id.as_deref(),
+                Some(expected_authority.proof_binding_id.as_str())
+            );
+            assert_eq!(wallet_request.authority.grant_id, expected_authority.grant_id);
+            if let Some(expected_launch_id) = launch_id.as_deref() {
+                assert_eq!(wallet_request.authority.launch_id, expected_launch_id);
+            } else {
+                launch_id = Some(wallet_request.authority.launch_id.clone());
+            }
+            actual.push(wallet_request.operation.kind());
+        }
+        assert_eq!(actual, expected);
+    }
+
+    async fn assert_v2_account_reads(
+        &self,
+        expected_authority: &RuntimeWalletAuthority,
+        expected_count: usize,
+    ) {
+        let expected = vec![WalletOperationKind::ListAccounts; expected_count];
+        self.assert_v2_account_operations(expected_authority, &expected)
+            .await;
+    }
+
+    async fn assert_v2_account_operations(
+        &self,
+        expected_authority: &RuntimeWalletAuthority,
+        expected_operations: &[WalletOperationKind],
+    ) {
+        let expected = expected_authority.verified_context();
+        let requests = self.requests.lock().await;
+        let mut actual = Vec::new();
+        for request in requests.iter() {
+            let operation = request.get("op").and_then(Value::as_str);
+            assert!(
+                !matches!(
+                    operation,
+                    Some(
+                        "accounts"
+                            | "create_managed_account"
+                            | "revoke_account"
+                            | "rename_account"
+                            | "set_default_account"
+                            | "export_managed_secret"
+                            | "import_managed_secret"
+                    )
+                ),
+                "account operation emitted a retired raw Wallet request: {request}"
+            );
+            if operation != Some(WALLET_BUS_OPERATION) {
+                continue;
+            }
+            assert_eq!(request["_runtime_invocation"]["source"], "runtime");
+            assert_eq!(request["_runtime_invocation"]["target"], "wallet");
+            assert_eq!(
+                request["_runtime_invocation"]["op"],
+                WALLET_BUS_OPERATION
+            );
+            assert_eq!(
+                request["_runtime_invocation"]["transport"],
+                "runtime-local-provider-plane"
+            );
+            assert_eq!(
+                request["_runtime_invocation"]["carrier"],
+                serde_json::Value::Null
+            );
+            let request_bytes = serde_json::to_vec(
+                request
+                    .get("request")
+                    .expect("Wallet Bus v2 request envelope"),
+            )
+            .unwrap();
+            let wallet_request =
+                WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts()).unwrap();
+            let kind = wallet_request.operation.kind();
+            if matches!(
+                kind,
+                WalletOperationKind::ExportManagedRecoveryKey
+                    | WalletOperationKind::ImportManagedRecoveryKey
+            ) {
+                assert!(
+                    request["request"]["operation"]["params"]
+                        .get("principal_id")
+                        .is_none(),
+                    "managed Recovery Key operation supplied principal_id outside Runtime authority"
+                );
+            }
+            if !matches!(
+                kind,
+                WalletOperationKind::ListAccounts
+                    | WalletOperationKind::CreateManagedAccount
+                    | WalletOperationKind::RevokeAccount
+                    | WalletOperationKind::RenameAccount
+                    | WalletOperationKind::SetDefaultAccount
+                    | WalletOperationKind::ExportManagedRecoveryKey
+                    | WalletOperationKind::ImportManagedRecoveryKey
+            ) {
+                continue;
+            }
+            if let WalletProviderOperationV2::ListAccounts { include_revoked } =
+                &wallet_request.operation
+            {
+                assert!(!include_revoked);
+            }
+            assert_eq!(wallet_request.authority.actor, expected.actor());
+            assert_eq!(
+                wallet_request.authority.principal_id,
+                expected.principal_id()
+            );
+            assert_eq!(
+                wallet_request.authority.session_id,
+                expected.session_id()
+            );
+            assert_eq!(
+                wallet_request.authority.proof_binding_id.as_deref(),
+                expected.proof_binding_id()
+            );
+            assert_eq!(wallet_request.authority.grant_id, expected.grant_id());
+            assert_eq!(wallet_request.authority.launch_id, expected.launch_id());
+            actual.push(kind);
+        }
+        assert_eq!(actual, expected_operations);
+    }
+
+    async fn assert_v2_approval_operations(
+        &self,
+        expected_authority: &RuntimeWalletAuthority,
+        expected_operations: &[WalletOperationKind],
+    ) {
+        let expected = expected_authority.verified_context();
+        let requests = self.requests.lock().await;
+        let mut actual = Vec::new();
+        for request in requests.iter() {
+            let operation = request.get("op").and_then(Value::as_str);
+            assert!(
+                !matches!(
+                    operation,
+                    Some(
+                        "approval_requests"
+                            | "request_signature"
+                            | "reject_approval"
+                            | "approve_approval"
+                            | "sign_approved"
+                            | "complete_approval"
+                    )
+                ),
+                "approval operation emitted a retired raw Wallet request: {request}"
+            );
+            if operation != Some(WALLET_BUS_OPERATION) {
+                continue;
+            }
+            let request_bytes = serde_json::to_vec(
+                request
+                    .get("request")
+                    .expect("Wallet Bus v2 request envelope"),
+            )
+            .unwrap();
+            let wallet_request =
+                WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts()).unwrap();
+            let kind = wallet_request.operation.kind();
+            if !matches!(
+                kind,
+                WalletOperationKind::RequestApproval
+                    | WalletOperationKind::ListApprovals
+                    | WalletOperationKind::RejectApproval
+                    | WalletOperationKind::ApproveAndSignManaged
+                    | WalletOperationKind::ApproveConnectorHandoff
+                    | WalletOperationKind::CompleteConnectorHandoff
+                    | WalletOperationKind::AttachValidatedChainOutcome
+            ) {
+                continue;
+            }
+            if wallet_request.authority.actor != expected.actor() {
+                continue;
+            }
+            assert_eq!(
+                wallet_request.authority.principal_id,
+                expected.principal_id()
+            );
+            assert_eq!(
+                wallet_request.authority.session_id,
+                expected.session_id()
+            );
+            assert_eq!(
+                wallet_request.authority.proof_binding_id.as_deref(),
+                expected.proof_binding_id()
+            );
+            assert_eq!(wallet_request.authority.grant_id, expected.grant_id());
+            assert_eq!(wallet_request.authority.launch_id, expected.launch_id());
+            actual.push(kind);
+        }
+        assert_eq!(actual, expected_operations);
+    }
+}
+
+impl MockWalletProvider {
+    async fn send_legacy_raw(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderError> {
+
         match request.get("op").and_then(|value| value.as_str()) {
             Some("challenge") => {
                 let domain = required_test_str(request, "domain")?;
@@ -3167,7 +4741,7 @@ impl Provider for MockWalletProvider {
                         "bc1q9vza2e8x573nczrlzms0wvx3gsqjx7vavgkx0l".to_string()
                     }
                 } else if create_new {
-                    format!("0x{:040x}", accounts.len() + 1)
+                    mock_managed_evm_address(accounts.len() + 1)?
                 } else {
                     "0x1111111111111111111111111111111111111111".to_string()
                 };
@@ -3240,6 +4814,109 @@ impl Provider for MockWalletProvider {
                 Ok(json!({
                     "status": "ok",
                     "data": { "account": account.clone() }
+                }))
+            }
+            Some("export_managed_recovery_set") => {
+                let principal_id = required_test_str(request, "principal_id")?;
+                let accounts = self.accounts.lock().await;
+                let keys = accounts
+                    .iter()
+                    .filter(|account| {
+                        account.get("principal_id").and_then(Value::as_str) == Some(principal_id)
+                            && account.get("revoked_at").is_none()
+                            && account.get("connector_id").and_then(Value::as_str).is_none()
+                            && account
+                                .get("proof_type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|proof| {
+                                    proof == "managed_evm" || proof == "managed_btc_p2wpkh"
+                                })
+                    })
+                    .map(|account| {
+                        json!({
+                            "account_id": account["account_id"],
+                            "recovery_key": {
+                                "schema": "elastos.wallet.recovery-key/v1",
+                                "account_id": account["account_id"],
+                                "chain_namespace": account["chain_namespace"],
+                                "address": account["address"],
+                                "secret_type": "secp256k1_private_key_hex",
+                                "private_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+                                "note": "This account was created as an encrypted signing key, not a BIP39 seed phrase."
+                            },
+                            "label": account.get("label").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.wallet.managed-recovery-set/v1",
+                        "keys": keys,
+                    }
+                }))
+            }
+            Some("import_managed_recovery_set") => {
+                let principal_id = required_test_str(request, "principal_id")?;
+                let recovery_set = request
+                    .get("recovery_set")
+                    .ok_or_else(|| ProviderError::Provider("missing recovery_set".into()))?;
+                let entries = recovery_set
+                    .get("keys")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| ProviderError::Provider("missing recovery set keys".into()))?;
+                let mut imported_accounts = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let account_id = required_test_str(entry, "account_id")?;
+                    let recovery_key = entry
+                        .get("recovery_key")
+                        .ok_or_else(|| ProviderError::Provider("missing recovery_key".into()))?;
+                    if required_test_str(recovery_key, "account_id")? != account_id {
+                        return Ok(json!({
+                            "status": "error",
+                            "code": "invalid_request",
+                            "message": "managed recovery set account_id mismatch"
+                        }));
+                    }
+                    let chain_namespace = required_test_str(recovery_key, "chain_namespace")?;
+                    let address = required_test_str(recovery_key, "address")?;
+                    let proof_type =
+                        if chain_namespace == "bip122:000000000019d6689c085ae165831e93" {
+                            "managed_btc_p2wpkh"
+                        } else {
+                            "managed_evm"
+                        };
+                    imported_accounts.push(json!({
+                        "account_id": account_id,
+                        "principal_id": principal_id,
+                        "proof_binding_id": format!("proof:wallet:managed:{chain_namespace}:{address}"),
+                        "chain_namespace": chain_namespace,
+                        "address": address,
+                        "proof_type": proof_type,
+                        "signing_available": true,
+                        "signing_status": "managed_key_available",
+                        "label": entry.get("label").cloned().unwrap_or_else(|| json!("Imported")),
+                        "linked_at": crate::auth::now_ts()
+                    }));
+                }
+                let mut accounts = self.accounts.lock().await;
+                for imported in &imported_accounts {
+                    if let Some(existing) = accounts.iter_mut().find(|account| {
+                        account.get("principal_id") == imported.get("principal_id")
+                            && account.get("account_id") == imported.get("account_id")
+                    }) {
+                        *existing = imported.clone();
+                    } else {
+                        accounts.push(imported.clone());
+                    }
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "imported": true,
+                        "account_count": imported_accounts.len(),
+                        "accounts": imported_accounts,
+                    }
                 }))
             }
             Some("export_managed_secret") => {
@@ -3423,24 +5100,52 @@ impl Provider for MockWalletProvider {
                 let payload_hash = format!("0x{}", hex::encode(Keccak256::digest(&payload_bytes)));
                 drop(accounts);
                 let mut approvals = self.approvals.lock().await;
-                let request_id = format!("wallet-approval:mock-{}", approvals.len() + 1);
+                let request_id = request
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("wallet-approval:mock-{}", approvals.len() + 1));
+                if let Some(existing) = approvals.iter().find(|approval| {
+                    approval.get("request_id").and_then(Value::as_str)
+                        == Some(request_id.as_str())
+                }) {
+                    return Ok(json!({
+                        "status": "ok",
+                        "data": {
+                            "approval_request": existing,
+                            "requires_approval": existing.get("status").and_then(Value::as_str) == Some("pending"),
+                            "signature": serde_json::Value::Null
+                        }
+                    }));
+                }
                 let approval = json!({
+                    "schema": "elastos.wallet.approval_request/v1",
                     "request_id": request_id,
+                    "wallet_request_sha256": request.get("wallet_request_sha256").cloned().unwrap_or(json!("legacy")),
+                    "authority_binding": request.get("authority_binding").cloned().unwrap_or(json!("legacy")),
+                    "kind": "signature",
                     "status": "pending",
                     "intent": intent,
                     "capsule_id": required_test_str(request, "capsule_id")?,
+                    "requested_by_actor": required_test_str(request, "capsule_id")?,
                     "resource": required_test_str(request, "resource")?,
                     "reason": required_test_str(request, "reason")?,
                     "account_id": account_id,
                     "chain_namespace": chain_namespace,
                     "address": account.get("address").cloned().unwrap_or(json!("0x0")),
+                    "proof_binding_id": account.get("proof_binding_id").cloned().unwrap_or(json!("proof:wallet:test")),
                     "proof_type": account.get("proof_type").cloned().unwrap_or(json!("siwe")),
                     "connector_id": account.get("connector_id").cloned().unwrap_or(json!(null)),
                     "payload_hash": payload_hash,
                     "payload": payload,
                     "principal_id": principal_id,
+                    "session_id": request.get("session_id").cloned().unwrap_or(json!("session:test")),
+                    "launch_id": request.get("launch_id").cloned().unwrap_or(json!("launch:test")),
                     "created_at": crate::auth::now_ts(),
-                    "expires_at": crate::auth::now_ts() + 600
+                    "expires_at": request
+                        .get("expires_at")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(|| crate::auth::now_ts() + 600)
                 });
                 approvals.push(approval.clone());
                 Ok(json!({
@@ -3475,6 +5180,87 @@ impl Provider for MockWalletProvider {
                     "status": "ok",
                     "data": { "approval_request": approval.clone() }
                 }))
+            }
+            Some("approve_and_sign_managed") => {
+                let principal_id = required_test_str(request, "principal_id")?;
+                let request_id = required_test_str(request, "request_id")?;
+                let mut approvals = self.approvals.lock().await;
+                let Some(approval) = approvals.iter_mut().find(|approval| {
+                    approval
+                        .get("principal_id")
+                        .and_then(|value| value.as_str())
+                        == Some(principal_id)
+                        && approval.get("request_id").and_then(|value| value.as_str())
+                            == Some(request_id)
+                }) else {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "not_found",
+                        "message": "wallet approval request not found"
+                    }));
+                };
+                if approval.get("status").and_then(|value| value.as_str()) != Some("pending") {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "invalid_request",
+                        "message": "wallet approval request is not pending"
+                    }));
+                }
+                if !approval
+                    .get("proof_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_managed_wallet_proof_type)
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "external_wallet_required",
+                        "message": "connector approvals require a typed connector handoff"
+                    }));
+                }
+                approval["status"] = json!("completed");
+                approval["signature_receipt"] = json!({
+                    "schema": "elastos.wallet.signature_receipt/v1",
+                    "request_id": request_id,
+                    "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
+                    "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
+                    "signature_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "completed_at": crate::auth::now_ts(),
+                });
+                if approval.get("intent").and_then(|value| value.as_str())
+                    == Some("transaction_intent")
+                {
+                    let signed_transaction = mock_sign_eip155_transaction(
+                        approval
+                            .get("payload")
+                            .ok_or_else(|| ProviderError::Provider("mock transaction approval is missing payload".to_string()))?,
+                    )?;
+                    let transaction_hash =
+                        signed_evm_transaction_hash_for_test(&signed_transaction);
+                    approval["signed_result"] = json!({
+                        "schema": "elastos.wallet.signed-transaction-result/v1",
+                        "request_id": request_id,
+                        "method": "eth_sendTransaction",
+                        "signed_transaction": signed_transaction,
+                        "transaction_hash": transaction_hash,
+                        "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
+                        "chain_namespace": approval.get("chain_namespace").cloned().unwrap_or(json!("eip155:20")),
+                        "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
+                    });
+                }
+                let mut data = json!({
+                    "approval_request": approval.clone(),
+                    "signature_receipt": approval["signature_receipt"],
+                    "signature": "0xsigned-managed",
+                    "signed_payload": {}
+                });
+                if let Some(signed_transaction) = approval
+                    .get("signed_result")
+                    .and_then(|result| result.get("signed_transaction"))
+                    .and_then(Value::as_str)
+                {
+                    data["signed_transaction"] = json!(signed_transaction);
+                }
+                Ok(json!({ "status": "ok", "data": data }))
             }
             Some("approve_approval") => {
                 let principal_id = required_test_str(request, "principal_id")?;
@@ -3534,6 +5320,7 @@ impl Provider for MockWalletProvider {
                         "payload_hash": payload_hash,
                         "signer": signer,
                         "message": format!("ElastOS Wallet Approval\n\nRequest: {request_id}"),
+                        "signature_type": "personal_sign",
                         "status": "awaiting_wallet_signature"
                     })
                 };
@@ -3642,11 +5429,19 @@ impl Provider for MockWalletProvider {
                 if approval.get("intent").and_then(|value| value.as_str())
                     == Some("transaction_intent")
                 {
+                    let signed_transaction = mock_sign_eip155_transaction(
+                        approval
+                            .get("payload")
+                            .ok_or_else(|| ProviderError::Provider("mock transaction approval is missing payload".to_string()))?,
+                    )?;
+                    let transaction_hash =
+                        signed_evm_transaction_hash_for_test(&signed_transaction);
                     approval["signed_result"] = json!({
-                        "schema": "elastos.wallet.managed-transaction-result/v1",
+                        "schema": "elastos.wallet.signed-transaction-result/v1",
                         "request_id": request_id,
-                        "method": "eth_sendRawTransaction",
-                        "signed_transaction": "0x1234",
+                        "method": "eth_sendTransaction",
+                        "signed_transaction": signed_transaction,
+                        "transaction_hash": transaction_hash,
                         "signer": approval.get("address").cloned().unwrap_or(json!("0x0")),
                         "chain_namespace": approval.get("chain_namespace").cloned().unwrap_or(json!("eip155:20")),
                         "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
@@ -3670,17 +5465,16 @@ impl Provider for MockWalletProvider {
                     "data": data
                 }))
             }
-            Some("record_transaction_hash") => {
+            Some("attach_validated_chain_outcome") => {
                 let principal_id = required_test_str(request, "principal_id")?;
-                let request_id = required_test_str(request, "request_id")?;
-                let transaction_hash = required_test_str(request, "transaction_hash")?;
-                if request_id.contains("record-fails") {
-                    return Ok(json!({
-                        "status": "error",
-                        "code": "record_failed",
-                        "message": "simulated wallet transaction hash recording failure"
-                    }));
-                }
+                let outcome = request
+                    .get("outcome")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProviderError::Provider("missing validated Chain outcome".to_string())
+                })?;
+                let request_id = required_test_str(&outcome, "approval_request_id")?;
                 let mut approvals = self.approvals.lock().await;
                 let Some(approval) = approvals.iter_mut().find(|approval| {
                     approval
@@ -3696,11 +5490,24 @@ impl Provider for MockWalletProvider {
                         "message": "wallet approval request not found"
                     }));
                 };
+                if approval
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| reason.contains("record-fails"))
+                    && approval.get("projection_failed_once").is_none()
+                {
+                    approval["projection_failed_once"] = json!(true);
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "projection_failed",
+                        "message": "simulated Wallet Chain outcome projection failure"
+                    }));
+                }
                 if approval.get("status").and_then(|value| value.as_str()) != Some("completed") {
                     return Ok(json!({
                         "status": "error",
                         "code": "invalid_request",
-                        "message": "wallet transaction hash can only be recorded after completion"
+                        "message": "Wallet Chain outcome requires completed approval"
                     }));
                 }
                 if approval.get("intent").and_then(|value| value.as_str())
@@ -3712,13 +5519,17 @@ impl Provider for MockWalletProvider {
                         "message": "wallet approval request is not a transaction"
                     }));
                 }
-                let mut signed_result = approval
-                    .get("signed_result")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                signed_result["transaction_hash"] = json!(transaction_hash);
-                signed_result["broadcast_recorded_at"] = json!(crate::auth::now_ts());
-                approval["signed_result"] = signed_result;
+                if let Some(existing) = approval.get("validated_chain_outcome") {
+                    if existing != &outcome {
+                        return Ok(json!({
+                            "status": "error",
+                            "code": "chain_outcome_conflict",
+                            "message": "simulated Wallet Chain outcome substitution"
+                        }));
+                    }
+                } else {
+                    approval["validated_chain_outcome"] = outcome;
+                }
                 Ok(json!({
                     "status": "ok",
                     "data": { "approval_request": approval.clone() }

@@ -4,23 +4,18 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>ElastOS Browser</title>
-    <script src="./elastos-theme.js"></script>
-    <link rel="stylesheet" href="./elastos-ui.css" />
-    <link rel="stylesheet" href="./style.css?v=browser-20260720c" />
+    <link rel="stylesheet" href="./style.css?v=browser-20260626a" />
   </head>
   <body data-shell-window-fit="fixed">
     <main class="browser-shell">
       <section class="browser-chrome" aria-label="Browser controls">
-        <div class="browser-nav-group" role="group" aria-label="History">
-          <button id="browser-back" class="browser-nav-button" type="button" aria-label="Back" disabled>
-            &larr;
-          </button>
-          <span class="browser-nav-divider" aria-hidden="true"></span>
-          <button id="browser-forward" class="browser-nav-button" type="button" aria-label="Forward" disabled>
-            &rarr;
-          </button>
-        </div>
-        <button id="browser-refresh" class="browser-nav-button browser-nav-lone" type="button" aria-label="Refresh" disabled>
+        <button id="browser-back" class="browser-nav-button" type="button" aria-label="Back" disabled>
+          &larr;
+        </button>
+        <button id="browser-forward" class="browser-nav-button" type="button" aria-label="Forward" disabled>
+          &rarr;
+        </button>
+        <button id="browser-refresh" class="browser-nav-button" type="button" aria-label="Refresh" disabled>
           &#8635;
         </button>
         <form id="browser-form" class="browser-address-row">
@@ -35,11 +30,9 @@
             value="https://ela.city/"
           />
         </form>
-        <div class="browser-util-group" role="group" aria-label="Browser tools">
-          <button id="browser-settings" class="browser-nav-button" type="button" aria-label="Browser settings" title="Browser settings" aria-controls="browser-settings-panel" aria-expanded="false">
-            &#9881;
-          </button>
-        </div>
+        <button id="browser-settings" class="browser-nav-button" type="button" aria-label="Browser settings" title="Browser settings" aria-controls="browser-settings-panel" aria-expanded="false">
+          &#9881;
+        </button>
       </section>
       <section id="browser-settings-panel" class="browser-settings-panel" aria-label="Browser settings" hidden>
         <div class="browser-settings-head">
@@ -61,19 +54,6 @@
         <button id="browser-profile-reset" class="browser-settings-action browser-settings-danger" type="button" aria-label="Reset Browser profile" title="Reset Browser profile">
           Reset profile
         </button>
-        <div id="browser-profile-reset-confirm" class="browser-settings-confirm" role="alertdialog" aria-labelledby="browser-profile-reset-copy" hidden>
-          <p id="browser-profile-reset-copy">
-            Reset Browser cookies, local storage, history, and cache for this account?
-          </p>
-          <div class="browser-settings-confirm-row">
-            <button id="browser-profile-reset-commit" class="browser-settings-action browser-settings-confirm-commit" type="button">
-              Reset
-            </button>
-            <button id="browser-profile-reset-cancel" class="browser-settings-action" type="button">
-              Cancel
-            </button>
-          </div>
-        </div>
       </section>
 
       <section class="browser-stage" aria-label="Web page">
@@ -101,6 +81,6 @@
       </section>
     </main>
 
-    <script type="module" src="./browser.js?v=browser-20260720c"></script>
+    <script type="module" src="./browser.js?v=browser-20260731b"></script>
   </body>
 </html>

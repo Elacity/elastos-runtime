@@ -98,7 +98,37 @@
       "platforms": [
         "any"
       ],
-      "note": "WASM capsule (wasm32-wasip1) - platform-independent, runs via runtime bridge"
+      "install_path": "capsules/wallet-walletconnect",
+      "entrypoint": "browser/index.html",
+      "entrypoint_sha256": "sha256:6e18e94f36708b7a7b9ee1fa672cc69db871ffb7d6130062de8b99cd8ced906b",
+      "entrypoint_size": 1389,
+      "runtime_abi": "elastos.runtime-projection/v1",
+      "execution": "web-projection",
+      "bus_contract": "elastos.runtime-projection/v1",
+      "wit_world_sha256": null,
+      "projections": [
+        "web",
+        "facts",
+        "affordances",
+        "gates"
+      ],
+      "browser_assets": [
+        {
+          "path": "browser/index.html",
+          "sha256": "sha256:6e18e94f36708b7a7b9ee1fa672cc69db871ffb7d6130062de8b99cd8ced906b",
+          "size": 1389
+        },
+        {
+          "path": "browser/style.css",
+          "sha256": "sha256:3bafe2b1f9e88a5c474acdd7e3a2053ed4fd0848b6e624acd5098a0cbb639387",
+          "size": 4606
+        },
+        {
+          "path": "browser/wallet-walletconnect.js",
+          "sha256": "sha256:bb4efeaceacfcbb334123729e4108f2b06a264c004b58856801605ac980075ea",
+          "size": 17187
+        }
+      ]
     },
     "content-block-graph-provider": {
       "cid": "",

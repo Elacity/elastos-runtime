@@ -16,6 +16,8 @@ Configure tool paths with:
   ELASTOS_NODE_BIN
   ELASTOS_DEBUGFS_BIN
   ELASTOS_BROWSER_NATIVE_PROXY_BIN
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN
+  ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN
   ELASTOS_BROWSER_VM_ARTIFACT_DATA_DIR
   ELASTOS_BROWSER_VM_BACKUP_RETENTION (default: 2, range: 1..10)
 
@@ -162,6 +164,33 @@ find_turnserver() {
     return 1
 }
 
+find_vz_turn_program() {
+    if [[ -n "${ELASTOS_BROWSER_VM_TURN_PROGRAM:-}" ]]; then
+        if [[ ! -x "${ELASTOS_BROWSER_VM_TURN_PROGRAM}" ]]; then
+            echo "ELASTOS_BROWSER_VM_TURN_PROGRAM is not executable: ${ELASTOS_BROWSER_VM_TURN_PROGRAM}" >&2
+            return 2
+        fi
+        printf '%s\n' "${ELASTOS_BROWSER_VM_TURN_PROGRAM}"
+        return
+    fi
+    if command -v turnserver >/dev/null 2>&1; then
+        command -v turnserver
+        return
+    fi
+    local candidate
+    for candidate in \
+        /usr/bin/turnserver \
+        /usr/local/bin/turnserver \
+        /opt/homebrew/bin/turnserver
+    do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+    return 1
+}
+
 browser_vm_target_platform() {
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64) printf '%s\n' "linux-amd64" ;;
@@ -208,6 +237,110 @@ resolve_browser_vm_native_proxy_source() {
             ;;
     esac
     return 1
+}
+
+browser_vm_guest_rust_target() {
+    case "$1" in
+        linux-arm64) printf '%s\n' "aarch64-unknown-linux-musl" ;;
+        linux-amd64) printf '%s\n' "x86_64-unknown-linux-musl" ;;
+        *) return 1 ;;
+    esac
+}
+
+build_browser_vm_guest_helper() {
+    local manifest="$1"
+    local rust_target="$2"
+    local linker_env=""
+    local linker=""
+
+    case "$rust_target" in
+        aarch64-unknown-linux-musl)
+            linker_env="CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
+            ;;
+        x86_64-unknown-linux-musl)
+            linker_env="CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
+            ;;
+        *)
+            echo "unsupported Browser VM guest Rust target: $rust_target" >&2
+            exit 1
+            ;;
+    esac
+
+    if [[ "$(uname -s)" == "Darwin" && -z "${!linker_env:-}" ]]; then
+        local rustc_bin
+        local rust_sysroot
+        rustc_bin="$(command -v rustc || true)"
+        if [[ -z "$rustc_bin" ]]; then
+            echo "rustc not found; Browser VM guest helper cross-build cannot locate rust-lld" >&2
+            exit 1
+        fi
+        rust_sysroot="$("$rustc_bin" --print sysroot)"
+        linker="$(find "$rust_sysroot" -type f -name rust-lld -perm -111 -print -quit 2>/dev/null || true)"
+        if [[ -z "$linker" ]]; then
+            echo "rust-lld not found in $rust_sysroot; Browser VM guest helper cross-build is unavailable" >&2
+            exit 1
+        fi
+        env "$linker_env=$linker" "$CARGO_BIN" build --quiet \
+            --manifest-path "$manifest" \
+            --target "$rust_target" \
+            --release
+        return
+    fi
+
+    "$CARGO_BIN" build --quiet \
+        --manifest-path "$manifest" \
+        --target "$rust_target" \
+        --release
+}
+
+build_browser_vm_guest_helpers() {
+    local target_platform
+    local rust_target
+    target_platform="$(browser_vm_target_platform || true)"
+    rust_target="$(browser_vm_guest_rust_target "$target_platform" || true)"
+    if [[ -z "$rust_target" ]]; then
+        echo "Browser VM guest helper build is unsupported on ${target_platform:-this platform}" >&2
+        exit 1
+    fi
+
+    echo "[setup-source-home] build Browser VM guest relay helpers"
+    build_browser_vm_guest_helper \
+        "${ROOT}/elastos/tools/browser-vm-runtime-relay/Cargo.toml" \
+        "$rust_target"
+    build_browser_vm_guest_helper \
+        "${ROOT}/elastos/tools/browser-vm-guest-control-bridge/Cargo.toml" \
+        "$rust_target"
+}
+
+resolve_browser_vm_guest_helper_source() {
+    local label="$1"
+    local env_name="$2"
+    local crate_name="$3"
+    local binary_name="$4"
+    local target_platform="$5"
+    local explicit="${!env_name:-}"
+    local rust_target
+    local candidate
+
+    if [[ -n "$explicit" ]]; then
+        if [[ ! -x "$explicit" ]]; then
+            echo "$env_name is not executable: $explicit" >&2
+            return 2
+        fi
+        printf '%s\n' "$explicit"
+        return
+    fi
+
+    rust_target="$(browser_vm_guest_rust_target "$target_platform" || true)"
+    if [[ -z "$rust_target" ]]; then
+        return 1
+    fi
+    candidate="${ROOT}/elastos/tools/${crate_name}/target/${rust_target}/release/${binary_name}"
+    if [[ ! -x "$candidate" ]]; then
+        echo "$label source build is missing: $candidate" >&2
+        return 1
+    fi
+    printf '%s\n' "$candidate"
 }
 
 validate_linux_guest_binary() {
@@ -825,9 +958,41 @@ write_browser_vm_target_manifest() {
 JSON
 }
 
+refresh_browser_vm_native_helpers() {
+    local rootfs="$1"
+    local debugfs="$2"
+    local target_platform="$3"
+    local runtime_relay_source
+    local guest_control_bridge_source
+
+    runtime_relay_source="$(resolve_browser_vm_guest_helper_source \
+        "browser-vm-runtime-relay" \
+        "ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN" \
+        "browser-vm-runtime-relay" \
+        "browser-vm-runtime-relay" \
+        "$target_platform")"
+    guest_control_bridge_source="$(resolve_browser_vm_guest_helper_source \
+        "browser-vm-guest-control-bridge" \
+        "ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN" \
+        "browser-vm-guest-control-bridge" \
+        "browser-vm-guest-control-bridge" \
+        "$target_platform")"
+    validate_linux_guest_binary "browser-vm-runtime-relay" \
+        "$runtime_relay_source" "$target_platform"
+    validate_linux_guest_binary "browser-vm-guest-control-bridge" \
+        "$guest_control_bridge_source" "$target_platform"
+    refresh_browser_vm_rootfs_file "$rootfs" "$runtime_relay_source" \
+        "/opt/elastos/bin/browser-vm-runtime-relay" "0100755" \
+        "runtime-relay" "$debugfs"
+    refresh_browser_vm_rootfs_file "$rootfs" "$guest_control_bridge_source" \
+        "/opt/elastos/bin/browser-vm-guest-control-bridge" "0100755" \
+        "guest-control-bridge" "$debugfs"
+}
+
 refresh_browser_vm_rootfs_files() {
     local rootfs="${ELASTOS_BROWSER_VM_ROOTFS:-${DATA_DIR}/browser-vm/rootfs.ext4}"
     local control_source="${ROOT}/scripts/browser-selkies-control-service.mjs"
+    local vz_transport_bootstrap_source="${ROOT}/scripts/browser-vm-vz-transport-bootstrap.mjs"
 
     if [[ ! -f "$rootfs" ]]; then
         return
@@ -843,6 +1008,10 @@ refresh_browser_vm_rootfs_files() {
     local target_platform
     local native_proxy_source=""
     target_platform="$(browser_vm_target_platform || true)"
+    if [[ -z "$target_platform" ]]; then
+        echo "Browser VM rootfs helper refresh is unsupported on this platform" >&2
+        exit 1
+    fi
     if [[ -n "$target_platform" ]]; then
         if ! native_proxy_source="$(resolve_browser_vm_native_proxy_source "$target_platform")"; then
             if [[ -n "${ELASTOS_BROWSER_NATIVE_PROXY_BIN:-}" ]]; then
@@ -870,6 +1039,10 @@ refresh_browser_vm_rootfs_files() {
     refresh_browser_vm_rootfs_file "$rootfs" "$control_source" \
         "/opt/elastos/bin/browser-selkies-control-service.mjs" "0100644" \
         "control-service" "$debugfs"
+    refresh_browser_vm_rootfs_file "$rootfs" "$vz_transport_bootstrap_source" \
+        "/opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs" "0100755" \
+        "vz-transport-bootstrap" "$debugfs"
+    refresh_browser_vm_native_helpers "$rootfs" "$debugfs" "$target_platform"
     refresh_browser_vm_rootfs_file "$rootfs" "$init_source" \
         "/opt/elastos/bin/browser-vm-init" "0100755" \
         "vm-init" "$debugfs"
@@ -999,6 +1172,8 @@ install_browser_runtime_helpers() {
         "${DATA_DIR}/bin/browser-vm-control-service.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-remote-vz-launcher.mjs" \
         "${DATA_DIR}/bin/browser-vm-remote-vz-launcher.mjs"
+    install -m 755 "${ROOT}/scripts/browser-vm-vz-transport-bootstrap.mjs" \
+        "${DATA_DIR}/scripts/browser-vm-vz-transport-bootstrap.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-local-crosvm-launcher.mjs" \
         "${DATA_DIR}/bin/browser-vm-local-crosvm-launcher.mjs"
     install -m 755 "${ROOT}/scripts/browser-vm-prepare-rootfs-pool.mjs" \
@@ -1072,6 +1247,17 @@ start_browser_runtime_turn() {
     fi
     if has_remote_browser_vm_control_config; then
         echo "[setup-source-home] skip Browser runtime TURN relay: remote Browser VM control is preserved"
+        return
+    fi
+    if [[ "$PLATFORM" == "darwin-arm64" ]]; then
+        local vz_turn_program
+        vz_turn_program="$(find_vz_turn_program || true)"
+        if [[ -z "$vz_turn_program" ]]; then
+            echo "turnserver was not found; install coturn or set ELASTOS_BROWSER_VM_TURN_PROGRAM for launch-owned VZ TURN." >&2
+            exit 1
+        fi
+        export ELASTOS_BROWSER_VM_TURN_PROGRAM="$vz_turn_program"
+        echo "[setup-source-home] configure launch-owned Browser VZ TURN"
         return
     fi
     if [[ -n "${ELASTOS_BROWSER_VM_ICE_SERVER:-}" || -n "${ELASTOS_BROWSER_VM_ICE_SERVERS_JSON:-}" ]]; then
@@ -1329,7 +1515,7 @@ echo "[setup-source-home] rustup home: ${RUSTUP_HOME:-<default>}"
 mkdir -p "${DATA_DIR}"
 if [[ "${SETUP_SOURCE_HOME_CONFIG_ONLY:-0}" == "1" ]]; then
     install_browser_source_home_config
-    echo "[setup-source-home] config-only ready"
+    echo "[setup-source-home] config-only artifacts installed"
     exit 0
 fi
 
@@ -1348,6 +1534,7 @@ if [[ "$PLATFORM" == "darwin-arm64" ]]; then
     echo "[setup-source-home] build Browser VZ engine supervisor"
     "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/Cargo.toml" --release -p elastos-vz --bin browser-vz-engine-supervisor
 fi
+build_browser_vm_guest_helpers
 
 echo "[setup-source-home] build native provider binaries"
 "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
@@ -1419,11 +1606,12 @@ start_browser_runtime_turn
 install_browser_source_home_config
 
 cat <<EOF
-[setup-source-home] ready
+[setup-source-home] artifacts installed; offline principal-root upgrade and restart are required before readiness
 
-Start the Mac/Linux source gateway with:
-  HOME="${HOME}" "${ROOT}/elastos/target/release/elastos" gateway --addr localhost:45542
+Use the platform source-home restart script. It stops the Runtime, performs the
+canonical principal-root upgrade, and starts Home only after the readiness gate
+passes.
 
-Open:
-  http://localhost:45542/apps/home/
+Direct gateway startup remains fail-closed while a configured protected root
+contains declared plaintext or an incomplete migration journal.
 EOF

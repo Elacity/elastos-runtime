@@ -21,6 +21,7 @@ Options:
   --guest-control-bridge-bin PATH
                                 browser-vm-guest-control-bridge binary
   --control-service PATH        browser-selkies-control-service.mjs
+  --vz-transport-bootstrap PATH browser-vm-vz-transport-bootstrap.mjs
   --node-bin PATH               guest node binary
   --chromium-bin PATH           guest Chromium binary
   --target-platform PLATFORM    linux-amd64|linux-arm64 (default: host Linux arch,
@@ -39,6 +40,7 @@ native_proxy_bin="${ELASTOS_BROWSER_NATIVE_PROXY_BIN:-}"
 runtime_relay_bin="${ELASTOS_BROWSER_VM_RUNTIME_RELAY_BIN:-}"
 guest_control_bridge_bin="${ELASTOS_BROWSER_VM_GUEST_CONTROL_BRIDGE_BIN:-}"
 control_service="${ELASTOS_BROWSER_SELKIES_CONTROL_SERVICE:-${repo_root}/scripts/browser-selkies-control-service.mjs}"
+vz_transport_bootstrap="${ELASTOS_BROWSER_VM_VZ_TRANSPORT_BOOTSTRAP:-${repo_root}/scripts/browser-vm-vz-transport-bootstrap.mjs}"
 node_bin="${ELASTOS_BROWSER_VM_NODE_BIN:-}"
 chromium_bin="${ELASTOS_BROWSER_VM_CHROMIUM_BIN:-}"
 target_platform="${ELASTOS_BROWSER_VM_TARGET_PLATFORM:-}"
@@ -67,6 +69,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --control-service)
       control_service="${2:-}"
+      shift 2
+      ;;
+    --vz-transport-bootstrap)
+      vz_transport_bootstrap="${2:-}"
       shift 2
       ;;
     --node-bin)
@@ -225,6 +231,7 @@ native_proxy_bin="$(resolve_required_executable "browser-native-proxy-engine" "$
 runtime_relay_bin="$(resolve_required_executable "browser-vm-runtime-relay" "$runtime_relay_bin")"
 guest_control_bridge_bin="$(resolve_required_executable "browser-vm-guest-control-bridge" "$guest_control_bridge_bin")"
 control_service="$(resolve_required_file "browser-selkies-control-service.mjs" "$control_service")"
+vz_transport_bootstrap="$(resolve_required_file "browser-vm-vz-transport-bootstrap.mjs" "$vz_transport_bootstrap")"
 node_bin="$(resolve_required_executable "node" "$node_bin")"
 chromium_bin="$(resolve_required_executable "chromium" "$chromium_bin")"
 
@@ -248,6 +255,7 @@ install -m 755 "$native_proxy_bin" "$staging_dir/opt/elastos/bin/browser-native-
 install -m 755 "$runtime_relay_bin" "$staging_dir/opt/elastos/bin/browser-vm-runtime-relay"
 install -m 755 "$guest_control_bridge_bin" "$staging_dir/opt/elastos/bin/browser-vm-guest-control-bridge"
 install -m 644 "$control_service" "$staging_dir/opt/elastos/bin/browser-selkies-control-service.mjs"
+install -m 755 "$vz_transport_bootstrap" "$staging_dir/opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs"
 install -m 755 "$node_bin" "$staging_dir/opt/elastos/bin/node"
 install -m 755 "$chromium_bin" "$staging_dir/opt/elastos/bin/chromium.real"
 cat > "$staging_dir/opt/elastos/bin/chromium" <<'SH'
@@ -323,6 +331,93 @@ rootfs_checkpoint "main init log redirected"
 
 rootfs_checkpoint "rootfs diagnostics initialized"
 
+relay_console_log() {
+  message="$*"
+  rootfs_mark "$message"
+  if [ -w /dev/hvc0 ]; then
+    printf 'browser-vm-init: %s\n' "$message" >/dev/hvc0 2>/dev/null || true
+  fi
+}
+
+relay_start_failure() {
+  label="$1"
+  log_file="$2"
+  detail=""
+  if [ -f "$log_file" ]; then
+    detail="$(head -c 512 "$log_file" 2>/dev/null | tr '\r\n' '  ' || true)"
+  fi
+  [ -n "$detail" ] || detail="no bounded startup error was emitted"
+  relay_console_log "$label relay startup failed: $detail"
+}
+
+wait_for_runtime_relay_ready() {
+  label="$1"
+  relay_pid="$2"
+  ready_file="$3"
+  log_file="$4"
+  listener_kind="$5"
+  listener_value="$6"
+  listener_port="${7:-}"
+
+  for _ in $(seq 1 100); do
+    [ -s "$ready_file" ] && break
+    if ! kill -0 "$relay_pid" 2>/dev/null; then
+      wait "$relay_pid" 2>/dev/null || true
+      relay_start_failure "$label" "$log_file"
+      return 1
+    fi
+    sleep 0.1
+  done
+  if [ ! -s "$ready_file" ]; then
+    kill "$relay_pid" 2>/dev/null || true
+    wait "$relay_pid" 2>/dev/null || true
+    relay_start_failure "$label" "$log_file"
+    return 1
+  fi
+
+  if ! /opt/elastos/bin/node - \
+      "$ready_file" "$listener_kind" "$listener_value" "$listener_port" <<'NODE'
+const fs = require("fs");
+const [readyPath, expectedKind, expectedValue, expectedPort] = process.argv.slice(2);
+const lines = fs.readFileSync(readyPath, "utf8").trim().split(/\r?\n/).filter(Boolean);
+if (lines.length !== 1) process.exit(1);
+const receipt = JSON.parse(lines[0]);
+if (
+  receipt.schema !== "elastos.browser.vm-runtime-relay.ready/v1" ||
+  receipt.network_mode !== "runtime_net_only" ||
+  receipt.direct_network !== false ||
+  receipt.transport !== "vsock_listen" ||
+  receipt.guest_listener?.kind !== expectedKind
+) {
+  process.exit(1);
+}
+if (expectedKind === "unix_socket") {
+  if (receipt.guest_listener.path !== expectedValue || expectedPort !== "") process.exit(1);
+} else if (expectedKind === "loopback_tcp") {
+  if (
+    receipt.guest_listener.host !== expectedValue ||
+    receipt.guest_listener.port !== Number(expectedPort)
+  ) {
+    process.exit(1);
+  }
+} else {
+  process.exit(1);
+}
+NODE
+  then
+    kill "$relay_pid" 2>/dev/null || true
+    wait "$relay_pid" 2>/dev/null || true
+    relay_start_failure "$label" "$log_file"
+    return 1
+  fi
+
+  if [ "$listener_kind" = "loopback_tcp" ]; then
+    relay_console_log "$label relay ready listener=$listener_kind endpoint=$listener_value:$listener_port transport=vsock_listen"
+  else
+    relay_console_log "$label relay ready listener=$listener_kind transport=vsock_listen"
+  fi
+}
+
 dump_browser_logs() {
   for log in /var/log/elastos/browser-vm-*.log; do
     [ -f "$log" ] || continue
@@ -342,6 +437,16 @@ on_exit() {
   fi
   if [ "$status" -ne 0 ] && [ -n "${ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PID:-}" ]; then
     kill "$ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PID" 2>/dev/null || true
+  fi
+  if [ "$status" -ne 0 ]; then
+    for relay_pid in \
+      "${ELASTOS_BROWSER_VM_RUNTIME_RELAY_PID:-}" \
+      "${ELASTOS_BROWSER_VM_MEDIA_RELAY_PID:-}"
+    do
+      [ -n "$relay_pid" ] || continue
+      kill "$relay_pid" 2>/dev/null || true
+      wait "$relay_pid" 2>/dev/null || true
+    done
   fi
   exit "$status"
 }
@@ -432,6 +537,9 @@ elif command -v busybox >/dev/null 2>&1; then
 fi
 
 ELASTOS_BROWSER_VM_TRANSPORT="$(cmdline_value elastos.browser_transport || printf '%s\n' "${ELASTOS_BROWSER_VM_TRANSPORT:-vsock}")"
+ELASTOS_BROWSER_VM_VZ_TRANSPORT="$(cmdline_value elastos.browser_vz_transport || printf '%s\n' "${ELASTOS_BROWSER_VM_VZ_TRANSPORT:-}")"
+ELASTOS_BROWSER_VM_BOOTSTRAP_PORT="$(cmdline_value elastos.browser_bootstrap_port || printf '%s\n' "${ELASTOS_BROWSER_VM_BOOTSTRAP_PORT:-}")"
+export ELASTOS_BROWSER_VM_VZ_TRANSPORT
 ELASTOS_BROWSER_VM_HOST_IP="$(cmdline_value elastos.browser_host_ip || printf '%s\n' "${ELASTOS_BROWSER_VM_HOST_IP:-}")"
 ELASTOS_BROWSER_VM_GUEST_IP="$(cmdline_value elastos.browser_guest_ip || printf '%s\n' "${ELASTOS_BROWSER_VM_GUEST_IP:-}")"
 ELASTOS_BROWSER_VM_NET_PREFIX="$(cmdline_value elastos.browser_net_prefix || printf '%s\n' "${ELASTOS_BROWSER_VM_NET_PREFIX:-30}")"
@@ -484,8 +592,135 @@ ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PORT="$(cmdline_value elastos.browser_control_
 : "${ELASTOS_BROWSER_VM_GUEST_RELAY_IPC:=/run/elastos/browser-exit.sock}"
 : "${ELASTOS_BROWSER_VM_CONTROL_SOCKET:=/run/elastos/browser-selkies-control.sock}"
 ELASTOS_BROWSER_VM_CONTROL_BRIDGE_PID=""
+ELASTOS_BROWSER_VM_RUNTIME_RELAY_PID=""
+ELASTOS_BROWSER_VM_MEDIA_RELAY_PID=""
 
-if [ "$ELASTOS_BROWSER_VM_TRANSPORT" = "private_tcp" ]; then
+if [ "$ELASTOS_BROWSER_VM_VZ_TRANSPORT" = "vsock_v1" ]; then
+  case "$ELASTOS_BROWSER_VM_BOOTSTRAP_PORT" in
+    ''|*[!0-9]*|0)
+      echo "browser-vm-init: VZ transport requires a valid bootstrap vsock port" >&2
+      exit 1
+      ;;
+  esac
+  ELASTOS_BROWSER_VM_BOOTSTRAP_SOCKET=/run/elastos/browser-vz-transport-bootstrap.sock
+  cat > /run/elastos/browser-vm-bootstrap-relay.json <<JSON
+{
+  "schema": "elastos.browser.vm-runtime-relay.config/v1",
+  "guest_relay_ipc_path": "${ELASTOS_BROWSER_VM_BOOTSTRAP_SOCKET}",
+  "network_mode": "runtime_net_only",
+  "direct_network": false,
+  "transport": {
+    "kind": "vsock_listen",
+    "port": ${ELASTOS_BROWSER_VM_BOOTSTRAP_PORT}
+  },
+  "replace_existing_socket": true,
+  "max_sessions": 1
+}
+JSON
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_CONFIG="$(cat /run/elastos/browser-vm-bootstrap-relay.json)" \
+    /opt/elastos/bin/browser-vm-runtime-relay \
+    >/run/elastos/browser-vm-bootstrap-relay.ready 2>/var/log/elastos/browser-vm-bootstrap-relay.log &
+  ELASTOS_BROWSER_VM_BOOTSTRAP_RELAY_PID="$!"
+  for _ in $(seq 1 100); do
+    [ -S "$ELASTOS_BROWSER_VM_BOOTSTRAP_SOCKET" ] && break
+    sleep 0.1
+  done
+  [ -S "$ELASTOS_BROWSER_VM_BOOTSTRAP_SOCKET" ] || {
+    echo "browser-vm-init: VZ transport bootstrap relay did not start" >&2
+    exit 1
+  }
+  ELASTOS_BROWSER_VM_VZ_TRANSPORT_BOOTSTRAP_CONFIG='{"schema":"elastos.browser.vz-transport-bootstrap.config/v1","relay_socket_path":"/run/elastos/browser-vz-transport-bootstrap.sock","authority_path":"/run/elastos/browser-vz-transport-authority.json","ice_servers_path":"/run/elastos/browser-ice-servers.json"}' \
+    /opt/elastos/bin/node /opt/elastos/bin/browser-vm-vz-transport-bootstrap.mjs
+  wait "$ELASTOS_BROWSER_VM_BOOTSTRAP_RELAY_PID"
+  read_vz_authority_field() {
+    /opt/elastos/bin/node -e '
+      const fs = require("fs");
+      const authority = JSON.parse(fs.readFileSync("/run/elastos/browser-vz-transport-authority.json", "utf8"));
+      const fields = {
+        egress_port: authority.egress?.vsock_port,
+        media_port: authority.media?.vsock_port,
+        guest_host: authority.turn?.guest_host,
+        guest_port: authority.turn?.guest_port,
+      };
+      const value = fields[process.argv[1]];
+      if (typeof value !== "string" && !Number.isInteger(value)) process.exit(2);
+      process.stdout.write(String(value));
+    ' "$1"
+  }
+  ELASTOS_BROWSER_VM_RELAY_PORT="$(read_vz_authority_field egress_port)"
+  ELASTOS_BROWSER_VM_MEDIA_RELAY_PORT="$(read_vz_authority_field media_port)"
+  ELASTOS_BROWSER_VM_GUEST_TURN_HOST="$(read_vz_authority_field guest_host)"
+  ELASTOS_BROWSER_VM_GUEST_TURN_PORT="$(read_vz_authority_field guest_port)"
+  cat > /run/elastos/browser-vm-runtime-relay.json <<JSON
+{
+  "schema": "elastos.browser.vm-runtime-relay.config/v1",
+  "guest_relay_ipc_path": "${ELASTOS_BROWSER_VM_GUEST_RELAY_IPC}",
+  "network_mode": "runtime_net_only",
+  "direct_network": false,
+  "transport": {
+    "kind": "vsock_listen",
+    "port": ${ELASTOS_BROWSER_VM_RELAY_PORT}
+  },
+  "replace_existing_socket": true
+}
+JSON
+  cat > /run/elastos/browser-vm-media-relay.json <<JSON
+{
+  "schema": "elastos.browser.vm-runtime-relay.config/v1",
+  "guest_loopback_tcp": {
+    "host": "${ELASTOS_BROWSER_VM_GUEST_TURN_HOST}",
+    "port": ${ELASTOS_BROWSER_VM_GUEST_TURN_PORT}
+  },
+  "network_mode": "runtime_net_only",
+  "direct_network": false,
+  "transport": {
+    "kind": "vsock_listen",
+    "port": ${ELASTOS_BROWSER_VM_MEDIA_RELAY_PORT}
+  }
+}
+JSON
+  chmod 600 \
+    /run/elastos/browser-vm-runtime-relay.json \
+    /run/elastos/browser-vm-media-relay.json
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY=/run/elastos/browser-vm-runtime-relay.ready
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG=/var/log/elastos/browser-vm-runtime-relay.log
+  ELASTOS_BROWSER_VM_MEDIA_RELAY_READY=/run/elastos/browser-vm-media-relay.ready
+  ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG=/var/log/elastos/browser-vm-media-relay.log
+  : >"$ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY"
+  : >"$ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG"
+  : >"$ELASTOS_BROWSER_VM_MEDIA_RELAY_READY"
+  : >"$ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG"
+  chmod 600 \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY" \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_READY" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG"
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_CONFIG="$(cat /run/elastos/browser-vm-runtime-relay.json)" \
+    /opt/elastos/bin/browser-vm-runtime-relay \
+    >"$ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY" \
+    2>"$ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG" &
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_PID="$!"
+  wait_for_runtime_relay_ready \
+    "ordinary runtime" \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_PID" \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_READY" \
+    "$ELASTOS_BROWSER_VM_RUNTIME_RELAY_LOG" \
+    "unix_socket" \
+    "$ELASTOS_BROWSER_VM_GUEST_RELAY_IPC"
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_CONFIG="$(cat /run/elastos/browser-vm-media-relay.json)" \
+    /opt/elastos/bin/browser-vm-runtime-relay \
+    >"$ELASTOS_BROWSER_VM_MEDIA_RELAY_READY" \
+    2>"$ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG" &
+  ELASTOS_BROWSER_VM_MEDIA_RELAY_PID="$!"
+  wait_for_runtime_relay_ready \
+    "media runtime" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_PID" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_READY" \
+    "$ELASTOS_BROWSER_VM_MEDIA_RELAY_LOG" \
+    "loopback_tcp" \
+    "$ELASTOS_BROWSER_VM_GUEST_TURN_HOST" \
+    "$ELASTOS_BROWSER_VM_GUEST_TURN_PORT"
+elif [ "$ELASTOS_BROWSER_VM_TRANSPORT" = "private_tcp" ]; then
   cat > /run/elastos/browser-vm-runtime-relay.json <<JSON
 {
   "schema": "elastos.browser.vm-runtime-relay.config/v1",
@@ -517,8 +752,10 @@ JSON
 fi
 rootfs_checkpoint "runtime relay config written"
 
-ELASTOS_BROWSER_VM_RUNTIME_RELAY_CONFIG="$(cat /run/elastos/browser-vm-runtime-relay.json)" \
-  /opt/elastos/bin/browser-vm-runtime-relay &
+if [ "$ELASTOS_BROWSER_VM_VZ_TRANSPORT" != "vsock_v1" ]; then
+  ELASTOS_BROWSER_VM_RUNTIME_RELAY_CONFIG="$(cat /run/elastos/browser-vm-runtime-relay.json)" \
+    /opt/elastos/bin/browser-vm-runtime-relay &
+fi
 
 echo "browser-vm-init: runtime relay started at ${ELASTOS_BROWSER_VM_GUEST_RELAY_IPC}" >&2
 rootfs_checkpoint "runtime relay started"
@@ -1096,6 +1333,58 @@ if not spec or not spec.origin:
 
 path = Path(spec.origin)
 text = path.read_text()
+main_path = path.with_name("__main__.py")
+if not main_path.is_file():
+    raise SystemExit("browser-vm-selkies-start: Selkies __main__.py not found")
+main_text = main_path.read_text()
+transport_helper_marker = "\ndef parse_rtc_config(data):\n"
+transport_helper_patch = '''
+def _elastos_turn_transport_query(url):
+    raw_query = urllib.parse.urlsplit(url).query
+    if not raw_query:
+        return ""
+    query = urllib.parse.parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=True,
+    )
+    if set(query) - {"transport"}:
+        raise ValueError("TURN URL contains unsupported query parameters")
+    transports = query.get("transport", [])
+    if not transports:
+        return ""
+    if len(transports) != 1 or transports[0] not in ("udp", "tcp"):
+        raise ValueError("TURN transport must be exactly udp or tcp")
+    return "?transport=" + transports[0]
+'''
+turn_uri_marker = '''                turn_uri = "turn://%s:%s@%s:%s" % (
+                    urllib.parse.quote(turn_user, safe=""),
+                    urllib.parse.quote(turn_password, safe=""),
+                    turn_host,
+                    turn_port
+                )
+'''
+turn_uri_patch = '''                turn_uri = "turn://%s:%s@%s:%s%s" % (
+                    urllib.parse.quote(turn_user, safe=""),
+                    urllib.parse.quote(turn_password, safe=""),
+                    turn_host,
+                    turn_port,
+                    _elastos_turn_transport_query(url)
+                )
+'''
+if "_elastos_turn_transport_query" not in main_text:
+    if transport_helper_marker not in main_text:
+        raise SystemExit("browser-vm-selkies-start: Selkies RTC parser patch target not found")
+    if turn_uri_marker not in main_text:
+        raise SystemExit("browser-vm-selkies-start: Selkies TURN URI patch target not found")
+    main_text = main_text.replace(
+        transport_helper_marker,
+        transport_helper_patch + transport_helper_marker,
+        1,
+    )
+    main_text = main_text.replace(turn_uri_marker, turn_uri_patch, 1)
+if "_elastos_turn_transport_query(url)" not in main_text:
+    raise SystemExit("browser-vm-selkies-start: Selkies TURN transport patch incomplete")
 fraction_needle = "from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC\n    fract = Gst.Fraction(60, 1)"
 fraction_replacement = """from gi.repository import GLib, Gst, GstRtp, GstSdp, GstWebRTC
     def _elastos_raw_caps_with_framerate(framerate):
@@ -1171,6 +1460,15 @@ turn_patch = '''        if elastos_ice_transport_policy:
             self.webrtcbin.set_property("ice-transport-policy", policy_value)
             logger.info("confirmed ICE transport policy after TURN setup: %s", elastos_ice_transport_policy)
 '''
+local_address_marker = '        self.pipeline.add(self.webrtcbin)\n'
+local_address_patch = '''        if os.environ.get("ELASTOS_BROWSER_VM_VZ_TRANSPORT", "").strip() == "vsock_v1":
+            self._elastos_vz_ice_agent = self.webrtcbin.get_property("ice-agent")
+            if self._elastos_vz_ice_agent is None:
+                raise GSTWebRTCAppError("VZ ICE agent is unavailable")
+            if not self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1"):
+                raise GSTWebRTCAppError("VZ ICE loopback address was rejected")
+            logger.info("using explicit VZ ICE local address: 127.0.0.1")
+'''
 if "elastos_ice_transport_policy" not in text:
     if marker not in text:
         raise SystemExit("browser-vm-selkies-start: Selkies relay patch target not found")
@@ -1181,6 +1479,17 @@ if "confirmed ICE transport policy after TURN setup" not in text:
     text = text.replace(turn_marker, turn_marker + turn_patch, 1)
 if "confirmed ICE transport policy after TURN setup" not in text:
     raise SystemExit("browser-vm-selkies-start: Selkies relay policy patch incomplete")
+if local_address_patch in text:
+    text = text.replace(local_address_patch, "", 1)
+if local_address_marker not in text:
+    raise SystemExit("browser-vm-selkies-start: Selkies ICE local address patch target not found")
+text = text.replace(
+    local_address_marker,
+    local_address_marker + local_address_patch,
+    1,
+)
+if 'self._elastos_vz_ice_agent.emit("add-local-ip-address", "127.0.0.1")' not in text:
+    raise SystemExit("browser-vm-selkies-start: Selkies VZ ICE local address patch incomplete")
 ice_log_marker = '        logger.debug("received ICE candidate: %d %s", mlineindex, candidate)\n'
 ice_log_patch = '        logger.info("emitting ICE candidate: %d %s", mlineindex, candidate)\n'
 if ice_log_patch not in text:
@@ -1326,6 +1635,7 @@ if audio_offer_patch not in text:
         raise SystemExit("browser-vm-selkies-start: Selkies split audio offer patch target not found")
     text = text.replace(audio_offer_marker, audio_offer_patch, 1)
 path.write_text(text)
+main_path.write_text(main_text)
 PY
 }
 
@@ -1402,13 +1712,6 @@ configure_static_media_relay_ipv4() {
     busybox ip addr add "${ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4}/${ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX}" dev "$iface" 2>/dev/null || true
   fi
   echo "browser-vm-selkies-start: media relay IPv4 ${ELASTOS_BROWSER_VM_MEDIA_RELAY_GUEST_IPV4}/${ELASTOS_BROWSER_VM_MEDIA_RELAY_PREFIX} assigned on ${iface}" >&2
-}
-
-log_media_relay_config() {
-  echo "browser-vm-selkies-start: ICE config follows" >&2
-  cat /run/elastos/browser-rtc.json >&2 || true
-  echo "browser-vm-selkies-start: media relay network config follows" >&2
-  cat /run/elastos/browser-media-relay-network.json >&2 || true
 }
 
 /opt/elastos/bin/node <<'NODE'
@@ -1536,29 +1839,48 @@ function normalizeEntry(entry) {
 const entries = [];
 const bootIceConfig = decodeHexJson(cmdlineValue("elastos.browser_ice_config_hex"));
 const displayMode = cmdlineValue("elastos.browser_display_mode") || "webrtc_remote_display";
+const vzTransport = cmdlineValue("elastos.browser_vz_transport");
 function configValue(name) {
   return process.env[name] || bootIceConfig[name] || "";
 }
 
-if (configValue("ELASTOS_BROWSER_VM_ICE_SERVER")) {
-  entries.push(configValue("ELASTOS_BROWSER_VM_ICE_SERVER"));
-}
-if (configValue("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON")) {
-  let parsed;
-  try {
-    parsed = JSON.parse(configValue("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON"));
-  } catch (error) {
-    fail(`ELASTOS_BROWSER_VM_ICE_SERVERS_JSON is invalid JSON: ${error.message}`);
+if (vzTransport === "vsock_v1") {
+  const stat = fs.statSync("/run/elastos/browser-ice-servers.json");
+  if (!stat.isFile() || (stat.mode & 0o077) !== 0) {
+    fail("Browser VZ ICE config must remain owner-only");
   }
-  if (!Array.isArray(parsed)) {
-    fail("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON must be an array");
+  const parsed = JSON.parse(
+    fs.readFileSync("/run/elastos/browser-ice-servers.json", "utf8"),
+  );
+  if (!Array.isArray(parsed) || parsed.length !== 1) {
+    fail("Browser VZ ICE config must contain one launch-bound server");
   }
   entries.push(...parsed);
+} else {
+  if (configValue("ELASTOS_BROWSER_VM_ICE_SERVER")) {
+    entries.push(configValue("ELASTOS_BROWSER_VM_ICE_SERVER"));
+  }
+  if (configValue("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON")) {
+    let parsed;
+    try {
+      parsed = JSON.parse(configValue("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON"));
+    } catch (error) {
+      fail(`ELASTOS_BROWSER_VM_ICE_SERVERS_JSON is invalid JSON: ${error.message}`);
+    }
+    if (!Array.isArray(parsed)) {
+      fail("ELASTOS_BROWSER_VM_ICE_SERVERS_JSON must be an array");
+    }
+    entries.push(...parsed);
+  }
 }
 if (entries.length > 8) fail("at most 8 ICE server entries are supported");
 
-const credential = configValue("ELASTOS_BROWSER_VM_ICE_CREDENTIAL");
-const username = configValue("ELASTOS_BROWSER_VM_ICE_USERNAME");
+const credential = vzTransport === "vsock_v1"
+  ? ""
+  : configValue("ELASTOS_BROWSER_VM_ICE_CREDENTIAL");
+const username = vzTransport === "vsock_v1"
+  ? ""
+  : configValue("ELASTOS_BROWSER_VM_ICE_USERNAME");
 if ((username && !credential) || (!username && credential)) {
   fail("ELASTOS_BROWSER_VM_ICE_USERNAME and ELASTOS_BROWSER_VM_ICE_CREDENTIAL must be set together");
 }
@@ -1580,13 +1902,17 @@ if (username && credential) {
   }
 }
 
-const policy = configValue("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY") || "relay";
+const policy = vzTransport === "vsock_v1"
+  ? "relay"
+  : configValue("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY") || "relay";
 if (!["all", "relay"].includes(policy)) {
   fail("ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY must be all or relay");
 }
 const effectivePolicy = policy;
 const relayHostIpv4 = normalizeIpv4(
-  configValue("ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4") || firstTurnIpv4Host(iceServers),
+  vzTransport === "vsock_v1"
+    ? ""
+    : configValue("ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4") || firstTurnIpv4Host(iceServers),
   "ELASTOS_BROWSER_VM_MEDIA_RELAY_HOST_IPV4",
 );
 const relayGuestIpv4 = normalizeIpv4(
@@ -1600,7 +1926,9 @@ const relayPrefix = normalizePrefix(
 fs.writeFileSync(
   "/run/elastos/browser-ice-servers.json",
   `${JSON.stringify(iceServers)}\n`,
+  { mode: 0o600 },
 );
+fs.chmodSync("/run/elastos/browser-ice-servers.json", 0o600);
 fs.writeFileSync(
   "/run/elastos/browser-ice-transport-policy",
   `${effectivePolicy}\n`,
@@ -1612,7 +1940,9 @@ fs.writeFileSync(
     iceTransportPolicy: effectivePolicy,
     blockStatus: "NOT_BLOCKED",
   })}\n`,
+  { mode: 0o600 },
 );
+fs.chmodSync("/run/elastos/browser-rtc.json", 0o600);
 fs.writeFileSync(
   "/run/elastos/browser-media-relay-network.json",
   `${JSON.stringify({
@@ -1637,9 +1967,8 @@ export ELASTOS_BROWSER_VM_ICE_TRANSPORT_POLICY
 selkies_checkpoint "ice config written"
 patch_selkies_relay_policy
 selkies_checkpoint "selkies relay policy patched"
-log_media_relay_config
 
-if [ "$(cat /run/elastos/browser-ice-servers.json)" != "[]" ]; then
+if [ "$ELASTOS_BROWSER_VM_VZ_TRANSPORT" != "vsock_v1" ] && [ "$(cat /run/elastos/browser-ice-servers.json)" != "[]" ]; then
   setup_media_relay_network
 fi
 selkies_checkpoint "media relay network initialized"

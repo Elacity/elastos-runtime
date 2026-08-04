@@ -17,11 +17,10 @@ import {
   saveShellLayoutState,
   loadShellSessionState,
   saveShellSessionState,
-  clearShellSessionState,
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260728ag";
+} from "./shell-core.js?v=home-20260725a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -31,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260728ag";
+} from "./shell-window-geometry.js?v=home-20260725a";
 import { playUiSound } from "./shell-sounds.js?v=home-20260728ag";
 import {
   applyFullscreenStageFromPlacement,
@@ -70,6 +69,13 @@ const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
 const WINDOW_OPEN_CLOSE_GHOST_GUARD_MS = 2600;
 const WINDOW_CLOSE_GUARD_MOVE_PX = 18;
 const BROWSER_DESKTOP_OPEN_GUARD_MS = 700;
+// Four 8s Runtime close attempts plus bounded 1.2s, 3s, and 7s retries.
+const BROWSER_WINDOW_CLOSE_TIMEOUT_MS = 50_000;
+const BROWSER_WINDOW_CLOSE_REQUEST_TYPE =
+  "elastos.browser.window-close.request/v1";
+const BROWSER_WINDOW_CLOSE_RESULT_TYPE =
+  "elastos.browser.window-close.result/v1";
+const OPAQUE_CAPSULE_ORIGIN = "null";
 const MAX_SESSION_WINDOWS = 24;
 const SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"]);
 
@@ -78,6 +84,15 @@ const SINGLE_SESSION_TARGETS = new Set(["people", "inbox", "wallet"]);
 export function supportsMenuNewWindow(targetId) {
   return !SINGLE_SESSION_TARGETS.has(targetId);
 }
+
+const WALLET_CONNECTOR_TARGETS = new Set([
+  "wallet-metamask",
+  "wallet-unisat",
+]);
+const NON_RESTORABLE_SESSION_TARGETS = new Set(WALLET_CONNECTOR_TARGETS);
+const WALLET_CONNECTOR_WINDOW_WIDTH = 480;
+const WALLET_CONNECTOR_WINDOW_HEIGHT = 560;
+const WALLET_CONNECTOR_WINDOW_EDGE_INSET = 24;
 
 const COMMON_IFRAME_SANDBOX = [
   "allow-downloads",
@@ -99,13 +114,10 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
   "allow-top-navigation-to-custom-protocols",
 ];
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
-const BROWSER_IFRAME_ALLOW_EXTRAS = ["clipboard-read", "clipboard-write"];
-/* Wallet needs write so address / recovery copy works in the opaque frame.
-   Read stays Browser-only — paste into Wallet is not a product path. */
-const WALLET_IFRAME_ALLOW_EXTRAS = ["clipboard-write"];
-/* Chat invite Copy uses navigator.clipboard.writeText in the opaque frame. */
-const CHAT_IFRAME_ALLOW_EXTRAS = ["clipboard-write"];
 const pendingWindowLaunches = new Set();
+const pendingBrowserWindowCloses = new Map();
+
+window.addEventListener("message", handleBrowserWindowCloseResult);
 
 export function iframeSandboxForLaunch(launched) {
   const tokens = [...COMMON_IFRAME_SANDBOX];
@@ -124,18 +136,8 @@ export function iframeSandboxForLaunch(launched) {
   return tokens.join(" ");
 }
 
-export function iframeAllowForLaunch(launched) {
-  const tokens = [...COMMON_IFRAME_ALLOW];
-  if (launched?.target === "browser") {
-    tokens.push(...BROWSER_IFRAME_ALLOW_EXTRAS);
-  }
-  if (launched?.target === "wallet") {
-    tokens.push(...WALLET_IFRAME_ALLOW_EXTRAS);
-  }
-  if (launched?.target === "chat" || launched?.target === "chat-room") {
-    tokens.push(...CHAT_IFRAME_ALLOW_EXTRAS);
-  }
-  return tokens.join("; ");
+function iframeAllowForLaunch() {
+  return COMMON_IFRAME_ALLOW.join("; ");
 }
 
 export function configureWindowHooks(nextHooks) {
@@ -197,7 +199,9 @@ function currentWindowRestoreBounds(node) {
 
 function persistedBrowserSessionEntries() {
   return sortWindowEntriesByZOrder(
-    browserWindowEntries(),
+    browserWindowEntries().filter(
+      (entry) => !NON_RESTORABLE_SESSION_TARGETS.has(entry.targetId),
+    ),
   )
     .reverse()
     .slice(0, MAX_SESSION_WINDOWS)
@@ -280,8 +284,7 @@ function persistBrowserSession() {
   if (shellState.restoringSession) {
     return;
   }
-  const rootShell = currentRootShellSessionId();
-  const windows = persistedBrowserSessionEntries();
+  const snapshot = snapshotBrowserSession();
   const desktops = [...getExtraDesktops()];
   const activeStage = stableSpaceKeyForId(getActiveStageId());
   const spaceOrder = (
@@ -289,8 +292,7 @@ function persistBrowserSession() {
   ).map((id) => stableSpaceKeyForId(id));
   const agent = agentWorkspaceForPersist();
   const payload = {
-    root_shell: rootShell,
-    windows,
+    ...snapshot,
     desktops,
     active_stage: activeStage,
     space_order: spaceOrder,
@@ -307,6 +309,12 @@ function persistBrowserSession() {
   saveShellSessionState(payload);
 }
 
+export function snapshotBrowserSession() {
+  return {
+    root_shell: currentRootShellSessionId(),
+    windows: persistedBrowserSessionEntries(),
+  };
+}
 
 /** Snap Shelf + harness after refresh when active_stage was Agent. */
 async function restoreAgentSurface(storedSession) {
@@ -710,6 +718,12 @@ function removeWindowEntries(entries) {
     // Reduced-motion / failed choreography — fall through to instant teardown.
   }
 
+  const returnFocusToWallet = entries.some(
+    (entry) =>
+      shellState.activeWindowId === entry.id &&
+      WALLET_CONNECTOR_TARGETS.has(entry.targetId),
+  );
+
   for (const entry of entries) {
     tearDownWindowEntry(entry);
   }
@@ -724,12 +738,311 @@ function removeWindowEntries(entries) {
   }
   if (removedActiveWindow) {
     shellState.activeWindowId = null;
-    focusTopVisibleWindow();
+    const wallet = returnFocusToWallet
+      ? topBrowserWindowEntryForTarget("wallet", { includeHidden: false })
+      : null;
+    if (wallet) {
+      focusWindow(wallet.id);
+    } else {
+      focusTopVisibleWindow();
+    }
   } else {
     requireWindowHooks().refreshLauncherIfVisible();
     persistBrowserSession();
   }
   return true;
+}
+
+function hasExactKeys(value, expectedKeys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index]);
+}
+
+function browserWindowCloseContext(entry) {
+  if (!entry || entry.targetId !== "browser") {
+    return null;
+  }
+  const frame = entry.node.querySelector(".window-frame");
+  let frameWindow = null;
+  try {
+    frameWindow = frame?.contentWindow || null;
+  } catch (_error) {
+    return null;
+  }
+  const route = frame?.dataset?.route || frame?.getAttribute("src") || "";
+  let homeToken = "";
+  try {
+    const url = new URL(route, window.location.href);
+    homeToken =
+      new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") || "";
+  } catch (_error) {
+    return null;
+  }
+  const browserInstance =
+    typeof entry.launchQuery?.browser_instance === "string"
+      ? entry.launchQuery.browser_instance
+      : "";
+  if (!frameWindow || !homeToken || !browserInstance) {
+    return null;
+  }
+  return { browserInstance, frameWindow, homeToken };
+}
+
+function browserWindowCloseRequestId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(
+      bytes,
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("");
+  }
+  throw new Error("Home GUI requires browser crypto for close isolation");
+}
+
+function markBrowserWindowCloseState(entry, state) {
+  if (!entry || !shellState.windows.has(entry.id)) {
+    return;
+  }
+  const closeButton = entry.node.querySelector("[data-action='close']");
+  entry.node.dataset.browserCloseState = state;
+  closeButton.disabled = state === "pending";
+  if (state === "retry") {
+    closeButton.setAttribute("aria-label", "Retry Browser close");
+    closeButton.title = "Runtime cleanup is pending. Activate to retry close.";
+    return;
+  }
+  closeButton.setAttribute("aria-label", "Close");
+  closeButton.title = state === "pending" ? "Closing Browser…" : "";
+}
+
+function settleBrowserWindowClose(record, terminal) {
+  window.clearTimeout(record.timeout);
+  pendingBrowserWindowCloses.delete(record.requestId);
+  if (record.entry.browserCloseRequest === record) {
+    delete record.entry.browserCloseRequest;
+  }
+  if (terminal && shellState.windows.get(record.entry.id) === record.entry) {
+    removeWindowEntries([record.entry]);
+    record.resolve(true);
+    return;
+  }
+  markBrowserWindowCloseState(record.entry, "retry");
+  record.resolve(false);
+}
+
+function handleBrowserWindowCloseResult(event) {
+  const message = event.data;
+  if (
+    event.origin !== OPAQUE_CAPSULE_ORIGIN ||
+    !hasExactKeys(message, [
+      "type",
+      "requestId",
+      "homeToken",
+      "browserInstance",
+      "state",
+      "pageId",
+      "generation",
+      "cleanupId",
+      "terminalKind",
+      "reason",
+    ]) ||
+    message.type !== BROWSER_WINDOW_CLOSE_RESULT_TYPE
+  ) {
+    return;
+  }
+  const record = pendingBrowserWindowCloses.get(message.requestId);
+  if (
+    !record ||
+    event.source !== record.frameWindow ||
+    message.homeToken !== record.homeToken ||
+    message.browserInstance !== record.browserInstance ||
+    !["terminal", "pending", "error"].includes(message.state) ||
+    typeof message.pageId !== "string" ||
+    !Number.isSafeInteger(message.generation) ||
+    message.generation < 0 ||
+    typeof message.cleanupId !== "string" ||
+    typeof message.terminalKind !== "string" ||
+    typeof message.reason !== "string"
+  ) {
+    return;
+  }
+  const lifecycle = {
+    pageId: message.pageId,
+    generation: message.generation,
+    cleanupId: message.cleanupId,
+  };
+  const matchesBoundLifecycle =
+    !record.lifecycle ||
+    (record.lifecycle.pageId === lifecycle.pageId &&
+      record.lifecycle.generation === lifecycle.generation &&
+      record.lifecycle.cleanupId === lifecycle.cleanupId);
+  if (message.state === "pending") {
+    if (
+      message.terminalKind !== "" ||
+      !message.reason ||
+      !matchesBoundLifecycle
+    ) {
+      return;
+    }
+    const hasLifecycle = Boolean(message.pageId && message.cleanupId);
+    if (
+      hasLifecycle !== Boolean(message.pageId || message.cleanupId) ||
+      (!hasLifecycle && message.generation !== 0)
+    ) {
+      return;
+    }
+    if (!record.lifecycle && hasLifecycle) {
+      record.lifecycle = Object.freeze(lifecycle);
+    }
+    return;
+  }
+  if (message.state === "error") {
+    if (message.terminalKind === "" && message.reason) {
+      settleBrowserWindowClose(record, false);
+    }
+    return;
+  }
+  const terminal =
+    message.reason === "" &&
+    ((["closed", "already_absent"].includes(message.terminalKind) &&
+      Boolean(message.pageId && message.cleanupId) &&
+      Boolean(record.lifecycle) &&
+      matchesBoundLifecycle) ||
+      (message.terminalKind === "no_page" &&
+        !record.lifecycle &&
+        message.pageId === "" &&
+        message.generation === 0 &&
+        message.cleanupId === ""));
+  if (terminal) {
+    settleBrowserWindowClose(record, true);
+  }
+}
+
+function requestBrowserWindowClose(entry) {
+  if (entry.browserCloseRequest) {
+    return entry.browserCloseRequest.promise;
+  }
+  const context = browserWindowCloseContext(entry);
+  if (!context) {
+    markBrowserWindowCloseState(entry, "retry");
+    return Promise.resolve(false);
+  }
+  const requestId = browserWindowCloseRequestId();
+  let resolveRequest;
+  const promise = new Promise((resolve) => {
+    resolveRequest = resolve;
+  });
+  const record = {
+    ...context,
+    entry,
+    promise,
+    requestId,
+    resolve: resolveRequest,
+    timeout: 0,
+  };
+  record.timeout = window.setTimeout(() => {
+    settleBrowserWindowClose(record, false);
+  }, BROWSER_WINDOW_CLOSE_TIMEOUT_MS);
+  entry.browserCloseRequest = record;
+  pendingBrowserWindowCloses.set(requestId, record);
+  markBrowserWindowCloseState(entry, "pending");
+  context.frameWindow.postMessage(
+    {
+      type: BROWSER_WINDOW_CLOSE_REQUEST_TYPE,
+      requestId,
+      homeToken: context.homeToken,
+      browserInstance: context.browserInstance,
+    },
+    "*",
+  );
+  return promise;
+}
+
+function browserLaunchAuthority(route) {
+  try {
+    const url = new URL(route, window.location.href);
+    return {
+      browserInstance: url.searchParams.get("browser_instance") || "",
+      homeToken:
+        new URLSearchParams(url.hash.replace(/^#/, "")).get("home_token") ||
+        "",
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+export function renewBrowserWindowAuthority(id, options = {}) {
+  const entry = shellState.windows.get(id);
+  if (!entry || entry.targetId !== "browser") {
+    return Promise.resolve(false);
+  }
+  if (entry.browserAuthorityRenewal) {
+    return entry.browserAuthorityRenewal;
+  }
+  const launchQuery = normalizedLaunchQuery(entry.launchQuery);
+  const browserInstance = launchQuery.browser_instance || "";
+  const frame = entry.node.querySelector(".window-frame");
+  const currentAuthority = browserLaunchAuthority(
+    frame?.dataset?.route || frame?.getAttribute("src") || "",
+  );
+  if (!browserInstance || currentAuthority?.browserInstance !== browserInstance) {
+    return Promise.resolve(false);
+  }
+  let renewal;
+  renewal = Promise.resolve()
+    .then(() =>
+      requireWindowHooks().launchTarget("browser", launchQuery, options),
+    )
+    .then((launched) => {
+      if (shellState.windows.get(id) !== entry) {
+        return false;
+      }
+      const nextAuthority = browserLaunchAuthority(launched?.route || "");
+      if (
+        launched?.target !== "browser" ||
+        launched.attach_kind !== "iframe" ||
+        launchDidFail(launched) ||
+        nextAuthority?.browserInstance !== browserInstance ||
+        !nextAuthority.homeToken ||
+        nextAuthority.homeToken === currentAuthority.homeToken
+      ) {
+        throw new Error("Browser authority renewal returned an invalid launch");
+      }
+      launched.title = canonicalTargetTitle(launched.target, launched.title);
+      entry.title = launched.title;
+      fitLaunchedWindow(entry);
+      if (entry.browserCloseRequest) {
+        settleBrowserWindowClose(entry.browserCloseRequest, false);
+      }
+      syncBrowserWindow(entry, launched);
+      try {
+        renderWindowTaskbar();
+        persistBrowserSession();
+      } catch (error) {
+        console.warn("Home GUI could not persist renewed Browser authority", error);
+      }
+      return Object.freeze({
+        browserInstance,
+        freshHomeToken: nextAuthority.homeToken,
+      });
+    })
+    .finally(() => {
+      if (entry.browserAuthorityRenewal === renewal) {
+        delete entry.browserAuthorityRenewal;
+      }
+    });
+  entry.browserAuthorityRenewal = renewal;
+  return renewal;
 }
 
 function activateTargetGroup(targetId) {
@@ -760,7 +1073,16 @@ export function hideAllTargetWindows(targetId) {
 }
 
 export function closeAllTargetWindows(targetId) {
-  return removeWindowEntries(browserWindowEntriesForTarget(targetId));
+  const entries = browserWindowEntriesForTarget(targetId);
+  if (targetId !== "browser") {
+    return removeWindowEntries(entries);
+  }
+  if (entries.length === 0) {
+    return false;
+  }
+  return Promise.all(entries.map((entry) => closeWindow(entry.id))).then(
+    (results) => results.every((result) => result === true),
+  );
 }
 
 function renderSystemErrorWindow({
@@ -839,7 +1161,17 @@ function renderTargetLaunchError(targetId, error) {
   });
 }
 
-function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
+function createWindow({
+  id,
+  title,
+  x,
+  y,
+  width,
+  height,
+  tone,
+  glyphTarget,
+  maximizeByDefault = true,
+}) {
   const bounds = fitWindowBounds({ x, y, width, height });
   const node = windowTemplate.content.firstElementChild.cloneNode(true);
   node.dataset.windowId = id;
@@ -895,7 +1227,7 @@ function createWindow({ id, title, x, y, width, height, tone, glyphTarget }) {
   attachWindowDrag(node, handle, focusWindow, persistBrowserSession);
   attachWindowResize(node, focusWindow, persistBrowserSession);
 
-  if (shouldOpenMaximizedByDefault()) {
+  if (maximizeByDefault && shouldOpenMaximizedByDefault()) {
     node.dataset.restoreLeft = node.style.left;
     node.dataset.restoreTop = node.style.top;
     node.dataset.restoreWidth = node.style.width;
@@ -988,7 +1320,15 @@ function nextBrowserInstanceId() {
   if (window.crypto && typeof window.crypto.randomUUID === "function") {
     return `browser:${window.crypto.randomUUID()}`;
   }
-  return `browser:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+  if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return `browser:${Array.from(
+      bytes,
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("")}`;
+  }
+  throw new Error("Home GUI requires browser crypto for window isolation");
 }
 
 export function showDesktopHome() {
@@ -1042,7 +1382,9 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
   const launchQuery = targetId === "browser"
     ? withBrowserInstanceQuery({ query: options.query }).query
     : normalizedLaunchQuery(options.query);
-  const launched = await requireWindowHooks().launchTarget(targetId, launchQuery);
+  const launched = options.authorizedLaunch
+    ? { ...options.authorizedLaunch }
+    : await requireWindowHooks().launchTarget(targetId, launchQuery);
   launched.title = canonicalTargetTitle(launched.target, launched.title);
   if (launched.attach_kind !== "iframe") {
     throw new Error(`unsupported attach kind: ${launched.attach_kind || "unknown"}`);
@@ -1067,6 +1409,7 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     height: windowSpec.height,
     tone: glyphTone(launched.target),
     glyphTarget: launched.target,
+    maximizeByDefault: !WALLET_CONNECTOR_TARGETS.has(launched.target),
   });
   armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
   node.dataset.target = launched.target;
@@ -1123,6 +1466,13 @@ async function launchBrowserTargetWindow(targetId, options = {}) {
     persistBrowserSession();
   }
   return entry;
+}
+
+export function attachAuthorizedTarget(launched) {
+  return launchBrowserTargetWindow(launched?.target, {
+    authorizedLaunch: launched,
+    query: {},
+  });
 }
 
 function launchDidFail(launched) {
@@ -1289,9 +1639,12 @@ export function maximizeActiveWindow() {
 export function closeWindow(id) {
   const entry = shellState.windows.get(id);
   if (!entry) {
-    return;
+    return false;
   }
-  removeWindowEntries([entry]);
+  if (entry.targetId === "browser") {
+    return requestBrowserWindowClose(entry);
+  }
+  return removeWindowEntries([entry]);
 }
 
 function focusTopVisibleWindow() {
@@ -1315,6 +1668,9 @@ function focusTopVisibleWindow() {
 }
 
 function browserWindowSpec(launched, offset) {
+  if (WALLET_CONNECTOR_TARGETS.has(launched.target)) {
+    return walletConnectorWindowSpec();
+  }
   if (launched.target === SYSTEM_APP_ID) {
     return {
       x: 36,
@@ -1344,6 +1700,46 @@ function browserWindowSpec(launched, offset) {
     y: 78 + offset * 22,
     width: 1040,
     height: 720,
+  };
+}
+
+function walletConnectorWindowSpec() {
+  const workspaceRect = desktop.getBoundingClientRect();
+  const workspaceWidth = Math.max(
+    WALLET_CONNECTOR_WINDOW_WIDTH,
+    window.innerWidth - workspaceRect.left,
+  );
+  const leftX = WALLET_CONNECTOR_WINDOW_EDGE_INSET;
+  const rightX = Math.max(
+    WALLET_CONNECTOR_WINDOW_EDGE_INSET,
+    workspaceWidth -
+      WALLET_CONNECTOR_WINDOW_WIDTH -
+      WALLET_CONNECTOR_WINDOW_EDGE_INSET,
+  );
+  const wallet = topBrowserWindowEntryForTarget("wallet", {
+    includeHidden: false,
+  });
+  if (!wallet) {
+    return {
+      x: rightX,
+      y: 72,
+      width: WALLET_CONNECTOR_WINDOW_WIDTH,
+      height: WALLET_CONNECTOR_WINDOW_HEIGHT,
+    };
+  }
+  const walletBounds = currentWindowBounds(wallet.node);
+  const overlapWidth = (x) => Math.max(
+    0,
+    Math.min(
+      x + WALLET_CONNECTOR_WINDOW_WIDTH,
+      walletBounds.x + walletBounds.width,
+    ) - Math.max(x, walletBounds.x),
+  );
+  return {
+    x: overlapWidth(leftX) <= overlapWidth(rightX) ? leftX : rightX,
+    y: walletBounds.y + 28,
+    width: WALLET_CONNECTOR_WINDOW_WIDTH,
+    height: WALLET_CONNECTOR_WINDOW_HEIGHT,
   };
 }
 
@@ -1495,7 +1891,6 @@ export async function restoreShellSession() {
       persistBrowserSession();
       return;
     }
-    clearShellSessionState();
     return;
   }
 
@@ -1554,7 +1949,6 @@ export async function restoreShellSession() {
       persistBrowserSession();
       return;
     }
-    clearShellSessionState();
     return;
   }
 

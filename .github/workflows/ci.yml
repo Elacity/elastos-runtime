@@ -30,6 +30,8 @@ jobs:
           bash scripts/check-wci-alignment.sh
           node scripts/home-entropy-check.mjs
           node scripts/browser-entropy-check.mjs
+      - name: Browser close handshake
+        run: node --test scripts/browser-window-close-handshake.test.mjs
       - name: cargo clippy
         working-directory: elastos
         run: cargo clippy --workspace --all-targets -- -D warnings

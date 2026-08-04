@@ -13,9 +13,9 @@ const parent = {
       source: parent,
       origin: parentOrigin,
       data: {
-        type: "home:passkey-authority-result",
+        type: "elastos.home.passkey-step-up.result/v1",
         requestId: message.requestId,
-        homeToken: "fresh-wallet-token",
+        stepUpToken: "fresh-wallet-step-up-token",
       },
     }));
   },
@@ -42,12 +42,12 @@ globalThis.window = {
 
 const { createWalletApi } = await import("../capsules/wallet/browser/wallet-api.js");
 const walletApi = createWalletApi({ getHomeToken: () => "existing-wallet-token" });
-const freshToken = await walletApi.requestFreshPasskeyHomeToken(
+const stepUpToken = await walletApi.requestPasskeyStepUp(
   "wallet.send",
   { account_id: "wallet:test", to: "0x1", amount: "1" },
 );
 
-assert.equal(freshToken, "fresh-wallet-token");
+assert.equal(stepUpToken, "fresh-wallet-step-up-token");
 assert.equal(delegatedRequest.origin, parentOrigin);
 assert.equal(delegatedRequest.message.homeToken, "existing-wallet-token");
 assert.equal(
@@ -56,9 +56,9 @@ assert.equal(
   "ordinary Wallet requests must retain their launch authority",
 );
 assert.equal(
-  walletApi.shellHeaders({}, freshToken)["x-elastos-home-token"],
-  "fresh-wallet-token",
-  "the passkey-bound operation must use the fresh scoped token as request authority",
+  walletApi.shellHeaders()["x-elastos-home-token"],
+  "existing-wallet-token",
+  "the passkey-bound operation must preserve its original launch authority",
 );
 
 const source = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
@@ -86,7 +86,7 @@ const freshOperations = [
 
 for (const [path, operations, transport] of freshOperations) {
   const code = source(path);
-  const calls = [...code.matchAll(/\bawait\s+requestFreshPasskeyHomeToken\s*\(/g)];
+  const calls = [...code.matchAll(/\bawait\s+requestPasskeyStepUp\s*\(/g)];
   assert.equal(
     calls.length,
     operations.length,
@@ -98,28 +98,28 @@ for (const [path, operations, transport] of freshOperations) {
     const segment = code.slice(call.index, end);
     assert.match(
       segment,
-      new RegExp(`requestFreshPasskeyHomeToken\\s*\\(\\s*["']${operation.replaceAll(".", "\\.")}["']`),
+      new RegExp(`requestPasskeyStepUp\\s*\\(\\s*["']${operation.replaceAll(".", "\\.")}["']`),
       `${path} fresh-passkey call ${index + 1} must remain ${operation}`,
     );
     assert.match(
       segment,
-      /home_token:\s*homeToken/,
-      `${path} ${operation} must bind the fresh token in its request body`,
+      /step_up_token:\s*stepUpToken/,
+      `${path} ${operation} must bind the step-up token in its request body`,
     );
     if (transport === "headers") {
       assert.match(
         segment,
-        /headers:\s*shellHeaders\([\s\S]{0,160}?homeToken\)/,
-        `${path} ${operation} must send the fresh token as request authority`,
+        /headers:\s*shellHeaders\(\{\s*"content-type":\s*"application\/json"\s*}\)/,
+        `${path} ${operation} must preserve the original launch token as request authority`,
       );
     } else {
       assert.match(
         segment,
-        /inboxAction\([\s\S]{0,300}?},\s*homeToken\)/,
-        `${path} ${operation} must send the fresh token through Inbox request authority`,
+        /inboxAction\([\s\S]{0,300}?step_up_token:\s*stepUpToken[\s\S]{0,80}?\);/,
+        `${path} ${operation} must carry step-up proof only in the Inbox request body`,
       );
     }
   });
 }
 
-console.log("[home-fresh-passkey-authority] PASS");
+console.log("[home-passkey-step-up] PASS");

@@ -2,7 +2,8 @@
 
 > Supplemental terminology note.
 >
-> Read [OVERVIEW.md](OVERVIEW.md) and [ARCHITECTURE.md](ARCHITECTURE.md) first.
+> Read the [repository README](../README.md) and
+> [ARCHITECTURE.md](ARCHITECTURE.md) first.
 > This file narrows the Carrier concept and its placement in the runtime. It is
 > not the current shipped-behavior contract. For current behavior and proof
 > levels, use [../state.md](../state.md), [COMMAND_MATRIX.md](COMMAND_MATRIX.md), and
@@ -10,24 +11,27 @@
 
 ## What Carrier Is
 
-**Carrier is the decentralized communication and content substrate of an ElastOS node.** It handles peer discovery, messaging, relay, and peer-to-peer content transfer for `elastos://` operations.
+**Carrier is the endpoint-authenticated off-box communication and content transport of
+an ElastOS node.** It can carry peer discovery, messaging, streams,
+replication, and peer-to-peer content transfer when Runtime routing selects it.
 
-Carrier is not the whole runtime. The runtime hosts Carrier and enforces capabilities, sessions, routing, and lifecycle around it. Carrier is also not a specific protocol implementation. The transport underneath (iroh today, Carrier Native/Boson tomorrow) is an implementation detail.
+Carrier is not the whole Runtime, the capsule API, or the authority system. The
+Runtime enforces principals, capabilities, sessions, routing, lifecycle, and
+audit around it. Carrier endpoint authentication proves the transport peer; it
+does not by itself prove who authored an application message. The transport
+implementation may change without changing capsule code.
 
 ## Capsule Model
 
-From a capsule's perspective, Carrier just works. A capsule calls `peer/gossip_send` and messages appear on every subscribed node. The capsule doesn't know or care whether it's running as native, WASM, or microVM, or whether it's on a Jetson, WSL, or a laptop.
+A capsule requests a typed Runtime resource operation. It does not call Carrier
+or select a transport. Runtime may satisfy the request locally, dispatch it to a
+provider, or select Carrier for an off-box route. Moving the target must not
+change capsule code or expose tickets, peer endpoints, or raw sockets.
 
-The intended end-state is stronger than "Carrier for remote messages." Capsules
-should see one Carrier-style capability plane for local and remote effects. A
-same-runtime call may be routed in-process, over stdio, over a browser adapter,
-or through loopback HTTP, but that is adapter plumbing below the capsule kernel.
-The capsule contract is still Carrier-shaped: signed capability envelope,
-target object/service, action, payload, response, subscription, and audit.
-Carrier must remain location-explicit message passing, not transparent remote
-objects. Typed interface descriptors may describe a provider method, but Runtime
-capabilities still authorize the call and remote failures must stay visible to
-the caller.
+Carrier remains location-explicit transport inside Runtime and provider
+implementations. Remote failure must stay visible as a typed operation result;
+it must not become transparent remote-object behavior or a silent local
+fallback.
 
 ### Trusted-Source Room Bootstrap
 
@@ -173,7 +177,8 @@ HTTP is not Carrier. In this repo it plays three supporting roles:
 
 A real browser capsule should not receive raw internet authority. The browser
 engine adapter may use local IPC, vsock, stdio, or loopback to talk to the
-runtime, but the capsule-facing contract is still Carrier-shaped:
+Runtime, but the capsule-facing contract remains the typed Runtime
+Browser/Net/Exit resource model:
 
 ```text
 browser capsule -> elastos://net/* -> Runtime Net provider -> Carrier/Exit provider
@@ -366,8 +371,8 @@ private route material such as `connect_ticket`, `relay_ipc`, `adapter_ipc`,
 The internal `browser-engine-adapter` provider is the matching engine boundary:
 it reports adapter status and refuses page launch unless the stream session has
 attached `adapter_ipc` byte transport. This keeps CEF/Chromium/WebView work
-behind the same Carrier-shaped runtime contract instead of exposing host browser
-or socket authority to web pages.
+behind the same typed Runtime Browser/Net/Exit contract instead of exposing host
+browser or socket authority to web pages.
 Native Linux engine processes go through `browser-engine-supervisor`, a small
 host helper that reads `ELASTOS_BROWSER_ENGINE_SUPERVISOR_CONFIG`, starts the
 operator-approved engine under `linux_new_netns`, and returns a typed supervisor
@@ -433,7 +438,10 @@ The trusted orchestration layer around Carrier. Manages capsule lifecycle, capab
 - `elastos-runtime` (capability authority, request handler)
 - `elastos-identity`, `elastos-tls`, `elastos-namespace`
 
-**Transport:** serial Carrier bridge for ordinary VM app capsules, HTTP over private guest network only for capsules that explicitly need guest IP bridging, and stdio JSON for host-native services.
+**Transport:** a substrate-specific, capsule-scoped Runtime adapter. Components
+use ElastOS Bus; web projections and microVMs use their documented narrow
+adapters. HTTP, `postMessage`, stdio, vsock, serial, and local IPC are host
+plumbing, not Carrier or the capsule contract.
 
 HTTP here is a control-plane protocol. It is not the Carrier substrate.
 
@@ -454,9 +462,11 @@ The physical network plumbing connecting each VM to the host.
 **Current implementation:**
 - `elastos-crosvm/network.rs`: TAP devices via ioctl, /30 subnets, host-only link (no iptables, no ip_forward)
 - TAP is no longer the default for ordinary app capsules; it is used when a capsule explicitly needs guest IP networking or a TCP bridge
-- Carrier serial bridge is the preferred control path for regular app capsules
+- Ordinary Apps use typed Runtime resources through their selected substrate adapter
 
-**Transport:** Linux TAP (host-only) when guest networking is explicitly enabled. Otherwise, app capsules use the serial Carrier bridge and avoid guest networking entirely.
+**Transport:** Linux TAP only when guest networking is explicitly enabled.
+Otherwise the substrate adapter communicates with Runtime without granting the
+guest ambient network authority.
 
 ## Naming in Code
 

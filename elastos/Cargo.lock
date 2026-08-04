@@ -1540,7 +1540,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "elastos-auth"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "hex",
@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-common"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "serde",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-compute"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "elastos-common",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-crosvm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "elastos-common",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-identity"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-namespace"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-runtime"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-server"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1704,11 +1704,13 @@ dependencies = [
  "elastos-runtime",
  "elastos-storage",
  "elastos-tls",
+ "elastos-wallet-contract",
  "flate2",
  "futures-lite",
  "getrandom 0.2.17",
  "hex",
  "hkdf",
+ "hmac",
  "iroh",
  "iroh-gossip",
  "k256",
@@ -1719,6 +1721,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "sha3",
  "tar",
@@ -1737,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-storage"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1758,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-tls"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum-server",
@@ -1772,27 +1775,41 @@ dependencies = [
 
 [[package]]
 name = "elastos-vz"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
+ "base64",
  "block2",
  "dirs",
  "dispatch2",
  "elastos-common",
  "elastos-compute",
+ "hmac",
  "libc",
  "objc2",
  "objc2-foundation",
  "objc2-virtualization",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+]
+
+[[package]]
+name = "elastos-wallet-contract"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

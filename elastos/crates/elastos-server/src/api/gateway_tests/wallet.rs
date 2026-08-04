@@ -1,4 +1,5 @@
 mod accounts;
+mod approvals_bus;
 mod auth;
 mod chain;
 mod connectors;

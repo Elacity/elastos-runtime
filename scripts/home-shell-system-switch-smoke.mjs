@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260723a";
+const moduleVersion = "home-20260725a";
 const requests = [];
 const windowListeners = new Map();
 const localStorageValues = new Map();
@@ -85,10 +85,6 @@ class FakeElement {
       this.listeners.set(type, []);
     }
     this.listeners.get(type).push(callback);
-  }
-
-  append(...children) {
-    for (const child of children) this.appendChild(child);
   }
 
   appendChild(child) {
@@ -205,7 +201,7 @@ const summary = {
   appearance: {},
   browser_state: {
     principal_id: "principal:home-shell-system-switch",
-    layout: { desktop: {}, taskbar: [], desktopApps: [], desktopIconsVisible: true },
+    layout: { desktop: {}, taskbar: [], desktopHidden: [], desktopIconsVisible: true },
     recent_targets: [],
     session: { windows: [] },
   },

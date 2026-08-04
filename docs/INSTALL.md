@@ -1,269 +1,180 @@
 # Installing ElastOS
 
-## Canonical Install (bootstrap from the publisher URL, then Carrier)
+## Install from the publisher
 
-The public installer is the current Linux `x86_64`/`aarch64` preview. macOS uses
-source-home staging for now; see [MAC.md](MAC.md).
+The public installer is the current Linux `x86_64`/`aarch64` preview.
+For macOS, use the [source-home staging runbook](MAC.md).
 
 ```bash
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
 elastos setup
 elastos
 ```
 
-After setup, `elastos` opens Home. The default Home profile includes System,
-People, Services, Browser, Wallet, Documents, Library, Marketplace, Archive, and
-Inbox without requiring users to learn runtime nouns first. Direct
-`elastos chat` remains a shortcut and auto-starts a local runtime — no separate
-`elastos serve` terminal needed. Subsequent runs reuse the running runtime
-automatically.
+The installer verifies the signed release, then installs the `elastos` binary.
+`elastos setup` fetches the core Home profile from the trusted publisher.
+Running `elastos` opens Home. This path does not need a separate
+`elastos serve` process.
 
-- The gateway-hosted installer carries the maintainer DID, signed release head,
-  and publisher discovery metadata automatically.
-- The web installer is a one-time bootstrap. After install, first-party
-  `setup` and `update` use the trusted source over Carrier by default.
-- Users should not need to know a HEAD CID to install or update normally.
-- Native chat does not require crosvm, vmlinux, kubo, or sudo.
+The current default Home exposes System, People, Services, Browser, Wallet,
+Documents, Library, Marketplace, Archive, and Inbox. People is installed as a
+separate app capsule; Home presents it but does not own its state or authority.
 
-Source checkout note:
+The installer URL bootstraps trust once. Later first-party setup and update
+operations use the trusted Carrier source by default. Users do not manage a
+release-head CID or gateway on the normal path.
 
-- A GitHub clone gives you source plus `components.json`. It does not stamp a trusted source into `sources.json`.
-- Source-built binaries can inspect setup profiles from the checkout, but `elastos setup` still needs either a published install or an explicitly created/added trusted source.
-- For a concrete source-checkout `source add` example, see [GETTING_STARTED.md](GETTING_STARTED.md#source-built-trusted-source-example).
+The signed manifest determines which setup profiles are available:
 
-`elastos setup` is intentionally narrow:
+- `elastos setup` installs the core Home profile.
+- `elastos setup --profile demo` adds demo Apps and supporting tools.
+- `elastos setup --profile operator` prepares the separate runtime used by
+  `serve`, remote node control, agents, WASM or microVM `run`, and
+  non-interactive capsule work.
 
-- it provisions the core Home profile; native chat is part of the runtime binary
-- it does not silently provision every share/site/operator dependency
-- broader surfaces require explicit extras or an operator profile
+Data `run` needs no Runtime, and interactive packaged capsules use managed Home.
+Only one live host may own an ElastOS data home at a time. Do not run Home and
+the operator runtime against the same home at the same time. See the
+[command matrix](COMMAND_MATRIX.md) for each command lane.
 
-Useful extras:
+### Source checkout note
+
+A clone contains source code and `components.json`. It does not create a
+trusted source relationship. A binary built from the checkout can read its
+setup profiles, but it still needs a trusted source before fetching published
+components.
+
+See [Getting started](GETTING_STARTED.md#source-built-trusted-source-example)
+for an explicit `source add` example. Use the public installer when testing the
+published install path.
+
+## Optional components
+
+The default Home setup installs only core components. Add content, site, or
+operator dependencies explicitly:
 
 ```bash
-# content-backed share/open with the local Kubo backend
+# Content-backed share and open
 elastos setup --with kubo --with ipfs-provider --with documents
 
-# local site serving / browser preview helper
+# Local site preview
 elastos setup --with site-provider
 
-# ephemeral public site serving
+# Ephemeral public site edge
 elastos setup --with site-provider --with tunnel-provider --with cloudflared
 
-# CID-backed site publish / activate on a fresh install
+# CID-backed site publication
 elastos setup --with kubo --with ipfs-provider
 ```
 
-## Manual Install (explicit operator/debug installer bootstrap)
+## Manual bootstrap
+
+Use an explicit gateway only when the publisher URL is unavailable or when
+testing release infrastructure:
 
 ```bash
 EXPLICIT_GATEWAY=https://publisher.example.com
 
-# Fetch the published installer bundle through one explicitly chosen IPFS gateway.
-curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/<INSTALLER_CID>/install.sh" | bash
+# Use the installer's published trust anchors.
+curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/INSTALLER_CID/install.sh" | bash
 
-# Or with explicit trust anchors
-curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/<INSTALLER_CID>/install.sh" | bash \
-  -s -- --head-cid <HEAD_CID> --maintainer-did <DID>
+# Or supply the trust anchors explicitly.
+curl -fsSL "${EXPLICIT_GATEWAY}/ipfs/INSTALLER_CID/install.sh" | bash \
+  -s -- --head-cid HEAD_CID --maintainer-did MAINTAINER_DID
 
-elastos setup
+~/.local/bin/elastos setup
+~/.local/bin/elastos
 ```
 
-Use this only when the canonical bootstrap publisher URL is unavailable or when
-you are doing release/debug work. It is not the preferred user workflow and
-should not be the default path you hand to external testers. The operator path
-is explicit on purpose: choose one gateway, know why you are using it, and do
-not silently switch transports.
+Replace the uppercase placeholders with the publisher's values. Use one gateway
+and explicit trust anchors. Do not fall back to unrelated transports or
+gateways.
 
-## Jetson (aarch64)
+## Jetson
 
-Prerequisites: Jetson Linux.
+The installer detects Linux `aarch64`:
 
 ```bash
-# Install (auto-detects aarch64)
 curl -fsSL https://elastos.elacitylabs.com/install.sh | bash
-
-# Setup (provisions the core Home profile — no crosvm/vmlinux needed for native chat)
 ~/.local/bin/elastos setup
-
-# Open Home
 ~/.local/bin/elastos
-
-# Or jump straight to chat
-~/.local/bin/elastos chat --nick jetson
-
-# Check for updates
 ~/.local/bin/elastos update --check
 ```
 
-Native chat does not require KVM, crosvm, vmlinux, or sudo. For microVM
-capsules, those are provisioned by setup but not required for the native chat path.
+Native Home and chat run without KVM, crosvm, a guest kernel, Kubo, or `sudo`.
+The default Home profile omits `crosvm` and `vmlinux`. Use an explicit profile
+or source-home provisioning for microVM and Browser VM work.
 
-Browser VM target maintenance is an operator path, not a normal user install
-step. On an already-provisioned Jetson Browser VM target, check for drift first:
+The [Browser VM target](BROWSER_VM_TARGET.md) documents the target contract and
+maintenance boundary. [Scripts](../scripts/README.md) maps the executable proof
+commands.
 
-```bash
-cd <target-source-checkout>
-HOME=<target-home> \
-XDG_DATA_HOME=<target-xdg-data-home> \
-scripts/browser-vm-target-refresh.sh --verify-only
-```
+Browser VM target maintenance is an operator path.
+Refresh-only is not sufficient for package/dependency changes: rebuild the target and run
+`scripts/browser-vm-artifact-preflight.sh`, including the complete
+PipeWire/WirePlumber/GStreamer dependency set, before installation.
 
-If drift is reported and the source checkout is the reviewed release branch,
-refresh Browser VM helpers without a full Rust/WASM build:
-
-```bash
-HOME=<target-home> \
-XDG_DATA_HOME=<target-xdg-data-home> \
-scripts/browser-vm-target-refresh.sh
-
-HOME=<target-home> \
-XDG_DATA_HOME=<target-xdg-data-home> \
-scripts/linux-source-home-restart.sh \
-  --home <target-home> \
-  --xdg-data-home <target-xdg-data-home> \
-  --addr <target-loopback-addr> \
-  --json-out <target-elastos-data-dir>/logs/gateway-restart.json
-```
-
-This refresh path updates installed Browser VM scripts plus guest script files
-inside existing initrd/rootfs artifacts. If the guest-control bridge binary has
-already been built for the Linux guest architecture, pass
-`--guest-control-bridge-bin <path>` to refresh it inside the rootfs with backup
-and verification. Refresh-only is not sufficient for package/dependency changes,
-Chromium wrapper changes, Selkies Python package patches, or other complete
-guest image changes; rebuild/restage the Browser VM rootfs, then run
-`scripts/browser-vm-artifact-preflight.sh` before claiming runtime parity.
-
-Then prove source/install/artifact/runtime parity from the reconciliation host:
+## Update
 
 ```bash
-scripts/jetson-browser-runtime-audit.mjs \
-  --host <target-host> \
-  --user <target-user> \
-  --data-dir <target-elastos-data-dir> \
-  --source-dir <target-source-checkout> \
-  --require-parity
+elastos update
+elastos update --check
 ```
 
-Use full `elastos setup` or `scripts/setup-source-home.sh` only when you are
-building/provisioning the runtime or changing broader VM artifacts such as the
-kernel, crosvm/VZ supervisor, native proxy binary, Chromium wrapper, Selkies app
-patch, PipeWire/WirePlumber/GStreamer dependency set, or guest image contract.
-After full source-home setup on a Linux target, run
-`scripts/linux-source-home-restart.sh` before testing the target. Setup can
-replace the gateway binary, and the old live gateway intentionally exits when it
-detects that stale executable state.
+`elastos update` discovers newer signed releases through the trusted source
+created during install.
 
-## Updating
+These overrides are for operators:
 
 ```bash
-elastos update                          # Canonical path (Carrier P2P discovery)
-elastos update --check                  # Check only, don't install
-elastos update --head-cid <cid>         # Manual/operator override
-elastos update --no-p2p --gateway <url> # Operator escape hatch (not the canonical path)
+elastos update --head-cid CID
+elastos update --no-p2p --gateway GATEWAY_URL
 ```
 
-`elastos update` should discover newer signed releases through the trusted source
-relationship established at install time. Explicit gateway and HEAD CID flags are
-operator/debug tools, not the primary product path.
+Replace `CID` and `GATEWAY_URL` with the source values.
 
-## Handoff Verification
+## Installed files
 
-Normal users do not need these commands. Use them before handing a branch,
-published candidate, or target device to another tester:
+When XDG variables are unset, the default paths are:
 
-```bash
-# Current checkout: source/review proof
-git diff --check
-node scripts/home-entropy-check.mjs
-node scripts/browser-entropy-check.mjs
-bash scripts/check-wci-alignment.sh
-
-# Current checkout: installed-style command behavior in a clean home
-just candidate-command-audit
-
-# Current 0.5.0 baseline through the canonical public installer/source path.
-# Requires a staged or published 0.5.0-compatible manifest with the current
-# home profile and checksummed artifacts.
-ELASTOS_PUBLISHER_GATEWAY=<candidate-url> \
-ELASTOS_BIN_OVERRIDE="$PWD/elastos/target/release/elastos" \
-  bash scripts/public-install-identity-smoke.sh
-ELASTOS_PUBLISHER_GATEWAY=<candidate-url> \
-ELASTOS_BIN_OVERRIDE="$PWD/elastos/target/release/elastos" \
-  bash scripts/public-install-home-frontdoor-smoke.sh
-
-# Source/local Carrier setup proof before a candidate gateway exists
-scripts/local-carrier-setup-smoke.sh
-
-# Final public install path after publishing 0.5.0
-bash scripts/public-install-identity-smoke.sh
-bash scripts/public-install-home-frontdoor-smoke.sh
-
-# Stricter Carrier relay-only setup path, when publisher relay health is under review
-ELASTOS_PUBLIC_INSTALL_FORCE_RELAY_ONLY=1 bash scripts/public-install-home-frontdoor-smoke.sh
-
-# Candidate publisher/gateway after staging a 0.5.0 artifact set
-ELASTOS_PUBLISHER_GATEWAY=<candidate-url> bash scripts/public-install-home-frontdoor-smoke.sh
-
-# Target closeout from the operator host when a Home-authorized Browser page is active
-scripts/jetson-browser-runtime-audit.mjs \
-  --host <target-host> \
-  --user <target-user> \
-  --data-dir <target-elastos-data-dir> \
-  --source-dir <target-source-checkout> \
-  --require-parity \
-  --min-active-crosvm-seconds 3600
-```
-
-The manual installed-device check is still separate: on each target host, run
-`elastos setup`, open `elastos`, visit System, Documents, Library, Inbox,
-People, and Services, launch and close at least one app, and return Home
-cleanly.
-Source-home and seed-node proofs do not replace this installed-path check.
-
-## Publisher Notes
-
-This document is for install and update behavior, not the internal release ceremony.
-
-- The canonical public gateway is `https://elastos.elacitylabs.com`.
-- Published installers are stamped so `elastos update` can discover newer signed releases without manual flags.
-- Release and ceremony scripts are internal maintainer tooling and are not part of the public install contract.
-
-## What Gets Installed
-
-These are the default paths when XDG variables are unset. Runtime data honors `XDG_DATA_HOME`.
-
-| Path | Description |
-|------|-------------|
+| Path | Purpose |
+| --- | --- |
 | `~/.local/bin/elastos` | Runtime binary |
-| `${XDG_DATA_HOME:-~/.local/share}/elastos/components.json` | Capsule registry |
-| `${XDG_DATA_HOME:-~/.local/share}/elastos/sources.json` | Trusted source config (for updates) |
+| `~/.local/share/elastos/components.json` | Installed component registry |
+| `~/.local/share/elastos/sources.json` | Trusted update sources |
 
-`elastos setup` installs the components selected by the active profile. The
-default `home` profile installs the Home front door and the visible Home
-surfaces: System, People, Services, Browser, Wallet, Documents, Library,
-Marketplace, Archive, and Inbox. People is installed as a separate app capsule;
-Home supplies only the shell and authorized launch. The profile also installs the local provider components needed
-by those surfaces, including DID, webspace, wallet/chain, Browser Engine, Net,
-and Exit providers. Demo chat-room, GBA, public-edge tunnel/cloudflared,
-IPFS/Kubo, and protected-content DRM providers are installed only when you choose a
-broader profile or add them with `--with`.
+The publisher's signed manifest controls what `elastos setup` installs. Run
+`elastos setup --list` to inspect the selected manifest's current profiles and
+components before installation. The installed `components.json` records what
+the selected profile installed. Do not infer parity with this development tree
+from the version label or a successful setup. [state.md](../state.md) records
+whether exact public-manifest parity evidence has been accepted.
 
-## Policy Capsule
+## Capability policy
 
-The Home/orchestrator capsule enforces capability policy. The default is secure:
+Runtime validates and enforces capability tokens. The built-in shell evaluates
+the local approval policy for interactive and operator flows:
 
-- **With terminal** (interactive): `cli` mode — operator approves/denies each request
-- **Without terminal** (daemon): `agent` mode — policy-file rules, built-in defaults cover standard capsules
+- In `cli` mode, the terminal asks the operator to approve or deny each request.
+- In `agent` mode, the shell applies the policy file and built-in defaults.
 
-Custom policy files can live at `~/.local/share/elastos/policy.json`, or you can point to another file with `ELASTOS_POLICY_FILE`.
+The default policy file is
+`~/.local/share/elastos/policy.json`. Set `ELASTOS_POLICY_FILE` to use a
+different operator-managed file.
 
-## Trust Model
+## Trust model
 
-All artifacts are signed with Ed25519. The installer verifies:
+The installer verifies:
 
-1. `release-head.json` signature against the maintainer DID
-2. `release.json` signature against the same DID
-3. Binary and components.json SHA-256 checksums
+1. the `release-head.json` signature against the maintainer DID
+2. the `release.json` signature against the same DID
+3. the binary and `components.json` SHA-256 checksums
 
-Gateways are transport only — signatures are the trust anchor.
+Gateways transport bytes. Signatures, hashes, and the maintainer DID establish
+trust.
+
+For release and target handoff commands, see the
+[runtime user story checklist](RUNTIME_REPO_USER_STORY_CHECKLIST.md) and
+[scripts index](../scripts/README.md). Those commands are outside the normal
+install path.

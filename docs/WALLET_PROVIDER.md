@@ -6,11 +6,17 @@ It is not the Runtime root of identity and it is not an app SDK.
 
 The contract is:
 
-`capsule -> runtime capability -> elastos://wallet/* -> wallet-provider -> wallet backend`
+`signed launch-token v4 -> verified RuntimeWalletAuthority -> private RuntimeWalletAdapter -> WalletProviderRequestV2 (Wallet Bus 2.3) -> wallet-provider`
 
 Capsules never receive private keys, browser wallet objects, raw wallet RPC,
 node RPC, seed phrases, or provider SDK handles. A wallet address is a proof
 binding on a Runtime principal, not the principal itself.
+
+The generic provider plane exposes only read-only
+`elastos://wallet/meta/status`. Generic HTTP, component/Carrier, attached
+component, capability-request, and Inspect callers cannot select a principal,
+forward a local bearer token, dispatch `wallet_contract`, or request any Wallet
+account, proof, approval, signing, secret, Recovery, or transaction operation.
 
 ## Authority Model
 
@@ -35,8 +41,9 @@ capsules. Browser wallets belong in dedicated connector capsules such as
 `wallet-metamask` and `wallet-unisat`; built-in wallet authority belongs in
 `wallet-provider`. External wallet links carry an explicit `connector_id`, and
 external approval completion fails closed if a different connector tries to
-finish the request. Home and System do not initiate wallet-link ceremonies
-directly.
+finish the request. Opaque connector frames initiate the fixed link or approval
+intent, while the trusted Home host owns only the top-level injected-provider
+effect; System does not initiate wallet-link ceremonies.
 
 ## User-Facing Wallet Ontology
 
@@ -62,10 +69,11 @@ balances, pending requests, defaults, and approval methods. Connector capsules
 such as MetaMask, UniSat, and WalletConnect remain launchable only as approval methods
 from Wallet flows, not as separate top-level wallet products. Built-in
 Bitcoin accounts live beside EVM accounts in Wallet; external Bitcoin approval
-tools remain connector methods. Browser extensions that do not inject into a
-sandboxed iframe, such as UniSat in some profiles, may be opened as a top-level
-connector window; that window still uses Runtime wallet-link and approval routes
-and does not expose extension authority to ordinary capsules.
+tools remain connector methods. The connector frames remain opaque and never
+receive browser-extension provider objects. For injected MetaMask/Brave and
+UniSat, a closed connector intent asks the trusted top-level Home host to perform
+the exact Runtime challenge or typed approval effect. WalletConnect retains its
+configured connector-owned adapter path.
 
 ## Storage
 
@@ -79,10 +87,10 @@ preferences, encrypted managed EVM wallet envelopes, pending SIWE proof
 challenges, and typed wallet approval requests in `wallet-state.json`. Account
 records and defaults are keyed by `principal_id`; proof challenges are
 short-lived, single-use, and bind the exact challenge resource.
-`request_signature` records a pending approval for an allowed intent and returns
-no signature. Every signature request must name `chain_namespace + intent`. If
-the caller omits `account_id`, the provider resolves the principal's explicit
-default for that chain and intent or fails closed.
+The typed `RequestApproval` operation records a pending approval for an allowed
+intent and returns no signature. Runtime resolves and supplies the exact
+principal-owned account, chain namespace, intent, resource, reason, payload, and
+expiry before invoking the private adapter.
 
 Built-in wallet keys are provider-owned and encrypted at rest under
 `localhost://ElastOS/SystemServices/Wallet/wallet-key.hex`. They are
@@ -114,37 +122,26 @@ DID-only recovery still needs a DID-envelope unwrap/rewrap path.
 
 ## Operations
 
-The provider surface is intentionally narrow:
+The public provider surface is intentionally limited to one operation:
 
-| Operation | Capability resource | Purpose |
-|-----------|---------------------|---------|
-| `status` | `elastos://wallet/meta/status` | Report provider version and configured wallet adapters |
-| `challenge` | `elastos://wallet/proof/challenge` | Create a Runtime-bound wallet proof challenge |
-| `bitcoin_challenge` | `elastos://wallet/proof/bip322/challenge` | Create a Runtime-bound Bitcoin ownership challenge |
-| `verify_proof` | `elastos://wallet/proof/verify` | Verify the currently supported EVM SIWE proof against the issued challenge |
-| `verify_bip322_proof` | `elastos://wallet/proof/bip322/verify` | Verify the currently supported Bitcoin BIP-322 proof against the issued challenge |
-| `verify_contract_proof` | `elastos://wallet/proof/verify_contract` | Consume an issued SIWE challenge only after chain-provider verifies ERC-1271 smart-account signature validity |
-| `create_managed_account` | `elastos://wallet/account/create_managed` | Create or return a passkey-controlled built-in EVM account |
-| `link_account` | `elastos://wallet/account/link` | Attach a verified wallet proof binding to a principal |
-| `accounts` | `elastos://wallet/account/list` | List linked accounts visible to the current principal |
-| `revoke_account` | `elastos://wallet/account/revoke` | Revoke a linked proof binding and related grants |
-| `rename_account` | `elastos://wallet/account/rename` | Rename a principal-scoped account label |
-| `export_managed_secret` | `elastos://wallet/account/export_secret` | Export a built-in account recovery key after fresh passkey verification |
-| `import_managed_secret` | `elastos://wallet/account/import_secret` | Import a built-in account recovery key after fresh passkey verification |
-| `set_default_account` | `elastos://wallet/account/set_default` | Select a principal-scoped default linked account for one chain and signing intent |
-| `default_account` | `elastos://wallet/account/default` | Resolve the selected account without exposing wallet authority to the caller |
-| `request_signature` | `elastos://wallet/<chain_namespace>/sign/<intent>` | Request explicit approval for a typed signing intent on a named chain |
-| `approval_requests` | `elastos://wallet/approval/list` | List wallet approval requests for the current principal |
-| `reject_approval` | `elastos://wallet/approval/reject` | Reject a pending wallet approval request |
-| `approve_approval` | `elastos://wallet/approval/approve` | Approve a pending request and create a wallet handoff |
-| `complete_approval` | `elastos://wallet/approval/complete` | Complete an approved request with a provider-owned signature receipt |
-| `sign_approved` | `elastos://wallet/approval/sign_approved` | Execute an approved request with a provider-owned managed wallet key |
+| Operation | Capability resource | Action | Purpose |
+|-----------|---------------------|--------|---------|
+| `status` | `elastos://wallet/meta/status` | `read` | Report bounded provider identity, version, and adapter status without principal data |
 
-The runtime resource mapper must reject unknown wallet operations and
-`request_signature` calls without a validated `chain_namespace + intent`.
-Typed transaction prepare/broadcast belongs to `chain-provider`; wallet-provider
-only owns proof bindings, approval state, managed signing, and connector
-completion receipts.
+All principal-sensitive work uses the private Runtime-local Wallet Bus 2.3
+envelope. Runtime derives `RuntimeWalletAuthority` only from a successfully
+validated signed launch token, constructs `WalletProviderRequestV2`, and
+dispatches a typed `WalletProviderOperationV2` through
+`RuntimeWalletAdapter`. The typed variants cover account reads and writes,
+proof challenges and verification, approval lifecycle operations, validated
+chain-outcome projection, and managed Recovery import/export. They are not
+generic provider methods or capsule capability resources.
+
+Generic `wallet_contract`, legacy proof/account/approval/signing/secret/Recovery
+names, signing URI derivation, and Wallet transaction prepare/broadcast all fail
+before provider invocation. Transaction prepare and broadcast remain typed
+`chain-provider` effects; wallet-provider owns proof bindings, approval state,
+managed signing, and connector completion receipts.
 
 Wallet owns accounts, approval methods, built-in send, and recovery-key
 actions. `POST /api/apps/wallet/wallet/managed` creates or returns the
@@ -163,11 +160,16 @@ ceremony at the moment of use. `POST
 /api/apps/wallet/wallet/approvals/:request_id/approve` approves managed wallet
 requests only when a fresh passkey-bound Home token is supplied; the provider
 then signs inside the wallet boundary and stores a receipt. External injected
-wallets are handled by dedicated connector capsules. The MetaMask connector uses
-`/api/apps/<wallet-connector>/wallet/approvals/*` to review, receive the typed
-handoff message, ask its wallet backend to sign, and complete the provider
-receipt. The route is generic, but only explicitly allowlisted connector
-capsules can use it. Wallet and Inbox can reject pending requests.
+wallets are handled by dedicated opaque connector capsules plus the trusted Home
+host. MetaMask/Brave and UniSat frames can read their Runtime account and
+approval summaries, but their only effect request is the closed
+`home:wallet-connector-effect` contract. Runtime's Home connector endpoints
+validate exact same-origin Home authority and a carried connector launch token
+for the same principal, session, proof, and grant before issuing a challenge or
+typed handoff. Home alone calls the top-level injected provider and returns only
+status to the connector frame. The generic direct connector completion path
+remains for configured WalletConnect, and only explicitly allowlisted
+connectors can use it. Wallet and Inbox can reject pending requests.
 App capsules still cannot call wallet RPC or receive signatures without the
 provider approval path.
 
@@ -186,11 +188,12 @@ P2WPKH address, the Bitcoin mainnet BIP-122 namespace, and an exact Runtime
 Bitcoin challenge resource. Arbitrary messages and non-Runtime challenges fail
 before approval.
 
-External Bitcoin proof requests use the same approval contract, but the Wallet
-surface owns the final handoff. It shows the exact Runtime BIP-322 message,
-lets the user copy it into a compatible Bitcoin wallet, accepts the returned
-signature, and completes the approval only after wallet-provider verifies that
-signature against the linked P2WPKH address and the stored Runtime challenge.
+External Bitcoin proof requests use the same approval contract. For UniSat,
+Runtime returns the exact typed Bitcoin proof handoff only to the trusted Home
+bridge; Home asks the top-level provider to sign that message and completes the
+approval only after wallet-provider verifies the signature against the linked
+address, selected proof type, and stored Runtime challenge. Neither Wallet nor
+the opaque connector frame handles a free-form message or returned signature.
 
 Wallet price data is also treated as an external effect. The temporary
 CoinGecko HTTP source is disabled until Wallet raises an Inbox request and an
@@ -214,7 +217,7 @@ The default wallet path is now:
 
 The optional injected-wallet path is:
 
-`passkey unlock -> open approval-method connector capsule -> connect EVM wallet -> verify Runtime SIWE proof -> link account + connector_id to the existing principal -> issue scoped connector capability -> audit -> revoke -> prove replay/expiry/wrong-chain/wrong-origin/wrong-connector fail closed`
+`passkey unlock -> open opaque approval-method connector capsule -> send one closed link intent to trusted Home -> Home discovers exact MetaMask or Brave fallback -> Runtime validates matching Home + connector launch-token v4 authority -> Runtime issues SIWE challenge -> Home signs only that challenge -> wallet-provider verifies and links account + connector_id to the existing principal -> audit -> revoke -> prove replay/expiry/wrong-chain/wrong-origin/wrong-connector fail closed`
 
 The built-in Bitcoin proof path is now:
 
@@ -222,11 +225,11 @@ The built-in Bitcoin proof path is now:
 
 The optional external Bitcoin proof path uses the same connector boundary:
 
-`passkey unlock -> open UniSat -> request BIP-322 challenge -> sign the exact Runtime challenge -> verify through wallet-provider -> link BTC proof binding to the existing principal -> audit -> revoke`
+`passkey unlock -> open opaque UniSat connector -> send one closed link intent to trusted Home -> Runtime validates matching Home + connector launch-token v4 authority -> Runtime issues the address-selected Bitcoin proof challenge -> Home asks top-level UniSat to sign that exact challenge using the selected proof mode -> verify through wallet-provider -> link BTC proof binding to the existing principal -> audit -> revoke`
 
 For approval-gated Bitcoin proof signing after a BTC address is linked:
 
-`app requests typed bitcoin_bip322_proof -> Wallet/Inbox review -> UniSat shows the exact Runtime BIP-322 message for external BTC accounts -> wallet-provider verifies and records a signed receipt`
+`app requests typed bitcoin_bip322_proof -> Wallet/Inbox review -> opaque UniSat connector requests exact approval id -> Runtime gives trusted Home the typed handoff -> top-level UniSat signs the exact Runtime proof message using the selected proof mode -> wallet-provider verifies and records a signed receipt`
 
 The provider issues and verifies the SIWE proof challenge, and the browser EVM
 wallet-link route uses that provider only after an active passkey-backed Runtime
@@ -248,7 +251,9 @@ the connector owns only Reown/AppKit browser UX plus the operator-pinned local
 adapter. Mode A is the first target: ElastOS acts as the dApp and external
 wallets sign Runtime challenges or requests. Mode B, where external dApps treat
 ElastOS as a WalletConnect wallet, is a later security milestone. Internal
-capsules do not use WalletConnect; they call `elastos://wallet/*`.
+capsules do not use WalletConnect or generic Wallet provider calls; their
+product routes enter the private typed Wallet Bus through verified Runtime
+authority.
 
 `wallet-walletconnect` remains invisible unless the runtime finds
 `elastos.walletconnect.connector/v1` config plus a local hashed Reown/AppKit SDK
@@ -269,10 +274,15 @@ do not add a visible Essentials surface until the pinned connector exists.
 Essentials, ELA, EID, BTC BIP-322, and UniversalX should reuse the same
 proof-binding shape.
 UniSat is the first dedicated browser Bitcoin connector because its injected API
-documents `requestAccounts` and BIP-322 simple `signMessage` support. The first
-Runtime proof class remains Bitcoin mainnet native P2WPKH only; UniSat users
-must select a native SegWit `bc1q...` account until Taproot and other script
-types have pinned test vectors and provider verification.
+documents `requestAccounts` and `signMessage`. Managed Bitcoin accounts remain
+Bitcoin-mainnet native P2WPKH and managed signing remains
+`managed_btc_p2wpkh`. Separately, wallet-provider source tests cover external
+BIP-322 simple verification for native P2WPKH and Taproot P2TR, plus legacy
+Bitcoin signed-message verification for P2PKH and nested SegWit P2SH-P2WPKH.
+Those verifier tests are not real UniSat compatibility evidence. Product
+acceptance still requires pinned real-wallet evidence for each claimed path,
+and the weaker proof-strength policy for legacy signed-message verification
+remains open.
 
 Do not add a BTC signing button to the MetaMask connector unless MetaMask exposes
 and documents a BIP-322-capable dapp API for Bitcoin accounts. MetaMask Bitcoin
@@ -288,26 +298,29 @@ chain proof binds the same contract address, chain ID, message hash, and
 signature hash.
 
 Bitcoin ownership proofs use the same Runtime-first shape. Browser-facing
-`/api/auth/btc/challenge` and `/api/auth/btc/verify` routes are connector-token
-scoped; System/Home tokens cannot create or verify BTC wallet links. Internally,
+`/api/auth/btc/challenge` and `/api/auth/btc/verify` routes remain
+connector-token scoped for direct configured connector use; System/Home tokens
+cannot create or verify BTC wallet links there. Injected UniSat instead uses the
+dedicated Home connector endpoints, which require both exact same-origin Home
+authority and a carried UniSat token bound to the same principal, session,
+proof, and grant. Internally,
 `bitcoin_challenge` issues a short-lived, single-use challenge for a Bitcoin
 address, and `verify_bip322_proof` consumes it only when the signed message
-matches the stored challenge exactly. The first supported proof class is
-BIP-322 simple for Bitcoin mainnet native P2WPKH addresses, exposed as
-`bip122:000000000019d6689c085ae165831e93` with proof type
-`bip322_simple`; the built-in managed Bitcoin account uses
-`managed_btc_p2wpkh` when it signs the same Runtime-bound proof after approval.
-Unsupported networks, unsupported address scripts, malformed witnesses,
-replayed challenges, expired challenges, wrong-message signatures, and
-non-Runtime managed proof messages fail closed. Legacy Bitcoin message signing
-is not accepted for privileged capabilities until it has an explicit weaker
-proof class.
+matches the stored challenge exactly. The external verifier has source-tested
+support for BIP-322 simple native P2WPKH and P2TR proofs under
+`bip322_simple`, and for Bitcoin signed-message P2PKH and P2SH-P2WPKH proofs
+under `bitcoin_signed_message`. The built-in managed Bitcoin account is
+different: it remains native P2WPKH and uses `managed_btc_p2wpkh` when signing
+the Runtime-bound proof after approval. Unsupported networks and scripts,
+malformed witnesses, replayed or expired challenges, wrong-message signatures,
+and non-Runtime managed proof messages fail closed.
 
-Broader Bitcoin script support is intentionally deferred. Adding P2SH, P2WSH,
-Taproot, multisig, or hardware-wallet-specific BIP-322 behavior needs pinned
-wallet compatibility, script-specific vectors, and connector UX before it can
-grant Runtime capabilities. Until then, native P2WPKH is the only accepted
-Bitcoin proof class.
+Source-tested verification is not a product compatibility or capability-strength
+claim. Real UniSat evidence for P2WPKH, P2TR, P2PKH, and P2SH-P2WPKH remains
+open, as does an explicit weaker-proof policy for `bitcoin_signed_message`.
+P2WSH, multisig, hardware-wallet-specific behavior, and any additional script
+types still need pinned vectors, wallet evidence, connector UX, and policy
+before they can be claimed as supported.
 
 ## Red Lines
 

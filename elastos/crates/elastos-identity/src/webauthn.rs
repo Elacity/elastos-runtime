@@ -525,6 +525,11 @@ impl IdentityManager {
         Ok(options)
     }
 
+    /// Cancel a pending registration or authentication challenge.
+    pub fn cancel_challenge(&mut self, session_token: &str) -> bool {
+        self.challenges.remove(session_token).is_some()
+    }
+
     /// Complete authentication flow
     pub fn complete_authentication(
         &mut self,

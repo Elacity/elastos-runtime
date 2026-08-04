@@ -41,6 +41,13 @@ and even that binding does not replace the route's launch-token and policy gate.
 No shell may infer authority from successful loading, same-origin placement, or
 an HTTP success response.
 
+The trusted top-level Home host for injected-wallet connector effects is a
+closed browser edge adapter, not a shell and not ESP authority. Its
+deterministic EIP-6963 selection uses self-asserted `rdns` announcement metadata;
+that metadata is not cryptographic extension authentication. Runtime challenge,
+signature, account, launch-authority, and receipt verification remains the
+authoritative boundary.
+
 ## Initialize
 
 `GET /api/esp/initialize` returns the static ESP descriptor for

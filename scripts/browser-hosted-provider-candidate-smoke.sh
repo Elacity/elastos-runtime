@@ -21,7 +21,7 @@ KasmVNC/Workspaces, BrowserBox, or another hosted remote browser candidate.
 The candidate must prove:
   - product compositor display contract, not CDP/JPEG proof frames
   - WebRTC audio track, video track, datachannel input, connected ICE
-  - remote compositor resize, so page scale can match the visible window
+  - fixed 1920x1080 guest raster continuity across viewer resize
   - Runtime/provider navigation commands: address navigate, back, forward, reload
   - controlled media playback with decoded audio/video bytes and quality floor
   - Runtime-mediated EIP-1193 wallet bridge

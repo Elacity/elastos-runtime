@@ -28,9 +28,6 @@ Options:
   --selkies-framerate <fps>                Default: 30
   --selkies-video-bitrate <mbps>           Default: 16
   --selkies-h264-crf <value>               Default: 23
-  --selkies-width <pixels>                 Default: 1280
-  --selkies-height <pixels>                Default: 720
-  --selkies-resolution-mode <mode>         Default: dynamic (dynamic|manual)
   --target-image <image>                   Prebuilt Selkies Runtime target image
   --local-exit-bin /path/to/browser-local-exit
   --native-proxy-bin /path/to/browser-native-proxy-engine
@@ -63,7 +60,6 @@ selkies_video_bitrate="16"
 selkies_h264_crf="23"
 selkies_width="1920"
 selkies_height="1080"
-selkies_resolution_mode="dynamic"
 selkies_display="${ELASTOS_BROWSER_SELKIES_DISPLAY:-:$((40 + ($$ % 50)))}"
 target_image=""
 local_exit_bin="${ELASTOS_BROWSER_LOCAL_EXIT_BIN:-}"
@@ -134,18 +130,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --selkies-h264-crf)
       selkies_h264_crf="${2:-}"
-      shift 2
-      ;;
-    --selkies-width)
-      selkies_width="${2:-}"
-      shift 2
-      ;;
-    --selkies-height)
-      selkies_height="${2:-}"
-      shift 2
-      ;;
-    --selkies-resolution-mode)
-      selkies_resolution_mode="${2:-}"
       shift 2
       ;;
     --target-image)
@@ -232,16 +216,10 @@ case "$selkies_encoder" in
   x264enc|x264enc-striped|jpeg) ;;
   *) echo "--selkies-encoder must be x264enc, x264enc-striped, or jpeg" >&2; exit 2 ;;
 esac
-case "$selkies_resolution_mode" in
-  dynamic|manual) ;;
-  *) echo "--selkies-resolution-mode must be dynamic or manual" >&2; exit 2 ;;
-esac
 for numeric_value in \
   "selkies-framerate:$selkies_framerate" \
   "selkies-video-bitrate:$selkies_video_bitrate" \
-  "selkies-h264-crf:$selkies_h264_crf" \
-  "selkies-width:$selkies_width" \
-  "selkies-height:$selkies_height"; do
+  "selkies-h264-crf:$selkies_h264_crf"; do
   name="${numeric_value%%:*}"
   value="${numeric_value#*:}"
   if ! [[ "$value" =~ ^[0-9]+$ ]]; then
@@ -261,11 +239,6 @@ if (( selkies_h264_crf < 5 || selkies_h264_crf > 50 )); then
   echo "--selkies-h264-crf must be 5..50" >&2
   exit 2
 fi
-if (( selkies_width < 640 || selkies_width > 3840 || selkies_height < 360 || selkies_height > 2160 )); then
-  echo "--selkies-width/--selkies-height must be within 640x360..3840x2160" >&2
-  exit 2
-fi
-
 cd "$repo_root"
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -468,7 +441,6 @@ export XDG_RUNTIME_DIR=/tmp/runtime-ubuntu
 export PIPEWIRE_RUNTIME_DIR=\$XDG_RUNTIME_DIR
 export PULSE_RUNTIME_PATH=\$XDG_RUNTIME_DIR/pulse
 export PULSE_SERVER=unix:\$PULSE_RUNTIME_PATH/native
-export ELASTOS_SELKIES_INITIAL_RESOLUTION=${selkies_width}x${selkies_height}
 mkdir -p \"\$XDG_RUNTIME_DIR\" \"\$PULSE_RUNTIME_PATH\" \"$container_profile_dir\"
 mkdir -p /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix
@@ -510,7 +482,7 @@ ELASTOS_BROWSER_NATIVE_PROXY_ENGINE_CONFIG='{
     \"--start-fullscreen\",
     \"--window-position=0,0\",
     \"--window-size=$selkies_width,$selkies_height\",
-    \"--force-device-scale-factor=1.5\",
+    \"--force-device-scale-factor=1\",
     \"--app=about:blank\",
     \"--user-data-dir=$container_profile_dir\",
     \"--remote-debugging-address=127.0.0.1\",
@@ -520,26 +492,6 @@ ELASTOS_BROWSER_NATIVE_PROXY_ENGINE_CONFIG='{
 ELASTOS_BROWSER_ENGINE_URL='about:blank' \
 ELASTOS_BROWSER_ENGINE_STREAM_ID='stream:selkies-runtime-exit-target' \
   /opt/elastos-browser-native-proxy-engine >/tmp/native-proxy-engine.log 2>/tmp/chromium-current.log &
-python3 - <<'PY'
-import os
-from pathlib import Path
-
-resolution = os.environ['ELASTOS_SELKIES_INITIAL_RESOLUTION']
-path = Path('/usr/local/lib/python3.12/dist-packages/selkies/webrtc_mode.py')
-source = path.read_text()
-quote = chr(34)
-needle = 'resize_display(' + quote + '1920x1080' + quote + ')'
-replacement = 'resize_display(' + quote + resolution + quote + ')'
-patched = source.replace(needle, replacement)
-if patched != source:
-    path.write_text(patched)
-PY
-selkies_resolution_args=()
-if [[ "$selkies_resolution_mode" == "manual" ]]; then
-  selkies_resolution_args=(--manual-width=$selkies_width --manual-height=$selkies_height --is-manual-resolution-mode=true)
-else
-  selkies_resolution_args=(--is-manual-resolution-mode=false)
-fi
 python3 -m selkies \
   --addr=127.0.0.1 \
   --port=$selkies_port \
@@ -556,10 +508,12 @@ python3 -m selkies \
   --video-bitrate=$selkies_video_bitrate \
   --h264-crf=$selkies_h264_crf \
   --h264-streaming-mode=true \
-  --enable-resize=true \
+  --enable-resize=false \
   --use-paint-over-quality=true \
   --paint-over-jpeg-quality=95 \
-  \"\${selkies_resolution_args[@]}\" >/tmp/selkies-current.log 2>&1
+  --manual-width=$selkies_width \
+  --manual-height=$selkies_height \
+  --is-manual-resolution-mode=true >/tmp/selkies-current.log 2>&1
 " >/dev/null
 
 for ((attempt = 0; attempt < timeout_seconds * 10; attempt += 1)); do
@@ -623,8 +577,8 @@ const config = {
   display_surface: {
     stream_width: Number("$selkies_width"),
     stream_height: Number("$selkies_height"),
-    css_width: Math.max(320, Math.round(Number("$selkies_width") / 1.5)),
-    css_height: Math.max(240, Math.round(Number("$selkies_height") / 1.5))
+    css_width: Number("$selkies_width"),
+    css_height: Number("$selkies_height")
   },
   connect_timeout_ms: 30000,
   signal_timeout_ms: 30000
@@ -706,7 +660,7 @@ console.log(JSON.stringify({
   selkies_framerate: Number("$selkies_framerate"),
   selkies_video_bitrate_mbps: Number("$selkies_video_bitrate"),
   selkies_resolution: "$selkies_width" + "x" + "$selkies_height",
-  selkies_resolution_mode: "$selkies_resolution_mode",
+  selkies_resolution_mode: "fixed",
   target_image: "$docker_image",
   prebuilt_target_image: Boolean("$target_image"),
   verified: Boolean($verify)

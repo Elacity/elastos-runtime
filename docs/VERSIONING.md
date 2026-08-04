@@ -12,7 +12,7 @@ This repo currently has three distinct version layers. They should not be read a
 
 1. **Core runtime release train**
    - the coordinated workspace line under [`elastos/Cargo.toml`](../elastos/Cargo.toml)
-   - examples: the current `0.5.0` baseline and a future `0.6.0-rc.1`
+   - examples: the `0.5.0` baseline and the current `0.6.0` release line
    - this is the public release identity for the runtime/server crates
 
 2. **Stamped public release version**
@@ -105,11 +105,11 @@ Do not invent ad hoc suffixes. If a new prerelease class is needed, update this 
 When reading logs, audits, or UI banners, use this interpretation:
 
 - **Published install**
-  - should show the stamped public release version, for example `0.5.0`
+  - should show the stamped public release version, for example `0.6.0`
 
 - **Source build without publish stamping**
   - may show the coordinated workspace version with `-dev`
-  - for the current baseline, that is `0.5.0-dev`
+  - for the current release line, that is `0.6.0-dev`
   - this means “current source build”, not “published release”
 
 - **Capsule manifest examples or local package metadata**

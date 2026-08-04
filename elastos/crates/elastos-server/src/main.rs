@@ -440,6 +440,31 @@ enum Commands {
     #[command(subcommand)]
     Source(sources::SourceCommand),
 
+    /// Migrate explicitly selected principal-root objects while the Runtime is offline
+    #[command(name = "principal-root-migrate", hide = true)]
+    PrincipalRootMigrate {
+        /// Exact Runtime data root; the command fails if a live host owns it
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Owner-only secret-free plan with hash-bound object selections
+        #[arg(long)]
+        plan: PathBuf,
+        /// Fresh directory for owner-only plaintext backups
+        #[arg(long)]
+        backup_dir: PathBuf,
+    },
+
+    /// Upgrade every configured protected root from canonical declared plaintext while offline
+    #[command(name = "principal-root-upgrade", hide = true)]
+    PrincipalRootUpgrade {
+        /// Exact Runtime data root; the command fails if a live host owns it
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Fresh owner-only rollback backup under data-dir/backups
+        #[arg(long)]
+        backup_dir: PathBuf,
+    },
+
     /// Show runtime version
     Version,
 
@@ -1446,6 +1471,30 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Source(cmd) => {
             release_cmd::run_source(cmd)?;
+        }
+
+        Commands::PrincipalRootMigrate {
+            data_dir,
+            plan,
+            backup_dir,
+        } => {
+            let receipt = elastos_server::auth::migrate_principal_root_objects_offline(
+                &data_dir,
+                &plan,
+                &backup_dir,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+
+        Commands::PrincipalRootUpgrade {
+            data_dir,
+            backup_dir,
+        } => {
+            let receipt = api::auth_gateway::migrate_configured_principal_roots_offline(
+                &data_dir,
+                &backup_dir,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
 
         Commands::Version => {

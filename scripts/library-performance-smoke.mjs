@@ -8,7 +8,13 @@ import path from "node:path";
 const require = createRequire(new URL("../elastos/tools/browser-playwright-engine/package.json", import.meta.url));
 const { chromium } = require("playwright");
 
-const capsuleRoot = path.resolve("capsules/library");
+const capsuleRoot = path.resolve("capsules/library/browser");
+const homeClipboardClientPath = path.resolve(
+  "capsules/home/browser/home-clipboard-client.js",
+);
+const homeClipboardProtocolPath = path.resolve(
+  "capsules/home/browser/home-clipboard-protocol.js",
+);
 const token = "library-performance-smoke-token";
 const principalRoot = "localhost://Users/perf";
 const documentsUri = `${principalRoot}/Documents`;
@@ -126,6 +132,16 @@ function createAppServer() {
       return;
     }
 
+    if (url.pathname === "/apps/home/home-clipboard-client.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      createReadStream(homeClipboardClientPath).pipe(res);
+      return;
+    }
+    if (url.pathname === "/apps/home/home-clipboard-protocol.js") {
+      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8" });
+      createReadStream(homeClipboardProtocolPath).pipe(res);
+      return;
+    }
     let relative = url.pathname.replace(/^\/apps\/library\/?/, "") || "index.html";
     relative = relative.replace(/^\/+/, "");
     const filePath = path.join(capsuleRoot, relative);
@@ -153,11 +169,45 @@ async function run() {
   const browser = await chromium.launch({ headless: true });
   try {
     const page = await browser.newPage();
+    const pageErrors = [];
+    const consoleErrors = [];
+    const failedRequests = [];
     page.on("pageerror", (error) => {
-      throw error;
+      pageErrors.push(String(error?.stack || error));
     });
-    await page.goto(`http://127.0.0.1:${port}/apps/library/?home_token=${encodeURIComponent(token)}`);
-    await page.locator(".item").filter({ hasText: "File-0001.txt" }).first().waitFor();
+    page.on("console", (message) => {
+      if (message.type() === "error") {
+        consoleErrors.push(message.text());
+      }
+    });
+    page.on("requestfailed", (request) => {
+      failedRequests.push({
+        url: request.url(),
+        error: request.failure()?.errorText || "",
+      });
+    });
+    page.on("response", (response) => {
+      if (response.status() >= 400) {
+        failedRequests.push({
+          url: response.url(),
+          error: `HTTP ${response.status()}`,
+        });
+      }
+    });
+    await page.goto(
+      `http://127.0.0.1:${port}/apps/library/#home_token=${encodeURIComponent(token)}`,
+    );
+    try {
+      await page.locator(".item").filter({ hasText: "File-0001.txt" }).first().waitFor();
+    } catch (error) {
+      throw new Error(
+        `Library performance fixture did not boot: ${String(error)}\n${JSON.stringify(
+          { pageErrors, consoleErrors, failedRequests },
+          null,
+          2,
+        )}`,
+      );
+    }
 
     const initialPerf = await page.evaluate(() => window.__libraryPerf);
     assert(initialPerf?.iconFetchCount === 0, "Library must not fetch/hydrate SVG icons from JavaScript");

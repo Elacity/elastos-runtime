@@ -2,16 +2,61 @@ use super::*;
 
 pub(in crate::api::gateway) async fn system_wallet_accounts_summary(
     state: &GatewayState,
-    principal_id: &str,
+    authority: &RuntimeWalletAuthority,
 ) -> SystemWalletAccountsSummary {
-    let response = crate::api::auth_gateway::wallet_provider_data(
+    let response = runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "accounts",
-            "principal_id": principal_id,
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
     )
     .await;
+    wallet_accounts_summary_from_response(response)
+}
+
+pub(in crate::api::gateway) async fn runtime_wallet_data(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    operation: elastos_wallet_contract::WalletProviderOperationV2,
+) -> anyhow::Result<serde_json::Value> {
+    let registry = state
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("wallet provider unavailable"))?;
+    match RuntimeWalletAdapter::new(registry, authority)
+        .invoke(operation)
+        .await?
+        .result
+    {
+        elastos_wallet_contract::WalletResultV2::Ok { data } => Ok(data),
+        elastos_wallet_contract::WalletResultV2::Error { message, .. } => anyhow::bail!(message),
+    }
+}
+
+pub(in crate::api::gateway) async fn runtime_wallet_data_with_request_id(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    request_id: String,
+    operation: elastos_wallet_contract::WalletProviderOperationV2,
+) -> anyhow::Result<serde_json::Value> {
+    let registry = state
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("wallet provider unavailable"))?;
+    match RuntimeWalletAdapter::new(registry, authority)
+        .invoke_with_request_id(request_id, operation)
+        .await?
+        .result
+    {
+        elastos_wallet_contract::WalletResultV2::Ok { data } => Ok(data),
+        elastos_wallet_contract::WalletResultV2::Error { message, .. } => anyhow::bail!(message),
+    }
+}
+
+fn wallet_accounts_summary_from_response(
+    response: anyhow::Result<serde_json::Value>,
+) -> SystemWalletAccountsSummary {
     match response {
         Ok(data) => {
             let accounts = data
@@ -88,17 +133,19 @@ pub(in crate::api::gateway) async fn system_wallet_managed_create(
     headers: HeaderMap,
     Json(input): Json<SystemWalletManagedCreateRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return system_error_response(err),
         };
-    create_managed_wallet_accounts(&state, &context, input, SYSTEM_CAPSULE_ID).await
+    let context = authority.home_launch_context();
+    create_managed_wallet_accounts(&state, &context, &authority, input, SYSTEM_CAPSULE_ID).await
 }
 
 pub(in crate::api::gateway) async fn create_managed_wallet_accounts(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     input: SystemWalletManagedCreateRequest,
     capsule_id: &'static str,
 ) -> Response {
@@ -116,15 +163,14 @@ pub(in crate::api::gateway) async fn create_managed_wallet_accounts(
             .label
             .clone()
             .unwrap_or_else(|| managed_wallet_label(&chain_namespace));
-        if let Err(err) = crate::api::auth_gateway::wallet_provider_data(
+        if let Err(err) = runtime_wallet_data(
             state,
-            serde_json::json!({
-                "op": "create_managed_account",
-                "principal_id": context.principal_id.clone(),
-                "chain_namespace": chain_namespace,
-                "label": label,
-                "create_new": input.create_new,
-            }),
+            authority,
+            elastos_wallet_contract::WalletProviderOperationV2::CreateManagedAccount {
+                chain_namespace,
+                label: Some(label),
+                create_new: input.create_new,
+            },
         )
         .await
         {
@@ -147,7 +193,7 @@ pub(in crate::api::gateway) async fn create_managed_wallet_accounts(
             },
         },
     );
-    Json(system_wallet_accounts_summary(state, &context.principal_id).await).into_response()
+    Json(system_wallet_accounts_summary(state, authority).await).into_response()
 }
 
 pub(in crate::api::gateway) async fn system_wallet_default_update(
@@ -155,17 +201,19 @@ pub(in crate::api::gateway) async fn system_wallet_default_update(
     headers: HeaderMap,
     Json(input): Json<SystemWalletDefaultRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, SYSTEM_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[SYSTEM_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return system_error_response(err),
         };
-    update_default_wallet_account(&state, &context, input, SYSTEM_CAPSULE_ID).await
+    let context = authority.home_launch_context();
+    update_default_wallet_account(&state, &context, &authority, input, SYSTEM_CAPSULE_ID).await
 }
 
 pub(in crate::api::gateway) async fn update_default_wallet_account(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     input: SystemWalletDefaultRequest,
     capsule_id: &'static str,
 ) -> Response {
@@ -174,29 +222,27 @@ pub(in crate::api::gateway) async fn update_default_wallet_account(
     let intent = input.intent.clone();
     let mirror_browser_default =
         chain_namespace.starts_with("eip155:") && intent == "transaction_intent";
-    match crate::api::auth_gateway::wallet_provider_data(
+    match runtime_wallet_data(
         state,
-        serde_json::json!({
-            "op": "set_default_account",
-            "principal_id": context.principal_id.clone(),
-            "chain_namespace": chain_namespace.clone(),
-            "intent": intent.clone(),
-            "account_id": account_id.clone(),
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::SetDefaultAccount {
+            chain_namespace: chain_namespace.clone(),
+            intent: intent.clone(),
+            account_id: account_id.clone(),
+        },
     )
     .await
     {
         Ok(_) => {
             if mirror_browser_default {
-                if let Err(err) = crate::api::auth_gateway::wallet_provider_data(
+                if let Err(err) = runtime_wallet_data(
                     state,
-                    serde_json::json!({
-                        "op": "set_default_account",
-                        "principal_id": context.principal_id.clone(),
-                        "chain_namespace": chain_namespace.clone(),
-                        "intent": "browser_connect",
-                        "account_id": account_id.clone(),
-                    }),
+                    authority,
+                    elastos_wallet_contract::WalletProviderOperationV2::SetDefaultAccount {
+                        chain_namespace: chain_namespace.clone(),
+                        intent: "browser_connect".to_string(),
+                        account_id: account_id.clone(),
+                    },
                 )
                 .await
                 {
@@ -219,7 +265,7 @@ pub(in crate::api::gateway) async fn update_default_wallet_account(
                     },
                 },
             );
-            Json(system_wallet_accounts_summary(state, &context.principal_id).await).into_response()
+            Json(system_wallet_accounts_summary(state, authority).await).into_response()
         }
         Err(err) => system_error_response(err),
     }
@@ -229,13 +275,13 @@ pub(in crate::api::gateway) async fn wallet_app_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
     let (wallet_accounts, wallet_approvals) = tokio::join!(
-        system_wallet_accounts_summary(&state, &context.principal_id),
-        system_wallet_approvals_summary(&state, &context.principal_id, true)
+        system_wallet_accounts_summary(&state, &authority),
+        system_wallet_approvals_summary(&state, &authority, true)
     );
     Json(serde_json::json!({
         "app": {

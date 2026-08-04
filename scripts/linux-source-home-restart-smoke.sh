@@ -102,6 +102,8 @@ required = [
     "refusing to kill unrelated listener",
     "pkill -TERM -f",
     "kill_port_listeners",
+    "principal-root-upgrade",
+    "principal_root_backup_dir",
 ]
 missing = [needle for needle in required if needle not in source]
 if missing:
@@ -127,6 +129,9 @@ fi
 failing_gateway="$tmp_dir/failing-gateway"
 cat >"$failing_gateway" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "principal-root-upgrade" ]]; then
+  printf '{"schema":"elastos.principal-root.upgrade-receipt/v1","status":"already_ready","root_count":0,"object_count":0,"roots":[]}\n'
+fi
 exit 0
 SH
 chmod +x "$failing_gateway"
@@ -171,6 +176,10 @@ PY
 mismatch_gateway="$tmp_dir/mismatch-gateway"
 cat >"$mismatch_gateway" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "principal-root-upgrade" ]]; then
+  printf '{"schema":"elastos.principal-root.upgrade-receipt/v1","status":"already_ready","root_count":0,"object_count":0,"roots":[]}\n'
+  exit 0
+fi
 addr="localhost:0"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -204,6 +213,44 @@ HTTPServer(("localhost", port), Handler).serve_forever()
 PY
 SH
 chmod +x "$mismatch_gateway"
+
+migration_failing_gateway="$tmp_dir/migration-failing-gateway"
+migration_start_marker="$tmp_dir/migration-started-main"
+cat >"$migration_failing_gateway" <<SH
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "principal-root-upgrade" ]]; then
+  exit 41
+fi
+touch "$migration_start_marker"
+exit 0
+SH
+chmod +x "$migration_failing_gateway"
+
+migration_fail_port="$(free_port)"
+migration_fail_home="$tmp_dir/migration-fail-home"
+migration_fail_xdg="$tmp_dir/migration-fail-xdg"
+prepare_installed_assets "$migration_fail_xdg"
+set +e
+"$repo_root/scripts/linux-source-home-restart.sh" \
+  --home "$migration_fail_home" \
+  --xdg-data-home "$migration_fail_xdg" \
+  --addr "localhost:${migration_fail_port}" \
+  --gateway-bin "$migration_failing_gateway" \
+  --wait-seconds 1 \
+  --log-dir "$tmp_dir/migration-fail-logs" \
+  --pid-file "$tmp_dir/run-migration-fail/gateway.pid" \
+  >"$tmp_dir/migration-fail.out" \
+  2>"$tmp_dir/migration-fail.err"
+migration_fail_status=$?
+set -e
+if [[ "$migration_fail_status" -eq 0 ]]; then
+  echo "linux-source-home-restart ignored a failed principal-root upgrade" >&2
+  exit 1
+fi
+if [[ -e "$migration_start_marker" ]]; then
+  echo "linux-source-home-restart started Home after principal-root upgrade failure" >&2
+  exit 1
+fi
 
 mismatch_port="$(free_port)"
 mismatch_home="$tmp_dir/mismatch-home"
@@ -297,4 +344,4 @@ if ! grep -q "refusing to kill unrelated listener" "$tmp_dir/unrelated.err"; the
   exit 1
 fi
 
-printf '{"schema":"elastos.linux-source-home-restart-smoke/v1","ok":true,"dry_run_contract":true,"hash_proof_gate_present":true,"invalid_addr_rejected":true,"live_failure_receipt":true,"hash_mismatch_receipt":true,"unrelated_listener_protected":true}\n'
+printf '{"schema":"elastos.linux-source-home-restart-smoke/v1","ok":true,"dry_run_contract":true,"hash_proof_gate_present":true,"principal_root_upgrade_gate_present":true,"invalid_addr_rejected":true,"live_failure_receipt":true,"hash_mismatch_receipt":true,"unrelated_listener_protected":true}\n'

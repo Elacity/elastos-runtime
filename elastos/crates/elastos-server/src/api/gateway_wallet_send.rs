@@ -7,64 +7,58 @@ pub(in crate::api::gateway) async fn wallet_app_send_transaction(
     headers: HeaderMap,
     Json(input): Json<WalletSendTransactionRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) = consume_fresh_passkey_home_token(
+    let context = launch.context.clone();
+    let step_up_request = serde_json::json!({
+        "account_id": input.account_id,
+        "chain_namespace": input.chain_namespace,
+        "to": input.to,
+        "amount": input.amount,
+    });
+    let step_up = match consume_or_recover_passkey_step_up_effect(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        WALLET_CAPSULE_ID,
+        &input.step_up_token,
+        &launch,
         180,
         "wallet.send",
+        &step_up_request,
+    ) {
+        Ok(step_up) => step_up,
+        Err(err) => return system_error_response(err),
+    };
+    let effect_id = match runtime_transaction_effect_id(
+        NATIVE_TRANSACTION_SOURCE,
+        &authority,
         &serde_json::json!({
-            "account_id": input.account_id,
-            "chain_namespace": input.chain_namespace,
-            "to": input.to,
-            "amount": input.amount,
+            "step_up_id": step_up.step_up_id,
+            "request_sha256": step_up.request_sha256,
         }),
     ) {
-        return system_error_response(err);
-    }
-    let audit_id = wallet_send_request_id(&input.account_id);
-    let _ = append_wallet_approval_audit(
-        &state.data_dir,
-        WalletApprovalAuditInput {
-            capsule_id: WALLET_CAPSULE_ID,
-            event_type: "wallet.transaction.requested",
-            principal_id: &context.principal_id,
-            session_id: &context.session_id,
-            request_id: &audit_id,
-            result: "requested",
-            reason: "Wallet requested a native EVM transaction send",
-        },
-    );
-    match wallet_send_transaction(&state, &context, &input, &audit_id).await {
+        Ok(effect_id) => effect_id,
+        Err(err) => return system_error_response(err),
+    };
+    match wallet_send_transaction(&state, &context, &authority, &input, &effect_id, &step_up).await
+    {
         Ok(payload) => Json(payload).into_response(),
-        Err((status, message)) => {
-            let _ = append_wallet_approval_audit(
-                &state.data_dir,
-                WalletApprovalAuditInput {
-                    capsule_id: WALLET_CAPSULE_ID,
-                    event_type: "wallet.transaction.failed",
-                    principal_id: &context.principal_id,
-                    session_id: &context.session_id,
-                    request_id: &audit_id,
-                    result: "failed",
-                    reason: &message,
-                },
-            );
-            (status, message).into_response()
-        }
+        Err((status, message)) => (status, message).into_response(),
     }
 }
 
 pub(in crate::api::gateway) async fn wallet_send_transaction(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     input: &WalletSendTransactionRequest,
-    audit_id: &str,
+    effect_id: &str,
+    step_up: &PasskeyStepUpEffectIdentity,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let Some(network) = wallet_chain_namespace_network(&input.chain_namespace) else {
         return Err((
@@ -74,158 +68,78 @@ pub(in crate::api::gateway) async fn wallet_send_transaction(
     };
     validate_wallet_evm_address(&input.to, "to")?;
     let value = native_amount_to_hex_quantity(&input.amount, 18)?;
-    let accounts = system_wallet_accounts_summary(state, &context.principal_id).await;
-    let Some(account) = accounts.accounts.iter().find(|account| {
-        account.account_id == input.account_id
-            && account.chain_namespace.starts_with("eip155:")
-            && input.chain_namespace.starts_with("eip155:")
-    }) else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Wallet send account is not linked to this Runtime principal".to_string(),
-        ));
-    };
-    if !account.signing_available || !is_managed_wallet_proof_type(&account.proof_type) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Wallet send currently requires a passkey-managed EVM account".to_string(),
-        ));
-    }
-    validate_wallet_evm_address(&account.address, "from")?;
-
-    let intent = wallet_chain_provider_data(
-        state,
-        serde_json::json!({
-            "op": "prepare_transaction",
-            "network": network,
-            "from": account.address,
-            "to": input.to,
-            "value": value,
-            "data": "0x",
-        }),
-    )
-    .await?;
-    if intent.get("schema").and_then(|value| value.as_str())
-        != Some("elastos.chain.unsigned_transaction_intent/v1")
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "chain provider returned an unsupported transaction intent".to_string(),
-        ));
-    }
-
-    let chain_broadcast_resource = format!("elastos://chain/{network}/broadcast_transaction");
-    let request_data = crate::api::auth_gateway::wallet_provider_data(
-        state,
-        serde_json::json!({
-            "op": "request_signature",
-            "principal_id": context.principal_id,
-            "account_id": account.account_id,
-            "chain_namespace": input.chain_namespace,
-            "intent": "transaction_intent",
-            "capsule_id": WALLET_CAPSULE_ID,
-            "resource": chain_broadcast_resource,
-            "reason": format!("Wallet sends {} native units on {}", input.amount, network),
-            "payload": intent
-        }),
-    )
-    .await
-    .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    let approval_request = request_data
-        .get("approval_request")
-        .filter(|value| value.is_object())
-        .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "wallet-provider returned an invalid approval response".to_string(),
-            )
-        })?;
-    let request_id = approval_request
-        .get("request_id")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "wallet-provider approval response is missing request id".to_string(),
-            )
-        })?;
-    let outcome = approve_managed_wallet_request(
-        state,
-        &state.data_dir,
-        &context.principal_id,
-        &context.session_id,
-        request_id,
-        "Approved in Wallet send flow",
-        WALLET_CAPSULE_ID,
-    )
-    .await
-    .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    let signed_transaction = outcome.signed_transaction.ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "built-in wallet did not return a signed transaction".to_string(),
+    let approval = if step_up.recovered {
+        resume_runtime_native_transaction_approval(
+            state,
+            authority,
+            effect_id,
+            &step_up.step_up_id,
+            &step_up.request_sha256,
         )
-    })?;
-    let receipt = wallet_chain_provider_data(
+        .await?
+    } else {
+        let accounts = system_wallet_accounts_summary(state, authority).await;
+        let Some(account) = accounts.accounts.iter().find(|account| {
+            account.account_id == input.account_id
+                && account.chain_namespace.starts_with("eip155:")
+                && input.chain_namespace.starts_with("eip155:")
+        }) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Wallet send account is not linked to this Runtime principal".to_string(),
+            ));
+        };
+        if !account.signing_available || !is_managed_wallet_proof_type(&account.proof_type) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Wallet send currently requires a passkey-managed EVM account".to_string(),
+            ));
+        }
+        validate_wallet_evm_address(&account.address, "from")?;
+
+        ensure_runtime_transaction_approval(
+            state,
+            authority,
+            RuntimeTransactionRequest {
+                source: NATIVE_TRANSACTION_SOURCE,
+                effect_id: effect_id.to_string(),
+                request_sha256: step_up.request_sha256.clone(),
+                account_id: account.account_id.clone(),
+                address: account.address.clone(),
+                chain_namespace: input.chain_namespace.clone(),
+                network: network.to_string(),
+                to: input.to.clone(),
+                value,
+                data: "0x".to_string(),
+                approval_reason: format!(
+                    "Wallet sends {} native units on {}",
+                    input.amount, network
+                ),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await?
+    };
+    let completion = complete_runtime_transaction_effect(
         state,
-        serde_json::json!({
-            "op": "broadcast_transaction",
-            "network": network,
-            "signed_transaction": signed_transaction,
+        authority,
+        RuntimeTransactionLookup::EffectId(&approval.effect_id),
+        Some(RuntimeManagedTransactionApproval {
+            context,
+            reason: "Approved in Wallet send flow",
+            capsule_id: WALLET_CAPSULE_ID,
         }),
     )
     .await?;
-    let transaction_hash = receipt
-        .get("transaction_hash")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "chain provider broadcast receipt is missing transaction hash".to_string(),
-            )
-        })?;
-    let recorded_approval = crate::api::auth_gateway::wallet_provider_data(
-        state,
-        serde_json::json!({
-            "op": "record_transaction_hash",
-            "principal_id": context.principal_id,
-            "request_id": request_id,
-            "transaction_hash": transaction_hash,
-        }),
-    )
-    .await
-    .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    let completed_approval_request = recorded_approval
-        .get("approval_request")
-        .filter(|value| value.is_object())
-        .cloned()
-        .unwrap_or_else(|| approval_request.clone());
-    append_wallet_approval_audit(
-        &state.data_dir,
-        WalletApprovalAuditInput {
-            capsule_id: WALLET_CAPSULE_ID,
-            event_type: "wallet.transaction.completed",
-            principal_id: &context.principal_id,
-            session_id: &context.session_id,
-            request_id: audit_id,
-            result: "completed",
-            reason: "Wallet signed and broadcasted a native EVM transaction",
-        },
-    )
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(serde_json::json!({
         "schema": "elastos.wallet.send-transaction-result/v1",
-        "request_id": request_id,
-        "transaction_hash": transaction_hash,
-        "approval_request": completed_approval_request,
-        "signed_result": recorded_approval
-            .get("approval_request")
-            .and_then(|value| value.get("signed_result"))
-            .cloned()
-            .or(outcome.signed_result),
-        "receipt": receipt,
+        "request_id": completion.approval_request_id,
+        "transaction_hash": completion.transaction_hash,
+        "approval_request": completion.approval_request,
+        "signed_result": completion.signed_result,
+        "receipt": completion.receipt,
+        "completion_status": if completion.completion_pending { "pending" } else { "complete" },
+        "completion_error": completion.completion_error,
     }))
 }
 
@@ -237,24 +151,6 @@ pub(in crate::api::gateway) fn wallet_chain_namespace_network(
         "eip155:8453" => Some("base-mainnet"),
         _ => None,
     }
-}
-
-pub(in crate::api::gateway) fn wallet_send_request_id(account_id: &str) -> String {
-    let safe_account: String = account_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == ':' || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("wallet-send:{safe_account}:{timestamp}")
 }
 
 pub(in crate::api::gateway) fn validate_wallet_evm_address(

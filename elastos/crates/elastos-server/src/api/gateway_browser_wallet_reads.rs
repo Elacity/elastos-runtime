@@ -2,9 +2,15 @@
 
 use super::*;
 
+#[cfg(not(test))]
+const BROWSER_WALLET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(test)]
+const BROWSER_WALLET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub(super) async fn browser_wallet_read(
     state: &GatewayState,
     context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     input: BrowserWalletReadRequest,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let request_id = browser_effect_request_id("chain-read", input.method.trim());
@@ -23,7 +29,17 @@ pub(super) async fn browser_wallet_read(
             decision: "standing_read_policy",
         },
     )?;
-    let result = browser_wallet_read_inner(state, context, &input).await;
+    let result = tokio::time::timeout(
+        BROWSER_WALLET_READ_TIMEOUT,
+        browser_wallet_read_inner(state, authority, &input),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "Browser wallet read timed out".to_string(),
+        ))
+    });
     let (event_type, result_label, decision) = match &result {
         Ok(_) => (
             "browser.chain_read.completed",
@@ -52,7 +68,7 @@ pub(super) async fn browser_wallet_read(
 
 async fn browser_wallet_read_inner(
     state: &GatewayState,
-    context: &HomeLaunchTokenContext,
+    authority: &RuntimeWalletAuthority,
     input: &BrowserWalletReadRequest,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let method = input.method.trim();
@@ -74,7 +90,7 @@ async fn browser_wallet_read_inner(
             "Browser chain reads require a supported eip155 chain".to_string(),
         ));
     };
-    let accounts = system_wallet_accounts_summary(state, &context.principal_id).await;
+    let accounts = system_wallet_accounts_summary(state, authority).await;
     if !accounts
         .accounts
         .iter()

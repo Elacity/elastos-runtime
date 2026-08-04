@@ -27,7 +27,7 @@ async fn test_system_can_select_default_wallet_without_exposing_connector_author
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/default")
                 .header("x-elastos-home-token", token.clone())
@@ -54,6 +54,8 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = authority.system_token.clone();
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), SYSTEM_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -75,12 +77,14 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
         })]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let missing_fresh_token = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Amanaged/approve")
                 .header("x-elastos-home-token", token.clone())
@@ -97,10 +101,10 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     let missing_text = String::from_utf8(missing_body.to_vec()).unwrap();
     assert!(missing_text.contains("fresh passkey verification is required"));
 
-    let approval_token = intent_token_for_authority_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         SYSTEM_CAPSULE_ID,
-        &authority,
+        &token,
         "wallet.approve",
         &json!({
             "request_id": "wallet-approval:managed",
@@ -109,13 +113,13 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     );
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Amanaged/approve")
                 .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"reason":"Looks correct","home_token":"{}"}}"#,
+                    r#"{{"reason":"Looks correct","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -129,6 +133,17 @@ async fn test_system_approves_managed_wallet_request_and_executes_signature() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["pending_count"], 0);
     assert_eq!(json["note"], "Approved and signed by built-in wallet.");
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_authority,
+            &[
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveAndSignManaged,
+                WalletOperationKind::ListApprovals,
+            ],
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -160,10 +175,10 @@ async fn test_system_does_not_approve_external_wallet_request() {
     };
     let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
 
-    let approval_token = intent_token_for_authority_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         SYSTEM_CAPSULE_ID,
-        &authority,
+        &token,
         "wallet.approve",
         &json!({
             "request_id": "wallet-approval:external",
@@ -172,13 +187,13 @@ async fn test_system_does_not_approve_external_wallet_request() {
     );
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/approvals/wallet-approval%3Aexternal/approve")
                 .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"reason":"Looks correct","home_token":"{}"}}"#,
+                    r#"{{"reason":"Looks correct","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),

@@ -4,60 +4,30 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Inbox · ElastOS</title>
-  <!-- tip: inbox-20260720b — unified-sidebar window (rail unchanged) -->
-  <script src="./elastos-theme.js"></script>
-  <link rel="stylesheet" href="./elastos-ui.css">
   <style>
-    /* Apps-level blend for the Inbox WINDOW (Library/System grammar).
-       Shell Inbox rail stays a separate surface. */
     :root {
-      color-scheme: dark;
-      --bg: var(--el-bg);
-      --sidebar-bg: rgba(22, 24, 29, 0.78);
-      --toolbar-bg: var(--bg);
-      --panel: var(--el-surface-raised);
-      --panel-strong: var(--el-surface-raised);
-      --panel-soft: var(--el-inset);
-      --line: var(--el-hairline);
-      --line-strong: var(--el-hairline-strong);
-      --ink: var(--el-text);
-      --muted: var(--el-muted);
-      --brand: var(--el-brand);
-      --accent: var(--el-accent);
-      --accent-soft: var(--el-accent-soft);
-      --danger: var(--el-danger);
+      color-scheme: light;
+      --bg: #ffffff;
+      --sidebar-bg: #f9f9f9;
+      --toolbar-bg: #fafafa;
+      --panel: #ffffff;
+      --panel-strong: #ffffff;
+      --panel-soft: #f9f9f9;
+      --line: #e5e7eb;
+      --line-strong: #d1d5db;
+      --ink: #1f2937;
+      --muted: #6b7280;
+      --brand: #f6921a;
+      --accent: #007aff;
+      --accent-soft: #e5f0ff;
+      --danger: #b14c5a;
       --shadow: none;
       --border: var(--line);
       --border-strong: var(--line-strong);
       --text: var(--ink);
       --radius-lg: 8px;
       --radius-md: 6px;
-      font-family: var(--el-font);
-    }
-
-    :root[data-el-theme="light"] {
-      color-scheme: light;
-      --sidebar-bg: #f0f1f4;
-      --toolbar-bg: var(--bg);
-    }
-
-    :root[data-el-theme="light"] body {
-      background: var(--bg);
-    }
-
-    :root[data-el-theme="light"] .entry-action:hover,
-    :root[data-el-theme="light"] .entry-action:focus-visible {
-      background: var(--el-inset);
-    }
-
-    :root[data-el-theme="light"] .entry-action.primary {
-      background: var(--text);
-      color: var(--el-surface-raised);
-    }
-
-    :root[data-el-theme="light"] .entry-action.danger {
-      border-color: color-mix(in srgb, var(--el-danger) 24%, transparent);
-      background: color-mix(in srgb, var(--el-danger) 8%, transparent);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
     }
 
     * {
@@ -102,15 +72,14 @@
       padding: 30px;
     }
 
-    /* Apps-level blend: flex/grid split; sidebar owns lights safe-top. */
     .shell {
       height: 100vh;
       height: 100dvh;
       display: grid;
-      grid-template-columns: 220px minmax(0, 1fr);
+      grid-template-columns: 200px minmax(0, 1fr);
       gap: 0;
       overflow: hidden;
-      background: var(--bg);
+      background: var(--panel);
     }
 
     .sidebar,
@@ -121,16 +90,13 @@
     .sidebar {
       display: flex;
       flex-direction: column;
-      gap: 2px;
-      padding: var(--window-chrome-safe-top, 52px) 12px 16px;
+      gap: 4px;
+      padding: 20px;
       border: 0;
-      border-right: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+      border-right: 1px solid var(--line);
       border-radius: 0;
-      background: color-mix(in srgb, var(--sidebar-bg) 78%, transparent);
+      background: var(--sidebar-bg);
       box-shadow: none;
-      backdrop-filter: blur(22px);
-      -webkit-backdrop-filter: blur(22px);
-      overflow-y: auto;
     }
 
     .main {
@@ -140,7 +106,7 @@
       overflow: hidden;
       border: 0;
       border-radius: 0;
-      background: var(--bg);
+      background: var(--panel);
       box-shadow: none;
     }
 
@@ -179,18 +145,15 @@
     }
 
     .sidebar-title {
-      margin: 0 0 10px;
-      padding: 0 4px;
+      margin: 15px 0 16px;
       color: var(--muted);
-      font-size: 11px;
+      font-size: 19px;
       font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
     }
 
     .summary-stack {
       display: grid;
-      gap: 2px;
+      gap: 4px;
     }
 
     .summary-card {
@@ -199,28 +162,16 @@
       justify-content: space-between;
       gap: 10px;
       min-height: 34px;
-      padding: 7px 12px;
-      border: 1px solid transparent;
-      border-radius: 999px;
+      padding: 7px 10px;
+      border: 0;
+      border-radius: 4px;
       background: transparent;
       color: var(--ink);
-      font: inherit;
-      text-align: left;
-      cursor: pointer;
     }
 
+    .summary-card.active,
     .summary-card:hover {
-      background: var(--el-lift);
-    }
-
-    /* Capsule selected row (Library/System grammar). */
-    .summary-card.active {
-      background: var(--el-lift-strong);
-      color: var(--el-accent);
-    }
-
-    .summary-card.active strong {
-      color: var(--el-accent);
+      background: var(--line);
     }
 
     .summary-card strong {
@@ -276,7 +227,7 @@
       border-radius: 6px;
       border: 1px solid var(--border);
       padding: 5px 10px;
-      background: var(--el-inset);
+      background: #fff;
       color: var(--text);
       cursor: pointer;
       font-weight: 600;
@@ -288,103 +239,38 @@
     .entry-action:hover,
     .entry-action:focus-visible {
       border-color: var(--border-strong);
-      background: rgba(255, 255, 255, 0.1);
+      background: #f9fafb;
       outline: none;
     }
 
-    /* Mail anatomy: a compact selectable list on the left, the full request
-       with its actions in a reading pane on the right. */
-    .entry-split {
-      flex: 1 1 auto;
+    .entry-list {
       display: grid;
-      grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
-      min-height: 0;
-    }
-
-    .entry-rows {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-      min-height: 0;
-      overflow: auto;
-      padding: 8px;
-      border-right: 1px solid var(--line);
-    }
-
-    .entry-row {
-      display: grid;
-      gap: 2px;
-      padding: 9px 10px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: var(--ink);
-      font: inherit;
-      text-align: left;
-      cursor: pointer;
-    }
-
-    .entry-row:hover {
-      background: var(--panel-soft);
-    }
-
-    .entry-row.active {
-      background: var(--accent-soft);
-    }
-
-    .entry-row-top {
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
       gap: 8px;
-    }
-
-    .entry-row-title {
-      overflow: hidden;
-      font-size: 13px;
-      font-weight: 600;
-      white-space: nowrap;
-      text-overflow: ellipsis;
-    }
-
-    .entry-row-time {
-      flex: 0 0 auto;
-      color: var(--muted);
-      font-size: 11px;
-    }
-
-    .entry-row-snippet {
-      overflow: hidden;
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-      text-overflow: ellipsis;
-    }
-
-    .entry-row-unread .entry-row-title::before {
-      content: "";
-      display: inline-block;
-      width: 7px;
-      height: 7px;
-      margin-right: 6px;
-      border-radius: 50%;
-      background: var(--accent);
-      vertical-align: 1px;
-    }
-
-    .entry-detail {
-      display: block;
       min-height: 0;
       overflow: auto;
-      padding: 18px 20px;
+      padding: 12px;
     }
 
-    .entry-detail-placeholder {
+    .entry {
       display: grid;
-      place-items: center;
-      height: 100%;
-      color: var(--muted);
-      font-size: 13px;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid #d0d0d0;
+      border-radius: 8px;
+      background: var(--panel-soft);
+      box-shadow: none;
+    }
+
+    .entry[data-severity="attention"] {
+      border-color: rgba(0, 122, 255, 0.35);
+      background: #f5f9ff;
+    }
+
+    .entry-copy {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
     }
 
     .entry-title-row {
@@ -395,7 +281,7 @@
     }
 
     .entry-title {
-      font-size: 1.15rem;
+      font-size: 1.05rem;
       font-weight: 600;
       letter-spacing: 0;
     }
@@ -420,31 +306,30 @@
     }
 
     .entry-body {
-      margin-top: 10px;
-      color: var(--ink);
-      font-size: 13.5px;
-      line-height: 1.55;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
     }
 
     .entry-actions {
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 18px;
-      padding-top: 14px;
-      border-top: 1px solid var(--line);
+      justify-content: flex-end;
+      align-content: flex-start;
+      gap: 6px;
+      min-width: 160px;
     }
 
     .entry-action.primary {
       background: var(--text);
       border-color: var(--text);
-      color: #0b0d10;
+      color: #f8fbff;
     }
 
     .entry-action.danger {
       color: var(--danger);
-      border-color: rgba(255, 143, 143, 0.32);
-      background: rgba(255, 143, 143, 0.1);
+      border-color: rgba(177, 76, 90, 0.24);
+      background: rgba(177, 76, 90, 0.08);
     }
 
     .entry-action:disabled {
@@ -459,78 +344,10 @@
       place-items: center;
       margin: 12px;
       padding: 20px;
-      border: 1px solid var(--line);
+      border: 1px solid #d0d0d0;
       border-radius: 8px;
       background: var(--panel-soft);
       text-align: center;
-    }
-
-    .empty-state h2 {
-      font-size: 16px;
-    }
-
-    .empty-state .muted {
-      margin-top: 6px;
-      font-size: 13px;
-    }
-
-    /* Rail: Home owns title/Open/Close. Single-column cards with inline actions. */
-    html[data-inbox-presentation="rail"] .sidebar {
-      display: none;
-    }
-
-    html[data-inbox-presentation="rail"] .shell {
-      grid-template-columns: 1fr;
-    }
-
-    html[data-inbox-presentation="rail"] .toolbar {
-      display: none;
-    }
-
-    html[data-inbox-presentation="rail"] .toolbar-title h1 {
-      display: none;
-    }
-
-    html[data-inbox-presentation="rail"] .entry-split {
-      grid-template-columns: 1fr;
-    }
-
-    html[data-inbox-presentation="rail"] .entry-detail {
-      display: none;
-    }
-
-    html[data-inbox-presentation="rail"] .entry-rows {
-      padding: 8px;
-      gap: 8px;
-      border-right: 0;
-    }
-
-    html[data-inbox-presentation="rail"] .entry-rail-card {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel-soft);
-    }
-
-    html[data-inbox-presentation="rail"] .entry-rail-card .entry-row-title {
-      white-space: normal;
-      font-size: 13px;
-    }
-
-    html[data-inbox-presentation="rail"] .entry-rail-card .entry-row-snippet {
-      white-space: normal;
-      display: -webkit-box;
-      -webkit-line-clamp: 3;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-    }
-
-    html[data-inbox-presentation="rail"] .entry-rail-card .entry-actions {
-      margin-top: 8px;
-      padding-top: 10px;
     }
 
     @media (max-width: 900px) {
@@ -564,20 +381,24 @@
         box-shadow: none;
       }
 
+      .toolbar,
+      .entry {
+        grid-template-columns: 1fr;
+      }
+
       .toolbar {
         display: flex;
         gap: 8px;
       }
 
-      /* Phone: list over detail, stacked. */
-      .entry-split {
-        grid-template-columns: 1fr;
-        grid-template-rows: minmax(120px, 40%) minmax(0, 1fr);
+      .entry {
+        gap: 8px;
+        padding: 8px;
       }
 
-      .entry-rows {
-        border-right: 0;
-        border-bottom: 1px solid var(--line);
+      .entry-actions {
+        justify-content: flex-start;
+        min-width: 0;
       }
 
       .summary-stack {
@@ -598,35 +419,31 @@
   <section id="inbox-shell" class="shell hidden">
     <aside class="sidebar">
       <div class="sidebar-title">Inbox</div>
-      <div class="summary-stack" role="group" aria-label="Inbox filters">
-        <button class="summary-card active" type="button" data-filter="all" aria-pressed="true">
+      <div class="summary-stack" aria-label="Inbox summary">
+        <article class="summary-card active">
           <strong id="pending-count">0</strong>
           <span>Pending</span>
-        </button>
-        <button class="summary-card" type="button" data-filter="review" aria-pressed="false">
+        </article>
+        <article class="summary-card">
           <strong id="review-count">0</strong>
           <span>Review</span>
-        </button>
+        </article>
       </div>
     </aside>
 
     <main class="main">
       <div class="toolbar">
         <div class="toolbar-title">
-          <h1 id="list-title">Requests</h1>
-          <p id="status-text" class="status">Loading…</p>
+          <h1>Requests</h1>
+          <p id="status-text" class="status">Loading...</p>
         </div>
         <button id="refresh" class="action-secondary" type="button">Refresh</button>
       </div>
 
-      <div class="entry-split">
-        <section id="entry-rows" class="entry-rows" role="listbox" aria-label="Requests"></section>
-        <section id="entry-detail" class="entry-detail" aria-live="polite"></section>
-      </div>
+      <section id="entry-list" class="entry-list" aria-live="polite"></section>
       <section id="empty-state" class="empty-state hidden">
         <div>
           <h2>No requests</h2>
-          <p class="muted">Approvals and connection requests will show up here.</p>
         </div>
       </section>
     </main>
@@ -636,31 +453,16 @@
     const INBOX_SAFETY_REFRESH_MS = 5 * 60 * 1000;
     const launchParams = new URLSearchParams(window.location.search);
     const homeParentOrigin = launchParams.get("home_origin") || "";
-    const presentation = launchParams.get("presentation") === "rail" ? "rail" : "window";
-    document.documentElement.dataset.inboxPresentation = presentation;
 
     const state = {
       homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
       entries: [],
       refreshInFlight: null,
-      filter: "all",
-      selectedId: "",
-      lastNotifications: {},
     };
 
     if (state.homeToken && homeParentOrigin && window.top !== window) {
       window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeParentOrigin);
     }
-
-    window.addEventListener("message", (event) => {
-      if (event.origin !== "null" || event.source !== window.parent) {
-        return;
-      }
-      const message = event.data || {};
-      if (message.type === "elastos:inbox-chrome-command" && message.cmd === "refresh") {
-        void requestInboxRefresh().catch(() => {});
-      }
-    });
 
     const elements = {
       lockedShell: document.getElementById("locked-shell"),
@@ -669,12 +471,8 @@
       pendingCount: document.getElementById("pending-count"),
       reviewCount: document.getElementById("review-count"),
       refresh: document.getElementById("refresh"),
-      entryRows: document.getElementById("entry-rows"),
-      entryDetail: document.getElementById("entry-detail"),
+      entryList: document.getElementById("entry-list"),
       emptyState: document.getElementById("empty-state"),
-      entrySplit: document.querySelector(".entry-split"),
-      listTitle: document.getElementById("list-title"),
-      filterButtons: [...document.querySelectorAll(".summary-card[data-filter]")],
     };
 
     function showLocked() {
@@ -709,15 +507,6 @@
           homeToken: state.homeToken,
         }, homeParentOrigin);
       }
-      notifyRailChrome();
-    }
-
-    function notifyRailChrome() {
-      if (presentation !== "rail" || window.parent === window) {
-        return;
-      }
-      const pending = state.entries.filter((entry) => !entry.read).length;
-      window.parent.postMessage({ type: "inbox:pending-count", count: pending }, "*");
     }
 
     function runtimeEventIsRelevant(event) {
@@ -739,10 +528,10 @@
       }
     }
 
-    async function api(path, options, authorityToken = state.homeToken) {
+    async function api(path, options) {
       const request = Object.assign({ method: "GET" }, options || {});
       request.headers = Object.assign({}, request.headers || {}, {
-        "x-elastos-home-token": authorityToken,
+        "x-elastos-home-token": state.homeToken,
       });
       if (request.body && !request.headers["content-type"]) {
         request.headers["content-type"] = "application/json";
@@ -755,7 +544,7 @@
       return response.json();
     }
 
-    async function requestFreshPasskeyHomeToken(operation, request) {
+    async function requestPasskeyStepUp(operation, request) {
       if (!state.homeToken || window.top === window || !homeParentOrigin) {
         throw new Error("Open Inbox from Home to verify your passkey.");
       }
@@ -771,14 +560,26 @@
             return;
           }
           const result = event.data && typeof event.data === "object" ? event.data : null;
-          if (result?.type !== "home:passkey-authority-result" || result.requestId !== requestId) {
+          if (
+            result?.type !== "elastos.home.passkey-step-up.result/v1"
+            || result.requestId !== requestId
+          ) {
             return;
           }
           window.clearTimeout(timeout);
           window.removeEventListener("message", onResult);
-          const freshToken = typeof result.homeToken === "string" ? result.homeToken.trim() : "";
-          if (freshToken) {
-            resolve(freshToken);
+          const stepUpToken = typeof result.stepUpToken === "string"
+            ? result.stepUpToken.trim()
+            : "";
+          const expectedKeys = stepUpToken
+            ? ["type", "requestId", "stepUpToken"]
+            : ["type", "requestId", "error"];
+          if (!hasExactKeys(result, expectedKeys)) {
+            reject(new Error("Passkey verification returned an invalid result."));
+            return;
+          }
+          if (stepUpToken) {
+            resolve(stepUpToken);
             return;
           }
           reject(new Error(typeof result.error === "string" && result.error.trim()
@@ -787,7 +588,7 @@
         };
         window.addEventListener("message", onResult);
         window.top.postMessage({
-          type: "home:request-passkey-authority",
+          type: "elastos.home.passkey-step-up.request/v1",
           requestId,
           homeToken: state.homeToken,
           operation,
@@ -796,11 +597,18 @@
       });
     }
 
-    async function inboxAction(actionId, fields = {}, authorityToken = state.homeToken) {
+    function hasExactKeys(value, expectedKeys) {
+      const actual = Object.keys(value).sort();
+      const expected = expectedKeys.slice().sort();
+      return actual.length === expected.length
+        && actual.every((key, index) => key === expected[index]);
+    }
+
+    async function inboxAction(actionId, fields = {}) {
       return api("/api/apps/inbox/actions", {
         method: "POST",
         body: JSON.stringify(Object.assign({ action_id: actionId }, fields)),
-      }, authorityToken);
+      });
     }
 
     async function loadInbox() {
@@ -809,7 +617,6 @@
       state.entries = Array.isArray(notifications.entries) ? notifications.entries : [];
       renderInbox(notifications);
       markVisibleRead(notifications);
-      notifyRailChrome();
       notifyHome();
     }
 
@@ -828,172 +635,27 @@
       return state.refreshInFlight;
     }
 
-    function filteredEntries() {
-      if (state.filter === "review") {
-        return state.entries.filter((entry) => entry && entry.severity === "attention");
-      }
-      return state.entries;
-    }
-
-    function setFilter(filter) {
-      state.filter = filter === "review" ? "review" : "all";
-      for (const button of elements.filterButtons) {
-        const active = button.dataset.filter === state.filter;
-        button.classList.toggle("active", active);
-        button.setAttribute("aria-pressed", active ? "true" : "false");
-      }
-      elements.listTitle.textContent = state.filter === "review" ? "Review" : "Requests";
-      renderInbox(state.lastNotifications);
-    }
-
     function renderInbox(notifications) {
-      state.lastNotifications = notifications || {};
-      const entries = filteredEntries();
-      const attentionCount = Number((notifications || {}).attention_count || 0);
-      elements.pendingCount.textContent = String(state.entries.length);
+      const entries = state.entries;
+      const attentionCount = Number(notifications.attention_count || 0);
+      elements.pendingCount.textContent = String(entries.length);
       elements.reviewCount.textContent = String(attentionCount);
-
-      // Keep the selection when it survives the refresh; otherwise pick the
-      // first entry so the reading pane is never pointlessly empty.
-      if (!entries.some((entry) => entry.id === state.selectedId)) {
-        state.selectedId = entries.length ? entries[0].id || "" : "";
+      elements.entryList.replaceChildren();
+      for (const entry of entries) {
+        elements.entryList.appendChild(createEntry(entry));
       }
-
-      elements.entryRows.replaceChildren();
-      if (presentation === "rail") {
-        for (const entry of entries) {
-          elements.entryRows.appendChild(createRailCard(entry));
-        }
-        elements.entryDetail.replaceChildren();
-      } else {
-        for (const entry of entries) {
-          elements.entryRows.appendChild(createRow(entry));
-        }
-        renderDetail(entries.find((entry) => entry.id === state.selectedId) || null);
-      }
-
-      const empty = entries.length === 0;
-      elements.emptyState.classList.toggle("hidden", !empty);
-      elements.entrySplit.classList.toggle("hidden", empty);
-      setStatus(state.entries.length === 0 ? "" : `${state.entries.length} pending.`);
-      notifyRailChrome();
+      elements.emptyState.classList.toggle("hidden", entries.length !== 0);
+      setStatus(entries.length === 0 ? "" : `${entries.length} pending.`);
     }
 
-    function createRow(entry) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "entry-row";
-      row.setAttribute("role", "option");
-      row.setAttribute("aria-selected", entry.id === state.selectedId ? "true" : "false");
-      row.classList.toggle("active", entry.id === state.selectedId);
-      row.classList.toggle("entry-row-unread", !entry.read);
+    function createEntry(entry) {
+      const article = document.createElement("article");
+      article.className = "entry";
+      article.dataset.notificationId = entry.id || "";
+      article.dataset.severity = entry.severity || "info";
 
-      const top = document.createElement("div");
-      top.className = "entry-row-top";
-      const title = document.createElement("span");
-      title.className = "entry-row-title";
-      title.textContent = entry.title || "Request";
-      const time = document.createElement("span");
-      time.className = "entry-row-time";
-      time.textContent = entry.created_at ? formatInboxTime(entry.created_at) : "";
-      top.append(title, time);
-
-      const snippet = document.createElement("span");
-      snippet.className = "entry-row-snippet";
-      snippet.textContent = entry.body || "";
-
-      row.append(top, snippet);
-      row.addEventListener("click", () => {
-        state.selectedId = entry.id || "";
-        renderInbox(state.lastNotifications);
-      });
-      return row;
-    }
-
-    function createRailCard(entry) {
-      const card = document.createElement("article");
-      card.className = "entry-rail-card";
-      if (!entry.read) {
-        card.classList.add("entry-row-unread");
-      }
-
-      const top = document.createElement("div");
-      top.className = "entry-row-top";
-      const title = document.createElement("span");
-      title.className = "entry-row-title";
-      title.textContent = publicInboxText(entry.title, "Request");
-      const time = document.createElement("span");
-      time.className = "entry-row-time";
-      time.textContent = entry.created_at ? formatInboxTime(entry.created_at) : "";
-      top.append(title, time);
-
-      const snippet = document.createElement("span");
-      snippet.className = "entry-row-snippet";
-      snippet.textContent = publicInboxText(entry.body, "This request needs your review.");
-
-      const actions = document.createElement("div");
-      actions.className = "entry-actions";
-      fillEntryActions(actions, entry);
-
-      card.append(top, snippet, actions);
-      return card;
-    }
-
-    function fillEntryActions(actions, entry) {
-      if (typeof entry.source_app === "string" && entry.source_app.trim()) {
-        actions.appendChild(createButton("Open", () => openSource(entry.source_app)));
-      }
-
-      const actionId = entry.action_ref && entry.action_ref.action_id;
-      if (typeof actionId === "string" && actionId.startsWith("room-approve-request:")) {
-        actions.appendChild(createActionButton("Approve", actionId, "primary"));
-        actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
-        const requestId = actionId.slice("wallet-approve-request:".length);
-        actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
-        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId })));
-        actions.appendChild(createActionButton("Reject", "wallet-reject-request:" + actionId.slice("wallet-approve-request:".length), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("capability-approve-request:")) {
-        actions.appendChild(createActionButton("Approve", actionId, "primary"));
-        actions.appendChild(createActionButton("Deny", "capability-deny-request:" + actionId.slice("capability-approve-request:".length), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("inspect-approve-request:")) {
-        const requestId = actionId.slice("inspect-approve-request:".length);
-        const approveButton = createButton("Approve", (button) => approveInspectRequest(button, requestId), "primary");
-        approveButton.dataset.actionId = actionId;
-        actions.appendChild(approveButton);
-        actions.appendChild(createButton("Deny", () => denyInspectRequest(requestId), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
-        actions.appendChild(createActionButton("Approve", actionId, "primary"));
-        actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
-      } else if (typeof actionId === "string" && actionId.startsWith("service-approve-request:")) {
-        actions.appendChild(createActionButton("Approve", actionId, "primary"));
-        actions.appendChild(createActionButton(
-          "Deny",
-          "service-deny-request:" + actionId.slice("service-approve-request:".length),
-          "danger",
-        ));
-      }
-
-      if (
-        entry.kind !== "wallet_approval_request" &&
-        entry.kind !== "capability_request" &&
-        entry.kind !== "inspect_action_request" &&
-        entry.kind !== "external_http_request" &&
-        entry.kind !== "service_access_request"
-      ) {
-        actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
-      }
-    }
-
-    function renderDetail(entry) {
-      elements.entryDetail.replaceChildren();
-      if (!entry) {
-        const placeholder = document.createElement("div");
-        placeholder.className = "entry-detail-placeholder";
-        placeholder.textContent = "Select a request";
-        elements.entryDetail.appendChild(placeholder);
-        return;
-      }
+      const copy = document.createElement("div");
+      copy.className = "entry-copy";
 
       const titleRow = document.createElement("div");
       titleRow.className = "entry-title-row";
@@ -1025,10 +687,45 @@
       body.className = "entry-body";
       body.textContent = publicInboxText(entry.body, "This request needs your review.");
 
+      copy.append(titleRow, time, body);
+
       const actions = document.createElement("div");
       actions.className = "entry-actions";
-      fillEntryActions(actions, entry);
-      elements.entryDetail.append(titleRow, time, body, actions);
+      if (typeof entry.source_app === "string" && entry.source_app.trim()) {
+        actions.appendChild(createButton("Open", () => openSource(entry.source_app)));
+      }
+
+      const actionId = entry.action_ref && entry.action_ref.action_id;
+      if (typeof actionId === "string" && actionId.startsWith("room-approve-request:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Deny", "room-deny-request:" + actionId.slice("room-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("wallet-approve-request:")) {
+        const requestId = actionId.slice("wallet-approve-request:".length);
+        actions.appendChild(createButton("Approve", (button) => approveWalletRequest(button, requestId), "primary"));
+        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId })));
+        actions.appendChild(createActionButton("Reject", "wallet-reject-request:" + actionId.slice("wallet-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("wallet-review-request:")) {
+        const requestId = actionId.slice("wallet-review-request:".length);
+        actions.appendChild(createButton("Review in Wallet", () => openSource("wallet", { wallet_request: requestId }), "primary"));
+      } else if (typeof actionId === "string" && actionId.startsWith("capability-approve-request:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Deny", "capability-deny-request:" + actionId.slice("capability-approve-request:".length), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("inspect-approve-request:")) {
+        const requestId = actionId.slice("inspect-approve-request:".length);
+        const approveButton = createButton("Approve", (button) => approveInspectRequest(button, requestId), "primary");
+        approveButton.dataset.actionId = actionId;
+        actions.appendChild(approveButton);
+        actions.appendChild(createButton("Deny", () => denyInspectRequest(requestId), "danger"));
+      } else if (typeof actionId === "string" && actionId.startsWith("wallet-price-http-approve:")) {
+        actions.appendChild(createActionButton("Approve", actionId, "primary"));
+        actions.appendChild(createActionButton("Reject", "wallet-price-http-deny:" + actionId.slice("wallet-price-http-approve:".length), "danger"));
+      }
+
+      if (entry.kind !== "wallet_approval_request" && entry.kind !== "capability_request" && entry.kind !== "inspect_action_request" && entry.kind !== "external_http_request") {
+        actions.appendChild(createActionButton("Dismiss", "notification-dismiss:" + entry.id));
+      }
+      article.append(copy, actions);
+      return article;
     }
 
     function createButton(label, onClick, className) {
@@ -1053,42 +750,11 @@
     async function runAction(actionId) {
       setButtonsDisabled(true);
       try {
-        const passkeyApprove = passkeyBoundApprove(actionId);
-        if (passkeyApprove) {
-          setStatus("Confirm with your passkey to approve.");
-          const homeToken = await requestFreshPasskeyHomeToken(passkeyApprove.operation, {
-            request_id: passkeyApprove.requestId,
-          });
-          await inboxAction(actionId, { home_token: homeToken }, homeToken);
-          setStatus("Approved.");
-          await loadInbox();
-          notifyHome();
-          return;
-        }
         await inboxAction(actionId);
         await loadInbox();
-      } catch (error) {
-        setStatus(String(error.message || error));
       } finally {
         setButtonsDisabled(false);
       }
-    }
-
-    function passkeyBoundApprove(actionId) {
-      if (typeof actionId !== "string") {
-        return null;
-      }
-      const pairs = [
-        ["room-approve-request:", "room.approve"],
-        ["capability-approve-request:", "capability.approve"],
-        ["service-approve-request:", "service.approve"],
-      ];
-      for (const [prefix, operation] of pairs) {
-        if (actionId.startsWith(prefix)) {
-          return { operation, requestId: actionId.slice(prefix.length) };
-        }
-      }
-      return null;
     }
 
     async function approveWalletRequest(button, requestId) {
@@ -1099,13 +765,13 @@
       button.disabled = true;
       setStatus("Confirm with your passkey to sign.");
       try {
-        const homeToken = await requestFreshPasskeyHomeToken("wallet.approve", {
+        const stepUpToken = await requestPasskeyStepUp("wallet.approve", {
           request_id: requestId,
           reason: "Approved in Inbox",
         });
         await inboxAction("wallet-approve-request:" + requestId, {
-          home_token: homeToken,
-        }, homeToken);
+          step_up_token: stepUpToken,
+        });
         setStatus("Request signed.");
         await loadInbox();
         notifyHome();
@@ -1122,12 +788,12 @@
       button.disabled = true;
       setStatus("Confirm with your passkey to approve this System action.");
       try {
-        const homeToken = await requestFreshPasskeyHomeToken("inspect.approve", {
+        const stepUpToken = await requestPasskeyStepUp("inspect.approve", {
           request_id: requestId,
         });
         const outcome = await inboxAction("inspect-approve-request:" + requestId, {
-          home_token: homeToken,
-        }, homeToken);
+          step_up_token: stepUpToken,
+        });
         requireInspectActionResult(outcome, requestId, "completed");
         setStatus("System action approved.");
         await loadInbox();
@@ -1232,7 +898,7 @@
     }
 
     function setButtonsDisabled(disabled) {
-      for (const button of elements.entryDetail.querySelectorAll("button")) {
+      for (const button of elements.entryList.querySelectorAll("button")) {
         button.disabled = disabled;
       }
       elements.refresh.disabled = disabled;
@@ -1299,100 +965,10 @@
         .finally(() => setButtonsDisabled(false));
     });
 
-    for (const button of elements.filterButtons) {
-      button.addEventListener("click", () => setFilter(button.dataset.filter));
-    }
-
-    // Shell menu bar: declare File/View menus to Home; commands come back as
-    // elastos:menu-command and route to the same functions the buttons use.
-    function announceShellMenuManifest() {
-      if (!state.homeToken || window.parent === window) {
-        return;
-      }
-      window.parent.postMessage({
-        type: "home:menu-manifest",
-        homeToken: state.homeToken,
-        menus: [
-          {
-            title: "File",
-            items: [
-              { label: "Refresh", cmd: "refresh" },
-              "-",
-              { label: "Close Window", cmd: "__close-window" },
-            ],
-          },
-          {
-            title: "View",
-            items: [
-              { label: "All Pending", cmd: "filter-all" },
-              { label: "Needs Review", cmd: "filter-review" },
-            ],
-          },
-        ],
-      }, window.location.origin);
-    }
-
-    function handleShellMenuCommand(cmd) {
-      switch (cmd) {
-        case "refresh":
-          requestInboxRefresh().catch((error) => setStatus(error.message || "Could not refresh."));
-          return;
-        case "filter-all":
-          setFilter("all");
-          return;
-        case "filter-review":
-          setFilter("review");
-          return;
-        default:
-      }
-    }
-
-    window.addEventListener("message", (event) => {
-      if (event.origin !== window.location.origin) {
-        return;
-      }
-      const message = event.data;
-      if (message?.type === "elastos:menu-command" && typeof message.cmd === "string") {
-        handleShellMenuCommand(message.cmd);
-      }
-    });
-
-    // List keyboard: the requests list is a listbox — arrows move the
-    // selection, Home/End jump, and the reading pane follows.
-    elements.entryRows.addEventListener("keydown", (event) => {
-      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
-        return;
-      }
-      const entries = filteredEntries();
-      if (!entries.length) {
-        return;
-      }
-      const index = entries.findIndex((entry) => entry.id === state.selectedId);
-      let next = index;
-      if (event.key === "ArrowDown") {
-        next = Math.min(entries.length - 1, index + 1);
-      } else if (event.key === "ArrowUp") {
-        next = Math.max(0, index - 1);
-      } else if (event.key === "Home") {
-        next = 0;
-      } else {
-        next = entries.length - 1;
-      }
-      if (next === index) {
-        return;
-      }
-      event.preventDefault();
-      state.selectedId = entries[next].id || "";
-      renderInbox(state.lastNotifications);
-      const rows = elements.entryRows.querySelectorAll(".entry-row");
-      rows[next]?.focus();
-    });
-
     if (!state.homeToken) {
       showLocked();
     } else {
       showInbox();
-      announceShellMenuManifest();
       requestInboxRefresh().catch(() => {});
       window.addEventListener("message", onRuntimeEvents);
       window.setInterval(() => {

@@ -16,19 +16,27 @@ import {
   shellState,
   fetchJson,
   targetById,
-} from "./shell-core.js?v=home-20260723a";
+} from "./shell-core.js?v=home-20260725a";
 import {
   bindHomeUnlock,
-  clearHomeSessionLock,
   hideHomeUnlock,
   isHomeAuthError,
-  isHomeSessionLocked,
-  rememberHomeSessionLock,
   refreshHomeSession,
-  requestPasskeyHomeAuthority,
+  requestPasskeyStepUp,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260723a";
+} from "./shell-auth.js?v=home-20260725a";
+import {
+  handleHomeWalletConnectorEffect,
+  WALLET_CONNECTOR_EFFECT_TYPE,
+} from "./home-wallet-connector-host.js?v=home-20260725a";
+import {
+  createHomeClipboardFrameState,
+  createHomeClipboardHost,
+  createHomeClipboardPrompt,
+  homeClipboardTargetSupported,
+} from "./home-clipboard-host.js?v=home-20260726a";
+import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260725a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -42,8 +50,20 @@ const HOME_CLI_SHELL_ID = "home-cli";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
 const MAX_LAUNCHED_APP_CONTEXTS = 128;
-const WALLET_CONNECTOR_TARGETS = Object.freeze(
-  new Set(["wallet-metamask", "wallet-unisat", "wallet-walletconnect"]),
+const BROWSER_AUTHORITY_RENEWAL_GUI_TIMEOUT_MS = 30_000;
+const BROWSER_AUTHORITY_RENEWAL_TIMEOUT_MS = 35_000;
+const BROWSER_AUTHORITY_RENEWAL_REQUEST_TYPE =
+  "elastos.home.browser-authority-renew.request/v1";
+const BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE =
+  "elastos.home.browser-authority-renew.result/v1";
+const HOME_GUI_AUTHORIZED_ATTACHMENT_SCHEMA =
+  "elastos.home.authorized-target-attachment/v1";
+const WALLET_CONNECTOR_TARGET_TITLES = Object.freeze({
+  "wallet-metamask": "MetaMask",
+  "wallet-unisat": "UniSat",
+});
+const WALLET_CONNECTOR_TARGETS = new Set(
+  Object.keys(WALLET_CONNECTOR_TARGET_TITLES),
 );
 const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   "archive-manager": new Set(["library"]),
@@ -58,7 +78,7 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   people: new Set(["chat-room"]),
   services: new Set(["browser", "chat-room"]),
   system: "visible-target",
-  "wallet": WALLET_CONNECTOR_TARGETS,
+  "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
 const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
@@ -66,8 +86,19 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   documents: new Set(["chat-room"]),
   library: new Set(["archive-manager", "browser", "chat-room"]),
 });
-const PASSKEY_AUTHORITY_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
+const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
 const launchedAppContexts = new Map();
+const pendingBrowserAuthorityRenewals = new Map();
+const homeClipboardPrompt = createHomeClipboardPrompt({
+  root: document.querySelector("#home-clipboard-prompt"),
+  title: document.querySelector("#home-clipboard-title"),
+  copy: document.querySelector("#home-clipboard-copy"),
+  allowButton: document.querySelector("#home-clipboard-allow"),
+  cancelButton: document.querySelector("#home-clipboard-cancel"),
+});
+const homeClipboardHost = createHomeClipboardHost({
+  prompt: homeClipboardPrompt,
+});
 
 function hideHostBootMask() {
   if (!homeShellBootMask) {
@@ -90,6 +121,46 @@ async function switchToHomeGuiAndOpenTarget(context, target, options = {}) {
   await openTargetFromHomeGui(target, options);
 }
 
+async function launchWalletConnectorFromTrustedSource(context, target) {
+  if (
+    context.kind !== "app-frame" ||
+    context.targetId !== "wallet" ||
+    !WALLET_CONNECTOR_TARGETS.has(target)
+  ) {
+    throw new Error("Home denied the Wallet connector launch");
+  }
+  requireHomeGuiActive("launch Wallet connector");
+  const launched = await launchHomeTarget(target);
+  const descriptor = walletConnectorAttachmentDescriptor(target, launched);
+  requireHomeGuiActive("attach Wallet connector");
+  if (!postToActiveShell({
+    type: "home:gui-command",
+    command: "attach-authorized-target",
+    descriptor,
+  })) {
+    throw new Error("Home GUI did not accept the Wallet connector attachment");
+  }
+}
+
+function retireLaunchedAppContext(homeToken) {
+  const context = launchedAppContexts.get(homeToken);
+  if (!context) {
+    return false;
+  }
+  cancelBrowserAuthorityRenewalsForToken(homeToken);
+  homeClipboardHost.retireFrame(context.clipboardState);
+  launchedAppContexts.delete(homeToken);
+  return true;
+}
+
+function clearLaunchedAppContexts() {
+  clearPendingBrowserAuthorityRenewals();
+  for (const context of launchedAppContexts.values()) {
+    homeClipboardHost.retireFrame(context.clipboardState);
+  }
+  launchedAppContexts.clear();
+}
+
 function enterHostAuthGate() {
   shellState.activeShellRootLaunchSeq += 1;
   shellState.activeShellRootTarget = "";
@@ -97,7 +168,7 @@ function enterHostAuthGate() {
   rememberActiveShellHint(HOME_GUI_SHELL_ID);
   document.body.dataset.homeShell = "resolving";
   document.body.dataset.homeGui = "dormant";
-  launchedAppContexts.clear();
+  clearLaunchedAppContexts();
   if (activeShellRoot) {
     activeShellRoot.hidden = true;
     activeShellRoot.dataset.target = "";
@@ -113,47 +184,16 @@ function enterHostAuthGate() {
 }
 
 async function showHostAuthGate(options = {}) {
-  // Session Lock (Control Centre) must keep the live desktop mounted so frost
-  // can blur it. enterHostAuthGate() tears the shell down — that path is only
-  // for cold boot / unsigned front door / hard re-auth.
-  const frostLock =
-    options.presentation === "prompt" && options.surface === "desktop";
-  if (frostLock) {
-    // Survive refresh: seat stays locked until passkey unlock or Sign out.
-    rememberHomeSessionLock();
-  } else {
-    enterHostAuthGate();
-  }
-  const surface = frostLock || options.surface === "desktop" ? "desktop" : "neutral";
-  const onUnlocked = frostLock
-    ? async () => {
-        clearHomeSessionLock();
-        document.body.dataset.homeStatus = "ready";
-        // Gate already dismissed in unlockComplete; refresh under the live desktop.
-        try {
-          await refreshHomeSession();
-        } catch (error) {
-          if (!isHomeAuthError(error)) {
-            console.error("home session refresh after lock failed", error);
-          }
-        }
-        try {
-          await refreshShellSummary();
-        } catch (error) {
-          console.error("home summary refresh after lock failed", error);
-        }
-        startShellTimers();
-      }
-    : () => boot();
-  const unlockReady = showHomeUnlock(onUnlocked, {
+  enterHostAuthGate();
+  const unlockReady = showHomeUnlock(() => boot(), {
     ...options,
-    surface,
+    surface: "neutral",
   });
   hideHostBootMask();
   await unlockReady;
 }
 
-async function launchHomeTarget(target, query = {}, authority = null) {
+async function launchHomeTarget(target, query = {}) {
   const body = {
     target,
     query: {
@@ -161,9 +201,6 @@ async function launchHomeTarget(target, query = {}, authority = null) {
       home_origin: window.location.origin,
     },
   };
-  if (authority) {
-    body.authority = authority;
-  }
   const launched = await fetchJson("/api/apps/home/launch", {
     method: "POST",
     body: JSON.stringify(body),
@@ -197,13 +234,210 @@ async function openTargetFromHomeGui(target, options = {}) {
 async function closeHomeGuiWindow(homeToken) {
   requireHomeGuiActive("close window");
   postToActiveShell({ type: "home:gui-command", command: "close-window", homeToken });
-  launchedAppContexts.delete(homeToken);
+  retireLaunchedAppContext(homeToken);
 }
 
-async function relaunchHomeGuiTarget(homeToken) {
-  requireHomeGuiActive("relaunch window");
-  postToActiveShell({ type: "home:gui-command", command: "relaunch-window", homeToken });
-  launchedAppContexts.delete(homeToken);
+function postBrowserAuthorityRenewalResult(record, result) {
+  try {
+    record.source.postMessage(
+      {
+        type: BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE,
+        requestId: record.requestId,
+        homeToken: record.oldHomeToken,
+        browserInstance: record.browserInstance,
+        ok: result.ok,
+        freshHomeToken: result.freshHomeToken,
+        reason: result.reason,
+      },
+      OPAQUE_FRAME_TARGET,
+    );
+  } catch (error) {
+    console.warn("home could not return Browser authority renewal", error);
+  }
+}
+
+function cancelBrowserAuthorityRenewalsForToken(homeToken) {
+  for (const [requestId, record] of pendingBrowserAuthorityRenewals) {
+    if (record.oldHomeToken !== homeToken) {
+      continue;
+    }
+    window.clearTimeout(record.timeout);
+    pendingBrowserAuthorityRenewals.delete(requestId);
+  }
+}
+
+function clearPendingBrowserAuthorityRenewals() {
+  for (const record of pendingBrowserAuthorityRenewals.values()) {
+    window.clearTimeout(record.timeout);
+  }
+  pendingBrowserAuthorityRenewals.clear();
+}
+
+function settleBrowserAuthorityRenewal(record, result) {
+  if (pendingBrowserAuthorityRenewals.get(record.requestId) !== record) {
+    return false;
+  }
+  window.clearTimeout(record.timeout);
+  pendingBrowserAuthorityRenewals.delete(record.requestId);
+  if (result.ok) {
+    retireLaunchedAppContext(record.oldHomeToken);
+  }
+  postBrowserAuthorityRenewalResult(record, result);
+  return true;
+}
+
+function startBrowserAuthorityRenewal(event, context, message) {
+  const requestId =
+    typeof message.requestId === "string" ? message.requestId.trim() : "";
+  const browserInstance =
+    typeof message.browserInstance === "string"
+      ? message.browserInstance.trim()
+      : "";
+  if (
+    context.kind !== "app-frame" ||
+    context.targetId !== "browser" ||
+    !hasExactMessageKeys(message, [
+      "type",
+      "requestId",
+      "homeToken",
+      "browserInstance",
+    ]) ||
+    message.type !== BROWSER_AUTHORITY_RENEWAL_REQUEST_TYPE ||
+    !requestId ||
+    requestId !== message.requestId ||
+    requestId.length > 128 ||
+    !browserInstance ||
+    browserInstance !== message.browserInstance ||
+    browserInstance.length > 256 ||
+    context.browserInstance !== browserInstance ||
+    context.source !== event.source
+  ) {
+    return false;
+  }
+  const pendingForFrame = [...pendingBrowserAuthorityRenewals.values()].find(
+    (record) =>
+      record.oldHomeToken === context.homeToken &&
+      record.browserInstance === browserInstance &&
+      record.source === event.source,
+  );
+  if (pendingForFrame) {
+    if (pendingForFrame.requestId !== requestId) {
+      postBrowserAuthorityRenewalResult(
+        {
+          requestId,
+          oldHomeToken: context.homeToken,
+          browserInstance,
+          source: event.source,
+        },
+        {
+          ok: false,
+          freshHomeToken: "",
+          reason: "renewal_in_flight",
+        },
+      );
+    }
+    return true;
+  }
+  if (pendingBrowserAuthorityRenewals.has(requestId)) {
+    return false;
+  }
+  const record = {
+    requestId,
+    oldHomeToken: context.homeToken,
+    browserInstance,
+    source: event.source,
+    timeout: 0,
+  };
+  record.timeout = window.setTimeout(() => {
+    settleBrowserAuthorityRenewal(record, {
+      ok: false,
+      freshHomeToken: "",
+      reason: "gui_timeout",
+    });
+  }, BROWSER_AUTHORITY_RENEWAL_TIMEOUT_MS);
+  pendingBrowserAuthorityRenewals.set(requestId, record);
+  try {
+    requireHomeGuiActive("renew Browser authority");
+    if (!postToActiveShell({
+      type: "home:gui-command",
+      command: "renew-browser-authority",
+      requestId,
+      oldHomeToken: context.homeToken,
+      browserInstance,
+      expiresAt: Date.now() + BROWSER_AUTHORITY_RENEWAL_GUI_TIMEOUT_MS,
+    })) {
+      throw new Error("Home GUI did not accept Browser authority renewal");
+    }
+  } catch (_error) {
+    settleBrowserAuthorityRenewal(record, {
+      ok: false,
+      freshHomeToken: "",
+      reason: "gui_unavailable",
+    });
+  }
+  return true;
+}
+
+function handleBrowserAuthorityRenewalResult(context, message) {
+  if (
+    context.kind !== "shell-frame" ||
+    context.targetId !== HOME_GUI_SHELL_ID ||
+    !hasExactMessageKeys(message, [
+      "type",
+      "requestId",
+      "oldHomeToken",
+      "browserInstance",
+      "ok",
+      "freshHomeToken",
+      "reason",
+      "homeToken",
+    ]) ||
+    message.type !== BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE
+  ) {
+    return false;
+  }
+  const record = pendingBrowserAuthorityRenewals.get(message.requestId);
+  if (
+    !record ||
+    message.oldHomeToken !== record.oldHomeToken ||
+    message.browserInstance !== record.browserInstance ||
+    typeof message.ok !== "boolean" ||
+    typeof message.freshHomeToken !== "string" ||
+    message.freshHomeToken.length > 4_096 ||
+    typeof message.reason !== "string" ||
+    message.reason.length > 128
+  ) {
+    return false;
+  }
+  if (!message.ok) {
+    if (message.freshHomeToken || !message.reason) {
+      return false;
+    }
+    return settleBrowserAuthorityRenewal(record, {
+      ok: false,
+      freshHomeToken: "",
+      reason: message.reason,
+    });
+  }
+  const oldContext = launchedAppContexts.get(record.oldHomeToken);
+  const freshContext = launchedAppContexts.get(message.freshHomeToken);
+  if (
+    message.reason !== "" ||
+    !message.freshHomeToken ||
+    message.freshHomeToken === record.oldHomeToken ||
+    oldContext?.targetId !== "browser" ||
+    oldContext.browserInstance !== record.browserInstance ||
+    oldContext.source !== record.source ||
+    freshContext?.targetId !== "browser" ||
+    freshContext.browserInstance !== record.browserInstance
+  ) {
+    return false;
+  }
+  return settleBrowserAuthorityRenewal(record, {
+    ok: true,
+    freshHomeToken: message.freshHomeToken,
+    reason: "",
+  });
 }
 
 async function deliverMessageToHomeGuiTargetFrame(target, payload) {
@@ -213,23 +447,8 @@ async function deliverMessageToHomeGuiTargetFrame(target, payload) {
   if (!context) {
     return false;
   }
-  /* Opaque capsule frames reject targetOrigin "null"; use * like every other host→frame post. */
-  context.source.postMessage(payload, OPAQUE_FRAME_TARGET);
+  context.source.postMessage(payload, context.origin);
   return true;
-}
-
-function setHomeGuiMenuManifest(windowId, menus, homeToken = "") {
-  requireHomeGuiActive("set menu manifest");
-  // Bridge to the isolated Home GUI frame — never direct-import the GUI module.
-  // The host does not know GUI window ids; it forwards the sender's launch
-  // token and the GUI resolves its own window (menus stay self-declared UI).
-  postToActiveShell({
-    type: "home:gui-command",
-    command: "set-menu-manifest",
-    windowId,
-    homeToken,
-    menus,
-  });
 }
 
 async function openHomeGuiTargetWithPayload(target, payload) {
@@ -251,154 +470,6 @@ async function openHomeGuiTargetWithPayload(target, payload) {
 async function showHomeGuiDesktop() {
   requireHomeGuiActive("show desktop");
   postToActiveShell({ type: "home:gui-command", command: "show-desktop" });
-}
-
-/* ---- Connector popup relay ----
-   Wallet connector popups are real-origin top-level windows: the extension
-   injects there, but the gateway (correctly) refuses their token'd API calls,
-   and the sandbox's implicit noopener plus BroadcastChannel origin
-   partitioning leave popup and opaque sheet with no direct channel. The host
-   shares the popup's real origin, so it bridges: popup stages arrive on a
-   same-origin BroadcastChannel and are forwarded into the sheet frame that
-   owns the matching launch token; sheet answers come back over the token-bound
-   frame bridge and are rebroadcast. Stages carry addresses/signatures only —
-   the launch token never crosses, and API calls stay inside the opaque sheet. */
-const CONNECTOR_POPUP_CHANNEL = "elastos:connector-popup";
-const CONNECTOR_POPUP_RELAY_TYPE = "elastos:connector-popup-relay";
-
-const connectorPopupChannel = "BroadcastChannel" in window
-  ? new BroadcastChannel(CONNECTOR_POPUP_CHANNEL)
-  : null;
-
-if (connectorPopupChannel) {
-  connectorPopupChannel.onmessage = (event) => {
-    const message = event.data || {};
-    if (message.type !== CONNECTOR_POPUP_RELAY_TYPE || message.from !== "popup") {
-      return;
-    }
-    const tokenTail = typeof message.tokenTail === "string" ? message.tokenTail : "";
-    if (!tokenTail) {
-      return;
-    }
-    for (const [token, context] of launchedAppContexts) {
-      if (!token.endsWith(tokenTail) || !WALLET_CONNECTOR_TARGETS.has(context.targetId)) {
-        continue;
-      }
-      if (context.source) {
-        context.source.postMessage(message, OPAQUE_FRAME_TARGET);
-      }
-      return;
-    }
-  };
-}
-
-function relayConnectorSheetAnswerToPopup(context, data) {
-  if (!connectorPopupChannel) {
-    return;
-  }
-  const { type: _type, homeToken: _homeToken, ...payload } = data;
-  connectorPopupChannel.postMessage({
-    type: CONNECTOR_POPUP_RELAY_TYPE,
-    from: "sheet",
-    tokenTail: context.homeToken.slice(-32),
-    ...payload,
-  });
-}
-
-/* ---- Shell UI preferences (theme / dock auto-hide / accent) ----
-   Opaque frames cannot reach localStorage, so the host — the only real-origin
-   document — is the canonical store. System (deep settings) and the GUI
-   (Control Centre) write through a token-gated message; the host persists and
-   relays a gui-command so the GUI chrome and its app frames re-apply. Closed
-   key set, values are short enums — cosmetic state only, no authority. */
-const UI_PREFERENCE_KEYS = Object.freeze({
-  theme: new Set(["auto", "light", "dark"]),
-  accent: new Set([
-    "blue",
-    "purple",
-    "pink",
-    "red",
-    "orange",
-    "yellow",
-    "green",
-    "graphite",
-    "custom",
-  ]),
-  dockAutoHide: new Set(["on", "off"]),
-  sounds: new Set(["on", "off"]),
-  focusMode: new Set(["on", "off"]),
-});
-const UI_PREFERENCE_STORE_PREFIX = "elastos.ui.";
-
-function normalizeAccentCustomHex(value) {
-  if (typeof value !== "string") {
-    return "";
-  }
-  const hex = value.trim();
-  if (!/^#[0-9A-Fa-f]{6}$/.test(hex)) {
-    return "";
-  }
-  return hex.toLowerCase();
-}
-
-function readUiPreferences() {
-  const preferences = {};
-  for (const key of Object.keys(UI_PREFERENCE_KEYS)) {
-    try {
-      const value = window.localStorage?.getItem(`${UI_PREFERENCE_STORE_PREFIX}${key}`) || "";
-      if (UI_PREFERENCE_KEYS[key].has(value)) {
-        preferences[key] = value;
-      }
-    } catch (_error) {
-      // Host storage unavailable — defaults apply.
-    }
-  }
-  try {
-    const custom = normalizeAccentCustomHex(
-      window.localStorage?.getItem(`${UI_PREFERENCE_STORE_PREFIX}accentCustom`) || "",
-    );
-    if (custom) {
-      preferences.accentCustom = custom;
-    }
-  } catch (_error) {
-    // Host storage unavailable — defaults apply.
-  }
-  return preferences;
-}
-
-function writeUiPreference(key, value) {
-  let stored = value;
-  if (key === "accentCustom") {
-    stored = normalizeAccentCustomHex(value);
-    if (!stored) {
-      return false;
-    }
-  } else if (!UI_PREFERENCE_KEYS[key]?.has(value)) {
-    return false;
-  }
-  try {
-    window.localStorage?.setItem(`${UI_PREFERENCE_STORE_PREFIX}${key}`, stored);
-  } catch (_error) {
-    // Still relay: the GUI applies for this session even without persistence.
-  }
-  postToActiveShell({
-    type: "home:gui-command",
-    command: "ui-preference",
-    preferences: { [key]: stored },
-  });
-  return true;
-}
-
-function pushUiPreferencesToActiveShell() {
-  const preferences = readUiPreferences();
-  if (Object.keys(preferences).length === 0) {
-    return;
-  }
-  postToActiveShell({
-    type: "home:gui-command",
-    command: "ui-preference",
-    preferences,
-  });
 }
 
 function syncActiveShellProjection(summary, activeShellMode) {
@@ -438,14 +509,81 @@ function rememberLaunchedAppContext(launched) {
     throw new Error("Runtime returned an incomplete isolated launch");
   }
   while (launchedAppContexts.size >= MAX_LAUNCHED_APP_CONTEXTS) {
-    launchedAppContexts.delete(launchedAppContexts.keys().next().value);
+    retireLaunchedAppContext(launchedAppContexts.keys().next().value);
   }
   launchedAppContexts.set(token, {
     targetId: launched.target,
-    viewerId: typeof launched.viewer === "string" ? launched.viewer : "",
+    browserInstance:
+      launched.target === "browser"
+        ? browserInstanceFromRoute(launched.route || "")
+        : "",
     origin: OPAQUE_CAPSULE_ORIGIN,
+    parentOrigin: window.location.origin,
     source: null,
+    clipboardState:
+      homeClipboardTargetSupported(launched.target)
+        ? createHomeClipboardFrameState()
+        : null,
+    walletEffectState: {
+      inFlight: false,
+      requestIds: new Set(),
+    },
   });
+}
+
+function walletConnectorAttachmentDescriptor(target, launched) {
+  const route = typeof launched?.route === "string" ? launched.route : "";
+  let resolved;
+  try {
+    resolved = new URL(route, window.location.href);
+  } catch (_error) {
+    throw new Error("Runtime returned an invalid Wallet connector route");
+  }
+  const routeQueryKeys = [...resolved.searchParams.keys()];
+  const routeFragment = new URLSearchParams(resolved.hash.replace(/^#/, ""));
+  const routeFragmentKeys = [...routeFragment.keys()];
+  const homeLaunchToken = routeFragment.get("home_token") || "";
+  if (
+    launched?.target !== target ||
+    launched?.attach_kind !== "iframe" ||
+    (launched?.launch_status && launched.launch_status !== "launched") ||
+    !route ||
+    route.length > 16_384 ||
+    resolved.origin !== window.location.origin ||
+    resolved.username ||
+    resolved.password ||
+    resolved.pathname !== `/apps/${target}/` ||
+    routeQueryKeys.length !== 1 ||
+    routeQueryKeys[0] !== "home_origin" ||
+    resolved.searchParams.get("home_origin") !== window.location.origin ||
+    routeFragmentKeys.length !== 1 ||
+    routeFragmentKeys[0] !== "home_token" ||
+    !homeLaunchToken ||
+    homeLaunchToken !== homeLaunchToken.trim() ||
+    homeLaunchToken.length > 4_096
+  ) {
+    throw new Error("Runtime returned an invalid Wallet connector launch");
+  }
+  return {
+    schema: HOME_GUI_AUTHORIZED_ATTACHMENT_SCHEMA,
+    receipt_id: walletConnectorAttachmentReceiptId(),
+    target,
+    title: WALLET_CONNECTOR_TARGET_TITLES[target],
+    attach_kind: "iframe",
+    route,
+  };
+}
+
+function walletConnectorAttachmentReceiptId() {
+  if (typeof window.crypto?.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  if (typeof window.crypto?.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  throw new Error("Home requires browser crypto for connector attachment isolation");
 }
 
 function activeShellTarget(summary) {
@@ -500,6 +638,7 @@ function preclaimActiveShellSwitch(active) {
   if (!target) {
     return false;
   }
+  clearLaunchedAppContexts();
   shellState.activeShellRootLaunchSeq += 1;
   showHostBootMask();
   hideShellHostRecovery();
@@ -700,6 +839,7 @@ async function signOutFromShellHostRecovery() {
     shellHostRecoverySignOutButton.disabled = true;
   }
   try {
+    clearLaunchedAppContexts();
     await signOutHome();
     reloadHomeShellHost();
   } catch (error) {
@@ -718,6 +858,7 @@ async function signOutFromShellHostRecovery() {
 async function signOutFromRootShell() {
   document.body.dataset.homeStatus = "booting";
   try {
+    clearLaunchedAppContexts();
     await signOutHome();
     reloadHomeShellHost();
   } catch (error) {
@@ -730,6 +871,7 @@ async function signOutFromRootShell() {
 }
 
 function clearActiveShellRoot({ resetHint = false } = {}) {
+  clearLaunchedAppContexts();
   if (resetHint) {
     rememberActiveShellHint(HOME_GUI_SHELL_ID);
   }
@@ -809,6 +951,7 @@ async function syncActiveShellRoot(summary, options = {}) {
   shellState.activeShellRootLaunchSeq = launchSeq;
   shellState.activeShellRootTarget = target;
   shellState.activeShellRootRoute = "";
+  clearLaunchedAppContexts();
   if (activeShellFrame) {
     activeShellFrame.removeAttribute("src");
     activeShellFrame.dataset.route = "";
@@ -892,52 +1035,56 @@ window.addEventListener("message", (event) => {
     return;
   }
   if (data.type === "home:shell-ready") {
-    if (context.kind === "shell-frame" && shellState.currentSummary) {
-      postToActiveShell({ type: "home:shell-summary", summary: shellState.currentSummary });
-    }
-    if (context.kind === "shell-frame" && context.targetId === HOME_GUI_SHELL_ID) {
-      pushUiPreferencesToActiveShell();
-    }
-    return;
-  }
-  if (data.type === "home:connector-popup-relay") {
-    // Only a mounted wallet connector sheet may answer its own popup.
-    if (context.kind !== "app-frame" || !WALLET_CONNECTOR_TARGETS.has(context.targetId)) {
-      console.warn("home ignored unauthorized connector-popup-relay message", context.targetId);
-      return;
-    }
-    relayConnectorSheetAnswerToPopup(context, data);
-    return;
-  }
-  if (data.type === "home:ui-preference") {
-    // Cosmetic shell preferences: System's Personalization pane and the GUI's
-    // Control Centre are the only writers. Closed key/value sets.
-    const trustedSystemApp = context.kind === "app-frame" && context.targetId === SYSTEM_APP_ID;
-    const trustedGuiShell = context.kind === "shell-frame" && context.targetId === HOME_GUI_SHELL_ID;
-    if (!trustedSystemApp && !trustedGuiShell) {
-      console.warn("home ignored unauthorized ui-preference message", context.targetId);
-      return;
-    }
-    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
-    if (data.action === "read") {
-      replyToShellRequest(event, requestId, readUiPreferences());
-      return;
-    }
-    const key = typeof data.key === "string" ? data.key.trim() : "";
-    const value = typeof data.value === "string" ? data.value.trim() : "";
-    if (!writeUiPreference(key, value)) {
-      console.warn("home ignored invalid ui-preference", key, value);
-      if (requestId) {
-        replyToShellRequest(event, requestId, null, new Error("Home rejected the preference"));
+    if (context.kind === "shell-frame") {
+      if (context.targetId === HOME_GUI_SHELL_ID) {
+        let browserContextId = "";
+        try {
+          browserContextId = loadOrCreateHomeBrowserContextId(
+            window.localStorage,
+            window.crypto,
+          );
+        } catch (_error) {
+          browserContextId = "";
+        }
+        if (browserContextId) {
+          postToActiveShell({
+            type: "home:shell-context",
+            browserContextId,
+          });
+        }
       }
-      return;
-    }
-    if (requestId) {
-      replyToShellRequest(event, requestId, true);
+      if (shellState.currentSummary) {
+        postToActiveShell({ type: "home:shell-summary", summary: shellState.currentSummary });
+      }
     }
     return;
   }
   if (data.type === "home:app-ready") {
+    if (
+      context.kind === "app-frame" &&
+      context.clipboardState &&
+      hasExactMessageKeys(data, ["type", "homeToken"])
+    ) {
+      homeClipboardHost.resetFrame(context.clipboardState, context);
+    }
+    return;
+  }
+  if (homeClipboardHost.handle(event, context, data)) {
+    return;
+  }
+  if (handleHomeWalletConnectorEffect(event, context, data)) {
+    return;
+  }
+  if (data.type === BROWSER_AUTHORITY_RENEWAL_REQUEST_TYPE) {
+    if (!startBrowserAuthorityRenewal(event, context, data)) {
+      console.warn("home ignored invalid Browser authority renewal request");
+    }
+    return;
+  }
+  if (data.type === BROWSER_AUTHORITY_RENEWAL_RESULT_TYPE) {
+    if (!handleBrowserAuthorityRenewalResult(context, data)) {
+      console.warn("home ignored invalid Browser authority renewal result");
+    }
     return;
   }
   if (data.type === "home:launch-target") {
@@ -969,39 +1116,13 @@ window.addEventListener("message", (event) => {
       return;
     }
     replyToShellRequest(event, requestId, true);
-    showHostAuthGate({ presentation: "prompt", surface: "desktop" }).catch((error) => {
+    showHostAuthGate({ presentation: "prompt", surface: "neutral" }).catch((error) => {
       console.error("home unlock failed", error);
     });
     return;
   }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
-    // Successful connector link — tell the isolated GUI to close its in-rail
-    // ceremony sheet (projection only; refresh already ran). Token-bound:
-    // the GUI verifies the token against its mounted sheet frame, so no
-    // other child can dismiss a ceremony it does not own.
-    if (context.kind === "app-frame" && context.homeToken) {
-      postToActiveShell({
-        type: "home:gui-command",
-        command: "connector-summary-refresh",
-        homeToken: context.homeToken,
-      });
-    }
-    return;
-  }
-  if (data.type === "home:menu-manifest") {
-    // Menus are self-declared UI, not authority: a window may only shape its
-    // OWN menu bar entry. The host binds the manifest to the sender's launch
-    // token; the isolated GUI resolves that token to its own window.
-    if (context.kind !== "app-frame" || !context.homeToken) {
-      console.warn("home ignored unauthorized menu-manifest message", context.targetId);
-      return;
-    }
-    try {
-      setHomeGuiMenuManifest(context.windowId || "", data.menus, context.homeToken);
-    } catch (error) {
-      console.error("home menu-manifest failed", error);
-    }
     return;
   }
   if (data.type === "home:active-shell-applied") {
@@ -1015,19 +1136,24 @@ window.addEventListener("message", (event) => {
     preclaimActiveShellSwitch(data.activeShell);
     return;
   }
-  if (data.type === "home:request-passkey-authority") {
+  if (data.type === "elastos.home.passkey-step-up.request/v1") {
     const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
     const operation = typeof data.operation === "string" ? data.operation.trim() : "";
-    const request = data.request && typeof data.request === "object" ? data.request : null;
+    const request = data.request
+      && typeof data.request === "object"
+      && !Array.isArray(data.request)
+      ? data.request
+      : null;
     if (
       context.kind !== "app-frame"
-      || !PASSKEY_AUTHORITY_TARGETS.has(context.targetId)
+      || !PASSKEY_STEP_UP_TARGETS.has(context.targetId)
+      || !hasExactMessageKeys(data, ["type", "requestId", "homeToken", "operation", "request"])
       || !requestId
       || requestId.length > 128
       || !operation
       || operation.length > 128
       || !request
-      || JSON.stringify(request).length > 65_536
+      || !isBoundedStepUpRequest(request)
     ) {
       console.warn("home ignored unauthorized passkey request", context.targetId);
       return;
@@ -1035,7 +1161,7 @@ window.addEventListener("message", (event) => {
     const reply = (payload) => {
       try {
         event.source?.postMessage({
-          type: "home:passkey-authority-result",
+          type: "elastos.home.passkey-step-up.result/v1",
           requestId,
           ...payload,
         }, OPAQUE_FRAME_TARGET);
@@ -1043,15 +1169,8 @@ window.addEventListener("message", (event) => {
         console.error("home could not return passkey result", error);
       }
     };
-    requestPasskeyHomeAuthority()
-      .then(async () => {
-        const launched = await launchHomeTarget(context.targetId, {}, { operation, request });
-        const scopedToken = homeLaunchTokenFromRoute(launched?.route || "");
-        if (!scopedToken) {
-          throw new Error("Passkey verification did not return capsule authority.");
-        }
-        reply({ homeToken: scopedToken });
-      })
+    requestPasskeyStepUp(context.homeToken, operation, request)
+      .then((stepUpToken) => reply({ stepUpToken }))
       .catch((error) => reply({
         error: error instanceof Error ? error.message : "Passkey verification failed.",
       }));
@@ -1171,16 +1290,6 @@ window.addEventListener("message", (event) => {
     });
     return;
   }
-  if (data.type === "home:relaunch-self") {
-    if (context.kind !== "app-frame" || !context.targetId) {
-      console.warn("home ignored unauthorized relaunch-self message", context.targetId);
-      return;
-    }
-    relaunchHomeGuiTarget(context.homeToken).catch((error) => {
-      console.error("home relaunch-self failed", error);
-    });
-    return;
-  }
   if (data.type !== "home:open-target") {
     return;
   }
@@ -1190,6 +1299,20 @@ window.addEventListener("message", (event) => {
   }
   if (!canOpenTargetFromHomeMessage(context, target)) {
     console.warn("home ignored unauthorized open-target message", context.targetId, target);
+    return;
+  }
+  if (
+    context.kind === "app-frame" &&
+    context.targetId === "wallet" &&
+    WALLET_CONNECTOR_TARGETS.has(target)
+  ) {
+    if (!hasExactMessageKeys(data, ["type", "target", "homeToken"])) {
+      console.warn("home ignored malformed Wallet connector launch", target);
+      return;
+    }
+    launchWalletConnectorFromTrustedSource(context, target).catch((error) => {
+      console.error("home Wallet connector launch failed", error);
+    });
     return;
   }
   const query = data.query && typeof data.query === "object" ? data.query : {};
@@ -1217,8 +1340,12 @@ function homeMessageContext(event, data) {
       ? { kind: "home", targetId: HOME_GUI_SHELL_ID }
       : null;
   }
-  const homeToken = typeof data.homeToken === "string" ? data.homeToken.trim() : "";
-  if (!homeToken) {
+  const walletConnectorEffect = data.type === WALLET_CONNECTOR_EFFECT_TYPE;
+  const tokenValue = walletConnectorEffect
+    ? data.connectorToken
+    : data.homeToken;
+  const homeToken = typeof tokenValue === "string" ? tokenValue.trim() : "";
+  if (!homeToken || (walletConnectorEffect && tokenValue !== homeToken)) {
     return null;
   }
   if (activeShellFrame) {
@@ -1248,15 +1375,27 @@ function homeMessageContext(event, data) {
   if (!launched || launched.origin !== event.origin) {
     return null;
   }
-  if (launched.source && launched.source !== event.source) {
+  if (!launched.source) {
+    if (
+      data.type !== "home:app-ready" ||
+      !hasExactMessageKeys(data, ["type", "homeToken"])
+    ) {
+      return null;
+    }
+    launched.source = event.source;
+  } else if (launched.source !== event.source) {
     return null;
   }
-  launched.source = event.source;
   return {
     kind: "app-frame",
     targetId: launched.targetId,
-    viewerId: launched.viewerId || "",
     homeToken,
+    origin: launched.origin,
+    parentOrigin: launched.parentOrigin,
+    source: launched.source,
+    clipboardState: launched.clipboardState,
+    walletEffectState: launched.walletEffectState,
+    browserInstance: launched.browserInstance,
   };
 }
 
@@ -1269,6 +1408,31 @@ function homeLaunchTokenFromRoute(route) {
   }
 }
 
+function browserInstanceFromRoute(route) {
+  try {
+    return new URL(route, window.location.href).searchParams.get("browser_instance") || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function hasExactMessageKeys(message, expectedKeys) {
+  const actual = Object.keys(message).sort();
+  const expected = [...expectedKeys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+function isBoundedStepUpRequest(request) {
+  try {
+    const serialized = JSON.stringify(request);
+    return typeof serialized === "string"
+      && new TextEncoder().encode(serialized).byteLength <= 65_536;
+  } catch (_error) {
+    return false;
+  }
+}
+
 function canOpenUriFromHomeMessage(context) {
   return context.kind === "home" || SHELL_MESSAGE_OPEN_URI_SOURCES.has(context.targetId);
 }
@@ -1277,20 +1441,9 @@ function canOpenTargetFromHomeMessage(context, target) {
   if (context.kind === "home") {
     return true;
   }
-  // Viewer-bound content (e.g. gba-ucity) speaks with its own target id but
-  // carries no policy entry; it inherits its viewer's grants (gba-emulator),
-  // still a closed set — never broader than the viewer itself.
-  const policy = SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.targetId] ||
-    (context.viewerId ? SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.viewerId] : undefined);
+  const policy = SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.targetId];
   if (!policy) {
     return false;
-  }
-  // Connector capsules are hidden from Home's visible targets by design, so
-  // the visible-target policy can never authorize them. The GUI hosts the
-  // wallet rail ceremony sheet, so it carries the wallet's connector-launch
-  // authority — the same closed set the wallet capsule itself holds.
-  if (context.targetId === HOME_GUI_SHELL_ID && WALLET_CONNECTOR_TARGETS.has(target)) {
-    return true;
   }
   if (policy === "visible-target") {
     return !!targetById(shellState.currentSummary, target) &&
@@ -1357,10 +1510,7 @@ function resolvePeerInviteUri(uri) {
 async function boot() {
   document.body.dataset.homeStatus = "booting";
   let summary = null;
-  const sessionLocked = isHomeSessionLocked();
-  // Lock restore needs the desktop mounted under frost — never defer GUI away.
-  const deferHomeGuiForBootHint =
-    !sessionLocked && Boolean(activeShellBootHintTarget());
+  const deferHomeGuiForBootHint = Boolean(activeShellBootHintTarget());
   try {
     await refreshHomeSession();
   } catch (error) {
@@ -1372,18 +1522,14 @@ async function boot() {
     summary = await refreshShellSummary({ deferHomeGuiForBootHint });
   } catch (error) {
     if (isHomeAuthError(error)) {
-      clearHomeSessionLock();
       await showHostAuthGate();
       return;
     }
     throw error;
   }
   if (!homeSummarySignedIn(summary)) {
-    // Unsigned front door (cold boot or after Sign out): full account picker.
-    // Compact prompt is only for mid-session re-auth over a live shell.
-    clearHomeSessionLock();
     document.body.dataset.homeStatus = "ready";
-    await showHostAuthGate();
+    await showHostAuthGate({ presentation: "prompt" });
     startShellTimers();
     return;
   }
@@ -1393,12 +1539,6 @@ async function boot() {
       return null;
     });
   document.body.dataset.homeStatus = "ready";
-  if (sessionLocked) {
-    // Seat was locked before refresh — restore frost over the live desktop.
-    await showHostAuthGate({ presentation: "prompt", surface: "desktop" });
-    startShellTimers();
-    return;
-  }
   hideHomeUnlock();
   runtimeReady.then(() => refreshShellSummary()).catch((error) => {
     console.error("home summary refresh failed after runtime ensure", error);
@@ -1438,8 +1578,7 @@ function requestShellSummaryRefresh({ reason = "request", delay = SUMMARY_REFRES
     shellState.summaryRefreshInFlight = true;
     refreshShellSummary().catch((error) => {
       if (isHomeAuthError(error)) {
-        // Mid-session summary 401: compact re-auth, never the family picker.
-        showHostAuthGate({ presentation: "prompt" }).catch((unlockError) => {
+        showHostAuthGate().catch((unlockError) => {
           console.error("home unlock failed", unlockError);
         });
         return;

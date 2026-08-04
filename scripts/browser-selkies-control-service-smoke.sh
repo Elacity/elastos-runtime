@@ -316,6 +316,7 @@ const requested = {
   timeoutOnceNavigations: 0,
   netTimeoutOnceNavigations: 0,
   lateChromeErrorNavigations: 0,
+  onlineProjected: false,
 };
 let historyEntries = [];
 let currentIndex = -1;
@@ -484,6 +485,22 @@ server.on("upgrade", (req, socket) => {
           fs.writeFileSync(`${readyPath}.wallet-binding`, message.params.name);
         }
         sendText(socket, JSON.stringify({ id: message.id, result: {} }));
+      } else if (message.method === "Network.overrideNetworkState") {
+        const projection = message.params || {};
+        if (
+          projection.offline !== false ||
+          projection.latency !== 0 ||
+          projection.downloadThroughput !== -1 ||
+          projection.uploadThroughput !== -1 ||
+          projection.connectionType !== "other"
+        ) {
+          sendText(socket, JSON.stringify({ id: message.id, error: { message: "wrong Runtime online-state projection" } }));
+          continue;
+        }
+        requested.onlineProjected = true;
+        fs.writeFileSync(`${readyPath}.online-projection`, JSON.stringify(projection));
+        fs.appendFileSync(`${readyPath}.online-projection-events`, `${JSON.stringify(projection)}\n`);
+        sendText(socket, JSON.stringify({ id: message.id, result: {} }));
       } else if (message.method === "Emulation.setDeviceMetricsOverride") {
         requested.viewport = message.params || {};
         fs.writeFileSync(`${readyPath}.viewport`, JSON.stringify(requested.viewport));
@@ -495,7 +512,21 @@ server.on("upgrade", (req, socket) => {
         sendText(socket, JSON.stringify({ id: message.id, result: { identifier: "wallet-bridge-smoke" } }));
       } else if (message.method === "Runtime.evaluate") {
         const expression = String(message.params?.expression || "");
-        if (expression.includes("globalThis[\"__elastosBrowserWalletRuntimeResult\"]")) {
+        if (expression.includes("online: navigator.onLine === true")) {
+          sendText(socket, JSON.stringify({
+            id: message.id,
+            result: {
+              result: {
+                type: "string",
+                value: JSON.stringify({
+                  online: requested.onlineProjected,
+                  connection_type: "other",
+                  effective_type: "4g",
+                }),
+              },
+            }
+          }));
+        } else if (expression.includes("globalThis[\"__elastosBrowserWalletRuntimeResult\"]")) {
           fs.appendFileSync(`${readyPath}.wallet-results`, `${expression}\n`);
           if (expression.includes("wallet:smoke-bridge")) {
             setTimeout(() => emitWalletBinding({
@@ -622,6 +653,10 @@ server.on("upgrade", (req, socket) => {
         sendText(socket, JSON.stringify({ id: message.id, result: {} }));
       } else if (message.method === "Page.navigate") {
         requested.navigated = String(message.params?.url || "");
+        if (!requested.onlineProjected) {
+          sendText(socket, JSON.stringify({ id: message.id, error: { message: "Runtime online-state projection was not installed before navigation" } }));
+          continue;
+        }
         if (requested.navigated !== firstUrl && requested.navigated !== secondUrl && requested.navigated !== networkChangedUrl && requested.navigated !== closedOnceUrl && requested.navigated !== timeoutOnceUrl && requested.navigated !== netTimeoutOnceUrl && requested.navigated !== slowDomUrl && requested.navigated !== closedConnectionUrl && requested.navigated !== lateChromeErrorUrl) {
           sendText(socket, JSON.stringify({ id: message.id, error: { message: `wrong navigate URL: ${requested.navigated}` } }));
           continue;
@@ -905,9 +940,15 @@ const server = http.createServer((req, res) => {
       url: target.href,
       pathname: target.pathname,
       host: req.headers.host || "",
+      origin: req.headers.origin || "",
       token: req.headers["x-elastos-home-token"] || "",
       body: bodyText ? JSON.parse(bodyText) : null,
     });
+    if (req.headers.origin !== "null") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "Runtime wallet request requires exact Origin: null" }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     if (req.method === "GET" && target.pathname === "/api/apps/browser/wallet/bridge") {
       res.end(JSON.stringify({
@@ -953,6 +994,7 @@ const server = http.createServer((req, res) => {
         approval_request: {
           request_id: requestId,
           status: "pending",
+          expires_at: Math.floor(Date.now() / 1000) + 600,
         },
         requires_wallet_approval: true,
       }));
@@ -964,6 +1006,7 @@ const server = http.createServer((req, res) => {
         approval_request: {
           request_id: "wallet-approval:tx-smoke",
           status: "pending",
+          expires_at: Math.floor(Date.now() / 1000) + 600,
         },
         requires_wallet_approval: true,
       }));
@@ -1163,6 +1206,30 @@ curl --silent --show-error --fail \
 const response = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
 if (response.active_pages !== 0) throw new Error("failed open leaked an active Selkies page");
 ' "$after_failed_status"
+"$node_bin" -e '
+const projection = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+if (
+  projection.offline !== false ||
+  projection.latency !== 0 ||
+  projection.downloadThroughput !== -1 ||
+  projection.uploadThroughput !== -1 ||
+  projection.connectionType !== "other"
+) {
+  throw new Error("Runtime online-state projection was not installed before initial navigation");
+}
+' "$tmp_dir/fake-cdp-ready.json.online-projection"
+"$node_bin" -e '
+const fs = require("fs");
+const events = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean);
+const log = fs.readFileSync(process.argv[2], "utf8");
+if (events.length < 2) {
+  throw new Error(`Runtime online-state projection must be verified before and after initial navigation; events=${events.length}`);
+}
+if (!log.includes("\"phase\":\"before_initial_navigation\"") ||
+    !log.includes("\"phase\":\"after_initial_navigation\"")) {
+  throw new Error("Runtime online-state projection diagnostics must bind both phases to the target");
+}
+' "$tmp_dir/fake-cdp-ready.json.online-projection-events" "$tmp_dir/control.log"
 
 new_target_count_before_recovery="$(read_new_target_count)"
 vm_guest_open_response="$tmp_dir/vm-guest-open-response.json"
@@ -1520,7 +1587,7 @@ if (display.media_transport !== "runtime_relay") throw new Error("Selkies displa
 if (display.offerer !== "engine") throw new Error("Selkies display must be engine-offer");
 if (display.input !== "datachannel" || display.input_protocol !== "selkies_v1") throw new Error("Selkies display must declare datachannel selkies_v1 input");
 if (display.width !== 1920 || display.height !== 1080) throw new Error("Selkies display must expose the fixed stream/input coordinate space");
-if (response.view?.schema !== "elastos.browser.view/v1" || response.view.width !== 1280 || response.view.height !== 720) throw new Error("Selkies result must expose a matching Browser view");
+if (response.view?.schema !== "elastos.browser.view/v1" || response.view.width !== 1920 || response.view.height !== 1080) throw new Error("Selkies result must expose the fixed product raster as its Browser view");
 if (display.initial_offer?.schema !== "elastos.browser.webrtc-offer/v1") throw new Error("missing initial offer");
 if (!display.initial_offer.sdp.includes("m=video")) throw new Error("initial offer must include video");
 if (display.audio_offer?.schema !== "elastos.browser.webrtc-offer/v1" || !display.audio_offer.sdp.includes("m=audio")) throw new Error("audio offer must include audio");
@@ -1542,9 +1609,13 @@ for (const expected of [
 ' "$tmp_dir/fake-cdp-ready.json.init-script"
 for _ in {1..100}; do
   proxy_request_count="$(wc -l <"$tmp_dir/fake-runtime-proxy-requests.jsonl" | tr -d ' ')"
-  [[ "$proxy_request_count" -ge 10 ]] && break
+  [[ "$proxy_request_count" -ge 8 ]] && break
   sleep 0.02
 done
+if [[ "$proxy_request_count" -lt 8 ]]; then
+  echo "Runtime wallet proxy received only $proxy_request_count requests; expected at least 8" >&2
+  exit 1
+fi
 "$node_bin" -e '
 const fs = require("fs");
 const lines = fs.readFileSync(process.argv[1], "utf8").trim().split(/\n/).filter(Boolean);
@@ -1562,6 +1633,9 @@ for (const path of [
   }
 }
 for (const request of requests) {
+  if (request.origin !== "null") {
+    throw new Error(`Runtime wallet proxy request did not carry exact Origin: null: ${JSON.stringify(request)}`);
+  }
   if (request.token !== "wallet-token-smoke") {
     throw new Error(`Runtime wallet proxy request lost Home token: ${JSON.stringify(request)}`);
   }
@@ -1597,8 +1671,9 @@ if (seen.get("/api/apps/browser/wallet/broadcast-transaction").body?.request_id 
 ' "$tmp_dir/fake-runtime-proxy-requests.jsonl"
 "$node_bin" -e '
 const viewport = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-if (viewport.width !== 1280 || viewport.height !== 720) throw new Error("initial CDP viewport did not preserve display aspect ratio");
-if (viewport.deviceScaleFactor !== 1) throw new Error("initial CDP viewport did not apply one-to-one VM scale factor");
+if (viewport.width !== 1920 || viewport.height !== 1080) throw new Error("initial CDP page raster must fill the fixed 1080p compositor");
+if (viewport.screenWidth !== 1920 || viewport.screenHeight !== 1080) throw new Error("initial CDP screen must match the fixed 1080p compositor");
+if (viewport.deviceScaleFactor !== 1) throw new Error("initial CDP page raster must use DPR 1");
 ' "$tmp_dir/fake-cdp-ready.json.viewport"
 
 page_id="$("$node_bin" -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); console.log(encodeURIComponent(r.page_id));' "$open_response")"
@@ -1870,11 +1945,14 @@ curl --silent --show-error --fail \
   "http://127.0.0.1:$cdp_port/__fake/navigate?url=https%3A%2F%2Fexample.com%2F" >/dev/null
 
 resize_response="$tmp_dir/resize-response.json"
-curl --silent --show-error --fail \
+resize_status="$(
+curl --silent --show-error \
   --unix-socket "$control_socket" \
   --header "content-type: application/json" \
   --data @- \
-  "http://browser-engine/pages/$page_id/input" >"$resize_response" <<'JSON'
+  --output "$resize_response" \
+  --write-out "%{http_code}" \
+  "http://browser-engine/pages/$page_id/input" <<'JSON'
 {
   "event": {
     "type": "resize",
@@ -1885,14 +1963,12 @@ curl --silent --show-error --fail \
   }
 }
 JSON
-"$node_bin" -e '
-const response = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
-if (response.schema !== "elastos.browser.input-result/v1") throw new Error("wrong resize result schema");
-if (response.accepted !== true || response.direct_network !== false) throw new Error("resize was not accepted fail-closed through Runtime route");
-if (response.width !== 992 || response.height !== 558) throw new Error("resize must return an aspect-preserving Browser viewport");
-const viewport = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
-if (viewport.width !== 992 || viewport.height !== 558) throw new Error("resize must update the CDP viewport with preserved display aspect");
-' "$resize_response" "$tmp_dir/fake-cdp-ready.json.viewport"
+)"
+if [[ "$resize_status" != "400" ]] || ! grep -q "guest raster is fixed at 1920x1080" "$resize_response"; then
+  echo "dynamic guest viewport resize must be retired, status=$resize_status" >&2
+  cat "$resize_response" >&2 || true
+  exit 1
+fi
 
 navigate_response="$tmp_dir/navigate-response.json"
 curl --silent --show-error --fail \
@@ -1914,6 +1990,10 @@ if (response.schema !== "elastos.browser.input-result/v1") throw new Error("wron
 if (response.accepted !== true || response.direct_network !== false) throw new Error("navigate was not accepted fail-closed through Runtime route");
 if (response.actual_url !== "https://example.com/?elastos-browser-nav-smoke=1") throw new Error(`navigate did not update URL state: ${JSON.stringify(response)}`);
 ' "$navigate_response"
+if ! grep -q '"phase":"after_navigate_navigation"' "$tmp_dir/control.log"; then
+  echo "Runtime online-state projection was not reverified after top-level navigation" >&2
+  exit 1
+fi
 
 back_response="$tmp_dir/back-response.json"
 curl --silent --show-error --fail \
@@ -2074,6 +2154,13 @@ if (!/ERR_CONNECTION_CLOSED/.test(String(response.error || ""))) throw new Error
 ' "$closed_connection_response" "$closed_connection_status"
 
 late_chrome_error_target_count_before="$(read_new_target_count)"
+late_chrome_error_projection_count_before="$(
+  "$node_bin" -e '
+    const fs = require("fs");
+    const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean);
+    process.stdout.write(String(lines.length));
+  ' "$tmp_dir/fake-cdp-ready.json.online-projection-events"
+)"
 late_chrome_error_response="$tmp_dir/late-chrome-error-response.json"
 curl --silent --show-error --fail-with-body \
   --unix-socket "$control_socket" \
@@ -2090,18 +2177,28 @@ curl --silent --show-error --fail-with-body \
 }
 JSON
 late_chrome_error_target_count_after="$(read_new_target_count)"
+late_chrome_error_projection_count_after="$(
+  "$node_bin" -e '
+    const fs = require("fs");
+    const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").filter(Boolean);
+    process.stdout.write(String(lines.length));
+  ' "$tmp_dir/fake-cdp-ready.json.online-projection-events"
+)"
 "$node_bin" -e '
 const fs = require("fs");
 const response = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 const attempts = Number(fs.readFileSync(process.argv[2], "utf8"));
 const beforeTargets = Number(process.argv[3]);
 const afterTargets = Number(process.argv[4]);
+const beforeProjections = Number(process.argv[5]);
+const afterProjections = Number(process.argv[6]);
 if (response.schema !== "elastos.browser.input-result/v1") throw new Error("wrong late Chrome error input result schema");
 if (response.accepted !== true || response.direct_network !== false) throw new Error("late Chrome error navigation was not accepted through Runtime route");
 if (response.actual_url !== "https://docs-late.ela.city/") throw new Error(`late Chrome error navigation did not land on replacement target: ${JSON.stringify(response)}`);
 if (attempts < 2) throw new Error(`late Chrome error navigation must retry on a fresh target; attempts=${attempts}`);
 if (afterTargets <= beforeTargets) throw new Error(`late Chrome error navigation did not allocate a replacement target; before=${beforeTargets} after=${afterTargets}`);
-' "$late_chrome_error_response" "$tmp_dir/fake-cdp-ready.json.late-chrome-error-navigations" "$late_chrome_error_target_count_before" "$late_chrome_error_target_count_after"
+if (afterProjections < beforeProjections + 2) throw new Error(`replacement target did not receive before/after online projection; before=${beforeProjections} after=${afterProjections}`);
+' "$late_chrome_error_response" "$tmp_dir/fake-cdp-ready.json.late-chrome-error-navigations" "$late_chrome_error_target_count_before" "$late_chrome_error_target_count_after" "$late_chrome_error_projection_count_before" "$late_chrome_error_projection_count_after"
 
 paste_response="$tmp_dir/paste-response.json"
 curl --silent --show-error --fail \

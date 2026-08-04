@@ -8,13 +8,18 @@ fn challenge_and_verify_evm_proof() {
     let signing_key = SigningKey::from_bytes((&[3u8; 32]).into()).unwrap();
     let address = test_address(&signing_key);
 
-    let challenge = provider.handle(Request::Challenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address: address.clone(),
-        chain_id: 20,
-        resources: vec!["elastos://wallet/account/link".into()],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::Challenge {
+            domain: "http://elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address: address.clone(),
+            chain_id: 20,
+            resources: vec!["elastos://wallet/account/link".into()],
+        },
+    );
     let message = match challenge {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["schema"], AuthChallengeV1::SCHEMA);
@@ -27,7 +32,12 @@ fn challenge_and_verify_evm_proof() {
         other => panic!("expected challenge, got {other:?}"),
     };
     let signature = sign_message(&signing_key, &message);
-    let verified = provider.handle(Request::VerifyProof { message, signature });
+    let verified = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::VerifyProof { message, signature },
+    );
 
     match verified {
         Response::Ok { data: Some(data) } => {
@@ -150,19 +160,24 @@ fn bitcoin_signed_message_rejects_mismatched_public_key() {
 }
 
 #[test]
-fn challenge_and_verify_bitcoin_bip322_proof() {
+fn production_decoder_rejects_replayed_bitcoin_proof() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let signing_key = bip322_test_signing_key();
     let address = bip322_test_address(&signing_key);
 
-    let challenge = provider.handle(Request::BitcoinChallenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address: address.clone(),
-        network: "bitcoin".into(),
-        resources: vec!["elastos://wallet/account/link".into()],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::BitcoinChallenge {
+            domain: "elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address: address.clone(),
+            network: PublicNetwork::bitcoin(),
+            resources: vec!["elastos://wallet/account/link".into()],
+        },
+    );
     let message = match challenge {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["schema"], BITCOIN_CHALLENGE_SCHEMA);
@@ -172,13 +187,14 @@ fn challenge_and_verify_bitcoin_bip322_proof() {
         other => panic!("expected Bitcoin challenge, got {other:?}"),
     };
     let signature = sign_bip322_simple_p2wpkh(&signing_key, &address, &message);
-
-    match provider.handle(Request::VerifyBip322Proof {
+    let verify = WalletProviderOperationV2::VerifyBip322Proof {
         message,
         signature,
-        signature_type: None,
+        signature_type: BITCOIN_PROOF_BIP322_SIMPLE.to_string(),
         public_key: None,
-    }) {
+    };
+
+    match invoke_wallet(&mut provider, "person:local:test", "wallet", verify.clone()) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["schema"], "elastos.wallet.proof/v1");
             assert_eq!(data["proof_type"], "bip322_simple");
@@ -192,6 +208,24 @@ fn challenge_and_verify_bitcoin_bip322_proof() {
         }
         other => panic!("expected verified Bitcoin proof, got {other:?}"),
     }
+    assert_eq!(provider.store.bitcoin_challenges.len(), 1);
+    assert!(provider.store.bitcoin_challenges[0].consumed_at.is_some());
+    match provider.status() {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["pending_bitcoin_challenge_count"], 0)
+        }
+        other => panic!("expected Wallet status, got {other:?}"),
+    }
+    match invoke_wallet(&mut provider, "person:local:test", "wallet", verify) {
+        Response::Error { code, message } => {
+            assert_eq!(code, "invalid_proof");
+            assert!(message.contains("already consumed"));
+        }
+        other => panic!("expected Bitcoin replay rejection, got {other:?}"),
+    }
+    provider.store.bitcoin_challenges[0].challenge.expires_at = now_ts().saturating_sub(1);
+    provider.store = prune_store(std::mem::take(&mut provider.store), now_ts());
+    assert!(provider.store.bitcoin_challenges.is_empty());
 }
 
 #[test]
@@ -201,13 +235,18 @@ fn challenge_and_verify_bitcoin_taproot_bip322_proof() {
     let secret_key = bip322_test_taproot_secret_key();
     let address = bip322_test_taproot_address(&secret_key);
 
-    let challenge = provider.handle(Request::BitcoinChallenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address: address.clone(),
-        network: "bitcoin".into(),
-        resources: vec!["elastos://wallet/account/link".into()],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::BitcoinChallenge {
+            domain: "elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address: address.clone(),
+            network: PublicNetwork::bitcoin(),
+            resources: vec!["elastos://wallet/account/link".into()],
+        },
+    );
     let message = match challenge {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["schema"], BITCOIN_CHALLENGE_SCHEMA);
@@ -218,12 +257,17 @@ fn challenge_and_verify_bitcoin_taproot_bip322_proof() {
     };
     let signature = sign_bip322_simple_p2tr(&secret_key, &address, &message);
 
-    match provider.handle(Request::VerifyBip322Proof {
-        message,
-        signature,
-        signature_type: None,
-        public_key: None,
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::VerifyBip322Proof {
+            message,
+            signature,
+            signature_type: BITCOIN_PROOF_BIP322_SIMPLE.to_string(),
+            public_key: None,
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["schema"], "elastos.wallet.proof/v1");
             assert_eq!(data["proof_type"], "bip322_simple");
@@ -246,13 +290,18 @@ fn challenge_and_verify_bitcoin_legacy_signed_message_proof() {
     let address = bitcoin_p2pkh_test_address(&signing_key);
     let public_key = bitcoin_test_public_key(&signing_key);
 
-    let challenge = provider.handle(Request::BitcoinChallenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address: address.clone(),
-        network: "bitcoin".into(),
-        resources: vec!["elastos://wallet/account/link".into()],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::BitcoinChallenge {
+            domain: "elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address: address.clone(),
+            network: PublicNetwork::bitcoin(),
+            resources: vec!["elastos://wallet/account/link".into()],
+        },
+    );
     let message = match challenge {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["schema"], BITCOIN_CHALLENGE_SCHEMA);
@@ -263,12 +312,17 @@ fn challenge_and_verify_bitcoin_legacy_signed_message_proof() {
     };
     let signature = sign_bitcoin_message(&signing_key, &message);
 
-    match provider.handle(Request::VerifyBip322Proof {
-        message,
-        signature,
-        signature_type: Some("bitcoin_signed_message".into()),
-        public_key: Some(public_key),
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::VerifyBip322Proof {
+            message,
+            signature,
+            signature_type: "bitcoin_signed_message".into(),
+            public_key: Some(public_key),
+        },
+    ) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["schema"], "elastos.wallet.proof/v1");
             assert_eq!(data["proof_type"], "bitcoin_signed_message");
@@ -284,13 +338,18 @@ fn bitcoin_bip322_challenge_rejects_unsupported_p2wsh_script() {
     let mut provider = init_provider(dir.path());
     let address = "bc1qp0ahvfh83088w49k405szqgg4f3pptr7p2g06tdxfjcd40z4lh4q95lsz9";
 
-    match provider.handle(Request::BitcoinChallenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address: address.into(),
-        network: "bitcoin".into(),
-        resources: vec![],
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::BitcoinChallenge {
+            domain: "elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address: address.into(),
+            network: PublicNetwork::bitcoin(),
+            resources: vec![],
+        },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "invalid_request");
             assert!(message.contains("unsupported Bitcoin address type"));
@@ -300,29 +359,36 @@ fn bitcoin_bip322_challenge_rejects_unsupported_p2wsh_script() {
 }
 
 #[test]
-fn challenge_and_verify_erc1271_contract_proof() {
+fn production_decoder_rejects_replayed_erc1271_proof() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let contract = "0x00000000000000000000000000000000000000cc";
     let signature = "0x01020304";
 
-    let challenge = provider.handle(Request::Challenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address: contract.into(),
-        chain_id: 20,
-        resources: vec!["elastos://wallet/account/link".into()],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::Challenge {
+            domain: "http://elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address: contract.into(),
+            chain_id: 20,
+            resources: vec!["elastos://wallet/account/link".into()],
+        },
+    );
     let message = match challenge {
         Response::Ok { data: Some(data) } => data["message"].as_str().unwrap().to_string(),
         other => panic!("expected challenge, got {other:?}"),
     };
-    let proof = erc1271_proof(&message, signature, contract, true);
-    match provider.handle(Request::VerifyContractProof {
+    let evidence = serde_json::from_value(erc1271_proof(&message, signature, contract, true))
+        .expect("typed ERC-1271 evidence");
+    let verify = WalletProviderOperationV2::VerifyContractProof {
         message,
         signature: signature.into(),
-        erc1271_proof: proof,
-    }) {
+        evidence,
+    };
+    match invoke_wallet(&mut provider, "person:local:test", "wallet", verify.clone()) {
         Response::Ok { data: Some(data) } => {
             assert_eq!(data["proof_type"], "siwe_erc1271");
             assert_eq!(data["chain_namespace"], "eip155:20");
@@ -334,6 +400,19 @@ fn challenge_and_verify_erc1271_contract_proof() {
         }
         other => panic!("expected ERC-1271 proof, got {other:?}"),
     }
+    assert_eq!(provider.store.challenges.len(), 1);
+    assert!(provider.store.challenges[0].consumed_at.is_some());
+    match provider.status() {
+        Response::Ok { data: Some(data) } => assert_eq!(data["pending_challenge_count"], 0),
+        other => panic!("expected Wallet status, got {other:?}"),
+    }
+    match invoke_wallet(&mut provider, "person:local:test", "wallet", verify) {
+        Response::Error { code, message } => {
+            assert_eq!(code, "invalid_proof");
+            assert!(message.contains("already consumed"));
+        }
+        other => panic!("expected ERC-1271 replay rejection, got {other:?}"),
+    }
 }
 
 #[test]
@@ -343,77 +422,111 @@ fn erc1271_contract_proof_fails_closed_without_consuming_challenge() {
     let contract = "0x00000000000000000000000000000000000000cc";
     let signature = "0x01020304";
 
-    let challenge = provider.handle(Request::Challenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address: contract.into(),
-        chain_id: 20,
-        resources: vec![],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::Challenge {
+            domain: "http://elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address: contract.into(),
+            chain_id: 20,
+            resources: vec![],
+        },
+    );
     let message = match challenge {
         Response::Ok { data: Some(data) } => data["message"].as_str().unwrap().to_string(),
         other => panic!("expected challenge, got {other:?}"),
     };
-    match provider.handle(Request::VerifyContractProof {
-        message: message.clone(),
-        signature: signature.into(),
-        erc1271_proof: erc1271_proof(&message, signature, contract, false),
-    }) {
+    let context = wallet_context("person:local:test", "wallet");
+    let invalid_request = wallet_request(
+        &context,
+        WalletProviderOperationV2::VerifyContractProof {
+            message: message.clone(),
+            signature: signature.into(),
+            evidence: serde_json::from_value(erc1271_proof(&message, signature, contract, true))
+                .expect("typed ERC-1271 evidence"),
+        },
+    );
+    let mut invalid_request = serde_json::to_value(invalid_request).unwrap();
+    invalid_request["operation"]["params"]["evidence"]["valid"] = json!(false);
+    match decode_and_handle_outer(
+        &mut provider,
+        json!({
+            "op": "wallet_contract",
+            "request": invalid_request,
+            "_runtime_invocation": runtime_invocation_envelope(),
+        }),
+    ) {
         Response::Error { code, message } => {
-            assert_eq!(code, "invalid_contract_proof");
-            assert!(message.contains("not accepted"));
+            assert_eq!(code, "invalid_wallet_contract");
+            assert!(message.contains("not valid"));
         }
         other => panic!("expected invalid ERC-1271 proof, got {other:?}"),
     }
-    match provider.handle(Request::VerifyContractProof {
-        message,
-        signature: signature.into(),
-        erc1271_proof: erc1271_proof(
-            &provider.store.challenges[0].challenge.siwe_message(),
-            signature,
-            contract,
-            true,
-        ),
-    }) {
+    let valid_evidence = serde_json::from_value(erc1271_proof(&message, signature, contract, true))
+        .expect("typed ERC-1271 evidence");
+    match invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::VerifyContractProof {
+            message,
+            signature: signature.into(),
+            evidence: valid_evidence,
+        },
+    ) {
         Response::Ok { .. } => {}
         other => panic!("expected valid retry after failed proof, got {other:?}"),
     }
 }
 
 #[test]
-fn proof_challenge_is_single_use() {
+fn production_decoder_rejects_replayed_eoa_proof() {
     let dir = tempfile::tempdir().unwrap();
     let mut provider = init_provider(dir.path());
     let signing_key = SigningKey::from_bytes((&[4u8; 32]).into()).unwrap();
     let address = test_address(&signing_key);
 
-    let challenge = provider.handle(Request::Challenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address,
-        chain_id: 20,
-        resources: vec![],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::Challenge {
+            domain: "http://elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address,
+            chain_id: 20,
+            resources: vec![],
+        },
+    );
     let message = match challenge {
         Response::Ok { data: Some(data) } => data["message"].as_str().unwrap().to_string(),
         other => panic!("expected challenge, got {other:?}"),
     };
     let signature = sign_message(&signing_key, &message);
+    let verify = WalletProviderOperationV2::VerifyProof { message, signature };
 
     assert!(matches!(
-        provider.handle(Request::VerifyProof {
-            message: message.clone(),
-            signature: signature.clone(),
-        }),
+        invoke_wallet(&mut provider, "person:local:test", "wallet", verify.clone(),),
         Response::Ok { .. }
     ));
-    match provider.handle(Request::VerifyProof { message, signature }) {
+    assert_eq!(provider.store.challenges.len(), 1);
+    assert!(provider.store.challenges[0].consumed_at.is_some());
+    match provider.status() {
+        Response::Ok { data: Some(data) } => assert_eq!(data["pending_challenge_count"], 0),
+        other => panic!("expected Wallet status, got {other:?}"),
+    }
+    match invoke_wallet(&mut provider, "person:local:test", "wallet", verify) {
         Response::Error { code, message } => {
             assert_eq!(code, "invalid_proof");
             assert!(message.contains("already consumed"));
         }
         other => panic!("expected replay rejection, got {other:?}"),
     }
+    provider.store.challenges[0].challenge.expires_at = now_ts().saturating_sub(1);
+    provider.store = prune_store(std::mem::take(&mut provider.store), now_ts());
+    assert!(provider.store.challenges.is_empty());
 }
 
 #[test]
@@ -423,13 +536,18 @@ fn proof_challenge_rejects_tampered_chain() {
     let signing_key = SigningKey::from_bytes((&[5u8; 32]).into()).unwrap();
     let address = test_address(&signing_key);
 
-    let challenge = provider.handle(Request::Challenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address,
-        chain_id: 20,
-        resources: vec![],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::Challenge {
+            domain: "http://elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address,
+            chain_id: 20,
+            resources: vec![],
+        },
+    );
     let mut message = match challenge {
         Response::Ok { data: Some(data) } => data["message"].as_str().unwrap().to_string(),
         other => panic!("expected challenge, got {other:?}"),
@@ -437,7 +555,12 @@ fn proof_challenge_rejects_tampered_chain() {
     message = message.replace("Chain ID: 20", "Chain ID: 8453");
     let signature = sign_message(&signing_key, &message);
 
-    match provider.handle(Request::VerifyProof { message, signature }) {
+    match invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::VerifyProof { message, signature },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "invalid_proof");
             assert!(message.contains("chain ID") || message.contains("does not match"));
@@ -453,13 +576,18 @@ fn proof_challenge_rejects_expired_challenge() {
     let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).unwrap();
     let address = test_address(&signing_key);
 
-    let challenge = provider.handle(Request::Challenge {
-        domain: "elastos.local".into(),
-        uri: "http://elastos.local/apps/home/".into(),
-        address,
-        chain_id: 20,
-        resources: vec![],
-    });
+    let challenge = invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::Challenge {
+            domain: "http://elastos.local".into(),
+            uri: "http://elastos.local/apps/home/".into(),
+            address,
+            chain_id: 20,
+            resources: vec![],
+        },
+    );
     let message = match challenge {
         Response::Ok { data: Some(data) } => data["message"].as_str().unwrap().to_string(),
         other => panic!("expected challenge, got {other:?}"),
@@ -467,7 +595,12 @@ fn proof_challenge_rejects_expired_challenge() {
     let signature = sign_message(&signing_key, &message);
     provider.store.challenges[0].challenge.expires_at = now_ts().saturating_sub(1);
 
-    match provider.handle(Request::VerifyProof { message, signature }) {
+    match invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::VerifyProof { message, signature },
+    ) {
         Response::Error { code, message } => {
             assert_eq!(code, "invalid_proof");
             assert!(message.contains("expired"));
@@ -483,13 +616,18 @@ fn proof_challenge_rejects_invalid_runtime_origin() {
     let signing_key = SigningKey::from_bytes((&[6u8; 32]).into()).unwrap();
     let address = test_address(&signing_key);
 
-    match provider.handle(Request::Challenge {
-        domain: "evil.example/path".into(),
-        uri: "https://elastos.local/apps/home/".into(),
-        address,
-        chain_id: 20,
-        resources: vec![],
-    }) {
+    match invoke_wallet(
+        &mut provider,
+        "person:local:test",
+        "wallet",
+        WalletProviderOperationV2::Challenge {
+            domain: "https://evil.example/path".into(),
+            uri: "https://elastos.local/apps/home/".into(),
+            address,
+            chain_id: 20,
+            resources: vec![],
+        },
+    ) {
         Response::Error { code, .. } => assert_eq!(code, "invalid_request"),
         other => panic!("expected invalid origin rejection, got {other:?}"),
     }

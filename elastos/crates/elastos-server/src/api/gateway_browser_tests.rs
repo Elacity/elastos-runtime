@@ -1,9 +1,38 @@
 use super::gateway_browser::{
-    browser_close_reconciled_receipt, browser_provider_resource_call, provider_response_data,
-    provider_response_error_message,
+    browser_provider_resource_call, browser_terminal_close_receipt, provider_response_data,
+    provider_response_error_message, BrowserEngineCleanup,
 };
-use super::BROWSER_CAPSULE_ID;
+use crate::api::browser_engine_protocol::{
+    BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+    BROWSER_ENGINE_PROTOCOL_VERSION,
+};
 use serde_json::json;
+
+fn test_browser_engine_cleanup(page_id: &str) -> BrowserEngineCleanup {
+    BrowserEngineCleanup {
+        cleanup_id: "browser-cleanup:test".to_string(),
+        page_id: page_id.to_string(),
+        principal_id: "person:local:test".to_string(),
+        owner_launch_id: "launch:test".to_string(),
+        browser_instance: None,
+        generation: "sha256:test-generation".to_string(),
+        engine_route_provider: "mock-browser-route".to_string(),
+        engine_provider: "browser-engine-adapter".to_string(),
+        engine_protocol_version: BROWSER_ENGINE_PROTOCOL_VERSION.to_string(),
+        engine_adapter: "mock-adapter".to_string(),
+        engine: "mock-engine".to_string(),
+        stream_id: "stream:test".to_string(),
+        transport_authority: None,
+        provider_cleanup: json!({
+            "schema": BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA,
+            page_id: page_id.to_string(),
+            "generation": "sha256:test-generation",
+            "adapter": "mock-adapter",
+            "engine": "mock-engine",
+            "stream_id": "stream:test",
+        }),
+    }
+}
 
 #[test]
 fn test_provider_response_data_unwraps_nested_provider_envelopes() {
@@ -41,51 +70,66 @@ fn test_provider_response_error_message_unwraps_nested_provider_errors() {
 }
 
 #[test]
-fn test_browser_close_reconciles_missing_page_control_session() {
-    let receipt = browser_close_reconciled_receipt(
-        "page:already-gone",
-        "engine_process_unavailable: Browser page has no page-scoped engine control session",
-    )
-    .expect("missing page-scoped control should be reconciled for close");
-
-    assert_eq!(receipt["schema"], "elastos.browser.close-result/v1");
-    assert_eq!(receipt["page_id"], "page:already-gone");
-    assert_eq!(receipt["closed"], true);
-    assert_eq!(receipt["already_closed"], true);
-    assert_eq!(receipt["reconciled"], true);
-    assert_eq!(
-        receipt["cleanup"]["schema"],
-        "elastos.browser.runtime-session-cleanup/v1"
-    );
-    assert_eq!(receipt["cleanup"]["ok"], true);
+fn test_browser_close_requires_exact_typed_terminal_cleanup_proof() {
+    let cleanup = test_browser_engine_cleanup("page:typed-terminal");
+    let receipt = json!({
+        "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+        "page_id": cleanup.page_id,
+        "generation": cleanup.generation,
+        "binding": cleanup.provider_cleanup,
+        "terminal": true,
+        "effects": {
+            "page_absent": true,
+            "child_absent": true,
+            "vm_absent": true,
+            "route_absent": true,
+            "socket_absent": true,
+        }
+    });
+    assert!(browser_terminal_close_receipt(&cleanup, receipt).is_ok());
 }
 
 #[test]
-fn test_browser_close_reconciliation_rejects_unrelated_engine_errors() {
-    assert!(browser_close_reconciled_receipt(
-        "page:still-unknown",
-        "engine_process_unavailable: timed out waiting for browser control response",
-    )
-    .is_none());
-    assert!(browser_close_reconciled_receipt(
-        "page:still-unknown",
-        "display_session_unavailable: webrtc_remote_display is unavailable",
-    )
-    .is_none());
+fn test_browser_close_rejects_absent_or_substituted_terminal_proof() {
+    let cleanup = test_browser_engine_cleanup("page:still-owned");
+    for receipt in [
+        json!({
+            "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+            "page_id": cleanup.page_id,
+            "generation": cleanup.generation,
+            "binding": cleanup.provider_cleanup,
+            "terminal": false,
+            "effects": {}
+        }),
+        json!({
+            "schema": BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+            "page_id": cleanup.page_id,
+            "generation": "sha256:substituted",
+            "binding": cleanup.provider_cleanup,
+            "terminal": true,
+            "effects": {
+                "page_absent": true,
+                "child_absent": true,
+                "vm_absent": true,
+                "route_absent": true,
+                "socket_absent": true,
+            }
+        }),
+    ] {
+        assert!(browser_terminal_close_receipt(&cleanup, receipt).is_err());
+    }
 }
 
 #[test]
-fn test_browser_provider_resource_call_separates_carrier_call_from_effect_resource() {
-    let call = browser_provider_resource_call(
+fn test_browser_provider_resource_call_rejects_generic_wallet_signing() {
+    let error = browser_provider_resource_call(
         "wallet",
         "request_signature",
         "elastos://wallet/eip155:20/sign/transaction_intent".to_string(),
         json!({
-            "principal_id": "person:local:alice",
             "account_id": "wallet:eip155:20:0x1111111111111111111111111111111111111111",
             "chain_namespace": "eip155:20",
             "intent": "transaction_intent",
-            "capsule_id": BROWSER_CAPSULE_ID,
             "resource": "elastos://chain/esc-mainnet/broadcast_transaction",
             "reason": "Browser page requests eth_sendTransaction on esc-mainnet",
             "payload": {
@@ -93,18 +137,13 @@ fn test_browser_provider_resource_call_separates_carrier_call_from_effect_resour
             }
         }),
     )
-    .expect("wallet signing provider call should be carrier-shaped");
+    .err()
+    .expect("Browser signing must use the private typed Wallet adapter");
 
-    assert_eq!(call.scheme, "wallet");
-    assert_eq!(
-        call.resource,
-        "elastos://wallet/eip155:20/sign/transaction_intent"
-    );
-    assert_eq!(call.request["op"], "request_signature");
-    assert_eq!(
-        call.request["resource"],
-        "elastos://chain/esc-mainnet/broadcast_transaction"
-    );
+    assert_eq!(error.0, axum::http::StatusCode::BAD_REQUEST);
+    assert!(error
+        .1
+        .contains("Unsupported wallet provider operation: request_signature"));
 }
 
 #[test]

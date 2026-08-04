@@ -176,6 +176,7 @@ HOME_VIRTUAL_AUTH_BROWSER_UI_CLICK_EXPECT_URL_RE="$click_expect_url_re" \
 HOME_VIRTUAL_AUTH_BROWSER_UI_CLICK_NAV_TIMEOUT_MS="$click_nav_timeout_ms" \
 HOME_VIRTUAL_AUTH_BROWSER_REMOTE_VIDEO_TIMEOUT_MS=180000 \
 HOME_VIRTUAL_AUTH_BROWSER_UI_PAGE_ID_TIMEOUT_MS=180000 \
+HOME_VIRTUAL_AUTH_BROWSER_AUDIO_STATS=1 \
 HOME_VIRTUAL_AUTH_BROWSER_INPUT_CLICK_X=640 \
 HOME_VIRTUAL_AUTH_BROWSER_INPUT_CLICK_Y=350 \
 "$node_bin" scripts/home-passkey-virtual-auth-smoke.mjs >"$embedded_json"
@@ -191,6 +192,7 @@ HOME_VIRTUAL_AUTH_BROWSER_DIAGNOSTIC_CLICK_OPTIONAL="${HOME_VIRTUAL_AUTH_BROWSER
 HOME_VIRTUAL_AUTH_BROWSER_OPEN_URLS="$proof_url" \
 HOME_VIRTUAL_AUTH_BROWSER_OPEN_HOLD_MS="$hold_ms" \
 HOME_VIRTUAL_AUTH_BROWSER_REMOTE_VIDEO_TIMEOUT_MS=180000 \
+HOME_VIRTUAL_AUTH_BROWSER_AUDIO_STATS=1 \
 "$node_bin" scripts/home-passkey-virtual-auth-smoke.mjs >"$open_json"
 
 read_control_status after "$control_after"
@@ -209,6 +211,7 @@ VIRTUAL_AUTH_PERSISTENT="$virtual_auth_persistent" \
 VIRTUAL_AUTH_CLEANUP="$virtual_auth_cleanup" \
 "$node_bin" - "$proof_json" <<'NODE'
 const fs = require("node:fs");
+const childProcess = require("node:child_process");
 
 const [
   outPath,
@@ -232,6 +235,7 @@ const openStreamSession = openPage.stream_session || null;
 const diagnostics = openPage.diagnostics || {};
 const closeResults = opened.browser_open?.close_results || [];
 const profileReset = opened.browser_profile_reset || null;
+const generatedAt = new Date().toISOString();
 
 function number(value, fallback = 0) {
   const parsed = Number(value);
@@ -339,6 +343,155 @@ function publicBrowserRoute(session) {
   };
 }
 
+function hasForbiddenTransportSecret(value) {
+  if (Array.isArray(value)) {
+    return value.some(hasForbiddenTransportSecret);
+  }
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  return Object.entries(value).some(([key, entry]) =>
+    ["auth_secret", "credential", "username"].includes(key) ||
+    hasForbiddenTransportSecret(entry));
+}
+
+const transportEffectKeys = [
+  "vz_network_devices_zero",
+  "guest_bootstrap_validated",
+  "guest_loopback_only",
+  "guest_interfaces",
+  "guest_default_route_absent",
+  "guest_direct_network_absent",
+  "ordinary_stream_fixed_target",
+  "media_stream_fixed_target",
+  "turn_launch_owned",
+  "turn_listener_loopback",
+  "hibernation_disabled",
+];
+
+function transportProofOk(proof, expectedPageId) {
+  if (
+    !proof ||
+    proof.schema !== "elastos.browser.vz-transport-public-proof/v1" ||
+    proof.page_id !== expectedPageId ||
+    !/^sha256:[0-9a-f]{64}$/.test(String(proof.binding_hash || "")) ||
+    !/^sha256:[0-9a-f]{64}$/.test(String(proof.generation || "")) ||
+    !/^sha256:[0-9a-f]{64}$/.test(String(proof.credential_hash || "")) ||
+    typeof proof.vm_id !== "string" ||
+    proof.vm_id.length === 0 ||
+    hasForbiddenTransportSecret(proof)
+  ) {
+    return false;
+  }
+  const effectKeys = Object.keys(proof.effects || {}).sort();
+  if (
+    JSON.stringify(effectKeys) !== JSON.stringify([...transportEffectKeys].sort()) ||
+    proof.effects?.guest_interfaces?.length !== 1 ||
+    proof.effects.guest_interfaces[0] !== "lo" ||
+    transportEffectKeys
+      .filter((key) => key !== "guest_interfaces")
+      .some((key) => proof.effects?.[key] !== true)
+  ) {
+    return false;
+  }
+  const egress = proof.egress || {};
+  const media = proof.media || {};
+  const turn = proof.turn || {};
+  const relayMin = number(turn.relay_port_min, 0);
+  const relayMax = number(turn.relay_port_max, 0);
+  return (
+    typeof egress.stream_id === "string" &&
+    typeof media.stream_id === "string" &&
+    egress.stream_id.length > 0 &&
+    media.stream_id.length > 0 &&
+    egress.stream_id !== media.stream_id &&
+    typeof egress.target === "string" &&
+    egress.target.length > 0 &&
+    media.target === `tcp://${turn.listen_host}:${turn.listen_port}` &&
+    /^sha256:[0-9a-f]{64}$/.test(String(egress.runtime_socket_hash || "")) &&
+    /^sha256:[0-9a-f]{64}$/.test(String(media.runtime_socket_hash || "")) &&
+    egress.runtime_socket_hash !== media.runtime_socket_hash &&
+    Number.isInteger(number(egress.vsock_port, NaN)) &&
+    Number.isInteger(number(media.vsock_port, NaN)) &&
+    number(egress.vsock_port) !== number(media.vsock_port) &&
+    turn.listen_host === "127.0.0.1" &&
+    turn.relay_host === "127.0.0.1" &&
+    turn.guest_url === "turn:127.0.0.1:3478?transport=tcp" &&
+    JSON.stringify(turn.protocols) === JSON.stringify(["turn", "tcp"]) &&
+    Number.isInteger(number(turn.listen_port, NaN)) &&
+    relayMin > 0 &&
+    relayMax >= relayMin &&
+    relayMax - relayMin < 64 &&
+    number(proof.expires_at_unix_ms, 0) > Date.parse(generatedAt)
+  );
+}
+
+const terminalTransportEffectKeys = [
+  "page_absent",
+  "child_absent",
+  "vm_absent",
+  "route_absent",
+  "socket_absent",
+  "transport_session_absent",
+  "turn_process_absent",
+  "turn_listener_absent",
+  "turn_relay_ports_absent",
+  "ordinary_vsock_bridge_absent",
+  "media_vsock_bridge_absent",
+  "bootstrap_vsock_bridge_absent",
+  "hibernation_state_absent",
+];
+
+function terminalTransportCleanupOk(closeResult, launchProof) {
+  return closeResult?.closed === true &&
+    closeResult?.cleanup?.schema === "elastos.browser.runtime-session-cleanup/v1" &&
+    closeResult.cleanup.ok === true &&
+    terminalTransportEffectKeys.every((key) => closeResult?.terminal_effects?.[key] === true) &&
+    closeResult?.transport_proof?.binding_hash === launchProof?.binding_hash &&
+    transportProofOk(closeResult?.transport_proof, closeResult?.page_id);
+}
+
+function lsofPortAbsent(protocol, port) {
+  const program = fs.existsSync("/usr/sbin/lsof") ? "/usr/sbin/lsof" : "lsof";
+  const result = childProcess.spawnSync(
+    program,
+    ["-nP", `-i${protocol}:${port}`],
+    { encoding: "utf8", timeout: 5_000 },
+  );
+  return {
+    protocol,
+    port,
+    absent: result.status === 1 && !String(result.stdout || "").trim(),
+    status: result.status,
+    error: result.error?.message || null,
+  };
+}
+
+function transportPortAbsence(proofs) {
+  const checks = [];
+  const seen = new Set();
+  for (const proof of proofs.filter(Boolean)) {
+    const turn = proof.turn || {};
+    const endpoints = [["TCP", number(turn.listen_port, 0)]];
+    const relayMin = number(turn.relay_port_min, 0);
+    const relayMax = number(turn.relay_port_max, -1);
+    for (let port = relayMin; port <= relayMax && port - relayMin < 64; port += 1) {
+      endpoints.push(["TCP", port], ["UDP", port]);
+    }
+    for (const [protocol, port] of endpoints) {
+      const key = `${protocol}:${port}`;
+      if (port > 0 && !seen.has(key)) {
+        seen.add(key);
+        checks.push(lsofPortAbsent(protocol, port));
+      }
+    }
+  }
+  return {
+    ok: checks.length > 0 && checks.every((entry) => entry.absent),
+    checks,
+  };
+}
+
 const thresholds = {
   max_remote_video_ready_ms: boundedEnv("ELASTOS_BROWSER_MAC_VM_MAX_VIDEO_READY_MS", 12000),
   max_navigation_ms: boundedEnv("ELASTOS_BROWSER_MAC_VM_MAX_NAV_MS", 15000),
@@ -374,6 +527,7 @@ const displaySessionProof = displaySession ? {
   display_backend: displaySession.display_backend || null,
   backend_class: displaySession.backend_class || null,
   offerer: displaySession.offerer || null,
+  ice_connection_policy: displaySession.ice_connection_policy || null,
   turn_ice_server_count: turnIceServerCount(displaySession),
   credentialed_turn_ice_server_count: turnIceServerCount(displaySession, true),
 } : null;
@@ -382,8 +536,19 @@ const runtimeMediaRelayOk =
   && displaySessionProof
   && displaySessionProof.mode === "webrtc_remote_display"
   && displaySessionProof.media_transport === "runtime_relay"
-  && displaySessionProof.turn_ice_server_count > 0
-  && displaySessionProof.credentialed_turn_ice_server_count > 0;
+  && (
+    (
+      displaySessionProof.ice_connection_policy === "engine_relay_only"
+      && displaySessionProof.offerer === "engine"
+      && displaySessionProof.turn_ice_server_count === 0
+      && displaySessionProof.credentialed_turn_ice_server_count === 0
+    ) ||
+    (
+      displaySessionProof.ice_connection_policy !== "engine_relay_only"
+      && displaySessionProof.turn_ice_server_count > 0
+      && displaySessionProof.credentialed_turn_ice_server_count > 0
+    )
+  );
 const diagnosticImages = Array.isArray(diagnostics.images) ? diagnostics.images : [];
 const pendingImageSamples = diagnosticImages
   .filter((image) => image && image.complete === false)
@@ -499,6 +664,26 @@ const engineIdentity =
   clickNavigation?.status?.engine_identity ||
   navigation.status?.engine_identity ||
   {};
+const embeddedTransportProof = engineIdentity.transport_proof || null;
+const openEngineIdentity = openPage.status?.engine_identity || {};
+const openTransportProof = openEngineIdentity.transport_proof || null;
+const embeddedTransportProofOk =
+  transportProofOk(embeddedTransportProof, embeddedUi.page_id);
+const openTransportProofOk =
+  transportProofOk(openTransportProof, openPage.page_id);
+const transportCleanupOk =
+  closeResults.length === 1 &&
+  terminalTransportCleanupOk(closeResults[0], openTransportProof);
+const portAbsence = transportPortAbsence([
+  embeddedTransportProof,
+  openTransportProof,
+]);
+const audioProof = embeddedUi.audio || {};
+const audioOk =
+  number(audioProof.audio_bytes_received, 0) > 0 &&
+  number(audioProof.audio_track_count, 0) > 0 &&
+  audioProof.remote_audio_muted !== true &&
+  audioProof.remote_audio_paused !== true;
 const vmIsolation = {
   schema: engineIdentity.schema || null,
   adapter: engineIdentity.adapter || null,
@@ -521,9 +706,9 @@ const vmIsolationOk =
 
 const proof = {
   schema: "elastos.browser.mac-vm-proof/v1",
-  ok: homeHttpOk && hashParity && controlOk && controlFreshAfterRestartOk && embeddedOk && clickNavigationOk && diagnosticsOk && performanceOk && zoomOk && profileResetOk && vmIsolationOk,
+  ok: homeHttpOk && hashParity && controlOk && controlFreshAfterRestartOk && embeddedOk && clickNavigationOk && diagnosticsOk && performanceOk && zoomOk && profileResetOk && vmIsolationOk && embeddedTransportProofOk && openTransportProofOk && transportCleanupOk && portAbsence.ok && audioOk,
   target: "mac-source-home",
-  generated_at: new Date().toISOString(),
+  generated_at: generatedAt,
   home: {
     url: process.env.HOME_URL,
     http_code: Number(process.env.HOME_HTTP_CODE),
@@ -576,6 +761,18 @@ const proof = {
     display_mode: embeddedUi.display_mode || null,
     display_session: displaySessionProof,
     vm_isolation: vmIsolation,
+    audio: {
+      ok: audioOk,
+      duration_ms: audioProof.duration_ms || null,
+      audio_bytes_received: number(audioProof.audio_bytes_received, 0),
+      audio_track_count: number(audioProof.audio_track_count, 0),
+      remote_audio_muted: audioProof.remote_audio_muted === true,
+      remote_audio_paused: audioProof.remote_audio_paused === true,
+    },
+    vz_transport: {
+      ok: embeddedTransportProofOk,
+      proof: embeddedTransportProof,
+    },
     remote_video_ready_ms: Number.isFinite(remoteVideoReadyMs) ? remoteVideoReadyMs : null,
     video_width: ready.video_width || null,
     video_height: ready.video_height || null,
@@ -637,7 +834,16 @@ const proof = {
       closed: entry.closed === true,
       isolated_session: entry.isolated_session === true,
       shutdown_ok: entry.shutdown?.ok === true,
+      terminal_effects: entry.terminal_effects || null,
+      transport_proof: entry.transport_proof || null,
     })),
+  },
+  vz_transport: {
+    ok: embeddedTransportProofOk && openTransportProofOk && transportCleanupOk && portAbsence.ok,
+    embedded_launch: embeddedTransportProof,
+    diagnostics_launch: openTransportProof,
+    exact_terminal_cleanup: transportCleanupOk,
+    port_absence: portAbsence,
   },
   profile_reset: {
     requested: profileResetRequested,
@@ -679,7 +885,7 @@ const proof = {
   },
   manual_acceptance: {
     status: "not_recorded",
-    reason: "Machine proof does not replace hash-bound manual UX, product audio, or authenticated ela.city edit-profile acceptance.",
+    reason: "Machine proof does not replace hash-bound manual UX or authenticated ela.city edit-profile acceptance.",
   },
 };
 

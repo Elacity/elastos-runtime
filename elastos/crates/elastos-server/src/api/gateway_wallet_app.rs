@@ -5,11 +5,12 @@ pub(in crate::api::gateway) async fn wallet_app_managed_create(
     headers: HeaderMap,
     Json(input): Json<SystemWalletManagedCreateRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    create_managed_wallet_accounts(&state, &context, input, WALLET_CAPSULE_ID).await
+    let context = authority.home_launch_context();
+    create_managed_wallet_accounts(&state, &context, &authority, input, WALLET_CAPSULE_ID).await
 }
 
 pub(in crate::api::gateway) async fn wallet_app_default_update(
@@ -17,11 +18,12 @@ pub(in crate::api::gateway) async fn wallet_app_default_update(
     headers: HeaderMap,
     Json(input): Json<SystemWalletDefaultRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    update_default_wallet_account(&state, &context, input, WALLET_CAPSULE_ID).await
+    let context = authority.home_launch_context();
+    update_default_wallet_account(&state, &context, &authority, input, WALLET_CAPSULE_ID).await
 }
 
 pub(in crate::api::gateway) async fn wallet_app_account_delete(
@@ -30,28 +32,30 @@ pub(in crate::api::gateway) async fn wallet_app_account_delete(
     headers: HeaderMap,
     Json(input): Json<WalletAccountDeleteRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) = consume_fresh_passkey_home_token(
+    let context = launch.context.clone();
+    if let Err(err) = consume_passkey_step_up_token(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        WALLET_CAPSULE_ID,
+        &input.step_up_token,
+        &launch,
         180,
         "wallet.account.delete",
         &serde_json::json!({ "account_id": account_id }),
     ) {
         return system_error_response(err);
     }
-    match crate::api::auth_gateway::wallet_provider_data(
+    match runtime_wallet_data(
         &state,
-        serde_json::json!({
-            "op": "revoke_account",
-            "principal_id": context.principal_id.clone(),
-            "account_id": account_id,
-        }),
+        &authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RevokeAccount { account_id },
     )
     .await
     {
@@ -69,8 +73,7 @@ pub(in crate::api::gateway) async fn wallet_app_account_delete(
                         "Wallet account deleted through Wallet after fresh passkey verification",
                 },
             );
-            Json(system_wallet_accounts_summary(&state, &context.principal_id).await)
-                .into_response()
+            Json(system_wallet_accounts_summary(&state, &authority).await).into_response()
         }
         Err(err) => system_error_response(err),
     }
@@ -82,18 +85,18 @@ pub(in crate::api::gateway) async fn wallet_app_account_rename(
     headers: HeaderMap,
     Json(input): Json<WalletAccountRenameRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    match crate::api::auth_gateway::wallet_provider_data(
+    let context = authority.home_launch_context();
+    match runtime_wallet_data(
         &state,
-        serde_json::json!({
-            "op": "rename_account",
-            "principal_id": context.principal_id.clone(),
-            "account_id": account_id,
-            "label": input.label,
-        }),
+        &authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RenameAccount {
+            account_id,
+            label: input.label,
+        },
     )
     .await
     {
@@ -110,8 +113,7 @@ pub(in crate::api::gateway) async fn wallet_app_account_rename(
                     reason: "Wallet account renamed through Wallet",
                 },
             );
-            Json(system_wallet_accounts_summary(&state, &context.principal_id).await)
-                .into_response()
+            Json(system_wallet_accounts_summary(&state, &authority).await).into_response()
         }
         Err(err) => system_error_response(err),
     }
@@ -123,28 +125,30 @@ pub(in crate::api::gateway) async fn wallet_app_account_recovery_key(
     headers: HeaderMap,
     Json(input): Json<WalletAccountRecoveryKeyRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) = consume_fresh_passkey_home_token(
+    let context = launch.context.clone();
+    if let Err(err) = consume_passkey_step_up_token(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        WALLET_CAPSULE_ID,
+        &input.step_up_token,
+        &launch,
         180,
         "wallet.recovery-key.export",
         &serde_json::json!({ "account_id": account_id }),
     ) {
         return system_error_response(err);
     }
-    match crate::api::auth_gateway::wallet_provider_data(
+    match runtime_wallet_data(
         &state,
-        serde_json::json!({
-            "op": "export_managed_secret",
-            "principal_id": context.principal_id.clone(),
-            "account_id": account_id,
-        }),
+        &authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ExportManagedRecoveryKey { account_id },
     )
     .await
     {
@@ -172,15 +176,20 @@ pub(in crate::api::gateway) async fn wallet_app_account_import_recovery_key(
     headers: HeaderMap,
     Json(input): Json<WalletAccountImportRecoveryKeyRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    if let Err(err) = consume_fresh_passkey_home_token(
+    let context = launch.context.clone();
+    if let Err(err) = consume_passkey_step_up_token(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        WALLET_CAPSULE_ID,
+        &input.step_up_token,
+        &launch,
         180,
         "wallet.recovery-key.import",
         &serde_json::json!({
@@ -190,14 +199,13 @@ pub(in crate::api::gateway) async fn wallet_app_account_import_recovery_key(
     ) {
         return system_error_response(err);
     }
-    match crate::api::auth_gateway::wallet_provider_data(
+    match runtime_wallet_data(
         &state,
-        serde_json::json!({
-            "op": "import_managed_secret",
-            "principal_id": context.principal_id.clone(),
-            "recovery_key": input.recovery_key,
-            "label": input.label,
-        }),
+        &authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ImportManagedRecoveryKey {
+            recovery_key: input.recovery_key,
+            label: input.label,
+        },
     )
     .await
     {
@@ -214,8 +222,7 @@ pub(in crate::api::gateway) async fn wallet_app_account_import_recovery_key(
                     reason: "Wallet recovery key imported after fresh passkey verification",
                 },
             );
-            Json(system_wallet_accounts_summary(&state, &context.principal_id).await)
-                .into_response()
+            Json(system_wallet_accounts_summary(&state, &authority).await).into_response()
         }
         Err(err) => system_error_response(err),
     }
@@ -227,11 +234,20 @@ pub(in crate::api::gateway) async fn wallet_app_approval_reject(
     Path(request_id): Path<String>,
     Json(input): Json<WalletApprovalRejectRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    reject_wallet_approval_request(&state, &context, &request_id, input, WALLET_CAPSULE_ID).await
+    let context = authority.home_launch_context();
+    reject_wallet_approval_request(
+        &state,
+        &context,
+        &authority,
+        &request_id,
+        input,
+        WALLET_CAPSULE_ID,
+    )
+    .await
 }
 
 pub(in crate::api::gateway) async fn wallet_app_managed_approval_approve(
@@ -240,11 +256,26 @@ pub(in crate::api::gateway) async fn wallet_app_managed_approval_approve(
     Path(request_id): Path<String>,
     Json(input): Json<WalletApprovalApproveRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let launch =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[WALLET_CAPSULE_ID]) {
+            Ok(launch) => launch,
+            Err(err) => return system_error_response(err),
+        };
+    let authority = match runtime_wallet_authority(&launch) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
-    approve_wallet_managed_request(&state, &context, &request_id, input, WALLET_CAPSULE_ID).await
+    let context = launch.context.clone();
+    approve_wallet_managed_request(
+        &state,
+        &launch,
+        &context,
+        &authority,
+        &request_id,
+        input,
+        WALLET_CAPSULE_ID,
+    )
+    .await
 }
 
 pub(in crate::api::gateway) async fn wallet_app_external_approval_approve(
@@ -253,18 +284,19 @@ pub(in crate::api::gateway) async fn wallet_app_external_approval_approve(
     Path(request_id): Path<String>,
     Json(input): Json<WalletApprovalApproveRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
+    let context = authority.home_launch_context();
     let reason = input
         .reason
         .unwrap_or_else(|| "Approved in Wallet".to_string());
     match approve_external_wallet_request(
         &state,
         &state.data_dir,
-        &context.principal_id,
-        &context.session_id,
+        &context,
+        &authority,
         &request_id,
         &reason,
         WALLET_CAPSULE_ID,
@@ -272,8 +304,7 @@ pub(in crate::api::gateway) async fn wallet_app_external_approval_approve(
     .await
     {
         Ok(outcome) => {
-            let mut summary =
-                system_wallet_approvals_summary(&state, &context.principal_id, false).await;
+            let mut summary = system_wallet_approvals_summary(&state, &authority, false).await;
             summary.note = Some(outcome.message);
             summary.handoff = outcome.handoff;
             Json(summary).into_response()
@@ -288,13 +319,15 @@ pub(in crate::api::gateway) async fn wallet_app_external_approval_complete(
     Path(request_id): Path<String>,
     Json(input): Json<WalletApprovalCompleteRequest>,
 ) -> Response {
-    let context = match require_wallet_app_launch_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    let authority = match require_wallet_app_launch_authority(&state.data_dir, &headers) {
+        Ok(authority) => authority,
         Err(err) => return system_error_response(err),
     };
+    let context = authority.home_launch_context();
     match complete_external_wallet_approval(
         &state,
         &context,
+        &authority,
         &request_id,
         input,
         WALLET_CAPSULE_ID,

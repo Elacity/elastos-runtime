@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::local_http::LoopbackHttpBaseUrl;
-use crate::provider_resource::{build_capability_resource, provider_operation_action};
+use crate::provider_resource::{
+    build_capability_resource, ensure_generic_wallet_capability, is_wallet_resource,
+    provider_operation_action, WALLET_STATUS_RESOURCE,
+};
 use anyhow::{Context, Result};
 use elastos_common::localhost::{
     is_supported_resource_scheme, is_system_only_backend_resource, rooted_localhost_fs_path,
@@ -203,6 +206,15 @@ fn carrier_invoke_dispatch(
         .get("body")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    if scheme == "wallet" {
+        if uri != WALLET_STATUS_RESOURCE || operation != "status" {
+            return Err(
+                "generic Wallet dispatch is limited to read-only elastos://wallet/meta/status; use the private Runtime Wallet Bus for authority-bound operations"
+                    .to_string(),
+            );
+        }
+        body = serde_json::json!({});
+    }
     if scheme == "localhost" {
         if let Some(object) = body.as_object_mut() {
             object.remove("token");
@@ -222,21 +234,11 @@ fn carrier_invoke_dispatch(
             body["network"] = serde_json::Value::String(network.to_string());
         }
     }
-    if scheme == "wallet" && operation == "request_signature" {
-        if let Some((chain_namespace, intent)) = wallet_signature_parts_from_uri(&uri) {
-            if body.get("chain_namespace").is_none() {
-                body["chain_namespace"] = serde_json::Value::String(chain_namespace);
-            }
-            if body.get("intent").is_none() {
-                body["intent"] = serde_json::Value::String(intent);
-            }
-        }
-    }
-
     let resource = build_capability_resource(&scheme, &operation, &body)?;
     let required_action = provider_operation_action(&scheme, &operation).ok_or_else(|| {
         format!("Unsupported provider operation action mapping: {scheme}/{operation}")
     })?;
+    ensure_generic_wallet_capability(&resource, required_action)?;
     body["op"] = serde_json::Value::String(operation.clone());
 
     Ok(CarrierInvokeDispatch {
@@ -728,21 +730,6 @@ fn provider_scheme_for_carrier_uri(uri: &str) -> Result<String, String> {
     Ok(scheme.to_string())
 }
 
-fn wallet_signature_parts_from_uri(uri: &str) -> Option<(String, String)> {
-    let mut segments = uri.strip_prefix("elastos://wallet/")?.split('/');
-    let chain_namespace = segments.next()?.trim();
-    let sign_segment = segments.next()?.trim();
-    let intent = segments.next()?.trim();
-    if chain_namespace.is_empty()
-        || sign_segment != "sign"
-        || intent.is_empty()
-        || segments.next().is_some()
-    {
-        return None;
-    }
-    Some((chain_namespace.to_string(), intent.to_string()))
-}
-
 /// Handle a single request from a component capsule host call.
 pub(crate) async fn handle_component_carrier_request(
     line: &str,
@@ -826,6 +813,16 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                         }));
                     }
                 };
+                if let Err(message) = ensure_generic_wallet_capability(resource, action) {
+                    return Ok(serde_json::json!({
+                        "id": id,
+                        "response": {
+                            "type": "error",
+                            "code": "generic_wallet_denied",
+                            "message": message,
+                        },
+                    }));
+                }
                 if !manifest_allows_resource(
                     &ctx.manifest_capabilities,
                     resource,
@@ -1167,7 +1164,7 @@ pub async fn handle_remote_request_with_audit_dir(
         }
         "request_capability" => {
             let resource = request["resource"].as_str().unwrap_or("");
-            let action = request["action"].as_str().unwrap_or("execute");
+            let action_str = request["action"].as_str().unwrap_or("execute");
             let reason = request["reason"].as_str().unwrap_or("");
 
             let scoped_resource = match scope_current_user_alias(resource, principal_id) {
@@ -1184,6 +1181,21 @@ pub async fn handle_remote_request_with_audit_dir(
                 }
             };
             let resource = scoped_resource.as_str();
+            if is_wallet_resource(resource) {
+                let action = match parse_action(action_str) {
+                    Some(action) => action,
+                    None => {
+                        return Ok(bridge_error_envelope(
+                            id,
+                            "invalid_action",
+                            &format!("Unknown action: {action_str}"),
+                        ));
+                    }
+                };
+                if let Err(message) = ensure_generic_wallet_capability(resource, action) {
+                    return Ok(bridge_error_envelope(id, "generic_wallet_denied", &message));
+                }
+            }
             if !manifest_allows_resource(manifest_capabilities, resource, principal_id) {
                 return Ok(serde_json::json!({
                     "id": id,
@@ -1196,7 +1208,7 @@ pub async fn handle_remote_request_with_audit_dir(
                 .header("Authorization", format!("Bearer {}", client_token))
                 .json(&serde_json::json!({
                     "resource": resource,
-                    "action": action,
+                    "action": action_str,
                     "reason": reason,
                 }))
                 .send()
@@ -1661,43 +1673,56 @@ mod tests {
     }
 
     #[test]
-    fn carrier_invoke_dispatch_derives_wallet_chain_and_intent() {
+    fn carrier_invoke_dispatch_rejects_wallet_signing_and_raw_contract() {
+        for (uri, operation) in [
+            (
+                "elastos://wallet/eip155:20/sign/transaction_intent",
+                "request_signature",
+            ),
+            ("elastos://wallet/account/list", "accounts"),
+            ("elastos://wallet/meta/status", "wallet_contract"),
+        ] {
+            let error = carrier_invoke_dispatch(
+                &serde_json::json!({
+                    "type": "carrier_invoke",
+                    "uri": uri,
+                    "operation": operation,
+                    "body": {
+                        "principal_id": "caller-selected-principal",
+                        "token": "caller-selected-token"
+                    }
+                }),
+                None,
+            )
+            .err()
+            .expect("generic Wallet operations must fail closed");
+
+            assert!(error.contains("private Runtime Wallet Bus"), "{error}");
+        }
+    }
+
+    #[test]
+    fn carrier_invoke_dispatch_bounds_wallet_status_body() {
         let dispatch = carrier_invoke_dispatch(
             &serde_json::json!({
                 "type": "carrier_invoke",
-                "uri": "elastos://wallet/eip155:20/sign/transaction_intent",
-                "operation": "request_signature",
+                "uri": "elastos://wallet/meta/status",
+                "operation": "status",
                 "body": {
-                    "capsule_id": "market",
-                    "resource": "elastos://wallet/eip155:20/sign/transaction_intent",
-                    "reason": "Approve transaction",
-                    "payload": {"schema": "elastos.wallet.test/v1"}
+                    "principal_id": "caller-selected-principal",
+                    "token": "caller-selected-token",
+                    "request": {"op": "wallet_contract"}
                 }
             }),
             None,
         )
-        .expect("wallet carrier invoke should dispatch");
+        .expect("read-only Wallet status should remain available");
 
         assert_eq!(dispatch.scheme, "wallet");
-        assert_eq!(dispatch.operation, "request_signature");
-        assert_eq!(
-            dispatch
-                .request
-                .get("chain_namespace")
-                .and_then(|value| value.as_str()),
-            Some("eip155:20")
-        );
-        assert_eq!(
-            dispatch
-                .request
-                .get("intent")
-                .and_then(|value| value.as_str()),
-            Some("transaction_intent")
-        );
-        assert_eq!(
-            dispatch.resource,
-            "elastos://wallet/eip155:20/sign/transaction_intent"
-        );
+        assert_eq!(dispatch.operation, "status");
+        assert_eq!(dispatch.resource, WALLET_STATUS_RESOURCE);
+        assert_eq!(dispatch.required_action, Action::Read);
+        assert_eq!(dispatch.request, serde_json::json!({"op": "status"}));
     }
 
     #[test]
@@ -1796,6 +1821,42 @@ mod tests {
         assert_eq!(response["id"], 15);
         assert_eq!(response["response"]["type"], "error");
         assert_eq!(response["response"]["code"], "manifest_capability_denied");
+    }
+
+    #[tokio::test]
+    async fn attached_bridge_wallet_contract_fails_before_http_dispatch() {
+        let response = handle_remote_request(
+            r#"{"id":16,"request":{"type":"carrier_invoke","uri":"elastos://wallet/meta/status","operation":"wallet_contract","token":"caller-token","body":{"principal_id":"caller-selected-principal","request":{"operation":{"kind":"list_accounts"}}}}}"#,
+            "http://127.0.0.1:12345",
+            "client-token",
+            "test-capsule",
+            &["elastos://wallet/*".to_string()],
+            None,
+        )
+        .await
+        .expect("attached bridge should reject raw Wallet Bus dispatch before HTTP");
+
+        assert_eq!(response["id"], 16);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "invalid_carrier_invoke");
+    }
+
+    #[tokio::test]
+    async fn attached_bridge_rejects_wallet_capability_before_http_dispatch() {
+        let response = handle_remote_request(
+            r#"{"id":17,"request":{"type":"request_capability","resource":"elastos://wallet/account/list","action":"read"}}"#,
+            "http://127.0.0.1:12345",
+            "client-token",
+            "test-capsule",
+            &["elastos://wallet/*".to_string()],
+            None,
+        )
+        .await
+        .expect("attached bridge should reject Wallet authority before HTTP");
+
+        assert_eq!(response["id"], 17);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "generic_wallet_denied");
     }
 
     #[tokio::test]
@@ -2192,109 +2253,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_invoke_wallet_signature_enforces_manifest_and_token_authority() {
+    async fn carrier_wallet_status_is_bounded_and_non_principal_specific() {
         let mut ctx = bridge_context();
-        ctx.manifest_capabilities =
-            vec!["elastos://wallet/eip155:20/sign/personal_sign".to_string()];
+        ctx.manifest_capabilities = vec![WALLET_STATUS_RESOURCE.to_string()];
         let provider = Arc::new(CapturingWalletProvider::default());
         ctx.provider_registry.register(provider.clone()).await;
-        let uri = "elastos://wallet/eip155:20/sign/transaction_intent";
-        let execute_token = bridge_token(&ctx, uri, Action::Execute);
-        let manifest_denied_line = serde_json::json!({
-            "id": 35,
-            "request": {
-                "type": "carrier_invoke",
-                "uri": uri,
-                "operation": "request_signature",
-                "token": execute_token,
-                "body": {
-                    "capsule_id": "market",
-                    "resource": uri,
-                    "reason": "Approve transaction",
-                    "payload": {"schema": "elastos.wallet.test/v1"}
-                }
-            }
-        })
-        .to_string();
-
-        let response = handle_request(&manifest_denied_line, &Some(ctx.clone()))
-            .await
-            .expect("manifest denial should produce a bridge response");
-
-        assert_eq!(response["id"], 35);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "manifest_capability_denied");
-        assert!(
-            provider.requests().await.is_empty(),
-            "manifest-denied wallet signing must not reach the wallet provider"
-        );
-
-        ctx.manifest_capabilities = vec![uri.to_string()];
-        let read_token = bridge_token(&ctx, uri, Action::Read);
-        let wrong_action_line = serde_json::json!({
-            "id": 36,
-            "request": {
-                "type": "carrier_invoke",
-                "uri": uri,
-                "operation": "request_signature",
-                "token": read_token,
-                "body": {
-                    "capsule_id": "market",
-                    "resource": uri,
-                    "reason": "Approve transaction",
-                    "payload": {"schema": "elastos.wallet.test/v1"}
-                }
-            }
-        })
-        .to_string();
-
-        let response = handle_request(&wrong_action_line, &Some(ctx.clone()))
-            .await
-            .expect("wrong action should produce a bridge response");
-
-        assert_eq!(response["id"], 36);
-        assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "capability_denied");
-        assert!(
-            provider.requests().await.is_empty(),
-            "wrong-action wallet signing tokens must not reach the wallet provider"
-        );
-
-        let execute_token = bridge_token(&ctx, uri, Action::Execute);
-        let allowed_line = serde_json::json!({
+        let token = bridge_token(&ctx, WALLET_STATUS_RESOURCE, Action::Read);
+        let line = serde_json::json!({
             "id": 37,
             "request": {
                 "type": "carrier_invoke",
-                "uri": uri,
-                "operation": "request_signature",
-                "token": execute_token,
+                "uri": WALLET_STATUS_RESOURCE,
+                "operation": "status",
+                "token": token,
                 "body": {
-                    "capsule_id": "market",
-                    "resource": uri,
-                    "reason": "Approve transaction",
-                    "payload": {"schema": "elastos.wallet.test/v1"}
+                    "principal_id": "caller-selected-principal",
+                    "token": "caller-selected-local-token",
+                    "request": {"op": "wallet_contract"}
                 }
             }
         })
         .to_string();
 
-        let response = handle_request(&allowed_line, &Some(ctx))
+        let response = handle_request(&line, &Some(ctx))
             .await
-            .expect("authorized wallet signing should produce a bridge response");
+            .expect("read-only Wallet status should produce a bridge response");
 
         assert_eq!(response["id"], 37);
         assert_eq!(response["response"]["type"], "carrier_result");
         let requests = provider.requests().await;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["op"], "request_signature");
-        assert_eq!(requests[0]["chain_namespace"], "eip155:20");
-        assert_eq!(requests[0]["intent"], "transaction_intent");
+        assert_eq!(requests[0], serde_json::json!({"op": "status"}));
     }
 
     #[tokio::test]
-    async fn request_capability_enforces_manifest_bound_before_pending_capacity() {
+    async fn component_bridge_wallet_contract_fails_before_provider_invocation() {
         let mut ctx = bridge_context();
-        ctx.manifest_capabilities = vec!["elastos://did/*".to_string()];
+        ctx.manifest_capabilities = vec!["elastos://wallet/*".to_string()];
+        let provider = Arc::new(CapturingWalletProvider::default());
+        ctx.provider_registry.register(provider.clone()).await;
+        let response = handle_component_carrier_request(
+            r#"{"id":35,"request":{"type":"carrier_invoke","uri":"elastos://wallet/meta/status","operation":"wallet_contract","token":"caller-token","body":{"principal_id":"caller-selected-principal","request":{"operation":{"kind":"list_accounts"}}}}}"#,
+            ctx,
+        )
+        .await
+        .expect("component bridge should reject raw Wallet Bus dispatch");
+
+        assert_eq!(response["id"], 35);
+        assert_eq!(response["response"]["type"], "error");
+        assert_eq!(response["response"]["code"], "invalid_carrier_invoke");
+        assert!(
+            provider.requests().await.is_empty(),
+            "raw component Wallet dispatch must not reach ProviderRegistry"
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_wallet_operations_fail_before_provider_invocation() {
+        let mut ctx = bridge_context();
+        ctx.manifest_capabilities = vec!["elastos://wallet/*".to_string()];
+        let provider = Arc::new(CapturingWalletProvider::default());
+        ctx.provider_registry.register(provider.clone()).await;
+
+        for (id, uri, operation) in [
+            (38, "elastos://wallet/account/list", "accounts"),
+            (39, "elastos://wallet/proof/challenge", "challenge"),
+            (
+                40,
+                "elastos://wallet/eip155:20/sign/transaction_intent",
+                "request_signature",
+            ),
+        ] {
+            let line = serde_json::json!({
+                "id": id,
+                "request": {
+                    "type": "carrier_invoke",
+                    "uri": uri,
+                    "operation": operation,
+                    "token": "caller-token",
+                    "body": {
+                        "principal_id": "caller-selected-principal",
+                        "token": "caller-selected-local-token"
+                    }
+                }
+            })
+            .to_string();
+            let response = handle_request(&line, &Some(ctx.clone()))
+                .await
+                .expect("Carrier bridge should reject generic Wallet authority");
+
+            assert_eq!(response["id"], id);
+            assert_eq!(response["response"]["type"], "error");
+            assert_eq!(response["response"]["code"], "invalid_carrier_invoke");
+        }
+
+        assert!(
+            provider.requests().await.is_empty(),
+            "rejected Carrier Wallet operations must not reach ProviderRegistry"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_capability_rejects_wallet_authority_before_pending_capacity() {
+        let mut ctx = bridge_context();
+        ctx.manifest_capabilities = vec!["elastos://wallet/*".to_string()];
         let pending_store = ctx.pending_store.clone();
         let response = handle_request(
             r#"{"id":35,"request":{"type":"request_capability","resource":"elastos://wallet/account/list","action":"read"}}"#,
@@ -2305,10 +2367,10 @@ mod tests {
 
         assert_eq!(response["id"], 35);
         assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "manifest_capability_denied");
+        assert_eq!(response["response"]["code"], "generic_wallet_denied");
         assert!(
             pending_store.list_pending().await.is_empty(),
-            "manifest-denied requests must not consume pending capacity or prompt the user"
+            "generic Wallet requests must not consume pending capacity or prompt the user"
         );
     }
 

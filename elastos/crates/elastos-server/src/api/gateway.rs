@@ -56,12 +56,16 @@ mod gateway_home_system;
 mod gateway_home_terminal;
 #[path = "gateway_home_token.rs"]
 mod gateway_home_token;
+#[path = "gateway_home_wallet_connector.rs"]
+mod gateway_home_wallet_connector;
 #[path = "gateway_inbox.rs"]
 mod gateway_inbox;
 #[path = "gateway_inspect_actions.rs"]
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_passkey_step_up.rs"]
+mod gateway_passkey_step_up;
 #[path = "gateway_provider_proxy.rs"]
 mod gateway_provider_proxy;
 #[path = "gateway_room.rs"]
@@ -70,14 +74,30 @@ mod gateway_room;
 mod gateway_server;
 #[path = "gateway_site.rs"]
 mod gateway_site;
+#[path = "gateway_transaction_effects.rs"]
+mod gateway_transaction_effects;
 #[path = "gateway_wallet.rs"]
 mod gateway_wallet;
+#[path = "gateway_wallet_adapter.rs"]
+mod gateway_wallet_adapter;
 #[cfg(test)]
 use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
 use gateway_esp::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
+
+pub(crate) fn principal_root_protected_object_inventory(
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    let mut inventory =
+        gateway_home_system::principal_root_protected_object_inventory(localhost_root);
+    inventory.extend(
+        gateway_transaction_effects::principal_root_protected_object_inventory(localhost_root),
+    );
+    inventory
+}
+
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 use gateway_home_system::*;
 pub(crate) use gateway_home_system::{
@@ -85,22 +105,34 @@ pub(crate) use gateway_home_system::{
 };
 use gateway_home_terminal::*;
 pub(super) use gateway_home_token::{
-    consume_fresh_passkey_home_token, home_launch_auth_data_dir, home_launch_token_header,
-    home_session_clear_cookie_header, home_session_cookie_header_for_token,
-    issue_home_launch_token_for_auth_grant, issue_home_launch_token_with_context,
-    issue_home_launch_token_with_intent, require_home_launch_token,
-    require_home_launch_token_context, require_home_launch_token_for_any,
-    require_home_launch_token_for_any_app_context, require_home_launch_token_for_any_context,
-    require_home_token, require_home_token_context, HomeLaunchTokenContext,
+    home_launch_auth_data_dir, home_launch_token_header, home_session_clear_cookie_header,
+    home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
+    issue_home_projection_launch_token_with_context, require_carried_home_launch_token,
+    require_home_launch_token, require_home_launch_token_binding,
+    require_home_launch_token_context, require_home_launch_token_for_any_app_context,
+    require_home_launch_token_for_any_context, require_home_projection_launch_token_context,
+    require_home_runtime_wallet_authority, require_home_token, require_home_token_context,
+    require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
+    require_runtime_wallet_authority, runtime_wallet_authority, HomeLaunchContext,
+    HomeLaunchTokenContext, RequiredHomeLaunchToken, RuntimeWalletAuthority,
 };
 #[cfg(test)]
 pub(crate) use gateway_home_token::{
-    issue_home_launch_token, local_home_launch_token_context, set_test_home_launch_auth_data_dir,
-    uuid_like_token,
+    issue_home_launch_token, issue_home_launch_token_with_context, local_home_launch_token_context,
+    set_test_home_launch_auth_data_dir, uuid_like_token,
 };
+use gateway_home_wallet_connector::*;
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
+use gateway_passkey_step_up::*;
+pub(super) use gateway_passkey_step_up::{
+    consume_or_recover_passkey_step_up_effect, consume_passkey_step_up_token,
+};
+#[cfg(test)]
+pub(crate) use gateway_passkey_step_up::{
+    issue_passkey_step_up_token_at_for_test, issue_passkey_step_up_token_for_test,
+};
 use gateway_provider_proxy::*;
 use gateway_room::*;
 pub(crate) use gateway_room::{
@@ -110,8 +142,10 @@ pub(crate) use gateway_server::advertised_gateway_urls;
 pub use gateway_server::start_gateway_server;
 use gateway_site::*;
 pub(super) use gateway_site::{content_type, validate_file_path};
+use gateway_transaction_effects::*;
 pub(crate) use gateway_wallet::ensure_wallet_connector_configured;
 use gateway_wallet::*;
+pub(super) use gateway_wallet_adapter::RuntimeWalletAdapter;
 
 /// Maximum size for a single file fetched through the gateway (100 MB).
 const MAX_GATEWAY_FILE_SIZE: usize = 100 * 1024 * 1024;
@@ -124,6 +158,7 @@ const MANAGED_WALLET_CHAIN_NAMESPACES: &[&str] = &[
     "eip155:8453",
     "bip122:000000000019d6689c085ae165831e93",
 ];
+const WALLET_APPROVAL_REQUEST_TTL_SECS: u64 = 10 * 60;
 const WALLET_PRICE_CACHE_TTL_SECS: u64 = 90;
 const WALLET_PRICE_API_URL: &str = "https://api.coingecko.com/api/v3/simple/price";
 const WALLET_PRICE_SOURCE_ENV: &str = "ELASTOS_WALLET_PRICE_SOURCE";
@@ -156,7 +191,7 @@ pub(crate) const ROOM_SESSION_COOKIE: &str = "room-session";
 pub(crate) const BROWSER_SESSION_COOKIE: &str = "browser-session";
 pub(crate) const HOME_SESSION_COOKIE: &str = "home-session";
 const ROOM_SYNC_CONSUMER_ID: &str = "room-sync";
-const HOME_LAUNCH_TOKEN_DOMAIN: &str = "elastos.home.launch.v1";
+const HOME_LAUNCH_TOKEN_DOMAIN: &str = "elastos.home.launch.v4";
 const HOME_LAUNCH_TOKEN_TTL_SECS: u64 = 12 * 60 * 60;
 const HOME_BROWSER_STATE_SCHEMA: &str = "elastos.home.browser-state/v1";
 const HOME_BROWSER_STATE_MAX_BYTES: usize = 64 * 1024;
@@ -312,11 +347,6 @@ pub(crate) const WALLET_CAPSULE_ID: &str = "wallet";
 pub(crate) const WALLET_UNISAT_CAPSULE_ID: &str = "wallet-unisat";
 pub(crate) const WALLET_WALLETCONNECT_CAPSULE_ID: &str = "wallet-walletconnect";
 const WALLET_CONNECTOR_CAPSULE_IDS: &[&str] = &[
-    WALLET_METAMASK_CAPSULE_ID,
-    WALLET_UNISAT_CAPSULE_ID,
-    WALLET_WALLETCONNECT_CAPSULE_ID,
-];
-pub(crate) const WALLET_LINK_CAPSULE_IDS: &[&str] = &[
     WALLET_METAMASK_CAPSULE_ID,
     WALLET_UNISAT_CAPSULE_ID,
     WALLET_WALLETCONNECT_CAPSULE_ID,
@@ -554,6 +584,18 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(super::auth_gateway::passkey_authenticate_complete),
         )
         .route(
+            "/api/auth/passkey-step-up/begin",
+            post(passkey_step_up_begin).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/passkey-step-up/complete",
+            post(passkey_step_up_complete).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
+        .route(
+            "/api/auth/passkey-step-up/cancel",
+            post(passkey_step_up_cancel).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
             "/api/browser/session/request",
             post(super::browser_sessions::browser_session_request),
         )
@@ -740,6 +782,11 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(gateway_browser::browser_app_page_webrtc),
         )
         .route(
+            "/api/apps/browser/wallet/request-accounts",
+            post(gateway_browser::browser_app_wallet_request_accounts)
+                .options(gateway_browser::browser_app_wallet_cors_preflight),
+        )
+        .route(
             "/api/apps/browser/wallet/request-signature",
             post(gateway_browser::browser_app_wallet_request_signature)
                 .options(gateway_browser::browser_app_wallet_cors_preflight),
@@ -768,6 +815,30 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/apps/browser/wallet/approvals/:request_id",
             get(gateway_browser::browser_app_wallet_approval_status)
                 .options(gateway_browser::browser_app_wallet_cors_preflight),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/evm/link/challenge",
+            post(home_wallet_connector_evm_link_challenge),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/evm/link/verify",
+            post(home_wallet_connector_evm_link_verify),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/bitcoin/link/challenge",
+            post(home_wallet_connector_bitcoin_link_challenge),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/bitcoin/link/verify",
+            post(home_wallet_connector_bitcoin_link_verify),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/approvals/:request_id/handoff",
+            post(home_wallet_connector_approval_handoff),
+        )
+        .route(
+            "/api/apps/home/wallet-connector/approvals/:request_id/complete",
+            post(home_wallet_connector_approval_complete),
         )
         .route(
             "/api/apps/:wallet_connector/wallet/approvals",
@@ -1154,7 +1225,9 @@ async fn landing_page() -> Html<String> {
 
 include!("gateway_models.rs");
 
-fn load_existing_gateway_runtime_did(data_dir: &std::path::Path) -> Option<String> {
+pub(in crate::api::gateway) fn load_existing_gateway_runtime_did(
+    data_dir: &std::path::Path,
+) -> Option<String> {
     if let Some(did) = std::env::var_os(HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV)
         .and_then(|value| value.into_string().ok())
         .map(|value| value.trim().to_string())
@@ -1234,6 +1307,7 @@ fn inbox_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
     let status = if text.contains("home launch token")
         || text.contains("fresh passkey")
+        || text.contains("passkey step-up")
         || text.contains("auth session is not active")
         || text.contains("auth session not found")
         || text.contains("belongs to a different principal")
@@ -1261,6 +1335,7 @@ fn system_error_response(err: anyhow::Error) -> Response {
         || text.contains("admin passkey required")
         || text.contains("proof-bound passkey session required")
         || text.contains("fresh passkey")
+        || text.contains("passkey step-up")
     {
         StatusCode::FORBIDDEN
     } else if text.contains("nickname must")

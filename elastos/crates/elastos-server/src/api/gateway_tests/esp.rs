@@ -128,7 +128,7 @@ async fn invoke_esp_method_with_input(
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/capsules/interfaces/invoke")
                 .header(CONTENT_TYPE, "application/json")
@@ -162,7 +162,7 @@ async fn esp_initialize_describes_existing_projection_routes() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/esp/initialize")
                 .body(Body::empty())
                 .unwrap(),
@@ -241,7 +241,7 @@ async fn esp_initialize_describes_existing_projection_routes() {
 
     let inspect_without_system_token = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/provider/inspect/plan")
                 .header(CONTENT_TYPE, "application/json")
@@ -263,7 +263,7 @@ async fn esp_initialize_keeps_http_adapter_separate_from_authority_model() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/esp/initialize")
                 .body(Body::empty())
                 .unwrap(),
@@ -308,7 +308,7 @@ async fn esp_initialize_keeps_http_adapter_separate_from_authority_model() {
 
     let negotiated = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/esp/initialize")
                 .header(CONTENT_TYPE, "application/json")
@@ -342,7 +342,7 @@ async fn esp_initialize_negotiates_schema_tags_without_authority() {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/esp/initialize")
                 .header(CONTENT_TYPE, "application/json")
@@ -370,7 +370,7 @@ async fn esp_initialize_negotiates_schema_tags_without_authority() {
 
     let unsupported_version = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/esp/initialize")
                 .header(CONTENT_TYPE, "application/json")
@@ -407,7 +407,7 @@ async fn esp_generic_invocation_executes_only_explicit_runtime_bindings() {
     let interfaces_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/capsules/interfaces")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())

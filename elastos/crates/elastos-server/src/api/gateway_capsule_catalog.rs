@@ -448,6 +448,10 @@ async fn dispatch_capsule_launch_affordance(
         &state.data_dir,
         &target_summary.route,
         target_summary.target.as_str(),
+        target_summary
+            .viewer
+            .as_deref()
+            .unwrap_or(target_summary.target.as_str()),
         &BTreeMap::new(),
         context,
     )
@@ -1362,6 +1366,8 @@ mod tests {
         };
         let token = issue_home_launch_token(data_dir.path(), "marketplace").unwrap();
         let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:61180".parse().unwrap());
+        headers.insert("origin", "null".parse().unwrap());
         headers.insert("x-elastos-home-token", token.parse().unwrap());
 
         let runtime_response = capsule_interface_invoke(

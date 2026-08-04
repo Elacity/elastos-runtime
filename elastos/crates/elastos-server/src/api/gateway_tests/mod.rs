@@ -15,11 +15,15 @@ use elastos_runtime::auth::{
     AuthSessionGrantV1, PasskeyWebAuthnBinding, ProofBinding,
 };
 use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
+use elastos_wallet_contract::{
+    WalletOperationKind, WalletProviderOperationV2, WalletProviderRequestV2,
+    WalletProviderResponseV2, WalletResultV2, WALLET_BUS_OPERATION,
+};
 use k256::ecdsa::SigningKey as EvmSigningKey;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::Sha256;
 use sha3::Keccak256;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(unix)]
 use tokio::io::AsyncReadExt as _;
 use tokio::net::TcpListener;
@@ -32,6 +36,17 @@ use tower::ServiceExt;
 const TEST_CIDV0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
 const TEST_CIDV1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 const GBA_EMULATOR_CAPSULE_ID: &str = "gba-emulator";
+
+fn test_browser_request(host: &'static str, origin: &'static str) -> axum::http::request::Builder {
+    let request = Request::builder()
+        .header(HOST, host)
+        .header("origin", origin);
+    if origin == "null" {
+        request
+    } else {
+        request.header("sec-fetch-site", "same-origin")
+    }
+}
 
 fn test_launch_token_from_route(route: &str) -> String {
     let route = url::Url::parse("http://localhost")
@@ -317,6 +332,123 @@ async fn browser_engine_attached_test_state(cache_dir: &std::path::Path) -> Gate
     browser_engine_attached_test_state_with_relay(cache_dir, None).await
 }
 
+async fn browser_engine_reconciliation_test_state(
+    cache_dir: &std::path::Path,
+    failure: MockDispatchedBrowserLaunchFailure,
+) -> (
+    GatewayState,
+    Arc<TokioMutex<Vec<serde_json::Value>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "exit",
+            Arc::new(MockAttachedExitProvider {
+                relay_ipc_path: None,
+                stream_id: mock_attached_stream_id(cache_dir),
+            }),
+        )
+        .await
+        .unwrap();
+    let close_calls = Arc::new(TokioMutex::new(Vec::new()));
+    let reconciliation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    registry
+        .register_sub_provider(
+            "browser-engine",
+            Arc::new(MockReconciliatingBrowserEngineProvider {
+                failure,
+                effect: TokioMutex::new(None),
+                launch_calls: std::sync::atomic::AtomicUsize::new(0),
+                close_calls: close_calls.clone(),
+                reconciliation_calls: reconciliation_calls.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    (
+        GatewayState {
+            provider_registry: Some(registry),
+            identity_manager: Arc::new(std::sync::OnceLock::new()),
+            cache_dir: cache_dir.to_path_buf(),
+            data_dir: cache_dir.to_path_buf(),
+        },
+        close_calls,
+        reconciliation_calls,
+    )
+}
+
+struct MockExitClosePlan {
+    close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    close_failures: usize,
+    close_hangs: usize,
+    close_started: Option<Arc<tokio::sync::Notify>>,
+}
+
+async fn browser_engine_retrying_close_test_state(
+    cache_dir: &std::path::Path,
+    engine_close_calls: Arc<TokioMutex<Vec<serde_json::Value>>>,
+    failure: MockBrowserEngineCloseFailure,
+    engine_close_failures: usize,
+    exit_close: Option<MockExitClosePlan>,
+    ownership: Option<Arc<MockBrowserOwnershipCounts>>,
+) -> GatewayState {
+    seed_test_browser_capsules(cache_dir);
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("net", Arc::new(MockNetProvider))
+        .await
+        .unwrap();
+    if let Some(exit_close) = exit_close {
+        let provider: Arc<dyn Provider> = Arc::new(
+            MockRemoteCarrierExitProvider::with_close_behavior(exit_close, ownership.clone()),
+        );
+        registry
+            .register_sub_provider("exit", provider)
+            .await
+            .unwrap();
+    } else {
+        registry
+            .register_sub_provider(
+                "exit",
+                Arc::new(MockAttachedExitProvider {
+                    relay_ipc_path: None,
+                    stream_id: mock_attached_stream_id(cache_dir),
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let engine_provider: Arc<dyn Provider> = match ownership {
+        Some(ownership) => Arc::new(MockRetryingBrowserEngineProvider::with_ownership(
+            engine_close_calls,
+            failure,
+            engine_close_failures,
+            ownership,
+        )),
+        None => Arc::new(MockRetryingBrowserEngineProvider::new(
+            engine_close_calls,
+            failure,
+            engine_close_failures,
+        )),
+    };
+    registry
+        .register_sub_provider("browser-engine", engine_provider)
+        .await
+        .unwrap();
+    GatewayState {
+        provider_registry: Some(registry),
+        identity_manager: Arc::new(std::sync::OnceLock::new()),
+        cache_dir: cache_dir.to_path_buf(),
+        data_dir: cache_dir.to_path_buf(),
+    }
+}
+
 async fn browser_engine_policy_blocked_test_state(cache_dir: &std::path::Path) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
@@ -505,10 +637,32 @@ async fn wallet_test_state_with_provider(
     cache_dir: &std::path::Path,
     provider: MockWalletProvider,
 ) -> GatewayState {
+    wallet_test_state_with_shared_provider(cache_dir, Arc::new(provider)).await
+}
+
+async fn wallet_test_state_with_observer(
+    cache_dir: &std::path::Path,
+) -> (GatewayState, Arc<RecordingWalletProvider>) {
+    wallet_test_state_with_recording_provider(cache_dir, MockWalletProvider::default()).await
+}
+
+async fn wallet_test_state_with_recording_provider(
+    cache_dir: &std::path::Path,
+    wallet_provider: MockWalletProvider,
+) -> (GatewayState, Arc<RecordingWalletProvider>) {
+    let provider = Arc::new(RecordingWalletProvider::new(wallet_provider));
+    let state = wallet_test_state_with_shared_provider(cache_dir, provider.clone()).await;
+    (state, provider)
+}
+
+async fn wallet_test_state_with_shared_provider(
+    cache_dir: &std::path::Path,
+    provider: Arc<dyn Provider>,
+) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
     registry
-        .register_sub_provider("wallet", Arc::new(provider))
+        .register_sub_provider("wallet", provider)
         .await
         .unwrap();
     GatewayState {
@@ -527,10 +681,34 @@ async fn wallet_chain_test_state_with_wallet_provider(
     cache_dir: &std::path::Path,
     wallet_provider: MockWalletProvider,
 ) -> GatewayState {
+    wallet_chain_test_state_with_shared_wallet_provider(cache_dir, Arc::new(wallet_provider)).await
+}
+
+async fn wallet_chain_test_state_with_observer(
+    cache_dir: &std::path::Path,
+) -> (GatewayState, Arc<RecordingWalletProvider>) {
+    wallet_chain_test_state_with_recording_wallet_provider(cache_dir, MockWalletProvider::default())
+        .await
+}
+
+async fn wallet_chain_test_state_with_recording_wallet_provider(
+    cache_dir: &std::path::Path,
+    wallet_provider: MockWalletProvider,
+) -> (GatewayState, Arc<RecordingWalletProvider>) {
+    let provider = Arc::new(RecordingWalletProvider::new(wallet_provider));
+    let state =
+        wallet_chain_test_state_with_shared_wallet_provider(cache_dir, provider.clone()).await;
+    (state, provider)
+}
+
+async fn wallet_chain_test_state_with_shared_wallet_provider(
+    cache_dir: &std::path::Path,
+    wallet_provider: Arc<dyn Provider>,
+) -> GatewayState {
     seed_test_browser_capsules(cache_dir);
     let registry = Arc::new(ProviderRegistry::new());
     registry
-        .register_sub_provider("wallet", Arc::new(wallet_provider))
+        .register_sub_provider("wallet", wallet_provider)
         .await
         .unwrap();
     registry
@@ -549,6 +727,7 @@ include!("support_providers.rs");
 include!("support_runtime.rs");
 
 mod browser_profile;
+mod browser_reconciliation;
 mod documents;
 mod esp;
 #[path = "../gateway_browser_route_tests.rs"]

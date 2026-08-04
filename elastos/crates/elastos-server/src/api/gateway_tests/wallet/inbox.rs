@@ -5,6 +5,8 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let dir = tempfile::tempdir().unwrap();
     let authority = passkey_authority(dir.path());
     let token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
+    let wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), INBOX_CAPSULE_ID, &token);
     let provider = MockWalletProvider {
         challenges: TokioMutex::default(),
         bitcoin_challenges: TokioMutex::default(),
@@ -26,12 +28,14 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
         })]),
         defaults: TokioMutex::default(),
     };
-    let app = gateway_router(wallet_test_state_with_provider(dir.path(), provider).await);
+    let (state, wallet_provider) =
+        wallet_test_state_with_recording_provider(dir.path(), provider).await;
+    let app = gateway_router(state);
 
     let summary = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", token.clone())
                 .body(Body::empty())
@@ -61,7 +65,7 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let missing_fresh_token = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", token.clone())
@@ -80,7 +84,7 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     let missing_text = String::from_utf8(missing_body.to_vec()).unwrap();
     assert!(missing_text.contains("fresh passkey verification is required"));
 
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         INBOX_CAPSULE_ID,
         &token,
@@ -92,13 +96,13 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
     );
     let approved = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/inbox/actions")
                 .header("x-elastos-home-token", token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"action_id":"wallet-approve-request:wallet-approval:test","home_token":"{}"}}"#,
+                    r#"{{"action_id":"wallet-approve-request:wallet-approval:test","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -124,6 +128,17 @@ async fn test_inbox_approves_wallet_requests_through_runtime_wallet_signing() {
         })
         .expect("wallet approval completion audit event");
     assert_eq!(event.capsule_id.as_deref(), Some(INBOX_CAPSULE_ID));
+    wallet_provider
+        .assert_v2_approval_operations(
+            &wallet_authority,
+            &[
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ListApprovals,
+                WalletOperationKind::ApproveAndSignManaged,
+            ],
+        )
+        .await;
 }
 
 #[test]
@@ -162,6 +177,9 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let system_token = authority.system_token.clone();
     let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
     let wallet_token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
+    let documents_token = app_token_for_authority(dir.path(), DOCUMENTS_CAPSULE_ID, &authority);
+    let documents_wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), DOCUMENTS_CAPSULE_ID, &documents_token);
     let home_token = authority.home_token.clone();
     let state = wallet_test_state(dir.path()).await;
     let app = gateway_router(state.clone());
@@ -169,7 +187,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let managed = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/managed")
                 .header("x-elastos-home-token", system_token.clone())
@@ -190,7 +208,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let default_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/default")
                 .header("x-elastos-home-token", system_token.clone())
@@ -204,21 +222,21 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
         .unwrap();
     assert_eq!(default_response.status(), StatusCode::OK);
 
-    let request_json = crate::api::auth_gateway::wallet_provider_data(
+    let request_json = runtime_wallet_data(
         &state,
-        json!({
-            "op": "request_signature",
-            "principal_id": authority.principal_id.clone(),
-            "chain_namespace": "eip155:20",
-            "intent": "capability_grant",
-            "capsule_id": "documents",
-            "resource": "elastos://wallet/eip155:20/sign/capability_grant",
-            "reason": "Documents publish approval",
-            "payload": {
+        &documents_wallet_authority,
+        WalletProviderOperationV2::RequestApproval {
+            account_id: account_id.to_string(),
+            chain_namespace: "eip155:20".to_string(),
+            intent: "capability_grant".to_string(),
+            resource: "elastos://wallet/eip155:20/sign/capability_grant".to_string(),
+            reason: "Documents publish approval".to_string(),
+            payload: json!({
                 "schema": "elastos.wallet.capability-request/v1",
                 "requested_by": "documents",
-            },
-        }),
+            }),
+            expires_at: crate::auth::now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
+        },
     )
     .await
     .unwrap();
@@ -229,7 +247,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let home = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", home_token)
                 .body(Body::empty())
@@ -251,7 +269,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let inbox = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token.clone())
                 .body(Body::empty())
@@ -274,7 +292,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
         "documents"
     );
 
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         WALLET_CAPSULE_ID,
         &wallet_token,
@@ -287,7 +305,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/wallet/wallet/managed-approvals/{}/approve",
@@ -296,7 +314,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
                 .header("x-elastos-home-token", wallet_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"reason":"Approved in Wallet","home_token":"{}"}}"#,
+                    r#"{{"reason":"Approved in Wallet","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -315,7 +333,7 @@ async fn test_wallet_approval_journey_creates_request_reviews_in_inbox_and_signs
 
     let approvals = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/wallet/approvals")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())
@@ -359,6 +377,9 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let system_token = authority.system_token.clone();
     let inbox_token = app_token_for_authority(dir.path(), INBOX_CAPSULE_ID, &authority);
     let wallet_token = app_token_for_authority(dir.path(), WALLET_CAPSULE_ID, &authority);
+    let documents_token = app_token_for_authority(dir.path(), DOCUMENTS_CAPSULE_ID, &authority);
+    let documents_wallet_authority =
+        runtime_wallet_authority_for_app_token(dir.path(), DOCUMENTS_CAPSULE_ID, &documents_token);
     let home_token = authority.home_token.clone();
     let state = wallet_test_state(dir.path()).await;
     let app = gateway_router(state.clone());
@@ -367,7 +388,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let managed = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/managed")
                 .header("x-elastos-home-token", system_token.clone())
@@ -394,7 +415,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let default_response = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/system/wallet/default")
                 .header("x-elastos-home-token", system_token.clone())
@@ -408,41 +429,41 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
         .unwrap();
     assert_eq!(default_response.status(), StatusCode::OK);
 
-    let challenge = crate::api::auth_gateway::wallet_provider_data(
+    let challenge = runtime_wallet_data(
         &state,
-        json!({
-            "op": "bitcoin_challenge",
-            "domain": "localhost",
-            "uri": "https://localhost/apps/home/",
-            "address": address,
-            "network": "btc-mainnet",
-            "resources": [
+        &documents_wallet_authority,
+        WalletProviderOperationV2::BitcoinChallenge {
+            domain: "localhost".to_string(),
+            uri: "https://localhost/apps/home/".to_string(),
+            address: address.to_string(),
+            network: elastos_wallet_contract::PublicNetwork::new("btc-mainnet").unwrap(),
+            resources: vec![
                 format!("elastos://principal/{}", authority.principal_id),
-                "elastos://wallet/account/link"
+                "elastos://wallet/account/link".to_string(),
             ],
-        }),
+        },
     )
     .await
     .unwrap();
     let message = challenge["message"].as_str().unwrap();
-    let request_json = crate::api::auth_gateway::wallet_provider_data(
+    let request_json = runtime_wallet_data(
         &state,
-        json!({
-            "op": "request_signature",
-            "principal_id": authority.principal_id.clone(),
-            "chain_namespace": btc_namespace,
-            "intent": "bitcoin_bip322_proof",
-            "capsule_id": "documents",
-            "resource": "elastos://wallet/proof/bip322/sign",
-            "reason": "Prove Bitcoin account ownership",
-            "payload": {
+        &documents_wallet_authority,
+        WalletProviderOperationV2::RequestApproval {
+            account_id: account_id.to_string(),
+            chain_namespace: btc_namespace.to_string(),
+            intent: "bitcoin_bip322_proof".to_string(),
+            resource: "elastos://wallet/proof/bip322/sign".to_string(),
+            reason: "Prove Bitcoin account ownership".to_string(),
+            payload: json!({
                 "schema": "elastos.wallet.bitcoin_bip322_request/v1",
                 "wallet_intent": "bitcoin_bip322_proof",
                 "network": "btc-mainnet",
                 "address": address,
                 "message": message,
-            },
-        }),
+            }),
+            expires_at: crate::auth::now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
+        },
     )
     .await
     .unwrap();
@@ -461,7 +482,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let home = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .uri("/api/apps/home/summary")
                 .header("x-elastos-home-token", home_token)
                 .body(Body::empty())
@@ -487,7 +508,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let inbox = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/inbox/summary")
                 .header("x-elastos-home-token", inbox_token.clone())
                 .body(Body::empty())
@@ -505,7 +526,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
         "Bitcoin proof request"
     );
 
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         dir.path(),
         WALLET_CAPSULE_ID,
         &wallet_token,
@@ -518,7 +539,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
     let approved = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!(
                     "/api/apps/wallet/wallet/managed-approvals/{}/approve",
@@ -527,7 +548,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
                 .header("x-elastos-home-token", wallet_token.clone())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"reason":"Approved in Wallet","home_token":"{}"}}"#,
+                    r#"{{"reason":"Approved in Wallet","step_up_token":"{}"}}"#,
                     approval_token
                 )))
                 .unwrap(),
@@ -546,7 +567,7 @@ async fn test_btc_wallet_approval_journey_reviews_in_inbox_and_signs() {
 
     let approvals = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .uri("/api/apps/system/wallet/approvals")
                 .header("x-elastos-home-token", system_token)
                 .body(Body::empty())

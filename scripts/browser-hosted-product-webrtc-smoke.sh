@@ -11,7 +11,7 @@ Usage:
     [--cdp-endpoint http://127.0.0.1:PORT] \
     [--relay-ipc-path /tmp/elastos-browser-local-exit.sock] \
     [--hold-ms 0] \
-    [--resize-width 0 --resize-height 0] \
+    [--resize-width 0 --resize-height 0] (viewer dimensions) \
     [--require-media] \
     [--url https://example.com/] \
     [--timeout-ms 30000]

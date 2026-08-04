@@ -8,6 +8,20 @@ If you find a security vulnerability, please report it privately via [GitHub Sec
 
 The following security-relevant findings remain open in the current runtime and are documented here for transparency.
 
+### Capability state and key rotation are not restart safe
+
+**Severity:** Medium
+**Files:** `elastos/crates/elastos-runtime/src/capability/manager.rs`, `elastos/crates/elastos-server/src/security_cmd.rs`
+**Status:** Open
+
+Capability signing-key creation and `elastos emergency rotate` log persistence
+errors but continue with in-memory state. The emergency command can therefore
+report success even when the new key was not written. Rotation also advances a
+fresh in-process capability store rather than a durable epoch record. Until the
+key and revocation state are committed atomically, operators must verify the
+persisted key and restart result instead of treating command completion as a
+durable rotation receipt.
+
 ### No replay protection in chat signatures
 
 **Severity:** Medium

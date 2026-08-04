@@ -4,6 +4,12 @@
 //! module stays focused on HTTP route registration and response shaping.
 
 use super::*;
+use crate::api::browser_engine_protocol::{
+    BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA, BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA,
+    BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
+};
+use std::sync::{Mutex as StdMutex, Weak};
+use tokio::sync::{watch, Notify};
 #[path = "gateway_browser_engine.rs"]
 mod gateway_browser_engine;
 #[path = "gateway_browser_response.rs"]
@@ -12,6 +18,8 @@ mod gateway_browser_response;
 mod gateway_browser_sessions;
 #[path = "gateway_browser_stream.rs"]
 mod gateway_browser_stream;
+#[path = "gateway_browser_transport.rs"]
+mod gateway_browser_transport;
 #[path = "gateway_browser_validation.rs"]
 mod gateway_browser_validation;
 #[path = "gateway_browser_wallet.rs"]
@@ -21,6 +29,7 @@ pub(in crate::api::gateway) use gateway_browser_engine::*;
 pub(in crate::api::gateway) use gateway_browser_response::*;
 pub(in crate::api::gateway) use gateway_browser_sessions::*;
 pub(in crate::api::gateway) use gateway_browser_stream::*;
+pub(in crate::api::gateway) use gateway_browser_transport::*;
 pub(in crate::api::gateway) use gateway_browser_validation::*;
 pub(in crate::api::gateway) use gateway_browser_wallet::*;
 
@@ -39,6 +48,13 @@ pub(super) struct BrowserSummaryResponse {
     pub(super) wallet_bridge: serde_json::Value,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BrowserSummaryQuery {
+    #[serde(default)]
+    pub(super) browser_instance: Option<String>,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BrowserOpenRequest {
@@ -49,6 +65,8 @@ pub(super) struct BrowserOpenRequest {
     pub(super) remote_exit_id: Option<String>,
     #[serde(default)]
     pub(super) adapter_id: Option<String>,
+    #[serde(default)]
+    pub(super) browser_instance: Option<String>,
     #[serde(default)]
     pub(super) viewport: Option<BrowserViewportRequest>,
     pub(super) display_mode: BrowserDisplayMode,
@@ -125,10 +143,20 @@ pub(super) struct BrowserProviderResourceCall {
     pub(super) request: serde_json::Value,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BrowserPageCloseRequest {
+    pub(super) schema: String,
+    pub(super) cleanup_id: String,
+    #[serde(default)]
+    pub(super) browser_instance: Option<String>,
+}
+
 #[derive(Debug)]
 struct BrowserOpenFailure {
     status: StatusCode,
     body: BrowserOpenFailureBody,
+    outcome: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -137,11 +165,75 @@ enum BrowserOpenFailureBody {
     Json(serde_json::Value),
 }
 
+fn browser_open_outcome(
+    state: &str,
+    page_acquired: bool,
+    vm_acquired: bool,
+    stream_acquired: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "elastos.browser.open-outcome/v1",
+        "state": state,
+        "effects": {
+            "page_acquired": page_acquired,
+            "vm_acquired": vm_acquired,
+            "stream_acquired": stream_acquired,
+        },
+    })
+}
+
+fn browser_terminal_pre_effect_outcome() -> serde_json::Value {
+    browser_open_outcome("terminal_pre_effect_failure", false, false, false)
+}
+
+fn browser_terminal_post_effect_outcome() -> serde_json::Value {
+    browser_open_outcome("terminal_post_effect_cleanup", true, true, true)
+}
+
+fn browser_terminal_post_dispatch_outcome(
+    page_acquired: bool,
+    vm_acquired: bool,
+) -> serde_json::Value {
+    browser_open_outcome(
+        "terminal_post_effect_cleanup",
+        page_acquired,
+        vm_acquired,
+        true,
+    )
+}
+
+fn browser_cleanup_pending_outcome(
+    page_acquired: bool,
+    vm_acquired: bool,
+    stream_acquired: bool,
+) -> serde_json::Value {
+    browser_open_outcome(
+        "cleanup_pending",
+        page_acquired,
+        vm_acquired,
+        stream_acquired,
+    )
+}
+
+fn browser_launch_reconciliation_pending_outcome() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "elastos.browser.open-outcome/v1",
+        "state": "cleanup_pending",
+        "effects": {
+            "page_acquired": serde_json::Value::Null,
+            "vm_acquired": serde_json::Value::Null,
+            "stream_acquired": true,
+        },
+        "ownership": "launch_reconciliation_pending",
+    })
+}
+
 impl BrowserOpenFailure {
     fn text(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             body: BrowserOpenFailureBody::Text(message.into()),
+            outcome: browser_terminal_pre_effect_outcome(),
         }
     }
 
@@ -149,7 +241,13 @@ impl BrowserOpenFailure {
         Self {
             status,
             body: BrowserOpenFailureBody::Json(body),
+            outcome: browser_terminal_pre_effect_outcome(),
         }
+    }
+
+    fn with_outcome(mut self, outcome: serde_json::Value) -> Self {
+        self.outcome = outcome;
+        self
     }
 
     fn provider(scheme: &str, err: anyhow::Error) -> Self {
@@ -158,10 +256,8 @@ impl BrowserOpenFailure {
     }
 
     fn into_response(self) -> Response {
-        match self.body {
-            BrowserOpenFailureBody::Text(message) => (self.status, message).into_response(),
-            BrowserOpenFailureBody::Json(body) => (self.status, Json(body)).into_response(),
-        }
+        let status = self.status;
+        (status, Json(self.status_value())).into_response()
     }
 
     fn status_value(&self) -> serde_json::Value {
@@ -174,6 +270,13 @@ impl BrowserOpenFailure {
             BrowserOpenFailureBody::Json(body) => body.clone(),
         };
         if let Some(object) = value.as_object_mut() {
+            object
+                .entry("schema".to_string())
+                .or_insert_with(|| serde_json::json!("elastos.browser.open-error/v1"));
+            object
+                .entry("ok".to_string())
+                .or_insert_with(|| serde_json::json!(false));
+            object.insert("outcome".to_string(), self.outcome.clone());
             object.insert(
                 "http_status".to_string(),
                 serde_json::json!(self.status.as_u16()),
@@ -186,16 +289,22 @@ impl BrowserOpenFailure {
 pub(super) async fn browser_app_summary(
     State(state): State<GatewayState>,
     headers: HeaderMap,
+    Query(query): Query<BrowserSummaryQuery>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return system_error_response(err),
         };
+    let context = authority.home_launch_context();
+    let browser_instance = match browser_instance_id(query.browser_instance) {
+        Ok(value) => value,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     let engine_adapter =
         browser_engine_summary(state.provider_registry.as_ref(), &context.principal_id).await;
     let net = browser_net_summary(state.provider_registry.as_ref(), &context.principal_id).await;
-    let wallet_accounts = system_wallet_accounts_summary(&state, &context.principal_id).await;
+    let wallet_accounts = system_wallet_accounts_summary(&state, &authority).await;
     let wallet_status = if wallet_accounts.linked_count > 0 {
         "configured"
     } else {
@@ -207,7 +316,13 @@ pub(super) async fn browser_app_summary(
             id: BROWSER_CAPSULE_ID.to_string(),
             route: "/apps/browser/".to_string(),
         },
-        sessions: browser_gateway_session_status(&state.data_dir, &context.principal_id).await,
+        sessions: browser_gateway_session_status(
+            &state.data_dir,
+            &context.principal_id,
+            Some(authority.verified_context().launch_id()),
+            browser_instance.as_deref(),
+        )
+        .await,
         principal_id: context.principal_id,
         engine_adapter,
         net,
@@ -313,25 +428,53 @@ pub(super) async fn browser_app_open(
     headers: HeaderMap,
     Json(input): Json<BrowserOpenRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
     let home_token = home_launch_token_header(&headers);
     let request_origin = browser_request_origin(&headers);
     if input.async_open {
-        let job = create_browser_open_job(&state.data_dir, &context.principal_id).await;
+        let owner_launch_id = authority.verified_context().launch_id();
+        let browser_instance = match browser_instance_id(input.browser_instance.clone()) {
+            Ok(value) => value,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        };
+        let intent_hash = browser_open_intent_hash(&input);
+        let reservation = match create_browser_open_job(
+            &state.data_dir,
+            &context.principal_id,
+            owner_launch_id,
+            browser_instance.as_deref(),
+            &intent_hash,
+        )
+        .await
+        {
+            Ok(reservation) => reservation,
+            Err((status, message)) => return (status, message).into_response(),
+        };
+        let job = reservation.handle;
         let open_id = job.id.clone();
-        let state_for_task = state.clone();
-        tokio::spawn(async move {
-            match execute_browser_open(&state_for_task, context, input, home_token, request_origin)
+        if reservation.should_spawn {
+            let state_for_task = state.clone();
+            tokio::spawn(async move {
+                match execute_browser_open(
+                    &state_for_task,
+                    context,
+                    authority,
+                    input,
+                    home_token,
+                    request_origin,
+                )
                 .await
-            {
-                Ok(result) => complete_browser_open_job(&job, result).await,
-                Err(error) => fail_browser_open_job(&job, error.status_value()).await,
-            }
-        });
+                {
+                    Ok(result) => complete_browser_open_job(&job, result).await,
+                    Err(error) => fail_browser_open_job(&job, error.status_value()).await,
+                }
+            });
+        }
         return (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -343,7 +486,16 @@ pub(super) async fn browser_app_open(
         )
             .into_response();
     }
-    match execute_browser_open(&state, context, input, home_token, request_origin).await {
+    match execute_browser_open(
+        &state,
+        context,
+        authority,
+        input,
+        home_token,
+        request_origin,
+    )
+    .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(error) => error.into_response(),
     }
@@ -354,20 +506,45 @@ pub(super) async fn browser_app_open_status(
     headers: HeaderMap,
     Path(open_id): Path<String>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
+    let owner_launch_id = authority.verified_context().launch_id();
     if !is_safe_runtime_id(&open_id) {
         return (StatusCode::BAD_REQUEST, "invalid Browser open id").into_response();
     }
-    let Some(snapshot) =
-        browser_open_job_for_principal(&state.data_dir, &open_id, &context.principal_id).await
+    let Some(snapshot) = browser_open_job_for_owner(
+        &state.data_dir,
+        &open_id,
+        &context.principal_id,
+        owner_launch_id,
+    )
+    .await
     else {
         return (StatusCode::NOT_FOUND, "Browser open job not found").into_response();
     };
     Json(browser_open_status_value(&open_id, snapshot)).into_response()
+}
+
+fn browser_open_intent_hash(input: &BrowserOpenRequest) -> String {
+    let intent = serde_json::json!({
+        "url": input.url.trim(),
+        "reason": input.reason.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "remote_exit_id": input.remote_exit_id.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "adapter_id": input.adapter_id.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "browser_instance": input.browser_instance.as_deref().map(str::trim).filter(|value| !value.is_empty()),
+        "viewport": input.viewport.as_ref().map(|viewport| serde_json::json!({
+            "width": viewport.width,
+            "height": viewport.height,
+        })),
+        "display_mode": input.display_mode.as_str(),
+        "guarantee_level": input.guarantee_level.as_str(),
+    });
+    let canonical = serde_json::to_vec(&intent).unwrap_or_default();
+    hex::encode(Sha256::digest(canonical))
 }
 
 fn browser_open_status_value(open_id: &str, snapshot: BrowserOpenJobSnapshot) -> serde_json::Value {
@@ -395,6 +572,7 @@ fn browser_open_status_value(open_id: &str, snapshot: BrowserOpenJobSnapshot) ->
 async fn execute_browser_open(
     state: &GatewayState,
     context: HomeLaunchTokenContext,
+    authority: RuntimeWalletAuthority,
     input: BrowserOpenRequest,
     home_token: Option<String>,
     request_origin: Option<String>,
@@ -404,6 +582,7 @@ async fn execute_browser_open(
         reason,
         remote_exit_id,
         adapter_id,
+        browser_instance,
         viewport,
         display_mode,
         guarantee_level,
@@ -443,27 +622,14 @@ async fn execute_browser_open(
         Ok(value) => value,
         Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
     };
-    let adapter_id = match browser_engine_adapter_id(adapter_id) {
+    let requested_adapter_id = match browser_engine_adapter_id(adapter_id) {
         Ok(value) => value,
         Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
     };
-    if let Err((status, message)) = append_browser_effect_audit_or_500(
-        &state.data_dir,
-        BrowserEffectAuditInput {
-            event_type: "browser.open.requested",
-            principal_id: &context.principal_id,
-            session_id: &context.session_id,
-            request_id: &open_request_id,
-            result: "requested",
-            method: display_mode.as_str(),
-            resource: &target,
-            page_url: &url,
-            origin: request_origin.as_deref(),
-            decision: "runtime_net_exit_policy",
-        },
-    ) {
-        return Err(BrowserOpenFailure::text(status, message));
-    }
+    let browser_instance = match browser_instance_id(browser_instance) {
+        Ok(value) => value,
+        Err(message) => return Err(BrowserOpenFailure::text(StatusCode::BAD_REQUEST, message)),
+    };
     let viewport = match viewport {
         Some(viewport) => match browser_viewport_value(viewport) {
             Ok(value) => Some(value),
@@ -481,18 +647,49 @@ async fn execute_browser_open(
             Ok(profile) => profile,
             Err(err) => return Err(BrowserOpenFailure::provider("browser", err)),
         };
+    let engine_registration = match registry
+        .registration_for_uri("elastos://browser-engine/launch")
+        .await
+    {
+        Some(registration) => registration,
+        None => {
+            return Err(BrowserOpenFailure::provider(
+                "browser-engine",
+                anyhow::anyhow!("Browser Engine provider route is unavailable"),
+            ))
+        }
+    };
+    let adapter_id = match resolve_browser_engine_adapter(
+        registry.as_ref(),
+        &context.principal_id,
+        requested_adapter_id.as_deref(),
+    )
+    .await
+    {
+        Ok(adapter_id) => adapter_id,
+        Err(message) => {
+            return Err(BrowserOpenFailure::provider(
+                "browser-engine",
+                anyhow::anyhow!(message),
+            ))
+        }
+    };
     let profile_key = profile
         .get("profile_key")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
     let lifecycle = BrowserLaunchLifecycle {
+        owner_launch_id: authority.verified_context().launch_id().to_string(),
+        browser_instance,
         url: url.clone(),
         exit_id: browser_lifecycle_exit_id(remote_exit_id.as_deref()),
+        engine_route_provider: engine_registration.provider.clone(),
+        selected_engine_adapter: Some(adapter_id.clone()),
         profile_key_hash: browser_lifecycle_hash(profile_key),
         vm_key_hash: browser_lifecycle_vm_key_hash(&[
             profile_key,
             remote_exit_id.as_deref().unwrap_or("local-runtime"),
-            adapter_id.as_deref().unwrap_or("default-adapter"),
+            &adapter_id,
             display_mode.as_str(),
             guarantee_level.as_str(),
             &target,
@@ -503,6 +700,24 @@ async fn execute_browser_open(
             Ok(reservation) => reservation,
             Err((status, message)) => return Err(BrowserOpenFailure::text(status, message)),
         };
+    if let Err((status, message)) = append_browser_effect_audit_or_500(
+        &state.data_dir,
+        BrowserEffectAuditInput {
+            event_type: "browser.open.requested",
+            principal_id: &context.principal_id,
+            session_id: &context.session_id,
+            request_id: &open_request_id,
+            result: "requested",
+            method: display_mode.as_str(),
+            resource: &target,
+            page_url: &url,
+            origin: request_origin.as_deref(),
+            decision: "runtime_net_exit_policy",
+        },
+    ) {
+        release_browser_launch(&launch_reservation).await;
+        return Err(BrowserOpenFailure::text(status, message));
+    }
     mark_browser_launch_preparing_image(&launch_reservation).await;
     let stream_request = serde_json::json!({
         "op": "stream",
@@ -525,15 +740,104 @@ async fn execute_browser_open(
         match browser_attach_runtime_stream_path(&state.data_dir, stream_session).await {
             Ok(receipt) => receipt,
             Err(err) => {
-                release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone())
-                    .await;
-                return Err(BrowserOpenFailure::provider("browser", err));
+                let outcome = release_browser_open_resources(
+                    state,
+                    &launch_reservation,
+                    stream_cleanup.clone(),
+                    false,
+                )
+                .await;
+                return Err(BrowserOpenFailure::provider("browser", err).with_outcome(outcome));
             }
         };
+    let engine_stream_id = match stream_session
+        .get("stream_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(stream_id) => stream_id.to_string(),
+        None => {
+            let outcome = release_browser_open_resources(
+                state,
+                &launch_reservation,
+                stream_cleanup.clone(),
+                false,
+            )
+            .await;
+            return Err(BrowserOpenFailure::provider(
+                "browser",
+                anyhow::anyhow!("Browser stream session omitted its exact stream identity"),
+            )
+            .with_outcome(outcome));
+        }
+    };
+    let vz_transport_launch = match prepare_browser_vz_transport_launch(
+        &state.data_dir,
+        BrowserVzTransportLaunchBinding {
+            generation: launch_reservation.generation(),
+            page_id: launch_reservation.page_id(),
+            vm_id: launch_reservation.vm_id(),
+            principal_id: &context.principal_id,
+            egress_stream_id: &engine_stream_id,
+            egress_target: &target,
+            egress_runtime_socket_path: stream_session
+                .pointer("/adapter_ipc/runtime_stream_path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        },
+    ) {
+        Ok(launch) => launch,
+        Err(message) => {
+            let outcome = release_browser_open_resources(
+                state,
+                &launch_reservation,
+                stream_cleanup.clone(),
+                false,
+            )
+            .await;
+            return Err(
+                BrowserOpenFailure::provider("browser", anyhow::anyhow!(message))
+                    .with_outcome(outcome),
+            );
+        }
+    };
+    if let Some(transport) = vz_transport_launch.as_ref() {
+        if let Err(message) = bind_browser_vz_transport_authority(
+            &state.data_dir,
+            &launch_reservation,
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            transport.authority.clone(),
+        )
+        .await
+        {
+            let outcome = release_browser_open_resources(
+                state,
+                &launch_reservation,
+                stream_cleanup.clone(),
+                false,
+            )
+            .await;
+            return Err(
+                BrowserOpenFailure::provider("browser", anyhow::anyhow!(message))
+                    .with_outcome(outcome),
+            );
+        }
+        if let Err(err) = spawn_browser_vz_fixed_media_listener(&transport.authority).await {
+            let outcome = release_browser_open_resources(
+                state,
+                &launch_reservation,
+                stream_cleanup.clone(),
+                false,
+            )
+            .await;
+            return Err(BrowserOpenFailure::provider("browser", err).with_outcome(outcome));
+        }
+    }
     let engine_stream_session = browser_engine_stream_session(&stream_session);
     let wallet = browser_wallet_bridge_payload(
         state,
         &context,
+        &authority,
         home_token.as_deref(),
         request_origin.as_deref(),
     )
@@ -541,6 +845,7 @@ async fn execute_browser_open(
     let mut engine_launch_request = serde_json::json!({
         "url": url.clone(),
         "stream_session": engine_stream_session,
+        "lifecycle_generation": launch_reservation.generation(),
         "principal_id": context.principal_id.clone(),
         "reason": reason.clone(),
         "profile": profile,
@@ -548,9 +853,13 @@ async fn execute_browser_open(
         "viewport": viewport,
         "display_mode": display_mode,
         "guarantee_level": guarantee_level,
+        "adapter_id": adapter_id,
     });
-    if let Some(adapter_id) = adapter_id.as_deref() {
-        engine_launch_request["adapter_id"] = serde_json::json!(adapter_id);
+    if let Some(transport) = vz_transport_launch.as_ref() {
+        engine_launch_request["page_id"] = serde_json::json!(launch_reservation.page_id());
+        engine_launch_request["vm_id"] = serde_json::json!(launch_reservation.vm_id());
+        engine_launch_request["transport_authority"] = transport.authority.clone();
+        engine_launch_request["transport_secret"] = transport.secret.clone();
     }
     mark_browser_launch_starting_vm(&launch_reservation).await;
     let engine_call = match browser_provider_resource_call(
@@ -562,21 +871,51 @@ async fn execute_browser_open(
         Ok(call) => call,
         Err((status, message)) => {
             mark_browser_launch_failed(&launch_reservation, message.clone()).await;
-            release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone())
-                .await;
-            return Err(BrowserOpenFailure::text(status, message));
+            let outcome = release_browser_open_resources(
+                state,
+                &launch_reservation,
+                stream_cleanup.clone(),
+                false,
+            )
+            .await;
+            return Err(BrowserOpenFailure::text(status, message).with_outcome(outcome));
         }
     };
+    if vz_transport_launch.is_some() {
+        if let Err(message) = mark_browser_vz_transport_dispatched(
+            &state.data_dir,
+            &launch_reservation,
+            &engine_stream_id,
+        )
+        .await
+        {
+            let outcome = release_browser_open_resources(
+                state,
+                &launch_reservation,
+                stream_cleanup.clone(),
+                false,
+            )
+            .await;
+            return Err(
+                BrowserOpenFailure::provider("browser", anyhow::anyhow!(message))
+                    .with_outcome(outcome),
+            );
+        }
+    }
     let engine_response = match browser_provider_resource_response(state, engine_call).await {
         Ok(value) => value,
-        Err((_status, message)) => {
-            mark_browser_launch_failed(&launch_reservation, message.clone()).await;
-            release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone())
-                .await;
-            return Err(BrowserOpenFailure::provider(
-                "browser-engine",
-                anyhow::anyhow!(message),
-            ));
+        Err((status, message)) => {
+            let outcome = reconcile_dispatched_browser_launch_failure(
+                state,
+                &launch_reservation,
+                &context.principal_id,
+                authority.verified_context().launch_id(),
+                &engine_stream_id,
+                stream_cleanup.clone(),
+                &message,
+            )
+            .await;
+            return Err(BrowserOpenFailure::text(status, message).with_outcome(outcome));
         }
     };
     if engine_response
@@ -592,22 +931,55 @@ async fn execute_browser_open(
             .get("message")
             .and_then(|value| value.as_str())
             .unwrap_or("Browser Engine Adapter rejected page launch");
+        let exact_did_not_act = consume_browser_vz_did_not_act_settlement(
+            state,
+            &launch_reservation,
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            &engine_response,
+        )
+        .await;
         if matches!(
             code,
             "engine_unavailable" | "byte_transport_unavailable" | "display_session_unavailable"
         ) {
-            mark_browser_launch_failed(&launch_reservation, message.to_string()).await;
-            release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone())
-                .await;
+            let outcome = match exact_did_not_act {
+                Some(outcome) => outcome,
+                None => {
+                    reconcile_dispatched_browser_launch_failure(
+                        state,
+                        &launch_reservation,
+                        &context.principal_id,
+                        authority.verified_context().launch_id(),
+                        &engine_stream_id,
+                        stream_cleanup.clone(),
+                        message,
+                    )
+                    .await
+                }
+            };
             return Err(BrowserOpenFailure::provider(
                 "browser-engine",
                 anyhow::anyhow!("browser-engine provider unavailable: {}", message),
-            ));
+            )
+            .with_outcome(outcome));
         }
-        if code == "browser_capacity_unavailable" {
-            mark_browser_launch_failed(&launch_reservation, message.to_string()).await;
-            release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone())
-                .await;
+        if matches!(code, "browser_capacity_unavailable" | "resources_in_use") {
+            let outcome = match exact_did_not_act {
+                Some(outcome) => outcome,
+                None => {
+                    reconcile_dispatched_browser_launch_failure(
+                        state,
+                        &launch_reservation,
+                        &context.principal_id,
+                        authority.verified_context().launch_id(),
+                        &engine_stream_id,
+                        stream_cleanup.clone(),
+                        message,
+                    )
+                    .await
+                }
+            };
             return Err(BrowserOpenFailure::json(
                 StatusCode::SERVICE_UNAVAILABLE,
                 serde_json::json!({
@@ -616,61 +988,355 @@ async fn execute_browser_open(
                     "code": code,
                     "message": message,
                 }),
-            ));
+            )
+            .with_outcome(outcome));
         }
-        mark_browser_launch_failed(&launch_reservation, message.to_string()).await;
-        release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone()).await;
+        let outcome = match exact_did_not_act {
+            Some(outcome) => outcome,
+            None => {
+                reconcile_dispatched_browser_launch_failure(
+                    state,
+                    &launch_reservation,
+                    &context.principal_id,
+                    authority.verified_context().launch_id(),
+                    &engine_stream_id,
+                    stream_cleanup.clone(),
+                    message,
+                )
+                .await
+            }
+        };
         return Err(BrowserOpenFailure::provider(
             "browser-engine",
             anyhow::anyhow!(message.to_string()),
-        ));
+        )
+        .with_outcome(outcome));
     }
     if let Some(message) = provider_response_error_message(&engine_response) {
-        mark_browser_launch_failed(&launch_reservation, message.clone()).await;
-        release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone()).await;
-        return Err(BrowserOpenFailure::provider(
-            "browser-engine",
-            anyhow::anyhow!(message),
-        ));
+        let outcome = reconcile_dispatched_browser_launch_failure(
+            state,
+            &launch_reservation,
+            &context.principal_id,
+            authority.verified_context().launch_id(),
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            &message,
+        )
+        .await;
+        return Err(
+            BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                .with_outcome(outcome),
+        );
     }
-    let engine_page = match provider_response_data(&engine_response)
-        .map(|page| validate_browser_engine_page(page, display_mode, guarantee_level))
-        .transpose()
-    {
-        Ok(Some(data)) => data,
-        Ok(None) => {
-            mark_browser_launch_failed(
+    let raw_engine_page = match provider_response_data(&engine_response) {
+        Some(data) => data,
+        None => {
+            let message = "browser-engine provider returned an invalid launch response";
+            let outcome = reconcile_dispatched_browser_launch_failure(
+                state,
                 &launch_reservation,
-                "browser-engine provider returned an invalid launch response",
+                &context.principal_id,
+                authority.verified_context().launch_id(),
+                &engine_stream_id,
+                stream_cleanup.clone(),
+                message,
             )
             .await;
-            release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone())
-                .await;
-            return Err(BrowserOpenFailure::provider(
-                "browser-engine",
-                anyhow::anyhow!("browser-engine provider returned an invalid launch response"),
-            ));
+            return Err(
+                BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                    .with_outcome(outcome),
+            );
         }
+    };
+    let engine_page = match validate_browser_engine_page(
+        raw_engine_page.clone(),
+        display_mode,
+        guarantee_level,
+    ) {
+        Ok(data) => data,
         Err(err) => {
-            mark_browser_launch_failed(&launch_reservation, err.to_string()).await;
-            release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone())
-                .await;
-            return Err(BrowserOpenFailure::provider("browser-engine", err));
+            let outcome = reconcile_dispatched_browser_launch_failure(
+                state,
+                &launch_reservation,
+                &context.principal_id,
+                authority.verified_context().launch_id(),
+                &engine_stream_id,
+                stream_cleanup.clone(),
+                &err.to_string(),
+            )
+            .await;
+            return Err(BrowserOpenFailure::provider("browser-engine", err).with_outcome(outcome));
         }
     };
     let Some(page_id) = engine_page.get("page_id").and_then(|value| value.as_str()) else {
-        mark_browser_launch_failed(
+        let message = "browser-engine provider returned page without page_id";
+        let outcome = reconcile_dispatched_browser_launch_failure(
+            state,
             &launch_reservation,
-            "browser-engine provider returned page without page_id",
+            &context.principal_id,
+            authority.verified_context().launch_id(),
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            message,
         )
         .await;
-        release_browser_open_resources(state, &launch_reservation, stream_cleanup.clone()).await;
-        return Err(BrowserOpenFailure::provider(
-            "browser-engine",
-            anyhow::anyhow!("browser-engine provider returned page without page_id"),
-        ));
+        return Err(
+            BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                .with_outcome(outcome),
+        );
     };
-    complete_browser_launch(&launch_reservation, page_id, stream_cleanup.clone()).await;
+    let Some(engine_adapter) = engine_page.get("adapter").and_then(|value| value.as_str()) else {
+        let message = "browser-engine provider returned page without adapter binding";
+        let outcome = reconcile_dispatched_browser_launch_failure(
+            state,
+            &launch_reservation,
+            &context.principal_id,
+            authority.verified_context().launch_id(),
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            message,
+        )
+        .await;
+        return Err(
+            BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                .with_outcome(outcome),
+        );
+    };
+    let Some(engine) = engine_page.get("engine").and_then(|value| value.as_str()) else {
+        let message = "browser-engine provider returned page without engine binding";
+        let outcome = reconcile_dispatched_browser_launch_failure(
+            state,
+            &launch_reservation,
+            &context.principal_id,
+            authority.verified_context().launch_id(),
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            message,
+        )
+        .await;
+        return Err(
+            BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                .with_outcome(outcome),
+        );
+    };
+    let Some(engine_provider) = engine_page.get("provider").and_then(|value| value.as_str()) else {
+        let message = "browser-engine provider omitted provider identity";
+        let outcome = reconcile_dispatched_browser_launch_failure(
+            state,
+            &launch_reservation,
+            &context.principal_id,
+            authority.verified_context().launch_id(),
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            message,
+        )
+        .await;
+        return Err(
+            BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                .with_outcome(outcome),
+        );
+    };
+    let Some(engine_protocol_version) = engine_page
+        .get("protocol_version")
+        .and_then(|value| value.as_str())
+    else {
+        let message = "browser-engine provider omitted protocol version";
+        let outcome = reconcile_dispatched_browser_launch_failure(
+            state,
+            &launch_reservation,
+            &context.principal_id,
+            authority.verified_context().launch_id(),
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            message,
+        )
+        .await;
+        return Err(
+            BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                .with_outcome(outcome),
+        );
+    };
+    if !is_safe_runtime_id(page_id)
+        || vz_transport_launch
+            .as_ref()
+            .is_some_and(|_| page_id != launch_reservation.page_id())
+        || engine_provider != BROWSER_ENGINE_PROVIDER_ID
+        || engine_protocol_version != BROWSER_ENGINE_PROTOCOL_VERSION
+        || !is_safe_runtime_id(engine_adapter)
+        || !is_safe_runtime_id(engine)
+    {
+        let message = "browser-engine provider returned an unsafe lifecycle binding";
+        let outcome = reconcile_dispatched_browser_launch_failure(
+            state,
+            &launch_reservation,
+            &context.principal_id,
+            authority.verified_context().launch_id(),
+            &engine_stream_id,
+            stream_cleanup.clone(),
+            message,
+        )
+        .await;
+        return Err(
+            BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                .with_outcome(outcome),
+        );
+    }
+    let public_transport_proof = if let Some(transport) = vz_transport_launch.as_ref() {
+        match browser_vz_public_transport_proof(
+            &transport.authority,
+            raw_engine_page
+                .get("transport_receipt")
+                .unwrap_or(&serde_json::Value::Null),
+        ) {
+            Ok(proof) => Some(proof),
+            Err(message) => {
+                let outcome = reconcile_dispatched_browser_launch_failure(
+                    state,
+                    &launch_reservation,
+                    &context.principal_id,
+                    authority.verified_context().launch_id(),
+                    &engine_stream_id,
+                    stream_cleanup.clone(),
+                    &message,
+                )
+                .await;
+                return Err(BrowserOpenFailure::provider(
+                    "browser-engine",
+                    anyhow::anyhow!(message),
+                )
+                .with_outcome(outcome));
+            }
+        }
+    } else {
+        None
+    };
+    let provider_cleanup = match browser_provider_cleanup_binding(
+        &raw_engine_page,
+        launch_reservation.generation(),
+        page_id,
+        engine_adapter,
+        engine,
+        engine_page
+            .get("stream_id")
+            .and_then(|value| value.as_str()),
+        vz_transport_launch
+            .as_ref()
+            .map(|transport| &transport.authority),
+    ) {
+        Ok(binding) => binding,
+        Err(message) => {
+            let outcome = reconcile_dispatched_browser_launch_failure(
+                state,
+                &launch_reservation,
+                &context.principal_id,
+                authority.verified_context().launch_id(),
+                &engine_stream_id,
+                stream_cleanup.clone(),
+                &message,
+            )
+            .await;
+            return Err(
+                BrowserOpenFailure::provider("browser-engine", anyhow::anyhow!(message))
+                    .with_outcome(outcome),
+            );
+        }
+    };
+    let mut browser_page = engine_page.clone();
+    if let Some(page) = browser_page.as_object_mut() {
+        page.remove("runtime_cleanup");
+        page.remove("transport_authority");
+        page.remove("transport_receipt");
+        if let Some(proof) = public_transport_proof {
+            page.insert("transport_proof".to_string(), proof);
+        }
+    }
+    let viewer_turn_capability = if let Some(transport) = vz_transport_launch.as_ref() {
+        match browser_vz_viewer_turn_capability(&transport.authority, &transport.secret) {
+            Ok(capability) => Some(capability),
+            Err(message) => {
+                let outcome = reconcile_dispatched_browser_launch_failure(
+                    state,
+                    &launch_reservation,
+                    &context.principal_id,
+                    authority.verified_context().launch_id(),
+                    &engine_stream_id,
+                    stream_cleanup.clone(),
+                    &message,
+                )
+                .await;
+                return Err(BrowserOpenFailure::provider(
+                    "browser-engine",
+                    anyhow::anyhow!(message),
+                )
+                .with_outcome(outcome));
+            }
+        }
+    } else {
+        None
+    };
+    let viewer_browser_page = match (
+        vz_transport_launch.as_ref(),
+        viewer_turn_capability.as_ref(),
+    ) {
+        (Some(transport), Some(capability)) => {
+            match project_browser_vz_viewer_turn(&browser_page, &transport.authority, capability) {
+                Ok(page) => page,
+                Err(message) => {
+                    let outcome = reconcile_dispatched_browser_launch_failure(
+                        state,
+                        &launch_reservation,
+                        &context.principal_id,
+                        authority.verified_context().launch_id(),
+                        &engine_stream_id,
+                        stream_cleanup.clone(),
+                        &message,
+                    )
+                    .await;
+                    return Err(BrowserOpenFailure::provider(
+                        "browser-engine",
+                        anyhow::anyhow!(message),
+                    )
+                    .with_outcome(outcome));
+                }
+            }
+        }
+        (None, None) => browser_page.clone(),
+        _ => unreachable!("Browser VZ viewer capability is derived from the launch transport"),
+    };
+    let runtime_cleanup = match complete_browser_launch(
+        &state.data_dir,
+        &launch_reservation,
+        BrowserLaunchEffect {
+            page_id: page_id.to_string(),
+            engine_provider: engine_provider.to_string(),
+            engine_protocol_version: engine_protocol_version.to_string(),
+            engine_adapter: engine_adapter.to_string(),
+            engine: engine.to_string(),
+            provider_cleanup,
+            browser_page: browser_page.clone(),
+            viewer_turn_capability,
+            stream_cleanup: stream_cleanup.clone(),
+        },
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(message) => {
+            let outcome = reap_browser_open_effect_after_failure(
+                state,
+                &launch_reservation,
+                page_id,
+                &context.principal_id,
+                authority.verified_context().launch_id(),
+                false,
+            )
+            .await;
+            return Err(
+                BrowserOpenFailure::provider("browser", anyhow::anyhow!(message))
+                    .with_outcome(outcome),
+            );
+        }
+    };
     if let Err((status, message)) = append_browser_effect_audit_or_500(
         &state.data_dir,
         BrowserEffectAuditInput {
@@ -686,8 +1352,16 @@ async fn execute_browser_open(
             decision: "browser_engine_provider",
         },
     ) {
-        release_browser_open_resources(state, &launch_reservation, stream_cleanup).await;
-        return Err(BrowserOpenFailure::text(status, message));
+        let outcome = reap_browser_open_effect_after_failure(
+            state,
+            &launch_reservation,
+            page_id,
+            &context.principal_id,
+            authority.verified_context().launch_id(),
+            true,
+        )
+        .await;
+        return Err(BrowserOpenFailure::text(status, message).with_outcome(outcome));
     }
     Ok(serde_json::json!({
         "schema": "elastos.browser.open-result/v1",
@@ -695,8 +1369,913 @@ async fn execute_browser_open(
         "target": target,
         "guarantee_level": guarantee_level.as_str(),
         "stream_session": browser_visible_stream_session(&stream_session),
-        "engine_page": engine_page,
+        "engine_page": viewer_browser_page,
+        "runtime_cleanup": runtime_cleanup,
     }))
+}
+
+async fn consume_browser_vz_did_not_act_settlement(
+    state: &GatewayState,
+    reservation: &BrowserLaunchReservation,
+    stream_id: &str,
+    stream_cleanup: Option<BrowserStreamCleanup>,
+    engine_response: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let adapter = engine_response
+        .get("adapter")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| value.len() <= 128 && is_safe_runtime_id(value))?;
+    let settlement = engine_response.get("launch_settlement_result")?;
+    let authority = browser_launch_transport_authority(reservation).await?;
+    if validate_browser_vz_did_not_act_settlement(
+        settlement,
+        &authority,
+        reservation,
+        stream_id,
+        adapter,
+    )
+    .is_err()
+    {
+        return None;
+    }
+    mark_browser_launch_failed(
+        reservation,
+        settlement
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Browser VZ launch did not act")
+            .to_string(),
+    )
+    .await;
+    Some(release_browser_open_resources(state, reservation, stream_cleanup, true).await)
+}
+
+fn validate_browser_vz_did_not_act_settlement(
+    settlement: &serde_json::Value,
+    authority: &serde_json::Value,
+    reservation: &BrowserLaunchReservation,
+    stream_id: &str,
+    adapter: &str,
+) -> Result<(), String> {
+    let (acted, _) = validate_browser_vz_launch_settlement_binding(settlement, authority)?;
+    if settlement.get("state").and_then(serde_json::Value::as_str) != Some("did_not_act")
+        || acted
+        || authority
+            .get("generation")
+            .and_then(serde_json::Value::as_str)
+            != Some(reservation.generation())
+        || authority.get("page_id").and_then(serde_json::Value::as_str)
+            != Some(reservation.page_id())
+        || authority.get("vm_id").and_then(serde_json::Value::as_str) != Some(reservation.vm_id())
+        || authority
+            .pointer("/egress/stream_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(stream_id)
+        || reservation.selected_engine_adapter() != Some(adapter)
+    {
+        return Err("Browser VZ DidNotAct settlement binding is not exact".to_string());
+    }
+    Ok(())
+}
+
+fn validate_browser_vz_launch_settlement_binding(
+    settlement: &serde_json::Value,
+    authority: &serde_json::Value,
+) -> Result<(bool, bool), String> {
+    validate_browser_vz_transport_authority(authority)?;
+    let object = settlement
+        .as_object()
+        .ok_or_else(|| "Browser VZ launch settlement must be an object".to_string())?;
+    let keys = [
+        "schema",
+        "state",
+        "message",
+        "binding_hash",
+        "generation",
+        "page_id",
+        "vm_id",
+        "stream_id",
+        "media_stream_id",
+        "effects",
+        "absence",
+    ];
+    let effects = settlement
+        .get("effects")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "Browser VZ DidNotAct settlement effects are missing".to_string())?;
+    let effect_keys = [
+        "session_directory",
+        "control_socket",
+        "ordinary_stream_bridge",
+        "media_stream_bridge",
+        "turn_process",
+        "supervisor_child",
+        "vm",
+    ];
+    let absence = settlement
+        .get("absence")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "Browser VZ DidNotAct settlement absence proof is missing".to_string())?;
+    let absence_keys = [
+        "child_absent",
+        "supervisor_child_absent",
+        "control_socket_absent",
+        "route_absent",
+        "turn_listener_absent",
+        "turn_relay_ports_absent",
+        "ordinary_stream_bridge_absent",
+        "media_stream_bridge_absent",
+        "session_directory_absent",
+        "vm_absent",
+    ];
+    let message = settlement
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| value.len() <= 8_192 && !value.contains('\0'))
+        .ok_or_else(|| "Browser VZ launch settlement message is invalid".to_string())?;
+    let _ = message;
+    if object.len() != keys.len()
+        || keys.iter().any(|key| !object.contains_key(*key))
+        || settlement.get("schema").and_then(serde_json::Value::as_str)
+            != Some("elastos.browser.vz-launch-settlement/v1")
+        || settlement.get("binding_hash") != authority.get("binding_hash")
+        || settlement.get("generation") != authority.get("generation")
+        || settlement.get("page_id") != authority.get("page_id")
+        || settlement.get("vm_id") != authority.get("vm_id")
+        || settlement.get("stream_id") != authority.pointer("/egress/stream_id")
+        || settlement.get("media_stream_id") != authority.pointer("/media/stream_id")
+        || effects.len() != effect_keys.len()
+        || effect_keys.iter().any(|key| {
+            effects
+                .get(*key)
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
+        })
+        || absence.len() != absence_keys.len()
+        || absence_keys
+            .iter()
+            .any(|key| absence.get(*key).and_then(serde_json::Value::as_bool) != Some(true))
+        || browser_terminal_receipt_contains_transport_secret(settlement)
+    {
+        return Err("Browser VZ launch settlement binding is not exact".to_string());
+    }
+    let acted = effect_keys
+        .iter()
+        .any(|key| effects.get(*key).and_then(serde_json::Value::as_bool) == Some(true));
+    let vm_acquired = effects.get("vm").and_then(serde_json::Value::as_bool) == Some(true);
+    match settlement.get("state").and_then(serde_json::Value::as_str) {
+        Some("did_not_act") if !acted => Ok((acted, vm_acquired)),
+        Some("terminal_post_effect_cleanup") if acted => Ok((acted, vm_acquired)),
+        _ => Err("Browser VZ launch settlement classification is invalid".to_string()),
+    }
+}
+
+enum BrowserDispatchedLaunchReconciliation {
+    DidNotAct,
+    TerminalPostEffectCleanup {
+        page_acquired: bool,
+        vm_acquired: bool,
+    },
+    EffectAcquired(Box<BrowserLaunchEffect>),
+    CleanupPending,
+}
+
+enum BrowserLaunchReconciliationDecision {
+    DidNotAct,
+    TerminalPostEffectCleanup {
+        page_acquired: bool,
+        vm_acquired: bool,
+    },
+    CloseExactEffect(Box<BrowserLaunchEffect>),
+    RetainIndeterminate(Option<String>),
+}
+
+pub(in crate::api::gateway) const BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT: Duration =
+    Duration::from_secs(30);
+const BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF: Duration = Duration::from_millis(100);
+const BROWSER_LAUNCH_RECONCILIATION_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT: usize = 8;
+
+static BROWSER_LIFECYCLE_RECONCILER_WAKES: OnceLock<StdMutex<BTreeMap<String, Weak<Notify>>>> =
+    OnceLock::new();
+
+struct BrowserLifecycleReconcilerRegistration {
+    scope: String,
+    wake: Arc<Notify>,
+}
+
+impl Drop for BrowserLifecycleReconcilerRegistration {
+    fn drop(&mut self) {
+        let Some(registry) = BROWSER_LIFECYCLE_RECONCILER_WAKES.get() else {
+            return;
+        };
+        let Ok(mut registry) = registry.lock() else {
+            return;
+        };
+        let wake = Arc::downgrade(&self.wake);
+        if registry
+            .get(&self.scope)
+            .is_some_and(|registered| Weak::ptr_eq(registered, &wake))
+        {
+            registry.remove(&self.scope);
+        }
+    }
+}
+
+pub(in crate::api::gateway) struct BrowserLifecycleReconciler {
+    shutdown: watch::Sender<bool>,
+    wake: Arc<Notify>,
+    #[cfg(test)]
+    sweep_observer: Option<Arc<BrowserLifecycleSweepObserver>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(test)]
+struct BrowserLifecycleSweepObserver {
+    completed: std::sync::atomic::AtomicUsize,
+    completed_tx: watch::Sender<usize>,
+    continue_sweeps: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl BrowserLifecycleSweepObserver {
+    fn new() -> Self {
+        let (completed_tx, _) = watch::channel(0);
+        Self {
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            completed_tx,
+            continue_sweeps: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn wait_for(&self, expected: usize) {
+        let mut completed_rx = self.completed_tx.subscribe();
+        loop {
+            if *completed_rx.borrow_and_update() >= expected {
+                return;
+            }
+            completed_rx
+                .changed()
+                .await
+                .expect("Browser lifecycle sweep observer must remain available");
+        }
+    }
+
+    async fn complete_and_pause(&self) {
+        let completed = self
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        self.completed_tx.send_replace(completed);
+        self.continue_sweeps
+            .acquire()
+            .await
+            .expect("Browser lifecycle sweep observer must remain available")
+            .forget();
+    }
+
+    fn resume(&self) {
+        self.continue_sweeps.add_permits(1);
+    }
+}
+
+impl BrowserLifecycleReconciler {
+    pub(in crate::api::gateway) fn cancel(&self) {
+        let _ = self.shutdown.send(true);
+        self.wake.notify_waiters();
+        #[cfg(test)]
+        if let Some(observer) = self.sweep_observer.as_ref() {
+            observer.resume();
+        }
+    }
+
+    pub(in crate::api::gateway) async fn join(self) -> Result<(), String> {
+        self.task
+            .await
+            .map_err(|err| format!("Browser launch reconciler task failed: {err}"))
+    }
+
+    #[cfg(test)]
+    pub(in crate::api::gateway) async fn wait_for_completed_sweeps(&self, expected: usize) {
+        self.sweep_observer
+            .as_ref()
+            .expect("controlled Browser lifecycle reconciler")
+            .wait_for(expected)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(in crate::api::gateway) fn resume_sweeps(&self) {
+        self.sweep_observer
+            .as_ref()
+            .expect("controlled Browser lifecycle reconciler")
+            .resume();
+    }
+}
+
+pub(in crate::api::gateway) fn start_browser_lifecycle_reconciler(
+    state: GatewayState,
+) -> Result<BrowserLifecycleReconciler, String> {
+    start_browser_lifecycle_reconciler_inner(
+        state,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(in crate::api::gateway) fn start_controlled_browser_lifecycle_reconciler(
+    state: GatewayState,
+) -> Result<BrowserLifecycleReconciler, String> {
+    start_browser_lifecycle_reconciler_inner(
+        state,
+        Some(Arc::new(BrowserLifecycleSweepObserver::new())),
+    )
+}
+
+fn start_browser_lifecycle_reconciler_inner(
+    state: GatewayState,
+    #[cfg(test)] sweep_observer: Option<Arc<BrowserLifecycleSweepObserver>>,
+) -> Result<BrowserLifecycleReconciler, String> {
+    let scope = state.data_dir.to_string_lossy().into_owned();
+    let wake = Arc::new(Notify::new());
+    let registry = BROWSER_LIFECYCLE_RECONCILER_WAKES.get_or_init(Default::default);
+    {
+        let mut registry = registry
+            .lock()
+            .map_err(|_| "Browser launch reconciler registry is unavailable".to_string())?;
+        if registry.get(&scope).and_then(Weak::upgrade).is_some() {
+            return Err(
+                "Browser launch reconciler is already running for this data root".to_string(),
+            );
+        }
+        registry.insert(scope.clone(), Arc::downgrade(&wake));
+    }
+    let registration = BrowserLifecycleReconcilerRegistration {
+        scope,
+        wake: wake.clone(),
+    };
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let task_wake = wake.clone();
+    #[cfg(test)]
+    let task_sweep_observer = sweep_observer.clone();
+    let task = tokio::spawn(async move {
+        #[cfg(test)]
+        run_browser_lifecycle_reconciler(
+            state,
+            task_wake,
+            shutdown_rx,
+            task_sweep_observer,
+            registration,
+        )
+        .await;
+        #[cfg(not(test))]
+        run_browser_lifecycle_reconciler(state, task_wake, shutdown_rx, registration).await;
+    });
+    Ok(BrowserLifecycleReconciler {
+        shutdown,
+        wake,
+        #[cfg(test)]
+        sweep_observer,
+        task,
+    })
+}
+
+async fn run_browser_lifecycle_reconciler(
+    state: GatewayState,
+    wake: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
+    #[cfg(test)] sweep_observer: Option<Arc<BrowserLifecycleSweepObserver>>,
+    _registration: BrowserLifecycleReconcilerRegistration,
+) {
+    let mut backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        let settled = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    release_browser_lifecycle_reconciliation_claims(&state.data_dir).await;
+                    break;
+                }
+                continue;
+            }
+            settled = cleanup_stale_browser_pages(&state) => settled,
+        };
+        #[cfg(test)]
+        if let Some(observer) = sweep_observer.as_ref() {
+            observer.complete_and_pause().await;
+        }
+        if settled {
+            backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = wake.notified() => {
+                backoff = BROWSER_LAUNCH_RECONCILIATION_MIN_BACKOFF;
+            }
+            _ = tokio::time::sleep(backoff) => {
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(BROWSER_LAUNCH_RECONCILIATION_MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+pub(in crate::api::gateway) fn notify_browser_lifecycle_reconciler(data_dir: &FsPath) {
+    let Some(registry) = BROWSER_LIFECYCLE_RECONCILER_WAKES.get() else {
+        return;
+    };
+    let scope = data_dir.to_string_lossy().into_owned();
+    let wake = registry.lock().ok().and_then(|mut registry| {
+        match registry.get(&scope).and_then(Weak::upgrade) {
+            Some(wake) => Some(wake),
+            None => {
+                registry.remove(&scope);
+                None
+            }
+        }
+    });
+    if let Some(wake) = wake {
+        wake.notify_one();
+    }
+}
+
+fn browser_launch_reconciliation_decision(
+    result: Result<BrowserDispatchedLaunchReconciliation, String>,
+) -> BrowserLaunchReconciliationDecision {
+    match result {
+        Ok(BrowserDispatchedLaunchReconciliation::DidNotAct) => {
+            BrowserLaunchReconciliationDecision::DidNotAct
+        }
+        Ok(BrowserDispatchedLaunchReconciliation::TerminalPostEffectCleanup {
+            page_acquired,
+            vm_acquired,
+        }) => BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup {
+            page_acquired,
+            vm_acquired,
+        },
+        Ok(BrowserDispatchedLaunchReconciliation::EffectAcquired(effect)) => {
+            BrowserLaunchReconciliationDecision::CloseExactEffect(effect)
+        }
+        Ok(BrowserDispatchedLaunchReconciliation::CleanupPending) => {
+            BrowserLaunchReconciliationDecision::RetainIndeterminate(None)
+        }
+        Err(err) => BrowserLaunchReconciliationDecision::RetainIndeterminate(Some(err)),
+    }
+}
+
+struct BrowserLaunchReconciliationAttempt<'a> {
+    generation: &'a str,
+    engine_route_provider: &'a str,
+    selected_engine_adapter: Option<&'a str>,
+    principal_id: &'a str,
+    stream_id: &'a str,
+    stream_cleanup: Option<BrowserStreamCleanup>,
+    transport_authority: Option<&'a serde_json::Value>,
+}
+
+async fn attempt_browser_launch_reconciliation_bounded(
+    state: &GatewayState,
+    attempt: BrowserLaunchReconciliationAttempt<'_>,
+) -> Result<BrowserDispatchedLaunchReconciliation, String> {
+    tokio::time::timeout(
+        BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+        attempt_browser_launch_reconciliation(state, attempt),
+    )
+    .await
+    .map_err(|_| "browser-engine launch reconciliation timed out".to_string())?
+}
+
+async fn reconcile_dispatched_browser_launch_failure(
+    state: &GatewayState,
+    reservation: &BrowserLaunchReservation,
+    principal_id: &str,
+    owner_launch_id: &str,
+    stream_id: &str,
+    stream_cleanup: Option<BrowserStreamCleanup>,
+    message: &str,
+) -> serde_json::Value {
+    mark_browser_launch_failed(reservation, message.to_string()).await;
+    let transport_authority = browser_launch_transport_authority(reservation).await;
+    let reconciliation = attempt_browser_launch_reconciliation_bounded(
+        state,
+        BrowserLaunchReconciliationAttempt {
+            generation: reservation.generation(),
+            engine_route_provider: reservation.engine_route_provider(),
+            selected_engine_adapter: reservation.selected_engine_adapter(),
+            principal_id,
+            stream_id,
+            stream_cleanup: stream_cleanup.clone(),
+            transport_authority: transport_authority.as_ref(),
+        },
+    )
+    .await;
+    match browser_launch_reconciliation_decision(reconciliation) {
+        BrowserLaunchReconciliationDecision::DidNotAct => {
+            release_browser_open_resources(state, reservation, stream_cleanup, true).await
+        }
+        BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup {
+            page_acquired,
+            vm_acquired,
+        } => {
+            if let Some(authority) = transport_authority.as_ref() {
+                if let Err(err) = close_browser_vz_fixed_media_listener(authority).await {
+                    tracing::warn!(
+                        error = %err,
+                        generation = reservation.generation(),
+                        "Browser terminal reconciliation could not retire its VZ media listener"
+                    );
+                    return browser_cleanup_pending_outcome(page_acquired, vm_acquired, true);
+                }
+            }
+            if let Err(err) =
+                discard_browser_vz_transport_preparation(&state.data_dir, reservation).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    generation = reservation.generation(),
+                    "Browser terminal reconciliation could not retire transport authority"
+                );
+                return browser_cleanup_pending_outcome(page_acquired, vm_acquired, true);
+            }
+            release_browser_launch(reservation).await;
+            if let Err(err) = close_browser_stream_cleanup(state, stream_cleanup).await {
+                tracing::warn!(
+                    error = %err,
+                    "Browser post-dispatch terminal reconciliation could not close its stream"
+                );
+                browser_cleanup_pending_outcome(page_acquired, vm_acquired, true)
+            } else {
+                browser_terminal_post_dispatch_outcome(page_acquired, vm_acquired)
+            }
+        }
+        BrowserLaunchReconciliationDecision::CloseExactEffect(effect) => {
+            let effect = *effect;
+            let page_id = effect.page_id.clone();
+            let ownership_persisted = complete_browser_launch(&state.data_dir, reservation, effect)
+                .await
+                .is_ok();
+            reap_browser_open_effect_after_failure(
+                state,
+                reservation,
+                &page_id,
+                principal_id,
+                owner_launch_id,
+                ownership_persisted,
+            )
+            .await
+        }
+        BrowserLaunchReconciliationDecision::RetainIndeterminate(reconciliation_error) => {
+            if let Some(err) = reconciliation_error {
+                tracing::warn!(
+                    error = %err,
+                    generation = reservation.generation(),
+                    stream_id,
+                    "Browser dispatched launch reconciliation remains indeterminate"
+                );
+            }
+            if let Err(err) = record_browser_launch_reconciliation_obligation(
+                &state.data_dir,
+                reservation,
+                stream_id,
+                stream_cleanup,
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %err,
+                    generation = reservation.generation(),
+                    stream_id,
+                    "Browser could not durably persist indeterminate launch ownership"
+                );
+            }
+            browser_launch_reconciliation_pending_outcome()
+        }
+    }
+}
+
+async fn attempt_browser_launch_reconciliation(
+    state: &GatewayState,
+    attempt: BrowserLaunchReconciliationAttempt<'_>,
+) -> Result<BrowserDispatchedLaunchReconciliation, String> {
+    let BrowserLaunchReconciliationAttempt {
+        generation,
+        engine_route_provider,
+        selected_engine_adapter,
+        principal_id,
+        stream_id,
+        stream_cleanup,
+        transport_authority,
+    } = attempt;
+    let registry = state.provider_registry.as_ref().ok_or_else(|| {
+        "browser-engine provider unavailable during launch reconciliation".to_string()
+    })?;
+    let registration = registry
+        .registration_for_uri("elastos://browser-engine/meta/status")
+        .await
+        .ok_or_else(|| {
+            "browser-engine provider status route unavailable during launch reconciliation"
+                .to_string()
+        })?;
+    if registration.provider != engine_route_provider {
+        return Err(
+            "browser-engine provider binding changed during launch reconciliation".to_string(),
+        );
+    }
+    let call = browser_provider_resource_call(
+        "browser-engine",
+        "status",
+        "elastos://browser-engine/meta/status".to_string(),
+        serde_json::json!({
+            "principal_id": principal_id,
+            "lifecycle_generation": generation,
+            "stream_id": stream_id,
+            "adapter_id": selected_engine_adapter,
+            "transport_authority": transport_authority,
+        }),
+    )
+    .map_err(|(_, message)| message)?;
+    let response = browser_provider_resource_response(state, call)
+        .await
+        .map_err(|(_, message)| message)?;
+    if let Some(message) = provider_response_error_message(&response) {
+        return Err(message);
+    }
+    let data = provider_response_data(&response)
+        .ok_or_else(|| "browser-engine launch reconciliation response is invalid".to_string())?;
+    if data.get("schema").and_then(serde_json::Value::as_str)
+        != Some("elastos.browser.engine.launch-reconciliation/v1")
+        || data
+            .get("lifecycle_generation")
+            .and_then(serde_json::Value::as_str)
+            != Some(generation)
+        || data.get("stream_id").and_then(serde_json::Value::as_str) != Some(stream_id)
+        || (transport_authority.is_some() && data.get("transport_authority") != transport_authority)
+    {
+        return Err("browser-engine launch reconciliation identity is invalid".to_string());
+    }
+    match data.get("state").and_then(serde_json::Value::as_str) {
+        Some("did_not_act")
+            if data
+                .pointer("/effects/page_acquired")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+                && data
+                    .pointer("/effects/vm_acquired")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false) =>
+        {
+            Ok(BrowserDispatchedLaunchReconciliation::DidNotAct)
+        }
+        Some("did_not_act") => {
+            Err("browser-engine DidNotAct proof omitted exact no-effect evidence".to_string())
+        }
+        Some("terminal_post_effect_cleanup") => {
+            let effects = data.get("effects").ok_or_else(|| {
+                "browser-engine terminal reconciliation omitted effects".to_string()
+            })?;
+            let page_acquired = effects
+                .get("page_acquired")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    "browser-engine terminal reconciliation omitted page ownership".to_string()
+                })?;
+            let vm_acquired = effects
+                .get("vm_acquired")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    "browser-engine terminal reconciliation omitted VM ownership".to_string()
+                })?;
+            if let Some(authority) = transport_authority {
+                validate_browser_dispatched_transport_terminal_receipt(
+                    data.get("terminal_cleanup_receipt")
+                        .unwrap_or(&serde_json::Value::Null),
+                    authority,
+                    generation,
+                    stream_id,
+                    selected_engine_adapter,
+                    page_acquired,
+                    vm_acquired,
+                )?;
+            }
+            Ok(
+                BrowserDispatchedLaunchReconciliation::TerminalPostEffectCleanup {
+                    page_acquired,
+                    vm_acquired,
+                },
+            )
+        }
+        Some("effect_acquired") => {
+            let effect = data
+                .get("effect")
+                .filter(|value| value.is_object())
+                .ok_or_else(|| {
+                    "browser-engine reconciliation omitted its exact effect".to_string()
+                })?;
+            let page_id = effect
+                .get("page_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| is_safe_runtime_id(value))
+                .ok_or_else(|| {
+                    "browser-engine reconciliation returned an unsafe page_id".to_string()
+                })?;
+            if transport_authority.is_some_and(|authority| {
+                effect.get("transport_authority") != Some(authority)
+                    || authority.get("page_id").and_then(serde_json::Value::as_str) != Some(page_id)
+                    || validate_browser_vz_transport_effect_receipt(
+                        authority,
+                        effect
+                            .get("transport_receipt")
+                            .unwrap_or(&serde_json::Value::Null),
+                    )
+                    .is_err()
+            }) {
+                return Err("browser-engine reconciliation transport authority changed".to_string());
+            }
+            let engine_provider = effect
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| *value == BROWSER_ENGINE_PROVIDER_ID)
+                .ok_or_else(|| {
+                    "browser-engine reconciliation provider identity changed".to_string()
+                })?;
+            let engine_protocol_version = effect
+                .get("protocol_version")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| *value == BROWSER_ENGINE_PROTOCOL_VERSION)
+                .ok_or_else(|| "browser-engine reconciliation protocol changed".to_string())?;
+            let engine_adapter = effect
+                .get("adapter")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| is_safe_runtime_id(value))
+                .ok_or_else(|| "browser-engine reconciliation adapter is unsafe".to_string())?;
+            if selected_engine_adapter.is_some_and(|selected| selected != engine_adapter) {
+                return Err(
+                    "browser-engine reconciliation selected adapter identity changed".to_string(),
+                );
+            }
+            let engine = effect
+                .get("engine")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| is_safe_runtime_id(value))
+                .ok_or_else(|| "browser-engine reconciliation engine is unsafe".to_string())?;
+            if effect.get("stream_id").and_then(serde_json::Value::as_str) != Some(stream_id) {
+                return Err("browser-engine reconciliation stream identity changed".to_string());
+            }
+            let provider_cleanup = browser_provider_cleanup_binding(
+                effect,
+                generation,
+                page_id,
+                engine_adapter,
+                engine,
+                Some(stream_id),
+                transport_authority,
+            )?;
+            Ok(BrowserDispatchedLaunchReconciliation::EffectAcquired(
+                Box::new(BrowserLaunchEffect {
+                    page_id: page_id.to_string(),
+                    engine_provider: engine_provider.to_string(),
+                    engine_protocol_version: engine_protocol_version.to_string(),
+                    engine_adapter: engine_adapter.to_string(),
+                    engine: engine.to_string(),
+                    provider_cleanup,
+                    browser_page: serde_json::json!({
+                        "schema": "elastos.browser.engine.reconciled-effect/v1",
+                        "provider": engine_provider,
+                        "protocol_version": engine_protocol_version,
+                        "page_id": page_id,
+                        "adapter": engine_adapter,
+                        "engine": engine,
+                        "stream_id": stream_id,
+                    }),
+                    viewer_turn_capability: None,
+                    stream_cleanup,
+                }),
+            ))
+        }
+        Some("cleanup_pending") => Ok(BrowserDispatchedLaunchReconciliation::CleanupPending),
+        _ => Err("browser-engine launch reconciliation state is invalid".to_string()),
+    }
+}
+
+fn validate_browser_dispatched_transport_terminal_receipt(
+    receipt: &serde_json::Value,
+    authority: &serde_json::Value,
+    generation: &str,
+    stream_id: &str,
+    selected_engine_adapter: Option<&str>,
+    page_acquired: bool,
+    vm_acquired: bool,
+) -> Result<(), String> {
+    if receipt.get("schema").and_then(serde_json::Value::as_str)
+        == Some("elastos.browser.vz-launch-settlement/v1")
+    {
+        let (acted, settlement_vm_acquired) =
+            validate_browser_vz_launch_settlement_binding(receipt, authority)?;
+        if selected_engine_adapter.is_none()
+            || receipt.get("state").and_then(serde_json::Value::as_str)
+                != Some("terminal_post_effect_cleanup")
+            || !acted
+            || page_acquired
+            || settlement_vm_acquired != vm_acquired
+            || receipt
+                .get("generation")
+                .and_then(serde_json::Value::as_str)
+                != Some(generation)
+            || receipt.get("stream_id").and_then(serde_json::Value::as_str) != Some(stream_id)
+        {
+            return Err("browser-engine terminal VZ launch settlement is not exact".to_string());
+        }
+        return Ok(());
+    }
+    let binding = receipt
+        .get("binding")
+        .ok_or_else(|| "browser-engine terminal transport binding is missing".to_string())?;
+    let transport_receipt = binding
+        .get("transport_receipt")
+        .ok_or_else(|| "browser-engine terminal transport effect receipt is missing".to_string())?;
+    validate_browser_vz_transport_effect_receipt(authority, transport_receipt)?;
+    let terminal_effects = [
+        "page_absent",
+        "child_absent",
+        "vm_absent",
+        "route_absent",
+        "socket_absent",
+        "transport_session_absent",
+        "turn_process_absent",
+        "turn_listener_absent",
+        "turn_relay_ports_absent",
+        "ordinary_vsock_bridge_absent",
+        "media_vsock_bridge_absent",
+        "bootstrap_vsock_bridge_absent",
+        "hibernation_state_absent",
+    ];
+    if receipt.get("schema").and_then(serde_json::Value::as_str)
+        != Some(BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA)
+        || receipt.get("page_id") != authority.get("page_id")
+        || receipt
+            .get("generation")
+            .and_then(serde_json::Value::as_str)
+            != Some(generation)
+        || receipt.get("terminal").and_then(serde_json::Value::as_bool) != Some(true)
+        || binding.get("schema").and_then(serde_json::Value::as_str)
+            != Some(BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA)
+        || binding.get("page_id") != authority.get("page_id")
+        || binding
+            .get("generation")
+            .and_then(serde_json::Value::as_str)
+            != Some(generation)
+        || binding.get("stream_id").and_then(serde_json::Value::as_str) != Some(stream_id)
+        || binding.get("principal_id") != authority.get("principal_id")
+        || binding.get("adapter").and_then(serde_json::Value::as_str) != selected_engine_adapter
+        || binding.get("engine").and_then(serde_json::Value::as_str) != Some("chromium_microvm")
+        || binding
+            .get("display_mode")
+            .and_then(serde_json::Value::as_str)
+            != Some("webrtc_remote_display")
+        || binding
+            .get("guarantee_level")
+            .and_then(serde_json::Value::as_str)
+            != Some("mechanism_microvm")
+        || binding
+            .get("isolated_session")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || binding.get("transport_authority") != Some(authority)
+        || terminal_effects.iter().any(|effect| {
+            receipt
+                .pointer(&format!("/effects/{effect}"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        })
+        || browser_terminal_receipt_contains_transport_secret(receipt)
+    {
+        return Err("browser-engine terminal transport receipt is not exact".to_string());
+    }
+    Ok(())
+}
+
+fn browser_terminal_receipt_contains_transport_secret(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(browser_terminal_receipt_contains_transport_secret),
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "credential" | "auth_secret" | "transport_secret"
+            ) || browser_terminal_receipt_contains_transport_secret(value)
+        }),
+        _ => false,
+    }
 }
 
 fn browser_stream_nonce(request_id: &str) -> String {
@@ -736,68 +2315,644 @@ fn browser_engine_adapter_id(value: Option<String>) -> Result<Option<String>, St
     Ok(Some(value))
 }
 
-async fn cleanup_stale_browser_pages(state: &GatewayState) {
-    retry_pending_browser_stream_cleanups(state).await;
-    for page in take_stale_browser_pages(&state.data_dir).await {
-        close_browser_page_record(state, page, "stale_browser_session_janitor").await;
+fn browser_provider_cleanup_binding(
+    engine_page: &serde_json::Value,
+    generation: &str,
+    page_id: &str,
+    adapter: &str,
+    engine: &str,
+    stream_id: Option<&str>,
+    transport_authority: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let binding = engine_page
+        .get("runtime_cleanup")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| {
+            "browser-engine provider omitted its Runtime-only cleanup binding".to_string()
+        })?;
+    let expected_stream_id = stream_id.unwrap_or_default();
+    if binding.get("schema").and_then(|value| value.as_str())
+        != Some(BROWSER_ENGINE_CLEANUP_BINDING_SCHEMA)
+        || binding.get("page_id").and_then(|value| value.as_str()) != Some(page_id)
+        || binding.get("generation").and_then(|value| value.as_str()) != Some(generation)
+        || binding.get("adapter").and_then(|value| value.as_str()) != Some(adapter)
+        || binding.get("engine").and_then(|value| value.as_str()) != Some(engine)
+        || binding.get("stream_id").and_then(|value| value.as_str()) != Some(expected_stream_id)
+        || transport_authority.is_some()
+            && binding.get("transport_authority") != transport_authority
+        || transport_authority.is_none() && binding.get("transport_authority").is_some()
+        || !browser_provider_cleanup_value_is_safe(&binding, 0)
+        || serde_json::to_vec(&binding).map_or(true, |bytes| bytes.len() > 16 * 1024)
+    {
+        return Err(
+            "browser-engine provider returned an invalid Runtime-only cleanup binding".to_string(),
+        );
     }
-    if !browser_scope_has_live_sessions(&state.data_dir).await {
-        match prune_orphan_browser_runtime_stream_sockets() {
-            Ok(0) => {}
-            Ok(removed) => {
-                tracing::info!(removed, "Browser pruned stale runtime stream socket files")
-            }
-            Err(err) => tracing::warn!(
-                error = %err,
-                "Browser stale runtime stream socket prune failed"
-            ),
+    if let Some(authority) = transport_authority {
+        validate_browser_vz_transport_effect_receipt(
+            authority,
+            binding
+                .get("transport_receipt")
+                .unwrap_or(&serde_json::Value::Null),
+        )?;
+    } else if binding.get("transport_receipt").is_some() {
+        return Err(
+            "browser-engine provider returned an unexpected VZ transport receipt".to_string(),
+        );
+    }
+    Ok(binding)
+}
+
+fn browser_provider_cleanup_value_is_safe(value: &serde_json::Value, depth: usize) -> bool {
+    if depth > 6 {
+        return false;
+    }
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+        serde_json::Value::String(text) => {
+            text.len() <= 1024
+                && !text
+                    .chars()
+                    .any(|character| character == '\0' || character.is_control())
+        }
+        serde_json::Value::Array(values) => {
+            values.len() <= 32
+                && values
+                    .iter()
+                    .all(|value| browser_provider_cleanup_value_is_safe(value, depth + 1))
+        }
+        serde_json::Value::Object(values) => {
+            values.len() <= 32
+                && values.iter().all(|(key, value)| {
+                    key.len() <= 128
+                        && is_safe_runtime_id(key)
+                        && browser_provider_cleanup_value_is_safe(value, depth + 1)
+                })
         }
     }
 }
 
-async fn retry_pending_browser_stream_cleanups(state: &GatewayState) {
-    for cleanup in take_pending_browser_stream_cleanups(&state.data_dir).await {
-        if let Err(err) = close_browser_stream_cleanup(state, Some(cleanup)).await {
+pub(in crate::api::gateway) async fn cleanup_stale_browser_pages(state: &GatewayState) -> bool {
+    let settled = retry_pending_browser_lifecycle_obligations(state).await;
+    let stale_pages = match take_stale_browser_pages(&state.data_dir).await {
+        Ok(pages) => pages,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "Browser stale ownership could not be transferred into durable cleanup"
+            );
+            return settled;
+        }
+    };
+    let reaped_stale_page = !stale_pages.is_empty();
+    for page in stale_pages {
+        close_browser_page_record(state, page).await;
+    }
+    settled || reaped_stale_page
+}
+
+async fn retry_pending_browser_lifecycle_obligations(state: &GatewayState) -> bool {
+    let launch_settled = retry_pending_browser_launch_reconciliations(state).await;
+    let engine_settled = retry_pending_browser_engine_cleanups(state).await;
+    let stream_settled = retry_pending_browser_stream_cleanups(state).await;
+    launch_settled || engine_settled || stream_settled
+}
+
+async fn retry_pending_browser_launch_reconciliations(state: &GatewayState) -> bool {
+    let mut settled = false;
+    for reconciliation in claim_pending_browser_launch_reconciliations(
+        &state.data_dir,
+        BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT,
+    )
+    .await
+    {
+        let result = if reconciliation.was_dispatched() {
+            attempt_browser_launch_reconciliation_bounded(
+                state,
+                BrowserLaunchReconciliationAttempt {
+                    generation: &reconciliation.generation,
+                    engine_route_provider: &reconciliation.engine_route_provider,
+                    selected_engine_adapter: reconciliation.selected_engine_adapter.as_deref(),
+                    principal_id: &reconciliation.principal_id,
+                    stream_id: &reconciliation.stream_id,
+                    stream_cleanup: reconciliation.stream_cleanup.clone(),
+                    transport_authority: reconciliation.transport_authority(),
+                },
+            )
+            .await
+        } else {
+            Ok(BrowserDispatchedLaunchReconciliation::DidNotAct)
+        };
+        match browser_launch_reconciliation_decision(result) {
+            BrowserLaunchReconciliationDecision::DidNotAct
+            | BrowserLaunchReconciliationDecision::TerminalPostEffectCleanup { .. } => {
+                if let Some(authority) = reconciliation.transport_authority() {
+                    if let Err(err) = close_browser_vz_fixed_media_listener(authority).await {
+                        tracing::warn!(
+                            error = %err,
+                            generation = %reconciliation.generation,
+                            "Browser launch reconciliation could not close its VZ media listener"
+                        );
+                        release_browser_launch_reconciliation_claim(
+                            &state.data_dir,
+                            &reconciliation,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+                let stream_result = tokio::time::timeout(
+                    BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+                    close_browser_stream_cleanup(state, reconciliation.stream_cleanup.clone()),
+                )
+                .await
+                .map_err(|_| "Browser stream cleanup timed out".to_string())
+                .and_then(|result| result);
+                if let Err(err) = stream_result {
+                    tracing::warn!(
+                        error = %err,
+                        generation = %reconciliation.generation,
+                        "Browser launch reconciliation terminal proof could not close its stream"
+                    );
+                    release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
+                        .await;
+                    continue;
+                }
+                if let Err(err) = forget_browser_launch_reconciliation_obligation(
+                    &state.data_dir,
+                    &reconciliation,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        generation = %reconciliation.generation,
+                        "Browser launch reconciliation terminal release could not be committed"
+                    );
+                    release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
+                        .await;
+                } else {
+                    release_browser_open_job_instance_for_owner(
+                        &state.data_dir,
+                        &reconciliation.principal_id,
+                        &reconciliation.owner_launch_id,
+                    )
+                    .await;
+                    settled = true;
+                }
+            }
+            BrowserLaunchReconciliationDecision::CloseExactEffect(effect) => {
+                let effect = *effect;
+                let cleanup = BrowserEngineCleanup {
+                    cleanup_id: reconciliation.cleanup_id.clone(),
+                    page_id: effect.page_id,
+                    principal_id: reconciliation.principal_id.clone(),
+                    owner_launch_id: reconciliation.owner_launch_id.clone(),
+                    browser_instance: reconciliation.browser_instance.clone(),
+                    generation: reconciliation.generation.clone(),
+                    engine_route_provider: reconciliation.engine_route_provider.clone(),
+                    engine_provider: effect.engine_provider,
+                    engine_protocol_version: effect.engine_protocol_version,
+                    engine_adapter: effect.engine_adapter,
+                    engine: effect.engine,
+                    stream_id: reconciliation.stream_id.clone(),
+                    transport_authority: reconciliation.transport_authority().cloned(),
+                    provider_cleanup: effect.provider_cleanup,
+                };
+                if let Err(err) = promote_browser_launch_reconciliation_effect(
+                    &state.data_dir,
+                    &reconciliation,
+                    cleanup.clone(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        generation = %reconciliation.generation,
+                        "Browser could not promote reconciled launch ownership into exact cleanup"
+                    );
+                    release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation)
+                        .await;
+                    continue;
+                }
+                let engine_result = tokio::time::timeout(
+                    BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+                    attempt_browser_engine_cleanup(state, &cleanup),
+                )
+                .await
+                .map_err(|_| "Browser engine cleanup timed out".to_string())
+                .and_then(|result| result);
+                let stream_result = tokio::time::timeout(
+                    BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+                    close_browser_stream_cleanup(state, reconciliation.stream_cleanup.clone()),
+                )
+                .await
+                .map_err(|_| "Browser stream cleanup timed out".to_string())
+                .and_then(|result| result);
+                if engine_result.is_ok() && stream_result.is_ok() {
+                    if let Err(err) = commit_browser_terminal_cleanup(state, &cleanup, None).await {
+                        release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+                        tracing::warn!(
+                            error = %err,
+                            page_id = %cleanup.page_id,
+                            "Browser reconciled cleanup terminal receipt and release could not be committed"
+                        );
+                    } else {
+                        release_browser_open_job_instance_for_owner(
+                            &state.data_dir,
+                            &cleanup.principal_id,
+                            &cleanup.owner_launch_id,
+                        )
+                        .await;
+                        settled = true;
+                    }
+                } else {
+                    release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+                    tracing::warn!(
+                        page_id = %cleanup.page_id,
+                        engine_error = ?engine_result.err(),
+                        stream_error = ?stream_result.err(),
+                        "Browser reconciled cleanup remains pending"
+                    );
+                }
+            }
+            BrowserLaunchReconciliationDecision::RetainIndeterminate(error) => {
+                if let Some(error) = error {
+                    tracing::warn!(
+                        error,
+                        generation = %reconciliation.generation,
+                        "Browser launch reconciliation retry remains indeterminate"
+                    );
+                }
+                release_browser_launch_reconciliation_claim(&state.data_dir, &reconciliation).await;
+            }
+        }
+    }
+    settled
+}
+
+async fn retry_pending_browser_engine_cleanups(state: &GatewayState) -> bool {
+    let mut settled = false;
+    for cleanup in claim_pending_browser_engine_cleanups(
+        &state.data_dir,
+        BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT,
+    )
+    .await
+    {
+        let engine_result = tokio::time::timeout(
+            BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+            attempt_browser_engine_cleanup(state, &cleanup),
+        )
+        .await
+        .map_err(|_| "Browser engine cleanup timed out".to_string())
+        .and_then(|result| result);
+        let stream_cleanup =
+            browser_pending_stream_cleanup_for_engine(&state.data_dir, &cleanup).await;
+        let stream_result = tokio::time::timeout(
+            BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+            close_browser_stream_cleanup(state, stream_cleanup),
+        )
+        .await
+        .map_err(|_| "Browser stream cleanup timed out".to_string())
+        .and_then(|result| result);
+        match (engine_result, stream_result) {
+            (Ok(_), Ok(())) => {
+                if let Err(err) = commit_browser_terminal_cleanup(state, &cleanup, None).await {
+                    release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+                    tracing::warn!(
+                        page_id = %cleanup.page_id,
+                        error = %err,
+                        "Browser terminal cleanup could not commit its receipt and owner release"
+                    );
+                } else {
+                    release_browser_open_job_instance_for_owner(
+                        &state.data_dir,
+                        &cleanup.principal_id,
+                        &cleanup.owner_launch_id,
+                    )
+                    .await;
+                    settled = true;
+                }
+            }
+            (engine_result, stream_result) => {
+                release_browser_engine_cleanup_claim(&state.data_dir, &cleanup).await;
+                tracing::warn!(
+                    page_id = %cleanup.page_id,
+                    engine_error = ?engine_result.err(),
+                    stream_error = ?stream_result.err(),
+                    "Browser pending engine cleanup retry failed"
+                );
+            }
+        }
+    }
+    settled
+}
+
+async fn retry_pending_browser_stream_cleanups(state: &GatewayState) -> bool {
+    let mut settled = false;
+    for cleanup in claim_pending_browser_stream_cleanups(
+        &state.data_dir,
+        BROWSER_LIFECYCLE_RECONCILIATION_BATCH_LIMIT,
+    )
+    .await
+    {
+        let cleanup_for_release = cleanup.clone();
+        let result = tokio::time::timeout(
+            BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+            close_browser_stream_cleanup(state, Some(cleanup)),
+        )
+        .await
+        .map_err(|_| "Browser stream cleanup timed out".to_string())
+        .and_then(|result| result);
+        if let Err(err) = result {
+            release_browser_stream_cleanup_claim(&state.data_dir, &cleanup_for_release).await;
             tracing::warn!(
                 error = %err,
                 "Browser pending stream cleanup retry failed"
+            );
+        } else {
+            settled = true;
+        }
+    }
+    settled
+}
+
+async fn commit_browser_terminal_cleanup(
+    state: &GatewayState,
+    cleanup: &BrowserEngineCleanup,
+    terminal_owner_launch_id: Option<&str>,
+) -> Result<(), String> {
+    record_browser_reaped_page_tombstone(&state.data_dir, cleanup, terminal_owner_launch_id)
+        .await?;
+    forget_browser_engine_cleanup_obligation(&state.data_dir, cleanup).await
+}
+
+async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanup) {
+    let engine_cleanup = page.engine_cleanup;
+    forget_browser_open_job_for_owner(
+        &state.data_dir,
+        &engine_cleanup.principal_id,
+        &engine_cleanup.owner_launch_id,
+    )
+    .await;
+    let engine_result = tokio::time::timeout(
+        BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+        attempt_browser_engine_cleanup(state, &engine_cleanup),
+    )
+    .await
+    .map_err(|_| "Browser stale page engine cleanup timed out".to_string())
+    .and_then(|result| result);
+    let stream_cleanup_for_release = page.stream_cleanup.clone();
+    let stream_result = tokio::time::timeout(
+        BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT,
+        close_browser_stream_cleanup(state, page.stream_cleanup),
+    )
+    .await
+    .map_err(|_| "Browser stale page stream cleanup timed out".to_string())
+    .and_then(|result| result);
+    if stream_result.is_err() {
+        if let Some(cleanup) = stream_cleanup_for_release.as_ref() {
+            release_browser_stream_cleanup_claim(&state.data_dir, cleanup).await;
+        }
+    }
+    match (&engine_result, &stream_result) {
+        (Ok(_), Ok(())) => {
+            if let Err(err) = commit_browser_terminal_cleanup(state, &engine_cleanup, None).await {
+                release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
+                tracing::warn!(
+                    page_id = %engine_cleanup.page_id,
+                    error = %err,
+                    "Browser stale page terminal receipt and release could not be committed"
+                );
+            }
+        }
+        _ => {
+            release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
+            tracing::warn!(
+                page_id = %engine_cleanup.page_id,
+                engine_error = ?engine_result.as_ref().err(),
+                stream_error = ?stream_result.as_ref().err(),
+                "Browser stale page engine cleanup failed"
             );
         }
     }
 }
 
-async fn close_browser_page_record(state: &GatewayState, page: BrowserPageCleanup, reason: &str) {
-    if let Ok(call) = browser_provider_resource_call(
+async fn attempt_browser_engine_cleanup(
+    state: &GatewayState,
+    cleanup: &BrowserEngineCleanup,
+) -> Result<serde_json::Value, String> {
+    require_browser_engine_provider_binding(state, cleanup).await?;
+    let call = browser_provider_resource_call(
         "browser-engine",
         "close_page",
         "elastos://browser-engine/close_page".to_string(),
         serde_json::json!({
-            "page_id": page.page_id.clone(),
-            "principal_id": page.principal_id,
-            "reason": reason,
+            "page_id": cleanup.page_id,
+            "principal_id": cleanup.principal_id,
+            "runtime_cleanup": cleanup.provider_cleanup,
         }),
-    ) {
-        let _ = browser_provider_resource_response(state, call).await;
+    )
+    .map_err(|(_, message)| message)?;
+    let response = browser_provider_resource_response(state, call)
+        .await
+        .map_err(|(_, message)| message)?;
+    if let Some(message) = provider_response_error_message(&response) {
+        return Err(message);
     }
-    if let Err(err) = close_browser_stream_cleanup(state, page.stream_cleanup).await {
-        tracing::warn!(
-            error = %err,
-            "Browser stale page stream cleanup failed"
+    let data = provider_response_data(&response).ok_or_else(|| {
+        "browser-engine provider returned an invalid close-page response".to_string()
+    })?;
+    let receipt = browser_terminal_close_receipt(cleanup, data)?;
+    if let Some(authority) = cleanup.transport_authority.as_ref() {
+        close_browser_vz_fixed_media_listener(authority).await?;
+    }
+    Ok(receipt)
+}
+
+async fn require_browser_engine_provider_binding(
+    state: &GatewayState,
+    cleanup: &BrowserEngineCleanup,
+) -> Result<(), String> {
+    let registry = state.provider_registry.as_ref().ok_or_else(|| {
+        "browser-engine provider unavailable while cleanup is pending".to_string()
+    })?;
+    let registration = registry
+        .registration_for_uri("elastos://browser-engine/close_page")
+        .await
+        .ok_or_else(|| {
+            "browser-engine provider route unavailable while cleanup is pending".to_string()
+        })?;
+    if registration.provider != cleanup.engine_route_provider {
+        return Err(
+            "browser-engine provider binding changed while exact cleanup is pending".to_string(),
         );
     }
+    let status_call = browser_provider_resource_call(
+        "browser-engine",
+        "status",
+        "elastos://browser-engine/meta/status".to_string(),
+        serde_json::json!({
+            "principal_id": cleanup.principal_id,
+        }),
+    )
+    .map_err(|(_, message)| message)?;
+    let status_response = browser_provider_resource_response(state, status_call)
+        .await
+        .map_err(|(_, message)| message)?;
+    if let Some(message) = provider_response_error_message(&status_response) {
+        return Err(message);
+    }
+    let status = provider_response_data(&status_response)
+        .ok_or_else(|| "browser-engine provider returned an invalid status binding".to_string())?;
+    if status.get("provider").and_then(|value| value.as_str())
+        != Some(cleanup.engine_provider.as_str())
+        || status
+            .get("protocol_version")
+            .and_then(|value| value.as_str())
+            != Some(cleanup.engine_protocol_version.as_str())
+    {
+        return Err(
+            "browser-engine provider identity or protocol changed while exact cleanup is pending"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 async fn release_browser_open_resources(
     state: &GatewayState,
     reservation: &BrowserLaunchReservation,
     stream_cleanup: Option<BrowserStreamCleanup>,
-) {
+    provider_dispatched: bool,
+) -> serde_json::Value {
+    if let Some(authority) = browser_launch_transport_authority(reservation).await {
+        if let Err(err) = close_browser_vz_fixed_media_listener(&authority).await {
+            tracing::warn!(
+                error = %err,
+                generation = reservation.generation(),
+                "Browser VZ prepared media listener could not be retired"
+            );
+            return browser_cleanup_pending_outcome(false, false, true);
+        }
+    }
+    if let Err(err) = discard_browser_vz_transport_preparation(&state.data_dir, reservation).await {
+        tracing::warn!(
+            error = %err,
+            generation = reservation.generation(),
+            "Browser VZ prepared transport authority could not be retired"
+        );
+        return browser_cleanup_pending_outcome(false, false, true);
+    }
     release_browser_launch(reservation).await;
     if let Err(err) = close_browser_stream_cleanup(state, stream_cleanup).await {
         tracing::warn!(
             error = %err,
             "Browser open resource cleanup failed"
         );
+        return browser_cleanup_pending_outcome(false, false, true);
+    }
+    if provider_dispatched {
+        browser_terminal_post_dispatch_outcome(false, false)
+    } else {
+        browser_terminal_pre_effect_outcome()
+    }
+}
+
+async fn reap_browser_open_effect_after_failure(
+    state: &GatewayState,
+    reservation: &BrowserLaunchReservation,
+    page_id: &str,
+    principal_id: &str,
+    owner_launch_id: &str,
+    ownership_persisted: bool,
+) -> serde_json::Value {
+    let page_cleanup = match browser_page_cleanup_for_principal(
+        &state.data_dir,
+        page_id,
+        principal_id,
+        owner_launch_id,
+        reservation.cleanup_id(),
+    )
+    .await
+    {
+        Ok(Some(cleanup)) => cleanup,
+        Ok(None) => {
+            tracing::warn!(
+                page_id,
+                "Browser open failure could not recover its exact cleanup binding"
+            );
+            return browser_cleanup_pending_outcome(true, true, true);
+        }
+        Err(err) => {
+            tracing::warn!(
+                page_id,
+                error = %err,
+                "Browser open failure could not load its exact cleanup binding"
+            );
+            return browser_cleanup_pending_outcome(true, true, true);
+        }
+    };
+    let stream_cleanup = page_cleanup.stream_cleanup.clone();
+    let engine_cleanup = page_cleanup.engine_cleanup;
+    let obligation_persisted = match record_browser_engine_cleanup_obligation(
+        &state.data_dir,
+        engine_cleanup.clone(),
+        stream_cleanup,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                page_id,
+                error = %err,
+                "Browser open failure cleanup could not persist its obligation"
+            );
+            false
+        }
+    };
+    let engine_result = attempt_browser_engine_cleanup(state, &engine_cleanup).await;
+    if !ownership_persisted && !obligation_persisted && engine_result.is_err() {
+        tracing::warn!(
+            page_id,
+            error = ?engine_result.as_ref().err(),
+            "Browser open failure remains actively owned because neither terminal cleanup nor durable transfer succeeded"
+        );
+        return browser_cleanup_pending_outcome(true, true, true);
+    }
+    let stream_result = release_browser_page_and_stream_for_principal(
+        state,
+        page_id,
+        principal_id,
+        owner_launch_id,
+    )
+    .await;
+    if engine_result.is_ok() && stream_result.is_ok() {
+        if let Err(err) = commit_browser_terminal_cleanup(state, &engine_cleanup, None).await {
+            release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
+            tracing::warn!(
+                page_id,
+                error = %err,
+                "Browser open failure terminal cleanup could not commit its receipt and release"
+            );
+            return browser_cleanup_pending_outcome(false, false, false);
+        }
+        browser_terminal_post_effect_outcome()
+    } else {
+        release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
+        tracing::warn!(
+            page_id,
+            engine_error = ?engine_result.as_ref().err(),
+            stream_error = ?stream_result.as_ref().err(),
+            "Browser open failure transferred exact cleanup into a retryable obligation"
+        );
+        browser_cleanup_pending_outcome(
+            engine_result.is_err(),
+            engine_result.is_err(),
+            stream_result.is_err(),
+        )
     }
 }
 
@@ -805,12 +2960,21 @@ async fn release_browser_page_and_stream_for_principal(
     state: &GatewayState,
     page_id: &str,
     principal_id: &str,
+    owner_launch_id: &str,
 ) -> Result<(), String> {
-    let stream_cleanup =
-        browser_page_stream_cleanup_for_principal(&state.data_dir, page_id, principal_id).await;
-    close_browser_stream_cleanup(state, stream_cleanup).await?;
-    let _ = release_browser_page_for_principal(&state.data_dir, page_id, principal_id).await;
-    Ok(())
+    let stream_cleanup = browser_page_stream_cleanup_for_principal(
+        &state.data_dir,
+        page_id,
+        principal_id,
+        owner_launch_id,
+    )
+    .await;
+    let cleanup_result = close_browser_stream_cleanup(state, stream_cleanup).await;
+    let _ =
+        release_browser_page_for_principal(&state.data_dir, page_id, principal_id, owner_launch_id)
+            .await;
+    forget_browser_open_job_for_owner(&state.data_dir, principal_id, owner_launch_id).await;
+    cleanup_result
 }
 
 async fn close_browser_stream_cleanup(
@@ -820,48 +2984,49 @@ async fn close_browser_stream_cleanup(
     let Some(cleanup) = stream_cleanup else {
         return Ok(());
     };
-    let Some(registry) = state.provider_registry.as_ref() else {
-        record_browser_stream_cleanup_failure(&state.data_dir, cleanup).await;
-        return Err("exit provider unavailable while closing Browser stream".to_string());
-    };
     let cleanup_for_failure = cleanup.clone();
-    let call = match browser_provider_resource_call(
-        "exit",
-        "close_stream",
-        "elastos://exit/close_stream".to_string(),
-        serde_json::json!({
-            "stream_id": cleanup.stream_id,
-            "principal_id": cleanup.principal_id,
-        }),
-    ) {
-        Ok(call) => call,
-        Err((_status, message)) => {
-            record_browser_stream_cleanup_failure(&state.data_dir, cleanup_for_failure).await;
-            return Err(message);
-        }
+    let listener_result =
+        close_browser_runtime_stream_listener(&state.data_dir, &cleanup.stream_id).await;
+    let provider_result = match state.provider_registry.as_ref() {
+        Some(registry) => match browser_provider_resource_call(
+            "exit",
+            "close_stream",
+            "elastos://exit/close_stream".to_string(),
+            serde_json::json!({
+                "stream_id": cleanup.stream_id,
+                "principal_id": cleanup.principal_id,
+            }),
+        ) {
+            Ok(call) => match registry.send_raw(call.scheme, &call.request).await {
+                Ok(response)
+                    if response.get("status").and_then(|value| value.as_str()) == Some("ok") =>
+                {
+                    Ok(())
+                }
+                Ok(response) => Err(provider_response_error_message(&response).unwrap_or_else(
+                    || "exit provider returned an invalid close_stream response".into(),
+                )),
+                Err(err) => Err(format!("exit provider close_stream failed: {err}")),
+            },
+            Err((_status, message)) => Err(message),
+        },
+        None => Err("exit provider unavailable while closing Browser stream".to_string()),
     };
-    match registry.send_raw(call.scheme, &call.request).await {
-        Ok(response) if response.get("status").and_then(|value| value.as_str()) == Some("ok") => {
-            forget_browser_stream_cleanup_failure(
-                &state.data_dir,
-                call.request
-                    .get("stream_id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default(),
-            )
-            .await;
-            Ok(())
+    match (listener_result, provider_result) {
+        (Ok(()), Ok(())) => {
+            forget_browser_stream_cleanup_failure(&state.data_dir, &cleanup_for_failure).await
         }
-        Ok(response) => {
-            let message = provider_response_error_message(&response).unwrap_or_else(|| {
-                "exit provider returned an invalid close_stream response".into()
-            });
-            record_browser_stream_cleanup_failure(&state.data_dir, cleanup_for_failure).await;
-            Err(message)
-        }
-        Err(err) => {
-            record_browser_stream_cleanup_failure(&state.data_dir, cleanup_for_failure).await;
-            Err(format!("exit provider close_stream failed: {err}"))
+        (listener_result, provider_result) => {
+            record_browser_stream_cleanup_failure(&state.data_dir, cleanup_for_failure).await?;
+            Err(format!(
+                "Browser stream cleanup remains pending: listener={}; provider={}",
+                listener_result
+                    .err()
+                    .unwrap_or_else(|| "terminal".to_string()),
+                provider_result
+                    .err()
+                    .unwrap_or_else(|| "terminal".to_string()),
+            ))
         }
     }
 }
@@ -871,16 +3036,18 @@ pub(super) async fn browser_app_page_status(
     headers: HeaderMap,
     Path(page_id): Path<String>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
+    let owner_launch_id = authority.verified_context().launch_id().to_string();
     if !is_safe_runtime_id(&page_id) {
         return (StatusCode::BAD_REQUEST, "invalid browser page id").into_response();
     }
     let principal_id = context.principal_id;
-    if !touch_browser_page(&state.data_dir, &page_id, &principal_id).await {
+    if !touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id).await {
         return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
     }
     let call = match browser_provider_resource_call(
@@ -906,7 +3073,8 @@ pub(super) async fn browser_app_page_status(
     }
     match provider_response_data(&response) {
         Some(data) => {
-            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id).await;
+            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id)
+                .await;
             Json(data).into_response()
         }
         None => gateway_provider_error_response(
@@ -921,16 +3089,18 @@ pub(super) async fn browser_app_page_diagnostics(
     headers: HeaderMap,
     Path(page_id): Path<String>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
+    let owner_launch_id = authority.verified_context().launch_id().to_string();
     if !is_safe_runtime_id(&page_id) {
         return (StatusCode::BAD_REQUEST, "invalid browser page id").into_response();
     }
     let principal_id = context.principal_id;
-    if !touch_browser_page(&state.data_dir, &page_id, &principal_id).await {
+    if !touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id).await {
         return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
     }
     let call = match browser_provider_resource_call(
@@ -956,7 +3126,8 @@ pub(super) async fn browser_app_page_diagnostics(
     }
     match provider_response_data(&response) {
         Some(data) => {
-            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id).await;
+            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id)
+                .await;
             Json(data).into_response()
         }
         None => gateway_provider_error_response(
@@ -971,16 +3142,18 @@ pub(super) async fn browser_app_page_heartbeat(
     headers: HeaderMap,
     Path(page_id): Path<String>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
+    let owner_launch_id = authority.verified_context().launch_id().to_string();
     if !is_safe_runtime_id(&page_id) {
         return (StatusCode::BAD_REQUEST, "invalid browser page id").into_response();
     }
     let principal_id = context.principal_id;
-    if !touch_browser_page(&state.data_dir, &page_id, &principal_id).await {
+    if !touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id).await {
         return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
     }
     Json(serde_json::json!({
@@ -998,16 +3171,18 @@ pub(super) async fn browser_app_page_input(
     Path(page_id): Path<String>,
     Json(input): Json<BrowserInputRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
+    let owner_launch_id = authority.verified_context().launch_id().to_string();
     if !is_safe_runtime_id(&page_id) {
         return (StatusCode::BAD_REQUEST, "invalid browser page id").into_response();
     }
     let principal_id = context.principal_id;
-    if !touch_browser_page(&state.data_dir, &page_id, &principal_id).await {
+    if !touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id).await {
         return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
     }
     let event = input.event;
@@ -1021,9 +3196,14 @@ pub(super) async fn browser_app_page_input(
         .unwrap_or_default();
     let navigation_url = event.get("url").and_then(|value| value.as_str());
     if browser_command && matches!(command, "navigate" | "back" | "forward" | "reload") {
-        let _ =
-            mark_browser_page_navigating(&state.data_dir, &page_id, &principal_id, navigation_url)
-                .await;
+        let _ = mark_browser_page_navigating(
+            &state.data_dir,
+            &page_id,
+            &principal_id,
+            &owner_launch_id,
+            navigation_url,
+        )
+        .await;
     }
     let call = match browser_provider_resource_call(
         "browser-engine",
@@ -1041,21 +3221,39 @@ pub(super) async fn browser_app_page_input(
     let response = match browser_provider_resource_response(&state, call).await {
         Ok(value) => value,
         Err((_status, message)) => {
-            let _ =
-                mark_browser_page_failed(&state.data_dir, &page_id, &principal_id, message.clone())
-                    .await;
+            let _ = mark_browser_page_failed(
+                &state.data_dir,
+                &page_id,
+                &principal_id,
+                &owner_launch_id,
+                message.clone(),
+            )
+            .await;
             return gateway_provider_error_response("browser-engine", anyhow::anyhow!(message));
         }
     };
     if let Some(message) = provider_response_error_message(&response) {
-        let _ = mark_browser_page_failed(&state.data_dir, &page_id, &principal_id, message.clone())
-            .await;
+        let _ = mark_browser_page_failed(
+            &state.data_dir,
+            &page_id,
+            &principal_id,
+            &owner_launch_id,
+            message.clone(),
+        )
+        .await;
         return gateway_provider_error_response("browser-engine", anyhow::anyhow!(message));
     }
     match provider_response_data(&response) {
         Some(data) => {
-            let _ = mark_browser_page_active(&state.data_dir, &page_id, &principal_id).await;
-            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id).await;
+            let _ = mark_browser_page_active(
+                &state.data_dir,
+                &page_id,
+                &principal_id,
+                &owner_launch_id,
+            )
+            .await;
+            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id)
+                .await;
             Json(data).into_response()
         }
         None => {
@@ -1063,6 +3261,7 @@ pub(super) async fn browser_app_page_input(
                 &state.data_dir,
                 &page_id,
                 &principal_id,
+                &owner_launch_id,
                 "browser-engine provider returned an invalid input response",
             )
             .await;
@@ -1078,101 +3277,273 @@ pub(super) async fn browser_app_page_close(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     Path(page_id): Path<String>,
+    close_request: Option<Json<BrowserPageCloseRequest>>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
+    let owner_launch_id = authority.verified_context().launch_id().to_string();
     if !is_safe_runtime_id(&page_id) {
         return (StatusCode::BAD_REQUEST, "invalid browser page id").into_response();
     }
     let principal_id = context.principal_id;
-    if !touch_browser_page(&state.data_dir, &page_id, &principal_id).await {
+    let (cleanup_id, requested_browser_instance) = match close_request {
+        Some(Json(request)) => {
+            if request.schema != "elastos.browser.close-request/v2"
+                || request.cleanup_id.len() > 128
+                || !is_safe_runtime_id(&request.cleanup_id)
+            {
+                return (StatusCode::BAD_REQUEST, "invalid Browser cleanup handle").into_response();
+            }
+            let browser_instance = match browser_instance_id(request.browser_instance) {
+                Ok(browser_instance) => browser_instance,
+                Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+            };
+            (request.cleanup_id, browser_instance)
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Browser close requires an opaque Runtime cleanup handle",
+            )
+                .into_response()
+        }
+    };
+    let page_cleanup = match browser_page_cleanup_for_principal(
+        &state.data_dir,
+        &page_id,
+        &principal_id,
+        &owner_launch_id,
+        &cleanup_id,
+    )
+    .await
+    {
+        Ok(Some(cleanup)) => cleanup,
+        Ok(None) => {
+            match browser_reaped_page_tombstone_matches(
+                &state.data_dir,
+                &page_id,
+                &principal_id,
+                &owner_launch_id,
+                &cleanup_id,
+                requested_browser_instance.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(receipt)) => {
+                    return Json(browser_public_already_absent_close_receipt(
+                        &page_id,
+                        &cleanup_id,
+                        receipt.browser_instance.as_deref(),
+                    ))
+                    .into_response();
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+                }
+            }
+            return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
+        }
+        Err(message) => return (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+    };
+    let cleanup_owner_launch_id = page_cleanup.engine_cleanup.owner_launch_id.clone();
+    let cleanup_browser_instance = page_cleanup.engine_cleanup.browser_instance.as_deref();
+    let supplied_instance_matches = requested_browser_instance
+        .as_deref()
+        .is_some_and(|instance| cleanup_browser_instance == Some(instance));
+    if (cleanup_owner_launch_id != owner_launch_id || requested_browser_instance.is_some())
+        && !supplied_instance_matches
+    {
         return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
     }
-    let _ = mark_browser_page_retiring(&state.data_dir, &page_id, &principal_id).await;
-    let call = match browser_provider_resource_call(
-        "browser-engine",
-        "close_page",
-        "elastos://browser-engine/close_page".to_string(),
-        serde_json::json!({
-            "page_id": page_id,
-            "principal_id": principal_id.clone(),
-        }),
-    ) {
-        Ok(call) => call,
-        Err((status, message)) => return (status, message).into_response(),
-    };
-    let response = match browser_provider_resource_response(&state, call).await {
-        Ok(value) => value,
-        Err((_status, message)) => {
-            if let Some(receipt) = browser_close_reconciled_receipt(&page_id, &message) {
-                if let Err(err) =
-                    release_browser_page_and_stream_for_principal(&state, &page_id, &principal_id)
-                        .await
-                {
-                    return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
-                }
-                return Json(receipt).into_response();
-            }
-            let _ =
-                mark_browser_page_failed(&state.data_dir, &page_id, &principal_id, message.clone())
-                    .await;
-            return gateway_provider_error_response("browser-engine", anyhow::anyhow!(message));
-        }
-    };
-    if let Some(message) = provider_response_error_message(&response) {
-        if let Some(receipt) = browser_close_reconciled_receipt(&page_id, &message) {
-            if let Err(err) =
-                release_browser_page_and_stream_for_principal(&state, &page_id, &principal_id).await
-            {
-                return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
-            }
-            return Json(receipt).into_response();
-        }
-        let _ = mark_browser_page_failed(&state.data_dir, &page_id, &principal_id, message.clone())
-            .await;
-        return gateway_provider_error_response("browser-engine", anyhow::anyhow!(message));
+    if page_cleanup.active_session {
+        let _ = mark_browser_page_retiring(
+            &state.data_dir,
+            &page_id,
+            &principal_id,
+            &cleanup_owner_launch_id,
+        )
+        .await;
     }
-    match provider_response_data(&response) {
-        Some(data) => {
-            if let Err(err) =
-                release_browser_page_and_stream_for_principal(&state, &page_id, &principal_id).await
-            {
-                return (StatusCode::SERVICE_UNAVAILABLE, err).into_response();
-            }
-            Json(data).into_response()
-        }
-        None => gateway_provider_error_response(
-            "browser-engine",
-            anyhow::anyhow!("browser-engine provider returned an invalid close-page response"),
-        ),
+    let engine_cleanup = page_cleanup.engine_cleanup.clone();
+    if let Err(message) = record_browser_engine_cleanup_obligation(
+        &state.data_dir,
+        engine_cleanup.clone(),
+        page_cleanup.stream_cleanup.clone(),
+    )
+    .await
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+    }
+    let engine_result = attempt_browser_engine_cleanup(&state, &engine_cleanup).await;
+    let stream_result = if page_cleanup.active_session {
+        release_browser_page_and_stream_for_principal(
+            &state,
+            &page_id,
+            &principal_id,
+            &cleanup_owner_launch_id,
+        )
+        .await
+    } else {
+        close_browser_stream_cleanup(&state, page_cleanup.stream_cleanup).await
+    };
+    let terminal = if engine_result.is_ok() && stream_result.is_ok() {
+        commit_browser_terminal_cleanup(&state, &engine_cleanup, Some(&owner_launch_id)).await
+    } else {
+        release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
+        Ok(())
+    };
+    if let Err(message) = terminal {
+        release_browser_engine_cleanup_claim(&state.data_dir, &engine_cleanup).await;
+        return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+    }
+    if let Err(cleanup_err) = stream_result {
+        return (StatusCode::SERVICE_UNAVAILABLE, cleanup_err).into_response();
+    }
+    match engine_result {
+        Ok(receipt) => Json(browser_public_terminal_close_receipt(
+            &engine_cleanup,
+            &receipt,
+        ))
+        .into_response(),
+        Err(message) => gateway_provider_error_response("browser-engine", anyhow::anyhow!(message)),
     }
 }
 
-pub(super) fn browser_close_reconciled_receipt(
+fn browser_public_already_absent_close_receipt(
     page_id: &str,
-    message: &str,
-) -> Option<serde_json::Value> {
-    if !message.contains("engine_process_unavailable")
-        || !message.contains("no page-scoped engine control session")
-    {
-        return None;
-    }
-    Some(serde_json::json!({
+    cleanup_id: &str,
+    browser_instance: Option<&str>,
+) -> serde_json::Value {
+    let mut receipt = serde_json::json!({
         "schema": "elastos.browser.close-result/v1",
         "page_id": page_id,
-        "closed": true,
+        "closed": false,
         "already_closed": true,
-        "reconciled": true,
-        "control_error": message,
+        "cleanup_id": cleanup_id,
+        "terminal_effects": {
+            "page_absent": true
+        },
         "cleanup": {
             "schema": "elastos.browser.runtime-session-cleanup/v1",
             "ok": true,
-            "action": "released_runtime_browser_session_after_missing_engine_control"
+            "action": "already_absent"
         }
-    }))
+    });
+    if let Some(browser_instance) = browser_instance {
+        receipt["browser_instance"] = serde_json::json!(browser_instance);
+    }
+    receipt
+}
+
+fn browser_public_terminal_close_receipt(
+    cleanup: &BrowserEngineCleanup,
+    receipt: &serde_json::Value,
+) -> serde_json::Value {
+    let mut public_receipt = serde_json::json!({
+        "schema": "elastos.browser.close-result/v1",
+        "page_id": cleanup.page_id,
+        "closed": true,
+        "cleanup_id": cleanup.cleanup_id,
+        "terminal_effects": {
+            "page_absent": receipt["effects"]["page_absent"],
+            "child_absent": receipt["effects"]["child_absent"],
+            "vm_absent": receipt["effects"]["vm_absent"],
+            "route_absent": receipt["effects"]["route_absent"],
+            "socket_absent": receipt["effects"]["socket_absent"]
+        },
+        "cleanup": {
+            "schema": "elastos.browser.runtime-session-cleanup/v1",
+            "ok": true,
+            "action": "released_exact_runtime_browser_ownership"
+        }
+    });
+    if let Some(browser_instance) = cleanup.browser_instance.as_deref() {
+        public_receipt["browser_instance"] = serde_json::json!(browser_instance);
+    }
+    if let (Some(authority), Some(transport_receipt)) = (
+        cleanup.provider_cleanup.get("transport_authority"),
+        cleanup.provider_cleanup.get("transport_receipt"),
+    ) {
+        if let Ok(proof) = browser_vz_public_transport_proof(authority, transport_receipt) {
+            public_receipt["transport_proof"] = proof;
+            for effect in [
+                "transport_session_absent",
+                "turn_process_absent",
+                "turn_listener_absent",
+                "turn_relay_ports_absent",
+                "ordinary_vsock_bridge_absent",
+                "media_vsock_bridge_absent",
+                "bootstrap_vsock_bridge_absent",
+                "hibernation_state_absent",
+            ] {
+                public_receipt["terminal_effects"][effect] = receipt["effects"][effect].clone();
+            }
+        }
+    }
+    public_receipt
+}
+
+pub(super) fn browser_terminal_close_receipt(
+    cleanup: &BrowserEngineCleanup,
+    data: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let expected_binding = &cleanup.provider_cleanup;
+    let transport_effects_terminal = expected_binding.get("transport_authority").is_none()
+        || [
+            "transport_session_absent",
+            "turn_process_absent",
+            "turn_listener_absent",
+            "turn_relay_ports_absent",
+            "ordinary_vsock_bridge_absent",
+            "media_vsock_bridge_absent",
+            "bootstrap_vsock_bridge_absent",
+            "hibernation_state_absent",
+        ]
+        .iter()
+        .all(|effect| {
+            data.pointer(&format!("/effects/{effect}"))
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        });
+    let terminal = data.get("schema").and_then(|value| value.as_str())
+        == Some(BROWSER_ENGINE_CLEANUP_RESULT_SCHEMA)
+        && data.get("page_id").and_then(|value| value.as_str()) == Some(cleanup.page_id.as_str())
+        && data.get("generation").and_then(|value| value.as_str())
+            == Some(cleanup.generation.as_str())
+        && data.get("binding") == Some(expected_binding)
+        && data.get("terminal").and_then(|value| value.as_bool()) == Some(true)
+        && data
+            .pointer("/effects/page_absent")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        && data
+            .pointer("/effects/child_absent")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        && data
+            .pointer("/effects/vm_absent")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        && data
+            .pointer("/effects/route_absent")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        && data
+            .pointer("/effects/socket_absent")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        && transport_effects_terminal;
+    if !terminal {
+        return Err(
+            "browser-engine provider did not prove exact terminal cleanup ownership".to_string(),
+        );
+    }
+    Ok(data)
 }
 
 pub(super) async fn browser_app_page_webrtc(
@@ -1181,11 +3552,13 @@ pub(super) async fn browser_app_page_webrtc(
     Path(page_id): Path<String>,
     Json(input): Json<BrowserWebrtcSignalRequest>,
 ) -> Response {
-    let context =
-        match require_home_launch_token_context(&state.data_dir, &headers, BROWSER_CAPSULE_ID) {
-            Ok(context) => context,
+    let authority =
+        match require_runtime_wallet_authority(&state.data_dir, &headers, &[BROWSER_CAPSULE_ID]) {
+            Ok(authority) => authority,
             Err(err) => return gateway_provider_error_response("browser", err),
         };
+    let context = authority.home_launch_context();
+    let owner_launch_id = authority.verified_context().launch_id().to_string();
     if !is_safe_runtime_id(&page_id) {
         return (StatusCode::BAD_REQUEST, "invalid browser page id").into_response();
     }
@@ -1203,12 +3576,27 @@ pub(super) async fn browser_app_page_webrtc(
         }
     }
     .to_string();
-    let signal = match browser_webrtc_signal_value(input) {
+    let mut signal = match browser_webrtc_signal_value(input) {
         Ok(signal) => signal,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
-    if !touch_browser_page(&state.data_dir, &page_id, &principal_id).await {
-        return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
+    let transport_authority = match touch_browser_page_transport_authority(
+        &state.data_dir,
+        &page_id,
+        &principal_id,
+        &owner_launch_id,
+    )
+    .await
+    {
+        Some(authority) => authority,
+        None => {
+            return (StatusCode::NOT_FOUND, "browser session is not active").into_response();
+        }
+    };
+    if let Some(authority) = transport_authority.as_ref() {
+        if let Err(message) = normalize_browser_vz_webrtc_signal(authority, &mut signal) {
+            return gateway_provider_error_response("browser", anyhow::anyhow!(message));
+        }
     }
     let call = match browser_provider_resource_call(
         "browser-engine",
@@ -1244,9 +3632,62 @@ pub(super) async fn browser_app_page_webrtc(
     };
     match validate_browser_webrtc_response(&signal_type, data) {
         Ok(data) => {
-            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id).await;
+            let _ = touch_browser_page(&state.data_dir, &page_id, &principal_id, &owner_launch_id)
+                .await;
             Json(data).into_response()
         }
         Err(err) => gateway_provider_error_response("browser-engine", err),
+    }
+}
+
+#[cfg(test)]
+mod browser_open_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn failed_open_serializes_cleanup_pending_separately_from_pre_effect_failure() {
+        let pending = BrowserOpenFailure::text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Browser cleanup remains owned by Runtime",
+        )
+        .with_outcome(browser_cleanup_pending_outcome(true, true, false))
+        .status_value();
+        let pre_effect = BrowserOpenFailure::text(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Browser VM was not acquired",
+        )
+        .status_value();
+
+        assert_eq!(pending["outcome"]["state"], "cleanup_pending");
+        assert_eq!(pending["outcome"]["effects"]["page_acquired"], true);
+        assert_eq!(
+            pre_effect["outcome"]["state"],
+            "terminal_pre_effect_failure"
+        );
+        assert_eq!(pre_effect["outcome"]["effects"]["page_acquired"], false);
+        assert_eq!(pre_effect["outcome"]["effects"]["vm_acquired"], false);
+    }
+
+    #[test]
+    fn dispatched_runtime_failures_remain_indeterminate_without_typed_settlement() {
+        assert!(matches!(
+            browser_launch_reconciliation_decision(Ok(
+                BrowserDispatchedLaunchReconciliation::CleanupPending
+            )),
+            BrowserLaunchReconciliationDecision::RetainIndeterminate(None)
+        ));
+        assert!(matches!(
+            browser_launch_reconciliation_decision(Err(
+                "injected Runtime reconciliation timeout".to_string()
+            )),
+            BrowserLaunchReconciliationDecision::RetainIndeterminate(Some(message))
+                if message == "injected Runtime reconciliation timeout"
+        ));
+        assert!(matches!(
+            browser_launch_reconciliation_decision(Ok(
+                BrowserDispatchedLaunchReconciliation::DidNotAct
+            )),
+            BrowserLaunchReconciliationDecision::DidNotAct
+        ));
     }
 }

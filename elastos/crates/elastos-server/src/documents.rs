@@ -739,6 +739,16 @@ fn documents_principal_root_uri(principal_id: &str) -> anyhow::Result<String> {
     Ok(crate::auth::principal_localhost_root(principal_id))
 }
 
+pub(crate) fn principal_root_protected_object_inventory(
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    vec![
+        crate::auth::PrincipalRootProtectedObjectDeclarationV1::root(format!(
+            "{localhost_root}/Documents"
+        )),
+    ]
+}
+
 fn documents_root(data_dir: &Path, principal_id: &str) -> anyhow::Result<PathBuf> {
     let root_uri = documents_principal_root_uri(principal_id)?;
     let rooted_path = root_uri

@@ -64,6 +64,8 @@ HOME="$tmp_dir/home" \
 XDG_DATA_HOME="$tmp_dir/xdg" \
 ELASTOS_NODE_BIN="$node_bin" \
 ELASTOS_BROWSER_RUNTIME_TURN_ENV="$shared_turn_env" \
+ELASTOS_BROWSER_VZ_TURN_ADVERTISED_HOST="192.168.65.1" \
+ELASTOS_BROWSER_VZ_TURN_RELAY_HOST="192.168.65.1" \
 SETUP_SOURCE_HOME_CONFIG_ONLY=1 \
   "$repo_root/scripts/setup-source-home.sh" >"$tmp_dir/setup-source-home.log"
 
@@ -113,6 +115,21 @@ for (const key of [
   if (Object.prototype.hasOwnProperty.call(env, key)) {
     throw new Error(`remote VZ setup must not inherit local ${key}`);
   }
+}
+NODE
+
+"$node_bin" - "$data_dir/config/browser-vz-vsock-transport.json" <<'NODE'
+const fs = require("node:fs");
+const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (
+  config.schema !== "elastos.browser.vz-transport-config/v1" ||
+  config.turn_advertised_host !== "192.168.65.1" ||
+  config.turn_relay_host !== "192.168.65.1"
+) {
+  throw new Error("remote VZ setup did not issue exact no-NIC transport config");
+}
+if ((fs.statSync(process.argv[2]).mode & 0o077) !== 0) {
+  throw new Error("remote VZ setup transport config is not owner-only");
 }
 NODE
 

@@ -15,16 +15,46 @@ Do not add new product surface area until the `Now` section is materially tighte
 Read this section as strict priority order for this branch. Do not start a lower
 section if a higher section is incoherent, unverified, or too large to review.
 
+### 0.6 release follow-up boundary
+
+- [ ] Keep Browser included but explicitly limited: address intermittent
+  restart, non-retained `ela.city` login, and slow performance before claiming
+  full Browser reliability. Preserve exact-once Wallet approval and
+  Runtime-only networking while fixing these issues.
+- [ ] Decide the post-0.6 policy for plaintext principal roots. The current
+  hidden upgrade migrates only roots that already have protection metadata; it
+  is not a general 0.5-to-0.6 data migration. Either provide an explicit,
+  user-approved reset for unprotected roots or design a separately reviewed
+  migration, then remove compatibility machinery that has no supported user
+  journey.
+- [ ] Replace administrative Browser cleanup retirement with provider-owned
+  durable child/process identities and idempotent terminal cleanup receipts.
+  Restart recovery must settle exact obligations from explicit retained
+  identity, not process-list, port-availability, or socket-inactivity inference.
+- [ ] Review `feat/shell-ui-esp-on-protocol` as a post-0.6 product line. Do not
+  replay its obsolete protocol/auth history or extended AI work; require small,
+  independently testable UI commits against the released ESP contracts.
+- [ ] Resume Carrier reconciliation for 0.7 only after its provider generation,
+  multi-node physical evidence, cleanup, and release boundaries are reviewed.
+
 ### 0. Branch readiness and reviewability
-- [ ] Keep branch assumptions current: `main` is the 0.5.0 baseline,
-  `feat/elastos-shell-protocol` is the active Components, ElastOS Bus, and shell-protocol work
-  branch based on `upstream/0.6-dev`; require tested, clean, reviewable slices
-  before publishing it for review.
+- [ ] Keep branch assumptions current: `main` is the 0.5.0 baseline and
+  `fix/elastos-shell-protocol-browser-wallet-consolidation` is the published
+  0.6.0 review line based on `feat/elastos-shell-protocol`, which descends from
+  `upstream/0.6-dev`. It is not merged or released; review its ordered commits
+  and release matrix before either action.
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
 - [ ] Keep oversized-file cleanup frozen unless branch review exposes a concrete no-behavior blocker. The existing Browser/Wallet/provider cleanup is already split into focused sibling modules: Browser gateway, Wallet gateway, Wallet UI send/receive/create/request/state/preference flows, wallet-provider EVM crypto, and wallet-provider approval test groups. Keep those seams stable and verified. Do not split `capsules/browser/browser/browser.js` further unless a diagnostic-frame/session seam is proven mechanical and behavior-free. Treat `gateway_tests/room.rs`, `gateway_room.rs`, `gateway_tests/home_system.rs`, `room_service.rs`, `auth_gateway.rs`, and `home_cmd.rs` as later cleanup unless they become direct release-review blockers. Keep `scripts/home-entropy-check.mjs` as a broad alignment gate for now, but do not let it accumulate new product logic. Each future split must be no-behavior, separately testable, and covered by the narrow Rust/JS smoke commands for that surface.
 - [ ] Review this branch in authority-bound slices, not as one Browser mega-diff: content availability/protected content providers, chain provider core, auth/recovery core, Wallet authority surface, Home/System UX, Chat/Carrier updates, capsule authority manifests, Browser ABI/adapter, Browser proof tooling, shared runtime/gateway, then release/registry/docs. Each slice must be a coherent commit with its own verification commands. Shared runtime/gateway hunks require manual hunk-level review because they cross provider boundaries. Keep `chain_provider_core` separate from Browser: typed proof, prepare, broadcast, sync health, and node lifecycle are blockchain-quadrant provider work, even when Browser consumes them through Wallet. Keep `auth_recovery_core` separate from route wiring: passkey/WebAuthn verification, proof-bound sessions, principal roots, and Recovery Kit helpers are authority primitives consumed by Home/System/Wallet gateway routes. The Wallet authority surface should be reviewed as provider authority core, Wallet app and connector capsules, then gateway/Inbox/audit wiring only after shared gateway hunks are isolated. For Home/System UX, run `node scripts/home-passkey-virtual-auth-smoke.mjs` on loopback Home to prove signed passkey journeys without a human cookie, then run the Camofox smokes for layout coverage. For Browser ABI/provider work, run the Browser Rust tests, `scripts/check-wci-alignment.sh`, `node scripts/home-entropy-check.mjs`, `node scripts/browser-display-mode-smoke.mjs`, `scripts/browser-wallet-bridge-smoke.sh`, and `scripts/browser-glide-wallet-smoke.sh`. Browser proof tooling must keep provider decision reports, objective audits, and runbooks structured and fail closed while product media/manual evidence is missing. Each slice must name its verification commands and must not claim Browser completion unless `scripts/browser-objective-audit.mjs` passes with accepted product media plus matching manual UX evidence.
-- [ ] Keep 0.5.0 reconciliation closed and reviewable: Browser ABI/runtime adapters, Home/System/Inbox/Library browser-hosted UX, Wallet/approval/chain Browser bridge work, Carrier/chat/Remote Carrier Exit transport, protected content/dKMS/dDRM/provider contracts, and release/install/registry/docs cleanup are reconciled in [state.md](state.md). Before claiming completeness, run reusable gates directly: `git diff --check`, `node scripts/home-entropy-check.mjs`, `node scripts/browser-entropy-check.mjs`, `bash scripts/check-wci-alignment.sh`, `just candidate-command-audit`, and the touched-surface Rust/capsule tests. Do not reopen a slice unless a newly proven Mac, Jetson, or server delta is identified with its owner slice and verification command.
-- [ ] Treat Remote Carrier Exit as part of the Carrier slice: two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint evidence; the installed artifact readiness report and route-readiness report must be hash-bound; evidence for route readiness, installed artifact readiness, discovery, policy, accounting, stream transport, Browser proof, and cleanup must cite reviewed route nouns; the local Browser machine-proof artifact must cite the reviewed route target or target host; local artifacts must stay redacted, and remote paths need an explicit digest and review trail. Compose Inspector, Carrier-only authority, installed artifact readiness, route-readiness, operator evidence, Browser handoff, manual UX, performance/zoom, and clean-worktree proof before any full-goal claim.
+- [ ] Keep the accepted 0.6 reconciliation closed and reviewable: ESP, Wallet,
+  Recovery, Home authority, GBA, and the bounded Browser continuation are
+  reconciled in [state.md](state.md). Carrier reconciliation, the shell UI
+  redesign, and extended AI UI work remain excluded. Before claiming
+  completeness, run `git diff --check`, the Home and Browser entropy checks,
+  WCI alignment, `just candidate-command-audit`, and touched-surface tests.
+  Reopen a slice only for a newly proven release-candidate defect with a named
+  owner and verification command.
+- [ ] Treat Remote Carrier Exit as part of the Carrier slice: two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint evidence; the installed artifact readiness report and route-readiness report must be hash-bound; evidence for route readiness, installed artifact readiness, discovery, policy, accounting, stream transport, Browser proof, and cleanup must cite reviewed route nouns; the local Browser machine-proof artifact must cite the reviewed route target or target host; local artifacts must stay redacted, and remote paths need an explicit digest and review trail. Compose Inspector, typed Runtime authority, installed artifact readiness, route-readiness, operator evidence, Browser handoff, manual UX, performance/zoom, and clean-worktree proof before any full-goal claim.
 - [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` where protected-content providers are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
 - [ ] Do not add visible UI, protocol surface, provider behavior, or blockchain hooks unless the runtime capability path, fail-closed behavior, and docs contract are already explicit.
 - [ ] Keep first-party capsule projection validation covered by
@@ -35,9 +65,9 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Keep the Browser provider proof language explicit: Selkies is the current self-hosted baseline, not the acceptance answer. Native/browser-product proof must stay tied to `browser-native-supervisor-smoke.sh`, `browser-native-proxy-engine-smoke.sh`, `browser-native-supervisor-proxy-smoke.sh`, `browser-native-operator-config.mjs`, and `browser-native-target-preflight.sh`; Browser wallet connector effects must keep `wallet-connector-transaction-smoke.mjs` in the verification set.
 - [ ] Keep protected-content release claims exact: `scripts/browser-ela-city-protected-content-open-smoke.sh` proves that Runtime Browser can open the known `ela.city` protected-content route and cleanly release the page session, and the current branch has a funded live purchase/playback proof for the known test path. Release notes may cite that current user journey, but must not claim arbitrary protected-content readiness, production dDRM completeness, dKMS readiness, or generic decrypt/render provider completion.
 
-### 0.5.0 baseline preservation on the 0.6-dev integration line
-- [ ] Review execution order for preserving 0.5.0 behavior while reviewing
-  `feat/elastos-shell-protocol` on its `upstream/0.6-dev` base:
+### 0.6.0 release-candidate preservation
+- [ ] Review execution order for preserving the accepted 0.6.0 candidate on
+  its `upstream/0.6-dev` base:
   1. Keep reusable source/review gates green on this branch:
      `git diff --check`, `node scripts/home-entropy-check.mjs`,
      `node scripts/browser-entropy-check.mjs`,
@@ -61,7 +91,7 @@ section if a higher section is incoherent, unverified, or too large to review.
   5. Keep source/local Carrier setup proof green with
      `scripts/local-carrier-setup-smoke.sh` before a candidate gateway exists.
      Candidate public install proof with the branch binary needs a staged or
-     published 0.5.0-compatible manifest with the current `home` profile and
+     published 0.6.0-compatible manifest with the current `home` profile and
      checksummed artifacts; then rerun `scripts/public-install-identity-smoke.sh`
      and `scripts/public-install-home-frontdoor-smoke.sh` with
      `ELASTOS_PUBLISHER_GATEWAY=<candidate-url>` and the branch binary override.
@@ -81,14 +111,16 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Browser wallet/product UX slice: prove Browser wallet dapp flows through Runtime-mediated Wallet/Inbox authority, including the known `ela.city` buy-result mismatch, EIP-1193 `eth_sendTransaction` return/receipt shape, account discovery/chain switching, and explicit audio/video/input manual evidence. Run `scripts/auth-wallet-focus-smoke.sh`, Browser wallet smokes, and the manual UX report before any Browser product-readiness claim.
   Current source smokes must be rerun before release proof; manual audio/video/input UX evidence remains open.
 - [ ] Installed Home/device proof slice: prove installed `elastos -> Home -> app -> Home` on Mac and Jetson, including live `/apps/home/`, app launch/focus/close, return-home behavior, provider manifest availability, and no source-tree-only assumptions. Keep host adapters behind Runtime contracts instead of branching product behavior per machine.
-- [ ] Release package/registry slice: stamp or verify provider component checksums, keep the current `home` publish preflight/dry-run receipt valid, verify installed provider manifests on the target data dirs, decide whether Browser VM helper/rootfs/initrd artifacts remain source-home generated via `scripts/setup-source-home.sh` plus `scripts/browser-vm-target-refresh.sh` or become explicit `components.json` release components, publish the 0.5.0 binary/artifact set so no-override public installed-path smokes use current code, and make changelog/release claims match only the proofs that passed on real target hosts.
+- [ ] Release package/registry slice: stamp or verify provider component checksums, keep the current `home` publish preflight/dry-run receipt valid, verify installed provider manifests on the target data dirs, decide whether Browser VM helper/rootfs/initrd artifacts remain source-home generated via `scripts/setup-source-home.sh` plus `scripts/browser-vm-target-refresh.sh` or become explicit `components.json` release components, publish the 0.6.0 binary/artifact set so no-override public installed-path smokes use current code, and make changelog/release claims match only the proofs that passed on real target hosts.
 - [ ] Final entropy slice: remove only proven-unused reconciliation leftovers, stale display paths, stale work logs, duplicate truth surfaces, generated artifacts, and target backups after they are either archived or intentionally retained. Do not add compatibility shims for removed `runtime_frame`, `diagnostic_frame`, screenshot, image-polling, or host-specific browser paths unless a current shipped caller is proven.
 
 ### 1. Blockchain quadrant: identity, wallet, auth, node capsules
 - [ ] Enforce the blockchain quadrant contract in code before UI: runtime principal, verified proof bindings, short-lived session grants, scoped capabilities, provider-mediated effects, signed audit, and fail-closed behavior.
 - [ ] Keep `scripts/wallet-product-safety-smoke.sh` green before release publish. It is the product-level Wallet safety gate for MetaMask multi-account link/remove, passkey-gated built-in account delete and recovery-key export/import, WalletConnect disabled without pinned operator config, Ledger hidden until implemented, and no hosted Browser UniSat injection path.
 - [ ] Make recovery semantics impossible to misunderstand before release publish: System's `Download Recovery Kit` must export one password-protectable full bundle containing the principal-owned Home/user data root plus every recoverable built-in Wallet key for that principal. Individual `elastos.wallet.recovery-key/v1` export/import remains an advanced per-account escape hatch. External wallets such as MetaMask, WalletConnect, Ledger, Essentials, and UniSat can only restore links/metadata because their private keys live outside ElastOS. Deleting a built-in wallet must warn when no full bundle or individual Wallet key has been saved, and the main Wallet view must offer both `Create account` and `Import Wallet key` without sending users to Settings.
-- [ ] Make "capsules know only Carrier" enforceable for blockchain work: wallet, DID, and node operations must be invoked through Carrier-style capability envelopes even when routed locally.
+- [ ] Keep the capsule boundary canonical: capsules invoke typed ElastOS Bus
+  resources for Wallet, DID, Chain, and other effects. Carrier is an optional
+  authenticated transport adapter behind those resources, not the capsule API.
 - [ ] Keep app/viewer/content capsules away from wallet RPC, node RPC, raw HTTP ports, chain SDKs, and private-key material; only wallet/node provider capsules may hold those authorities.
 - [ ] Keep principals, proof bindings, and sessions separate. Principals are people, agents, devices, capsules, and providers. Wallet addresses, BTC addresses, `did:key`, and `did:elastos` are proof bindings. Sessions are ephemeral grant contexts, not identities.
 - [ ] Separate signing roles explicitly: device DID, human/persona DID, agent DID, capsule/provider DID, publisher DID, optional object/head identity, and session grant. Define which identity signs launch grants, Carrier envelopes, package manifests, published objects, credentials, global name claims, and access rights.
@@ -100,8 +132,9 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Make recovery and migration user-friendly and quantum-conscious behind `elastos.recovery-kit/v1`: add client-side WebAuthn PRF wrapping without sending raw PRF output to the runtime, add DID-envelope unwrap or rewrap before claiming DID-only recovery, add `did:elastos`/EID resolver-backed proof verification, and implement future ML-KEM/ML-DSA/SLH-DSA/HQC envelopes.
 - [ ] Keep WebAuthn RP policy operationally explicit: production Home needs a stable HTTPS RP domain, local development uses `localhost` as a separate passkey world, and native/mobile hosts need an explicit host-auth adapter rather than a header-based bypass.
 - [ ] Add WalletConnect as a dedicated connector capsule, not as authority inside ordinary apps and not as raw SDK state inside app capsules. `wallet-provider` owns proof bindings, approvals, receipts, and audit; `wallet-walletconnect` owns only Reown/AppKit browser UX plus an operator-pinned local adapter. Do not commit a bundled default Reown Project ID; official deployments and independent operators must pin their own runtime config and local SDK asset before the visible connector path is enabled.
+- [ ] Move the inherited hardcoded `wallet_connector_evm_chains` metadata out of Runtime gateway code and behind the provider-owned chain metadata boundary. Until then, treat the ESC/Base names, native currency fields, and RPC URLs returned by that helper as explicit provider-ownership debt, not Home, shell, or connector authority.
 - [ ] Add Essentials/ELA only after the pinned WalletConnect connector contract exists: use Essentials or Elastos Wallet JS SDK for ELA mainchain signing, with EID treated as an optional identity/proof adapter for credentials, recovery, publisher identity, verified service endpoints, and DAO operations, not as a default chain network.
-- [ ] Complete BTC proof/signing support beyond native P2WPKH and the first connector path. Keep UniSat as a dedicated connector capsule limited to Runtime challenges, native SegWit `bc1q...` accounts, connector-bound approval completion, and runtime-verified receipts. Pin broader BIP-322 script support, wallet compatibility, and test vectors before accepting more script types; give legacy message signing a weaker capability class before accepting it; keep all Bitcoin node credentials/ports inside `chain-provider`.
+- [ ] Complete real-wallet evidence and proof-strength policy for external BTC verification. Managed Bitcoin remains native P2WPKH. Source tests currently cover external BIP-322 simple P2WPKH/P2TR verification and Bitcoin signed-message P2PKH/P2SH-P2WPKH verification, but they are not real UniSat compatibility evidence. Pin real UniSat evidence for every claimed path and define the weaker capability policy for legacy signed-message proofs before making product or privileged-capability claims; keep all Bitcoin node credentials/ports inside `chain-provider`.
 - [ ] Treat UniversalX/Universal Accounts as optional onboarding and transaction UX adapters. They must never mint runtime principals, runtime sessions, or privileged capabilities directly.
 - [ ] Continue converging Wallet UX around one user mental model: Wallet -> Accounts -> balances/assets/activity -> approval methods. Add token/NFT asset reads, richer activity history, oracle/provider-backed price feeds, and fully wired send signers without exposing raw wallet RPC, chain RPC, node ports, HTTP/Web APIs, connector SDK authority, or private-key material to ordinary capsules. External HTTP pricing must stay disabled until it appears as an Inbox request and an admin explicitly approves the local price-source policy; actual HTTP price fetches must remain audited; the durable target is a typed oracle/price provider with signed receipts.
 - [ ] Keep DID/name/CID semantics explicit before coding beyond the first auth slice: `did:key` is the local device/node DID, passkey principals are local account roots, `did:elastos`/EID is the future global account/credential/namespace path, and CIDs identify immutable content graphs. Do not add `did:localhost` or treat local handles such as `alice` as global identity; globally scarce names need a chain/registry claim path that prevents double-claiming.
@@ -159,8 +192,8 @@ section if a higher section is incoherent, unverified, or too large to review.
 ## Next
 
 ### Capsule ABI stabilization
-- [ ] Use the readiness proof in
-  [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#readiness-proof) as the shared
+- [ ] Use the capsule contract in
+  [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md) as the shared
   acceptance contract across branches. Keep ownership narrow: ESP owns Bus v1
   and shell projections; component-runtime hardening owns admission and resource
   enforcement; capsule-package trust owns bundle identity and interface
@@ -187,10 +220,14 @@ section if a higher section is incoherent, unverified, or too large to review.
   do not add stream, lifecycle, cancellation, capacity, or object-handle
   semantics until they share one Runtime authorization, provider, audit, and
   cleanup path.
+- [ ] Port one small first-party product App to `elastos.component/v1` before
+  claiming Component/Bus product adoption. Keep the conformance fixture and
+  authoring template described as contract proof until that migration passes
+  installed lifecycle, authority, state, and UX evidence.
 - [ ] Implement the Browser Capsule architecture in [docs/BROWSER_CAPSULE.md](docs/BROWSER_CAPSULE.md): one Browser/Net/Exit ABI above platform-specific engine adapters, with no ambient host internet, no raw sockets, no raw DNS, no direct Runtime API exposure to web pages, no raw wallet/chain/storage authority, and profile/bookmark/download state rooted under the active principal.
 - [ ] Move Browser profile persistence into principal-owned `localhost://` state: cookies, localStorage, IndexedDB, service workers, permissions, bookmarks, history, and downloads must live under `localhost://Users/<principal>/BrowserProfiles/<profile>/...` or an equivalent provider-owned encrypted root, never a shared hosted-Chromium/container profile. This must preserve dapp sessions across refresh/restart, prevent admin/guest leakage, support Recovery Kit/migration, and be covered by tests proving two principals cannot read or mutate each other's browser profile state.
 - [ ] Define the Net/Exit provider contract separately from browser UI before improving the visible Browser surface. Runtime must validate Browser stream requests through Net, hand them to Exit only through explicit capability policy, keep HTTP-fetch proxying as a constrained compatibility/diagnostic capability, block LAN/private IP access by default, and hide private adapter/relay IPC descriptors from Browser UI responses.
-- [ ] Treat the current `browser` capsule as a Runtime Browser proof, not a final general-purpose browser. It may render public HTTPS pages through an operator-configured Exit policy, but it must not claim final native/microVM isolation, raw wallet compatibility, Carrier-only off-box networking, or product-quality media until those proofs land.
+- [ ] Treat the current `browser` capsule as a Runtime Browser proof, not a final general-purpose browser. It may render public HTTPS pages through an operator-configured Exit policy, but it must not claim final native/microVM isolation, raw wallet compatibility, general off-box Browser support, or product-quality media until those proofs land.
 - [ ] Keep the visible Browser on the stream/engine path, not host iframe or host tab browsing. Address requests must call `/api/apps/browser/open`; Runtime reserves streams through Net/Exit; Browser UI receives only a page id plus frame/input routes; `elastos://net/http` remains compatibility/diagnostic-only.
 - [ ] Finish the Browser Engine Adapter behind the internal `elastos://browser-engine/*` contract. Engine adapters must use operator-approved supervisor commands, Runtime-mediated Exit streams, no direct host TCP/DNS/HTTP, no wallet injection, no chain RPC, no raw host-network authority, and fail-closed display/input proofs.
 - [ ] Keep `browser-playwright-engine` diagnostic-only. It may exercise Runtime Exit, display-session, input, and wallet-bridge contracts, but it must never be treated as product Browser runtime or allowed to claim product audio/video acceptance.
@@ -240,7 +277,10 @@ section if a higher section is incoherent, unverified, or too large to review.
 
 ### Runtime primitives missing for the PC2 world-computer model
 - [ ] Replace hardcoded `Users/self` assumptions with first-class principals: passkey-owned user roots, user DID, device DID, personas, agents, active session, and capability tokens bound to principal + capsule + session.
-- [ ] Add authenticated Carrier envelopes as the default application contract: sender DID, object identity, signature, capability context, replay protection, and verified delivery status. Keep raw gossip/transport as an explicit unsafe/provider-level lane.
+- [ ] Add authenticated Carrier envelopes as an optional transport adapter
+  behind typed ElastOS Bus resources: sender DID, object identity, signature,
+  capability context, replay protection, and verified delivery status. Keep raw
+  gossip/transport as an explicit unsafe provider-level lane.
 - [ ] Keep the `object-provider` / `content-provider` ontology stable while completing the remaining World Computer object/content work: `object-provider` owns mutable principal-root objects, and `content-provider` owns published content identity, availability, and Carrier-backed delivery authority.
 - [ ] Extract pure object-provider core out of `elastos-server::library` into a smaller provider-core crate when modularity becomes the release bar: preserve the existing `object-provider` capsule/API boundary, move principal-root object request handling, path rules, archive/event helpers, and tests without changing Library behavior, and keep publish/share/availability authority separated through `content-provider` and Runtime coordination.
 - [ ] Keep Public placement and Published content separate in every Library/Home/Spaces surface: `Public` is a user-facing placement/projection under the active principal root, while `published_cid`/`elastos://<cid>` is the only public content-link truth. Do not add hidden auto-publish side effects for rename/move/copy/upload into Public; if auto-publish is desired later, make it an explicit user policy prompt backed by content-provider receipts.

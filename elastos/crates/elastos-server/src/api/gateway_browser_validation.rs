@@ -281,6 +281,34 @@ pub(in crate::api::gateway) fn is_safe_runtime_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
 }
 
+pub(in crate::api::gateway) fn browser_instance_id(
+    value: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let Some(identifier) = value.strip_prefix("browser:") else {
+        return Err("invalid Browser instance binding".to_string());
+    };
+    let compact = identifier.replace('-', "");
+    let hyphens_are_canonical = identifier.len() == 32
+        || (identifier.len() == 36
+            && identifier.as_bytes().get(8) == Some(&b'-')
+            && identifier.as_bytes().get(13) == Some(&b'-')
+            && identifier.as_bytes().get(18) == Some(&b'-')
+            && identifier.as_bytes().get(23) == Some(&b'-'));
+    if compact.len() != 32
+        || !compact
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || !hyphens_are_canonical
+    {
+        return Err("invalid Browser instance binding".to_string());
+    }
+    Ok(Some(value.to_string()))
+}
+
 pub(in crate::api::gateway) fn validate_browser_engine_page(
     page: serde_json::Value,
     expected_display_mode: BrowserDisplayMode,
@@ -290,6 +318,16 @@ pub(in crate::api::gateway) fn validate_browser_engine_page(
     {
         anyhow::bail!(
             "browser-engine provider did not return an elastos.browser.engine.page/v1 receipt"
+        );
+    }
+    if page.get("provider").and_then(|value| value.as_str()) != Some(BROWSER_ENGINE_PROVIDER_ID)
+        || page
+            .get("protocol_version")
+            .and_then(|value| value.as_str())
+            != Some(BROWSER_ENGINE_PROTOCOL_VERSION)
+    {
+        anyhow::bail!(
+            "browser-engine provider returned an unsupported provider identity or protocol version"
         );
     }
     if page.get("direct_network").and_then(|value| value.as_bool()) != Some(false) {
@@ -369,13 +407,18 @@ pub(in crate::api::gateway) fn validate_browser_engine_page(
         }
     }
     validate_browser_engine_guarantee(&page, expected_guarantee_level)?;
-    Ok(browser_visible_engine_page(&page))
+    Ok(browser_visible_engine_page(&page, expected_guarantee_level))
 }
 
-fn browser_visible_engine_page(page: &serde_json::Value) -> serde_json::Value {
+fn browser_visible_engine_page(
+    page: &serde_json::Value,
+    guarantee_level: BrowserGuaranteeLevel,
+) -> serde_json::Value {
     let mut visible = serde_json::Map::new();
     for key in [
         "schema",
+        "provider",
+        "protocol_version",
         "page_id",
         "adapter",
         "engine",
@@ -391,34 +434,41 @@ fn browser_visible_engine_page(page: &serde_json::Value) -> serde_json::Value {
         copy_browser_visible_field(&mut visible, page, key);
     }
     if let Some(display_session) = page.get("display_session") {
-        visible.insert(
-            "display_session".to_string(),
-            browser_visible_object_fields(
-                display_session,
-                &[
-                    "schema",
-                    "session_id",
-                    "mode",
-                    "width",
-                    "height",
-                    "network_mode",
-                    "direct_network",
-                    "input",
-                    "input_protocol",
-                    "display_backend",
-                    "backend_class",
-                    "media_transport",
-                    "audio",
-                    "video",
-                    "ice_servers",
-                    "offerer",
-                    "initial_offer",
-                    "audio_offer",
-                    "signaling_url",
-                    "surface_id",
-                ],
-            ),
+        let mut visible_display_session = browser_visible_object_fields(
+            display_session,
+            &[
+                "schema",
+                "session_id",
+                "mode",
+                "width",
+                "height",
+                "network_mode",
+                "direct_network",
+                "input",
+                "input_protocol",
+                "display_backend",
+                "backend_class",
+                "media_transport",
+                "audio",
+                "video",
+                "ice_servers",
+                "offerer",
+                "initial_offer",
+                "audio_offer",
+                "signaling_url",
+                "surface_id",
+            ],
         );
+        if guarantee_level == BrowserGuaranteeLevel::MechanismMicrovm {
+            copy_browser_visible_field(
+                visible_display_session
+                    .as_object_mut()
+                    .expect("Browser-visible display session is an object"),
+                display_session,
+                "ice_connection_policy",
+            );
+        }
+        visible.insert("display_session".to_string(), visible_display_session);
     }
     if let Some(view) = page.get("view") {
         visible.insert(
@@ -535,6 +585,20 @@ fn validate_browser_engine_guarantee(
                         "Browser VM WebRTC display must use runtime_relay media transport"
                     );
                 }
+                if page
+                    .pointer("/display_session/ice_connection_policy")
+                    .and_then(|value| value.as_str())
+                    != Some("engine_relay_only")
+                    || page.pointer("/display_session/ice_servers").is_some()
+                    || page
+                        .pointer("/display_session/offerer")
+                        .and_then(|value| value.as_str())
+                        != Some("engine")
+                {
+                    anyhow::bail!(
+                        "Browser VM WebRTC display must use engine_relay_only without Browser ICE credentials"
+                    );
+                }
             }
         }
         BrowserGuaranteeLevel::OperatorRbi => {
@@ -559,6 +623,28 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn browser_instance_binding_accepts_only_canonical_random_ids() {
+        for valid in [
+            "browser:00112233445566778899aabbccddeeff",
+            "browser:00112233-4455-6677-8899-aabbccddeeff",
+        ] {
+            assert_eq!(
+                browser_instance_id(Some(valid.to_string())).unwrap(),
+                Some(valid.to_string())
+            );
+        }
+        for invalid in [
+            "",
+            "browser:",
+            "browser:00112233445566778899AABBCCDDEEFF",
+            "browser:00112233-4455-6677-8899a-abbccddeeff",
+            "other:00112233445566778899aabbccddeeff",
+        ] {
+            assert!(browser_instance_id(Some(invalid.to_string())).is_err());
+        }
+    }
+
     fn page(
         display_mode: &str,
         view: serde_json::Value,
@@ -566,6 +652,8 @@ mod tests {
     ) -> serde_json::Value {
         json!({
             "schema": "elastos.browser.engine.page/v1",
+            "provider": "browser-engine-adapter",
+            "protocol_version": BROWSER_ENGINE_PROTOCOL_VERSION,
             "page_id": "page:test",
             "adapter": "test-adapter",
             "engine": "contract_proof",
@@ -603,6 +691,26 @@ mod tests {
             "network_mode": "runtime_net_only",
             "direct_network": false
         })
+    }
+
+    fn mechanism_microvm_page() -> serde_json::Value {
+        let mut display = webrtc_display(1920, 1080);
+        display["display_backend"] =
+            serde_json::Value::String("vm_selkies_gstreamer_webrtc".to_string());
+        display["media_transport"] = serde_json::Value::String("runtime_relay".to_string());
+        display["audio"] = serde_json::Value::Bool(true);
+        display["video"] = serde_json::Value::Bool(true);
+        display["offerer"] = serde_json::Value::String("engine".to_string());
+        display["ice_connection_policy"] =
+            serde_json::Value::String("engine_relay_only".to_string());
+        let mut page = page("webrtc_remote_display", browser_view(1280, 720), display);
+        page["engine"] = serde_json::Value::String("chromium_microvm".to_string());
+        page["isolation"] = json!({
+            "schema": "elastos.browser.engine.isolation/v1",
+            "kind": "per_launch_vm_target",
+            "session_dir": "/tmp/elastos-browser-vm-sessions/test"
+        });
+        page
     }
 
     #[test]
@@ -732,6 +840,56 @@ mod tests {
         assert!(visible.pointer("/view/control_socket_path").is_none());
         assert!(visible.pointer("/wallet_bridge/home_token").is_none());
         assert!(visible.pointer("/wallet_bridge/principal_id").is_none());
+    }
+
+    #[test]
+    fn mechanism_microvm_preserves_exact_engine_relay_policy_without_ice_credentials() {
+        let visible = validate_browser_engine_page(
+            mechanism_microvm_page(),
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+        )
+        .expect("valid VZ engine relay policy should remain Browser-visible");
+
+        assert_eq!(
+            visible["display_session"]["ice_connection_policy"],
+            "engine_relay_only"
+        );
+        assert!(visible["display_session"].get("ice_servers").is_none());
+    }
+
+    #[test]
+    fn mechanism_microvm_rejects_missing_or_credentialed_engine_relay_policy() {
+        let mut missing = mechanism_microvm_page();
+        missing["display_session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ice_connection_policy");
+        let missing_err = validate_browser_engine_page(
+            missing,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+        )
+        .expect_err("missing VZ engine relay policy must fail closed");
+        assert!(missing_err
+            .to_string()
+            .contains("must use engine_relay_only without Browser ICE credentials"));
+
+        let mut credentialed = mechanism_microvm_page();
+        credentialed["display_session"]["ice_servers"] = json!([{
+            "urls": ["turn:127.0.0.1:3478"],
+            "username": "guest-user",
+            "credential": "guest-secret"
+        }]);
+        let credentialed_err = validate_browser_engine_page(
+            credentialed,
+            BrowserDisplayMode::WebrtcRemoteDisplay,
+            BrowserGuaranteeLevel::MechanismMicrovm,
+        )
+        .expect_err("VZ guest TURN credentials must not become Browser-visible");
+        assert!(credentialed_err
+            .to_string()
+            .contains("must use engine_relay_only without Browser ICE credentials"));
     }
 
     #[test]

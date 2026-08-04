@@ -702,10 +702,9 @@ async fn test_chat_room_session_start_connects_open_room_local_runtime() {
     let launch = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -722,7 +721,7 @@ async fn test_chat_room_session_start_connects_open_room_local_runtime() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
                 .header("x-elastos-home-token", token.as_str())
@@ -752,10 +751,9 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
     let launch = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -773,7 +771,7 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
     let start = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
                 .header("x-elastos-home-token", token.as_str())
@@ -790,7 +788,7 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/invites/create-link")
                 .header("x-elastos-home-token", token.as_str())
@@ -848,10 +846,9 @@ async fn test_chat_room_session_start_requires_active_local_member_for_seeded_ro
     let launch = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -868,7 +865,7 @@ async fn test_chat_room_session_start_requires_active_local_member_for_seeded_ro
 
     let denied = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
                 .header("x-elastos-home-token", token.as_str())
@@ -909,10 +906,9 @@ async fn test_chat_room_session_start_connects_active_local_member() {
     let launch = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -929,7 +925,7 @@ async fn test_chat_room_session_start_connects_active_local_member() {
 
     let response = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
                 .header("x-elastos-home-token", token)
@@ -961,10 +957,9 @@ async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_c
     let launch = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -982,7 +977,7 @@ async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_c
     let send = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/objects/send")
                 .header("x-elastos-home-token", token.as_str())
@@ -1005,7 +1000,7 @@ async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_c
 
     let poll = app
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/poll")
                 .header("x-elastos-home-token", token.as_str())
@@ -1064,7 +1059,7 @@ async fn test_chat_room_shell_can_kick_guest_without_exposing_session_token() {
     let approve = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/chat-room/requests/{request_id}/approve"))
                 .header("x-elastos-home-token", &chat_token)
@@ -1098,7 +1093,7 @@ async fn test_chat_room_shell_can_kick_guest_without_exposing_session_token() {
     let kick = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/chat-room/guests/{session_id}/kick"))
                 .header("x-elastos-home-token", &chat_token)
@@ -1137,10 +1132,9 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
     let launch = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", authority.home_token.as_str())
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -1157,7 +1151,7 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
     let native_session = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
                 .header("x-elastos-home-token", home_token.as_str())
@@ -1237,10 +1231,9 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
     let launch = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "http://localhost:61180")
                 .method("POST")
                 .uri("/api/apps/home/launch")
-                .header(HOST, "localhost:61180")
                 .header("x-elastos-home-token", home_app_token(dir.path()))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"target":"chat-room"}"#))
@@ -1280,7 +1273,7 @@ async fn test_chat_room_shell_can_approve_browser_access_request() {
     let approve = app
         .clone()
         .oneshot(
-            Request::builder()
+            test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri(format!("/api/apps/chat-room/requests/{request_id}/approve"))
                 .header("x-elastos-home-token", home_token)

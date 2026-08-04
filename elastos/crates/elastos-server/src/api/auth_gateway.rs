@@ -8,11 +8,8 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
-use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{
-    header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE},
-    HeaderMap, HeaderValue, StatusCode,
-};
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -26,16 +23,20 @@ use elastos_runtime::auth::{
     PrincipalRootProtectorV1, PrincipalRootRecoveryArchiveV1, PrincipalRootRecoveryStatusV1,
     ProofBinding, ProofBindingKind, RecoveryKitV1, RuntimeAuditEventV1,
 };
+use elastos_wallet_contract::{
+    Erc1271ProofEvidenceV1, ManagedRecoveryKeyEntryV1, ManagedRecoverySetV1, PublicNetwork,
+    WalletProviderOperationV2, WalletResultV2,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::gateway::{
-    consume_fresh_passkey_home_token, home_session_cookie_header_for_token,
+    consume_passkey_step_up_token, home_session_cookie_header_for_token,
     is_wallet_connector_capsule_id, issue_home_launch_token_for_auth_grant,
-    login_avatar_bytes_for_credential, login_avatar_cid_for_principal, GatewayState,
-    HOME_CAPSULE_ID, WALLET_LINK_CAPSULE_IDS,
+    require_home_launch_token_binding, require_runtime_wallet_authority, runtime_wallet_authority,
+    GatewayState, RuntimeWalletAdapter, RuntimeWalletAuthority, HOME_CAPSULE_ID,
 };
 
 const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
@@ -47,10 +48,24 @@ const FULL_RECOVERY_BUNDLE_IMPORT_REQUEST_SCHEMA: &str =
     "elastos.full-recovery-bundle.import.request/v1";
 const FULL_RECOVERY_BUNDLE_PACKAGE_SCHEMA: &str = "elastos.full-recovery-bundle.package/v1";
 const FULL_RECOVERY_BUNDLE_IMPORT_RESPONSE_SCHEMA: &str =
-    "elastos.full-recovery-bundle.import.response/v1";
+    "elastos.full-recovery-bundle.import.response/v2";
 const FULL_RECOVERY_BUNDLE_AAD_DOMAIN: &str = "elastos.full-recovery-bundle.package.v1";
 const FULL_RECOVERY_BUNDLE_KDF_PARAMS: &str = "m=19456,t=2,p=1,len=32";
-const WALLET_RECOVERY_KEY_SCHEMA: &str = "elastos.wallet.recovery-key/v1";
+const FULL_RECOVERY_BUNDLE_SEMANTIC_DIGEST_DOMAIN: &[u8] =
+    b"elastos.full-recovery-bundle.semantic.v1";
+const WALLET_RESTORE_COMPLETE: &str = "complete";
+const WALLET_RESTORE_INCOMPLETE: &str = "incomplete";
+const WALLET_RESTORE_REASON_NONE: &str = "none";
+const WALLET_RESTORE_REASON_PROVIDER_UNAVAILABLE: &str = "wallet_provider_unavailable";
+const WALLET_RESTORE_REASON_PROVIDER_INVALID_RESPONSE: &str = "wallet_provider_invalid_response";
+const WALLET_RESTORE_REASON_PROVIDER_REJECTED: &str = "wallet_provider_rejected";
+const WALLET_RESTORE_REASON_AUTHORITY_INVALID: &str = "wallet_authority_invalid";
+const RUNTIME_AUDIT_COMPLETE: &str = "complete";
+const RUNTIME_AUDIT_INCOMPLETE: &str = "incomplete";
+const RUNTIME_AUDIT_REASON_NONE: &str = "none";
+const RUNTIME_AUDIT_REASON_UNAVAILABLE: &str = "runtime_audit_unavailable";
+const RECOVERY_TERMINAL_RETRY_HEADER: &str = "x-elastos-recovery-terminal";
+const MAX_RECOVERY_TERMINAL_RETRY_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,26 +155,6 @@ pub struct AuthRevokeResponse {
 pub struct PasskeyStatusResponse {
     pub registered: bool,
     pub guest_registration_enabled: bool,
-    /// Minimal local account directory for the unsigned Home front door.
-    /// Never includes principal roots, grants, or recovery material.
-    #[serde(default)]
-    pub accounts: Vec<PasskeyLoginAccount>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PasskeyLoginAccount {
-    pub principal_id: String,
-    pub display_name: String,
-    pub role: String,
-    pub credential_id: String,
-    pub last_used_at: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avatar_cid: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PasskeyAccountAvatarQuery {
-    pub credential_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,7 +235,7 @@ pub struct FullRecoveryBundleExportRequest {
     pub localhost_root: String,
     #[serde(default)]
     pub label: Option<String>,
-    pub home_token: String,
+    pub step_up_token: String,
     #[serde(default)]
     pub download_password: Option<String>,
 }
@@ -264,6 +259,40 @@ pub struct FullRecoveryBundleImportRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct FullRecoveryWalletRestoreOutcomeV2 {
+    status: &'static str,
+    expected_count: usize,
+    imported_count: usize,
+    reason_code: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct FullRecoveryRuntimeAuditOutcomeV2 {
+    status: &'static str,
+    reason_code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FullRecoveryBundleImportResponseV2 {
+    schema: &'static str,
+    principal_id: String,
+    localhost_root: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_principal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_localhost_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_token: Option<String>,
+    wallet_restore: FullRecoveryWalletRestoreOutcomeV2,
+    runtime_audit: FullRecoveryRuntimeAuditOutcomeV2,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PasskeyBeginResponse<T> {
     pub schema: String,
     pub ceremony_id: String,
@@ -284,12 +313,6 @@ pub struct PasskeyRegisterCompleteRequest {
 pub struct PasskeyAuthenticateCompleteRequest {
     pub ceremony_id: String,
     pub response: AuthenticationResponse,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PasskeyAuthenticateBeginRequest {
-    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -364,50 +387,12 @@ pub async fn passkey_status(State(state): State<GatewayState>) -> Response {
         Err(err) => return auth_error_response(err),
     };
     let manager = manager.lock().await;
-    let registered = manager.status().registered;
-    drop(manager);
-    let accounts = match passkey_login_accounts(&state.data_dir) {
-        Ok(accounts) => accounts,
-        Err(err) => return auth_error_response(err),
-    };
     Json(PasskeyStatusResponse {
-        registered,
+        registered: manager.status().registered,
         guest_registration_enabled: crate::auth::guest_registration_enabled(&state.data_dir)
             .unwrap_or(false),
-        accounts,
     })
     .into_response()
-}
-
-/// Unsigned front-door avatar: only the CID registered for this enrolled credential.
-pub async fn passkey_account_avatar(
-    State(state): State<GatewayState>,
-    Query(query): Query<PasskeyAccountAvatarQuery>,
-) -> Response {
-    match login_avatar_bytes_for_credential(&state.data_dir, &query.credential_id) {
-        Ok((bytes, content_type)) => {
-            let mut response = bytes.into_response();
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-            response.headers_mut().insert(
-                CACHE_CONTROL,
-                HeaderValue::from_static("private, max-age=300"),
-            );
-            // Capsule frames use COEP require-corp; without CORP the <img> is
-            // blocked (opaque Origin: null) even when the GET itself is 200.
-            response.headers_mut().insert(
-                "cross-origin-resource-policy",
-                HeaderValue::from_static("cross-origin"),
-            );
-            response.headers_mut().insert(
-                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                HeaderValue::from_static("null"),
-            );
-            response
-        }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 pub async fn passkey_list(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
@@ -431,7 +416,8 @@ pub async fn full_recovery_bundle_export(
 ) -> Response {
     match full_recovery_bundle_export_inner(&state, &headers, input).await {
         Ok(value) => Json(value).into_response(),
-        Err(err) => auth_error_response(err),
+        Err(err) => principal_root_migration_required_response(&err)
+            .unwrap_or_else(|| auth_error_response(err)),
     }
 }
 
@@ -455,8 +441,14 @@ pub async fn full_recovery_bundle_import(
             }
             http_response
         }
-        Err(err) => auth_error_response(err),
+        Err(err) => principal_root_migration_required_response(&err)
+            .unwrap_or_else(|| auth_error_response(err)),
     }
+}
+
+fn principal_root_migration_required_response(err: &anyhow::Error) -> Option<Response> {
+    err.downcast_ref::<crate::auth::PrincipalRootMigrationRequiredV1>()
+        .map(|outcome| (StatusCode::CONFLICT, Json(outcome.clone())).into_response())
 }
 
 pub async fn passkey_revoke(
@@ -544,10 +536,8 @@ pub async fn passkey_register_complete(
 pub async fn passkey_authenticate_begin(
     State(state): State<GatewayState>,
     headers: HeaderMap,
-    body: Option<Json<PasskeyAuthenticateBeginRequest>>,
 ) -> Response {
-    let input = body.map(|Json(value)| value).unwrap_or_default();
-    match passkey_authenticate_begin_inner(&state, &headers, input).await {
+    match passkey_authenticate_begin_inner(&state, &headers).await {
         Ok(response) => Json(response).into_response(),
         Err(err) => auth_error_response(err),
     }
@@ -875,39 +865,110 @@ async fn recovery_status_inner(
 ) -> anyhow::Result<PrincipalRootRecoveryStatusV1> {
     let context = require_auth_home_or_system_context(state, headers)?;
     let principal = require_active_passkey_principal_for_context(state, &context)?;
-    let Some(protection) = crate::auth::load_principal_root_protection(
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
+    let inspection = crate::auth::inspect_declarative_principal_root_protection(
         &state.data_dir,
         &principal.principal_id,
         &principal.localhost_root,
-    )?
-    else {
-        return Ok(PrincipalRootRecoveryStatusV1::unprotected(
+        &protected_object_inventory,
+    )?;
+    let Some(protection) = inspection.protection else {
+        let mut status = PrincipalRootRecoveryStatusV1::unprotected(
             principal.principal_id,
             principal.localhost_root,
-        ));
+        );
+        if inspection.plaintext_object_count > 0 {
+            status
+                .required_actions
+                .insert(0, "migrate_declared_plaintext_objects".to_string());
+        }
+        return Ok(status);
     };
+    let root_encrypted = inspection.plaintext_object_count == 0
+        && inspection.encrypted_object_count == inspection.declared_object_count;
     let protection_configured = !protection.protectors.is_empty();
     let recovery_configured = protection
         .protectors
         .iter()
         .any(|protector| protector.verified_at.is_some());
     let recovery_download_available = recovery_archive_from_protection(&protection).is_some();
-    let required_actions = if recovery_configured {
-        Vec::new()
-    } else {
-        vec!["verify_recovery_before_public_guest_hosting".to_string()]
-    };
+    let mut required_actions = Vec::new();
+    if !root_encrypted {
+        required_actions.push("migrate_declared_plaintext_objects".to_string());
+    }
+    if !recovery_configured {
+        required_actions.push("verify_recovery_before_public_guest_hosting".to_string());
+    }
     Ok(PrincipalRootRecoveryStatusV1 {
         schema: elastos_runtime::auth::PRINCIPAL_ROOT_RECOVERY_STATUS_SCHEMA.to_string(),
         principal_id: principal.principal_id,
         localhost_root: principal.localhost_root,
-        root_encrypted: true,
+        root_encrypted,
         recovery_configured,
         recovery_download_available,
         protection_configured,
         required_actions,
         crypto: protection.crypto,
     })
+}
+
+pub fn verify_configured_principal_roots_ready(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let declarations = configured_principal_root_upgrade_declarations(data_dir)?;
+    crate::auth::verify_declared_principal_roots_ready(data_dir, &declarations)
+}
+
+pub fn migrate_configured_principal_roots_offline(
+    data_dir: &std::path::Path,
+    backup_dir: &std::path::Path,
+) -> anyhow::Result<crate::auth::PrincipalRootUpgradeReceiptV1> {
+    crate::auth::migrate_declared_principal_roots_offline(data_dir, backup_dir, || {
+        configured_principal_root_upgrade_declarations(data_dir)
+    })
+}
+
+fn configured_principal_root_upgrade_declarations(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<Vec<crate::auth::PrincipalRootUpgradeDeclarationV1>> {
+    let mut protections = crate::auth::load_auth_state(data_dir)?.principal_root_protections;
+    protections.sort_by(|left, right| {
+        (&left.principal_id, &left.localhost_root)
+            .cmp(&(&right.principal_id, &right.localhost_root))
+    });
+    Ok(protections
+        .into_iter()
+        .map(
+            |protection| crate::auth::PrincipalRootUpgradeDeclarationV1 {
+                inventory: principal_root_protected_object_inventory(
+                    data_dir,
+                    &protection.localhost_root,
+                ),
+                principal_id: protection.principal_id,
+                localhost_root: protection.localhost_root,
+            },
+        )
+        .collect())
+}
+
+pub(crate) fn principal_root_protected_object_inventory(
+    data_dir: &std::path::Path,
+    localhost_root: &str,
+) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
+    let mut inventory = crate::documents::principal_root_protected_object_inventory(localhost_root);
+    inventory.extend(crate::library::principal_root_protected_object_inventory(
+        localhost_root,
+    ));
+    inventory.extend(super::gateway::principal_root_protected_object_inventory(
+        localhost_root,
+    ));
+    inventory.extend(
+        super::viewer_gateway::principal_root_protected_object_inventory(data_dir, localhost_root),
+    );
+    // BrowserProfiles are VM lifecycle artifacts, and provider logs are
+    // provider-internal state. Neither is a principal-root protected object.
+    inventory.sort();
+    inventory.dedup();
+    inventory
 }
 
 async fn full_recovery_bundle_export_inner(
@@ -918,20 +979,16 @@ async fn full_recovery_bundle_export_inner(
     if input.schema != FULL_RECOVERY_BUNDLE_EXPORT_REQUEST_SCHEMA {
         anyhow::bail!("unsupported full recovery bundle export request schema");
     }
-    let (app, context) = require_auth_home_or_system_app_context(state, headers)?;
-    consume_fresh_passkey_home_token(
+    let launch = require_home_launch_token_binding(
         &state.data_dir,
-        &input.home_token,
-        &context,
-        &app,
-        180,
-        "auth.full-recovery-bundle.export",
-        &serde_json::json!({
-            "principal_id": input.principal_id,
-            "localhost_root": input.localhost_root,
-            "label": input.label,
-        }),
+        headers,
+        &[HOME_CAPSULE_ID, super::gateway::SYSTEM_CAPSULE_ID],
     )?;
+    if launch.context.proof_binding_id.is_none() {
+        anyhow::bail!("missing proof-bound auth session");
+    }
+    let wallet_authority = runtime_wallet_authority(&launch)?;
+    let context = launch.context.clone();
     let principal = require_active_passkey_principal_for_context(state, &context)?;
     if input.principal_id != principal.principal_id
         || input.localhost_root != principal.localhost_root
@@ -946,6 +1003,28 @@ async fn full_recovery_bundle_export_inner(
     }
 
     let now = crate::auth::now_ts();
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(&state.data_dir, &principal.localhost_root);
+    let protection_activation =
+        crate::auth::begin_declarative_principal_root_protection_activation(
+            &state.data_dir,
+            &principal.principal_id,
+            &principal.localhost_root,
+            &protected_object_inventory,
+        )?;
+    consume_passkey_step_up_token(
+        &state.data_dir,
+        &input.step_up_token,
+        &launch,
+        180,
+        "auth.full-recovery-bundle.export",
+        &serde_json::json!({
+            "principal_id": input.principal_id,
+            "localhost_root": input.localhost_root,
+            "label": input.label,
+            "download_password": input.download_password,
+        }),
+    )?;
     let kit = recovery_kit_get_or_create_for_principal(
         state,
         &context,
@@ -953,8 +1032,9 @@ async fn full_recovery_bundle_export_inner(
         input.label.as_deref(),
         now,
     )?;
-    let wallet_recovery_keys =
-        wallet_recovery_keys_for_principal(state, &principal.principal_id).await?;
+    drop(protection_activation);
+    let wallet_recovery_set = export_managed_recovery_set(state, &wallet_authority).await?;
+    let wallet_recovery_keys = full_bundle_wallet_recovery_keys(wallet_recovery_set)?;
     let wallet_recovery_key_count = wallet_recovery_keys.len();
     let bundle = json!({
         "schema": FULL_RECOVERY_BUNDLE_SCHEMA,
@@ -1006,8 +1086,32 @@ async fn full_recovery_bundle_import_inner(
     if input.schema != FULL_RECOVERY_BUNDLE_IMPORT_REQUEST_SCHEMA {
         anyhow::bail!("unsupported full recovery bundle import request schema");
     }
-    let context = require_auth_home_or_system_context(state, headers)?;
+    let launch = require_home_launch_token_binding(
+        &state.data_dir,
+        headers,
+        &[HOME_CAPSULE_ID, super::gateway::SYSTEM_CAPSULE_ID],
+    )?;
+    if launch.context.proof_binding_id.is_none() {
+        anyhow::bail!("missing proof-bound auth session");
+    }
+    let context = launch.context.clone();
+    let verified_actor = launch.launch_context.executable_actor.clone();
+    let pre_recovery_wallet_authority = runtime_wallet_authority(&launch)?;
     let bundle = full_recovery_bundle_from_import_request(&input)?;
+    validate_full_recovery_bundle(&bundle)?;
+    let recovery_set = managed_recovery_set_from_full_bundle(&bundle)?;
+    let data_kit: RecoveryKitV1 = serde_json::from_value(
+        bundle
+            .get("data_kit")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("full recovery bundle missing data_kit"))?,
+    )?;
+    crate::auth::verify_recovery_kit_material(&data_kit)?;
+    let bundle_sha256 = full_recovery_bundle_semantic_digest(&bundle)?;
+    let bundle_id = bundle
+        .get("bundle_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("full recovery bundle missing bundle_id"))?;
     let bundle_principal = bundle
         .get("principal_id")
         .and_then(Value::as_str)
@@ -1023,12 +1127,100 @@ async fn full_recovery_bundle_import_inner(
             "full recovery bundle belongs to another account; use account recovery to attach it"
         );
     }
-    let data_kit: RecoveryKitV1 = serde_json::from_value(
-        bundle
-            .get("data_kit")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("full recovery bundle missing data_kit"))?,
-    )?;
+    let expected_wallet_count = recovery_set.keys.len();
+    let completed_audit_id = full_recovery_outcome_audit_id(
+        bundle_id,
+        bundle_principal,
+        WALLET_RESTORE_COMPLETE,
+        WALLET_RESTORE_REASON_NONE,
+        expected_wallet_count,
+        expected_wallet_count,
+        &bundle_sha256,
+    );
+    if let Some(terminal_event) = recovery_terminal_retry_event(&state.data_dir, headers)? {
+        if input.reassign_to_current_principal {
+            anyhow::bail!("Recovery terminal retry cannot reassign a principal root");
+        }
+        validate_recovery_terminal_retry_event(
+            &terminal_event,
+            &completed_audit_id,
+            bundle_principal,
+            context.proof_binding_id.as_deref(),
+            &context.session_id,
+            expected_wallet_count,
+            &bundle_sha256,
+        )?;
+        let audit_result = crate::auth::append_signed_full_recovery_outcome_audit_event(
+            &state.data_dir,
+            terminal_event.clone(),
+        );
+        let runtime_audit = match audit_result {
+            Ok(()) => FullRecoveryRuntimeAuditOutcomeV2 {
+                status: RUNTIME_AUDIT_COMPLETE,
+                reason_code: RUNTIME_AUDIT_REASON_NONE,
+                retry_token: None,
+            },
+            Err(_) => FullRecoveryRuntimeAuditOutcomeV2 {
+                status: RUNTIME_AUDIT_INCOMPLETE,
+                reason_code: RUNTIME_AUDIT_REASON_UNAVAILABLE,
+                retry_token: Some(encode_recovery_terminal_retry_event(&terminal_event)?),
+            },
+        };
+        return Ok(serde_json::to_value(FullRecoveryBundleImportResponseV2 {
+            schema: FULL_RECOVERY_BUNDLE_IMPORT_RESPONSE_SCHEMA,
+            principal_id: bundle_principal.to_string(),
+            localhost_root: bundle_root.to_string(),
+            status: "imported".to_string(),
+            previous_principal_id: None,
+            previous_localhost_root: None,
+            home_token: None,
+            system_token: None,
+            wallet_restore: FullRecoveryWalletRestoreOutcomeV2 {
+                status: WALLET_RESTORE_COMPLETE,
+                expected_count: expected_wallet_count,
+                imported_count: expected_wallet_count,
+                reason_code: WALLET_RESTORE_REASON_NONE,
+            },
+            runtime_audit,
+        })?);
+    }
+    if !input.reassign_to_current_principal {
+        if let Some(completed_event) = crate::auth::load_signed_full_recovery_outcome_audit_event(
+            &state.data_dir,
+            &completed_audit_id,
+        )? {
+            validate_recovery_terminal_retry_event(
+                &completed_event,
+                &completed_audit_id,
+                bundle_principal,
+                context.proof_binding_id.as_deref(),
+                &context.session_id,
+                expected_wallet_count,
+                &bundle_sha256,
+            )?;
+            return Ok(serde_json::to_value(FullRecoveryBundleImportResponseV2 {
+                schema: FULL_RECOVERY_BUNDLE_IMPORT_RESPONSE_SCHEMA,
+                principal_id: bundle_principal.to_string(),
+                localhost_root: bundle_root.to_string(),
+                status: "imported".to_string(),
+                previous_principal_id: None,
+                previous_localhost_root: None,
+                home_token: None,
+                system_token: None,
+                wallet_restore: FullRecoveryWalletRestoreOutcomeV2 {
+                    status: WALLET_RESTORE_COMPLETE,
+                    expected_count: expected_wallet_count,
+                    imported_count: expected_wallet_count,
+                    reason_code: WALLET_RESTORE_REASON_NONE,
+                },
+                runtime_audit: FullRecoveryRuntimeAuditOutcomeV2 {
+                    status: RUNTIME_AUDIT_COMPLETE,
+                    reason_code: RUNTIME_AUDIT_REASON_NONE,
+                    retry_token: None,
+                },
+            })?);
+        }
+    }
     let recovery_response = recovery_kit_import_inner(
         state,
         headers,
@@ -1041,53 +1233,112 @@ async fn full_recovery_bundle_import_inner(
         },
     )
     .await?;
-    let wallet_keys = bundle
-        .get("wallet_recovery_keys")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut imported_wallet_keys = Vec::new();
-    for key in wallet_keys {
-        if key.get("schema").and_then(Value::as_str) != Some(WALLET_RECOVERY_KEY_SCHEMA) {
-            continue;
-        }
-        let label = key.get("label").and_then(Value::as_str).map(str::to_string);
-        wallet_provider_data(
-            state,
-            json!({
-                "op": "import_managed_secret",
-                "principal_id": recovery_response.principal_id,
-                "recovery_key": key,
-                "label": label,
-            }),
+    let wallet_authority = if recovery_response.status == "reassigned" {
+        replacement_wallet_authority(
+            &state.data_dir,
+            headers,
+            &verified_actor,
+            context.proof_binding_id.as_deref(),
+            &recovery_response,
         )
-        .await?;
-        imported_wallet_keys.push(json!({ "schema": WALLET_RECOVERY_KEY_SCHEMA }));
-    }
-    crate::auth::append_audit_event(
+    } else {
+        Ok(pre_recovery_wallet_authority)
+    };
+    let (wallet_restore, audit_proof_binding_id, audit_session_id) = match wallet_authority {
+        Ok(authority) => {
+            let audit_proof_binding_id = authority
+                .verified_context()
+                .proof_binding_id()
+                .map(ToString::to_string);
+            let audit_session_id = authority.verified_context().session_id().to_string();
+            let wallet_restore =
+                restore_managed_recovery_set(state, &authority, recovery_set).await;
+            (wallet_restore, audit_proof_binding_id, audit_session_id)
+        }
+        Err(_) => (
+            incomplete_wallet_restore(
+                expected_wallet_count,
+                WALLET_RESTORE_REASON_AUTHORITY_INVALID,
+            ),
+            context.proof_binding_id.clone(),
+            context.session_id.clone(),
+        ),
+    };
+    let (event_type, result) = if wallet_restore.status == WALLET_RESTORE_COMPLETE {
+        ("auth.full_recovery_bundle.imported", "ok")
+    } else {
+        ("auth.full_recovery_bundle.import_incomplete", "incomplete")
+    };
+    let audit_reason = full_recovery_outcome_audit_reason(
+        &recovery_response.status,
+        wallet_restore.status,
+        wallet_restore.reason_code,
+        wallet_restore.expected_count,
+        wallet_restore.imported_count,
+        &bundle_sha256,
+    );
+    let mut outcome_event = audit_event(AuditEventInput {
+        event_type,
+        principal_id: Some(recovery_response.principal_id.clone()),
+        proof_binding_id: audit_proof_binding_id,
+        session_id: Some(audit_session_id),
+        result,
+        reason: &audit_reason,
+        occurred_at: crate::auth::now_ts(),
+        ..AuditEventInput::default()
+    });
+    outcome_event.event_id = full_recovery_outcome_audit_id(
+        bundle_id,
+        &recovery_response.principal_id,
+        wallet_restore.status,
+        wallet_restore.reason_code,
+        wallet_restore.expected_count,
+        wallet_restore.imported_count,
+        &bundle_sha256,
+    );
+    let signed_outcome_event = crate::auth::sign_audit_event(&state.data_dir, outcome_event)?;
+    #[cfg(test)]
+    let audit_result = crate::auth::consume_recovery_reassignment_test_fault(
         &state.data_dir,
-        audit_event(AuditEventInput {
-            event_type: "auth.full_recovery_bundle.imported",
-            principal_id: Some(recovery_response.principal_id.clone()),
-            proof_binding_id: context.proof_binding_id.clone(),
-            session_id: Some(context.session_id.clone()),
-            result: "ok",
-            reason: "full recovery bundle imported and included wallet keys restored",
-            occurred_at: crate::auth::now_ts(),
-            ..AuditEventInput::default()
-        }),
-    )?;
-    Ok(json!({
-        "schema": FULL_RECOVERY_BUNDLE_IMPORT_RESPONSE_SCHEMA,
-        "principal_id": recovery_response.principal_id,
-        "localhost_root": recovery_response.localhost_root,
-        "status": recovery_response.status,
-        "previous_principal_id": recovery_response.previous_principal_id,
-        "previous_localhost_root": recovery_response.previous_localhost_root,
-        "home_token": recovery_response.home_token,
-        "system_token": recovery_response.system_token,
-        "wallet_recovery_key_count": imported_wallet_keys.len(),
-    }))
+        crate::auth::RecoveryReassignmentTestFault::PostCommitOutcomeAudit,
+    )
+    .and_then(|()| {
+        crate::auth::append_signed_full_recovery_outcome_audit_event(
+            &state.data_dir,
+            signed_outcome_event.clone(),
+        )
+    });
+    #[cfg(not(test))]
+    let audit_result = crate::auth::append_signed_full_recovery_outcome_audit_event(
+        &state.data_dir,
+        signed_outcome_event.clone(),
+    );
+    let runtime_audit = match audit_result {
+        Ok(()) => FullRecoveryRuntimeAuditOutcomeV2 {
+            status: RUNTIME_AUDIT_COMPLETE,
+            reason_code: RUNTIME_AUDIT_REASON_NONE,
+            retry_token: None,
+        },
+        Err(_) => FullRecoveryRuntimeAuditOutcomeV2 {
+            status: RUNTIME_AUDIT_INCOMPLETE,
+            reason_code: RUNTIME_AUDIT_REASON_UNAVAILABLE,
+            retry_token: (wallet_restore.status == WALLET_RESTORE_COMPLETE)
+                .then(|| encode_recovery_terminal_retry_event(&signed_outcome_event))
+                .transpose()?,
+        },
+    };
+    Ok(serde_json::to_value(FullRecoveryBundleImportResponseV2 {
+        schema: FULL_RECOVERY_BUNDLE_IMPORT_RESPONSE_SCHEMA,
+        principal_id: recovery_response.principal_id,
+        localhost_root: recovery_response.localhost_root,
+        status: recovery_response.status,
+        previous_principal_id: recovery_response.previous_principal_id,
+        previous_localhost_root: recovery_response.previous_localhost_root,
+        home_token: recovery_response.home_token,
+        system_token: recovery_response.system_token,
+        wallet_restore,
+        runtime_audit,
+    })?)
 }
 
 fn full_recovery_bundle_from_import_request(
@@ -1097,7 +1348,6 @@ fn full_recovery_bundle_from_import_request(
         anyhow::bail!("import exactly one full recovery bundle or package");
     }
     if let Some(bundle) = input.bundle.as_ref() {
-        validate_full_recovery_bundle(bundle)?;
         return Ok(bundle.clone());
     }
     let package = input
@@ -1161,51 +1411,322 @@ fn recovery_kit_get_or_create_for_principal(
     Ok(kit)
 }
 
-async fn wallet_recovery_keys_for_principal(
+async fn export_managed_recovery_set(
     state: &GatewayState,
-    principal_id: &str,
-) -> anyhow::Result<Vec<Value>> {
-    let accounts = wallet_provider_data(
-        state,
-        json!({
-            "op": "accounts",
-            "principal_id": principal_id,
-            "include_revoked": false,
-        }),
-    )
-    .await?;
-    let mut recovery_keys = Vec::new();
-    for account in accounts
-        .get("accounts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let proof_type = account
-            .get("proof_type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if proof_type != "managed_evm" && proof_type != "managed_btc_p2wpkh" {
-            continue;
-        }
-        let Some(account_id) = account.get("account_id").and_then(Value::as_str) else {
-            continue;
-        };
-        let mut key = wallet_provider_data(
-            state,
-            json!({
-                "op": "export_managed_secret",
-                "principal_id": principal_id,
-                "account_id": account_id,
-            }),
-        )
+    authority: &RuntimeWalletAuthority,
+) -> anyhow::Result<ManagedRecoverySetV1> {
+    let registry = state
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("wallet provider unavailable"))?;
+    let response = RuntimeWalletAdapter::new(registry, authority)
+        .invoke(WalletProviderOperationV2::ExportManagedRecoverySet {})
         .await?;
-        if let Some(label) = account.get("label").and_then(Value::as_str) {
-            key["label"] = json!(label);
-        }
-        recovery_keys.push(key);
+    let data = match response.result {
+        WalletResultV2::Ok { data } => data,
+        WalletResultV2::Error { message, .. } => anyhow::bail!(message),
+    };
+    let recovery_set: ManagedRecoverySetV1 = serde_json::from_value(data)
+        .map_err(|err| anyhow::anyhow!("invalid managed recovery set response: {err}"))?;
+    recovery_set
+        .validate()
+        .map_err(|err| anyhow::anyhow!("invalid managed recovery set response: {err}"))?;
+    Ok(recovery_set)
+}
+
+fn full_bundle_wallet_recovery_keys(
+    recovery_set: ManagedRecoverySetV1,
+) -> anyhow::Result<Vec<Value>> {
+    recovery_set
+        .keys
+        .into_iter()
+        .map(|entry| {
+            let mut recovery_key = entry.recovery_key;
+            let object = recovery_key
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("managed recovery key must be an object"))?;
+            object.insert("account_id".to_string(), json!(entry.account_id));
+            if let Some(label) = entry.label {
+                object.insert("label".to_string(), json!(label));
+            }
+            Ok(recovery_key)
+        })
+        .collect()
+}
+
+fn managed_recovery_set_from_full_bundle(bundle: &Value) -> anyhow::Result<ManagedRecoverySetV1> {
+    let keys = bundle
+        .get("wallet_recovery_keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("full recovery bundle wallet_recovery_keys must be an array")
+        })?
+        .iter()
+        .map(|value| {
+            let object = value.as_object().ok_or_else(|| {
+                anyhow::anyhow!("full recovery bundle Wallet recovery key must be an object")
+            })?;
+            let account_id = object
+                .get("account_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("full recovery bundle Wallet recovery key missing account_id")
+                })?
+                .to_string();
+            let label = match object.get("label") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(label)) => Some(label.clone()),
+                Some(_) => {
+                    anyhow::bail!("full recovery bundle Wallet recovery key label must be text")
+                }
+            };
+            let mut recovery_key = value.clone();
+            recovery_key
+                .as_object_mut()
+                .expect("Wallet recovery key object checked above")
+                .remove("label");
+            Ok(ManagedRecoveryKeyEntryV1 {
+                account_id,
+                recovery_key,
+                label,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    ManagedRecoverySetV1::new(keys).map_err(|err| {
+        anyhow::anyhow!("invalid managed recovery set in full recovery bundle: {err}")
+    })
+}
+
+fn replacement_wallet_authority(
+    data_dir: &std::path::Path,
+    request_headers: &HeaderMap,
+    verified_actor: &str,
+    expected_proof_binding_id: Option<&str>,
+    recovery_response: &RecoveryKitImportResponse,
+) -> anyhow::Result<RuntimeWalletAuthority> {
+    let token = match verified_actor {
+        HOME_CAPSULE_ID => recovery_response.home_token.as_deref(),
+        super::gateway::SYSTEM_CAPSULE_ID => recovery_response.system_token.as_deref(),
+        _ => None,
     }
-    Ok(recovery_keys)
+    .ok_or_else(|| anyhow::anyhow!("recovery response missing replacement shell token"))?;
+    let mut headers = request_headers.clone();
+    headers.insert("x-elastos-home-token", HeaderValue::from_str(token)?);
+    let authority = require_runtime_wallet_authority(data_dir, &headers, &[verified_actor])?;
+    let verified = authority.verified_context();
+    if verified.actor() != verified_actor
+        || verified.principal_id() != recovery_response.principal_id
+        || verified.proof_binding_id() != expected_proof_binding_id
+    {
+        anyhow::bail!("replacement shell token Wallet authority binding mismatch");
+    }
+    Ok(authority)
+}
+
+async fn restore_managed_recovery_set(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    recovery_set: ManagedRecoverySetV1,
+) -> FullRecoveryWalletRestoreOutcomeV2 {
+    let expected_count = recovery_set.keys.len();
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return incomplete_wallet_restore(
+            expected_count,
+            WALLET_RESTORE_REASON_PROVIDER_UNAVAILABLE,
+        );
+    };
+    let response = match RuntimeWalletAdapter::new(registry, authority)
+        .invoke(WalletProviderOperationV2::ImportManagedRecoverySet { recovery_set })
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            let reason_code = if wallet_adapter_error_is_invalid_response(&err) {
+                WALLET_RESTORE_REASON_PROVIDER_INVALID_RESPONSE
+            } else {
+                WALLET_RESTORE_REASON_PROVIDER_UNAVAILABLE
+            };
+            return incomplete_wallet_restore(expected_count, reason_code);
+        }
+    };
+    let data = match response.result {
+        WalletResultV2::Ok { data } => data,
+        WalletResultV2::Error { .. } => {
+            return incomplete_wallet_restore(
+                expected_count,
+                WALLET_RESTORE_REASON_PROVIDER_REJECTED,
+            )
+        }
+    };
+    let response_is_complete = data.get("imported").and_then(Value::as_bool) == Some(true)
+        && data.get("account_count").and_then(Value::as_u64) == u64::try_from(expected_count).ok()
+        && data
+            .get("accounts")
+            .and_then(Value::as_array)
+            .is_some_and(|accounts| accounts.len() == expected_count);
+    if !response_is_complete {
+        return incomplete_wallet_restore(
+            expected_count,
+            WALLET_RESTORE_REASON_PROVIDER_INVALID_RESPONSE,
+        );
+    }
+    FullRecoveryWalletRestoreOutcomeV2 {
+        status: WALLET_RESTORE_COMPLETE,
+        expected_count,
+        imported_count: expected_count,
+        reason_code: WALLET_RESTORE_REASON_NONE,
+    }
+}
+
+fn incomplete_wallet_restore(
+    expected_count: usize,
+    reason_code: &'static str,
+) -> FullRecoveryWalletRestoreOutcomeV2 {
+    FullRecoveryWalletRestoreOutcomeV2 {
+        status: WALLET_RESTORE_INCOMPLETE,
+        expected_count,
+        imported_count: 0,
+        reason_code,
+    }
+}
+
+fn wallet_adapter_error_is_invalid_response(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.contains("response is missing")
+        || message.contains("invalid Wallet provider v2 response")
+}
+
+fn full_recovery_outcome_audit_id(
+    bundle_id: &str,
+    principal_id: &str,
+    wallet_status: &str,
+    reason_code: &str,
+    expected_count: usize,
+    imported_count: usize,
+    bundle_sha256: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"elastos.full-recovery-bundle.outcome-audit.v1");
+    let expected_count = expected_count.to_string();
+    let imported_count = imported_count.to_string();
+    for value in [
+        bundle_id.as_bytes(),
+        principal_id.as_bytes(),
+        wallet_status.as_bytes(),
+        reason_code.as_bytes(),
+        expected_count.as_bytes(),
+        imported_count.as_bytes(),
+        bundle_sha256.as_bytes(),
+    ] {
+        digest.update([0]);
+        digest.update(value);
+    }
+    format!("audit:full-recovery:{}", hex::encode(digest.finalize()))
+}
+
+fn full_recovery_bundle_semantic_digest(bundle: &Value) -> anyhow::Result<String> {
+    let canonical = canonical_recovery_json(bundle);
+    let mut digest = Sha256::new();
+    digest.update(FULL_RECOVERY_BUNDLE_SEMANTIC_DIGEST_DOMAIN);
+    digest.update([0]);
+    digest.update(serde_json::to_vec(&canonical)?);
+    Ok(format!("sha256:{}", hex::encode(digest.finalize())))
+}
+
+fn canonical_recovery_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_recovery_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_recovery_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn full_recovery_outcome_audit_reason(
+    root_status: &str,
+    wallet_status: &str,
+    reason_code: &str,
+    expected_count: usize,
+    imported_count: usize,
+    bundle_sha256: &str,
+) -> String {
+    format!(
+        "full recovery bundle root {root_status} and Wallet restore {wallet_status}; reason_code={reason_code}; expected_count={expected_count}; imported_count={imported_count}; bundle_sha256={bundle_sha256}"
+    )
+}
+
+fn encode_recovery_terminal_retry_event(event: &RuntimeAuditEventV1) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(event)?;
+    if bytes.len() > MAX_RECOVERY_TERMINAL_RETRY_BYTES {
+        anyhow::bail!("Recovery terminal retry evidence is too large");
+    }
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn recovery_terminal_retry_event(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<RuntimeAuditEventV1>> {
+    let Some(value) = headers.get(RECOVERY_TERMINAL_RETRY_HEADER) else {
+        return Ok(None);
+    };
+    let encoded = value
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("invalid Recovery terminal retry header"))?;
+    if encoded.is_empty() || encoded.len() > MAX_RECOVERY_TERMINAL_RETRY_BYTES * 2 {
+        anyhow::bail!("invalid Recovery terminal retry header size");
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| anyhow::anyhow!("invalid Recovery terminal retry encoding"))?;
+    if bytes.len() > MAX_RECOVERY_TERMINAL_RETRY_BYTES {
+        anyhow::bail!("Recovery terminal retry evidence is too large");
+    }
+    let event: RuntimeAuditEventV1 = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid Recovery terminal retry evidence"))?;
+    crate::auth::verify_signed_full_recovery_outcome_audit_event(data_dir, &event)?;
+    Ok(Some(event))
+}
+
+fn validate_recovery_terminal_retry_event(
+    event: &RuntimeAuditEventV1,
+    expected_event_id: &str,
+    principal_id: &str,
+    proof_binding_id: Option<&str>,
+    session_id: &str,
+    expected_wallet_count: usize,
+    bundle_sha256: &str,
+) -> anyhow::Result<()> {
+    let reason_matches = ["imported", "reassigned"].iter().any(|root_status| {
+        event.reason
+            == full_recovery_outcome_audit_reason(
+                root_status,
+                WALLET_RESTORE_COMPLETE,
+                WALLET_RESTORE_REASON_NONE,
+                expected_wallet_count,
+                expected_wallet_count,
+                bundle_sha256,
+            )
+    });
+    if event.event_id != expected_event_id
+        || event.schema != RuntimeAuditEventV1::SCHEMA
+        || event.event_type != "auth.full_recovery_bundle.imported"
+        || event.principal_id.as_deref() != Some(principal_id)
+        || event.proof_binding_id.as_deref() != proof_binding_id
+        || event.session_id.as_deref() != Some(session_id)
+        || event.challenge_id.is_some()
+        || event.capsule_id.is_some()
+        || event.result != "ok"
+        || !reason_matches
+    {
+        anyhow::bail!("Recovery terminal retry evidence binding mismatch");
+    }
+    Ok(())
 }
 
 fn password_protected_full_recovery_bundle(
@@ -1295,7 +1816,6 @@ fn full_recovery_bundle_from_password_package(
         )
         .map_err(|_| anyhow::anyhow!("invalid full recovery bundle password or ciphertext"))?;
     let bundle: Value = serde_json::from_slice(&plaintext)?;
-    validate_full_recovery_bundle(&bundle)?;
     if full_bundle_str(&bundle, "principal_id")? != principal_id
         || full_bundle_str(&bundle, "localhost_root")? != localhost_root
         || full_bundle_str(&bundle, "bundle_id")? != bundle_id
@@ -1427,6 +1947,9 @@ async fn recovery_kit_import_inner(
         );
     }
     let now = crate::auth::now_ts();
+    let candidate_data_key = crate::auth::recovery_kit_data_key(&kit)?;
+    let mut protection =
+        protection_from_recovery_kit(&kit, Some("Imported Recovery Kit"), now, None)?;
     let previous_principal_id = principal.principal_id.clone();
     let previous_localhost_root = principal.localhost_root.clone();
     let verified_did_recovery_protector = match input.did_recovery_proof.as_ref() {
@@ -1444,9 +1967,24 @@ async fn recovery_kit_import_inner(
         },
         None => None,
     };
+    let protected_object_inventory =
+        principal_root_protected_object_inventory(&state.data_dir, &kit.localhost_root);
+    let _protection_activation =
+        crate::auth::begin_declarative_principal_root_protection_activation_with_candidate(
+            &state.data_dir,
+            &protection,
+            &candidate_data_key,
+            &protected_object_inventory,
+        )?;
     let archive = crate::auth::recovery_archive_from_kit(&state.data_dir, &kit)?;
-    let mut protection =
-        protection_from_recovery_kit(&kit, Some("Imported Recovery Kit"), now, Some(archive))?;
+    let recovery_protector = protection
+        .protectors
+        .iter_mut()
+        .find(|protector| {
+            protector.kind == elastos_runtime::auth::PrincipalRootProtectorKind::RecoveryKit
+        })
+        .ok_or_else(|| anyhow::anyhow!("candidate protection has no Recovery Kit protector"))?;
+    recovery_protector.archive = Some(archive);
     if let Some(protector) = verified_did_recovery_protector {
         protection.protectors.push(protector);
     }
@@ -1465,79 +2003,90 @@ async fn recovery_kit_import_inner(
                 format!("recovery root reassignment failed: {err}"),
             );
         }
-    }
-    crate::auth::store_principal_root_protection(&state.data_dir, protection)?;
-    let (principal, home_token, system_token, audit_session_id, status, event_type, reason) =
-        if input.reassign_to_current_principal {
-            let proof_binding_id = principal.proof_binding_id.clone();
-            let principal = match crate::auth::reassign_passkey_binding_to_recovered_root(
-                &state.data_dir,
-                &proof_binding_id,
-                &kit.principal_id,
-                &kit.localhost_root,
-                now,
-            ) {
-                Ok(principal) => principal,
-                Err(err) => {
-                    return fail_recovery_kit_request(
-                        state,
-                        &context,
-                        &principal,
-                        "auth.recovery_kit.import.rejected",
-                        format!("recovery root reassignment failed: {err}"),
-                    );
-                }
-            };
-            let grant = AuthSessionGrantV1 {
-                schema: AuthSessionGrantV1::SCHEMA.to_string(),
-                grant_id: format!("grant:{}", random_hex(16)),
-                session_id: format!("auth:{}", random_hex(16)),
-                principal_id: principal.principal_id.clone(),
-                proof_binding_id: principal.proof_binding_id.clone(),
-                issued_at: now,
-                expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
-                apps: vec![
-                    HOME_CAPSULE_ID.to_string(),
-                    super::gateway::SYSTEM_CAPSULE_ID.to_string(),
-                ],
-            };
-            crate::auth::store_session_grant(&state.data_dir, grant.clone())?;
-            let home_token =
-                issue_home_launch_token_for_auth_grant(&state.data_dir, HOME_CAPSULE_ID, &grant)?;
-            let system_token = issue_home_launch_token_for_auth_grant(
-                &state.data_dir,
-                super::gateway::SYSTEM_CAPSULE_ID,
-                &grant,
-            )?;
-            (
-                principal,
-                Some(home_token),
-                Some(system_token),
-                grant.session_id,
-                "reassigned",
-                "auth.recovery_kit.reassigned",
-                "principal root reassigned from verified Recovery Kit and session reissued",
-            )
-        } else {
-            (
-                principal,
-                None,
-                None,
-                context.session_id.clone(),
-                "imported",
-                "auth.recovery_kit.imported",
-                "principal recovery kit imported and verified",
-            )
+        let proof_binding_id = principal.proof_binding_id.clone();
+        let grant = AuthSessionGrantV1 {
+            schema: AuthSessionGrantV1::SCHEMA.to_string(),
+            grant_id: format!("grant:{}", random_hex(16)),
+            session_id: format!("auth:{}", random_hex(16)),
+            principal_id: kit.principal_id.clone(),
+            proof_binding_id: proof_binding_id.clone(),
+            issued_at: now,
+            expires_at: now.saturating_add(AUTH_SESSION_TTL_SECS),
+            apps: vec![
+                HOME_CAPSULE_ID.to_string(),
+                super::gateway::SYSTEM_CAPSULE_ID.to_string(),
+            ],
         };
+        #[cfg(test)]
+        crate::auth::consume_recovery_reassignment_test_fault(
+            &state.data_dir,
+            crate::auth::RecoveryReassignmentTestFault::TokenPreparation,
+        )?;
+        let home_token =
+            issue_home_launch_token_for_auth_grant(&state.data_dir, HOME_CAPSULE_ID, &grant)?;
+        let system_token = issue_home_launch_token_for_auth_grant(
+            &state.data_dir,
+            super::gateway::SYSTEM_CAPSULE_ID,
+            &grant,
+        )?;
+        let signed_audit_event = crate::auth::sign_audit_event(
+            &state.data_dir,
+            audit_event(AuditEventInput {
+                event_type: "auth.recovery_kit.reassigned",
+                principal_id: Some(kit.principal_id.clone()),
+                proof_binding_id: Some(proof_binding_id.clone()),
+                session_id: Some(grant.session_id.clone()),
+                result: "ok",
+                reason: "principal root reassigned from verified Recovery Kit and session reissued",
+                occurred_at: now,
+                ..AuditEventInput::default()
+            }),
+        )?;
+        let principal = match crate::auth::commit_recovered_root_reassignment(
+            &state.data_dir,
+            crate::auth::RecoveredRootReassignment {
+                proof_binding_id,
+                recovered_principal_id: kit.principal_id.clone(),
+                recovered_localhost_root: kit.localhost_root.clone(),
+                protection,
+                replacement_grant: grant,
+                signed_audit_event,
+                updated_at: now,
+            },
+        ) {
+            Ok(principal) => principal,
+            Err(err) => {
+                return fail_recovery_kit_request(
+                    state,
+                    &context,
+                    &principal,
+                    "auth.recovery_kit.import.rejected",
+                    format!("recovery root reassignment failed: {err}"),
+                );
+            }
+        };
+        return Ok(RecoveryKitImportResponse {
+            schema: "elastos.recovery-kit.import.response/v1".to_string(),
+            principal_id: principal.principal_id,
+            localhost_root: principal.localhost_root,
+            status: "reassigned".to_string(),
+            previous_principal_id: Some(previous_principal_id),
+            previous_localhost_root: Some(previous_localhost_root),
+            home_token: Some(home_token),
+            system_token: Some(system_token),
+        });
+    }
+
+    crate::auth::store_principal_root_protection(&state.data_dir, protection)?;
     crate::auth::append_audit_event(
         &state.data_dir,
         audit_event(AuditEventInput {
-            event_type,
+            event_type: "auth.recovery_kit.imported",
             principal_id: Some(principal.principal_id.clone()),
-            proof_binding_id: Some(principal.proof_binding_id),
-            session_id: Some(audit_session_id),
+            proof_binding_id: Some(principal.proof_binding_id.clone()),
+            session_id: Some(context.session_id.clone()),
             result: "ok",
-            reason,
+            reason: "principal recovery kit imported and verified",
             occurred_at: now,
             ..AuditEventInput::default()
         }),
@@ -1546,15 +2095,11 @@ async fn recovery_kit_import_inner(
         schema: "elastos.recovery-kit.import.response/v1".to_string(),
         principal_id: principal.principal_id,
         localhost_root: principal.localhost_root,
-        status: status.to_string(),
-        previous_principal_id: input
-            .reassign_to_current_principal
-            .then_some(previous_principal_id),
-        previous_localhost_root: input
-            .reassign_to_current_principal
-            .then_some(previous_localhost_root),
-        home_token,
-        system_token,
+        status: "imported".to_string(),
+        previous_principal_id: None,
+        previous_localhost_root: None,
+        home_token: None,
+        system_token: None,
     })
 }
 
@@ -1918,40 +2463,79 @@ fn require_auth_home_or_system_context(
     Ok(context)
 }
 
-fn require_auth_home_or_system_app_context(
-    state: &GatewayState,
-    headers: &HeaderMap,
-) -> anyhow::Result<(String, super::gateway::HomeLaunchTokenContext)> {
-    let (app, context) = super::gateway::require_home_launch_token_for_any_app_context(
-        &state.data_dir,
-        headers,
-        &[HOME_CAPSULE_ID, super::gateway::SYSTEM_CAPSULE_ID],
-    )?;
-    if context.proof_binding_id.is_none() {
-        anyhow::bail!("missing proof-bound auth session");
-    }
-    Ok((app, context))
-}
-
-struct WalletLinkContext {
+pub(in crate::api) struct WalletLinkContext {
     app: String,
     context: super::gateway::HomeLaunchTokenContext,
+    authority: RuntimeWalletAuthority,
 }
 
 fn require_wallet_link_context(
     state: &GatewayState,
     headers: &HeaderMap,
 ) -> anyhow::Result<WalletLinkContext> {
-    let (app, context) = super::gateway::require_home_launch_token_for_any_app_context(
+    let authority = require_runtime_wallet_authority(
         &state.data_dir,
         headers,
-        WALLET_LINK_CAPSULE_IDS,
+        &[super::gateway::WALLET_WALLETCONNECT_CAPSULE_ID],
     )?;
-    super::gateway::ensure_wallet_connector_configured(&state.data_dir, &app)?;
+    let verified = authority.verified_context();
+    let app = verified.actor().to_string();
+    verified_wallet_link_context(state, &app, authority)
+}
+
+pub(in crate::api) fn verified_wallet_link_context(
+    state: &GatewayState,
+    app: &str,
+    authority: RuntimeWalletAuthority,
+) -> anyhow::Result<WalletLinkContext> {
+    if !is_wallet_connector_capsule_id(app) {
+        anyhow::bail!("wallet linking requires a dedicated wallet connector capsule");
+    }
+    let verified = authority.verified_context();
+    if verified.actor() != app {
+        anyhow::bail!("wallet connector launch actor mismatch");
+    }
+    let context = super::gateway::HomeLaunchTokenContext {
+        principal_id: verified.principal_id().to_string(),
+        session_id: verified.session_id().to_string(),
+        proof_binding_id: verified.proof_binding_id().map(ToString::to_string),
+        grant_id: verified.grant_id().to_string(),
+    };
+    super::gateway::ensure_wallet_connector_configured(&state.data_dir, app)?;
     if context.proof_binding_id.is_none() {
         anyhow::bail!("missing proof-bound auth session");
     }
-    Ok(WalletLinkContext { app, context })
+    Ok(WalletLinkContext {
+        app: app.to_string(),
+        context,
+        authority,
+    })
+}
+
+async fn wallet_link_provider_data(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    operation: WalletProviderOperationV2,
+) -> anyhow::Result<Value> {
+    match wallet_link_provider_result(state, authority, operation).await? {
+        WalletResultV2::Ok { data } => Ok(data),
+        WalletResultV2::Error { message, .. } => anyhow::bail!(message),
+    }
+}
+
+async fn wallet_link_provider_result(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    operation: WalletProviderOperationV2,
+) -> anyhow::Result<WalletResultV2> {
+    let registry = state
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("wallet provider unavailable"))?;
+    Ok(RuntimeWalletAdapter::new(registry, authority)
+        .invoke(operation)
+        .await?
+        .result)
 }
 
 fn validate_passkey_proof_binding_id(proof_binding_id: &str) -> anyhow::Result<()> {
@@ -2021,70 +2605,17 @@ async fn passkey_register_complete_inner(
 async fn passkey_authenticate_begin_inner(
     state: &GatewayState,
     headers: &HeaderMap,
-    input: PasskeyAuthenticateBeginRequest,
 ) -> anyhow::Result<PasskeyBeginResponse<RequestOptions>> {
     let ceremony_id = format!("passkey:authenticate:{}", random_hex(16));
     let rp = super::handlers::identity::derive_rp(headers)?;
     let manager = state.identity_manager()?;
     let mut manager = manager.lock().await;
-    let credential_id = input
-        .credential_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let options = manager.begin_authentication_for(&ceremony_id, &rp.id, credential_id)?;
+    let options = manager.begin_authentication(&ceremony_id, &rp.id)?;
     Ok(PasskeyBeginResponse {
         schema: "elastos.auth.passkey.authenticate.begin/v1".to_string(),
         ceremony_id,
         options,
     })
-}
-
-fn passkey_login_accounts(data_dir: &std::path::Path) -> anyhow::Result<Vec<PasskeyLoginAccount>> {
-    let mut accounts = crate::auth::active_passkey_principals(data_dir)?
-        .into_iter()
-        .filter_map(|principal| {
-            let passkey = principal.proof_binding.passkey.as_ref()?;
-            let display_name = if principal.display_name.trim().is_empty() {
-                "Account".to_string()
-            } else {
-                principal.display_name.clone()
-            };
-            let role = match principal.role {
-                crate::auth::RuntimePrincipalRole::Admin => "admin",
-                crate::auth::RuntimePrincipalRole::Guest => "guest",
-            };
-            let avatar_cid = login_avatar_cid_for_principal(
-                data_dir,
-                &principal.principal_id,
-                &principal.localhost_root,
-            );
-            Some(PasskeyLoginAccount {
-                principal_id: principal.principal_id,
-                display_name,
-                role: role.to_string(),
-                credential_id: passkey.credential_id.clone(),
-                last_used_at: passkey.last_used_at,
-                avatar_cid,
-            })
-        })
-        .collect::<Vec<_>>();
-    accounts.sort_by(|left, right| {
-        right
-            .last_used_at
-            .cmp(&left.last_used_at)
-            .then_with(|| {
-                let left_admin = left.role == "admin";
-                let right_admin = right.role == "admin";
-                right_admin.cmp(&left_admin)
-            })
-            .then_with(|| {
-                left.display_name
-                    .to_lowercase()
-                    .cmp(&right.display_name.to_lowercase())
-            })
-    });
-    Ok(accounts)
 }
 
 async fn passkey_authenticate_complete_inner(
@@ -2194,31 +2725,43 @@ async fn evm_challenge_inner(
     headers: &HeaderMap,
     input: EvmChallengeRequest,
 ) -> anyhow::Result<EvmChallengeResponse> {
-    let launch_context = require_wallet_link_context(state, headers)?;
-    let context = launch_context.context;
+    let link = require_wallet_link_context(state, headers)?;
+    evm_challenge_for_wallet_link(state, headers, input, link).await
+}
+
+pub(in crate::api) async fn evm_challenge_for_wallet_link(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    input: EvmChallengeRequest,
+    link: WalletLinkContext,
+) -> anyhow::Result<EvmChallengeResponse> {
+    let WalletLinkContext {
+        context, authority, ..
+    } = link;
     validate_evm_address(&input.address).map_err(anyhow::Error::msg)?;
     if input.chain_id == 0 {
         anyhow::bail!("chain_id must be non-zero");
     }
 
     let now = crate::auth::now_ts();
-    let domain = request_domain(headers)?;
-    let scheme = request_scheme(&domain);
-    let uri = format!("{scheme}://{domain}/apps/home/");
+    let request_authority = request_domain(headers)?;
+    let scheme = request_scheme(&request_authority);
+    let origin = format!("{scheme}://{request_authority}");
+    let uri = format!("{origin}/apps/home/");
     let resources = vec![
         "elastos://wallet/account/link".to_string(),
         format!("elastos://principal/{}", context.principal_id),
     ];
-    let data = wallet_provider_data(
+    let data = wallet_link_provider_data(
         state,
-        json!({
-            "op": "challenge",
-            "domain": domain,
-            "uri": uri,
-            "address": input.address,
-            "chain_id": input.chain_id,
-            "resources": resources,
-        }),
+        &authority,
+        WalletProviderOperationV2::Challenge {
+            domain: origin,
+            uri,
+            address: input.address,
+            chain_id: input.chain_id,
+            resources,
+        },
     )
     .await?;
     let challenge_id = required_string(&data, "challenge_id")?;
@@ -2252,9 +2795,20 @@ async fn evm_verify_inner(
     headers: &HeaderMap,
     input: EvmVerifyRequest,
 ) -> anyhow::Result<EvmVerifyResponse> {
-    let launch_context = require_wallet_link_context(state, headers)?;
-    let app = launch_context.app;
-    let context = launch_context.context;
+    let link = require_wallet_link_context(state, headers)?;
+    evm_verify_for_wallet_link(state, input, link).await
+}
+
+pub(in crate::api) async fn evm_verify_for_wallet_link(
+    state: &GatewayState,
+    input: EvmVerifyRequest,
+    link: WalletLinkContext,
+) -> anyhow::Result<EvmVerifyResponse> {
+    let WalletLinkContext {
+        app,
+        context,
+        authority,
+    } = link;
     let session_proof_binding_id = context
         .proof_binding_id
         .clone()
@@ -2268,18 +2822,18 @@ async fn evm_verify_inner(
         .ok_or_else(|| anyhow::anyhow!("SIWE proof missing challenge resource"))?
         .to_string();
     let now = crate::auth::now_ts();
-    let data = match wallet_provider_data(
+    let data = match wallet_link_provider_result(
         state,
-        json!({
-            "op": "verify_proof",
-            "message": &input.message,
-            "signature": &input.signature,
-        }),
+        &authority,
+        WalletProviderOperationV2::VerifyProof {
+            message: input.message.clone(),
+            signature: input.signature.clone(),
+        },
     )
-    .await
+    .await?
     {
-        Ok(data) => data,
-        Err(ecdsa_err) => {
+        WalletResultV2::Ok { data } => data,
+        WalletResultV2::Error { code, message } if code == "invalid_proof" => {
             let network = network_id_for_eip155_chain_id(parsed.chain_id)
                 .ok_or_else(|| anyhow::anyhow!("ERC-1271 verification requires a configured chain-provider network for eip155:{}", parsed.chain_id))?;
             let message_hash = format!(
@@ -2299,19 +2853,23 @@ async fn evm_verify_inner(
             .await
             .map_err(|chain_err| {
                 anyhow::anyhow!(
-                    "wallet ECDSA proof failed ({ecdsa_err}); ERC-1271 verification failed ({chain_err})"
+                    "Wallet EOA proof failed ({message}); ERC-1271 verification failed ({chain_err})"
                 )
             })?;
-            wallet_provider_data(
+            let evidence = erc1271_wallet_evidence(network, erc1271_proof)?;
+            wallet_link_provider_data(
                 state,
-                json!({
-                    "op": "verify_contract_proof",
-                    "message": &input.message,
-                    "signature": &input.signature,
-                    "erc1271_proof": erc1271_proof,
-                }),
+                &authority,
+                WalletProviderOperationV2::VerifyContractProof {
+                    message: input.message.clone(),
+                    signature: input.signature.clone(),
+                    evidence,
+                },
             )
             .await?
+        }
+        WalletResultV2::Error { code, message } => {
+            anyhow::bail!("Wallet proof rejected ({code}): {message}")
         }
     };
     let proof_binding_id = required_string(&data, "proof_binding_id")?;
@@ -2359,17 +2917,17 @@ async fn evm_verify_inner(
         now,
     )?;
     crate::auth::ensure_proof_binding_not_revoked(&principal)?;
-    wallet_provider_data(
+    let _ = wallet_connector_id_for_wallet_link(&app)?;
+    wallet_link_provider_data(
         state,
-        json!({
-            "op": "link_account",
-            "principal_id": principal.principal_id.clone(),
-            "proof_binding_id": principal.proof_binding_id.clone(),
-            "chain_namespace": chain_namespace,
-            "address": address,
-            "proof_type": proof_type,
-            "connector_id": wallet_connector_id_for_wallet_link(&app)?,
-        }),
+        &authority,
+        WalletProviderOperationV2::LinkVerifiedAccount {
+            proof_binding_id: principal.proof_binding_id.clone(),
+            chain_namespace,
+            address,
+            proof_type: proof_type.clone(),
+            label: None,
+        },
     )
     .await?;
     crate::auth::append_audit_event(
@@ -2391,8 +2949,9 @@ async fn evm_verify_inner(
         }),
     )?;
 
-    let app_token = super::gateway::issue_home_launch_token_with_context(
+    let app_token = super::gateway::issue_home_projection_launch_token_with_context(
         &state.data_dir,
+        &app,
         &app,
         &super::gateway::HomeLaunchTokenContext {
             principal_id: session.principal_id.clone(),
@@ -2416,8 +2975,19 @@ async fn btc_challenge_inner(
     headers: &HeaderMap,
     input: BtcChallengeRequest,
 ) -> anyhow::Result<BtcChallengeResponse> {
-    let launch_context = require_wallet_link_context(state, headers)?;
-    let context = launch_context.context;
+    let link = require_wallet_link_context(state, headers)?;
+    btc_challenge_for_wallet_link(state, headers, input, link).await
+}
+
+pub(in crate::api) async fn btc_challenge_for_wallet_link(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    input: BtcChallengeRequest,
+    link: WalletLinkContext,
+) -> anyhow::Result<BtcChallengeResponse> {
+    let WalletLinkContext {
+        context, authority, ..
+    } = link;
     let now = crate::auth::now_ts();
     let domain = request_domain(headers)?;
     let scheme = request_scheme(&domain);
@@ -2426,16 +2996,16 @@ async fn btc_challenge_inner(
         "elastos://wallet/account/link".to_string(),
         format!("elastos://principal/{}", context.principal_id),
     ];
-    let data = wallet_provider_data(
+    let data = wallet_link_provider_data(
         state,
-        json!({
-            "op": "bitcoin_challenge",
-            "domain": domain,
-            "uri": uri,
-            "address": input.address,
-            "network": input.network,
-            "resources": resources,
-        }),
+        &authority,
+        WalletProviderOperationV2::BitcoinChallenge {
+            domain,
+            uri,
+            address: input.address,
+            network: PublicNetwork::new(input.network)?,
+            resources,
+        },
     )
     .await?;
     let challenge_id = required_string(&data, "challenge_id")?;
@@ -2478,24 +3048,37 @@ async fn btc_verify_inner(
     headers: &HeaderMap,
     input: BtcVerifyRequest,
 ) -> anyhow::Result<BtcVerifyResponse> {
-    let launch_context = require_wallet_link_context(state, headers)?;
-    let app = launch_context.app;
-    let context = launch_context.context;
+    let link = require_wallet_link_context(state, headers)?;
+    btc_verify_for_wallet_link(state, input, link).await
+}
+
+pub(in crate::api) async fn btc_verify_for_wallet_link(
+    state: &GatewayState,
+    input: BtcVerifyRequest,
+    link: WalletLinkContext,
+) -> anyhow::Result<BtcVerifyResponse> {
+    let WalletLinkContext {
+        app,
+        context,
+        authority,
+    } = link;
     let session_proof_binding_id = context
         .proof_binding_id
         .clone()
         .ok_or_else(|| anyhow::anyhow!("missing proof-bound auth session"))?;
     let challenge_id = bitcoin_challenge_id_from_message(&input.message)?;
     let now = crate::auth::now_ts();
-    let data = wallet_provider_data(
+    let data = wallet_link_provider_data(
         state,
-        json!({
-            "op": "verify_bip322_proof",
-            "message": &input.message,
-            "signature": &input.signature,
-            "signature_type": input.signature_type.as_deref().unwrap_or("bip322_simple"),
-            "public_key": input.public_key,
-        }),
+        &authority,
+        WalletProviderOperationV2::VerifyBip322Proof {
+            message: input.message.clone(),
+            signature: input.signature,
+            signature_type: input
+                .signature_type
+                .unwrap_or_else(|| "bip322_simple".to_string()),
+            public_key: input.public_key,
+        },
     )
     .await?;
     let proof_binding_id = required_string(&data, "proof_binding_id")?;
@@ -2549,17 +3132,17 @@ async fn btc_verify_inner(
         now,
     )?;
     crate::auth::ensure_proof_binding_not_revoked(&principal)?;
-    wallet_provider_data(
+    let _ = wallet_connector_id_for_wallet_link(&app)?;
+    wallet_link_provider_data(
         state,
-        json!({
-            "op": "link_account",
-            "principal_id": principal.principal_id.clone(),
-            "proof_binding_id": principal.proof_binding_id.clone(),
-            "chain_namespace": chain_namespace,
-            "address": address,
-            "proof_type": proof_type,
-            "connector_id": wallet_connector_id_for_wallet_link(&app)?,
-        }),
+        &authority,
+        WalletProviderOperationV2::LinkVerifiedAccount {
+            proof_binding_id: principal.proof_binding_id.clone(),
+            chain_namespace,
+            address,
+            proof_type,
+            label: None,
+        },
     )
     .await?;
     crate::auth::append_audit_event(
@@ -2577,8 +3160,9 @@ async fn btc_verify_inner(
         }),
     )?;
 
-    let app_token = super::gateway::issue_home_launch_token_with_context(
+    let app_token = super::gateway::issue_home_projection_launch_token_with_context(
         &state.data_dir,
+        &app,
         &app,
         &super::gateway::HomeLaunchTokenContext {
             principal_id: session.principal_id.clone(),
@@ -2620,13 +3204,6 @@ fn wallet_connector_id_for_wallet_link(app: &str) -> anyhow::Result<&str> {
     anyhow::bail!("wallet linking requires a dedicated wallet connector capsule")
 }
 
-pub(crate) async fn wallet_provider_data(
-    state: &GatewayState,
-    request: Value,
-) -> anyhow::Result<Value> {
-    provider_data(state, "wallet", request).await
-}
-
 async fn chain_provider_data(state: &GatewayState, request: Value) -> anyhow::Result<Value> {
     provider_data(state, "chain", request).await
 }
@@ -2660,6 +3237,23 @@ fn network_id_for_eip155_chain_id(chain_id: u64) -> Option<&'static str> {
         8453 => Some("base-mainnet"),
         _ => None,
     }
+}
+
+fn erc1271_wallet_evidence(
+    expected_network: &str,
+    mut data: Value,
+) -> anyhow::Result<Erc1271ProofEvidenceV1> {
+    if data
+        .get("network")
+        .and_then(|network| network.get("id"))
+        .and_then(Value::as_str)
+        != Some(expected_network)
+    {
+        anyhow::bail!("ERC-1271 proof network mismatch");
+    }
+    data["network"] = Value::String(expected_network.to_string());
+    serde_json::from_value(data)
+        .map_err(|err| anyhow::anyhow!("invalid ERC-1271 proof evidence: {err}"))
 }
 
 fn required_string(data: &Value, field: &str) -> anyhow::Result<String> {
@@ -2819,7 +3413,7 @@ fn passkey_verified_response(headers: &HeaderMap, response: PasskeyVerifyRespons
     http_response
 }
 
-fn auth_error_response(err: anyhow::Error) -> Response {
+pub(in crate::api) fn auth_error_response(err: anyhow::Error) -> Response {
     let text = err.to_string();
     let status = if text.contains("missing")
         || text.contains("invalid")
@@ -2938,6 +3532,46 @@ mod tests {
     use axum::http::HeaderValue;
     use elastos_runtime::provider::{Provider, ProviderError, ResourceRequest, ResourceResponse};
     use std::sync::Arc;
+
+    #[test]
+    fn full_recovery_semantic_digest_canonicalizes_objects_and_binds_nested_content() {
+        let first: Value = serde_json::from_str(
+            r#"{
+                "schema":"elastos.full-recovery-bundle/v1",
+                "bundle_id":"bundle:test",
+                "data_kit":{"kit_id":"kit:test","crypto":{"cipher":"aes-256-gcm"}},
+                "wallet_recovery_keys":[{"account_id":"wallet:test","private_key_hex":"11"}]
+            }"#,
+        )
+        .unwrap();
+        let reordered: Value = serde_json::from_str(
+            r#"{
+                "wallet_recovery_keys":[{"private_key_hex":"11","account_id":"wallet:test"}],
+                "data_kit":{"crypto":{"cipher":"aes-256-gcm"},"kit_id":"kit:test"},
+                "bundle_id":"bundle:test",
+                "schema":"elastos.full-recovery-bundle/v1"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            full_recovery_bundle_semantic_digest(&first).unwrap(),
+            full_recovery_bundle_semantic_digest(&reordered).unwrap()
+        );
+
+        let mut kit_substitution = reordered.clone();
+        kit_substitution["data_kit"]["kit_id"] = json!("kit:substituted");
+        assert_ne!(
+            full_recovery_bundle_semantic_digest(&first).unwrap(),
+            full_recovery_bundle_semantic_digest(&kit_substitution).unwrap()
+        );
+
+        let mut wallet_substitution = reordered;
+        wallet_substitution["wallet_recovery_keys"][0]["private_key_hex"] = json!("22");
+        assert_ne!(
+            full_recovery_bundle_semantic_digest(&first).unwrap(),
+            full_recovery_bundle_semantic_digest(&wallet_substitution).unwrap()
+        );
+    }
 
     fn test_gateway_state(data_dir: &std::path::Path) -> GatewayState {
         GatewayState {
@@ -3061,6 +3695,24 @@ mod tests {
             "x-elastos-home-token",
             HeaderValue::from_str(token).unwrap(),
         );
+        headers.insert("host", HeaderValue::from_static("localhost:61180"));
+        let payload: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(token)
+                .expect("decode test launch token"),
+        )
+        .expect("parse test launch token");
+        let actor = payload["payload"]["launch_context"]["executable_actor"]
+            .as_str()
+            .expect("test launch token actor");
+        headers.insert(
+            "origin",
+            if actor == HOME_CAPSULE_ID {
+                HeaderValue::from_static("http://localhost:61180")
+            } else {
+                HeaderValue::from_static("null")
+            },
+        );
         headers
     }
 
@@ -3074,6 +3726,8 @@ mod tests {
             ))
             .unwrap(),
         );
+        headers.insert("host", HeaderValue::from_static("localhost:61180"));
+        headers.insert("origin", HeaderValue::from_static("http://localhost:61180"));
         headers
     }
 
@@ -3204,52 +3858,6 @@ mod tests {
             first_principal.localhost_root,
             second_principal.localhost_root
         );
-    }
-
-    #[test]
-    fn passkey_login_accounts_are_sorted_and_omit_roots() {
-        let empty = tempfile::tempdir().unwrap();
-        assert!(passkey_login_accounts(empty.path()).unwrap().is_empty());
-
-        let temp = tempfile::tempdir().unwrap();
-        let state = test_gateway_state(temp.path());
-        let admin = issue_named_passkey_session_grant(
-            &state,
-            "identity-test",
-            &test_credential(),
-            "https://elastos.elacitylabs.com",
-            true,
-            "admin passkey",
-            Some("Zed Admin"),
-        )
-        .unwrap();
-        let guest = issue_named_passkey_session_grant(
-            &state,
-            "identity-test",
-            &test_credential_2(),
-            "https://elastos.elacitylabs.com",
-            true,
-            "guest passkey",
-            Some("Ada Guest"),
-        )
-        .unwrap();
-
-        // Equal last_used_at (second resolution) → admin before guest, then name.
-        let accounts = passkey_login_accounts(temp.path()).unwrap();
-        assert_eq!(accounts.len(), 2);
-        assert_eq!(accounts[0].principal_id, admin.principal_id);
-        assert_eq!(accounts[0].display_name, "Zed Admin");
-        assert_eq!(accounts[0].role, "admin");
-        assert_eq!(accounts[0].credential_id, "credential-1");
-        assert_eq!(accounts[1].principal_id, guest.principal_id);
-        assert_eq!(accounts[1].display_name, "Ada Guest");
-        assert_eq!(accounts[1].role, "guest");
-        assert_eq!(accounts[1].credential_id, "credential-2");
-        assert!(accounts[0].avatar_cid.is_none());
-        let encoded = serde_json::to_value(&accounts).unwrap();
-        assert!(encoded[0].get("localhost_root").is_none());
-        assert!(encoded[0].get("proof_binding_id").is_none());
-        assert!(encoded[0].get("avatar_cid").is_none());
     }
 
     #[tokio::test]
@@ -3408,6 +4016,48 @@ mod tests {
         assert!(status.protection_configured);
         assert!(status.recovery_configured);
         assert!(status.required_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_status_distinguishes_configured_protection_from_plaintext_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
+                .unwrap();
+        crate::auth::store_test_principal_root_protection(temp.path(), &principal.principal_id);
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            principal.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"legacy plaintext").unwrap();
+
+        let status = recovery_status_inner(&state, &home_token_headers(&grant.home_token))
+            .await
+            .unwrap();
+
+        assert!(status.protection_configured);
+        assert!(!status.root_encrypted);
+        assert!(status
+            .required_actions
+            .contains(&"migrate_declared_plaintext_objects".to_string()));
+        assert!(!serde_json::to_string(&status)
+            .unwrap()
+            .contains(object_uri.as_str()));
     }
 
     #[tokio::test]
@@ -3699,7 +4349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_kit_import_accepts_verified_material_without_prior_protection() {
+    async fn recovery_kit_import_accepts_exact_kit_envelope_binding_without_prior_protection() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
@@ -3723,11 +4373,38 @@ mod tests {
             1_800_000_000,
         )
         .unwrap();
+        let archive = crate::auth::recovery_archive_from_kit(temp.path(), &kit).unwrap();
+        let protection = protection_from_recovery_kit(
+            &kit,
+            Some("Exact imported binding"),
+            1_800_000_000,
+            Some(archive),
+        )
+        .unwrap();
+        crate::auth::store_principal_root_protection(temp.path(), protection).unwrap();
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            principal.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        crate::auth::write_principal_root_object(
+            temp.path(),
+            &grant.principal_id,
+            &principal.localhost_root,
+            &object_uri,
+            &object_path,
+            b"exact imported key",
+        )
+        .unwrap();
+        let mut auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
+        auth_state.principal_root_protections.clear();
+        crate::auth::save_auth_state(temp.path(), &auth_state).unwrap();
         let request = RecoveryKitMaterialImport {
             principal_id: grant.principal_id.clone(),
             localhost_root: principal.localhost_root.clone(),
             reassign_to_current_principal: false,
-            kit,
+            kit: kit.clone(),
             did_recovery_proof: None,
         };
 
@@ -3742,10 +4419,226 @@ mod tests {
             .unwrap();
         assert!(status.root_encrypted);
         assert!(status.recovery_configured);
+        assert_eq!(
+            crate::auth::read_principal_root_object(
+                temp.path(),
+                &kit.principal_id,
+                &kit.localhost_root,
+                &object_uri,
+                &object_path,
+            )
+            .unwrap(),
+            b"exact imported key"
+        );
         let auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
         let event = auth_state.audit.last().unwrap();
         assert_eq!(event.event_type, "auth.recovery_kit.imported");
         assert_eq!(event.result, "ok");
+    }
+
+    #[tokio::test]
+    async fn recovery_kit_import_rejects_wrong_key_binding_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
+                .unwrap();
+        let exact_kit = create_recovery_kit_for_principal(
+            &grant.principal_id,
+            &principal.localhost_root,
+            Some("exact"),
+            1_800_000_000,
+        )
+        .unwrap();
+        let archive = crate::auth::recovery_archive_from_kit(temp.path(), &exact_kit).unwrap();
+        let protection = protection_from_recovery_kit(
+            &exact_kit,
+            Some("Exact retained binding"),
+            1_800_000_000,
+            Some(archive),
+        )
+        .unwrap();
+        crate::auth::store_principal_root_protection(temp.path(), protection).unwrap();
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            principal.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        crate::auth::write_principal_root_object(
+            temp.path(),
+            &grant.principal_id,
+            &principal.localhost_root,
+            &object_uri,
+            &object_path,
+            b"exact retained key",
+        )
+        .unwrap();
+        let wrong_kit = create_recovery_kit_for_principal(
+            &grant.principal_id,
+            &principal.localhost_root,
+            Some("wrong"),
+            1_800_000_001,
+        )
+        .unwrap();
+        assert_ne!(wrong_kit.data_key_id, exact_kit.data_key_id);
+        let auth_state_path = crate::auth::auth_state_path(temp.path()).unwrap();
+        let auth_state_before = std::fs::read(&auth_state_path).unwrap();
+        let archive_key_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), "ElastOS/System/Auth")
+                .unwrap()
+                .join("recovery-archive.key");
+        let archive_key_before = std::fs::read(&archive_key_path).unwrap();
+        let object_before = std::fs::read(&object_path).unwrap();
+
+        let err = recovery_kit_import_inner(
+            &state,
+            &home_token_headers(&grant.home_token),
+            RecoveryKitMaterialImport {
+                principal_id: grant.principal_id,
+                localhost_root: principal.localhost_root,
+                reassign_to_current_principal: false,
+                kit: wrong_kit,
+                did_recovery_proof: None,
+            },
+        )
+        .await
+        .expect_err("a valid but wrong Recovery Kit must not activate the root");
+
+        assert!(err.to_string().contains("envelope binding is invalid"));
+        assert_eq!(std::fs::read(auth_state_path).unwrap(), auth_state_before);
+        assert_eq!(std::fs::read(archive_key_path).unwrap(), archive_key_before);
+        assert_eq!(std::fs::read(object_path).unwrap(), object_before);
+        assert!(crate::auth::is_auth_session_active(
+            temp.path(),
+            &grant.session_id,
+            crate::auth::now_ts()
+        )
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn recovery_kit_import_requires_plaintext_migration_before_any_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let credential = test_credential();
+        store_test_credential(temp.path(), credential.clone());
+        let grant = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "test passkey grant",
+        )
+        .unwrap();
+        let principal =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &grant.proof_binding_id)
+                .unwrap();
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            principal.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"existing uCity save").unwrap();
+        let kit = create_recovery_kit_for_principal(
+            &grant.principal_id,
+            &principal.localhost_root,
+            Some("test"),
+            1_800_000_000,
+        )
+        .unwrap();
+        let before = crate::auth::load_auth_state(temp.path()).unwrap();
+        let archive_key_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), "ElastOS/System/Auth")
+                .unwrap()
+                .join("recovery-archive.key");
+
+        let err = recovery_kit_import_inner(
+            &state,
+            &home_token_headers(&grant.home_token),
+            RecoveryKitMaterialImport {
+                principal_id: grant.principal_id,
+                localhost_root: principal.localhost_root.clone(),
+                reassign_to_current_principal: false,
+                kit,
+                did_recovery_proof: None,
+            },
+        )
+        .await
+        .expect_err("plaintext migration must precede Recovery Kit import");
+        let outcome = err
+            .downcast_ref::<crate::auth::PrincipalRootMigrationRequiredV1>()
+            .expect("typed migration-required outcome");
+        let after = crate::auth::load_auth_state(temp.path()).unwrap();
+
+        assert_eq!(outcome.plaintext_object_count, 1);
+        assert_eq!(after.audit.len(), before.audit.len());
+        assert_eq!(after.sessions.len(), before.sessions.len());
+        assert_eq!(
+            after.principal_root_protections,
+            before.principal_root_protections
+        );
+        assert!(!archive_key_path.exists());
+        assert_eq!(std::fs::read(object_path).unwrap(), b"existing uCity save");
+    }
+
+    #[test]
+    fn protected_object_inventory_includes_gba_but_excludes_vm_and_provider_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let localhost_root = crate::auth::principal_localhost_root("person:local:inventory");
+        let inventory = principal_root_protected_object_inventory(temp.path(), &localhost_root);
+        let uris = inventory
+            .iter()
+            .map(crate::auth::PrincipalRootProtectedObjectDeclarationV1::uri)
+            .collect::<Vec<_>>();
+
+        assert!(uris
+            .iter()
+            .any(|uri| uri.ends_with("/.AppData/LocalHost/GBA")));
+        assert!(uris.iter().all(|uri| !uri.contains("/BrowserProfiles")));
+        assert!(uris
+            .iter()
+            .all(|uri| { !uri.contains("/ProviderLogs") && !uri.contains("/.Runtime/Providers") }));
+    }
+
+    #[test]
+    fn configured_principal_root_readiness_rejects_declared_plaintext() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal_id = "person:local:startup-readiness";
+        let protection =
+            crate::auth::store_test_principal_root_protection(temp.path(), principal_id);
+        let object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/legacy.sav",
+            protection.localhost_root
+        );
+        let object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, b"legacy save").unwrap();
+
+        let error = verify_configured_principal_roots_ready(temp.path())
+            .expect_err("Home readiness must reject declared plaintext");
+        let outcome = error
+            .downcast_ref::<crate::auth::PrincipalRootMigrationRequiredV1>()
+            .expect("typed migration-required readiness result");
+
+        assert_eq!(outcome.principal_id, principal_id);
+        assert_eq!(outcome.plaintext_object_count, 1);
+        assert_eq!(std::fs::read(object_path).unwrap(), b"legacy save");
     }
 
     #[tokio::test]
@@ -3893,6 +4786,31 @@ mod tests {
             1_800_000_000,
         )
         .unwrap();
+        let archive = crate::auth::recovery_archive_from_kit(temp.path(), &kit).unwrap();
+        let protection = protection_from_recovery_kit(
+            &kit,
+            Some("Orphaned exact binding"),
+            1_800_000_000,
+            Some(archive),
+        )
+        .unwrap();
+        crate::auth::store_principal_root_protection(temp.path(), protection).unwrap();
+        let recovered_object_uri = format!(
+            "{}/.AppData/LocalHost/GBA/ucity/rom-id.sav",
+            old_principal.localhost_root
+        );
+        let recovered_object_path =
+            elastos_common::localhost::rooted_localhost_fs_path(temp.path(), &recovered_object_uri)
+                .unwrap();
+        crate::auth::write_principal_root_object(
+            temp.path(),
+            &old_principal.principal_id,
+            &old_principal.localhost_root,
+            &recovered_object_uri,
+            &recovered_object_path,
+            b"reassigned exact key",
+        )
+        .unwrap();
         crate::auth::revoke_passkey_binding(
             temp.path(),
             &old.proof_binding_id,
@@ -3970,10 +4888,124 @@ mod tests {
         assert!(status.root_encrypted);
         assert!(status.recovery_configured);
         assert_eq!(status.principal_id, old_principal.principal_id);
+        assert_eq!(
+            crate::auth::read_principal_root_object(
+                temp.path(),
+                &old_principal.principal_id,
+                &old_principal.localhost_root,
+                &recovered_object_uri,
+                &recovered_object_path,
+            )
+            .unwrap(),
+            b"reassigned exact key"
+        );
         let auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
         let event = auth_state.audit.last().unwrap();
         assert_eq!(event.event_type, "auth.recovery_kit.reassigned");
         assert_eq!(event.result, "ok");
+    }
+
+    #[tokio::test]
+    async fn recovery_reassignment_precommit_failures_preserve_original_authority() {
+        for fault in [
+            crate::auth::RecoveryReassignmentTestFault::TokenPreparation,
+            crate::auth::RecoveryReassignmentTestFault::AuditChainRejection,
+            crate::auth::RecoveryReassignmentTestFault::AuthStateSave,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = test_gateway_state(temp.path());
+            let recovered = issue_passkey_session_grant(
+                &state,
+                "identity-test",
+                &test_credential(),
+                "https://elastos.elacitylabs.com",
+                true,
+                "recovered passkey grant",
+            )
+            .unwrap();
+            let recovered_principal = crate::auth::load_principal_for_proof_binding(
+                temp.path(),
+                &recovered.proof_binding_id,
+            )
+            .unwrap();
+            let kit = create_recovery_kit_for_principal(
+                &recovered_principal.principal_id,
+                &recovered_principal.localhost_root,
+                Some("fault-injected recovered root"),
+                1_800_000_000,
+            )
+            .unwrap();
+            crate::auth::revoke_passkey_binding(
+                temp.path(),
+                &recovered.proof_binding_id,
+                crate::auth::now_ts(),
+            )
+            .unwrap();
+            let current = issue_passkey_session_grant(
+                &state,
+                "identity-test",
+                &test_credential_2(),
+                "https://elastos.elacitylabs.com",
+                true,
+                "pre-reassignment passkey grant",
+            )
+            .unwrap();
+            let current_principal = crate::auth::load_principal_for_proof_binding(
+                temp.path(),
+                &current.proof_binding_id,
+            )
+            .unwrap();
+            crate::auth::inject_recovery_reassignment_test_fault(temp.path(), fault);
+
+            let error = recovery_kit_import_inner(
+                &state,
+                &home_token_headers(&current.home_token),
+                RecoveryKitMaterialImport {
+                    principal_id: current_principal.principal_id.clone(),
+                    localhost_root: current_principal.localhost_root.clone(),
+                    reassign_to_current_principal: true,
+                    kit: kit.clone(),
+                    did_recovery_proof: None,
+                },
+            )
+            .await
+            .expect_err("fault-injected reassignment must fail");
+
+            assert!(error.to_string().contains("injected recovery reassignment"));
+            assert!(crate::auth::is_auth_session_active(
+                temp.path(),
+                &current.session_id,
+                crate::auth::now_ts()
+            )
+            .unwrap());
+            let unchanged = crate::auth::load_principal_for_proof_binding(
+                temp.path(),
+                &current.proof_binding_id,
+            )
+            .unwrap();
+            assert_eq!(unchanged.principal_id, current_principal.principal_id);
+            assert_eq!(unchanged.localhost_root, current_principal.localhost_root);
+            recovery_status_inner(&state, &home_token_headers(&current.home_token))
+                .await
+                .expect("pre-reassignment token must remain usable");
+
+            let auth_state = crate::auth::load_auth_state(temp.path()).unwrap();
+            assert!(!auth_state.audit.iter().any(|event| {
+                event.event_type == "auth.recovery_kit.reassigned" && event.result == "ok"
+            }));
+            assert!(!auth_state.sessions.iter().any(|stored| {
+                stored.revoked_at.is_none()
+                    && stored.grant.proof_binding_id == current.proof_binding_id
+                    && stored.grant.principal_id == recovered_principal.principal_id
+            }));
+            assert!(crate::auth::load_principal_root_protection(
+                temp.path(),
+                &kit.principal_id,
+                &kit.localhost_root,
+            )
+            .unwrap()
+            .is_none());
+        }
     }
 
     #[tokio::test]
@@ -4019,6 +5051,10 @@ mod tests {
                 .unwrap();
         let mut headers = home_token_headers(&current.home_token);
         headers.insert("host", HeaderValue::from_static("elastos.elacitylabs.com"));
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://elastos.elacitylabs.com"),
+        );
 
         let bundle_principal_id = kit.principal_id.clone();
         let bundle_localhost_root = kit.localhost_root.clone();
@@ -4382,13 +5418,14 @@ mod tests {
         .unwrap());
     }
 
-    #[test]
-    fn sign_out_revokes_http_only_home_cookie_session() {
+    #[tokio::test]
+    async fn sign_out_revokes_only_active_session_without_resetting_principal_or_passkey() {
         let temp = tempfile::tempdir().unwrap();
         let _auth_data_dir = super::super::gateway::set_test_home_launch_auth_data_dir(temp.path());
         let state = test_gateway_state(temp.path());
         let credential = test_credential();
-        let grant = issue_passkey_session_grant(
+        store_test_credential(temp.path(), credential.clone());
+        let active = issue_passkey_session_grant(
             &state,
             "identity-test",
             &credential,
@@ -4397,18 +5434,53 @@ mod tests {
             "test passkey grant",
         )
         .unwrap();
-        let headers = home_session_cookie_headers(&grant.home_token);
+        let retained = issue_passkey_session_grant(
+            &state,
+            "identity-test",
+            &credential,
+            "https://elastos.elacitylabs.com",
+            true,
+            "retained passkey grant",
+        )
+        .unwrap();
+        let principal_before =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &active.proof_binding_id)
+                .unwrap();
+        let headers = home_session_cookie_headers(&active.home_token);
 
         let response = sign_out_session_inner(&state, &headers).unwrap();
 
         assert_eq!(response.status, "signed_out");
-        assert_eq!(response.session_id, grant.session_id);
+        assert_eq!(response.session_id, active.session_id);
         assert!(!crate::auth::is_auth_session_active(
             temp.path(),
-            &grant.session_id,
+            &active.session_id,
             crate::auth::now_ts()
         )
         .unwrap());
+        assert!(crate::auth::is_auth_session_active(
+            temp.path(),
+            &retained.session_id,
+            crate::auth::now_ts()
+        )
+        .unwrap());
+
+        let principal_after =
+            crate::auth::load_principal_for_proof_binding(temp.path(), &active.proof_binding_id)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(principal_after).unwrap(),
+            serde_json::to_value(principal_before).unwrap(),
+        );
+
+        let passkeys = passkey_list_inner(&state, &home_token_headers(&retained.home_token))
+            .await
+            .unwrap();
+        assert!(passkeys.passkeys.iter().any(|passkey| {
+            passkey.proof_binding_id == active.proof_binding_id
+                && passkey.principal_id == active.principal_id
+                && passkey.current
+        }));
     }
 
     #[tokio::test]
@@ -4463,6 +5535,10 @@ mod tests {
         .unwrap();
         let mut headers = home_session_cookie_headers(&grant.home_token);
         headers.insert("host", HeaderValue::from_static("elastos.elacitylabs.com"));
+        headers.insert(
+            "origin",
+            HeaderValue::from_static("https://elastos.elacitylabs.com"),
+        );
 
         let response = sign_out_session(State(state), headers).await;
         let cookies: Vec<_> = response

@@ -10,10 +10,13 @@ const repoRoot = new URL("../", import.meta.url);
 const browserSource = [
   "capsules/browser/browser/browser.js",
   "capsules/browser/browser/browser-clipboard.js",
+  "capsules/home/browser/home-clipboard-client.js",
+  "capsules/home/browser/home-clipboard-protocol.js",
   "capsules/browser/browser/browser-history.js",
   "capsules/browser/browser/browser-input-surface.js",
   "capsules/browser/browser/browser-input.js",
   "capsules/browser/browser/browser-location.js",
+  "capsules/browser/browser/browser-page-cleanup.js",
   "capsules/browser/browser/browser-remote-display.js",
   "capsules/browser/browser/browser-runtime-api.js",
   "capsules/browser/browser/browser-status.js",
@@ -28,6 +31,17 @@ const browserStyle = fs.readFileSync(
 );
 const homeGuiWindowsSource = fs.readFileSync(
   new URL("capsules/home-gui/browser/shell-windows.js", repoRoot),
+  "utf8",
+);
+const homeClipboardHostSource = fs.readFileSync(
+  new URL(
+    "capsules/home/browser/home-clipboard-host.js",
+    repoRoot,
+  ),
+  "utf8",
+);
+const homeShellHostSource = fs.readFileSync(
+  new URL("capsules/home/browser/home-shell-host.js", repoRoot),
   "utf8",
 );
 const homeShellWindowGeometrySource = fs.readFileSync(
@@ -68,9 +82,9 @@ const sanitizedErrorTextSource = extractFunction(
   browserSource,
   "sanitizedErrorText",
 );
-const browserLaunchFailureSummarySource = extractFunction(
+const runtimeOpenOutcomeSource = extractFunction(
   browserSource,
-  "browserLaunchFailureSummary",
+  "runtimeOpenOutcome",
 );
 const isAuthoritySessionErrorSource = extractFunction(
   browserSource,
@@ -100,7 +114,6 @@ const browserMediaContentRectSource = extractFunction(
   browserSource,
   "browserMediaContentRect",
 );
-
 function runCase(query) {
   const script = new vm.Script(`
     const params = new URLSearchParams(${JSON.stringify(query)});
@@ -149,17 +162,28 @@ expectError("display=unsupported", "Unsupported Browser display mode");
   const script = new vm.Script(`
     ${isAuthoritySessionErrorSource}
     ${sanitizedErrorTextSource}
-    ${browserLaunchFailureSummarySource}
+    ${runtimeOpenOutcomeSource}
     ${friendlyOpenErrorSource}
     friendlyOpenError({
-      status: 400,
-      message: "browser engine supervisor exited with status exit status: 1; Browser VM persistent launcher exited before readiness with 0:\\n\\u001b[32m INFO\\u001b[0m browser-vz-engine-supervisor stage=open_guest_page_start"
+      status: 503,
+      message: "browser engine supervisor exited with status exit status: 1",
+      payload: {
+        outcome: {
+          schema: "elastos.browser.open-outcome/v1",
+          state: "terminal_pre_effect_failure",
+          effects: {
+            page_acquired: false,
+            vm_acquired: false,
+            stream_acquired: false
+          }
+        }
+      }
     });
   `);
   const message = script.runInNewContext({});
   assert(
-    message === "Browser Engine failed to start cleanly. The failed session was closed; refresh Browser, or choose another Browser Engine.",
-    `Browser launch failures must be sanitized, got ${message}`,
+    message === "Browser Engine failed to start cleanly. No Browser page or VM was acquired.",
+    `Browser launch failures must use their structured Runtime outcome, got ${message}`,
   );
 }
 
@@ -281,10 +305,9 @@ assert(
 assert(
   browserSource.includes("const requiresRuntimeRoute =") &&
     browserSource.includes('event?.type === "browser_command"') &&
-    browserSource.includes('event?.type === "resize"') &&
     browserSource.includes('event?.type === "file_upload"') &&
     browserSource.includes("!requiresRuntimeRoute"),
-  "Browser viewport resize and file upload must route through Runtime/provider CDP control instead of Selkies datachannel fallback",
+  "Browser commands and file upload must route through Runtime/provider CDP control instead of Selkies datachannel fallback",
 );
 assert(
   sameBrowserStreamTarget("https://ela.city/", "https://ela.city/home") &&
@@ -299,10 +322,15 @@ assert(
   "Browser address-bar navigation must try Runtime/provider navigation from Chrome error pages before falling back to a fresh Runtime session",
 );
 assert(
-  browserSource.includes("function scheduleViewportResize()") &&
-    browserSource.includes("lastViewport = viewport;") &&
-    !browserSource.includes('type: "resize"'),
-  "Stable WebRTC Browser display must not send provider resize commands that can freeze the fixed compositor stream",
+  !browserSource.includes("scheduleViewportResize") &&
+    !browserSource.includes('{ type: "resize"') &&
+    !browserSource.includes("ResizeObserver") &&
+    browserSource.includes("const PRODUCT_RASTER_WIDTH = 1920") &&
+    browserSource.includes("const PRODUCT_RASTER_HEIGHT = 1080") &&
+    browserSource.includes("deviceScaleFactor: 1") &&
+    browserSource.includes("width: stream.width") &&
+    browserSource.includes("height: stream.height"),
+  "Browser must keep one fixed 1920x1080 DPR-1 guest raster and never drive it from the Home panel",
 );
 assert(
   homeGuiWindowsSource.includes(`syncBrowserWindow(entry, launched);
@@ -330,7 +358,7 @@ assert(
 );
 assert(
   !selkiesMessagesForInputSource.includes('event.type === "resize"'),
-  "Selkies datachannel input must not own viewport resize; resize is provider state, not pointer input",
+  "Selkies datachannel input must not own guest raster size",
 );
 assert(
   browserSource.includes(
@@ -357,14 +385,29 @@ assert(
     browserSource.includes("The Browser Engine is running, but the secure display connection is not ready.") &&
     browserSource.includes("this device has no secure display relay candidate") &&
     browserSource.includes("shared secure display route") &&
-    browserSource.includes("Refresh Browser, or choose another Browser Engine or Exit Node.") &&
+    browserSource.includes("No Browser page or VM was acquired.") &&
+    browserSource.includes(
+      "Runtime cleanup is pending for the acquired Browser session.",
+    ) &&
     browserSource.includes('const iceTransportPolicy =') &&
-    browserSource.includes('displaySession.media_transport === "runtime_relay" ? "relay" : "all"') &&
+    browserSource.includes('displaySession.media_transport === "runtime_relay" && !engineRelayOnly') &&
+    browserSource.includes('displaySession.ice_connection_policy === "runtime_launch_relay_only"') &&
+    browserSource.includes("validateRuntimeLaunchTurn(") &&
+    browserSource.includes('"elastos.browser.media-diagnostic/v1"') &&
+    browserSource.includes('"viewer_ice_pair"') &&
+    browserSource.includes('"viewer_ontrack"') &&
+    browserSource.includes('"viewer_first_frame"') &&
+    browserSource.includes("selected_local_candidate_type") &&
+    browserSource.includes("video_packets_received") &&
+    browserSource.includes("runtimeLaunchRelayOnly ||") &&
     browserSource.includes("iceTransportPolicy,") &&
     browserSource.includes("failRemoteDisplay(nextPeerConnection, \"no_first_frame\")") &&
-    browserSource.includes('onRecoveryRequired(message, { retry: false })') &&
-    browserSource.includes("The stuck Browser session was closed"),
-  "Browser product launch must not silently fall back from WebRTC to image polling, leave stuck Browser sessions, or expose relay internals to users",
+    browserSource.includes("await onRecoveryRequired(message, options)") &&
+    browserSource.includes("createRuntimePageCleanupController") &&
+    browserSource.includes("Runtime cleanup is pending") &&
+    browserSource.includes("Runtime confirmed the failed Browser session closed") &&
+    !browserSource.includes("The stuck Browser session was closed"),
+  "Browser product launch must not silently fall back from WebRTC to image polling, discard Runtime ownership before terminal cleanup, or expose relay internals to users",
 );
 
 {
@@ -408,6 +451,8 @@ assert(
     ${browserPointFromEventSource}
     JSON.stringify({
       center: browserPointFromEvent({ clientX: 500, clientY: 500 }),
+      topLeft: browserPointFromEvent({ clientX: 0, clientY: 218.75 }),
+      bottomRight: browserPointFromEvent({ clientX: 1000, clientY: 781.25 }),
       outside: browserPointFromEvent({ clientX: 500, clientY: 100 })
     });
   `);
@@ -415,6 +460,13 @@ assert(
   assert(
     points.center.x === 960 && points.center.y === 540,
     `contained center must map to video center, got ${JSON.stringify(points.center)}`,
+  );
+  assert(
+    points.topLeft.x === 0 &&
+      points.topLeft.y === 0 &&
+      points.bottomRight.x === 1920 &&
+      points.bottomRight.y === 1080,
+    `contained video corners must map to all encoded corners after viewer resize, got ${JSON.stringify(points)}`,
   );
   assert(
     points.outside === null,
@@ -459,11 +511,19 @@ assert(
 );
 assert(
   homeGuiWindowsSource.includes("function iframeAllowForLaunch") &&
-    homeGuiWindowsSource.includes('launched?.target === "browser"') &&
-    homeGuiWindowsSource.includes('"clipboard-read"') &&
-    homeGuiWindowsSource.includes('"clipboard-write"') &&
-    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"'),
-  "Home must grant clipboard-read/write only through the Browser iframe allow policy so remote paste can read the host clipboard",
+    homeGuiWindowsSource.includes('allow="${iframeAllowForLaunch(launched)}"') &&
+    !homeGuiWindowsSource.includes('"clipboard-read"') &&
+    !homeGuiWindowsSource.includes('"clipboard-write"') &&
+    !browserSource.includes("navigator.clipboard") &&
+    !browserSource.includes("execCommand") &&
+    browserSource.includes("createHomeClipboardClient") &&
+    browserSource.includes("pendingRemoteCopy") &&
+    browserSource.includes('getData("text/plain")') &&
+    homeShellHostSource.includes("createHomeClipboardHost") &&
+    homeClipboardHostSource.includes("await prompt.request") &&
+    homeClipboardHostSource.includes("await clipboard.readText()") &&
+    homeClipboardHostSource.includes("await clipboard.writeText(clipboardText)"),
+  "Browser Clipboard must cross one visible-user-action trusted Home edge while the opaque Browser frame has no Clipboard permission or compatibility fallback",
 );
 
 console.log(
@@ -473,6 +533,6 @@ console.log(
     default_mode: "webrtc_remote_display",
     diagnostic_requires_debug: true,
     audio_invariants_checked: requiredAudioInvariants.length,
-    input_invariants_checked: 10,
+    input_invariants_checked: 12,
   }),
 );
