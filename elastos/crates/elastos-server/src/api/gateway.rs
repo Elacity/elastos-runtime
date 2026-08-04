@@ -868,6 +868,18 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             get(home_agent_backends_get).put(home_agent_backends_put),
         )
         .route(
+            "/api/apps/home/agent/tools/library.read",
+            post(home_agent_library_read_request),
+        )
+        .route(
+            "/api/apps/home/agent/tools/library.read/:request_id",
+            get(home_agent_library_read_status),
+        )
+        .route(
+            "/api/apps/home/agent/tools/library.read/:request_id/cancel",
+            post(home_agent_library_read_cancel),
+        )
+        .route(
             "/api/apps/home/state",
             get(home_browser_state_get).post(home_browser_state_update),
         )

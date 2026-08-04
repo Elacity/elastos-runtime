@@ -1,5 +1,5 @@
 /* Agent message stream + turn theatre.
-   Bound from agent-harness.js. Tip: home-20260804as
+   Bound from agent-harness.js. Tip: home-20260804at
    Live: gateway SSE (/api/apps/home/agent/chat/stream) with AbortController
    stop; mock remains the honest fallback when Live is down.
    UI ≠ authority (Principle 16) — chat carries no tool or grant power.
@@ -14,22 +14,22 @@ import {
   clearLastStreamFailure,
   splitThinkTaggedContent,
   getSelectedModel,
-} from "./mock-agent-provider.js?v=home-20260804as";
+} from "./mock-agent-provider.js?v=home-20260804at";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamLiveChatCompletion,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260804as";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804as";
+} from "./agent-live.js?v=home-20260804at";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804at";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804as";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804as";
+} from "./agent-grants.js?v=home-20260804at";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804at";
 
 /** @type {null | object} */
 let ctx = null;
@@ -1104,7 +1104,7 @@ async function startLiveTurnForPrompt(userText) {
     syncTruthStrip();
     syncWorkbenchPanels();
     if (!stoppedEarly) {
-      maybeOfferToolAfterReply(userText);
+      void maybeOfferToolAfterReply();
     }
   } catch (err) {
     if (generation !== ctx.streamGeneration) {
@@ -1287,7 +1287,7 @@ function startTurnReveal({
       noteMockTurnTokens(
         approxTokens || Math.max(200, Math.round(replyText.length / 3)),
       );
-      maybeOfferToolAfterReply();
+      void maybeOfferToolAfterReply();
       appendFollowUpChips(followUps);
       syncTruthStrip();
       syncWorkbenchPanels();

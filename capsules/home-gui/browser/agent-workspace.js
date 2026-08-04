@@ -8,13 +8,13 @@ import {
   setReasoningVisible,
   getUsageLedger,
   applyUsageLedger,
-} from "./mock-agent-provider.js?v=home-20260804as";
+} from "./mock-agent-provider.js?v=home-20260804at";
 import {
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
-} from "./agent-live.js?v=home-20260804as";
-import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804as";
+} from "./agent-live.js?v=home-20260804at";
+import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804at";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;
@@ -66,6 +66,9 @@ export function serializeSessionForPersist(session) {
               summary: truncatePersistedText(m.summary || ""),
               scope: m.scope || "",
               args: m.args && typeof m.args === "object" ? m.args : undefined,
+              inbox: Boolean(m.inbox),
+              requestId: m.requestId ? String(m.requestId).slice(0, 80) : undefined,
+              result: m.result ? truncatePersistedText(m.result) : undefined,
             };
           }
           return {

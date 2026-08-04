@@ -330,10 +330,10 @@ async fn dispatch_inbox_action(
         return Ok("Rejected wallet request.".to_string());
     }
     if let Some(request_id) = action_id.strip_prefix("capability-approve-request:") {
-        return approve_runtime_capability_request(data_dir, request_id).await;
+        return approve_runtime_capability_request(state, request_id).await;
     }
     if let Some(request_id) = action_id.strip_prefix("capability-deny-request:") {
-        return deny_runtime_capability_request(data_dir, request_id).await;
+        return deny_runtime_capability_request(state, request_id).await;
     }
     if let Some(request_id) = action_id.strip_prefix("service-approve-request:") {
         let data_dir = data_dir.clone();
@@ -397,9 +397,12 @@ async fn dispatch_inbox_action(
 }
 
 pub(super) async fn approve_runtime_capability_request(
-    data_dir: &std::path::Path,
+    state: &GatewayState,
     request_id: &str,
 ) -> anyhow::Result<String> {
+    let data_dir = &state.data_dir;
+    let agent_library = agent_library_read_job_exists(data_dir, request_id);
+    let duration = if agent_library { "once" } else { "session" };
     let coords = load_live_runtime_coords(data_dir)
         .await
         .ok_or_else(|| anyhow::anyhow!("local runtime is not running"))?;
@@ -412,19 +415,28 @@ pub(super) async fn approve_runtime_capability_request(
         .header(AUTHORIZATION, format!("Bearer {shell_token}"))
         .json(&serde_json::json!({
             "request_id": request_id,
-            "duration": "session",
-            "rationale": "Approved in Inbox",
+            "duration": duration,
+            "rationale": if agent_library {
+                "Approved in Inbox · Agent library.read once"
+            } else {
+                "Approved in Inbox"
+            },
         }))
         .send()
         .await?
         .error_for_status()?;
+    if agent_library {
+        fulfill_agent_library_read_after_grant(state, request_id).await?;
+        return Ok("Approved Agent Library.read once — result ready on Home.".to_string());
+    }
     Ok("Approved capsule request.".to_string())
 }
 
 pub(super) async fn deny_runtime_capability_request(
-    data_dir: &std::path::Path,
+    state: &GatewayState,
     request_id: &str,
 ) -> anyhow::Result<String> {
+    let data_dir = &state.data_dir;
     let coords = load_live_runtime_coords(data_dir)
         .await
         .ok_or_else(|| anyhow::anyhow!("local runtime is not running"))?;
@@ -442,5 +454,6 @@ pub(super) async fn deny_runtime_capability_request(
         .send()
         .await?
         .error_for_status()?;
+    mark_agent_library_read_denied(data_dir, request_id);
     Ok("Denied capsule request.".to_string())
 }

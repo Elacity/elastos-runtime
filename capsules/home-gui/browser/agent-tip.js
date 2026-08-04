@@ -58,8 +58,13 @@
  * [ ] Stream/probe failures surface on status strip; healthy Live stays quiet
  * [ ] usageTurns persist via session.agent
  *
+ * Wave 5 tools (§AT):
+ * [ ] library.read creates Inbox capability request (not mock mint)
+ * [ ] Open Inbox / Deny cancel; Approve once → Desktop list on card
+ * [ ] wallet.sign remains preview mock
+ *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804as";
+export const TIP = "home-20260804at";

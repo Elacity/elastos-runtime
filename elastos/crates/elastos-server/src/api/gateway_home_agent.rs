@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::header::AUTHORIZATION;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -549,4 +550,592 @@ pub(super) async fn home_agent_chat_stream(
         header::HeaderValue::from_static("no"),
     );
     response
+}
+
+/* ── Wave 5.01 — On-Home Library.read via Inbox capability (gateway-mediated) ── */
+
+const AGENT_LIBRARY_READ_SCHEMA: &str = "elastos.home.agent.library-read/v1";
+const AGENT_LIBRARY_READ_REASON: &str = "home-agent:library.read";
+const MAX_LIBRARY_LIST_NAMES: usize = 48;
+const MAX_LIBRARY_RESULT_CHARS: usize = 12_000;
+const MAX_LIBRARY_JOBS: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentLibraryReadJob {
+    request_id: String,
+    principal_id: String,
+    resource: String,
+    created_at: u64,
+    /// pending | ready | denied | error
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentLibraryReadStore {
+    schema: String,
+    jobs: Vec<AgentLibraryReadJob>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HomeAgentLibraryReadBody {
+    #[serde(default)]
+    uri: Option<String>,
+}
+
+fn agent_library_read_store_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("config/home-agent-library-read.json")
+}
+
+fn load_agent_library_read_store(data_dir: &Path) -> AgentLibraryReadStore {
+    let path = agent_library_read_store_path(data_dir);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return AgentLibraryReadStore {
+            schema: AGENT_LIBRARY_READ_SCHEMA.to_string(),
+            jobs: Vec::new(),
+        };
+    };
+    let Ok(parsed) = serde_json::from_slice::<AgentLibraryReadStore>(&bytes) else {
+        return AgentLibraryReadStore {
+            schema: AGENT_LIBRARY_READ_SCHEMA.to_string(),
+            jobs: Vec::new(),
+        };
+    };
+    if parsed.schema != AGENT_LIBRARY_READ_SCHEMA {
+        return AgentLibraryReadStore {
+            schema: AGENT_LIBRARY_READ_SCHEMA.to_string(),
+            jobs: Vec::new(),
+        };
+    }
+    parsed
+}
+
+fn store_agent_library_read_store(data_dir: &Path, store: &AgentLibraryReadStore) -> anyhow::Result<()> {
+    let path = agent_library_read_store_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(store)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn upsert_agent_library_read_job(data_dir: &Path, job: AgentLibraryReadJob) -> anyhow::Result<()> {
+    let mut store = load_agent_library_read_store(data_dir);
+    if let Some(existing) = store
+        .jobs
+        .iter_mut()
+        .find(|row| row.request_id == job.request_id)
+    {
+        *existing = job;
+    } else {
+        store.jobs.push(job);
+    }
+    if store.jobs.len() > MAX_LIBRARY_JOBS {
+        let skip = store.jobs.len() - MAX_LIBRARY_JOBS;
+        store.jobs = store.jobs.split_off(skip);
+    }
+    store_agent_library_read_store(data_dir, &store)
+}
+
+pub(super) fn agent_library_read_job_exists(data_dir: &Path, request_id: &str) -> bool {
+    load_agent_library_read_store(data_dir)
+        .jobs
+        .iter()
+        .any(|job| job.request_id == request_id)
+}
+
+fn agent_desktop_resource(
+    context: &HomeLaunchTokenContext,
+    uri: Option<&str>,
+) -> anyhow::Result<String> {
+    let root = crate::auth::principal_localhost_root(&context.principal_id);
+    let desktop = format!("{root}/Desktop");
+    let Some(uri) = uri.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(desktop);
+    };
+    if uri.contains("..") || uri.contains('\\') {
+        anyhow::bail!("invalid library uri");
+    }
+    if uri == desktop
+        || (uri.starts_with(&desktop) && uri.as_bytes().get(desktop.len()) == Some(&b'/'))
+    {
+        return Ok(uri.to_string());
+    }
+    anyhow::bail!("library.read is scoped to Desktop on this Home");
+}
+
+async fn agent_attach_client_token(
+    client: &reqwest::Client,
+    api_url: &str,
+    attach_secret: &str,
+) -> anyhow::Result<String> {
+    gateway_attach_runtime_token(client, api_url, attach_secret, "client").await
+}
+
+async fn list_desktop_names_for_agent(
+    state: &GatewayState,
+    principal_id: &str,
+    resource: &str,
+) -> anyhow::Result<String> {
+    let Some(registry) = state.provider_registry.as_ref() else {
+        anyhow::bail!("object provider registry unavailable");
+    };
+    let request = json!({
+        "op": "list",
+        "principal_id": principal_id,
+        "uri": resource,
+    });
+    let response = registry
+        .send_raw("object", &request)
+        .await
+        .map_err(|err| anyhow::anyhow!("object list failed: {err}"))?;
+    if response.get("status").and_then(Value::as_str) != Some("ok") {
+        let message = response
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("object list failed");
+        anyhow::bail!("{message}");
+    }
+    let objects = response
+        .get("data")
+        .and_then(|data| data.get("objects"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut lines = Vec::new();
+    lines.push(format!("Library.read · {resource}"));
+    lines.push(format!("{} object(s)", objects.len()));
+    for object in objects.iter().take(MAX_LIBRARY_LIST_NAMES) {
+        let name = object
+            .get("name")
+            .or_else(|| object.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or("(unnamed)");
+        let kind = object
+            .get("kind")
+            .or_else(|| object.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("object");
+        lines.push(format!("- {name} · {kind}"));
+    }
+    if objects.len() > MAX_LIBRARY_LIST_NAMES {
+        lines.push(format!(
+            "… {} more not shown",
+            objects.len() - MAX_LIBRARY_LIST_NAMES
+        ));
+    }
+    let mut text = lines.join("\n");
+    if text.len() > MAX_LIBRARY_RESULT_CHARS {
+        text.truncate(MAX_LIBRARY_RESULT_CHARS);
+        text.push('…');
+    }
+    Ok(text)
+}
+
+/// After Inbox grants a home-agent library.read request — one list, then done.
+pub(super) async fn fulfill_agent_library_read_after_grant(
+    state: &GatewayState,
+    request_id: &str,
+) -> anyhow::Result<()> {
+    let mut store = load_agent_library_read_store(&state.data_dir);
+    let Some(job) = store
+        .jobs
+        .iter_mut()
+        .find(|job| job.request_id == request_id)
+    else {
+        return Ok(());
+    };
+    if job.status == "ready" || job.status == "denied" {
+        return Ok(());
+    }
+    let principal_id = job.principal_id.clone();
+    let resource = job.resource.clone();
+    match list_desktop_names_for_agent(state, &principal_id, &resource).await {
+        Ok(result) => {
+            job.status = "ready".to_string();
+            job.result = Some(result);
+            job.error = None;
+        }
+        Err(err) => {
+            job.status = "error".to_string();
+            job.error = Some(err.to_string());
+            job.result = None;
+        }
+    }
+    store_agent_library_read_store(&state.data_dir, &store)
+}
+
+pub(super) fn mark_agent_library_read_denied(data_dir: &Path, request_id: &str) {
+    let mut store = load_agent_library_read_store(data_dir);
+    let Some(job) = store
+        .jobs
+        .iter_mut()
+        .find(|job| job.request_id == request_id)
+    else {
+        return;
+    };
+    job.status = "denied".to_string();
+    job.result = None;
+    job.error = Some("Denied in Inbox".to_string());
+    let _ = store_agent_library_read_store(data_dir, &store);
+}
+
+/// POST /api/apps/home/agent/tools/library.read
+pub(super) async fn home_agent_library_read_request(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(body): Json<HomeAgentLibraryReadBody>,
+) -> Response {
+    let context = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[HOME_GUI_SHELL_ID],
+    ) {
+        Ok(context) => context,
+        Err(err) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "status": "error",
+                    "code": "missing-home-launch-token",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let resource = match agent_desktop_resource(&context, body.uri.as_deref()) {
+        Ok(resource) => resource,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": "error",
+                    "code": "invalid_resource",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(coords) = load_live_runtime_coords(&state.data_dir).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "error",
+                "code": "runtime_unavailable",
+                "message": "local runtime is not running — Inbox cannot mint library.read",
+            })),
+        )
+            .into_response();
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "code": "client_build",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let client_token = match agent_attach_client_token(
+        &client,
+        &coords.api_url,
+        &coords.attach_secret,
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "status": "error",
+                    "code": "attach_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let response = match client
+        .post(format!("{}/api/capability/request", coords.api_url))
+        .header(AUTHORIZATION, format!("Bearer {client_token}"))
+        .json(&json!({
+            "resource": resource,
+            "action": "read",
+            "reason": AGENT_LIBRARY_READ_REASON,
+        }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "status": "error",
+                    "code": "capability_request_failed",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = response.status();
+    let body: Value = match response.json().await {
+        Ok(body) => body,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "status": "error",
+                    "code": "capability_request_decode",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if !status.is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "error",
+                "code": "capability_request_http",
+                "message": body.get("message").and_then(Value::as_str).unwrap_or("capability request failed"),
+            })),
+        )
+            .into_response();
+    }
+
+    let request_status = body
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    if request_status == "denied" || request_status == "auto_denied" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "denied",
+                "code": "capability_denied",
+                "message": body.get("reason").and_then(Value::as_str).unwrap_or("capability denied"),
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(request_id) = body.get("request_id").and_then(Value::as_str) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "error",
+                "code": "missing_request_id",
+                "message": "capability request returned no request_id",
+            })),
+        )
+            .into_response();
+    };
+
+    let job = AgentLibraryReadJob {
+        request_id: request_id.to_string(),
+        principal_id: context.principal_id.clone(),
+        resource: resource.clone(),
+        created_at: crate::auth::now_ts(),
+        status: "pending".to_string(),
+        result: None,
+        error: None,
+    };
+    if let Err(err) = upsert_agent_library_read_job(&state.data_dir, job) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "code": "job_store",
+                "message": err.to_string(),
+            })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "pending",
+            "request_id": request_id,
+            "resource": resource,
+            "tool": "library.read",
+            "label": "Library · Read",
+            "summary": "Allow once in Inbox — one Desktop list for Agent on this Home.",
+            "scope": resource,
+            "inbox": true,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /api/apps/home/agent/tools/library.read/:request_id
+pub(super) async fn home_agent_library_read_status(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    AxumPath(request_id): AxumPath<String>,
+) -> Response {
+    let context = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[HOME_GUI_SHELL_ID],
+    ) {
+        Ok(context) => context,
+        Err(err) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "status": "error",
+                    "code": "missing-home-launch-token",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let store = load_agent_library_read_store(&state.data_dir);
+    let Some(job) = store.jobs.iter().find(|job| job.request_id == request_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "status": "error",
+                "code": "unknown_request",
+                "message": "no library.read job for that request_id",
+            })),
+        )
+            .into_response();
+    };
+    if job.principal_id != context.principal_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "error",
+                "code": "principal_mismatch",
+                "message": "library.read job belongs to another Home principal",
+            })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": job.status,
+            "request_id": job.request_id,
+            "resource": job.resource,
+            "result": job.result,
+            "error": job.error,
+            "tool": "library.read",
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/apps/home/agent/tools/library.read/:request_id/cancel
+pub(super) async fn home_agent_library_read_cancel(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    AxumPath(request_id): AxumPath<String>,
+) -> Response {
+    let context = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[HOME_GUI_SHELL_ID],
+    ) {
+        Ok(context) => context,
+        Err(err) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "status": "error",
+                    "code": "missing-home-launch-token",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let store = load_agent_library_read_store(&state.data_dir);
+    let Some(job) = store.jobs.iter().find(|job| job.request_id == request_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "status": "error",
+                "code": "unknown_request",
+                "message": "no library.read job for that request_id",
+            })),
+        )
+            .into_response();
+    };
+    if job.principal_id != context.principal_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "error",
+                "code": "principal_mismatch",
+                "message": "library.read job belongs to another Home principal",
+            })),
+        )
+            .into_response();
+    }
+
+    if let Some(coords) = load_live_runtime_coords(&state.data_dir).await {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            if let Ok(shell_token) =
+                home_attach_shell(&client, &coords.api_url, &coords.attach_secret).await
+            {
+                let _ = client
+                    .post(format!("{}/api/capability/deny", coords.api_url))
+                    .header(AUTHORIZATION, format!("Bearer {shell_token}"))
+                    .json(&json!({
+                        "request_id": request_id,
+                        "reason": "Denied from Agent",
+                    }))
+                    .send()
+                    .await;
+            }
+        }
+    }
+    mark_agent_library_read_denied(&state.data_dir, &request_id);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "denied",
+            "request_id": request_id,
+            "tool": "library.read",
+        })),
+    )
+        .into_response()
 }

@@ -2,9 +2,9 @@
    no tool, grant, or capsule authority; grant cards remain fail-closed preview
    (Principle 16). Path: gateway /api/provider/ai/* and /api/provider/llama/*
    (home-gui-only allowlist, home launch token).
-   Tip: home-20260804as */
+   Tip: home-20260804at */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804as";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804at";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
@@ -405,6 +405,83 @@ export async function fetchAgentBackends({ force = false } = {}) {
       backendsPromise = null;
     });
   return backendsPromise;
+}
+
+function libraryReadUrl(requestId) {
+  const base = "/api/apps/home/agent/tools/library.read";
+  if (requestId) {
+    return new URL(`${base}/${encodeURIComponent(requestId)}`, window.location.href).href;
+  }
+  return new URL(base, window.location.href).href;
+}
+
+function homeAgentHeaders(extra = {}) {
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    const error = new Error("missing home launch token in Home GUI shell");
+    error.code = "missing-home-launch-token";
+    throw error;
+  }
+  return {
+    accept: "application/json",
+    "x-elastos-home-token": token,
+    ...extra,
+  };
+}
+
+/** Wave 5.01 — create Inbox-backed library.read capability request. */
+export async function requestAgentLibraryRead({ uri } = {}) {
+  const response = await fetch(libraryReadUrl(), {
+    method: "POST",
+    headers: homeAgentHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify(uri ? { uri } : {}),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.message || `library.read request failed: ${response.status}`);
+    error.code = data?.code || "library_read_request_failed";
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+export async function fetchAgentLibraryReadStatus(requestId) {
+  const id = String(requestId || "").trim();
+  if (!id) {
+    return null;
+  }
+  const response = await fetch(libraryReadUrl(id), {
+    headers: homeAgentHeaders(),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.message || `library.read status failed: ${response.status}`);
+    error.code = data?.code || "library_read_status_failed";
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+export async function cancelAgentLibraryRead(requestId) {
+  const id = String(requestId || "").trim();
+  if (!id) {
+    return null;
+  }
+  const response = await fetch(`${libraryReadUrl(id)}/cancel`, {
+    method: "POST",
+    headers: homeAgentHeaders({ "content-type": "application/json" }),
+    body: "{}",
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.message || `library.read cancel failed: ${response.status}`);
+    error.code = data?.code || "library_read_cancel_failed";
+    error.status = response.status;
+    throw error;
+  }
+  return data;
 }
 
 export async function saveAgentBackends(patch = {}) {
