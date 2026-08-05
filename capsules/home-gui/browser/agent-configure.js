@@ -1,5 +1,5 @@
 /* Agent Settings / Usage pages + workbench panels.
-   Bound from agent-harness.js (ctx + host). Tip: home-20260804ax
+   Bound from agent-harness.js (ctx + host). Tip: home-20260804ay
    UI ≠ authority (Principle 16): pages never mint grants. */
 
 import {
@@ -12,17 +12,19 @@ import {
   getHardwareEstimate,
   getPlanMarkdown,
   getTruthSnapshot,
-} from "./mock-agent-provider.js?v=home-20260804ax";
+} from "./mock-agent-provider.js?v=home-20260804ay";
 import {
   DEFAULT_LIVE_SYSTEM_PROMPT,
   MAX_LIVE_SYSTEM_PROMPT_CHARS,
+  MAX_AGENT_NOTES_CHARS,
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
+  normalizeAgentNotes,
   fetchAgentBackends,
   saveAgentBackends,
   getAgentBackendsCache,
-} from "./agent-live.js?v=home-20260804ax";
+} from "./agent-live.js?v=home-20260804ay";
 
 /** @type {null | object} */
 let ctx = null;
@@ -85,6 +87,11 @@ function bindPromptPanelOnce() {
       if (count) {
         count.textContent = `${String(ctx.systemPrompt).length}/${MAX_LIVE_SYSTEM_PROMPT_CHARS}`;
       }
+      persistPromptPrefsSoon();
+      return;
+    }
+    if (target?.matches?.("[data-agent-notes]")) {
+      ctx.agentNotes = normalizeAgentNotes(target.value);
       persistPromptPrefsSoon();
       return;
     }
@@ -212,6 +219,12 @@ function renderPromptPanel() {
   const count = document.querySelector("[data-system-prompt-count]");
   if (count) {
     count.textContent = `${prompt.length}/${MAX_LIVE_SYSTEM_PROMPT_CHARS}`;
+  }
+  const notes = normalizeAgentNotes(ctx.agentNotes || "");
+  ctx.agentNotes = notes;
+  const notesEl = document.querySelector("[data-agent-notes]");
+  if (notesEl && notesEl.value !== notes) {
+    notesEl.value = notes;
   }
   const temp = document.querySelector("[data-agent-temperature]");
   if (temp) {

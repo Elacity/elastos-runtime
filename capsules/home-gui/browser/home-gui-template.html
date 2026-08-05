@@ -828,6 +828,19 @@
                 </button>
                 <span class="agent-prompt-count" data-system-prompt-count></span>
               </div>
+              <label class="agent-prompt-label" for="agent-home-notes">Notes on this Home</label>
+              <textarea
+                id="agent-home-notes"
+                class="agent-prompt-textarea"
+                data-agent-notes
+                rows="4"
+                maxlength="4000"
+                spellcheck="true"
+                placeholder="Sticky facts for Live turns — host-persisted on this Home only. Not cloud memory."
+              ></textarea>
+              <p class="agent-harness-page-foot">
+                Notes append to the system prompt for Live · never leave this Home · UI ≠ authority
+              </p>
               <div class="agent-prompt-params">
                 <label class="agent-prompt-param">
                   <span>Temperature</span>

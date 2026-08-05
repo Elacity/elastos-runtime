@@ -12,11 +12,11 @@ import {
   snapAppsShelfFace,
   bindShelfAttachHost,
   addComposerAttachment,
-} from "./agent-shelf.js?v=home-20260804ax";
+} from "./agent-shelf.js?v=home-20260804ay";
 import {
   shellState,
   desktopObjects,
-} from "./shell-core.js?v=home-20260804ax";
+} from "./shell-core.js?v=home-20260804ay";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -26,8 +26,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260804ax";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804ax";
+} from "./shell-stages.js?v=home-20260804ay";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804ay";
 import {
   resetMockCapabilities,
   getSelectedModel,
@@ -45,18 +45,18 @@ import {
   requestModelGet,
   removeProject,
   getLastStreamFailure,
-} from "./mock-agent-provider.js?v=home-20260804ax";
+} from "./mock-agent-provider.js?v=home-20260804ay";
 import {
   bindAgentWorkspaceSnapshot,
-} from "./shell-windows.js?v=home-20260804ax";
-import { TIP } from "./agent-tip.js?v=home-20260804ax";
-import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804ax";
+} from "./shell-windows.js?v=home-20260804ay";
+import { TIP } from "./agent-tip.js?v=home-20260804ay";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804ay";
 import {
   bindAgentWorkspaceStore,
   getAgentWorkspaceSnapshot,
   applyAgentWorkspaceSnapshot,
   persistAgentWorkspaceSoon,
-} from "./agent-workspace.js?v=home-20260804ax";
+} from "./agent-workspace.js?v=home-20260804ay";
 import {
   bindAgentConfigure,
   harnessPageOpen,
@@ -69,7 +69,7 @@ import {
   setWorkbenchTab,
   syncWorkbenchPanels,
   syncWorkbenchOpenUi,
-} from "./agent-configure.js?v=home-20260804ax";
+} from "./agent-configure.js?v=home-20260804ay";
 import {
   bindAgentGrants,
   syncTruthStrip,
@@ -80,7 +80,7 @@ import {
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
   getReadyLibraryReadGrant,
-} from "./agent-grants.js?v=home-20260804ax";
+} from "./agent-grants.js?v=home-20260804ay";
 import {
   bindAgentStream,
   clearStreamTimer,
@@ -109,7 +109,7 @@ import {
   updateJumpToLatestVisibility,
   ensureJumpToLatest,
   setStreamStatus,
-} from "./agent-stream.js?v=home-20260804ax";
+} from "./agent-stream.js?v=home-20260804ay";
 import {
   getLiveInferenceState,
   probeLiveInference,
@@ -118,7 +118,7 @@ import {
   fetchAgentBackends,
   getAgentBackendsCache,
   extractAgentLibraryRead,
-} from "./agent-live.js?v=home-20260804ax";
+} from "./agent-live.js?v=home-20260804ay";
 import {
   bindAgentSessions,
   relativeTime,
@@ -146,7 +146,7 @@ import {
   closeSessionActions,
   openSessionActions,
   runSessionAction,
-} from "./agent-sessions.js?v=home-20260804ax";
+} from "./agent-sessions.js?v=home-20260804ay";
 export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
 let workbenchTab = "outputs";
@@ -246,6 +246,8 @@ let sessionMode = "chat";
 let toolMode = "read";
 /** Wave 2 — prompt + sampling prefs (host-persisted; gateway clamps). */
 let systemPrompt = "";
+/** Wave 7 — sticky On-Home notes (host-persisted; appended to Live system). */
+let agentNotes = "";
 let maxTokens = 2048;
 let temperature = 0.7;
 
@@ -270,6 +272,10 @@ bindAgentWorkspaceStore({
   getSystemPrompt: () => systemPrompt,
   setSystemPrompt: (v) => {
     systemPrompt = String(v ?? "");
+  },
+  getAgentNotes: () => agentNotes,
+  setAgentNotes: (v) => {
+    agentNotes = String(v ?? "");
   },
   getMaxTokens: () => maxTokens,
   setMaxTokens: (v) => {
@@ -337,6 +343,12 @@ bindAgentConfigure(
     },
     set systemPrompt(v) {
       systemPrompt = String(v ?? "");
+    },
+    get agentNotes() {
+      return agentNotes;
+    },
+    set agentNotes(v) {
+      agentNotes = String(v ?? "");
     },
     get maxTokens() {
       return maxTokens;
@@ -410,6 +422,7 @@ bindAgentStream(
     get active() { return active; },
     set active(v) { active = v; },
     get systemPrompt() { return systemPrompt; },
+    get agentNotes() { return agentNotes; },
     get maxTokens() { return maxTokens; },
     get temperature() { return temperature; },
   },

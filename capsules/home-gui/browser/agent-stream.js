@@ -1,5 +1,5 @@
 /* Agent message stream + turn theatre.
-   Bound from agent-harness.js. Tip: home-20260804ax
+   Bound from agent-harness.js. Tip: home-20260804ay
    Live: gateway SSE (/api/apps/home/agent/chat/stream) with AbortController
    stop; mock remains the honest fallback when Live is down.
    UI ≠ authority (Principle 16) — chat carries no tool or grant power.
@@ -14,22 +14,22 @@ import {
   clearLastStreamFailure,
   splitThinkTaggedContent,
   getSelectedModel,
-} from "./mock-agent-provider.js?v=home-20260804ax";
+} from "./mock-agent-provider.js?v=home-20260804ay";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamLiveChatCompletion,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260804ax";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804ax";
+} from "./agent-live.js?v=home-20260804ay";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804ay";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804ax";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804ax";
+} from "./agent-grants.js?v=home-20260804ay";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804ay";
 
 /** @type {null | object} */
 let ctx = null;
@@ -978,6 +978,7 @@ async function startLiveTurnForPrompt(userText) {
     const result = await streamLiveChatCompletion(
       buildLiveMessages(session?.messages || [], {
         systemPrompt: ctx.systemPrompt,
+        notes: ctx.agentNotes,
       }),
       {
         maxTokens: ctx.maxTokens,

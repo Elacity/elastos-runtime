@@ -2,9 +2,9 @@
    no tool, grant, or capsule authority; grant cards remain fail-closed preview
    (Principle 16). Path: gateway /api/provider/ai/* and /api/provider/llama/*
    (home-gui-only allowlist, home launch token).
-   Tip: home-20260804ax */
+   Tip: home-20260804ay */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804ax";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804ay";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
@@ -20,6 +20,17 @@ export const DEFAULT_LIVE_SYSTEM_PROMPT =
 export const DEFAULT_LIVE_MAX_TOKENS = 2048;
 export const DEFAULT_LIVE_TEMPERATURE = 0.7;
 export const MAX_LIVE_SYSTEM_PROMPT_CHARS = 8_000;
+export const MAX_AGENT_NOTES_CHARS = 4_000;
+
+export function normalizeAgentNotes(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return "";
+  }
+  return text.length > MAX_AGENT_NOTES_CHARS
+    ? text.slice(0, MAX_AGENT_NOTES_CHARS)
+    : text;
+}
 
 export function clampLiveMaxTokens(value) {
   const n = Number(value);
@@ -285,18 +296,21 @@ export async function probeLiveInference({ force = false } = {}) {
 }
 
 /** Session history → OpenAI-compat messages (user/assistant only, bounded). */
-export function buildLiveMessages(sessionMessages = [], { systemPrompt } = {}) {
-  const turns = sessionMessages
+export function buildLiveMessages(sessionMessages = [], { systemPrompt, notes } = {}) {
+  const history = Array.isArray(sessionMessages) ? sessionMessages : [];
+  const turns = history
     .filter((m) => (m.role === "user" || m.role === "agent") && String(m.text || "").trim())
     .slice(-LIVE_HISTORY_LIMIT)
     .map((m) => ({
       role: m.role === "agent" ? "assistant" : "user",
       content: String(m.text),
     }));
-  return [
-    { role: "system", content: normalizeLiveSystemPrompt(systemPrompt) },
-    ...turns,
-  ];
+  let system = normalizeLiveSystemPrompt(systemPrompt);
+  const noteText = normalizeAgentNotes(notes);
+  if (noteText) {
+    system = `${system}\n\nNotes on this Home (sticky · host-persisted):\n${noteText}`;
+  }
+  return [{ role: "system", content: system }, ...turns];
 }
 
 /**

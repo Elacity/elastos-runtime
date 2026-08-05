@@ -6,7 +6,7 @@ import {
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260804ax";
+} from "./home-gui-authority.js?v=home-20260804ay";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -51,7 +51,7 @@ const {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} = await import("./home-gui.js?v=home-20260804ax");
+} = await import("./home-gui.js?v=home-20260804ay");
 
 function requestId() {
   if (window.crypto?.randomUUID) {
