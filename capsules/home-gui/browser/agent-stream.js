@@ -1,5 +1,5 @@
 /* Agent message stream + turn theatre.
-   Bound from agent-harness.js. Tip: home-20260804aw
+   Bound from agent-harness.js. Tip: home-20260804ax
    Live: gateway SSE (/api/apps/home/agent/chat/stream) with AbortController
    stop; mock remains the honest fallback when Live is down.
    UI ≠ authority (Principle 16) — chat carries no tool or grant power.
@@ -14,22 +14,22 @@ import {
   clearLastStreamFailure,
   splitThinkTaggedContent,
   getSelectedModel,
-} from "./mock-agent-provider.js?v=home-20260804aw";
+} from "./mock-agent-provider.js?v=home-20260804ax";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamLiveChatCompletion,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260804aw";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804aw";
+} from "./agent-live.js?v=home-20260804ax";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804ax";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804aw";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804aw";
+} from "./agent-grants.js?v=home-20260804ax";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804ax";
 
 /** @type {null | object} */
 let ctx = null;

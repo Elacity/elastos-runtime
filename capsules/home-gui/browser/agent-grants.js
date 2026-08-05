@@ -1,5 +1,5 @@
 /* Agent grant cards + truth strip.
-   Bound from agent-harness.js. Tip: home-20260804aw
+   Bound from agent-harness.js. Tip: home-20260804ax
    UI ≠ authority (Principle 16): Allow once does not mint Capsule power.
    library.read → real Inbox capability (Wave 5.01); wallet.sign stays preview mock. */
 
@@ -11,14 +11,14 @@ import {
   wantsLibraryTool,
   wantsWalletTool,
   wantsWebSearchTool,
-} from "./mock-agent-provider.js?v=home-20260804aw";
+} from "./mock-agent-provider.js?v=home-20260804ax";
 import {
   requestAgentLibraryRead,
   fetchAgentLibraryReadStatus,
   cancelAgentLibraryRead,
   requestAgentWebSearch,
-} from "./agent-live.js?v=home-20260804aw";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804aw";
+} from "./agent-live.js?v=home-20260804ax";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804ax";
 
 /** @type {null | Record<string, Function>} */
 let store = null;
@@ -133,7 +133,7 @@ function paintInboxGrantCard(card, spec) {
   body.className = "agent-grant-card-summary";
   body.textContent =
     spec.summary ||
-    "Approve in Inbox — one Desktop list on this Home. Agent UI does not mint the grant.";
+    "Approve in Inbox — one Desktop list on this Home. After Allow, Desktop attach can extract cited text (still no ambient FS).";
 
   const scopeEl = document.createElement("p");
   scopeEl.className = "agent-grant-card-scope";
@@ -166,7 +166,7 @@ function paintInboxGrantCard(card, spec) {
     chip.className = "agent-grant-card-chip";
     chip.textContent =
       state === "granted"
-        ? "Allowed once · Inbox — Desktop list below"
+        ? "Allowed once · Inbox — list below; Desktop attach can extract"
         : state === "error"
           ? `Error · ${spec.error || "tool failed"}`
           : "Denied · fail-closed";
@@ -176,6 +176,11 @@ function paintInboxGrantCard(card, spec) {
       result.className = "agent-grant-card-result";
       result.textContent = spec.result;
       card.append(result);
+      const teach = document.createElement("p");
+      teach.className = "agent-grant-card-teach";
+      teach.textContent =
+        "On-Home KB: attach a Desktop text file to pull a size-capped extract into the next Live turn (cited paths).";
+      card.append(teach);
     }
   }
 }

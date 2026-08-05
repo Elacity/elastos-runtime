@@ -81,4 +81,4 @@
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804aw";
+export const TIP = "home-20260804ax";
