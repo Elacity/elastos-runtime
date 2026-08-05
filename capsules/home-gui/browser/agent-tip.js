@@ -67,8 +67,14 @@
  * [ ] Diff/Browser/Term stay disabled without ADE grant
  * [ ] Copy says needs ADE — no Open Terminal / Pyodide identity
  *
+ * Wave 6.01 Local Library KB (§AV):
+ * [ ] After Inbox library.read ready, Desktop attach extracts cited text
+ * [ ] Live turn includes On-Home Library path listing when granted
+ * [ ] Extract fails closed without grant / for binary files
+ * [ ] No ambient /api/provider/object from home-gui
+ *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804au";
+export const TIP = "home-20260804av";

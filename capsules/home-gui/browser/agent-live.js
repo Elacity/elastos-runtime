@@ -2,9 +2,9 @@
    no tool, grant, or capsule authority; grant cards remain fail-closed preview
    (Principle 16). Path: gateway /api/provider/ai/* and /api/provider/llama/*
    (home-gui-only allowlist, home launch token).
-   Tip: home-20260804au */
+   Tip: home-20260804av */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804au";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804av";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
@@ -478,6 +478,30 @@ export async function cancelAgentLibraryRead(requestId) {
   if (!response.ok) {
     const error = new Error(data?.message || `library.read cancel failed: ${response.status}`);
     error.code = data?.code || "library_read_cancel_failed";
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+/** Wave 6.01 — extract Desktop text after Inbox library.read is ready. */
+export async function extractAgentLibraryRead(requestId, uri) {
+  const id = String(requestId || "").trim();
+  const target = String(uri || "").trim();
+  if (!id || !target) {
+    const error = new Error("library.read extract requires request_id and uri");
+    error.code = "library_read_extract_args";
+    throw error;
+  }
+  const response = await fetch(`${libraryReadUrl(id)}/extract`, {
+    method: "POST",
+    headers: homeAgentHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ uri: target }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.message || `library.read extract failed: ${response.status}`);
+    error.code = data?.code || "library_read_extract_failed";
     error.status = response.status;
     throw error;
   }

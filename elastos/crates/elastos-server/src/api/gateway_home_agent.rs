@@ -559,6 +559,8 @@ const AGENT_LIBRARY_READ_REASON: &str = "home-agent:library.read";
 const MAX_LIBRARY_LIST_NAMES: usize = 48;
 const MAX_LIBRARY_RESULT_CHARS: usize = 12_000;
 const MAX_LIBRARY_JOBS: usize = 64;
+const MAX_LIBRARY_EXTRACT_BYTES: usize = 200_000;
+const MAX_LIBRARY_EXTRACT_CHARS: usize = 24_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentLibraryReadJob {
@@ -722,7 +724,16 @@ async fn list_desktop_names_for_agent(
             .or_else(|| object.get("type"))
             .and_then(Value::as_str)
             .unwrap_or("object");
-        lines.push(format!("- {name} · {kind}"));
+        let object_uri = object
+            .get("uri")
+            .or_else(|| object.get("target_uri"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if object_uri.is_empty() {
+            lines.push(format!("- {name} · {kind}"));
+        } else {
+            lines.push(format!("- {name} · {kind} · {object_uri}"));
+        }
     }
     if objects.len() > MAX_LIBRARY_LIST_NAMES {
         lines.push(format!(
@@ -1138,4 +1149,198 @@ pub(super) async fn home_agent_library_read_cancel(
         })),
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HomeAgentLibraryExtractBody {
+    uri: String,
+}
+
+async fn read_desktop_text_for_agent(
+    state: &GatewayState,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<(String, String)> {
+    let Some(registry) = state.provider_registry.as_ref() else {
+        anyhow::bail!("object provider registry unavailable");
+    };
+    let request = json!({
+        "op": "read",
+        "principal_id": principal_id,
+        "uri": uri,
+    });
+    let response = registry
+        .send_raw("object", &request)
+        .await
+        .map_err(|err| anyhow::anyhow!("object read failed: {err}"))?;
+    if response.get("status").and_then(Value::as_str) != Some("ok") {
+        let message = response
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("object read failed");
+        anyhow::bail!("{message}");
+    }
+    let data = response
+        .get("data")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let encoding = data
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("base64");
+    if encoding != "base64" {
+        anyhow::bail!("unsupported object encoding: {encoding}");
+    }
+    let b64 = data
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("object read missing data"))?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|err| anyhow::anyhow!("object read base64 decode failed: {err}"))?;
+    if bytes.len() > MAX_LIBRARY_EXTRACT_BYTES {
+        anyhow::bail!(
+            "object larger than {} bytes — not extracted",
+            MAX_LIBRARY_EXTRACT_BYTES
+        );
+    }
+    if bytes
+        .iter()
+        .take(512)
+        .any(|&b| b == 0)
+    {
+        anyhow::bail!("binary object — text extract not supported");
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.len() > MAX_LIBRARY_EXTRACT_CHARS {
+        text.truncate(MAX_LIBRARY_EXTRACT_CHARS);
+        text.push('…');
+    }
+    let name = data
+        .get("object")
+        .and_then(|object| object.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            uri.rsplit('/').next().unwrap_or("object")
+        })
+        .to_string();
+    Ok((name, text))
+}
+
+/// POST /api/apps/home/agent/tools/library.read/:request_id/extract
+/// Wave 6.01 — after Inbox grant (job ready), extract one Desktop text object.
+pub(super) async fn home_agent_library_read_extract(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    AxumPath(request_id): AxumPath<String>,
+    Json(body): Json<HomeAgentLibraryExtractBody>,
+) -> Response {
+    let context = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[HOME_GUI_SHELL_ID],
+    ) {
+        Ok(context) => context,
+        Err(err) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "status": "error",
+                    "code": "missing-home-launch-token",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let store = load_agent_library_read_store(&state.data_dir);
+    let Some(job) = store.jobs.iter().find(|job| job.request_id == request_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "status": "error",
+                "code": "unknown_request",
+                "message": "no library.read job for that request_id",
+            })),
+        )
+            .into_response();
+    };
+    if job.principal_id != context.principal_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "error",
+                "code": "principal_mismatch",
+                "message": "library.read job belongs to another Home principal",
+            })),
+        )
+            .into_response();
+    }
+    if job.status != "ready" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "error",
+                "code": "grant_not_ready",
+                "message": format!(
+                    "library.read job is {} — Inbox Allow once required before extract",
+                    job.status
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    let uri = match agent_desktop_resource(&context, Some(body.uri.as_str())) {
+        Ok(uri) => uri,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": "error",
+                    "code": "invalid_resource",
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if uri == job.resource {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "code": "not_a_file",
+                "message": "extract requires a Desktop file uri, not the Desktop root",
+            })),
+        )
+            .into_response();
+    }
+
+    match read_desktop_text_for_agent(&state, &context.principal_id, &uri).await {
+        Ok((name, text)) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "request_id": request_id,
+                "uri": uri,
+                "name": name,
+                "text": text,
+                "tool": "library.read",
+                "cited": true,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "code": "extract_failed",
+                "message": err.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }

@@ -7,15 +7,20 @@
 
    Send opens Agent Harness (Home drops, dock stays) — see agent-harness.js. */
 
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804au";
-import { TIP } from "./agent-tip.js?v=home-20260804au";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804av";
+import { TIP } from "./agent-tip.js?v=home-20260804av";
 import {
   agentHarnessActive,
   hideAgentHarness,
   sendToAgentHarness,
   showAgentHarness,
   stopAgentHarnessStream,
-} from "./agent-send.js?v=home-20260804au";
+} from "./agent-send.js?v=home-20260804av";
+import { extractAgentLibraryRead } from "./agent-live.js?v=home-20260804av";
+import {
+  formatLibraryKbContext,
+  getReadyLibraryReadGrant,
+} from "./agent-grants.js?v=home-20260804av";
 
 let bound = false;
 let morphGeneration = 0;
@@ -323,6 +328,12 @@ function formatAttachmentContext(attachments) {
   const parts = [];
   for (const item of attachments) {
     const name = item.name || "file";
+    if (item.text && item.kind === "desktop" && item.uri) {
+      parts.push(
+        `Attached Desktop «${name}» (${item.uri}) · Inbox library.read extract (cited):\n${item.text}`,
+      );
+      continue;
+    }
     if (item.text) {
       parts.push(
         `Attached «${name}» (size-capped local extract · not a Library grant):\n${item.text}`,
@@ -365,7 +376,9 @@ export async function sendAgentComposerMessage() {
 
   const attached = composerAttachments.slice();
   const context = formatAttachmentContext(attached);
-  const outbound = context ? `${prompt}\n\n---\n${context}` : prompt;
+  const libraryKb = formatLibraryKbContext();
+  const blocks = [libraryKb, context].filter(Boolean).join("\n\n");
+  const outbound = blocks ? `${prompt}\n\n---\n${blocks}` : prompt;
 
   input.value = "";
   autosizeComposer(input);
@@ -975,13 +988,29 @@ export function bindAgentShelf() {
     const desktopOpt = event.target.closest?.("[data-attach-desktop-uri]");
     if (desktopOpt?.dataset.attachDesktopUri) {
       event.preventDefault();
-      addComposerAttachment({
-        kind: "desktop",
-        name: desktopOpt.dataset.attachDesktopName || "Desktop object",
-        uri: desktopOpt.dataset.attachDesktopUri,
-        size: Number(desktopOpt.dataset.attachDesktopSize) || 0,
-      });
+      const uri = desktopOpt.dataset.attachDesktopUri;
+      const name = desktopOpt.dataset.attachDesktopName || "Desktop object";
+      const size = Number(desktopOpt.dataset.attachDesktopSize) || 0;
       closeAttachMenu();
+      void (async () => {
+        const grant = getReadyLibraryReadGrant();
+        let text = "";
+        if (grant?.requestId) {
+          try {
+            const extracted = await extractAgentLibraryRead(grant.requestId, uri);
+            text = String(extracted?.text || "");
+          } catch (err) {
+            console.warn("Desktop library.read extract failed", err);
+          }
+        }
+        addComposerAttachment({
+          kind: "desktop",
+          name,
+          uri,
+          size,
+          text,
+        });
+      })();
       return;
     }
     if (

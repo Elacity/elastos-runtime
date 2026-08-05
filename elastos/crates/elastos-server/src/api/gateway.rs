@@ -880,6 +880,10 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             post(home_agent_library_read_cancel),
         )
         .route(
+            "/api/apps/home/agent/tools/library.read/:request_id/extract",
+            post(home_agent_library_read_extract),
+        )
+        .route(
             "/api/apps/home/state",
             get(home_browser_state_get).post(home_browser_state_update),
         )

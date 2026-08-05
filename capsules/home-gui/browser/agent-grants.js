@@ -1,5 +1,5 @@
 /* Agent grant cards + truth strip.
-   Bound from agent-harness.js. Tip: home-20260804au
+   Bound from agent-harness.js. Tip: home-20260804av
    UI ≠ authority (Principle 16): Allow once does not mint Capsule power.
    library.read → real Inbox capability (Wave 5.01); wallet.sign stays preview mock. */
 
@@ -10,13 +10,13 @@ import {
   applyCapabilityState,
   wantsLibraryTool,
   wantsWalletTool,
-} from "./mock-agent-provider.js?v=home-20260804au";
+} from "./mock-agent-provider.js?v=home-20260804av";
 import {
   requestAgentLibraryRead,
   fetchAgentLibraryReadStatus,
   cancelAgentLibraryRead,
-} from "./agent-live.js?v=home-20260804au";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804au";
+} from "./agent-live.js?v=home-20260804av";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804av";
 
 /** @type {null | Record<string, Function>} */
 let store = null;
@@ -24,10 +24,38 @@ let store = null;
 let host = null;
 /** @type {Map<string, number>} */
 const libraryPollTimers = new Map();
+/** @type {null | { requestId: string, resource: string, result: string }} */
+let readyLibraryGrant = null;
 
 export function bindAgentGrants(nextStore = {}, nextHost = {}) {
   store = nextStore;
   host = nextHost;
+}
+
+/** Wave 6.01 — latest Inbox-ready library.read (for Desktop extract + citations). */
+export function getReadyLibraryReadGrant() {
+  return readyLibraryGrant ? { ...readyLibraryGrant } : null;
+}
+
+function setReadyLibraryGrant(next) {
+  readyLibraryGrant = next
+    ? {
+        requestId: String(next.requestId || "").slice(0, 80),
+        resource: String(next.resource || "").slice(0, 512),
+        result: String(next.result || "").slice(0, 12_000),
+      }
+    : null;
+}
+
+/** Cited On-Home Library listing for Live context (fail-closed when not granted). */
+export function formatLibraryKbContext() {
+  if (!readyLibraryGrant?.result) {
+    return "";
+  }
+  return (
+    `On-Home Library (Inbox library.read · cited paths):\n` +
+    `${readyLibraryGrant.result}`
+  );
 }
 
 export function syncTruthStrip() {
@@ -167,6 +195,11 @@ function startLibraryReadPoll(card, requestId) {
           result: status.result || "(empty Desktop list)",
           inbox: true,
         };
+        setReadyLibraryGrant({
+          requestId,
+          resource: status.resource || "",
+          result: outcome.result,
+        });
         updateSessionGrant("library.read", {
           state: "granted",
           requestId,
@@ -187,6 +220,7 @@ function startLibraryReadPoll(card, requestId) {
       }
       if (status.status === "denied") {
         clearLibraryPoll(requestId);
+        setReadyLibraryGrant(null);
         updateSessionGrant("library.read", { state: "denied", requestId });
         applyCapabilityState("library.read", "denied");
         paintInboxGrantCard(card, {
@@ -201,6 +235,7 @@ function startLibraryReadPoll(card, requestId) {
       }
       if (status.status === "error") {
         clearLibraryPoll(requestId);
+        setReadyLibraryGrant(null);
         updateSessionGrant("library.read", {
           state: "denied",
           requestId,
@@ -418,6 +453,7 @@ export function resolveGrantFromCard(card, decision) {
             console.warn("library.read cancel failed", err);
           }
         }
+        setReadyLibraryGrant(null);
         updateSessionGrant("library.read", { state: "denied", requestId });
         applyCapabilityState("library.read", "denied");
         paintInboxGrantCard(card, {
@@ -527,6 +563,7 @@ export async function maybeOfferToolAfterReply() {
 
 export function hydrateCapabilitiesFromSession(session) {
   resetMockCapabilities();
+  setReadyLibraryGrant(null);
   for (const msg of session?.messages || []) {
     if (msg.role !== "grant" || !msg.toolId) {
       continue;
@@ -536,8 +573,15 @@ export function hydrateCapabilitiesFromSession(session) {
         /* Card re-render path in harness will call appendGrantCard — poll starts there. */
         continue;
       }
-      if (msg.state === "granted" || msg.state === "denied") {
-        applyCapabilityState(msg.toolId, msg.state);
+      if (msg.state === "granted") {
+        applyCapabilityState(msg.toolId, "granted");
+        setReadyLibraryGrant({
+          requestId: msg.requestId || "",
+          resource: msg.scope || msg.args?.uri || "",
+          result: msg.result || "",
+        });
+      } else if (msg.state === "denied") {
+        applyCapabilityState(msg.toolId, "denied");
       }
       continue;
     }

@@ -12,11 +12,11 @@ import {
   snapAppsShelfFace,
   bindShelfAttachHost,
   addComposerAttachment,
-} from "./agent-shelf.js?v=home-20260804au";
+} from "./agent-shelf.js?v=home-20260804av";
 import {
   shellState,
   desktopObjects,
-} from "./shell-core.js?v=home-20260804au";
+} from "./shell-core.js?v=home-20260804av";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -26,8 +26,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260804au";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804au";
+} from "./shell-stages.js?v=home-20260804av";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804av";
 import {
   resetMockCapabilities,
   getSelectedModel,
@@ -45,18 +45,18 @@ import {
   requestModelGet,
   removeProject,
   getLastStreamFailure,
-} from "./mock-agent-provider.js?v=home-20260804au";
+} from "./mock-agent-provider.js?v=home-20260804av";
 import {
   bindAgentWorkspaceSnapshot,
-} from "./shell-windows.js?v=home-20260804au";
-import { TIP } from "./agent-tip.js?v=home-20260804au";
-import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804au";
+} from "./shell-windows.js?v=home-20260804av";
+import { TIP } from "./agent-tip.js?v=home-20260804av";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804av";
 import {
   bindAgentWorkspaceStore,
   getAgentWorkspaceSnapshot,
   applyAgentWorkspaceSnapshot,
   persistAgentWorkspaceSoon,
-} from "./agent-workspace.js?v=home-20260804au";
+} from "./agent-workspace.js?v=home-20260804av";
 import {
   bindAgentConfigure,
   harnessPageOpen,
@@ -69,7 +69,7 @@ import {
   setWorkbenchTab,
   syncWorkbenchPanels,
   syncWorkbenchOpenUi,
-} from "./agent-configure.js?v=home-20260804au";
+} from "./agent-configure.js?v=home-20260804av";
 import {
   bindAgentGrants,
   syncTruthStrip,
@@ -79,7 +79,8 @@ import {
   sessionAlreadyHasGrant,
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804au";
+  getReadyLibraryReadGrant,
+} from "./agent-grants.js?v=home-20260804av";
 import {
   bindAgentStream,
   clearStreamTimer,
@@ -108,7 +109,7 @@ import {
   updateJumpToLatestVisibility,
   ensureJumpToLatest,
   setStreamStatus,
-} from "./agent-stream.js?v=home-20260804au";
+} from "./agent-stream.js?v=home-20260804av";
 import {
   getLiveInferenceState,
   probeLiveInference,
@@ -116,7 +117,8 @@ import {
   setLiveChatPair,
   fetchAgentBackends,
   getAgentBackendsCache,
-} from "./agent-live.js?v=home-20260804au";
+  extractAgentLibraryRead,
+} from "./agent-live.js?v=home-20260804av";
 import {
   bindAgentSessions,
   relativeTime,
@@ -144,7 +146,7 @@ import {
   closeSessionActions,
   openSessionActions,
   runSessionAction,
-} from "./agent-sessions.js?v=home-20260804au";
+} from "./agent-sessions.js?v=home-20260804av";
 export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
 let workbenchTab = "outputs";
@@ -1653,11 +1655,14 @@ export function renderLibraryWorkbench() {
     const empty = document.createElement("p");
     empty.className = "agent-library-empty";
     empty.dataset.libraryEmpty = "1";
-    empty.textContent =
-      "Desktop objects appear here. Attach from the composer — content extract needs a library.read grant (Inbox; UI ≠ authority).";
+    const grant = getReadyLibraryReadGrant();
+    empty.textContent = grant?.requestId
+      ? "Desktop is empty — grant is ready; add a file then attach to extract."
+      : "Desktop objects appear here. Attach from the composer — content extract needs a library.read grant (Inbox; UI ≠ authority).";
     host.append(empty);
     return;
   }
+  const grant = getReadyLibraryReadGrant();
   for (const object of objects) {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -1665,13 +1670,16 @@ export function renderLibraryWorkbench() {
     btn.dataset.libraryAttachUri = object.uri;
     btn.dataset.libraryAttachName = object.name;
     btn.textContent = object.name;
-    btn.title = `${object.uri} · attach (content needs library.read)`;
+    btn.title = grant?.requestId
+      ? `${object.uri} · attach with Inbox library.read extract`
+      : `${object.uri} · attach (content needs library.read)`;
     host.append(btn);
   }
   const note = document.createElement("p");
   note.className = "agent-library-empty";
-  note.textContent =
-    "Attach adds a Desktop reference. Extracted text for Desktop objects waits on library.read (no ambient authority).";
+  note.textContent = grant?.requestId
+    ? "Inbox library.read ready — attach extracts cited Desktop text into the next Live turn."
+    : "Attach adds a Desktop reference. Extracted text waits on Inbox library.read (no ambient authority).";
   host.append(note);
 }
 
@@ -2197,15 +2205,30 @@ export function bindAgentHarness() {
     const lib = event.target.closest?.("[data-library-attach-uri]");
     if (lib?.dataset.libraryAttachUri) {
       event.preventDefault();
-      addComposerAttachment({
-        kind: "desktop",
-        name: lib.dataset.libraryAttachName || "Desktop object",
-        uri: lib.dataset.libraryAttachUri,
-      });
-      openWorkbench({ tab: "library", force: true });
-      const input = shelfComposerInput();
-      input?.focus?.({ preventScroll: true });
-      syncAgentSendButton();
+      const uri = lib.dataset.libraryAttachUri;
+      const name = lib.dataset.libraryAttachName || "Desktop object";
+      void (async () => {
+        const grant = getReadyLibraryReadGrant();
+        let text = "";
+        if (grant?.requestId) {
+          try {
+            const extracted = await extractAgentLibraryRead(grant.requestId, uri);
+            text = String(extracted?.text || "");
+          } catch (err) {
+            console.warn("Workbench library.read extract failed", err);
+          }
+        }
+        addComposerAttachment({
+          kind: "desktop",
+          name,
+          uri,
+          text,
+        });
+        openWorkbench({ tab: "library", force: true });
+        const input = shelfComposerInput();
+        input?.focus?.({ preventScroll: true });
+        syncAgentSendButton();
+      })();
       return;
     }
     const out = event.target.closest?.("[data-output-id]");
