@@ -87,8 +87,12 @@
  * [ ] Edit tags… shows #tags on session row; persist reload
  * [ ] Image attach → vision · unsupported (no fake caption)
  *
+ * Thinking markdown (§BB):
+ * [ ] Thinking block renders bold/lists/fences (not raw **)
+ * [ ] Mid-stream thinking paints markdown; Stop keeps raw source
+ *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804ba";
+export const TIP = "home-20260804bb";

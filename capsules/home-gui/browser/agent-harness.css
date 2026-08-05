@@ -2458,11 +2458,30 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   min-height: 0;
   overflow: hidden;
   border-left: 2px solid color-mix(in srgb, var(--text) 12%, transparent);
-  white-space: pre-wrap;
   font-family: inherit;
   font-size: 12.5px;
   line-height: 1.5;
-  opacity: 0.8;
+  opacity: 0.88;
+  text-wrap: pretty;
+}
+
+.agent-thinking-body > :first-child {
+  margin-top: 0;
+}
+
+.agent-thinking-body > :last-child {
+  margin-bottom: 0;
+}
+
+.agent-thinking-body p,
+.agent-thinking-body ul,
+.agent-thinking-body ol {
+  margin: 0.35em 0;
+}
+
+.agent-thinking-body .agent-md-code {
+  margin: 0.4em 0;
+  opacity: 0.95;
 }
 
 .agent-thinking.is-streaming .agent-thinking-body::after {

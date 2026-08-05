@@ -8,14 +8,14 @@ import {
   setReasoningVisible,
   getUsageLedger,
   applyUsageLedger,
-} from "./mock-agent-provider.js?v=home-20260804ba";
+} from "./mock-agent-provider.js?v=home-20260804bb";
 import {
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
   normalizeAgentNotes,
-} from "./agent-live.js?v=home-20260804ba";
-import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804ba";
+} from "./agent-live.js?v=home-20260804bb";
+import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804bb";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;
@@ -75,6 +75,9 @@ export function serializeSessionForPersist(session) {
           return {
             role: m.role === "user" || m.role === "agent" ? m.role : "agent",
             text: truncatePersistedText(m.text || ""),
+            ...(m.thinking
+              ? { thinking: truncatePersistedText(m.thinking) }
+              : {}),
           };
         })
         .filter(Boolean)

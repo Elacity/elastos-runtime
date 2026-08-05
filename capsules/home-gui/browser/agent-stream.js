@@ -1,5 +1,5 @@
 /* Agent message stream + turn theatre.
-   Bound from agent-harness.js. Tip: home-20260804ba
+   Bound from agent-harness.js. Tip: home-20260804bb
    Live: gateway SSE (/api/apps/home/agent/chat/stream) with AbortController
    stop; mock remains the honest fallback when Live is down.
    UI ≠ authority (Principle 16) — chat carries no tool or grant power.
@@ -14,22 +14,22 @@ import {
   clearLastStreamFailure,
   splitThinkTaggedContent,
   getSelectedModel,
-} from "./mock-agent-provider.js?v=home-20260804ba";
+} from "./mock-agent-provider.js?v=home-20260804bb";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamLiveChatCompletion,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260804ba";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804ba";
+} from "./agent-live.js?v=home-20260804bb";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804bb";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804ba";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804ba";
+} from "./agent-grants.js?v=home-20260804bb";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804bb";
 
 /** @type {null | object} */
 let ctx = null;
@@ -116,6 +116,20 @@ function paintAgentMessageBody(body, text, { streaming = false } = {}) {
   const raw = String(text ?? "");
   body.dataset.mdSource = raw;
   body.innerHTML = renderMarkdown(raw, { streaming });
+}
+
+/** Thinking uses the same markdown subset as replies (lists/bold/fences). */
+function paintThinkingBody(body, text, { streaming = false } = {}) {
+  if (!body) {
+    return;
+  }
+  const raw = String(text ?? "");
+  body.dataset.mdSource = raw;
+  body.innerHTML = renderMarkdown(raw, { streaming });
+}
+
+function thinkingBodyRaw(body) {
+  return String(body?.dataset?.mdSource || body?.textContent || "");
 }
 
 function paintTurnUsageMeta(row, turn) {
@@ -566,6 +580,15 @@ export function renderActiveSession() {
     if (msg.role === "grant") {
       appendGrantCard(msg);
     } else {
+      if (msg.role === "agent" && msg.thinking) {
+        const think = appendThinkingBlock(msg.thinking, {
+          streaming: false,
+          open: false,
+        });
+        if (think) {
+          finishThinkingBlock(think, Number(msg.updatedAt) || Date.now());
+        }
+      }
       appendMessage(msg.role, msg.text, { msgIndex: index });
     }
   });
@@ -598,9 +621,9 @@ export function appendThinkingBlock(text, { streaming = false, open = true } = {
     `<span class="agent-thinking-label">Thinking</span>`;
   const bodyWrap = document.createElement("div");
   bodyWrap.className = "agent-thinking-body-wrap";
-  const body = document.createElement("pre");
+  const body = document.createElement("div");
   body.className = "agent-thinking-body";
-  body.textContent = text;
+  paintThinkingBody(body, text, { streaming });
   bodyWrap.append(body);
   details.append(summary, bodyWrap);
   stream.append(details);
@@ -843,7 +866,7 @@ export function stopMockStream({ keepPartial = true, drainQueue = false } = {}) 
   const thinking = host.streamEl()?.querySelector(".agent-thinking.is-streaming");
   let thinkingText = "";
   if (thinking) {
-    thinkingText = thinking.querySelector(".agent-thinking-body")?.textContent || "";
+    thinkingText = thinkingBodyRaw(thinking.querySelector(".agent-thinking-body"));
     finishThinkingBlock(thinking, Number(thinking.dataset.startedAt) || Date.now());
   }
   const streaming = host.streamEl()?.querySelector(".agent-msg-agent.is-streaming");
@@ -943,9 +966,7 @@ async function startLiveTurnForPrompt(userText) {
         });
       } else {
         const body = thinkingEl.querySelector(".agent-thinking-body");
-        if (body) {
-          body.textContent = reasoning;
-        }
+        paintThinkingBody(body, reasoning, { streaming: true });
         thinkingEl.hidden = !ctx.reasoningVisible && !content;
         if (ctx.reasoningVisible) {
           thinkingEl.open = true;
@@ -1020,9 +1041,7 @@ async function startLiveTurnForPrompt(userText) {
     if (thinkingEl) {
       if (thinking) {
         const body = thinkingEl.querySelector(".agent-thinking-body");
-        if (body) {
-          body.textContent = thinking;
-        }
+        paintThinkingBody(body, thinking, { streaming: false });
         thinkingEl.hidden = false;
         finishThinkingBlock(thinkingEl, thinkStartedAt);
       } else {
@@ -1182,9 +1201,7 @@ function startTurnReveal({
   const thinkBody = thinking?.querySelector(".agent-thinking-body");
   if (thinking && !ctx.reasoningVisible) {
     thinking.hidden = true;
-    if (thinkBody) {
-      thinkBody.textContent = thinkingText;
-    }
+    paintThinkingBody(thinkBody, thinkingText, { streaming: false });
   }
 
   let phase = showThinking && ctx.reasoningVisible ? "thinking" : "tool";
@@ -1226,11 +1243,14 @@ function startTurnReveal({
 
     if (phase === "thinking" && thinkBody) {
       thinkIndex = Math.min(thinkingText.length, thinkIndex + 3 + (thinkIndex % 2));
-      thinkBody.textContent = thinkingText.slice(0, thinkIndex);
+      paintThinkingBody(thinkBody, thinkingText.slice(0, thinkIndex), {
+        streaming: true,
+      });
       if (scroller) {
         scroller.scrollTop = scroller.scrollHeight;
       }
       if (thinkIndex >= thinkingText.length) {
+        paintThinkingBody(thinkBody, thinkingText, { streaming: false });
         beginToolOrAnswer();
       }
       return;

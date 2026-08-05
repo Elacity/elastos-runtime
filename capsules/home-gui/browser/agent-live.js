@@ -2,9 +2,9 @@
    no tool, grant, or capsule authority; grant cards remain fail-closed preview
    (Principle 16). Path: gateway /api/provider/ai/* and /api/provider/llama/*
    (home-gui-only allowlist, home launch token).
-   Tip: home-20260804ba */
+   Tip: home-20260804bb */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804ba";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804bb";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
