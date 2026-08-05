@@ -2,7 +2,7 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-import { TIP } from "./agent-tip.js?v=home-20260804az";
+import { TIP } from "./agent-tip.js?v=home-20260804ba";
 
 let planMarkdown = `### To-dos
 - [ ] Clarify what to build
