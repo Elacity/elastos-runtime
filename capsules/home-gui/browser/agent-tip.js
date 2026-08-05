@@ -73,8 +73,12 @@
  * [ ] Extract fails closed without grant / for binary files
  * [ ] No ambient /api/provider/object from home-gui
  *
+ * Wave 6.02 Web search (§AW):
+ * [ ] “search the web / online” → fail-closed Exit/net card (no scrape)
+ * [ ] Gateway POST /agent/tools/web.search returns unavailable + citations:[]
+ *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804av";
+export const TIP = "home-20260804aw";

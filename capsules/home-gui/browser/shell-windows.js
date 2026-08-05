@@ -30,8 +30,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260804av";
-import { playUiSound } from "./shell-sounds.js?v=home-20260804av";
+} from "./shell-window-geometry.js?v=home-20260804aw";
+import { playUiSound } from "./shell-sounds.js?v=home-20260804aw";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -50,8 +50,8 @@ import {
   exitFullscreenStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260804av";
-import { TIP as SHELL_TIP } from "./agent-tip.js?v=home-20260804av";
+} from "./shell-stages.js?v=home-20260804aw";
+import { TIP as SHELL_TIP } from "./agent-tip.js?v=home-20260804aw";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [

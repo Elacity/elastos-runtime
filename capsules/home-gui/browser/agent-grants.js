@@ -1,5 +1,5 @@
 /* Agent grant cards + truth strip.
-   Bound from agent-harness.js. Tip: home-20260804av
+   Bound from agent-harness.js. Tip: home-20260804aw
    UI ≠ authority (Principle 16): Allow once does not mint Capsule power.
    library.read → real Inbox capability (Wave 5.01); wallet.sign stays preview mock. */
 
@@ -10,13 +10,15 @@ import {
   applyCapabilityState,
   wantsLibraryTool,
   wantsWalletTool,
-} from "./mock-agent-provider.js?v=home-20260804av";
+  wantsWebSearchTool,
+} from "./mock-agent-provider.js?v=home-20260804aw";
 import {
   requestAgentLibraryRead,
   fetchAgentLibraryReadStatus,
   cancelAgentLibraryRead,
-} from "./agent-live.js?v=home-20260804av";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804av";
+  requestAgentWebSearch,
+} from "./agent-live.js?v=home-20260804aw";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804aw";
 
 /** @type {null | Record<string, Function>} */
 let store = null;
@@ -495,6 +497,46 @@ export function sessionAlreadyHasGrant(session, toolId) {
   );
 }
 
+function appendWebSearchUnavailableCard(session, payload, query) {
+  const grant = {
+    role: "grant",
+    toolId: "web.search",
+    state: "denied",
+    inbox: false,
+    label: payload?.label || "Web · Search",
+    summary:
+      payload?.summary ||
+      "Web search needs an Exit/net grant — Agent does not scrape the open web.",
+    scope: payload?.scope || "exit/net (not granted)",
+    args: { query: String(query || "").slice(0, 200) },
+  };
+  session.messages.push(grant);
+  const card = document.createElement("article");
+  card.className = "agent-grant-card is-denied";
+  card.dataset.role = "grant";
+  card.dataset.toolId = "web.search";
+  card.dataset.state = "denied";
+  card.innerHTML =
+    `<div class="agent-grant-card-head">` +
+    `<span class="agent-grant-card-title"></span>` +
+    `<span class="agent-grant-card-preview">Exit/net · fail-closed</span></div>` +
+    `<p class="agent-grant-card-summary"></p>` +
+    `<p class="agent-grant-card-scope"></p>` +
+    `<div class="agent-grant-card-chip">Unavailable · no ambient browser scrape</div>`;
+  card.querySelector(".agent-grant-card-title").textContent = grant.label;
+  card.querySelector(".agent-grant-card-summary").textContent = grant.summary;
+  card.querySelector(".agent-grant-card-scope").textContent = `Scope: ${grant.scope}`;
+  host.streamEl()?.append(card);
+  host.clearEmptyState?.();
+  host.scrollStreamToEnd?.();
+  syncTruthStrip();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+}
+
 export async function maybeOfferToolAfterReply() {
   const session = store.getSessions().find((s) => s.id === store.getActiveSessionId());
   if (!session) {
@@ -504,6 +546,23 @@ export async function maybeOfferToolAfterReply() {
     .reverse()
     .find((m) => m.role === "user");
   const text = lastUser?.text || "";
+  if (wantsWebSearchTool(text) && !sessionAlreadyHasGrant(session, "web.search")) {
+    try {
+      const payload = await requestAgentWebSearch(text);
+      appendWebSearchUnavailableCard(session, payload, text);
+    } catch (err) {
+      appendWebSearchUnavailableCard(
+        session,
+        {
+          label: "Web · Search",
+          summary: err?.message || "Web search unavailable",
+          scope: "exit/net (not granted)",
+        },
+        text,
+      );
+    }
+    return;
+  }
   if (wantsWalletTool(text) && !sessionAlreadyHasGrant(session, "wallet.sign")) {
     const req = requestTool({ toolId: "wallet.sign", args: {} });
     const grant = {

@@ -2,9 +2,9 @@
    no tool, grant, or capsule authority; grant cards remain fail-closed preview
    (Principle 16). Path: gateway /api/provider/ai/* and /api/provider/llama/*
    (home-gui-only allowlist, home launch token).
-   Tip: home-20260804av */
+   Tip: home-20260804aw */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804av";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804aw";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
@@ -478,6 +478,36 @@ export async function cancelAgentLibraryRead(requestId) {
   if (!response.ok) {
     const error = new Error(data?.message || `library.read cancel failed: ${response.status}`);
     error.code = data?.code || "library_read_cancel_failed";
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+/** Wave 6.02 — ask gateway for web.search; fail-closed until Exit/net exists. */
+export async function requestAgentWebSearch(query = "") {
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    const error = new Error("missing home launch token in Home GUI shell");
+    error.code = "missing-home-launch-token";
+    throw error;
+  }
+  const response = await fetch(
+    new URL("/api/apps/home/agent/tools/web.search", window.location.href).href,
+    {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "x-elastos-home-token": token,
+      },
+      body: JSON.stringify({ query: String(query || "").slice(0, 500) }),
+    },
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.message || `web.search failed: ${response.status}`);
+    error.code = data?.code || "web_search_failed";
     error.status = response.status;
     throw error;
   }

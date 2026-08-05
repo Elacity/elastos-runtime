@@ -2,7 +2,7 @@
    UI ≠ authority (Principle 16): never mints Carrier/Capsule grants,
    never calls live ai-provider. Label everything Preview · mock. */
 
-import { TIP } from "./agent-tip.js?v=home-20260804av";
+import { TIP } from "./agent-tip.js?v=home-20260804aw";
 
 let planMarkdown = `### To-dos
 - [ ] Clarify what to build
@@ -506,6 +506,18 @@ export function wantsLibraryTool(text) {
 export function wantsWalletTool(text) {
   const t = String(text || "").toLowerCase();
   return t.includes("wallet") || t.includes("sign") || t.includes("recovery");
+}
+
+/** Heuristic: user asks for open-web search (Exit/net — fail-closed until granted). */
+export function wantsWebSearchTool(text) {
+  const t = String(text || "").toLowerCase();
+  return (
+    t.includes("search the web") ||
+    t.includes("web search") ||
+    t.includes("google ") ||
+    t.includes("look up online") ||
+    t.includes("search online")
+  );
 }
 
 function scopeFor(cap) {

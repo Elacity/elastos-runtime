@@ -1228,6 +1228,40 @@ async fn read_desktop_text_for_agent(
     Ok((name, text))
 }
 
+/// POST /api/apps/home/agent/tools/web.search
+/// Wave 6.02 — fail-closed until Exit/net capability exists (no browser scrape).
+pub(super) async fn home_agent_web_search(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(_body): Json<Value>,
+) -> Response {
+    if let Err(err) = require_home_gui_launch(&state, &headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "error",
+                "code": "missing-home-launch-token",
+                "message": err,
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "unavailable",
+            "tool": "web.search",
+            "label": "Web · Search",
+            "summary": "Web search needs an Exit/net grant on this Home. Agent does not scrape the open web from the browser (UI ≠ authority).",
+            "scope": "exit/net (not granted)",
+            "citations": [],
+            "result": null,
+            "fail_closed": true,
+        })),
+    )
+        .into_response()
+}
+
 /// POST /api/apps/home/agent/tools/library.read/:request_id/extract
 /// Wave 6.01 — after Inbox grant (job ready), extract one Desktop text object.
 pub(super) async fn home_agent_library_read_extract(
