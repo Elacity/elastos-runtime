@@ -8,14 +8,14 @@ import {
   setReasoningVisible,
   getUsageLedger,
   applyUsageLedger,
-} from "./mock-agent-provider.js?v=home-20260804ay";
+} from "./mock-agent-provider.js?v=home-20260804az";
 import {
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
   normalizeAgentNotes,
-} from "./agent-live.js?v=home-20260804ay";
-import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804ay";
+} from "./agent-live.js?v=home-20260804az";
+import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804az";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;
@@ -79,13 +79,22 @@ export function serializeSessionForPersist(session) {
         })
         .filter(Boolean)
     : [];
+  const tags = Array.isArray(session.tags)
+    ? session.tags
+        .map((t) => String(t || "").trim().slice(0, 24))
+        .filter(Boolean)
+        .slice(0, 6)
+    : [];
   return {
     id: String(session.id).slice(0, 80),
     title: String(session.title || "Chat").slice(0, 64),
     group: session.group === "Earlier" ? "Earlier" : "Today",
     pinned: Boolean(session.pinned),
+    archived: Boolean(session.archived),
     projectId: session.projectId ? String(session.projectId).slice(0, 80) : null,
     mode: session.mode === "build" ? "build" : "chat",
+    tags,
+    forkedFrom: session.forkedFrom ? String(session.forkedFrom).slice(0, 80) : null,
     updatedAt: Number(session.updatedAt) || Date.now(),
     messages,
   };

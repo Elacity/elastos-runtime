@@ -1,25 +1,25 @@
 /* Agent session nav, search, CRUD, project create.
-   Bound from agent-harness.js. Tip: home-20260804ay
+   Bound from agent-harness.js. Tip: home-20260804az
    Host session.agent persist only — UI ≠ authority (Principle 16).
    Wave 1: archive soft-hide, JSON import/export, body search (already). */
 
 import {
   listProjects,
   createProject,
-} from "./mock-agent-provider.js?v=home-20260804ay";
-import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260804ay";
-import { closeHarnessPage } from "./agent-configure.js?v=home-20260804ay";
+} from "./mock-agent-provider.js?v=home-20260804az";
+import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260804az";
+import { closeHarnessPage } from "./agent-configure.js?v=home-20260804az";
 import {
   renderActiveSession,
   renderFollowUpQueue,
   stopMockStream,
   setTitle,
   titleFromPrompt,
-} from "./agent-stream.js?v=home-20260804ay";
+} from "./agent-stream.js?v=home-20260804az";
 import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
-} from "./agent-shelf.js?v=home-20260804ay";
+} from "./agent-shelf.js?v=home-20260804az";
 
 /** @type {null | object} */
 let ctx = null;
@@ -99,6 +99,8 @@ export function exportActiveSessionJson() {
       pinned: Boolean(session.pinned),
       projectId: session.projectId || null,
       archived: Boolean(session.archived),
+      tags: Array.isArray(session.tags) ? session.tags.slice(0, 6) : [],
+      forkedFrom: session.forkedFrom || null,
       updatedAt: session.updatedAt || Date.now(),
       messages: session.messages || [],
     },
@@ -151,6 +153,10 @@ export function importSessionsFromJsonText(raw) {
         pinned: Boolean(src.pinned),
         projectId: src.projectId || null,
         archived: Boolean(src.archived),
+        tags: Array.isArray(src.tags)
+          ? src.tags.map((t) => String(t || "").trim().slice(0, 24)).filter(Boolean).slice(0, 6)
+          : [],
+        forkedFrom: src.forkedFrom ? String(src.forkedFrom).slice(0, 80) : null,
         updatedAt: Number(src.updatedAt) || Date.now(),
         messages: Array.isArray(src.messages) ? src.messages : [],
       },
@@ -298,7 +304,27 @@ export function appendSessionRow(host, session, { nested = false } = {}) {
     meta.textContent = "Build";
     btn.append(meta);
   }
-  btn.title = [session.title, session.pinned ? "Pinned" : "", relativeTime(session.updatedAt)]
+  if (session.forkedFrom) {
+    const forkMeta = document.createElement("span");
+    forkMeta.className = "agent-harness-session-meta";
+    forkMeta.textContent = "Fork";
+    forkMeta.title = "Forked from another chat";
+    btn.append(forkMeta);
+  }
+  const tags = Array.isArray(session.tags) ? session.tags.filter(Boolean).slice(0, 3) : [];
+  if (tags.length) {
+    const tagMeta = document.createElement("span");
+    tagMeta.className = "agent-harness-session-meta is-tags";
+    tagMeta.textContent = tags.map((t) => `#${t}`).join(" ");
+    tagMeta.title = tags.map((t) => `#${t}`).join(" · ");
+    btn.append(tagMeta);
+  }
+  btn.title = [
+    session.title,
+    session.pinned ? "Pinned" : "",
+    tags.length ? tags.map((t) => `#${t}`).join(" ") : "",
+    relativeTime(session.updatedAt),
+  ]
     .filter(Boolean)
     .join(" · ");
 
@@ -549,6 +575,70 @@ export function renameSession(sessionId) {
   persistAgentWorkspaceSoon();
 }
 
+/** Wave 7.02 — copy chat into a new session (host-persisted; no Capsule authority). */
+export function forkSession(sessionId) {
+  const source = ctx.sessions.find((s) => s.id === sessionId);
+  if (!source) {
+    return;
+  }
+  stopMockStream({ keepPartial: true });
+  const baseTitle = String(source.title || "Chat").replace(/\s*\(fork\)\s*$/i, "");
+  const forked = {
+    id: `s-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    title: `${baseTitle.slice(0, 54)} (fork)`.slice(0, 64),
+    group: "Today",
+    pinned: false,
+    archived: false,
+    projectId: source.projectId || null,
+    mode: source.mode === "build" ? "build" : "chat",
+    tags: Array.isArray(source.tags) ? source.tags.slice(0, 6) : [],
+    forkedFrom: source.id,
+    updatedAt: Date.now(),
+    messages: Array.isArray(source.messages)
+      ? source.messages.map((m) => {
+          if (!m || typeof m !== "object") {
+            return null;
+          }
+          if (m.role === "grant") {
+            return { ...m };
+          }
+          return {
+            role: m.role === "user" || m.role === "agent" ? m.role : "agent",
+            text: m.text || "",
+            ...(m.thinking ? { thinking: m.thinking } : {}),
+            ...(m.partial ? { partial: true } : {}),
+          };
+        }).filter(Boolean)
+      : [],
+  };
+  ctx.sessions = [forked, ...ctx.sessions];
+  ctx.activeSessionId = forked.id;
+  renderSessions();
+  renderActiveSession();
+  persistAgentWorkspaceSoon();
+}
+
+/** Tags are presentation labels on this Home — comma-separated, max 6. */
+export function editSessionTags(sessionId) {
+  const session = ctx.sessions.find((s) => s.id === sessionId);
+  if (!session) {
+    return;
+  }
+  const current = Array.isArray(session.tags) ? session.tags.join(", ") : "";
+  const next = window.prompt("Tags (comma-separated, max 6)", current);
+  if (next == null) {
+    return;
+  }
+  session.tags = String(next)
+    .split(/[,#]+/)
+    .map((t) => t.trim().toLowerCase().replace(/\s+/g, "-").slice(0, 24))
+    .filter(Boolean)
+    .slice(0, 6);
+  session.updatedAt = Date.now();
+  renderSessions();
+  persistAgentWorkspaceSoon();
+}
+
 export function deleteSession(sessionId) {
   ctx.sessions = ctx.sessions.filter((s) => s.id !== sessionId);
   if (ctx.activeSessionId === sessionId) {
@@ -648,6 +738,8 @@ export function openSessionActions(sessionId, anchor) {
   }
 
   addAction("Rename", "rename");
+  addAction("Fork chat", "fork");
+  addAction("Edit tags…", "tags");
   addAction(session.archived ? "Unarchive" : "Archive", "archive");
   addAction("Export Markdown", "export");
   addAction("Export JSON", "export-json");
@@ -688,6 +780,14 @@ export function runSessionAction(action) {
   }
   if (action === "rename") {
     renameSession(id);
+    return;
+  }
+  if (action === "fork") {
+    forkSession(id);
+    return;
+  }
+  if (action === "tags") {
+    editSessionTags(id);
     return;
   }
   if (action === "archive") {

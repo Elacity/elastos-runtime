@@ -9,17 +9,17 @@
  * (wallet → Wallet rail; everything else → Inbox rail).
  */
 
-import { clockNode } from "./shell-core.js?v=home-20260804ay";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804ay";
+import { clockNode } from "./shell-core.js?v=home-20260804az";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804az";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
-} from "./shell-popovers.js?v=home-20260804ay";
+} from "./shell-popovers.js?v=home-20260804az";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260804ay";
-import { showWalletRail } from "./shell-wallet-rail.js?v=home-20260804ay";
+} from "./shell-motion.js?v=home-20260804az";
+import { showWalletRail } from "./shell-wallet-rail.js?v=home-20260804az";
 
 const STORE_KEY = "elastos.home.notifications";
 const MAX_ENTRIES = 50;

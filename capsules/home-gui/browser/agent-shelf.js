@@ -7,20 +7,20 @@
 
    Send opens Agent Harness (Home drops, dock stays) — see agent-harness.js. */
 
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804ay";
-import { TIP } from "./agent-tip.js?v=home-20260804ay";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804az";
+import { TIP } from "./agent-tip.js?v=home-20260804az";
 import {
   agentHarnessActive,
   hideAgentHarness,
   sendToAgentHarness,
   showAgentHarness,
   stopAgentHarnessStream,
-} from "./agent-send.js?v=home-20260804ay";
-import { extractAgentLibraryRead } from "./agent-live.js?v=home-20260804ay";
+} from "./agent-send.js?v=home-20260804az";
+import { extractAgentLibraryRead } from "./agent-live.js?v=home-20260804az";
 import {
   formatLibraryKbContext,
   getReadyLibraryReadGrant,
-} from "./agent-grants.js?v=home-20260804ay";
+} from "./agent-grants.js?v=home-20260804az";
 
 let bound = false;
 let morphGeneration = 0;
@@ -328,6 +328,13 @@ function formatAttachmentContext(attachments) {
   const parts = [];
   for (const item of attachments) {
     const name = item.name || "file";
+    if (item.kind === "image") {
+      parts.push(
+        `Attached image «${name}» — vision is not available on this Home yet ` +
+          `(fail-closed; no fake caption or remote vision API).`,
+      );
+      continue;
+    }
     if (item.text && item.kind === "desktop" && item.uri) {
       parts.push(
         `Attached Desktop «${name}» (${item.uri}) · Inbox library.read extract (cited):\n${item.text}`,
@@ -823,11 +830,14 @@ function renderComposerAttachments() {
       `<span class="agent-attach-chip-meta"></span>` +
       `<span class="agent-attach-chip-x" aria-hidden="true">×</span>`;
     chip.querySelector(".agent-attach-chip-name").textContent = file.name;
-    const meta = file.text
-      ? `extract · ${Math.max(1, Math.round(file.text.length / 1024))} KB`
-      : file.uri
-        ? "desktop · needs grant"
-        : `${Math.max(1, Math.round((file.size || 0) / 1024))} KB`;
+    const meta =
+      file.kind === "image"
+        ? "vision · unsupported"
+        : file.text
+          ? `${file.uri ? "grant" : "extract"} · ${Math.max(1, Math.round(file.text.length / 1024))} KB`
+          : file.uri
+            ? "desktop · needs grant"
+            : `${Math.max(1, Math.round((file.size || 0) / 1024))} KB`;
     chip.querySelector(".agent-attach-chip-meta").textContent = meta;
     host.append(chip);
   }
@@ -931,10 +941,25 @@ async function onAttachFilesSelected(event) {
     return;
   }
   for (const file of files.slice(0, 8)) {
+    const type = String(file.type || "");
+    const name = file.name || "file";
+    const isImage =
+      type.startsWith("image/") ||
+      /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i.test(name);
+    if (isImage) {
+      /* Wave 7.03 — honest unsupported; never invent captions or call vision APIs. */
+      addComposerAttachment({
+        kind: "image",
+        name,
+        size: Number(file.size) || 0,
+        text: "",
+      });
+      continue;
+    }
     const text = await readTextAttachment(file);
     addComposerAttachment({
       kind: "file",
-      name: file.name || "file",
+      name,
       size: Number(file.size) || 0,
       text,
     });

@@ -10,13 +10,13 @@
  * - Expose / Show Windows — Mission Control overview (shell-expose.js)
  */
 
-import { shellState } from "./shell-core.js?v=home-20260804ay";
+import { shellState } from "./shell-core.js?v=home-20260804az";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260804ay";
+} from "./shell-window-geometry.js?v=home-20260804az";
 
-import { TIP } from "./agent-tip.js?v=home-20260804ay";
+import { TIP } from "./agent-tip.js?v=home-20260804az";
 const DESKTOP_STAGE = "desktop";
 /** Singleton Agent Space — always in the ring beside Desktop (Mission Control peer). */
 const AGENT_STAGE = "agent";

@@ -64,20 +64,20 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260804ay";
-import { playUiSound } from "./shell-sounds.js?v=home-20260804ay";
+} from "./shell-windows.js?v=home-20260804az";
+import { playUiSound } from "./shell-sounds.js?v=home-20260804az";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260804ay";
+} from "./shell-popovers.js?v=home-20260804az";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260804ay";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260804ay";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260804ay";
-import { TIP as SHELF_TIP } from "./agent-tip.js?v=home-20260804ay";
+} from "./shell-motion.js?v=home-20260804az";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260804az";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260804az";
+import { TIP as SHELF_TIP } from "./agent-tip.js?v=home-20260804az";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;

@@ -2231,7 +2231,7 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   text-overflow: ellipsis;
 }
 
-/* Only rendered for Build sessions — a quiet trailing tag, not a sub-line. */
+/* Quiet trailing tags (Build / Fork / #tags) — not a sub-line. */
 .agent-harness-session-meta {
   flex: 0 0 auto;
   padding: 2px 6px;
@@ -2241,6 +2241,16 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.02em;
+  max-width: 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-harness-session-meta.is-tags {
+  font-weight: 520;
+  letter-spacing: -0.01em;
+  text-transform: none;
 }
 
 .agent-starter-chips {

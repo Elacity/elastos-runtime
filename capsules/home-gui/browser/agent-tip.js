@@ -82,8 +82,13 @@
  * [ ] Live system prompt includes notes when set
  * [ ] library heuristics include desktop / what’s on my
  *
+ * Wave 7.02–03 fork/tags/vision (§AZ):
+ * [ ] Session ··· → Fork chat creates copy with Fork badge; persists
+ * [ ] Edit tags… shows #tags on session row; persist reload
+ * [ ] Image attach → vision · unsupported (no fake caption)
+ *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
  */
 
-export const TIP = "home-20260804ay";
+export const TIP = "home-20260804az";
