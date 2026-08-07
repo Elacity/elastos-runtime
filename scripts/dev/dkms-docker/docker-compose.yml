@@ -7,6 +7,8 @@
 # host-side debugging/describe — the runtime reaches nodes over Carrier (did:key), not
 # these ports. Live nodes expose 9443 only on the private mesh, never publicly.
 
+# All three nodes run the SAME image; only node0 declares the build so
+# `docker compose build` compiles it once instead of three times in parallel.
 x-node: &node
   build:
     context: ../../..
@@ -34,6 +36,7 @@ x-node: &node
 services:
   dkms-node0:
     <<: *node
+    image: dkms-docker-node
     environment:
       <<: *node-env
       NODE_INDEX: "0"
