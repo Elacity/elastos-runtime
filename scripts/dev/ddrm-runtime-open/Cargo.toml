@@ -1,0 +1,39 @@
+[package]
+name = "ddrm-runtime-open"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Default-on runtime-core OPEN entrypoint (dev driver, NOT a capsule, never shipped):
+# constructs the trusted `DrmHost` from `ProviderLauncher`s + a `DurableEventStore` and
+# drives a dDRM open reading a TYPED JSON CONFIG (provider binaries, work dir, viewer,
+# content id, publish-escrow fixture, mode) — NO smoke assembles the host. The producer's
+# escrow is a publish-time fixture this binary reads, not inline code. `ddrm-consumer-smoke.sh`
+# is now a thin caller that writes a config and INVOKES this binary.
+# See scripts/ddrm-consumer-smoke.sh and docs/convergence/SYSTEM_ARCHITECTURE_MAP.md.
+
+[[bin]]
+name = "ddrm-runtime-open"
+path = "src/main.rs"
+
+[features]
+# dev-modes: enables the dev-only `reference` key backend in this NEVER-SHIPPED harness and
+# makes it the default-when-absent. OFF by default so the driver defaults to (and only accepts)
+# the production `dkms` backend (DEV_MODE_GUARD_SPEC). Matches the same-named feature across the
+# dDRM crates; dev/CI build with `--features dev-modes`.
+dev-modes = []
+
+[dependencies]
+# The SAME shared transcript encoder both rail sides bind (Day 54): the orchestrator
+# computes the canonical AAD the key authority seals to and the decrypt boundary
+# rebuilds. No private re-implementation -> no drift.
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope" }
+# The runtime-core open-plan EXECUTOR: the smoke no longer hand-walks the plan inline —
+# it drives the REAL binaries THROUGH the core, which threads the plan's binding edges
+# and fails closed on a broken edge. Same crate the runtime would wire to real providers.
+ddrm-plan-runner = { path = "../../../capsules/ddrm-plan-runner" }
+serde_json = "1.0"
+base64 = "0.22"
+# Content-addressing for the content-plane fetch: CIDv1 raw + sha2-256, byte-for-byte
+# what encrypt-provider (and PC2/Helia single-chunk) produces. Pure function of the bytes.
+sha2 = "0.10"

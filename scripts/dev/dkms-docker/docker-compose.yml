@@ -1,0 +1,71 @@
+# Three ISOLATED dKMS quorum nodes — each container is one "server": its own process
+# tree, its own network identity, its own private /data volume (master seed + carrier
+# identity), exactly like the three live geo nodes. Run via ./up.sh (it also assembles
+# the Carrier descriptor); see docs/DKMS_NODE_PROVISIONING.md.
+#
+# Ports: each node's dkms-authority is ALSO exposed on localhost (1944N) purely for
+# host-side debugging/describe — the runtime reaches nodes over Carrier (did:key), not
+# these ports. Live nodes expose 9443 only on the private mesh, never publicly.
+
+x-node: &node
+  build:
+    context: ../../..
+    dockerfile: scripts/dev/dkms-docker/Dockerfile
+  restart: unless-stopped
+  environment: &node-env
+    # Allow-list of runtime CALLER verifying keys (comma-separated b64 ML-DSA-65 VKs).
+    # up.sh mints a caller identity and fills this via .env. Empty = anonymous sessions
+    # (authorization then rests entirely on the wallet-signed AccessGrant + chain check).
+    DKMS_AUTHORITY_ALLOWED_CALLERS: ${DKMS_AUTHORITY_ALLOWED_CALLERS:-}
+    # Optional lifecycle-operator VK (rotation etc.). Not needed for the recover vertical.
+    DKMS_AUTHORITY_OPERATOR_VK: ${DKMS_AUTHORITY_OPERATOR_VK:-}
+    # The node's OWN pinned, read-only Base RPC pool for trustless AccessGrant
+    # authorization (it re-checks hasAccessByContentId itself; contract/selector/chain-id
+    # default to the live Base mainnet values compiled into the node).
+    DKMS_CHAIN_RPC_POOL: ${DKMS_CHAIN_RPC_POOL:-https://mainnet.base.org,https://base-rpc.publicnode.com}
+    # The node's OWN quorum identity pin (cross-quorum replay defense). MANDATORY in the
+    # release-build node: without it every grant-authorized recover fails closed. up.sh
+    # computes it from the assembled descriptor (b64(SHA-256 over t + the ordered node
+    # vks)) and fills this via .env after the identities are published.
+    DKMS_AUTHORITY_NODE_SET_ID_B64: ${DKMS_AUTHORITY_NODE_SET_ID_B64:-}
+  volumes:
+    - ./shared:/shared
+
+services:
+  dkms-node0:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_INDEX: "0"
+    volumes:
+      - dkms-node0-data:/data
+      - ./shared:/shared
+    ports:
+      - "127.0.0.1:19443:9443"
+
+  dkms-node1:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_INDEX: "1"
+    volumes:
+      - dkms-node1-data:/data
+      - ./shared:/shared
+    ports:
+      - "127.0.0.1:29443:9443"
+
+  dkms-node2:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_INDEX: "2"
+    volumes:
+      - dkms-node2-data:/data
+      - ./shared:/shared
+    ports:
+      - "127.0.0.1:39443:9443"
+
+volumes:
+  dkms-node0-data:
+  dkms-node1-data:
+  dkms-node2-data:

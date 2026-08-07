@@ -1,0 +1,36 @@
+[package]
+name = "dkms-carrier-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# dkms-carrier-client — the RUNTIME-SIDE Carrier sidecar for the dKMS quorum transport.
+#
+# Runs on the runtime host. It exposes a LOOPBACK TCP listener (default 127.0.0.1:9444)
+# that `key-provider` connects to. The first line of each connection is a `did:key`
+# preamble naming the target quorum node; the sidecar dials that node's Carrier address
+# (ALPN `elastos/dkms-authority/1`) over iroh and relays raw bytes both ways.
+#
+# This keeps iroh OUT of the security-critical `key-provider` binary: `key-provider`
+# only opens a loopback socket and writes the target did, then runs its EXISTING framed
+# PQ-channel protocol unchanged. Because the transport is now "network", `key-provider`
+# forces network=true (mandatory encrypted channel) for the carrier scheme.
+#
+# Its own workspace (empty `[workspace]` below) so the iroh stack stays isolated.
+
+[[bin]]
+name = "dkms-carrier-client"
+path = "src/main.rs"
+
+[dependencies]
+iroh = { version = "0.96", features = ["address-lookup-mdns"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+anyhow = "1.0"
+bs58 = "0.5"
+getrandom = "0.2"
+url = "2.5"
+
+[profile.release]
+opt-level = 2
+
+[workspace]

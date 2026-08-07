@@ -14,7 +14,7 @@ const homeClipboardClientUrl = pathToFileURL(
 
 async function importConnectorFixture(path) {
   const source = readFileSync(resolve(path), "utf8").replace(
-    '"/apps/home/home-clipboard-client.js?v=home-20260726a"',
+    '"/apps/home/home-clipboard-client.js?v=home-20260807a"',
     JSON.stringify(homeClipboardClientUrl),
   );
   return import(

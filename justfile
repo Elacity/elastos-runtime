@@ -69,14 +69,65 @@ verify-release:
     just local-carrier-setup-smoke
     just home-frontdoor-smoke
 
+# CI gate: the full `verify` MINUS the Carrier-network setup smoke (`local-carrier-setup-smoke`),
+# which a stock GitHub runner cannot reach. Everything else a clean runner CAN verify runs here;
+# the carrier smoke is covered separately on a Carrier-capable Linux box / self-hosted runner.
+verify-ci:
+    just alignment-check
+    just _verify-tail
+
+# (hidden) gate steps shared by `verify` and `verify-ci` — everything after the alignment-check
+# + (verify-only) carrier-smoke preamble.
+_verify-tail:
+    ./scripts/command-smoke.sh
+    just candidate-command-audit
+    cd elastos && cargo fmt --all -- --check
+    cd elastos && cargo clippy --workspace --all-targets -- -D warnings
+    cd elastos && cargo test --workspace
+    # The dev-modes lane (Sprint 46, council S46 guardian F3): the money-path construction
+    # ratchets (S43 typed BuyError, the S46 prepare-leg deadline, chain-mock buys) are
+    # `#[cfg(feature = "dev-modes")]` — without this lane the gate never compiles them and a
+    # "ratchet" outside the gate cannot ratchet. Shares the workspace build cache; lib-only.
+    cd elastos && cargo test -p elastos-server --lib --features dev-modes
+    just verify-capsules
+
+# Build + test the dDRM capsule crates the elastos-workspace gate does not reach. These crates
+# carry the protected-content surface (watermark codec, grant-digest envelope, media-authority), are
+# exercised under their CANONICAL feature sets (matching scripts/dev/run-creator-gateway.sh), and
+# gated by build+test only (clippy -D warnings is held back for now: pre-existing lint debt).
+verify-capsules:
+    cd capsules/decrypt-provider && cargo test --features rail-stream,rail-mint,pdf-render,pq-envelope
+    cd capsules/ddrm-envelope && cargo test --features access-grant,av-variants
+    cd scripts/dev/ddrm-media-authority && cargo test
+    # AV forensic cross-language weld: the Python extractor's canonical codeword must match the Rust
+    # serve selector byte-for-byte (golden vectors on both sides). Pure stdlib — no numpy/ffmpeg.
+    python3 tools/av-forensics/test_canonical.py
+
 # Fail-closed check for rooted-localhost and Home-first contract drift
 alignment-check:
     ./scripts/check-wci-alignment.sh
 
 # Verify the checked-in ElastOS Bus contract and real Component fixture
 bus-conformance:
+    #!/usr/bin/env bash
+    set -euo pipefail
     node scripts/check-elastos-bus-wit.mjs
-    cd elastos && cargo test -p elastos-server component_runs_through_real_bus_authority_provider_and_audit_paths -- --nocapture
+    cd elastos
+    # Full module path + --exact so a rename can't silently drift the filter to zero matches.
+    # cargo test still exits 0 on a zero-match filter (a vacuous pass), so we explicitly assert
+    # exactly one test ran and passed rather than trusting the exit code alone.
+    out=$(cargo test -p elastos-server --lib \
+        runtime::tests::component_conformance_exercises_bus_authorization_dispatch_and_audit \
+        -- --exact --nocapture 2>&1) && status=0 || status=$?
+    echo "$out"
+    if [ "$status" -ne 0 ]; then
+        echo "::error::bus-conformance: test run failed" >&2
+        exit "$status"
+    fi
+    if ! echo "$out" | grep -qE "test result: ok\. 1 passed"; then
+        echo "::error::bus-conformance: expected exactly 1 test to run and pass (filter matched 0 — check the test name/path)" >&2
+        exit 1
+    fi
 
 # Validate canonical capsule scaffolds against the current manifest and WIT contracts
 capsule-templates:

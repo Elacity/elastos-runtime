@@ -2,9 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `main` is the live line. The work-branch patterns are included so we can run the
+    # full gate on our own work in isolation (this entry lives only on the branch; it
+    # does NOT affect main or other branches until/unless it is merged). Drop the
+    # non-`main` patterns at merge time.
+    branches: [main, feat/**, upstream/**, review/**]
   pull_request:
     branches: [main]
+  # Manual trigger so a feature branch can be put through the full Linux gate
+  # (incl. the Linux-only carrier smoke in `just verify`) before merge.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,6 +45,11 @@ jobs:
       - name: cargo check
         working-directory: elastos
         run: cargo check --workspace
+      # Type-check the network-gated live-buy test so a rename can't silently rot the operator's
+      # only live tool (it stays #[ignore]d + feature-off in the gate; this never runs it). S45 F3.
+      - name: cargo check (live-chain test)
+        working-directory: elastos
+        run: cargo check -p elastos-server --features live-chain --tests
 
   test:
     name: Test
@@ -53,6 +65,13 @@ jobs:
         run: cargo test --workspace
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
+      - name: cargo test (dev-modes lane)
+        working-directory: elastos
+        # The money-path construction ratchets (S43 typed BuyError, the S46 prepare-leg
+        # deadline, chain-mock buys) are `#[cfg(feature = "dev-modes")]` — without this lane
+        # the gate never compiles them, and a ratchet outside the gate cannot ratchet
+        # (council S46 guardian F3). Lib-only; shares the workspace build cache.
+        run: cargo test -p elastos-server --lib --features dev-modes
 
   build-release:
     name: Build Release (x86_64)
@@ -66,3 +85,94 @@ jobs:
       - name: cargo build --release
         working-directory: elastos
         run: cargo build --workspace --release
+
+  # The canonical gate on Linux, MINUS the Carrier-network setup smoke: alignment-check +
+  # command smoke + candidate-command-audit + fmt/clippy/test (elastos workspace) + the dDRM
+  # capsule build+test (verify-capsules). This turns "manually covered" into "green on a clean
+  # runner". The `local-carrier-setup-smoke` step is excluded here because it fetches the
+  # net-provider artifact over Elastos Carrier, which a stock GitHub runner cannot reach — run
+  # the full `just verify` on a Carrier-capable Linux box / self-hosted runner before merge.
+  # RUSTFLAGS=-D warnings is inherited from `env` above.
+  verify:
+    name: Verify (Linux CI gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            elastos
+            capsules/decrypt-provider
+            capsules/ddrm-envelope
+            scripts/dev/ddrm-media-authority
+      - uses: extractions/setup-just@v2
+      - name: Install ripgrep (required by alignment-check; not preinstalled on the runner)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: just verify-ci
+        run: just verify-ci
+
+  # Isolated, fast signal for the protected-content capsule crates that live OUTSIDE
+  # the elastos workspace (so the `check`/`test` jobs and `cargo --workspace` never
+  # reach them): the watermark codec, the grant-digest envelope, the media-authority.
+  # Independent of the carrier smoke, so a flaky/heavy smoke run never masks a capsule
+  # regression. Build+test only (these crates still carry pre-existing clippy debt).
+  capsules:
+    name: dDRM Capsule Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            capsules/decrypt-provider
+            capsules/ddrm-envelope
+            scripts/dev/ddrm-media-authority
+      - uses: extractions/setup-just@v2
+      - name: just verify-capsules
+        run: just verify-capsules
+
+  # Pre-mainnet deploy invariant (fix-pack ②): a PRODUCTION dkms-authority node must be a release
+  # build with DEFAULT features — the legacy unsigned-receipt path (`legacy-receipt-authz`) and the
+  # `dev-modes` opt-in that pulls it in must NEVER ship. The crate enforces this with a
+  # `compile_error!` keyed on a release build (no `debug_assertions`); this job asserts BOTH
+  # directions so the guard can't silently rot. See `docs/DEPLOY_CHECKLIST.md`.
+  # `dkms-authority` lives OUTSIDE the elastos workspace, so the other jobs never reach it.
+  dkms-release-invariant:
+    name: dKMS Release Invariant (no dev-modes/legacy)
+    runs-on: ubuntu-latest
+    # Assert the FEATURE invariant only; do not let unrelated pre-existing rustc warnings in this
+    # out-of-workspace crate mask it (the rest of CI keeps -D warnings).
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: capsules/dkms-authority
+      - name: Release build with DEFAULT features must succeed (no legacy path compiled)
+        run: cargo build --release --manifest-path capsules/dkms-authority/Cargo.toml
+      - name: Release build with legacy-receipt-authz must FAIL closed (compile guard)
+        run: |
+          if out=$(cargo build --release --manifest-path capsules/dkms-authority/Cargo.toml --features legacy-receipt-authz 2>&1); then
+            echo "::error::release build ACCEPTED legacy-receipt-authz — the release-invariant guard is missing"
+            exit 1
+          fi
+          echo "$out" | grep -q "release build must not enable" || {
+            echo "::error::release build failed, but NOT via the release-invariant guard:"; echo "$out"; exit 1;
+          }
+          echo "ok: release + legacy-receipt-authz rejected at compile time"
+      - name: Release build with dev-modes must FAIL closed (compile guard)
+        run: |
+          if out=$(cargo build --release --manifest-path capsules/dkms-authority/Cargo.toml --features dev-modes 2>&1); then
+            echo "::error::release build ACCEPTED dev-modes — the release-invariant guard is missing"
+            exit 1
+          fi
+          echo "$out" | grep -q "release build must not enable" || {
+            echo "::error::release build failed, but NOT via the release-invariant guard:"; echo "$out"; exit 1;
+          }
+          echo "ok: release + dev-modes rejected at compile time"

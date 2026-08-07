@@ -1,0 +1,12 @@
+{
+  "name": "unixfs-oracle",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ground-truth oracle: computes Helia @helia/unixfs root CIDs + dag-pb block bytes for fixed test vectors, so the Rust content plane can be pinned byte-for-byte against the real IPFS importer PC2 uses (pc2-node/src/storage/ipfs.ts addBytes).",
+  "dependencies": {
+    "@helia/unixfs": "^5.0.0",
+    "blockstore-core": "^5.0.0",
+    "multiformats": "^13.0.0"
+  }
+}

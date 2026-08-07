@@ -254,11 +254,11 @@ CHILD = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <title>Opaque Home GUI child</title>
-  <link rel="stylesheet" href="/capsules/home-gui/browser/style.css?v=home-20260725a">
+  <link rel="stylesheet" href="/capsules/home-gui/browser/style.css?v=home-20260807a">
 </head>
 <body data-home-status="booting" data-home-shell="desktop" data-home-gui="mounted">
   <div class="home-gui-shell"></div>
-  <script type="module" src="/capsules/home-gui/browser/home-gui-shell.js?v=home-20260726a"></script>
+  <script type="module" src="/capsules/home-gui/browser/home-gui-shell.js?v=home-20260807a"></script>
   <script type="module">
     const route = new URL(window.location.href);
     const proofOrigin = route.searchParams.get("proof_origin") || "";
