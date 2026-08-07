@@ -927,6 +927,7 @@ mod tests {
             identity_manager: Arc::new(OnceLock::new()),
             cache_dir: data_dir.join("cache"),
             data_dir: data_dir.to_path_buf(),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
         }
     }
 

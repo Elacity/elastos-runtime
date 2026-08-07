@@ -38,7 +38,7 @@ use futures_lite::StreamExt;
 use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -355,6 +355,18 @@ pub fn did_to_public_key(did: &str) -> Option<iroh::PublicKey> {
     }
     let key_bytes: [u8; 32] = bytes[2..34].try_into().ok()?;
     iroh::PublicKey::from_bytes(&key_bytes).ok()
+}
+
+/// Encode an iroh Ed25519 `PublicKey` (a Carrier node-id) as a `did:key:z6Mk...` string — the
+/// exact inverse of [`did_to_public_key`], and the runtime's canonical principal namespace.
+/// Used to turn the QUIC-verified remote node-id into the `did:key` the rest of the runtime (and
+/// the quota ledger) attributes on, so peer identity is one namespace end-to-end.
+pub fn public_key_to_did(public_key: &iroh::PublicKey) -> String {
+    let mut bytes = Vec::with_capacity(34);
+    bytes.push(0xed);
+    bytes.push(0x01);
+    bytes.extend_from_slice(public_key.as_bytes());
+    format!("did:key:z{}", bs58::encode(bytes).into_string())
 }
 
 pub fn decode_ticket_endpoints(ticket: &str) -> Vec<iroh::EndpointAddr> {
@@ -767,12 +779,47 @@ impl ProtocolHandler for FileHandler {
     }
 }
 
+/// Read one newline-delimited JSON control line from a Carrier stream without
+/// ever buffering more than `MAX_LINE_BYTES`. Every Carrier read path — the
+/// unauthenticated inbound handler *and* the client-side response readers —
+/// funnels through here so an untrusted remote peer (inbound) or a malicious
+/// source we dialed (response) cannot OOM the node with a newline-less flood.
+/// Fail-closed: an oversized or truncated line is an error, not a giant alloc.
+/// This is the same 1 MB bound BUG-6 applied to the WASM/microVM bridges,
+/// extended to the primary request path. Carrier bulk bytes ride the separate
+/// length-prefixed path (`read_carrier_len_prefixed_bytes`), not this reader,
+/// so the 1 MB cap only ever bounds small JSON control lines.
+pub(crate) async fn read_bounded_carrier_line<R>(reader: &mut R, context: &str) -> Result<String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use crate::carrier_bridge::{read_bounded_line, BoundedLine, MAX_LINE_BYTES};
+    match read_bounded_line(reader).await? {
+        BoundedLine::Line(line) => Ok(line),
+        BoundedLine::Eof => {
+            anyhow::bail!("{context}: connection closed before a complete line was received")
+        }
+        BoundedLine::TooLarge => {
+            anyhow::bail!("{context}: line exceeded the {MAX_LINE_BYTES}-byte bound")
+        }
+    }
+}
+
 async fn handle_file_connection(
     conn: iroh::endpoint::Connection,
     data_dir: &std::path::Path,
     provider_registry: Option<Weak<ProviderRegistry>>,
     gossip_state: Arc<Mutex<GossipState>>,
 ) -> Result<()> {
+    // The iroh QUIC handshake CRYPTOGRAPHICALLY authenticates the remote to its node-id (public
+    // key). Capture it ONCE per connection as the VERIFIED peer identity, encoded in the runtime's
+    // canonical `did:key` namespace (so it matches the allowlist + the quota ledger end-to-end).
+    // The provider-invoke plane uses it to (a) authenticate the peer against a trusted-DID allowlist
+    // and (b) inject a verified principal — instead of trusting the self-referential, caller-supplied
+    // envelope fields the T1 audit flagged. iroh binds the remote node-id at the QUIC handshake, so
+    // it is always present for an established connection; a peer is nonetheless ANONYMOUS (read-only,
+    // fail-closed) unless its `did:key` is on the trusted allowlist below.
+    let peer_did = Some(public_key_to_did(&conn.remote_id()));
     loop {
         let (mut send, recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
@@ -781,10 +828,17 @@ async fn handle_file_connection(
         let data_dir = data_dir.to_path_buf();
         let provider_registry = provider_registry.clone();
         let gossip_state = gossip_state.clone();
+        let peer_did = peer_did.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_file_stream(&mut send, recv, &data_dir, provider_registry, gossip_state)
-                    .await
+            if let Err(e) = handle_file_stream(
+                &mut send,
+                recv,
+                &data_dir,
+                provider_registry,
+                gossip_state,
+                peer_did,
+            )
+            .await
             {
                 debug!("carrier file stream error: {:#}", e);
             }
@@ -799,10 +853,12 @@ async fn handle_file_stream(
     data_dir: &std::path::Path,
     provider_registry: Option<Weak<ProviderRegistry>>,
     gossip_state: Arc<Mutex<GossipState>>,
+    // The cryptographically-verified remote node-id (did:key), or `None` for an
+    // unauthenticated/unknown peer. Load-bearing for the provider-invoke plane gate.
+    peer_did: Option<String>,
 ) -> Result<()> {
     let mut reader = BufReader::new(recv);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let line = read_bounded_carrier_line(&mut reader, "carrier file stream").await?;
 
     let msg: CarrierMessage = serde_json::from_str(line.trim())?;
 
@@ -948,7 +1004,8 @@ async fn handle_file_stream(
                 .await?;
                 return Ok(());
             };
-            let response = carrier_provider_invoke_registry(&registry, &msg.data).await?;
+            let response =
+                carrier_provider_invoke_registry(&registry, &msg.data, peer_did.as_deref()).await?;
             send_json(send, &response).await?;
         }
         "browser_exit_stream" => {
@@ -1335,7 +1392,15 @@ async fn bridge_browser_carrier_stream_to_relay(
 async fn carrier_provider_invoke_registry(
     registry: &ProviderRegistry,
     data: &serde_json::Value,
+    // The cryptographically-verified remote peer DID (iroh node-id), or `None` when the peer
+    // is unauthenticated. Determines which provider-plane allowlist applies AND supplies the
+    // verified principal — never trust a caller-supplied `principal_id` on this plane.
+    peer_did: Option<&str>,
 ) -> Result<serde_json::Value> {
+    // A peer is AUTHENTICATED only when its verified DID is on the operator's trusted-peer
+    // allowlist. Empty allowlist (the default) ⇒ no authenticated peers ⇒ every inbound peer
+    // stays on the read-only anonymous plane: fail-closed, zero behavior change until opt-in.
+    let authenticated = peer_did.map(carrier_trusted_peer).unwrap_or(false);
     let source = data
         .get("source")
         .and_then(|value| value.as_str())
@@ -1355,16 +1420,63 @@ async fn carrier_provider_invoke_registry(
         .get("transfer")
         .and_then(|value| value.as_str())
         .unwrap_or("json");
-    let request = data
+    let mut request = data
         .get("request")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("provider_invoke missing request"))?;
+    // Verified-principal injection (closes the T1 caller-supplied-principal hole): the provider
+    // must attribute quota + ownership to the CRYPTOGRAPHICALLY VERIFIED peer, never a value the
+    // remote put in the envelope. Critically, the content coordinator keys quota + ownership on
+    // `publisher_did` / `object_did` read straight from the request (`content.rs`
+    // `effective_publisher_did` HONORS any non-empty caller value), so THOSE are the load-bearing
+    // fields — overriding only `principal_id` (which the content provider never reads) would leave
+    // the hole open. We stamp all three with the verified principal: an authenticated peer acts as
+    // its own verified `did:key`; the anonymous plane carries `carrier:anonymous` so no
+    // caller-supplied identity is ever honored. So an allowlisted peer can only write content
+    // attributed to and owned by ITSELF (cross-owner push-replication is a deferred per-flow
+    // design, tracked with the key/rights residual).
+    if let Some(object) = request.as_object_mut() {
+        let verified_principal = peer_did
+            .filter(|_| authenticated)
+            .unwrap_or("carrier:anonymous");
+        for identity_field in ["publisher_did", "object_did", "principal_id"] {
+            object.insert(
+                identity_field.to_string(),
+                serde_json::Value::String(verified_principal.to_string()),
+            );
+        }
+    }
 
     if !carrier_provider_target_allowed(target) {
         return Ok(serde_json::json!({
             "ok": false,
             "code": "unauthorized_provider_target",
             "error": "Carrier provider invocation must target an ElastOS service provider, not a raw backend",
+        }));
+    }
+    // Fail-closed containment gate (audit T1): `handle_file_connection` accepts
+    // every inbound peer with NO authentication, and the envelope check below is
+    // self-referential (it validates caller-supplied fields against each other,
+    // not against a runtime-issued capability), so anything reachable here is
+    // reachable by any anonymous remote peer. Restrict the anonymous plane to
+    // non-mutating reads only — writes and all key/decrypt/drm/rights ops are
+    // refused until authenticated peer sessions land.
+    let plane_allows = if authenticated {
+        carrier_provider_plane_allows_authenticated(target, operation)
+    } else {
+        carrier_provider_plane_allows_unauthenticated(target, operation)
+    };
+    if !plane_allows {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "code": "unauthorized_provider_operation",
+            "error": format!(
+                "operation {target}:{operation} is not permitted on the \
+                 {} carrier provider plane (anonymous = read-only; authenticated = \
+                 content reads+writes; key/decrypt/drm/rights remain gated pending \
+                 per-flow cross-node capability design)",
+                if authenticated { "authenticated" } else { "unauthenticated" }
+            ),
         }));
     }
     if let Err(message) =
@@ -1395,6 +1507,89 @@ fn carrier_provider_target_allowed(target: &str) -> bool {
         target,
         "content" | "availability" | "rights" | "key" | "decrypt" | "drm"
     )
+}
+
+/// The ONLY `(target, operation)` pairs an *unauthenticated* inbound Carrier peer
+/// may invoke over the provider_invoke plane. This is a strict default-DENY
+/// allowlist of *non-mutating reads*, per the KEEP containment principle
+/// (fail-closed, capability-mediated):
+///
+///   - `content:fetch` — pull already-published bytes (pull replication),
+///   - `content:status` — read publish/availability status,
+///   - `content:admission` — a storage-quota *decision* ("would you store this?") that computes and returns a verdict without writing.
+///
+/// Everything else is refused on the anonymous plane, deliberately:
+///   - content **writes** (`publish`/`import_exact`/`import_object`/`ensure`/
+///     `unpublish`/`repair`): an unauthenticated remote could otherwise pin
+///     arbitrary bytes into this node's store under a *caller-supplied*
+///     `principal_id` (unauthorized write + quota-attribution abuse);
+///   - **all** `key`/`decrypt`/`drm`/`rights`/`availability` operations: these
+///     can release or gate key material / DRM rights and must never be reachable
+///     without an authenticated peer session.
+///
+/// Authenticated push-replication and cross-node key/rights flows are re-enabled
+/// once real Carrier peer authentication lands (tracked in KNOWN_GAPS as the
+/// carrier peer-auth gap). Widening this set without peer auth reopens T1.
+fn carrier_provider_plane_allows_unauthenticated(target: &str, operation: &str) -> bool {
+    matches!(
+        (target, operation),
+        ("content", "fetch") | ("content", "status") | ("content", "admission")
+    )
+}
+
+/// The `(target, operation)` pairs an AUTHENTICATED (trusted-DID) inbound peer may invoke: the
+/// unauthenticated read set PLUS content push-replication WRITES, executed under the peer's
+/// VERIFIED principal (so quota/attribution is honest — the T1 write hole). Deliberately still
+/// EXCLUDES all `key`/`decrypt`/`drm`/`rights` operations even when authenticated: releasing or
+/// gating key material across nodes needs its own per-flow capability design, and widening it on
+/// a bare node-id allowlist would reopen the T1 key-material caveat. Fail-closed by construction —
+/// membership in this set is the ONLY thing peer-auth unlocks in this slice.
+fn carrier_provider_plane_allows_authenticated(target: &str, operation: &str) -> bool {
+    if carrier_provider_plane_allows_unauthenticated(target, operation) {
+        return true;
+    }
+    matches!(
+        (target, operation),
+        ("content", "publish")
+            | ("content", "import_exact")
+            | ("content", "import_object")
+            | ("content", "ensure")
+            | ("content", "unpublish")
+            | ("content", "repair")
+    )
+}
+
+/// Whether a cryptographically-verified remote peer DID is on the operator's trusted-peer
+/// allowlist. Sourced from `ELASTOS_CARRIER_TRUSTED_PEERS` (comma-separated iroh node-ids /
+/// `did:key` strings). EMPTY / UNSET (the default) ⇒ returns false for every peer ⇒ the
+/// authenticated plane is inert and every inbound peer stays read-only: fail-closed, and no
+/// behavior change until an operator explicitly opts a specific peer in. Trust derives from the
+/// verified DID (per the Carrier design: "trust from signatures and trusted DIDs, not from the
+/// transport"), never from a caller-supplied envelope field.
+fn carrier_trusted_peer(peer_did: &str) -> bool {
+    let peer_did = peer_did.trim();
+    if peer_did.is_empty() {
+        return false;
+    }
+    let Ok(list) = std::env::var("ELASTOS_CARRIER_TRUSTED_PEERS") else {
+        return false;
+    };
+    list.split(',')
+        .map(str::trim)
+        .filter(|allowed| !allowed.is_empty())
+        .any(|allowed| {
+            // Normalize each entry into the `did:key` namespace so an operator may list EITHER a
+            // `did:key:z6Mk...` or a raw iroh node-id (mirrors `source_node_id`'s dual acceptance).
+            // A malformed entry simply never matches (fail-closed).
+            let allowed_did = if allowed.starts_with("did:key:") {
+                allowed.to_string()
+            } else if let Ok(public_key) = allowed.parse::<iroh::PublicKey>() {
+                public_key_to_did(&public_key)
+            } else {
+                return false;
+            };
+            allowed_did == peer_did
+        })
 }
 
 fn validate_carrier_provider_invocation(
@@ -1502,21 +1697,7 @@ fn validate_carrier_provider_stream_contract(
 }
 
 fn validate_carrier_content_path(path: &str) -> Result<(), String> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    if path.starts_with('/') || path.starts_with('\\') {
-        return Err("content fetch path must be relative".to_string());
-    }
-    if path.contains('\\') || path.contains('\0') {
-        return Err("content fetch path contains invalid characters".to_string());
-    }
-    for segment in path.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err("content fetch path contains an invalid segment".to_string());
-        }
-    }
-    Ok(())
+    crate::net_validation::validate_content_path(path)
 }
 
 async fn send_json(send: &mut iroh::endpoint::SendStream, value: &serde_json::Value) -> Result<()> {
@@ -2059,25 +2240,11 @@ fn validate_content_cid(cid: &str) -> Result<(), String> {
 }
 
 fn validate_carrier_external_endpoint_url(raw: &str) -> Result<(), String> {
-    let url = url::Url::parse(raw)
-        .map_err(|err| format!("invalid carrier external endpoint URL: {err}"))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(
-            "carrier external endpoint URL must not contain inline credentials".to_string(),
-        );
-    }
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) => Ok(()),
-        _ => Err("carrier external endpoint URL must use https or local loopback http".to_string()),
-    }
+    crate::net_validation::validate_outbound_endpoint_url(raw, "carrier external endpoint")
 }
 
 fn validate_carrier_authorization_header_value(value: &str) -> Result<(), String> {
-    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
-        return Err("carrier authorization header contains invalid newline".to_string());
-    }
-    Ok(())
+    crate::net_validation::validate_outbound_header_value(value, "carrier authorization header")
 }
 
 fn local_replica_count(request: &serde_json::Value) -> u32 {
@@ -2490,17 +2657,20 @@ impl CarrierAvailabilityProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        // Pre-effect request-shape validation (no state locked / no announce yet):
+        // a missing/invalid cid is a provable no-op, so DidNotAct lets the carrier
+        // refund the consumed single-use (BUG-4). The `join_failed` path below
+        // stays a structured error — it runs after a join that may have acted.
         let cid = match request.get("cid").and_then(|value| value.as_str()) {
             Some(cid) => cid.trim(),
             None => {
-                return Ok(carrier_availability_error(
-                    "invalid_request",
-                    "Carrier availability requires cid",
+                return Err(ProviderError::DidNotAct(
+                    "carrier availability requires a cid".into(),
                 ))
             }
         };
         if let Err(err) = validate_content_cid(cid) {
-            return Ok(carrier_availability_error("invalid_cid", err));
+            return Err(ProviderError::DidNotAct(format!("invalid cid: {err}")));
         }
         let uri = request
             .get("uri")
@@ -2795,24 +2965,25 @@ impl CarrierAvailabilityProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        // Pre-effect request-shape validation (no fetch issued yet) — DidNotAct so
+        // the carrier refunds the unused single-use on a provable no-op (BUG-4).
         let cid = match request.get("cid").and_then(|value| value.as_str()) {
             Some(cid) => cid.trim(),
             None => {
-                return Ok(carrier_availability_error(
-                    "invalid_request",
-                    "Carrier availability fetch requires cid",
+                return Err(ProviderError::DidNotAct(
+                    "carrier availability fetch requires a cid".into(),
                 ))
             }
         };
         if let Err(err) = validate_content_cid(cid) {
-            return Ok(carrier_availability_error("invalid_cid", err));
+            return Err(ProviderError::DidNotAct(format!("invalid cid: {err}")));
         }
         let path = request
             .get("path")
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if let Err(err) = validate_carrier_content_path(path) {
-            return Ok(carrier_availability_error("invalid_path", err));
+            return Err(ProviderError::DidNotAct(format!("invalid path: {err}")));
         }
         let topic_name = content_availability_topic_name(cid);
         let messages = {
@@ -4970,14 +5141,23 @@ impl Provider for CarrierGossipProvider {
                     .map(|mode| mode.eq_ignore_ascii_case("direct"))
                     .unwrap_or(false);
                 if topic_name.is_empty() {
-                    return Ok(
-                        serde_json::json!({"status":"error","code":"missing_topic","message":"topic required"}),
-                    );
+                    // Pre-effect request-shape rejection: nothing joined/sent yet, so
+                    // a consumed single-use is provably a no-op and is refunded (BUG-4
+                    // DidNotAct ocap contract). The `join_failed` path below stays
+                    // `Provider` because the join may have partially acted.
+                    return Err(ProviderError::DidNotAct(
+                        "gossip_join requires a non-empty topic".into(),
+                    ));
                 }
+                // `already_joined` is a STABLE no-op (a replay yields the same
+                // already-joined result), so it is refundable (DidNotAct). But
+                // `too_many_topics` is a TRANSIENT capacity condition — a replay
+                // could ACT once capacity frees, so it is NOT a guaranteed no-op and
+                // stays a structured error (the holder re-requests for a retry).
                 if state.joined_topics.contains(topic_name) {
-                    return Ok(
-                        serde_json::json!({"status":"error","code":"already_joined","message":"already joined"}),
-                    );
+                    return Err(ProviderError::DidNotAct(
+                        "gossip_join: topic already joined".into(),
+                    ));
                 }
                 if state.joined_topics.len() >= MAX_TOPICS {
                     return Ok(
@@ -4996,9 +5176,10 @@ impl Provider for CarrierGossipProvider {
             "gossip_leave" => {
                 let topic_name = request["topic"].as_str().unwrap_or_default();
                 if topic_name.is_empty() {
-                    return Ok(
-                        serde_json::json!({"status":"error","code":"missing_topic","message":"topic required"}),
-                    );
+                    // Pre-effect request-shape rejection (nothing removed yet) — refundable.
+                    return Err(ProviderError::DidNotAct(
+                        "gossip_leave requires a non-empty topic".into(),
+                    ));
                 }
 
                 let removed_sender = state.senders.remove(topic_name);
@@ -5630,8 +5811,7 @@ impl CarrierClient {
         send.write_all(&bytes).await?;
         send.finish()?;
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_bounded_carrier_line(&mut reader, "carrier release_head response").await?;
         let resp: serde_json::Value = serde_json::from_str(line.trim())?;
         if resp["ok"].as_bool() == Some(true) {
             Ok(Some(resp["release"].clone()))
@@ -5695,8 +5875,8 @@ impl CarrierClient {
         send.finish()?;
 
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line =
+            read_bounded_carrier_line(&mut reader, "carrier provider_invoke response").await?;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
             return Ok(response
@@ -5744,8 +5924,7 @@ impl CarrierClient {
         send.finish()?;
 
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_bounded_carrier_line(&mut reader, "carrier gossip_push response").await?;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
             return Ok(());
@@ -5778,8 +5957,7 @@ impl CarrierClient {
         send.finish()?;
 
         let mut reader = BufReader::new(recv);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_bounded_carrier_line(&mut reader, "carrier gossip_pull response").await?;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
         if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
             let message = response
@@ -5910,6 +6088,39 @@ pub async fn try_p2p_discovery(
 mod tests {
     use super::*;
     use std::sync::{Mutex as StdMutex, OnceLock};
+
+    /// The unauthenticated inbound Carrier reader (and every client-side response
+    /// reader) must bound a newline-less flood instead of buffering it whole —
+    /// otherwise a remote peer OOMs the node pre-auth (the BUG-6 class, extended
+    /// to the primary request path). A line just over the 1 MB cap with no
+    /// newline is refused, not allocated.
+    #[tokio::test]
+    async fn read_bounded_carrier_line_refuses_oversized_flood() {
+        use tokio::io::BufReader;
+        let flood = vec![b'a'; crate::carrier_bridge::MAX_LINE_BYTES + 4096];
+        let mut reader = BufReader::new(std::io::Cursor::new(flood));
+        let err = read_bounded_carrier_line(&mut reader, "test stream")
+            .await
+            .expect_err("an oversized newline-less line must be refused, not buffered");
+        assert!(
+            err.to_string().contains("bound"),
+            "error should name the byte bound, got: {err}"
+        );
+    }
+
+    /// A well-formed line under the cap round-trips unchanged (CRLF stripped),
+    /// so bounding the read does not break legitimate control traffic.
+    #[tokio::test]
+    async fn read_bounded_carrier_line_reads_normal_line() {
+        use tokio::io::BufReader;
+        let mut reader = BufReader::new(std::io::Cursor::new(
+            b"{\"op\":\"release_head\"}\r\n".to_vec(),
+        ));
+        let line = read_bounded_carrier_line(&mut reader, "test stream")
+            .await
+            .expect("a normal line must read back");
+        assert_eq!(line, "{\"op\":\"release_head\"}");
+    }
 
     fn env_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -6084,6 +6295,13 @@ mod tests {
                 "status": "ok",
                 "data": {
                     "op": request.get("op").cloned().unwrap_or(serde_json::Value::Null),
+                    // Echo the identity fields the REAL content coordinator attributes on
+                    // (publisher_did/object_did — NOT principal_id), so peer-auth tests assert the
+                    // VERIFIED principal was injected onto the load-bearing fields, never a
+                    // caller-supplied one. (Echoing principal_id here previously MASKED the T1 gap.)
+                    "publisher_did": request.get("publisher_did").cloned().unwrap_or(serde_json::Value::Null),
+                    "object_did": request.get("object_did").cloned().unwrap_or(serde_json::Value::Null),
+                    "principal_id": request.get("principal_id").cloned().unwrap_or(serde_json::Value::Null),
                     "runtime_invocation": request
                         .get("_runtime_invocation")
                         .cloned()
@@ -7159,7 +7377,7 @@ mod tests {
             }
         });
 
-        let response = carrier_provider_invoke_registry(&registry, &request)
+        let response = carrier_provider_invoke_registry(&registry, &request, None)
             .await
             .unwrap();
 
@@ -7314,7 +7532,7 @@ mod tests {
             }
         });
 
-        let response = carrier_provider_invoke_registry(&registry, &request)
+        let response = carrier_provider_invoke_registry(&registry, &request, None)
             .await
             .unwrap();
 
@@ -7359,7 +7577,7 @@ mod tests {
             }
         });
 
-        let response = carrier_provider_invoke_registry(&registry, &request)
+        let response = carrier_provider_invoke_registry(&registry, &request, None)
             .await
             .unwrap();
 
@@ -7400,12 +7618,320 @@ mod tests {
             }
         });
 
-        let response = carrier_provider_invoke_registry(&registry, &request)
+        let response = carrier_provider_invoke_registry(&registry, &request, None)
             .await
             .unwrap();
 
         assert_eq!(response["ok"], false);
         assert_eq!(response["code"], "unauthorized_provider_target");
+    }
+
+    /// Audit T1 / carrier peer-auth gap: a WRITE op (content:publish) on the
+    /// unauthenticated provider_invoke plane must be refused *before* it ever
+    /// reaches the provider, so a remote peer cannot pin bytes under a
+    /// caller-supplied principal. Refusal happens ahead of `send_raw`, so an
+    /// empty registry (no content provider) still proves the gate fired.
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_refuses_write_op_on_anonymous_plane() {
+        let registry = ProviderRegistry::new();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "content",
+            "operation": "publish",
+            "transfer": "json",
+            "request": {
+                "op": "publish",
+                "principal_id": "did:key:zAttacker",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "publish",
+                    "capability": "provider:carrier-availability->content:publish",
+                    "transport": "carrier-provider-plane",
+                    "carrier": { "route": "connect_ticket" },
+                    "transfer": "json"
+                }
+            }
+        });
+
+        let response = carrier_provider_invoke_registry(&registry, &request, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], "unauthorized_provider_operation");
+    }
+
+    /// Audit T1 (critical caveat): key/decrypt/drm are reachable targets, but no
+    /// key-material op may be invoked without an authenticated peer session.
+    /// Every key/decrypt/drm operation is refused on the anonymous plane.
+    #[tokio::test]
+    async fn test_carrier_provider_invoke_refuses_key_material_ops_on_anonymous_plane() {
+        let registry = ProviderRegistry::new();
+        for (target, op) in [
+            ("key", "unwrap"),
+            ("decrypt", "decrypt"),
+            ("drm", "license"),
+        ] {
+            let request = serde_json::json!({
+                "source": "carrier-availability",
+                "target": target,
+                "operation": op,
+                "transfer": "json",
+                "request": {
+                    "op": op,
+                    "_runtime_invocation": {
+                        "schema": "elastos.provider.invocation/v1",
+                        "source": "carrier-availability",
+                        "target": target,
+                        "op": op,
+                        "capability": format!("provider:carrier-availability->{target}:{op}"),
+                        "transport": "carrier-provider-plane",
+                        "carrier": { "route": "connect_ticket" },
+                        "transfer": "json"
+                    }
+                }
+            });
+            let response = carrier_provider_invoke_registry(&registry, &request, None)
+                .await
+                .unwrap();
+            assert_eq!(response["ok"], false, "{target}:{op} must be refused");
+            assert_eq!(
+                response["code"], "unauthorized_provider_operation",
+                "{target}:{op} must be refused as an unauthorized operation"
+            );
+        }
+    }
+
+    // ---- Carrier peer authentication (G-CARRIER-PEER) --------------------------------------
+    // Serializes the env-var mutating peer-auth tests (ELASTOS_CARRIER_TRUSTED_PEERS is
+    // process-global). Poison is ignored: the guarded unit is `()`.
+    fn carrier_peer_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn public_key_to_did_round_trips_with_did_to_public_key() {
+        // A canonical Ed25519 public key (RFC 8032 test vector) — no RNG needed.
+        let key_bytes: [u8; 32] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        let public_key = iroh::PublicKey::from_bytes(&key_bytes).expect("valid ed25519 key");
+        let did = public_key_to_did(&public_key);
+        assert!(did.starts_with("did:key:z"), "must be a did:key: {did}");
+        // The verified peer node-id encodes to a did:key that parses straight back to the same key,
+        // so the allowlist (did:key) and the QUIC-verified node-id live in ONE namespace.
+        assert_eq!(
+            did_to_public_key(&did).expect("did:key parses back"),
+            public_key
+        );
+    }
+
+    #[test]
+    fn carrier_authenticated_plane_widens_content_writes_but_never_key_material() {
+        // Reads stay allowed; content push-replication writes are now allowed for an
+        // authenticated peer; key/decrypt/drm/rights stay refused EVEN authenticated.
+        assert!(carrier_provider_plane_allows_authenticated(
+            "content", "fetch"
+        ));
+        for op in [
+            "publish",
+            "import_exact",
+            "import_object",
+            "ensure",
+            "unpublish",
+            "repair",
+        ] {
+            assert!(
+                carrier_provider_plane_allows_authenticated("content", op),
+                "authenticated content:{op} must be allowed"
+            );
+            assert!(
+                !carrier_provider_plane_allows_unauthenticated("content", op),
+                "anonymous content:{op} must stay refused"
+            );
+        }
+        for (target, op) in [
+            ("key", "unwrap"),
+            ("decrypt", "decrypt"),
+            ("drm", "license"),
+            ("rights", "grant"),
+        ] {
+            assert!(
+                !carrier_provider_plane_allows_authenticated(target, op),
+                "{target}:{op} must stay refused even when authenticated"
+            );
+        }
+    }
+
+    #[test]
+    fn carrier_trusted_peer_is_fail_closed_and_matches_only_the_allowlist() {
+        let _g = carrier_peer_env_lock();
+        std::env::remove_var("ELASTOS_CARRIER_TRUSTED_PEERS");
+        // Fail-closed: no allowlist ⇒ no peer is trusted; empty DID never trusted.
+        assert!(!carrier_trusted_peer("did:key:zTrusted"));
+        assert!(!carrier_trusted_peer(""));
+        std::env::set_var(
+            "ELASTOS_CARRIER_TRUSTED_PEERS",
+            " did:key:zTrusted , did:key:zOther ",
+        );
+        assert!(
+            carrier_trusted_peer("did:key:zTrusted"),
+            "allowlisted peer is trusted"
+        );
+        assert!(carrier_trusted_peer("did:key:zOther"));
+        assert!(
+            !carrier_trusted_peer("did:key:zStranger"),
+            "non-allowlisted peer is not trusted"
+        );
+        std::env::remove_var("ELASTOS_CARRIER_TRUSTED_PEERS");
+    }
+
+    /// An AUTHENTICATED (allowlisted-DID) peer may perform a content WRITE, and the provider is
+    /// attributed the VERIFIED principal — never the caller-supplied `principal_id` (T1 fix).
+    #[tokio::test]
+    // The env lock is DESIGNED to be held across this test's awaits — it serializes
+    // process-global ELASTOS_CARRIER_TRUSTED_PEERS access across async tests; the
+    // await-holding-lock lint targets production-executor deadlock risk, not this.
+    #[allow(clippy::await_holding_lock)]
+    async fn test_carrier_provider_invoke_authenticated_peer_writes_under_verified_principal() {
+        let _g = carrier_peer_env_lock();
+        std::env::set_var("ELASTOS_CARRIER_TRUSTED_PEERS", "did:key:zTrusted");
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("content", Arc::new(MockCarrierContentProvider))
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "content",
+            "operation": "publish",
+            "transfer": "json",
+            "request": {
+                "op": "publish",
+                // Caller-supplied identity fields spoofing a victim — ALL must be OVERRIDDEN with
+                // the verified peer, on the fields the real content coordinator attributes on.
+                "publisher_did": "did:key:zVictim",
+                "object_did": "did:key:zVictim",
+                "principal_id": "did:key:zAttacker",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "publish",
+                    "capability": "provider:carrier-availability->content:publish",
+                    "transport": "carrier-provider-plane",
+                    "carrier": { "route": "connect_ticket" },
+                    "transfer": "json"
+                }
+            }
+        });
+        let response =
+            carrier_provider_invoke_registry(&registry, &request, Some("did:key:zTrusted"))
+                .await
+                .unwrap();
+        std::env::remove_var("ELASTOS_CARRIER_TRUSTED_PEERS");
+        assert_eq!(
+            response["ok"], true,
+            "authenticated write must be allowed: {response}"
+        );
+        // The verified peer DID replaced the caller-supplied victim on the LOAD-BEARING fields the
+        // content coordinator attributes quota + ownership on — not just principal_id.
+        assert_eq!(
+            response["result"]["data"]["publisher_did"],
+            "did:key:zTrusted"
+        );
+        assert_eq!(response["result"]["data"]["object_did"], "did:key:zTrusted");
+        assert_eq!(
+            response["result"]["data"]["principal_id"],
+            "did:key:zTrusted"
+        );
+    }
+
+    /// An authenticated peer STILL cannot touch key material — auth widens content only.
+    #[tokio::test]
+    // The env lock is DESIGNED to be held across this test's awaits — it serializes
+    // process-global ELASTOS_CARRIER_TRUSTED_PEERS access across async tests; the
+    // await-holding-lock lint targets production-executor deadlock risk, not this.
+    #[allow(clippy::await_holding_lock)]
+    async fn test_carrier_provider_invoke_authenticated_peer_still_refused_key_material() {
+        let _g = carrier_peer_env_lock();
+        std::env::set_var("ELASTOS_CARRIER_TRUSTED_PEERS", "did:key:zTrusted");
+        let registry = ProviderRegistry::new();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "key",
+            "operation": "unwrap",
+            "transfer": "json",
+            "request": {
+                "op": "unwrap",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "key",
+                    "op": "unwrap",
+                    "capability": "provider:carrier-availability->key:unwrap",
+                    "transport": "carrier-provider-plane",
+                    "carrier": { "route": "connect_ticket" },
+                    "transfer": "json"
+                }
+            }
+        });
+        let response =
+            carrier_provider_invoke_registry(&registry, &request, Some("did:key:zTrusted"))
+                .await
+                .unwrap();
+        std::env::remove_var("ELASTOS_CARRIER_TRUSTED_PEERS");
+        assert_eq!(
+            response["ok"], false,
+            "key material must be refused even authenticated"
+        );
+        assert_eq!(response["code"], "unauthorized_provider_operation");
+    }
+
+    /// A peer whose verified DID is NOT on the allowlist is treated as anonymous — a write is
+    /// refused exactly as for an unauthenticated peer (the allowlist is the only gate).
+    #[tokio::test]
+    // The env lock is DESIGNED to be held across this test's awaits — it serializes
+    // process-global ELASTOS_CARRIER_TRUSTED_PEERS access across async tests; the
+    // await-holding-lock lint targets production-executor deadlock risk, not this.
+    #[allow(clippy::await_holding_lock)]
+    async fn test_carrier_provider_invoke_untrusted_peer_stays_read_only() {
+        let _g = carrier_peer_env_lock();
+        std::env::set_var("ELASTOS_CARRIER_TRUSTED_PEERS", "did:key:zSomeoneElse");
+        let registry = ProviderRegistry::new();
+        let request = serde_json::json!({
+            "source": "carrier-availability",
+            "target": "content",
+            "operation": "publish",
+            "transfer": "json",
+            "request": {
+                "op": "publish",
+                "_runtime_invocation": {
+                    "schema": "elastos.provider.invocation/v1",
+                    "source": "carrier-availability",
+                    "target": "content",
+                    "op": "publish",
+                    "capability": "provider:carrier-availability->content:publish",
+                    "transport": "carrier-provider-plane",
+                    "carrier": { "route": "connect_ticket" },
+                    "transfer": "json"
+                }
+            }
+        });
+        let response =
+            carrier_provider_invoke_registry(&registry, &request, Some("did:key:zStranger"))
+                .await
+                .unwrap();
+        std::env::remove_var("ELASTOS_CARRIER_TRUSTED_PEERS");
+        assert_eq!(response["ok"], false, "an untrusted peer must not write");
+        assert_eq!(response["code"], "unauthorized_provider_operation");
     }
 
     #[tokio::test]
@@ -8663,6 +9189,84 @@ mod tests {
         assert_eq!(requests[1]["request"]["object_did"], "did:key:zObject");
         assert_eq!(requests[2]["op"], "status");
         endpoint.close().await;
+    }
+
+    /// BUG-4 first REAL provider migration: the carrier-only CarrierGossipProvider
+    /// returns `DidNotAct` for a pre-effect request-shape rejection (empty topic),
+    /// so the carrier can safely refund the consumed single-use capability. Proven
+    /// against the real provider (not a mock); the carrier's refund-on-DidNotAct is
+    /// already covered by carrier_bridge::tests.
+    #[tokio::test]
+    async fn gossip_join_and_leave_empty_topic_return_did_not_act() {
+        use elastos_runtime::provider::Provider;
+
+        let (local_sk, local_did) = elastos_identity::derive_did(&[31u8; 32]);
+        let endpoint = Endpoint::builder()
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint.address_lookup().add(memory_lookup.clone());
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did),
+        )));
+        let provider = CarrierGossipProvider::new(state);
+
+        for op in ["gossip_join", "gossip_leave"] {
+            let resp = provider
+                .send_raw(&serde_json::json!({ "op": op, "topic": "" }))
+                .await;
+            assert!(
+                matches!(resp, Err(ProviderError::DidNotAct(_))),
+                "{op} with an empty topic must return DidNotAct (refundable); got {resp:?}"
+            );
+        }
+    }
+
+    /// BUG-4 second REAL migration: the carrier-only CarrierAvailabilityProvider
+    /// returns `DidNotAct` for pre-effect request-shape rejections (missing/invalid
+    /// cid on `ensure`/`fetch`), so the carrier refunds the unused single-use.
+    #[tokio::test]
+    async fn carrier_availability_request_shape_rejections_return_did_not_act() {
+        use elastos_runtime::provider::Provider;
+
+        let (local_sk, local_did) = elastos_identity::derive_did(&[37u8; 32]);
+        let endpoint = Endpoint::builder()
+            .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
+            .bind()
+            .await
+            .unwrap();
+        let memory_lookup = MemoryLookup::new();
+        endpoint.address_lookup().add(memory_lookup.clone());
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let state = Arc::new(Mutex::new(GossipState::new(
+            endpoint.clone(),
+            gossip,
+            memory_lookup,
+            Some(local_sk),
+            Some(local_did),
+        )));
+        let provider = CarrierAvailabilityProvider::new(state);
+
+        // Missing cid (announce + fetch) and an invalid cid are provable no-ops.
+        let cases = [
+            serde_json::json!({ "op": "ensure" }),
+            serde_json::json!({ "op": "fetch" }),
+            serde_json::json!({ "op": "ensure", "cid": "bad cid with spaces!" }),
+        ];
+        for req in cases {
+            let resp = provider.send_raw(&req).await;
+            assert!(
+                matches!(resp, Err(ProviderError::DidNotAct(_))),
+                "{req} must return DidNotAct (refundable); got {resp:?}"
+            );
+        }
     }
 
     #[tokio::test]

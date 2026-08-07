@@ -765,7 +765,7 @@ async fn fake_runtime_list_capsules(
     if !fake_runtime_has_home_token(&headers, &state) {
         return (
             StatusCode::FORBIDDEN,
-            "This endpoint requires shell privileges",
+            "This endpoint requires consent-broker privileges",
         )
             .into_response();
     }
@@ -780,7 +780,7 @@ async fn fake_runtime_launch_capsule(
     if !fake_runtime_has_home_token(&headers, &state) {
         return (
             StatusCode::FORBIDDEN,
-            "This endpoint requires shell privileges",
+            "This endpoint requires consent-broker privileges",
         )
             .into_response();
     }

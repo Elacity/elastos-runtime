@@ -101,22 +101,24 @@ pub(crate) fn principal_root_protected_object_inventory(
 pub(super) use gateway_home_runtime::{viewer_object_shell_description, viewer_object_shell_title};
 use gateway_home_system::*;
 use gateway_home_terminal::*;
+#[allow(unused_imports)]
 pub(super) use gateway_home_token::{
     home_launch_auth_data_dir, home_launch_token_header, home_session_clear_cookie_header,
     home_session_cookie_header_for_token, issue_home_launch_token_for_auth_grant,
-    issue_home_projection_launch_token_with_context, require_carried_home_launch_token,
-    require_home_launch_token, require_home_launch_token_binding,
-    require_home_launch_token_context, require_home_launch_token_for_any_app_context,
-    require_home_launch_token_for_any_context, require_home_projection_launch_token_context,
-    require_home_runtime_wallet_authority, require_home_token, require_home_token_context,
+    issue_home_launch_token_with_context, issue_home_projection_launch_token_with_context,
+    require_carried_home_launch_token, require_home_launch_token,
+    require_home_launch_token_binding, require_home_launch_token_context,
+    require_home_launch_token_for_any_app_context, require_home_launch_token_for_any_context,
+    require_home_projection_launch_token_context, require_home_runtime_wallet_authority,
+    require_home_token, require_home_token_context, require_home_token_launch,
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
     require_runtime_wallet_authority, runtime_wallet_authority, HomeLaunchContext,
     HomeLaunchTokenContext, RequiredHomeLaunchToken, RuntimeWalletAuthority,
 };
 #[cfg(test)]
 pub(crate) use gateway_home_token::{
-    issue_home_launch_token, issue_home_launch_token_with_context, local_home_launch_token_context,
-    set_test_home_launch_auth_data_dir, uuid_like_token,
+    issue_home_launch_token, local_home_launch_token_context, set_test_home_launch_auth_data_dir,
+    uuid_like_token,
 };
 use gateway_home_wallet_connector::*;
 use gateway_inbox::*;
@@ -177,6 +179,7 @@ pub const HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID_ENV: &str =
     "ELASTOS_HOME_CLI_AUTH_CONTEXT_PROOF_BINDING_ID";
 pub const HOME_CLI_AUTH_CONTEXT_GRANT_ID_ENV: &str = "ELASTOS_HOME_CLI_AUTH_CONTEXT_GRANT_ID";
 pub const HOME_CLI_GATEWAY_API_URL_ENV: &str = "ELASTOS_HOME_CLI_GATEWAY_API_URL";
+
 const WALLET_PRICE_IDS: &[(&str, &str)] = &[
     ("BTC", "bitcoin"),
     ("ETH", "ethereum"),
@@ -334,7 +337,7 @@ fn home_launch_token_context_from_parts(
         grant_id: grant_id.to_string(),
     })
 }
-const BROWSER_CAPSULE_ID: &str = "browser";
+pub(crate) const BROWSER_CAPSULE_ID: &str = "browser";
 const SERVICES_CAPSULE_ID: &str = "services";
 pub(crate) const SYSTEM_CAPSULE_ID: &str = "system";
 const SYSTEM_ROUTE: &str = "/apps/system/";
@@ -412,6 +415,14 @@ pub struct GatewayState {
     pub cache_dir: PathBuf,
     /// Runtime data directory backing rooted Publisher/Edge/MyWebSite state.
     pub data_dir: PathBuf,
+    /// Tamper-evident audit sink (GAP-8), lazily file-backed under `data_dir/audit/`. Mirrors the
+    /// `identity_manager` lazy pattern: an EXPLICIT field (no hidden global), initialized on first
+    /// use so the ~25 constructors stay `Arc::new(OnceLock::new())`. UNIFICATION: at serve time this
+    /// cell is pre-seeded (via [`seed_gateway_audit_log`]) with the shared runtime/infra custody log
+    /// when — and ONLY when — that log is durable, so the gateway and runtime share ONE signed chain;
+    /// otherwise it stays empty and the gateway lazily opens its own durable file sink (never a
+    /// durable→memory downgrade).
+    pub audit_log: Arc<OnceLock<Arc<elastos_runtime::primitives::audit::AuditLog>>>,
 }
 
 #[derive(Clone)]
@@ -422,6 +433,39 @@ pub(crate) fn is_trusted_home_shell_id(name: &str) -> bool {
 }
 
 impl GatewayState {
+    /// The tamper-evident audit log, lazily opened (hash-chained + ed25519-signed) under
+    /// `data_dir/audit/gateway-audit.log`. FAIL-CLOSED (AUD-2): if the signed, durable file
+    /// log cannot be opened this returns `Err` rather than silently swapping in an unsigned,
+    /// fail-open memory log. A custody caller must then refuse to serve — content whose open
+    /// is recorded only to a volatile, non-tamper-evident memory log must never be served.
+    pub(crate) fn audit_log(
+        &self,
+    ) -> Result<Arc<elastos_runtime::primitives::audit::AuditLog>, String> {
+        use elastos_runtime::primitives::audit::AuditLog;
+        if let Some(existing) = self.audit_log.get() {
+            return Ok(existing.clone());
+        }
+        // Serialize CONSTRUCTION (S52): the audit log now holds a single-opener flock, so the old
+        // benign both-construct-one-wins race would make the LOSER's open fail `WouldBlock` and
+        // surface a spurious error while a healthy canonical log exists. One constructor runs;
+        // everyone else re-reads the cell. A process-global mutex is fine — construction happens
+        // once per gateway lifetime (tests with distinct data_dirs serialize briefly, harmlessly).
+        static CONSTRUCT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CONSTRUCT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = self.audit_log.get() {
+            return Ok(existing.clone());
+        }
+        let path = self.data_dir.join("audit").join("gateway-audit.log");
+        let log = Arc::new(
+            AuditLog::with_file(&path)
+                .map_err(|e| format!("gateway audit log unavailable at {path:?}: {e}"))?,
+        );
+        let _ = self.audit_log.set(log.clone());
+        Ok(self.audit_log.get().cloned().unwrap_or(log))
+    }
+
     pub(crate) fn identity_manager(
         &self,
     ) -> anyhow::Result<Arc<tokio::sync::Mutex<IdentityManager>>> {
@@ -440,6 +484,29 @@ impl GatewayState {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("passkey identity manager unavailable"))
     }
+}
+
+/// Seed the gateway's lazy audit-log cell, UNIFYING it onto the shared runtime custody
+/// chain — but only when that shared log is DURABLE.
+///
+/// Fail-closed durability invariant (the crux): the gateway audit sink is always
+/// file-backed (AUD-2), whereas the shared `infra` log is memory-only unless
+/// `ELASTOS_AUDIT_LOG_PATH` is set. Pre-seeding the gateway with a memory-only shared
+/// log would silently DOWNGRADE gateway custody from durable→volatile — a security
+/// regression. So we adopt the shared log ONLY when `log_path().is_some()` (durable);
+/// otherwise we return an empty cell, leaving the gateway to lazily open its OWN file
+/// sink (today's behavior). A pure, I/O-free function so the no-downgrade rule is
+/// unit-testable without standing up a server.
+pub(crate) fn seed_gateway_audit_log(
+    shared: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
+) -> Arc<OnceLock<Arc<elastos_runtime::primitives::audit::AuditLog>>> {
+    let cell = OnceLock::new();
+    if let Some(log) = shared {
+        if log.log_path().is_some() {
+            let _ = cell.set(log);
+        }
+    }
+    Arc::new(cell)
 }
 
 pub fn gateway_router(state: GatewayState) -> Router {
@@ -604,6 +671,7 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/provider/object/download/raw",
             get(gateway_library_download),
         )
+        .route("/api/provider/object/cover", get(gateway_library_cover))
         .route(
             "/api/provider/object/upload",
             put(gateway_library_upload).layer(DefaultBodyLimit::max(MAX_GATEWAY_FILE_SIZE)),
@@ -907,6 +975,24 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route("/api/apps/marketplace/catalog", get(marketplace_catalog))
         .route("/api/apps/services/summary", get(services_summary))
         .route("/api/apps/services/offers", post(services_offer_update))
+        .route("/api/market/search", get(market_search))
+        .route("/api/market/sections", get(market_sections))
+        .route("/api/market/indexer-status", get(market_indexer_status))
+        .route("/api/market/get", get(market_get))
+        .route("/api/market/history", get(market_history))
+        .route("/api/market/preview/plan", get(market_preview_plan))
+        .route(
+            "/api/market/preview/file/:cid/*path",
+            get(market_preview_file),
+        )
+        .route("/api/market/vault", get(market_vault))
+        .route("/api/market/listed", get(market_listed))
+        .route("/api/market/me", get(market_me))
+        .route("/api/market/acquire", post(market_acquire))
+        .route("/api/market/acquire-status", get(market_acquire_status))
+        .route("/api/market/order/sell", post(market_order_sell))
+        .route("/api/market/order/withdraw", post(market_order_withdraw))
+        .route("/api/market/order/approve", post(market_order_approve))
         .route("/api/apps/inbox/summary", get(inbox_summary))
         .route("/api/apps/inbox/actions", post(inbox_action))
         .route("/api/apps/people/summary", get(people_summary))
@@ -1035,6 +1121,112 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
             "/api/viewers/:viewer/storage/:capsule/:scope/:name",
             get(super::viewer_gateway::viewer_storage_get)
                 .put(super::viewer_gateway::viewer_storage_put),
+        )
+        .route(
+            "/api/viewers/open",
+            axum::routing::post(super::viewer_open::open_owned_in_viewer),
+        )
+        .route(
+            "/api/viewers/prepare-grant",
+            axum::routing::post(super::viewer_open::prepare_owned_grant),
+        )
+        .route(
+            "/api/market/buy",
+            axum::routing::post(super::viewer_open::buy_owned_access),
+        )
+        .route(
+            "/api/create/mint",
+            axum::routing::post(super::viewer_open::mint_create_asset),
+        )
+        .route(
+            "/api/apps/creator/status",
+            get(super::creator::creator_status),
+        )
+        .route(
+            "/api/apps/creator/prepare-mint",
+            // The mint payload carries the asset bytes (base64) inline, so it far exceeds axum's
+            // 2 MB default body cap. Allow the same ceiling as a Library upload (100 MB) — base64
+            // inflation (~33%) means this comfortably covers an image and a modest video.
+            axum::routing::post(super::creator::creator_prepare_mint)
+                .layer(DefaultBodyLimit::max(MAX_GATEWAY_FILE_SIZE)),
+        )
+        .route(
+            "/api/apps/creator/prepare-progress/:job_id",
+            get(super::creator::creator_prepare_progress),
+        )
+        .route(
+            "/api/apps/creator/wallet",
+            get(super::creator::creator_wallet),
+        )
+        .route(
+            "/api/apps/creator/channels",
+            get(super::creator::creator_list_channels),
+        )
+        .route(
+            "/api/apps/creator/create-channel",
+            axum::routing::post(super::creator::creator_create_channel),
+        )
+        .route(
+            "/api/apps/creator/prepare-trade-approval",
+            axum::routing::post(super::creator::creator_prepare_trade_approval),
+        )
+        .route(
+            "/api/apps/creator/mint-status",
+            axum::routing::post(super::creator::creator_mint_status),
+        )
+        .route(
+            "/api/viewers/elacity-player/media/open",
+            axum::routing::post(super::media_authority::open_demo_media),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session",
+            get(super::viewer_media::viewer_media_manifest),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/init",
+            get(super::viewer_media::viewer_media_init),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/cover",
+            get(super::viewer_media::viewer_media_cover),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/segment/:index",
+            get(super::viewer_media::viewer_media_segment),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/track/:track/init",
+            get(super::viewer_media::viewer_media_track_init),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/track/:track/segment/:index",
+            get(super::viewer_media::viewer_media_track_segment),
+        )
+        .route(
+            "/api/viewers/ddrm-viewer/object/open",
+            axum::routing::post(super::object_authority::open_owned_object),
+        )
+        .route(
+            "/api/viewers/:viewer/object/:session",
+            get(super::viewer_object::viewer_object_manifest),
+        )
+        .route(
+            "/api/viewers/:viewer/object/:session/bytes",
+            get(super::viewer_object::viewer_object_bytes),
+        )
+        .route(
+            "/api/viewers/:viewer/object/:session/page",
+            get(super::viewer_object::viewer_object_page),
+        )
+        // Explicit session release (viewer pagehide beacon + Home shell window-close hook).
+        // One shared foundation dispatches by kind — see api/session_lifecycle.rs.
+        .route(
+            "/api/viewers/:viewer/object/:session/close",
+            axum::routing::post(super::viewer_object::viewer_object_close),
+        )
+        .route(
+            "/api/viewers/:viewer/media/:session/close",
+            axum::routing::post(super::viewer_media::viewer_media_close),
         )
         .route(
             "/apps/:app",
@@ -1210,6 +1402,8 @@ include!("gateway_models.rs");
 pub(in crate::api::gateway) fn load_existing_gateway_runtime_did(
     data_dir: &std::path::Path,
 ) -> Option<String> {
+    // Operator override first (0.5): an explicit trusted-signer DID via env wins, so a
+    // managed/remote runtime can pin WHO the trusted signer is without a local device key.
     if let Some(did) = std::env::var_os(HOME_LAUNCH_TRUSTED_SIGNER_DID_ENV)
         .and_then(|value| value.into_string().ok())
         .map(|value| value.trim().to_string())
@@ -1218,14 +1412,39 @@ pub(in crate::api::gateway) fn load_existing_gateway_runtime_did(
         return Some(did);
     }
 
+    // The gateway DID is deterministically derived from the on-disk device key
+    // (SHA-256 over a fixed label || device_key) and is therefore boot-stable.
+    // Per-request token verification calls this on every protected-asset fetch, so
+    // re-reading device.key + re-deriving the ed25519 identity each time is pure
+    // waste. Memoize the resolved DID instead.
+    //
+    // Containment: only the POSITIVE result is cached. A missing identity keeps
+    // being re-checked (so a device key provisioned after gateway start is still
+    // picked up), and the cached value can only ever be the real derived DID — it
+    // can never widen authority. The signature/expiry/session checks that actually
+    // authorize a request stay per-request in the callers; this only memoizes WHO
+    // the trusted signer is, not WHETHER a given token is valid.
+    static DID_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, String>>,
+    > = std::sync::OnceLock::new();
+    let cache = DID_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    if let Some(did) = cache.lock().ok().and_then(|m| m.get(data_dir).cloned()) {
+        return Some(did);
+    }
+
     let device_key = data_dir.join("identity").join("device.key");
     if !device_key.exists() {
         return None;
     }
-    elastos_identity::load_or_create_did(data_dir)
+    let did = elastos_identity::load_or_create_did(data_dir)
         .ok()
         .map(|(_signing_key, did)| did)
-        .filter(|did| !did.trim().is_empty())
+        .filter(|did| !did.trim().is_empty())?;
+    if let Ok(mut m) = cache.lock() {
+        m.insert(data_dir.to_path_buf(), did.clone());
+    }
+    Some(did)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1369,3 +1588,127 @@ mod gateway_browser_tests;
 #[cfg(test)]
 #[path = "gateway_tests/mod.rs"]
 mod gateway_tests;
+
+#[cfg(test)]
+mod aud2_audit_failclosed_tests {
+    use super::*;
+
+    #[test]
+    fn audit_log_fails_closed_when_signed_log_cannot_open() {
+        // AUD-2: when the signed file log cannot be opened, audit_log() must return Err
+        // (so the custody caller refuses to serve), NOT silently fall back to an unsigned,
+        // fail-open memory log. Force the failure by placing a FILE where the audit/ dir
+        // would go, so AuditLog::with_file cannot create+open data_dir/audit/...log.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audit"), b"not a directory").unwrap();
+        let state = GatewayState {
+            provider_registry: None,
+            identity_manager: Arc::new(std::sync::OnceLock::new()),
+            cache_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
+        };
+        assert!(
+            state.audit_log().is_err(),
+            "audit_log must fail closed when the signed file log cannot open, never fall back to a memory log"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_unification_tests {
+    use super::*;
+    use elastos_runtime::primitives::audit::AuditLog;
+
+    fn state_with_audit(
+        dir: &std::path::Path,
+        audit_log: Arc<std::sync::OnceLock<Arc<AuditLog>>>,
+    ) -> GatewayState {
+        GatewayState {
+            provider_registry: None,
+            identity_manager: Arc::new(std::sync::OnceLock::new()),
+            cache_dir: dir.to_path_buf(),
+            data_dir: dir.to_path_buf(),
+            audit_log,
+        }
+    }
+
+    #[test]
+    fn gateway_records_a_real_content_open_onto_the_shared_chain_and_it_verifies() {
+        // A REAL gateway custody event — the `content_open` record the owned-open path writes
+        // (viewer_open.rs) — must land on infra.audit_log AND verify under chain_attestation, not
+        // merely share an Arc. Read the attestation from the ORIGINAL infra handle to prove the
+        // event reached infra.audit_log itself.
+        let dir = tempfile::tempdir().unwrap();
+        let infra = Arc::new(AuditLog::with_file(dir.path().join("unified.log")).unwrap());
+
+        // SEED-BEFORE-USE: the cell is born seeded at construction, so no audit_log() call can run
+        // first and silently leave the gateway on its own file (a later OnceLock::set would no-op).
+        let cell = seed_gateway_audit_log(Some(infra.clone()));
+        assert!(
+            cell.get().is_some(),
+            "the durable shared log must be seeded eagerly at construction (before any audit_log() call)"
+        );
+        let state = state_with_audit(dir.path(), cell);
+
+        let got = state.audit_log().expect("durable shared log is available");
+        assert!(
+            Arc::ptr_eq(&got, &infra),
+            "gateway must ride the SAME shared custody chain, not a separate sink"
+        );
+
+        // The exact custody call the gateway's owned-open path makes for a denied open.
+        got.content_open(
+            "sess-1",
+            "did:ela:alice",
+            "bafyreigatewayprobe",
+            "open",
+            "denied",
+            "rights-provider",
+            None,
+        )
+        .expect("the gateway content_open record commits to the unified durable chain");
+
+        // Attest from the ORIGINAL infra handle (not `got`): the gateway's event is on
+        // infra.audit_log, and the live full-chain verify-on-read walk accepts it.
+        let att = infra
+            .chain_attestation()
+            .expect("a durable chain attests itself");
+        assert!(
+            att.verified,
+            "the gateway-recorded content_open must verify on the unified chain (got {att:?})"
+        );
+        assert!(
+            att.records >= 1,
+            "the gateway content_open must be present on infra.audit_log (records {})",
+            att.records
+        );
+    }
+
+    #[test]
+    fn gateway_never_downgrades_a_memory_only_shared_log() {
+        // The crux invariant: a memory-only shared log (log_path == None) must NOT be
+        // adopted — doing so would downgrade gateway custody from durable→volatile. The
+        // cell stays empty so the gateway lazily opens its OWN durable file sink.
+        let shared = Arc::new(AuditLog::new());
+        assert!(
+            shared.log_path().is_none(),
+            "precondition: AuditLog::new() is memory-only"
+        );
+        let cell = seed_gateway_audit_log(Some(shared));
+        assert!(
+            cell.get().is_none(),
+            "a memory-only shared log must never be adopted (no durable→memory downgrade)"
+        );
+    }
+
+    #[test]
+    fn gateway_with_no_shared_log_keeps_its_own_sink() {
+        // No shared log threaded ⇒ empty cell ⇒ the gateway opens its own file sink lazily.
+        let cell = seed_gateway_audit_log(None);
+        assert!(
+            cell.get().is_none(),
+            "no shared log ⇒ empty cell (own sink)"
+        );
+    }
+}

@@ -137,6 +137,26 @@ impl fmt::Display for Action {
     }
 }
 
+impl std::str::FromStr for Action {
+    type Err = ();
+
+    /// Parse the canonical lowercase action name (the inverse of [`Display`](fmt::Display)) — the
+    /// ONE place the dispatch gate and any conformance check turn an action STRING back into the
+    /// enum, so no hand-copied action list can drift from the variants (council S50 guardian F4).
+    /// Case-insensitive: callers historically lowercased first, so accept mixed case too.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "read" => Ok(Action::Read),
+            "write" => Ok(Action::Write),
+            "execute" => Ok(Action::Execute),
+            "message" => Ok(Action::Message),
+            "delete" => Ok(Action::Delete),
+            "admin" => Ok(Action::Admin),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Extensible constraints for capability tokens
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenConstraints {
@@ -151,6 +171,18 @@ pub struct TokenConstraints {
 
     /// Use-limited tokens (None = unlimited)
     pub(crate) max_uses: Option<u32>,
+
+    /// Affordance-consent binding (W2 step 6): the exact affordance method this
+    /// token authorises. `None` for ordinary session/capability tokens. Bound
+    /// into the signature (see [`CapabilityToken::signable_bytes`]) so it cannot
+    /// be altered after issue — a granted affordance token can never be replayed
+    /// for a different method.
+    pub(crate) method_id: Option<String>,
+
+    /// Canonical hash of the invocation arguments this token authorises (W2 step
+    /// 6). `None` for ordinary tokens. Also signature-bound, so the token cannot
+    /// be replayed with different arguments.
+    pub(crate) input_hash: Option<String>,
 }
 
 impl TokenConstraints {
@@ -166,6 +198,21 @@ impl TokenConstraints {
             delegatable,
             max_classification,
             max_uses,
+            method_id: None,
+            input_hash: None,
+        }
+    }
+
+    /// Constraints for a single-use, non-delegatable affordance-consent token
+    /// bound to an exact `(method_id, input_hash)` (W2 step 6). The binding is
+    /// carried in the signed token body, so the granted token can never be
+    /// replayed for a different method or with different arguments.
+    pub fn for_affordance(method_id: impl Into<String>, input_hash: impl Into<String>) -> Self {
+        Self {
+            max_uses: Some(1),
+            method_id: Some(method_id.into()),
+            input_hash: Some(input_hash.into()),
+            ..Default::default()
         }
     }
 
@@ -180,6 +227,16 @@ impl TokenConstraints {
     }
     pub fn max_uses(&self) -> Option<u32> {
         self.max_uses
+    }
+
+    /// The affordance method this token is bound to, if any (W2 step 6).
+    pub fn method_id(&self) -> Option<&str> {
+        self.method_id.as_deref()
+    }
+
+    /// The canonical argument hash this token is bound to, if any (W2 step 6).
+    pub fn input_hash(&self) -> Option<&str> {
+        self.input_hash.as_deref()
     }
 }
 
@@ -361,6 +418,26 @@ impl CapabilityToken {
             }
         }
 
+        // Affordance-consent binding (W2 step 6): variable-length, explicit
+        // discriminant + length-prefix, so the (method_id, input_hash) the user
+        // approved is sealed into the signature and cannot be swapped after issue.
+        match &self.constraints.method_id {
+            None => hasher.update([0u8]),
+            Some(v) => {
+                hasher.update([1u8]);
+                hasher.update((v.len() as u64).to_le_bytes());
+                hasher.update(v.as_bytes());
+            }
+        }
+        match &self.constraints.input_hash {
+            None => hasher.update([0u8]),
+            Some(v) => {
+                hasher.update([1u8]);
+                hasher.update((v.len() as u64).to_le_bytes());
+                hasher.update(v.as_bytes());
+            }
+        }
+
         // Temporal
         hasher.update(self.issued_at.unix_secs.to_le_bytes());
         hasher.update(self.issued_at.monotonic_seq.to_le_bytes());
@@ -419,6 +496,35 @@ mod tests {
     use super::*;
     use crate::primitives::time::SecureTimestamp;
 
+    /// `FromStr` is the exact inverse of `Display` for every variant (the one action parser), and
+    /// it is case-insensitive; an unknown action fails closed. This pins the round-trip so the
+    /// dispatch gate's accepted set can never drift from the enum (S50 guardian F4).
+    #[test]
+    fn action_from_str_is_the_inverse_of_display_and_fails_closed() {
+        use std::str::FromStr;
+        for a in [
+            Action::Read,
+            Action::Write,
+            Action::Execute,
+            Action::Message,
+            Action::Delete,
+            Action::Admin,
+        ] {
+            assert_eq!(Action::from_str(&a.to_string()), Ok(a), "round-trips: {a}");
+            assert_eq!(
+                Action::from_str(&a.to_string().to_uppercase()),
+                Ok(a),
+                "case-insensitive: {a}"
+            );
+        }
+        assert_eq!(
+            Action::from_str("negotiate"),
+            Err(()),
+            "unknown ⇒ fail-closed"
+        );
+        assert_eq!(Action::from_str(""), Err(()));
+    }
+
     fn create_test_token() -> CapabilityToken {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let verifying_key = signing_key.verifying_key();
@@ -466,6 +572,52 @@ mod tests {
         // Tamper with token
         token.capsule = "evil-capsule".to_string();
         assert!(!token.verify_signature(&verifying_key));
+    }
+
+    #[test]
+    fn for_affordance_is_single_use_nondelegatable_and_bound() {
+        let c = TokenConstraints::for_affordance("play", "deadbeef");
+        assert_eq!(c.max_uses(), Some(1), "affordance grant is single-use");
+        assert!(!c.delegatable(), "affordance grant is non-delegatable");
+        assert_eq!(c.method_id(), Some("play"));
+        assert_eq!(c.input_hash(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn affordance_binding_is_sealed_into_signature() {
+        // W2 step 6: the (method_id, input_hash) the user approved is bound into
+        // the SIGNED token body, so an approved affordance grant can never be
+        // replayed against a different method or with different arguments.
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let verifying_key = signing_key.verifying_key();
+
+        let mut token = CapabilityToken::new(
+            "vm-player".to_string(),
+            verifying_key.to_bytes(),
+            ResourceId::new("elastos://rights/play"),
+            Action::Execute,
+            TokenConstraints::for_affordance("play", "deadbeef"),
+            SecureTimestamp::now(),
+            None,
+        );
+        token.sign(&signing_key);
+        assert!(token.verify_signature(&verifying_key));
+
+        // Swapping the bound method breaks the signature.
+        let mut method_swapped = token.clone();
+        method_swapped.constraints.method_id = Some("delete".to_string());
+        assert!(
+            !method_swapped.verify_signature(&verifying_key),
+            "a method-swapped affordance token must fail verification"
+        );
+
+        // Swapping the bound argument hash breaks the signature.
+        let mut args_swapped = token.clone();
+        args_swapped.constraints.input_hash = Some("feedface".to_string());
+        assert!(
+            !args_swapped.verify_signature(&verifying_key),
+            "an argument-swapped affordance token must fail verification"
+        );
     }
 
     #[test]

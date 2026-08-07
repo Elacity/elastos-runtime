@@ -595,6 +595,60 @@ pub(super) async fn gateway_library_upload_cancel(
     .into_response()
 }
 
+/// GET /api/provider/object/cover?uri=<library uri> — an owned `.ddrm` asset's PUBLIC cover art.
+///
+/// The Library browser renders this as the asset's tile thumbnail (PC2 parity). It resolves the
+/// capsule's `thumbnail` (a key-free `ipfs://<cid>` pinned at mint) and proxies the image through
+/// the ipfs provider — the same canonical cover-fetch path the media player uses. It serves no
+/// plaintext content and no key material, is scoped to the caller's own objects, and fails closed
+/// (404) when the asset has no cover, so the browser falls back to the generic type icon.
+pub(super) async fn gateway_library_cover(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let mut uri = String::new();
+    for (key, value) in form_urlencoded::parse(raw_query.as_deref().unwrap_or_default().as_bytes())
+    {
+        if key == "uri" {
+            uri = value.trim().to_string();
+        }
+    }
+    if uri.is_empty() {
+        return (StatusCode::BAD_REQUEST, "cover uri is required").into_response();
+    }
+    let context = match require_home_launch_token_for_any_context(
+        &state.data_dir,
+        &headers,
+        &[LIBRARY_CAPSULE_ID],
+    ) {
+        Ok(context) => context,
+        Err(err) => return gateway_provider_error_response("object", err),
+    };
+    let Some(registry) = state.provider_registry.as_ref().cloned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "content provider unavailable",
+        )
+            .into_response();
+    };
+    // Resolve the PUBLIC cover reference from the owner's own capsule (no content, no keys).
+    let cover_uri = match crate::library::ddrm_cover_uri_for_object(
+        &state.data_dir,
+        &context.principal_id,
+        &uri,
+    ) {
+        Ok(Some(cover_uri)) => cover_uri,
+        Ok(None) | Err(_) => {
+            return (StatusCode::NOT_FOUND, "this asset has no cover art").into_response()
+        }
+    };
+    match crate::api::viewer_media::fetch_public_cover_bytes(&registry, &cover_uri).await {
+        Ok(bytes) => crate::api::viewer_media::cover_image_response(bytes),
+        Err((code, message)) => (code, message).into_response(),
+    }
+}
+
 pub(super) async fn gateway_library_download(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -1348,7 +1402,25 @@ pub(super) async fn gateway_provider_proxy(
             }
         },
         "inspect" => match op.as_str() {
-            "capsules" | "capsule" | "self" | "plan" | "request_act" => &[SYSTEM_CAPSULE_ID],
+            // Read-only Capsule Inspector. Full-view inspect is a System
+            // operator surface (System scope); the provider is read-only and
+            // gated. `plan` is the read-only invocation preview (no effect).
+            // Write ops (e.g. revoke) are intentionally not exposed through the
+            // browser proxy.
+            // `discover` resolves which capsule offers a goal across the WHOLE
+            // installed set (the cross-capsule capability map), so it is a System-
+            // operator surface, pinned here exactly like capsules/plan/intent and
+            // NEVER added to the `self` arm below.
+            // `request_act` opens a pending, plan-bound provider action for
+            // operator approval (0.5 approved-provider-dispatch). It is a System-
+            // operator surface exactly like capsules/plan/intent/discover.
+            "capsules" | "capsule" | "plan" | "intent" | "discover" | "request_act" => {
+                &[SYSTEM_CAPSULE_ID]
+            }
+            // Self-tier: an app/browser principal may inspect ONLY its own record.
+            // Gated to the browser/app principal set (NOT System); the provider's
+            // self branch forces target = the authenticated principal.
+            "self" => &[BROWSER_CAPSULE_ID],
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1398,7 +1470,11 @@ pub(super) async fn gateway_provider_proxy(
             .into_response();
     }
     request["op"] = serde_json::Value::String(op.clone());
-    if scheme == "documents" || scheme == "object" || scheme == "net" {
+    if scheme == "documents"
+        || scheme == "object"
+        || scheme == "net"
+        || (scheme == "inspect" && op == "self")
+    {
         request["principal_id"] = serde_json::Value::String(principal_id.clone());
     }
     if scheme == "object" && op == "shared_access" {
@@ -1429,6 +1505,10 @@ pub(super) async fn gateway_provider_proxy(
     if scheme == "net" && op == "http" {
         return gateway_browser::gateway_browser_net_http(registry.as_ref(), &request).await;
     }
+    // The older `net/stream` browser path was removed in 0.5 (Browser is WebRTC-only now; the
+    // screenshot/polling stream fallback is gone). The route is retained ONLY to return an explicit
+    // 410 Gone that points callers at the WebRTC open path, rather than falling through to a generic
+    // provider dispatch (which surfaced a misleading 503).
     if scheme == "net" && op == "stream" {
         return (
             StatusCode::GONE,
@@ -1587,6 +1667,8 @@ pub(super) async fn gateway_provider_proxy(
     Json(response).into_response()
 }
 
+/// The first `_runtime*`/carrier-routing metadata key on a provider request, if any (0.5). Used by
+/// the inspect-action + browser-response paths to detect runtime-routing metadata on a request.
 pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value) -> Option<&str> {
     request
         .as_object()?

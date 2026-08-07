@@ -5799,6 +5799,17 @@ mod tests {
     fn attachment_upload_finish_preserves_retry_state_when_final_state_save_fails() {
         use std::os::unix::fs::PermissionsExt;
 
+        // This test injects a write failure via a read-only (0o500) room dir. root
+        // bypasses DAC permission bits, so the write would succeed and the retry
+        // path could never be exercised — skip rather than assert a false negative.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipping attachment_upload_finish_preserves_retry_state_when_final_state_save_fails: \
+                 running as root bypasses the 0o500 write barrier this test relies on"
+            );
+            return;
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let request =
             request_browser_access(tmp.path(), browser_request("Alice", "iPhone", None)).unwrap();

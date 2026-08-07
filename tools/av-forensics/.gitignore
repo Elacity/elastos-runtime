@@ -1,0 +1,8 @@
+# Operator run artifacts (the DSP extractor writes these; never commit them).
+__pycache__/
+*.pyc
+*.mp4
+*.webm
+*.gray
+.venv/
+vmaf.json

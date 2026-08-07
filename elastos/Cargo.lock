@@ -1665,6 +1665,7 @@ dependencies = [
  "elastos-storage",
  "flate2",
  "hex",
+ "libc",
  "rand 0.8.6",
  "serde",
  "serde_json",

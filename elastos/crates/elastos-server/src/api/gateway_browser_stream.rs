@@ -1479,8 +1479,14 @@ fn browser_stream_socket_path(
     let socket_name = format!("{}.sock", hex::encode(&digest[..16]));
     // Unix socket paths have a small platform limit. Keep Browser stream sockets
     // in /tmp rather than platform temp roots like macOS /var/folders/.../T.
-    let stream_dir = browser_runtime_stream_root().join(directory);
-    std::fs::create_dir_all(&stream_dir)?;
+    // SECURITY: on unix that base is the SHARED, world-writable `/tmp`. A fixed directory
+    // name there could be pre-created and owned by any local user, who could then unlink our
+    // deterministically-named socket and re-bind their own to MITM or DoS the decrypted media
+    // stream. Scope the directory name to our euid, and (in `ensure_private_stream_dir`)
+    // create it 0700-owned-by-us and REFUSE any pre-existing directory we do not own or that
+    // is group/other-writable.
+    let stream_dir = browser_runtime_stream_root().join(stream_dir_name(directory));
+    ensure_private_stream_dir(&stream_dir)?;
     Ok(stream_dir.join(socket_name))
 }
 
@@ -1492,6 +1498,69 @@ fn browser_runtime_stream_root() -> PathBuf {
 #[cfg(not(unix))]
 fn browser_runtime_stream_root() -> PathBuf {
     std::env::temp_dir()
+}
+
+/// The base directory name for Browser stream sockets. On unix it is scoped to the euid so the
+/// (shared `/tmp`) base is not a fixed name any local user could pre-create and own.
+#[cfg(unix)]
+fn stream_dir_name(directory: &str) -> String {
+    let euid = unsafe { libc::geteuid() };
+    format!("{directory}-{euid}")
+}
+#[cfg(not(unix))]
+fn stream_dir_name(directory: &str) -> String {
+    directory.to_string()
+}
+
+/// Create — or validate the reuse of — a PRIVATE per-user directory for Browser stream sockets.
+/// Because the base is the world-writable `/tmp`, this is the gate that stops a local
+/// attacker from squatting the directory and hijacking the (deterministically-named) socket: the
+/// directory is created `0700` and, if it already exists, must be a real directory (not a planted
+/// symlink), owned by this process's euid, and NOT group/other-writable — otherwise we fail closed
+/// rather than bind a socket carrying decrypted media into a directory someone else controls.
+#[cfg(unix)]
+fn ensure_private_stream_dir(dir: &FsPath) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // symlink_metadata: do NOT follow a symlink an attacker may have planted in its place.
+            let meta = std::fs::symlink_metadata(dir)
+                .map_err(|e| anyhow::anyhow!("stat browser stream dir {}: {e}", dir.display()))?;
+            if !meta.file_type().is_dir() {
+                anyhow::bail!(
+                    "browser stream dir {} is not a directory (possible squatting) — refusing",
+                    dir.display()
+                );
+            }
+            let euid = unsafe { libc::geteuid() };
+            if meta.uid() != euid {
+                anyhow::bail!(
+                    "browser stream dir {} is owned by uid {}, not this process ({}) — refusing to reuse a foreign directory",
+                    dir.display(),
+                    meta.uid(),
+                    euid
+                );
+            }
+            if meta.mode() & 0o022 != 0 {
+                anyhow::bail!(
+                    "browser stream dir {} is group/other-writable (mode {:o}) — refusing an unsafe directory",
+                    dir.display(),
+                    meta.mode() & 0o777
+                );
+            }
+            Ok(())
+        }
+        Err(err) => Err(anyhow::anyhow!(
+            "create browser stream dir {}: {err}",
+            dir.display()
+        )),
+    }
+}
+#[cfg(not(unix))]
+fn ensure_private_stream_dir(dir: &FsPath) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("create browser stream dir {}: {e}", dir.display()))
 }
 
 pub(in crate::api::gateway) fn validate_browser_stream_receipt(
@@ -1705,9 +1774,12 @@ mod tests {
             .unwrap();
         let runtime_stream_path = PathBuf::from(runtime_stream_path);
 
-        assert!(path.starts_with("/tmp/elastos-browser-adapter-ipc/"));
+        // The socket dirs are euid-scoped (see `stream_dir_name`) to prevent /tmp squatting.
+        let adapter_prefix = format!("/tmp/{}/", stream_dir_name(BROWSER_ADAPTER_IPC_TMP_DIR));
+        assert!(path.starts_with(&adapter_prefix));
         assert!(path.ends_with(".sock"));
-        assert!(runtime_stream_path.starts_with("/tmp/elastos-browser-streams/"));
+        let stream_prefix = format!("/tmp/{}/", stream_dir_name(BROWSER_RUNTIME_STREAM_TMP_DIR));
+        assert!(runtime_stream_path.starts_with(&stream_prefix));
         assert_ne!(PathBuf::from(path), runtime_stream_path);
         #[cfg(unix)]
         assert_eq!(
@@ -2211,5 +2283,58 @@ mod tests {
         bridge_task.await.unwrap().unwrap();
         relay_task.await.unwrap();
         remote_node.endpoint.close().await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_dir_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn unique_tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "elastos-priv-dir-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// The happy path: the directory is created private (not group/other-accessible) and reusing
+    /// our own directory on a subsequent call is idempotent.
+    #[test]
+    fn ensure_private_stream_dir_creates_0700_and_reuses_our_own() {
+        let dir = unique_tmp("ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_stream_dir(&dir).expect("create private dir");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a freshly created stream dir must not be group/other-accessible, got {mode:o}"
+        );
+        // Reusing the same (still ours, still 0700) directory succeeds.
+        ensure_private_stream_dir(&dir).expect("reuse our own private dir");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (security): a pre-existing directory that is group/other-writable — the shape a
+    /// local attacker would create to squat the shared `/tmp` base and hijack the deterministically
+    /// named socket — must be REFUSED, not silently reused.
+    #[test]
+    fn ensure_private_stream_dir_refuses_a_world_writable_dir() {
+        let dir = unique_tmp("hostile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = ensure_private_stream_dir(&dir)
+            .expect_err("a world-writable stream dir must be refused");
+        assert!(
+            format!("{err:#}").contains("writable"),
+            "expected a group/other-writable refusal, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

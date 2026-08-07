@@ -58,6 +58,46 @@ pub fn is_runtime_system_service_resource(uri: &str) -> bool {
     })
 }
 
+/// True iff `uri` is a BARE scheme-level wildcard grant (e.g. `elastos://*`,
+/// `localhost://*`, or normalize-equivalents like `elastos://*/`). After the capability
+/// matcher's normalization (drop empty + "." path segments), the path portion is exactly
+/// "*", so a token granted this resource prefix-matches EVERY resource under the scheme,
+/// a blast radius no legitimate grant needs (real grants are scheme-scoped, e.g.
+/// `elastos://inspect/*`, `localhost://Users/...`). Used to refuse such grants at the
+/// mint chokepoints (AUD-5). A scheme-scoped wildcard (>=1 path segment) is false.
+pub fn is_overbroad_grant_resource(uri: &str) -> bool {
+    let Some(scheme_end) = uri.find("://") else {
+        return false;
+    };
+    let path: Vec<&str> = uri[scheme_end + 3..]
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect();
+    path == ["*"]
+}
+
+#[cfg(test)]
+mod overbroad_tests {
+    use super::is_overbroad_grant_resource;
+
+    #[test]
+    fn flags_bare_scheme_wildcards_only() {
+        // Bare scheme wildcards (match-everything) are refused ...
+        assert!(is_overbroad_grant_resource("elastos://*"));
+        assert!(is_overbroad_grant_resource("localhost://*"));
+        assert!(is_overbroad_grant_resource("elastos://*/")); // normalize-equivalent
+                                                              // ... while shipped scheme-scoped wildcards + concrete paths are allowed.
+        assert!(!is_overbroad_grant_resource("elastos://inspect/*"));
+        assert!(!is_overbroad_grant_resource("elastos://wallet/*"));
+        assert!(!is_overbroad_grant_resource("elastos://did/*"));
+        assert!(!is_overbroad_grant_resource("elastos://peer/*"));
+        assert!(!is_overbroad_grant_resource(
+            "localhost://Users/self/Documents/x"
+        ));
+        assert!(!is_overbroad_grant_resource("not-a-uri"));
+    }
+}
+
 pub fn parse_localhost_uri(uri: &str) -> Option<(&str, &str)> {
     let rest = uri.strip_prefix("localhost://")?;
     parse_localhost_path(rest)

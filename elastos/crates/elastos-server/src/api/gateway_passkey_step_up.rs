@@ -1438,6 +1438,7 @@ mod tests {
             identity_manager: Arc::new(OnceLock::new()),
             cache_dir: data_dir.path().join("cache"),
             data_dir: data_dir.path().to_path_buf(),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
         };
         StepUpFixture {
             data_dir,
@@ -1651,6 +1652,80 @@ mod tests {
         assert!(error
             .to_string()
             .contains("original passkey credential is unavailable"));
+    }
+
+    /// Both freshness branches of `PasskeyStepUpPayload::validate`, independently.
+    ///
+    /// FINDING behind this test: for the money verbs the two constants COINCIDE —
+    /// `MONEY_STEP_UP_MAX_AGE_SECS` is 180 and `PASSKEY_STEP_UP_TTL_SECS` is 180, and
+    /// `issue_step_up_token` sets `exp = iat + PASSKEY_STEP_UP_TTL_SECS`. So any token old enough
+    /// to trip the max-age check has ALREADY tripped `exp <= now`, and the gateway-level "stale
+    /// token" test (`test_market_buy_rejects_stale_passkey_step_up`, which back-dates by 181s)
+    /// only ever exercises the exp branch. The max-age parameter is not therefore decorative: it
+    /// is what stops a money verb from ever being MORE lenient than the ceremony TTL, and it does
+    /// fire on its own for any caller passing a window shorter than the TTL. Both are pinned here,
+    /// on the validator directly, because no reachable issuer can produce a token that separates
+    /// them at the route level.
+    #[test]
+    fn step_up_freshness_checks_expiry_and_age_independently() {
+        // Build from a REAL issued assertion and vary only `iat`/`exp`, so the payload cannot
+        // drift from the shape the issuer actually signs.
+        let fixture = fixture();
+        let issued = issue_passkey_step_up_token_for_test(
+            fixture.data_dir.path(),
+            &fixture.app_token,
+            INBOX_CAPSULE_ID,
+            "inspect.approve",
+            &serde_json::json!({ "request_id": "freshness-probe" }),
+        )
+        .unwrap();
+        let envelope: PasskeyStepUpEnvelope =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&issued).unwrap()).unwrap();
+
+        let now = 1_000_000u64;
+        let payload = |iat: u64| {
+            let mut payload = envelope.payload.clone();
+            payload.iat = iat;
+            payload.exp = iat.saturating_add(PASSKEY_STEP_UP_TTL_SECS);
+            payload
+        };
+
+        // Inside both windows.
+        payload(now - 10)
+            .validate(now, crate::api::viewer_open::MONEY_STEP_UP_MAX_AGE_SECS)
+            .expect("a recent assertion is fresh");
+
+        // AGE branch alone: still unexpired (exp is 170s away), but older than a 60s window.
+        let age_only = payload(now - 10)
+            .validate(now, 5)
+            .expect_err("an assertion older than the caller's window is refused");
+        assert!(
+            age_only.to_string().contains("too old"),
+            "expected the max-age branch, got: {age_only}"
+        );
+
+        // EXPIRY branch alone: generous age window, but the token itself has expired.
+        let expired = payload(now - PASSKEY_STEP_UP_TTL_SECS - 1)
+            .validate(now, u64::MAX)
+            .expect_err("an expired assertion is refused whatever the window");
+        assert!(
+            expired.to_string().contains("expired"),
+            "expected the exp branch, got: {expired}"
+        );
+
+        // A future-dated assertion is refused too — the other half of the `iat` check, which no
+        // clock skew beyond a minute may paper over.
+        let future = payload(now + 61)
+            .validate(now, u64::MAX)
+            .expect_err("a future-dated assertion is refused");
+        assert!(future.to_string().contains("too old"), "got: {future}");
+
+        // The money window may never be looser than the ceremony TTL, or `min()` would silently
+        // hand money verbs a longer grace than the ceremony that issued the assertion. A `const`
+        // block so the guarantee is enforced at compile time, not merely observed at run time.
+        const _: () = assert!(
+            crate::api::viewer_open::MONEY_STEP_UP_MAX_AGE_SECS <= PASSKEY_STEP_UP_TTL_SECS
+        );
     }
 
     #[test]

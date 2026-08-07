@@ -48,6 +48,28 @@ impl CarrierServiceBridge {
         }
     }
 
+    /// BUG-7 liveness, PENDING-SAFE. The carrier child is spawned LAZILY on the
+    /// first request, so a not-yet-spawned (`None`) child MUST read as ALIVE — if
+    /// reap ever treated a pending service as dead it would kill a live capsule
+    /// whose child simply hasn't fielded its first request (strictly worse than
+    /// the zombie leak this fixes). Only a spawned-then-exited child is `false`.
+    /// A poisoned lock or a `try_wait` error is fail-safe ALIVE (never reap on
+    /// uncertainty). `try_wait` reaps the kernel process-table entry, mirroring
+    /// the crosvm BUG-1 `child_has_exited` discipline.
+    fn is_alive(&self) -> bool {
+        match self.child.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                None => true, // lazily not yet spawned = pending = alive
+                Some(child) => match child.try_wait() {
+                    Ok(None) => true,     // still running
+                    Ok(Some(_)) => false, // exited — reapable
+                    Err(_) => true,       // indeterminate — fail-safe alive
+                },
+            },
+            Err(_) => true, // poisoned — fail-safe alive
+        }
+    }
+
     fn spawn(&self) -> Result<ChildIo, ProviderError> {
         let mut cmd = Command::new(&self.binary_path);
         cmd.stdin(Stdio::piped())
@@ -55,6 +77,13 @@ impl CarrierServiceBridge {
             .stderr(Stdio::inherit());
         for (k, v) in &self.env_vars {
             cmd.env(k, v);
+        }
+        // P16 (Sprint 46, council red-team F1): carrier capsules inherit the gateway env — strip
+        // the runtime-only secrets (rail bearer, broadcastable signed tx). AFTER the explicit
+        // env_vars loop, so even a misconfigured explicit pass of a secret is defeated. ONE shared
+        // list — see `elastos_runtime::provider::RUNTIME_ONLY_SECRETS`.
+        for secret in elastos_runtime::provider::RUNTIME_ONLY_SECRETS {
+            cmd.env_remove(secret);
         }
         let mut child = cmd.spawn().map_err(|e| {
             ProviderError::Provider(format!(
@@ -196,6 +225,43 @@ impl Drop for CarrierServiceBridge {
     }
 }
 
+/// A cheap, cloneable liveness probe for a carrier service's host child process,
+/// handed to the supervisor at registration so reap can tell a dead carrier from a
+/// live one (BUG-7). Pending-safe: a lazily-not-yet-spawned child reads as ALIVE.
+/// Holds an `Arc` to the same bridge the provider serves from, so it observes the
+/// real child without exposing the bridge type.
+#[derive(Clone)]
+pub struct CarrierLiveness {
+    bridge: Arc<CarrierServiceBridge>,
+}
+
+impl CarrierLiveness {
+    /// `true` while the carrier service is alive or pending (not yet spawned);
+    /// `false` only once its spawned child has exited.
+    pub fn is_alive(&self) -> bool {
+        self.bridge.is_alive()
+    }
+
+    /// Test-only: a probe whose host child has already spawned and exited, so
+    /// `is_alive()` reports dead. Used by the supervisor reap test to prove the
+    /// reap loop collects a dead carrier service (BUG-7). Reaps the child before
+    /// handing back the probe so the dead state is observed deterministically.
+    #[cfg(test)]
+    pub(crate) fn exited_for_test() -> Self {
+        let bridge = Arc::new(CarrierServiceBridge::new(
+            "true".into(),
+            vec![],
+            serde_json::json!({}),
+        ));
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let _ = child.wait(); // ensure exited before the probe observes it
+        *bridge.child.lock().unwrap() = Some(child);
+        CarrierLiveness { bridge }
+    }
+}
+
 /// Carrier-plane provider that runs a capsule binary directly on the host.
 pub struct CarrierServiceProvider {
     scheme: &'static str,
@@ -218,6 +284,15 @@ impl CarrierServiceProvider {
                 env_vars,
                 init_config,
             )),
+        }
+    }
+
+    /// A cloneable liveness probe over this provider's host child (BUG-7). The
+    /// supervisor stores it on the Carrier backend so reap can collect a dead
+    /// carrier service instead of treating it as unconditionally alive.
+    pub fn liveness(&self) -> CarrierLiveness {
+        CarrierLiveness {
+            bridge: Arc::clone(&self.bridge),
         }
     }
 
@@ -376,5 +451,60 @@ impl Provider for CarrierServiceProvider {
             .map_err(|e| {
                 ProviderError::Provider(format!("carrier service bridge task join failed: {e}"))
             })?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bridge() -> CarrierServiceBridge {
+        CarrierServiceBridge::new("true".into(), vec![], serde_json::json!({}))
+    }
+
+    // ── BUG-7: carrier liveness is pending-safe, so reap collects a dead carrier
+    //    child but never kills a live (or not-yet-spawned) one. ──
+
+    #[test]
+    fn is_alive_treats_a_not_yet_spawned_child_as_alive() {
+        // THE load-bearing fail-safe: the carrier child is spawned lazily on the
+        // first request, so `None` (never spawned) MUST be alive — otherwise reap
+        // would kill a live service that simply hasn't been used yet.
+        assert!(bridge().is_alive());
+    }
+
+    #[test]
+    fn is_alive_is_true_while_the_child_runs() {
+        let b = bridge();
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        *b.child.lock().unwrap() = Some(child);
+        assert!(b.is_alive(), "a running carrier child must read as alive");
+        // Drop kills the child.
+    }
+
+    #[test]
+    fn is_alive_is_false_once_the_child_has_exited() {
+        let b = bridge();
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        *b.child.lock().unwrap() = Some(child);
+        // try_wait can momentarily race the kernel delivering SIGCHLD; poll until
+        // the exited child is observed dead (and reaped), mirroring BUG-1's test.
+        let mut dead = false;
+        for _ in 0..50 {
+            if !b.is_alive() {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            dead,
+            "an exited carrier child must eventually read as not-alive (reapable)"
+        );
     }
 }

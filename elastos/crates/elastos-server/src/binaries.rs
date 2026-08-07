@@ -72,6 +72,26 @@ pub fn verify_component_binary_with_data_dir(
     name: &str,
     path: &Path,
 ) -> anyhow::Result<()> {
+    // Explicit dev override (mirrors verify_provider_binary): if the operator points
+    // ELASTOS_<NAME>_BIN at exactly this binary, trust it WITHOUT manifest verification.
+    // This is the local-sovereign escape hatch for platforms the installed manifest has
+    // no entry for (e.g. macOS arm64 → "unknown-arm64"), where verification would
+    // otherwise fail closed against a Linux-only release manifest.
+    let env_name = format!(
+        "ELASTOS_{}_BIN",
+        name.to_ascii_uppercase().replace('-', "_")
+    );
+    if let Some(override_path) = std::env::var_os(&env_name) {
+        if Path::new(&override_path) == path {
+            tracing::warn!(
+                "{name}: trusting operator-provided binary from {env_name} WITHOUT manifest \
+                 verification (explicit dev override) — {}",
+                path.display()
+            );
+            return Ok(());
+        }
+    }
+
     let checksum = setup::verify_installed_component_binary(data_dir, name, path)?;
     tracing::info!(
         "{} binary verified against installed manifest ({})",

@@ -10,6 +10,23 @@ use serde_json::Value;
 
 pub const WALLET_STATUS_RESOURCE: &str = "elastos://wallet/meta/status";
 
+/// Canonical operation sets for the dKMS/dDRM/marketplace rail providers.
+///
+/// These mirror each provider capsule's `authority.capabilities[].operations`
+/// and keep `build_capability_resource` in agreement with
+/// [`provider_operation_action`]: an op missing from one is missing from both,
+/// so the pair fails closed together.
+const ENCRYPT_OPS: &[&str] = &[
+    "status",
+    "seal",
+    "seal_inline_threshold",
+    "seal_segments_threshold",
+    "cenc_signal_inits",
+];
+const PUBLISH_OPS: &[&str] = &["status", "prepare_publish"];
+const MEDIA_OPS: &[&str] = &["status", "package", "package_dash"];
+const MARKET_OPS: &[&str] = &["status", "reconstruct_listing"];
+
 /// Build the capability resource string for a provider request.
 ///
 /// First-party `elastos://` sub-providers use `elastos://<scheme>/...`.
@@ -90,6 +107,11 @@ pub fn build_capability_resource(
         "rights" => rights_resource(op),
         "key" => key_resource(op),
         "decrypt" => decrypt_resource(op),
+        // dKMS/dDRM/marketplace rail providers.
+        "encrypt" => simple_elastos_resource("encrypt", op, ENCRYPT_OPS),
+        "publish" => simple_elastos_resource("publish", op, PUBLISH_OPS),
+        "media" => simple_elastos_resource("media", op, MEDIA_OPS),
+        "market" => simple_elastos_resource("market", op, MARKET_OPS),
         "wallet" => wallet_resource(op),
         "did" => did_resource(op),
         "ipfs" => ipfs_resource(op),
@@ -158,6 +180,29 @@ pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
             _ => None,
         },
         "drm" | "rights" | "key" | "decrypt" => read_only_provider_action(op),
+        // dKMS/dDRM/marketplace rail providers. `status` observes; sealing/packaging
+        // mutates provider-side state; listing reconstruction is pure observation.
+        // FAIL CLOSED: unlisted ops return `None` like every other scheme.
+        "encrypt" => match op {
+            "status" => Some(Action::Read),
+            "seal" | "seal_inline_threshold" | "seal_segments_threshold" | "cenc_signal_inits" => {
+                Some(Action::Write)
+            }
+            _ => None,
+        },
+        "publish" => match op {
+            "status" | "prepare_publish" => Some(Action::Read),
+            _ => None,
+        },
+        "media" => match op {
+            "status" => Some(Action::Read),
+            "package" | "package_dash" => Some(Action::Write),
+            _ => None,
+        },
+        "market" => match op {
+            "status" | "reconstruct_listing" => Some(Action::Read),
+            _ => None,
+        },
         "net" => match op {
             "status" | "resolve" => Some(Action::Read),
             "connect" | "stream" | "http" => Some(Action::Write),
@@ -286,8 +331,11 @@ fn ipfs_op_required_action(op: &str) -> Option<Action> {
 fn object_op_required_action(op: &str) -> Option<Action> {
     match op {
         "roots" | "list" | "stat" | "read" | "download" | "status" | "events" => Some(Action::Read),
+        // `acquire` completes the marketplace rail (publish -> index -> buy -> acquire)
+        // by materializing a purchased object into the caller's own object space, so it
+        // mutates principal-side state exactly like `publish`/`repair`/`share` do.
         "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
-        | "unpublish" | "repair" | "share" => Some(Action::Write),
+        | "unpublish" | "repair" | "acquire" | "share" => Some(Action::Write),
         "delete_permanently" | "empty_trash" => Some(Action::Delete),
         _ => None,
     }

@@ -155,12 +155,47 @@ fn home_launch_cookie_header(
     path: &str,
     secure: bool,
 ) -> anyhow::Result<HeaderValue> {
-    let mut value =
-        format!("{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite=Strict");
+    home_launch_cookie_header_same_site(name, token, max_age_secs, path, secure, "Strict")
+}
+
+fn home_launch_cookie_header_same_site(
+    name: &str,
+    token: &str,
+    max_age_secs: u64,
+    path: &str,
+    secure: bool,
+    same_site: &str,
+) -> anyhow::Result<HeaderValue> {
+    let mut value = format!(
+        "{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite={same_site}"
+    );
     if secure {
         value.push_str("; Secure");
     }
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
+}
+
+/// The Set-Cookie header for an APP-scoped launch-token cookie (Sprint 33, the money surface):
+/// `HttpOnly` (an XSS in the frame can still ride it same-origin but can never EXFILTRATE it),
+/// `SameSite=Strict` (never sent on any cross-site request), and `Path`-scoped to the one app's
+/// API prefix so it rides nothing else. This replaces the URL-borne `?home_token=…` delivery for
+/// surfaces that carry money verbs — a launch URL is copyable, logged, and shoulder-surfable; an
+/// HttpOnly cookie is none of those.
+#[allow(dead_code)]
+pub(crate) fn app_launch_cookie_header_for_token(
+    name: &str,
+    token: &str,
+    path: &str,
+    secure: bool,
+) -> anyhow::Result<HeaderValue> {
+    home_launch_cookie_header_same_site(
+        name,
+        token,
+        HOME_LAUNCH_TOKEN_TTL_SECS,
+        path,
+        secure,
+        "Strict",
+    )
 }
 
 pub(crate) fn local_home_launch_token_context(
@@ -393,6 +428,20 @@ pub(crate) fn require_home_token_context(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
+    require_home_token_launch(data_dir, headers).map(|required| required.context)
+}
+
+/// The same Home-hosted authority [`require_home_token_context`] proves, but returning the WHOLE
+/// verified launch (launch id + launch context), not just the principal context.
+///
+/// A money verb needs the full launch: `consume_passkey_step_up_token` binds the step-up assertion
+/// to the exact launch it was minted under (`original_launch_id` + `launch_context`), so a token
+/// obtained inside one Home launch cannot be replayed from another. The context alone cannot carry
+/// that binding.
+pub(in crate::api) fn require_home_token_launch(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<RequiredHomeLaunchToken> {
     require_home_launch_token_for_any_from_with_origin(
         data_dir,
         headers,
@@ -400,7 +449,6 @@ pub(crate) fn require_home_token_context(
         Some(HOME_SESSION_COOKIE),
         HomeLaunchOriginPolicy::Browser,
     )
-    .map(|required| required.context)
 }
 
 pub(crate) fn home_launch_token_header(headers: &HeaderMap) -> Option<String> {

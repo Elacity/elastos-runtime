@@ -242,7 +242,7 @@ pub async fn register_complete(
                 .await;
 
             if let Some(ref audit) = state.audit_log {
-                audit.emit(
+                audit.emit_best_effort(
                     elastos_runtime::primitives::audit::AuditEvent::IdentityRegistered {
                         timestamp: SecureTimestamp::now(),
                         user_id: user_id.clone(),
@@ -298,7 +298,7 @@ pub async fn authenticate_complete(
                 .await;
 
             if let Some(ref audit) = state.audit_log {
-                audit.emit(
+                audit.emit_best_effort(
                     elastos_runtime::primitives::audit::AuditEvent::AuthAttempt {
                         timestamp: SecureTimestamp::now(),
                         identity: user_id.clone(),
@@ -312,7 +312,7 @@ pub async fn authenticate_complete(
         }
         Err(e) => {
             if let Some(ref audit) = state.audit_log {
-                audit.emit(
+                audit.emit_best_effort(
                     elastos_runtime::primitives::audit::AuditEvent::AuthAttempt {
                         timestamp: SecureTimestamp::now(),
                         identity: "unknown".to_string(),

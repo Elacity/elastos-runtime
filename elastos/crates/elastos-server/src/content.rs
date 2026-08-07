@@ -1804,22 +1804,14 @@ impl ContentExternalRepairFleetEndpoint {
 }
 
 fn validate_operator_alert_sink_url(raw: &str) -> Result<(), String> {
-    let url = url::Url::parse(raw).map_err(|err| format!("invalid operator alert URL: {err}"))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("operator alert URL must not contain inline credentials".to_string());
-    }
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) => Ok(()),
-        _ => Err("operator alert URL must use https or local loopback http".to_string()),
-    }
+    crate::net_validation::validate_outbound_endpoint_url(raw, "operator alert")
 }
 
 fn validate_operator_alert_header_value(value: &str) -> Result<(), String> {
-    if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
-        return Err("operator alert authorization header contains invalid newline".to_string());
-    }
-    Ok(())
+    crate::net_validation::validate_outbound_header_value(
+        value,
+        "operator alert authorization header",
+    )
 }
 
 fn federated_operator_alert_exchange_request(alert: &Value, emitted_at: u64) -> Value {
@@ -2526,6 +2518,19 @@ pub async fn fetch_bytes_via_provider(
     cid: &str,
     path: Option<&str>,
 ) -> anyhow::Result<Vec<u8>> {
+    fetch_bytes_via_provider_bounded(registry, cid, path, None).await
+}
+
+/// Like [`fetch_bytes_via_provider`] but with a per-request fetch bound (ms) forwarded to the
+/// backend. The ipfs-provider is SERIAL: an unbounded cat for a CID nobody provides holds its
+/// pipe for ~10 minutes and starves every other caller — small/interactive fetches (marketplace
+/// metadata.json, cover art) must pass a tight bound and fail fast instead.
+pub async fn fetch_bytes_via_provider_bounded(
+    registry: &ProviderRegistry,
+    cid: &str,
+    path: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> anyhow::Result<Vec<u8>> {
     let mut request = json!({
         "op": "fetch",
         "cid": cid,
@@ -2537,6 +2542,9 @@ pub async fn fetch_bytes_via_provider(
     });
     if let Some(path) = path.filter(|path| !path.is_empty()) {
         request["path"] = Value::String(path.to_string());
+    }
+    if let Some(ms) = timeout_ms {
+        request["timeout_ms"] = json!(ms);
     }
 
     let mut session = registry
@@ -2732,15 +2740,18 @@ impl ContentProvider {
     }
 
     async fn fetch(&self, request: &Value) -> Result<Value, ProviderError> {
+        // Pre-effect request-shape validation (before any registry/IPFS fetch): a
+        // missing/invalid cid or path is a deterministic no-op (a replay rejects
+        // identically), so DidNotAct lets the carrier refund the unused single-use
+        // (BUG-4). The actual fetch below may fail mid-stream and stays Provider/Io.
         let cid = request
             .get("cid")
             .and_then(|cid| cid.as_str())
             .filter(|cid| !cid.trim().is_empty())
-            .ok_or_else(|| ProviderError::Provider("content fetch requires cid".into()))?;
+            .ok_or_else(|| ProviderError::DidNotAct("content fetch requires a cid".into()))?;
         if !is_valid_cid(cid) {
-            return Ok(provider_error(
-                "invalid_cid",
-                "content fetch requires a valid CID",
+            return Err(ProviderError::DidNotAct(
+                "content fetch requires a valid CID".into(),
             ));
         }
 
@@ -2749,13 +2760,17 @@ impl ContentProvider {
             .and_then(|path| path.as_str())
             .unwrap_or("");
         if let Err(message) = validate_content_path(path) {
-            return Ok(provider_error("invalid_path", &message));
+            return Err(ProviderError::DidNotAct(format!("invalid path: {message}")));
         }
 
         let registry = self.registry()?;
         let transfer = ContentFetchTransfer::from_request(request)?;
+        // Optional per-request fetch bound, forwarded to the SERIAL ipfs backend so an
+        // interactive caller (marketplace metadata, cover art) fails fast on an unresolvable
+        // CID instead of holding the backend pipe for minutes and starving other fetches.
+        let timeout_ms = request.get("timeout_ms").and_then(Value::as_u64);
         let result = match self
-            .fetch_from_local_backend(&registry, cid, path, &transfer)
+            .fetch_from_local_backend(&registry, cid, path, timeout_ms, &transfer)
             .await
         {
             Ok(result) => result,
@@ -2822,6 +2837,7 @@ impl ContentProvider {
         registry: &ProviderRegistry,
         cid: &str,
         path: &str,
+        timeout_ms: Option<u64>,
         transfer: &ContentFetchTransfer,
     ) -> Result<ContentFetchResult, ProviderError> {
         let mut ipfs_request = json!({
@@ -2830,6 +2846,9 @@ impl ContentProvider {
         });
         if !path.is_empty() {
             ipfs_request["path"] = Value::String(path.to_string());
+        }
+        if let Some(ms) = timeout_ms {
+            ipfs_request["timeout_ms"] = json!(ms);
         }
 
         let ipfs_response = self
@@ -2902,7 +2921,10 @@ impl ContentProvider {
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
                 if !files.is_array() {
-                    return Ok(provider_error("invalid_request", "files must be an array"));
+                    // Pre-effect request-shape rejection (before the IPFS add).
+                    return Err(ProviderError::DidNotAct(
+                        "content publish: files must be an array".into(),
+                    ));
                 }
                 let files = with_directory_object_manifest(
                     files,
@@ -2923,12 +2945,14 @@ impl ContentProvider {
                 })
             }
             Some("file") => {
+                // Pre-effect request-shape rejection (before the IPFS add): missing
+                // data rejects identically on replay → DidNotAct (refundable).
                 let data = request
                     .get("data")
                     .and_then(|data| data.as_str())
                     .filter(|data| !data.trim().is_empty())
                     .ok_or_else(|| {
-                        ProviderError::Provider("content file publish requires data".into())
+                        ProviderError::DidNotAct("content file publish requires data".into())
                     })?;
                 let filename = request
                     .get("filename")
@@ -2943,9 +2967,10 @@ impl ContentProvider {
                 })
             }
             Some(_) | None => {
-                return Ok(provider_error(
-                    "unsupported_content_kind",
-                    "content publish supports kind=directory or kind=file",
+                // Pre-effect request-shape rejection: an unsupported/missing kind
+                // rejects identically on replay → DidNotAct (refundable).
+                return Err(ProviderError::DidNotAct(
+                    "content publish supports kind=directory or kind=file".into(),
                 ));
             }
         };
@@ -3218,15 +3243,20 @@ impl ContentProvider {
 
     async fn import_exact(&self, request: &Value) -> Result<Value, ProviderError> {
         validate_import_exact_invocation(request)?;
+        // Pre-effect request-shape validation (before payload extraction + the IPFS
+        // add): a missing/invalid cid rejects identically on replay, so DidNotAct
+        // refunds the unused single-use. The `storage_quota_exceeded` check below
+        // stays a structured error — capacity is transient (a replay could act).
         let cid = request
             .get("cid")
             .and_then(|cid| cid.as_str())
             .filter(|cid| !cid.trim().is_empty())
-            .ok_or_else(|| ProviderError::Provider("content import_exact requires cid".into()))?;
+            .ok_or_else(|| {
+                ProviderError::DidNotAct("content import_exact requires a cid".into())
+            })?;
         if !is_valid_cid(cid) {
-            return Ok(provider_error(
-                "invalid_cid",
-                "content import_exact requires a valid CID",
+            return Err(ProviderError::DidNotAct(
+                "content import_exact requires a valid CID".into(),
             ));
         }
         let bytes = import_exact_payload_bytes(request)?;
@@ -8069,21 +8099,7 @@ fn is_valid_cid(value: &str) -> bool {
 }
 
 fn validate_content_path(path: &str) -> Result<(), String> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    if path.starts_with('/') || path.starts_with('\\') {
-        return Err("content fetch path must be relative".to_string());
-    }
-    if path.contains('\\') || path.contains('\0') {
-        return Err("content fetch path contains invalid characters".to_string());
-    }
-    for segment in path.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err("content fetch path contains an invalid segment".to_string());
-        }
-    }
-    Ok(())
+    crate::net_validation::validate_content_path(path)
 }
 
 fn with_directory_object_manifest(
@@ -9227,6 +9243,56 @@ mod tests {
         assert!(err
             .to_string()
             .contains("requires Runtime provider invocation metadata"));
+    }
+
+    /// BUG-4: ContentProvider request-shape rejections on the WRITE ops
+    /// (import_exact invalid cid, publish file missing data) are pre-effect — they
+    /// reject before the IPFS add — so they return DidNotAct (refundable). Quota /
+    /// capacity rejections deliberately stay structured errors (transient).
+    #[tokio::test]
+    async fn content_write_request_shape_rejections_return_did_not_act() {
+        let (_data_dir, _registry, _ipfs, content) = registry_with_content_and_ipfs().await;
+
+        // Valid invocation metadata but an invalid cid → pre-effect, refundable.
+        let invalid_cid = content
+            .send_raw(&json!({
+                "op": "import_exact",
+                "cid": "not-a-cid",
+                "stream": test_stream_payload(b"x"),
+                "_runtime_invocation": carrier_import_exact_invocation(),
+            }))
+            .await;
+        assert!(
+            matches!(invalid_cid, Err(ProviderError::DidNotAct(_))),
+            "import_exact invalid cid → DidNotAct; got {invalid_cid:?}"
+        );
+
+        // publish a file with no data → pre-effect, refundable.
+        let publish_no_data = content
+            .send_raw(&json!({ "op": "publish", "kind": "file" }))
+            .await;
+        assert!(
+            matches!(publish_no_data, Err(ProviderError::DidNotAct(_))),
+            "publish file missing data → DidNotAct; got {publish_no_data:?}"
+        );
+
+        // publish with an unsupported kind → pre-effect, refundable.
+        let bad_kind = content
+            .send_raw(&json!({ "op": "publish", "kind": "bogus" }))
+            .await;
+        assert!(
+            matches!(bad_kind, Err(ProviderError::DidNotAct(_))),
+            "publish unsupported kind → DidNotAct; got {bad_kind:?}"
+        );
+
+        // publish a directory with a non-array `files` → pre-effect, refundable.
+        let bad_files = content
+            .send_raw(&json!({ "op": "publish", "kind": "directory", "files": "not-an-array" }))
+            .await;
+        assert!(
+            matches!(bad_files, Err(ProviderError::DidNotAct(_))),
+            "publish directory non-array files → DidNotAct; got {bad_files:?}"
+        );
     }
 
     #[tokio::test]
@@ -11253,27 +11319,32 @@ mod tests {
 
     #[tokio::test]
     async fn content_fetch_rejects_invalid_cid_and_path() {
+        // BUG-4: `fetch`'s request-shape rejections are pre-effect, deterministic
+        // no-ops (a replay rejects identically), so they return DidNotAct — the
+        // carrier refunds the unused single-use rather than burning the grant.
         let (_data_dir, _registry, _ipfs, content) = registry_with_content_and_ipfs().await;
+
+        let missing_cid = content.send_raw(&json!({ "op": "fetch" })).await;
+        assert!(
+            matches!(missing_cid, Err(ProviderError::DidNotAct(_))),
+            "missing cid → DidNotAct; got {missing_cid:?}"
+        );
+
         let invalid_cid = content
-            .send_raw(&json!({
-                "op": "fetch",
-                "cid": "not-a-cid",
-            }))
-            .await
-            .unwrap();
-        assert_eq!(invalid_cid["status"], "error");
-        assert_eq!(invalid_cid["code"], "invalid_cid");
+            .send_raw(&json!({ "op": "fetch", "cid": "not-a-cid" }))
+            .await;
+        assert!(
+            matches!(invalid_cid, Err(ProviderError::DidNotAct(_))),
+            "invalid cid → DidNotAct; got {invalid_cid:?}"
+        );
 
         let invalid_path = content
-            .send_raw(&json!({
-                "op": "fetch",
-                "cid": TEST_CID,
-                "path": "../secret",
-            }))
-            .await
-            .unwrap();
-        assert_eq!(invalid_path["status"], "error");
-        assert_eq!(invalid_path["code"], "invalid_path");
+            .send_raw(&json!({ "op": "fetch", "cid": TEST_CID, "path": "../secret" }))
+            .await;
+        assert!(
+            matches!(invalid_path, Err(ProviderError::DidNotAct(_))),
+            "invalid path → DidNotAct; got {invalid_path:?}"
+        );
     }
 
     #[tokio::test]

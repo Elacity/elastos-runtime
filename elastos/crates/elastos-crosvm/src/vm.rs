@@ -32,6 +32,12 @@ pub struct RunningVm {
 
     /// Path to crosvm binary (for `crosvm stop`)
     crosvm_bin: Option<PathBuf>,
+
+    /// W1b per-TAP egress firewall. Installed at [`Self::start`] together with
+    /// the TAP and torn down on every exit path next to the TAP teardown, so a
+    /// `guest_network` device is never up without its leash and never leaks a
+    /// stale chain onto a recycled TAP.
+    egress_firewall: Option<crate::EgressFirewall>,
 }
 
 impl RunningVm {
@@ -45,6 +51,22 @@ impl RunningVm {
             process: None,
             pid: None,
             crosvm_bin: None,
+            egress_firewall: None,
+        }
+    }
+
+    /// Bind the per-TAP egress firewall to this VM before [`Self::start`]. Keyed
+    /// on the real TAP device name (W1b/F1); installed and torn down with the TAP.
+    pub fn set_egress_firewall(&mut self, firewall: Option<crate::EgressFirewall>) {
+        self.egress_firewall = firewall;
+    }
+
+    /// Tear down the per-TAP egress firewall (best-effort, idempotent). Called
+    /// next to every TAP teardown so the leash never outlives the TAP nor leaks
+    /// a stale chain onto a recycled device.
+    fn teardown_egress_firewall(&self) {
+        if let Some(ref firewall) = self.egress_firewall {
+            firewall.teardown();
         }
     }
 
@@ -98,6 +120,26 @@ impl RunningVm {
             })?;
         }
 
+        // W1b: leash the TAP fail-closed. The TAP now exists; install the per-TAP
+        // egress firewall BEFORE booting the guest. If the leash cannot be
+        // installed, tear the TAP back down and fail the launch — never boot a
+        // guest_network device without its containment.
+        if let Some(ref firewall) = self.egress_firewall {
+            firewall.apply().map_err(|e| {
+                if let Some(ref network) = self.config.network {
+                    let _ = network.teardown();
+                }
+                ElastosError::Compute(format!(
+                    "egress firewall install failed for '{}': {}",
+                    self.manifest.name, e
+                ))
+            })?;
+            tracing::info!(
+                "Egress firewall installed for VM '{}' (default-deny, host-API-only)",
+                self.manifest.name
+            );
+        }
+
         // Ensure socket directory exists and is writable.
         // setcap binaries run with AT_SECURE which may restrict /tmp access.
         if let Some(parent) = self.socket_path.parent() {
@@ -141,6 +183,7 @@ impl RunningVm {
             if let Some(ref network) = self.config.network {
                 let _ = network.teardown();
             }
+            self.teardown_egress_firewall();
             ElastosError::Compute(format!("Failed to start crosvm: {}", e))
         })?;
 
@@ -249,6 +292,7 @@ impl RunningVm {
         if let Some(ref network) = self.config.network {
             let _ = network.teardown();
         }
+        self.teardown_egress_firewall();
 
         Ok(())
     }
@@ -275,6 +319,7 @@ impl RunningVm {
         if let Some(ref network) = self.config.network {
             let _ = network.teardown();
         }
+        self.teardown_egress_firewall();
 
         Ok(())
     }
@@ -300,6 +345,35 @@ impl RunningVm {
         }
     }
 
+    /// Poll whether the VM process has exited, **reaping** it if so (BUG-1).
+    ///
+    /// Unlike [`is_running`], this consults the owned child handle via
+    /// `try_wait()`, which calls `waitpid` and clears the kernel process-table
+    /// entry. A self-exited crosvm child would otherwise linger as a zombie:
+    /// `kill(pid, 0)` (what `is_running` uses) still succeeds for a zombie, so a
+    /// liveness-only reaper would never collect it. Returns `true` once the
+    /// child has terminated. Requires `&mut self` because reaping mutates the
+    /// child handle; call it from the reap path (which holds the write lock),
+    /// not from read-only status queries.
+    pub fn has_exited(&mut self) -> bool {
+        match self.process.as_mut() {
+            Some(child) => {
+                if child_has_exited(child) {
+                    self.pid = None;
+                    self.status = CapsuleStatus::Stopped;
+                    true
+                } else {
+                    false
+                }
+            }
+            // No owned child handle: fall back to PID liveness. A missing pid
+            // means nothing is running (already stopped/never started).
+            None => self
+                .pid
+                .is_none_or(|pid| signal::kill(Pid::from_raw(pid as i32), None).is_err()),
+        }
+    }
+
     /// Get the VM's HTTP port (if configured)
     pub fn http_port(&self) -> Option<u16> {
         self.config.http_port
@@ -321,5 +395,66 @@ impl Drop for RunningVm {
         if let Some(ref network) = self.config.network {
             let _ = network.teardown();
         }
+        self.teardown_egress_firewall();
+    }
+}
+
+/// Returns `true` if `child` has terminated, reaping it in the process.
+///
+/// Factored out of [`RunningVm::has_exited`] so the reaping decision can be
+/// exercised without constructing a full VM (no KVM required). On a `try_wait`
+/// error we treat the process as exited: a process we can no longer query is
+/// safer to drop from the running set (it will be re-detected if wrong) than to
+/// pin forever as a phantom-alive zombie — the exact failure BUG-1 describes.
+fn child_has_exited(child: &mut Child) -> bool {
+    match child.try_wait() {
+        Ok(Some(_status)) => true, // exited and reaped
+        Ok(None) => false,         // still running
+        Err(_) => true,            // unqueryable; fail toward reaping
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child_has_exited;
+
+    /// A finished child is reported as exited (and reaped), not phantom-alive.
+    #[tokio::test]
+    async fn child_has_exited_reaps_a_finished_process() {
+        let mut child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn /bin/true");
+
+        // try_wait can momentarily race the kernel delivering SIGCHLD; poll a
+        // bounded number of times so the test is deterministic, not flaky.
+        let mut exited = false;
+        for _ in 0..200 {
+            if child_has_exited(&mut child) {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            exited,
+            "a process that ran `true` must be detected as exited"
+        );
+    }
+
+    /// A still-running child is NOT reported as exited (no false reap).
+    #[tokio::test]
+    async fn child_has_exited_is_false_while_running() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 30");
+
+        assert!(
+            !child_has_exited(&mut child),
+            "a long-running child must not be reported as exited"
+        );
+
+        // Clean up the test child.
+        let _ = child.kill().await;
     }
 }

@@ -7,9 +7,9 @@ pub mod audit;
 pub mod metrics;
 pub mod time;
 
-#[allow(unused_imports)]
-pub use audit::{AuditEvent, AuditLog};
-#[allow(unused_imports)]
+pub use audit::{
+    verify_mandate_receipt, AuditEvent, AuditLog, ChainAttestation, MandateReceipt,
+    MandateReceiptScope, MandateReceiptVerdict,
+};
 pub use metrics::CapsuleMetrics;
-#[allow(unused_imports)]
 pub use time::SecureTimestamp;

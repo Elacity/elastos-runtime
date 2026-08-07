@@ -265,18 +265,41 @@ impl ComputeProvider for ComponentProvider {
     }
 }
 
+/// Classify a Runtime bridge error code for the guest.
+///
+/// The Runtime mediates every component effect, so this mapping is the guest-visible half of
+/// the authorization contract: an authority REFUSAL must arrive as `Denied`, never as
+/// `Internal`. The distinction is load-bearing — `Internal` reads as a transient fault, so a
+/// guest (or an SDK retry wrapper) that sees it will re-drive a request the Runtime has already
+/// refused, turning one fail-closed decision into a hot loop against the capability plane and
+/// burying the security decision in noise.
+///
+/// The refusal codes come from `elastos-server/src/carrier_bridge.rs` — including
+/// `manifest_capability_denied`, the manifest-capability ceiling that bounds a component to the
+/// authority its manifest declares. This crate cannot see those constants, so the list here is
+/// the contract; `every_authority_refusal_code_classifies_as_denied` pins it.
 fn bus_error(code: &str, message: impl Into<String>) -> elastos::bus::types::BusError {
     let message = message.into();
     match code {
-        "denied" | "capability_denied" | "missing_token" | "invalid_token" => {
-            elastos::bus::types::BusError::Denied(message)
-        }
-        "not_found" => elastos::bus::types::BusError::NotFound(message),
+        // Authority refusals: the Runtime decided this effect may not happen.
+        "denied"
+        | "capability_denied"
+        | "missing_token"
+        | "invalid_token"
+        | "expired"
+        | "manifest_capability_denied"
+        | "system_backend_denied"
+        | "generic_wallet_denied"
+        | "infrastructure_capsule"
+        | "not_capsule_kernel_abi" => elastos::bus::types::BusError::Denied(message),
+        "not_found" | "provider_not_found" => elastos::bus::types::BusError::NotFound(message),
         "timeout" => elastos::bus::types::BusError::Timeout(message),
         "unavailable" => elastos::bus::types::BusError::Unavailable(message),
-        "invalid" | "invalid_action" | "invalid_carrier_invoke" => {
-            elastos::bus::types::BusError::Invalid(message)
-        }
+        "invalid"
+        | "invalid_action"
+        | "invalid_carrier_invoke"
+        | "unsupported_resource"
+        | "principal_context_required" => elastos::bus::types::BusError::Invalid(message),
         _ => elastos::bus::types::BusError::Internal(message),
     }
 }
@@ -527,6 +550,155 @@ mod tests {
         )
         .unwrap();
         assert_eq!(json_line(&line), json_line(&expected));
+    }
+
+    /// The manifest-capability ceiling is enforced by the Runtime bridge behind the hostcall
+    /// (`carrier_bridge::manifest_denied_response`, keyed on the per-launch bounds Runtime
+    /// registers for this capsule id). What the component runner owns is the other half of
+    /// that contract: the denial must reach the guest AS a denial, and never as a success.
+    ///
+    /// Fixture is the verbatim envelope the bridge emits for a resource outside the
+    /// manifest's declared authority.
+    fn manifest_denied_hostcall(captured: Arc<Mutex<Vec<String>>>) -> BridgeHostcall {
+        Arc::new(move |line, _capsule, _principal| {
+            captured.lock().unwrap().push(line.to_string());
+            Ok(serde_json::json!({
+                "id": 1,
+                "response": {
+                    "type": "error",
+                    "code": "manifest_capability_denied",
+                    "message": "capsule manifest does not declare authority for \
+                                elastos://key/escrow",
+                }
+            })
+            .to_string())
+        })
+    }
+
+    #[test]
+    fn component_invoke_of_undeclared_capability_is_denied_fail_closed() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ComponentState {
+            hostcall: Some(manifest_denied_hostcall(captured.clone())),
+            capsule_id: "component-1".into(),
+            principal_id: Some("person:local:test".into()),
+            limits: ComponentProvider::store_limits(),
+        };
+
+        // The manifest of this capsule declares only `elastos://did/*`; it reaches for the
+        // key-escrow plane.
+        let err = elastos::bus::providers::Host::invoke(
+            &mut state,
+            elastos::bus::types::InvokeRequest {
+                resource: "elastos://key/escrow".into(),
+                operation: "release".into(),
+                body: b"{}".to_vec(),
+                grant: Some("grant-token".into()),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, elastos::bus::types::BusError::Denied(_)),
+            "an undeclared capability must surface as a DENIAL, not an internal fault \
+             (a guest that sees Internal treats an authority decision as a transient \
+             failure and retries it): {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("does not declare authority"),
+            "the denial reason must survive the crossing: {err:?}"
+        );
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "the runner must not retry or fan out a denied invoke"
+        );
+    }
+
+    #[test]
+    fn component_capability_request_for_undeclared_resource_is_denied_fail_closed() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ComponentState {
+            hostcall: Some(manifest_denied_hostcall(captured.clone())),
+            capsule_id: "component-1".into(),
+            principal_id: Some("person:local:test".into()),
+            limits: ComponentProvider::store_limits(),
+        };
+
+        let err = elastos::bus::capabilities::Host::request(
+            &mut state,
+            elastos::bus::types::CapabilityRequest {
+                resource: "elastos://key/escrow".into(),
+                actions: vec!["execute".into()],
+                reason: "escalate".into(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, elastos::bus::types::BusError::Denied(_)),
+            "asking for a capability outside the manifest ceiling must be denied, and no \
+             grant may be synthesized: {err:?}"
+        );
+    }
+
+    /// Every code the Runtime bridge emits for an AUTHORITY refusal must classify as
+    /// `Denied`. Keep in sync with `elastos-server/src/carrier_bridge.rs` — this crate
+    /// cannot see those constants, so the list is the contract.
+    #[test]
+    fn every_authority_refusal_code_classifies_as_denied() {
+        for code in [
+            "denied",
+            "capability_denied",
+            "missing_token",
+            "invalid_token",
+            "expired",
+            "manifest_capability_denied",
+            "system_backend_denied",
+            "generic_wallet_denied",
+            "infrastructure_capsule",
+            "not_capsule_kernel_abi",
+        ] {
+            assert!(
+                matches!(
+                    bus_error(code, "refused"),
+                    elastos::bus::types::BusError::Denied(_)
+                ),
+                "'{code}' is an authority refusal and must reach the guest as Denied"
+            );
+        }
+        // A genuine runtime fault stays Internal — the classification must discriminate.
+        assert!(matches!(
+            bus_error("provider_error", "boom"),
+            elastos::bus::types::BusError::Internal(_)
+        ));
+        assert!(matches!(
+            bus_error("provider_not_found", "no route"),
+            elastos::bus::types::BusError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn component_without_a_configured_bridge_is_unavailable_not_permitted() {
+        // No hostcall wired ⇒ no Runtime mediation ⇒ nothing may proceed.
+        let mut state = ComponentState {
+            hostcall: None,
+            capsule_id: "component-1".into(),
+            principal_id: None,
+            limits: ComponentProvider::store_limits(),
+        };
+
+        let err = elastos::bus::providers::Host::invoke(
+            &mut state,
+            elastos::bus::types::InvokeRequest {
+                resource: "elastos://key/escrow".into(),
+                operation: "release".into(),
+                body: b"{}".to_vec(),
+                grant: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, elastos::bus::types::BusError::Unavailable(_)));
     }
 
     #[test]

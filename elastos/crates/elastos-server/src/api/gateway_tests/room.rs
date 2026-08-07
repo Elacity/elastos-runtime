@@ -189,6 +189,7 @@ async fn test_gateway_carrier_bootstrap_route_returns_live_ticket() {
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     });
 
     let response = app
@@ -232,6 +233,7 @@ async fn test_gateway_carrier_bootstrap_prefers_managed_runtime_ticket() {
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     });
 
     let response = app
@@ -268,6 +270,7 @@ async fn test_gateway_carrier_bootstrap_publisher_role_uses_gateway_ticket() {
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     });
 
     let response = app

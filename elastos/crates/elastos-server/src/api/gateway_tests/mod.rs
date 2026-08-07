@@ -69,6 +69,7 @@ fn test_state(cache_dir: &std::path::Path) -> GatewayState {
     GatewayState {
         provider_registry: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -129,6 +130,7 @@ async fn documents_test_state(cache_dir: &std::path::Path) -> GatewayState {
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -166,6 +168,7 @@ async fn library_protected_content_test_state(cache_dir: &std::path::Path) -> Ga
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -190,6 +193,7 @@ async fn library_external_provider_test_state(cache_dir: &std::path::Path) -> Ga
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -219,6 +223,7 @@ async fn library_webspace_test_state(cache_dir: &std::path::Path) -> GatewayStat
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -249,6 +254,7 @@ async fn library_test_state_with_content(
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -264,6 +270,7 @@ async fn chain_test_state(cache_dir: &std::path::Path) -> GatewayState {
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -279,6 +286,7 @@ async fn content_test_state(cache_dir: &std::path::Path) -> GatewayState {
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -294,6 +302,7 @@ async fn net_test_state(cache_dir: &std::path::Path) -> GatewayState {
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -313,6 +322,7 @@ async fn net_exit_test_state(cache_dir: &std::path::Path) -> GatewayState {
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -377,6 +387,7 @@ async fn browser_engine_reconciliation_test_state(
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: cache_dir.to_path_buf(),
             data_dir: cache_dir.to_path_buf(),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
         },
         close_calls,
         reconciliation_calls,
@@ -446,6 +457,7 @@ async fn browser_engine_retrying_close_test_state(
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     }
 }
 
@@ -467,6 +479,7 @@ async fn browser_engine_policy_blocked_test_state(cache_dir: &std::path::Path) -
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -518,6 +531,7 @@ async fn browser_engine_remote_carrier_exit_test_state_with_close_failures(
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -566,6 +580,7 @@ async fn rejecting_browser_engine_remote_carrier_exit_test_state_with_close_fail
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -592,6 +607,7 @@ async fn malformed_browser_summary_test_state(cache_dir: &std::path::Path) -> Ga
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -624,6 +640,7 @@ async fn browser_engine_attached_test_state_with_relay(
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -668,6 +685,7 @@ async fn wallet_test_state_with_shared_provider(
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -718,6 +736,7 @@ async fn wallet_chain_test_state_with_shared_wallet_provider(
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
     }
@@ -728,6 +747,8 @@ include!("support_runtime.rs");
 
 mod browser_profile;
 mod browser_reconciliation;
+mod dkms_capsule_manifests;
+mod dkms_rail;
 mod documents;
 mod esp;
 #[path = "../gateway_browser_route_tests.rs"]

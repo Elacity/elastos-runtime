@@ -7,9 +7,10 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::path::Path;
 use std::sync::Arc;
 
+use super::receipt::AffordanceGrantReceiptV1;
 use super::store::CapabilityStore;
 use super::token::{Action, CapabilityToken, ResourceId, TokenConstraints, TokenId};
-use crate::primitives::audit::AuditLog;
+use crate::primitives::audit::{AuditError, AuditEvent, AuditLog};
 use crate::primitives::metrics::MetricsManager;
 use crate::primitives::time::SecureTimestamp;
 
@@ -18,18 +19,43 @@ use crate::primitives::time::SecureTimestamp;
 pub enum ValidationError {
     InvalidSignature,
     UntrustedIssuer,
-    WrongCapsule { expected: String, got: String },
-    WrongAction { expected: Action, got: Action },
-    WrongResource { expected: String, got: String },
+    WrongCapsule {
+        expected: String,
+        got: String,
+    },
+    WrongAction {
+        expected: Action,
+        got: Action,
+    },
+    WrongResource {
+        expected: String,
+        got: String,
+    },
     TokenRevoked,
     TokenExpired,
     FutureDatedToken,
-    UseLimitExceeded { current: u32, max: u32 },
-    ClassificationUnavailable { token: u8 },
-    ClassificationExceeded { token: u8, resource: u8 },
-    InvalidVersion { expected: u8, got: u8 },
+    UseLimitExceeded {
+        current: u32,
+        max: u32,
+    },
+    ClassificationUnavailable {
+        token: u8,
+    },
+    ClassificationExceeded {
+        token: u8,
+        resource: u8,
+    },
+    InvalidVersion {
+        expected: u8,
+        got: u8,
+    },
     DelegationNotAllowed,
     DelegationScopeWidened,
+    /// The signed, durable use-record could not be written for a single-use
+    /// affordance-consent token, so the redemption fails closed (W2 step 9). The
+    /// token's use IS consumed (single-use), so the act must be refused rather
+    /// than dispatched without a durable signed record.
+    AuditWriteFailed,
 }
 
 impl std::fmt::Display for ValidationError {
@@ -77,6 +103,9 @@ impl std::fmt::Display for ValidationError {
             Self::DelegationScopeWidened => {
                 write!(f, "delegated token cannot widen scope of parent")
             }
+            Self::AuditWriteFailed => {
+                write!(f, "durable signed use-record could not be written")
+            }
         }
     }
 }
@@ -99,6 +128,56 @@ pub struct CapabilityManager {
 
     /// Metrics manager
     metrics: Arc<MetricsManager>,
+
+    /// G8 policy flip (Sprint 53), operator opt-in via `ELASTOS_AUDIT_FAIL_CLOSED_USE`: when set,
+    /// ORDINARY capability use-records in [`validate`](Self::validate) are BLOCKING — an act whose
+    /// signed use-record cannot be durably written is DENIED (`AuditWriteFailed`), the discipline
+    /// affordance-consent tokens have always had (W2 step 9). Default OFF: best-effort, byte-
+    /// identical to pre-S53 behavior. The cost that made this a gap (an fsync per validate) was
+    /// retired by the S51 group commit — under concurrency, validates share fsyncs — so this is
+    /// now a POLICY choice: "no act without a durable record" vs "availability over the record".
+    /// Meaningful only with a durable audit log (`ELASTOS_AUDIT_LOG_PATH`); a memory-only emit
+    /// essentially cannot fail (short of a panic-poisoned chain lock).
+    ///
+    /// OPERATIONAL CONSEQUENCE the opt-in buys, stated plainly (council S53 F1): a durable log
+    /// POISONS on its first failed append/fsync (S51 — the on-disk suffix is unknown after a
+    /// failure), so with this flag ON, one bad write halts EVERY act process-wide — all tokens,
+    /// all capsules deny `AuditWriteFailed` — until an operator restart re-verifies the durable
+    /// prefix. That is the deliberate posture (acts halt when the custody plane is dead), and it
+    /// is also DoS-shaped: anything that can fail one write (disk full, a co-tenant filling the
+    /// audit filesystem) is a full capability-plane outage. Retries during the outage still burn
+    /// use-limited tokens' counts (the ordering bound below). Choose it knowingly.
+    fail_closed_use: bool,
+}
+
+/// Parse the `ELASTOS_AUDIT_FAIL_CLOSED_USE` STRICTNESS switch (pure — the env read is the thin
+/// wrapper below). Unset/`0`/`false` ⇒ off (the default); `1`/`true` ⇒ on; anything else ⇒ ON with
+/// a loud warning — garbage in a switch whose only job is to be STRICTER must never silently
+/// weaken it (the closed-world rule the rail selector applies, pointed in the fail-closed
+/// direction).
+fn parse_fail_closed_use(raw: Option<&str>) -> bool {
+    match raw {
+        None => false,
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" => false,
+            "1" | "true" => true,
+            other => {
+                tracing::warn!(
+                    "ELASTOS_AUDIT_FAIL_CLOSED_USE={other:?} is not one of 1|true|0|false — \
+                     treating as ON (a strictness switch never weakens on garbage)"
+                );
+                true
+            }
+        },
+    }
+}
+
+fn fail_closed_use_from_env() -> bool {
+    parse_fail_closed_use(
+        std::env::var("ELASTOS_AUDIT_FAIL_CLOSED_USE")
+            .ok()
+            .as_deref(),
+    )
 }
 
 impl CapabilityManager {
@@ -117,7 +196,15 @@ impl CapabilityManager {
             store,
             audit_log,
             metrics,
+            fail_closed_use: fail_closed_use_from_env(),
         }
+    }
+
+    /// Set the fail-closed use-record policy EXPLICITLY (tests + embedders); production wiring
+    /// reads `ELASTOS_AUDIT_FAIL_CLOSED_USE` in the constructors. See the field doc.
+    pub fn with_fail_closed_use(mut self, on: bool) -> Self {
+        self.fail_closed_use = on;
+        self
     }
 
     /// Load signing key from disk, or generate and persist a new one.
@@ -175,6 +262,7 @@ impl CapabilityManager {
             store,
             audit_log,
             metrics,
+            fail_closed_use: fail_closed_use_from_env(),
         }
     }
 
@@ -228,6 +316,7 @@ impl CapabilityManager {
             store,
             audit_log,
             metrics,
+            fail_closed_use: fail_closed_use_from_env(),
         }
     }
 
@@ -241,23 +330,24 @@ impl CapabilityManager {
         self.verifying_key.to_bytes()
     }
 
-    /// Grant a new capability token
-    pub fn grant(
+    /// Build + sign a capability token (the shared mint core for [`grant`](Self::grant) and
+    /// [`grant_durable`](Self::grant_durable)). Records the request metric. Does NOT audit — the
+    /// caller chooses the audit discipline (best-effort vs fail-closed), so the two mint surfaces
+    /// can never drift on how a token is minted, only on how its grant event is recorded.
+    fn mint_signed_token(
         &self,
         capsule_id: &str,
-        resource: ResourceId,
+        resource: &ResourceId,
         action: Action,
         constraints: TokenConstraints,
         expiry: Option<SecureTimestamp>,
     ) -> CapabilityToken {
         let issued_at = SecureTimestamp::now();
-
-        // Ensure token epoch is at least current epoch
+        // Ensure token epoch is at least current epoch.
         let mut constraints = constraints;
         if constraints.epoch < self.store.current_epoch() {
             constraints.epoch = self.store.current_epoch();
         }
-
         let mut token = CapabilityToken::new(
             capsule_id.to_string(),
             self.public_key_bytes(),
@@ -267,18 +357,83 @@ impl CapabilityManager {
             issued_at,
             expiry,
         );
-
-        // Sign the token
         token.sign(&self.signing_key);
-
-        // Record metrics
         self.metrics.record_capability_request(capsule_id);
+        token
+    }
 
-        // Audit log
+    /// Grant a new capability token. The grant event is audited BEST-EFFORT (a lost audit append
+    /// does not fail the grant) — the ephemeral hot path for tokens that are not the durable,
+    /// provable mandate primitive. For a mandate (whose portable receipt IS its record, and whose
+    /// registry entry is now retention-pruned — Sprint 23), use [`grant_durable`](Self::grant_durable)
+    /// so the grant event is guaranteed on the chain before the mandate exists.
+    pub fn grant(
+        &self,
+        capsule_id: &str,
+        resource: ResourceId,
+        action: Action,
+        constraints: TokenConstraints,
+        expiry: Option<SecureTimestamp>,
+    ) -> CapabilityToken {
+        let token = self.mint_signed_token(capsule_id, &resource, action, constraints, expiry);
+        // Audit log (best-effort).
         self.audit_log
             .capability_grant(&token.id, capsule_id, &resource, action, expiry);
-
         token
+    }
+
+    /// Grant a capability token FAIL-CLOSED: emit the signed durable `CapabilityGrant` record
+    /// BEFORE returning the token (emit-before-issue, mirroring [`revoke`](Self::revoke)'s
+    /// emit-before-mutate). If the audit write fails the grant ABORTS — the token is never returned,
+    /// so the caller never issues a mandate whose grant event is not on the chain. This is the mint
+    /// side of "the chain is the permanent record": a durable, retention-pruned mandate
+    /// (Sprint 23/24) can never exist without a provable grant event, closing the Sprint 23 council
+    /// F1 corner (a best-effort mint whose audit was lost, once pruned, had no trace). Accepted
+    /// tradeoff, symmetric with revoke: a mandate that cannot be recorded does not happen.
+    pub fn grant_durable(
+        &self,
+        capsule_id: &str,
+        resource: ResourceId,
+        action: Action,
+        constraints: TokenConstraints,
+        expiry: Option<SecureTimestamp>,
+        responsible_entity: Option<String>,
+    ) -> Result<CapabilityToken, AuditError> {
+        // Service-layer bound (council S32 F6): the responsible entity is written VERBATIM into the
+        // signed chain here, so the shared syntactic bound is re-applied at this choke point — a
+        // non-HTTP caller cannot smuggle an unbounded/hostile blob onto the chain.
+        if let Some(e) = responsible_entity.as_deref() {
+            if !crate::capability::responsible_entity_syntax_ok(e) {
+                return Err(AuditError::Serialize(
+                    "responsible_entity must be ≤256 chars of DID charset".to_string(),
+                ));
+            }
+        }
+        let token = self.mint_signed_token(capsule_id, &resource, action, constraints, expiry);
+        // Emit-before-issue: the durable signed grant record must land before the token is handed
+        // back. On failure the token is dropped here — never issued, never stored in any registry.
+        self.audit_log.emit(AuditEvent::CapabilityGrant {
+            timestamp: SecureTimestamp::now(),
+            token_id: token.id.to_string(),
+            capsule_id: capsule_id.to_string(),
+            resource: resource.to_string(),
+            action: action.to_string(),
+            expiry,
+            // Sprint 32: the liability binding rides the SIGNED grant record — who is accountable
+            // for every act under this mandate, provable in the exported receipt.
+            responsible_entity,
+        })?;
+        Ok(token)
+    }
+
+    /// Refund one consumed use of a token (saturating). The caller must only
+    /// invoke this when the consumed use was provably a NO-OP — e.g. the act it
+    /// authorized never reached a provider (a routing failure), so no side effect
+    /// occurred. Returns the new use count. NEVER call this after a provider may
+    /// have acted: refunding a partially-applied effect would enable a second
+    /// execution (BUG-4 — see the carrier dispatch path for the safe slice).
+    pub async fn refund_use(&self, token_id: &TokenId) -> u32 {
+        self.store.refund_token_use(token_id).await
     }
 
     /// Validate a token for use
@@ -402,19 +557,73 @@ impl CapabilityManager {
             }
         }
 
-        // SUCCESS - emit audit event
-        self.audit_log.capability_use(
-            &token.id,
-            caller_capsule_id,
-            requested_resource,
-            requested_action,
-            true,
-        );
+        // SUCCESS - emit audit event.
+        //
+        // (Classification was already verified at step 11 above, incl. 0.5's stricter
+        // ClassificationUnavailable branch.) For affordance-consent tokens (single-use,
+        // bound to a method + args) the use-record is BLOCKING: if the signed durable
+        // record cannot be written the redemption FAILS CLOSED (W2 step 9), so a
+        // consent-gated affordance can never be consumed without a durable signed record —
+        // mirroring the AUD-2/AUD-3 fail-closed audit fixes. Ordinary capability tokens
+        // keep the best-effort emit BY DEFAULT — unless the operator opted into the G8
+        // policy flip (`fail_closed_use`, Sprint 53): then EVERY use-record is blocking
+        // and an act that cannot be durably recorded is denied. KNOWN ORDERING BOUND
+        // (same as the affordance path has always had): a use-limited token's count was
+        // consumed at step 12 above, so a use burned on a failed record is spent without
+        // an act — the fail-closed direction (never an act without a record), never a
+        // free act.
+        if token.constraints.method_id.is_some() || self.fail_closed_use {
+            self.audit_log
+                .emit(AuditEvent::CapabilityUse {
+                    timestamp: SecureTimestamp::now(),
+                    token_id: token.id.to_string(),
+                    capsule_id: caller_capsule_id.to_string(),
+                    resource: requested_resource.to_string(),
+                    action: requested_action.to_string(),
+                    success: true,
+                    rail_ref: None,
+                })
+                .map_err(|_| ValidationError::AuditWriteFailed)?;
+        } else {
+            self.audit_log.capability_use(
+                &token.id,
+                caller_capsule_id,
+                requested_resource,
+                requested_action,
+                true,
+            );
+        }
 
         // Record metrics
         self.metrics.record_capability_use(caller_capsule_id);
 
         Ok(())
+    }
+
+    /// Issue a signed [`AffordanceGrantReceiptV1`] attesting that an
+    /// affordance-consent token was redeemed for the exact `(capsule, method,
+    /// arguments)` approved (W2 step 9). Signed by the runtime's capability issuer
+    /// key — the same trust root that minted the token — so the holder can prove
+    /// what was done in their name. Verifiable via [`public_key`].
+    pub fn issue_affordance_receipt(
+        &self,
+        token_id: &str,
+        capsule: &str,
+        method_id: &str,
+        input_hash: &str,
+        resource: &str,
+        action: Action,
+    ) -> AffordanceGrantReceiptV1 {
+        AffordanceGrantReceiptV1::issue(
+            &self.signing_key,
+            self.public_key_bytes(),
+            token_id,
+            capsule,
+            method_id,
+            input_hash,
+            resource,
+            &action.to_string(),
+        )
     }
 
     /// Delegate a token: issue a narrower token on behalf of the parent.
@@ -461,12 +670,16 @@ impl CapabilityManager {
             (None, None) => None,
         };
 
-        // Non-delegatable, inherits parent action
+        // Non-delegatable, inherits parent action. A delegated token is never an
+        // affordance-consent token (those are minted non-delegatable), so it
+        // carries no affordance binding.
         let constraints = TokenConstraints {
             delegatable: false,
             epoch: parent.constraints.epoch,
             max_classification: parent.constraints.max_classification,
             max_uses: parent.constraints.max_uses,
+            method_id: None,
+            input_hash: None,
         };
 
         let token = self.grant(
@@ -488,10 +701,23 @@ impl CapabilityManager {
         Ok(token)
     }
 
-    /// Revoke a specific token
-    pub async fn revoke(&self, token_id: TokenId, reason: &str) {
+    /// Revoke a specific token, FAIL-CLOSED with durable signed custody.
+    ///
+    /// Emits the signed durable `CapabilityRevoke` record BEFORE killing the token
+    /// (emit-before-mutate, mirroring AUD-3's `revoke_request`/`deny_request`): if
+    /// the audit write fails the revoke ABORTS (the token stays valid) and the
+    /// error propagates, so a revoke can never silently complete without a durable
+    /// signed record — symmetric with the fail-closed deny. (Accepted AUD-3
+    /// tradeoff: a revoke that cannot be recorded does not happen; a degraded audit
+    /// surfaces loudly rather than losing custody.)
+    pub async fn revoke(&self, token_id: TokenId, reason: &str) -> Result<(), AuditError> {
+        self.audit_log.emit(AuditEvent::CapabilityRevoke {
+            timestamp: SecureTimestamp::now(),
+            token_id: token_id.to_string(),
+            reason: reason.to_string(),
+        })?;
         self.store.revoke_token(token_id).await;
-        self.audit_log.capability_revoke(&token_id, reason);
+        Ok(())
     }
 
     /// Revoke all tokens by advancing the epoch
@@ -549,12 +775,30 @@ impl CapabilityManager {
         self.store.current_epoch()
     }
 
+    /// Read-only probe: has this token id been individually revoked? For operator surfaces that
+    /// must not render a killed mandate as live. The enforcement decision itself always goes
+    /// through [`validate`](Self::validate), never this shortcut.
+    pub async fn is_token_revoked(&self, token_id: &TokenId) -> bool {
+        self.store.is_token_revoked(token_id).await
+    }
+
+    /// Read-only probe: is a token minted at `token_epoch` still epoch-valid (not invalidated by a
+    /// later `revoke_all`/key-rotation epoch advance)? For dispatch liveness the pure envelope gate
+    /// cannot re-derive. Enforcement still goes through [`validate`](Self::validate).
+    pub fn is_epoch_valid(&self, token_epoch: u64) -> bool {
+        self.store.is_epoch_valid(token_epoch)
+    }
+
     /// Get reference to the audit log
     pub fn audit_log(&self) -> &Arc<AuditLog> {
         &self.audit_log
     }
 
-    /// Helper to audit validation failures
+    /// Helper to audit validation failures. DELIBERATELY best-effort even under `fail_closed_use`
+    /// (council S53 F2): a deny is not an act — losing its record is observability loss, never an
+    /// unrecorded act — and on the same failing log a blocking failure-record would fail
+    /// identically anyway (the deny already stands). Failure-records are a known best-effort
+    /// residual of the G8 flip.
     fn audit_validation_failure(&self, token: &CapabilityToken, capsule_id: &str, reason: &str) {
         self.audit_log
             .capability_use(&token.id, capsule_id, &token.resource, token.action, false);
@@ -696,7 +940,7 @@ mod tests {
         );
 
         // Revoke this specific token
-        manager.revoke(token.id, "test revocation").await;
+        manager.revoke(token.id, "test revocation").await.unwrap();
 
         // Token should now be invalid
         let result = manager
@@ -710,6 +954,202 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ValidationError::TokenRevoked)));
+    }
+
+    /// G8 POLICY-FLIP RATCHET (Sprint 53): with `fail_closed_use` ON, an ORDINARY capability act
+    /// whose signed use-record cannot be durably written is DENIED (`AuditWriteFailed`) — "no act
+    /// without a durable record", the discipline affordance-consent tokens have always had. With
+    /// it OFF (the default), the same failing log leaves validation `Ok` — best-effort,
+    /// byte-identical pre-S53 behavior. Both directions pinned against one failing-log seam.
+    #[tokio::test]
+    async fn the_fail_closed_use_opt_in_denies_undurable_acts_and_the_default_does_not() {
+        for (opt_in, expect_denied) in [(true, true), (false, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "mgr-use-ro-{}-{}.log",
+                std::process::id(),
+                opt_in
+            ));
+            std::fs::File::create(&path).unwrap();
+            let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+            // Explicit policy (not the env read) so the test is deterministic under any test env.
+            let manager = CapabilityManager::new(
+                Arc::new(CapabilityStore::new()),
+                Arc::new(AuditLog::with_file_handle(ro)),
+                Arc::new(MetricsManager::new()),
+            )
+            .with_fail_closed_use(opt_in);
+
+            let token = manager.grant(
+                "test-capsule",
+                ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                Action::Read,
+                TokenConstraints::default(),
+                None,
+            );
+            let result = manager
+                .validate(
+                    &token,
+                    "test-capsule",
+                    Action::Read,
+                    &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                    None,
+                )
+                .await;
+            if expect_denied {
+                assert!(
+                    matches!(result, Err(ValidationError::AuditWriteFailed)),
+                    "opt-in ON: an act with no durable record is denied (got {result:?})"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "default OFF: best-effort is unchanged (got {result:?})"
+                );
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// A MEMORY-ONLY log under the opt-in still validates Ok (council S53 F4): with no durable
+    /// writer there is no durability to fail, so the flag adds no availability risk to a
+    /// memory-log deployment — the blocking emit just succeeds.
+    #[tokio::test]
+    async fn the_fail_closed_use_opt_in_is_harmless_on_a_memory_only_log() {
+        let manager = CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::new()),
+            Arc::new(MetricsManager::new()),
+        )
+        .with_fail_closed_use(true);
+        let token = manager.grant(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let result = manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                None,
+            )
+            .await;
+        assert!(result.is_ok(), "memory-only + opt-in: {result:?}");
+    }
+
+    /// The `ELASTOS_AUDIT_FAIL_CLOSED_USE` parse is a STRICTNESS switch: unset/0/false ⇒ off,
+    /// 1/true ⇒ on, and GARBAGE ⇒ ON (never silently weaker) — pinned on the pure parser.
+    #[test]
+    fn the_fail_closed_use_switch_never_weakens_on_garbage() {
+        assert!(!parse_fail_closed_use(None));
+        for off in ["0", "false", "FALSE", " 0 ", ""] {
+            assert!(!parse_fail_closed_use(Some(off)), "{off:?} is off");
+        }
+        for on in ["1", "true", "TRUE", " 1 "] {
+            assert!(parse_fail_closed_use(Some(on)), "{on:?} is on");
+        }
+        for garbage in ["yes", "on", "2", "tru"] {
+            assert!(
+                parse_fail_closed_use(Some(garbage)),
+                "{garbage:?} must fail STRICT, never silently off"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_fails_closed_when_audit_write_fails() {
+        // G8b: a read-only audit makes the durable signed write fail — the revoke
+        // must ABORT (emit-before-mutate) and the token must stay VALID, never
+        // silently killed without a durable record (mirrors AUD-3 revoke_request).
+        let path = std::env::temp_dir().join(format!("mgr-revoke-ro-{}.log", std::process::id()));
+        std::fs::File::create(&path).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let manager = CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::with_file_handle(ro)),
+            Arc::new(MetricsManager::new()),
+        );
+
+        let token = manager.grant(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+
+        let res = manager.revoke(token.id, "compromised").await;
+        assert!(
+            res.is_err(),
+            "revoke must fail closed when its durable audit write fails"
+        );
+
+        // The token must STILL validate — the revoke aborted before mutating.
+        let still_valid = manager
+            .validate(
+                &token,
+                "test-capsule",
+                Action::Read,
+                &ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                None,
+            )
+            .await;
+        assert!(
+            still_valid.is_ok(),
+            "token stays valid when its revocation audit write fails (got {still_valid:?})"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn grant_durable_fails_closed_when_audit_write_fails() {
+        // Sprint 24 (closes Sprint 23 council F1): the fail-closed mint must ABORT when its durable
+        // signed CapabilityGrant cannot be written — no token returned, so no mandate is issued
+        // whose grant event is not on the chain. Symmetric with revoke_fails_closed above.
+        let path = std::env::temp_dir().join(format!("mgr-grant-ro-{}.log", std::process::id()));
+        std::fs::File::create(&path).unwrap();
+        let ro = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let manager = CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            Arc::new(AuditLog::with_file_handle(ro)),
+            Arc::new(MetricsManager::new()),
+        );
+
+        let res = manager.grant_durable(
+            "test-capsule",
+            ResourceId::new("localhost://Users/self/Documents/test.txt"),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+            None,
+        );
+        assert!(
+            res.is_err(),
+            "grant_durable must fail closed when its durable audit write fails — no token issued"
+        );
+
+        // A manager with a WRITABLE audit mints successfully and hands back the signed token — the
+        // emit()? landed, so the grant is on the chain (provability is asserted end-to-end at the
+        // handler layer, where a durable+signed audit backs export_mandate_receipt_for_capability).
+        let ok_manager = create_test_manager();
+        let token = ok_manager
+            .grant_durable(
+                "test-capsule",
+                ResourceId::new("localhost://Users/self/Documents/test.txt"),
+                Action::Read,
+                TokenConstraints::default(),
+                None,
+                None,
+            )
+            .expect("a durable mint succeeds when the audit write lands");
+        assert!(
+            token.signature.iter().any(|b| *b != 0),
+            "the durably-minted token is signed and was handed back"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
@@ -1044,7 +1484,7 @@ mod tests {
         );
 
         // Revoke the parent
-        manager.revoke(parent.id, "compromised").await;
+        manager.revoke(parent.id, "compromised").await.unwrap();
 
         // Delegation should fail because parent is revoked
         let result = manager
@@ -1190,7 +1630,7 @@ mod tests {
         // Revoke the token mid-flight
         let mgr = Arc::clone(&manager);
         set.spawn(async move {
-            mgr.revoke(token_id, "concurrent test").await;
+            mgr.revoke(token_id, "concurrent test").await.unwrap();
             Ok(()) // Return Ok so we can join uniformly
         });
 
@@ -1282,7 +1722,7 @@ mod tests {
         for _ in 0..50 {
             let mgr = Arc::clone(&manager);
             set.spawn(async move {
-                mgr.revoke(token_id, "concurrent revoke").await;
+                mgr.revoke(token_id, "concurrent revoke").await.unwrap();
             });
         }
 

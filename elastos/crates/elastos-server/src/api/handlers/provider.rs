@@ -159,16 +159,23 @@ async fn enforce_capability(
 
     let resource_id = ResourceId::new(resource);
 
-    // Use the token's own action — the shell granted it for this purpose.
-    // The provider capsule enforces fine-grained action checks.
+    // G-ID: a capsule session's canonical caller identity is its `vm_id`, never the
+    // session-id shim — fail closed when a capsule session carries no capsule
+    // identity. Shell-bearer bridge calls keep the authenticated session as the
+    // token subject (the grant path mints those tokens at the session id), so
+    // capsule metadata still never replaces authenticated authority.
+    let caller_id = if session.is_shell() {
+        session.id.as_str()
+    } else {
+        session.vm_id.as_deref().ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "session has no capsule identity".to_string(),
+            )
+        })?
+    };
     cap_mgr
-        .validate(
-            &token,
-            session.id.as_str(),
-            required_action,
-            &resource_id,
-            None,
-        )
+        .validate(&token, caller_id, required_action, &resource_id, None)
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, format!("Capability denied: {}", e)))
 }

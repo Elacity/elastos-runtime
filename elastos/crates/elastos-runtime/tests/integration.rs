@@ -240,7 +240,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shell_can_grant_capability() {
+    async fn test_runtime_grant_arm_fails_closed() {
+        // G4a (Principle 10): the runtime IPC grant arm is a removed second
+        // authorization path — it mints nothing and fails closed, even for the
+        // shell. The only path that can issue a capability is the approval-gated
+        // HTTP handler (/api/capability/grant -> approval::decide).
         let (_, request_handler, _, shell_id) = create_test_runtime().await;
 
         let response = request_handler
@@ -256,11 +260,8 @@ mod tests {
             .await;
 
         match response {
-            RuntimeResponse::CapabilityGranted { token_id } => {
-                assert!(!token_id.is_empty());
-                assert_eq!(token_id.len(), 32); // 16 bytes hex encoded
-            }
-            _ => panic!("Expected CapabilityGranted response"),
+            RuntimeResponse::Error { code, .. } => assert_eq!(code, "unauthorized"),
+            other => panic!("runtime grant arm must fail closed, got {other:?}"),
         }
     }
 
@@ -268,25 +269,11 @@ mod tests {
     async fn test_shell_can_revoke_capability() {
         let (_, request_handler, _, shell_id) = create_test_runtime().await;
 
-        // First grant a capability
-        let grant_response = request_handler
-            .handle(
-                &shell_id,
-                RuntimeRequest::GrantCapability {
-                    capsule_id: "target-capsule".to_string(),
-                    resource: "localhost://Users/self/Documents/test/*".to_string(),
-                    action: "read".to_string(),
-                    constraints: CapabilityConstraints::default(),
-                },
-            )
-            .await;
-
-        let token_id = match grant_response {
-            RuntimeResponse::CapabilityGranted { token_id } => token_id,
-            _ => panic!("Expected CapabilityGranted"),
-        };
-
-        // Now revoke it
+        // Revoke is idempotent (it marks the id revoked), so a syntactically valid
+        // 32-hex token id exercises the shell-only revoke authorization path. We no
+        // longer mint via the runtime grant arm just to revoke — that arm is
+        // neutralized (see test_runtime_grant_arm_fails_closed).
+        let token_id = "0".repeat(32); // 16 zero bytes => valid TokenId hex
         let revoke_response = request_handler
             .handle(&shell_id, RuntimeRequest::RevokeCapability { token_id })
             .await;

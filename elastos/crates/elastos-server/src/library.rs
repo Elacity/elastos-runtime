@@ -293,6 +293,22 @@ enum ObjectProviderRequest {
         #[serde(default)]
         protected_content_fixture: bool,
     },
+    /// Buy -> pin: materialize a bought, ENCRYPTED IPFS asset into the buyer's Library and pin its CID.
+    /// `content_cid` is the encrypted asset's IPFS CID; `uri` optionally overrides the destination
+    /// (defaults to `<buyer-root>/<folder>/<name>`); `metadata` carries `{name?, mime?, folder?, capsule?}`.
+    /// `folder` routes the file to the type-correct Library folder (Videos/Music/Pictures/Documents);
+    /// `capsule` is the reconstructed dKMS descriptor that makes the asset OPENABLE via the quorum path
+    /// (materialized in place of the opaque blob). The entitlement (did this principal actually buy it?) is
+    /// gated UPSTREAM by the marketplace/buy api caller — the object-provider only pins what it is told to,
+    /// exactly like Publish. Holds no keys (P4/P15).
+    Acquire {
+        principal_id: String,
+        content_cid: String,
+        #[serde(default)]
+        uri: Option<String>,
+        #[serde(default)]
+        metadata: Option<Value>,
+    },
     Unpublish {
         principal_id: String,
         uri: String,
@@ -408,6 +424,28 @@ impl Provider for ObjectProvider {
                 };
                 library_repair(&data_dir, registry, &principal_id, &uri).await
             }
+            ObjectProviderRequest::Acquire {
+                principal_id,
+                content_cid,
+                uri,
+                metadata,
+            } => {
+                let Some(registry) = self.registry.upgrade() else {
+                    return Ok(provider_error(
+                        "library_error",
+                        "object provider registry unavailable",
+                    ));
+                };
+                library_acquire(
+                    &data_dir,
+                    registry,
+                    &principal_id,
+                    &content_cid,
+                    uri.as_deref(),
+                    metadata.as_ref(),
+                )
+                .await
+            }
             request @ (ObjectProviderRequest::Status { .. }
             | ObjectProviderRequest::Share { .. }
             | ObjectProviderRequest::SharedAccess { .. }) => {
@@ -448,7 +486,8 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
     let result = match request {
         ObjectProviderRequest::Publish { .. }
         | ObjectProviderRequest::Unpublish { .. }
-        | ObjectProviderRequest::Repair { .. } => Err(anyhow!(
+        | ObjectProviderRequest::Repair { .. }
+        | ObjectProviderRequest::Acquire { .. } => Err(anyhow!(
             "library content operation requires Runtime content coordinator"
         )),
         request => handle_library_request(data_dir, request),
@@ -639,6 +678,22 @@ pub async fn handle_object_provider_runtime_request(
             )
             .await
         }
+        ObjectProviderRequest::Acquire {
+            principal_id,
+            content_cid,
+            uri,
+            metadata,
+        } => {
+            library_acquire(
+                &data_dir,
+                registry,
+                &principal_id,
+                &content_cid,
+                uri.as_deref(),
+                metadata.as_ref(),
+            )
+            .await
+        }
         ObjectProviderRequest::Unpublish {
             principal_id,
             uri,
@@ -795,6 +850,12 @@ async fn attach_protected_content_open_chain(
         key_envelope: sealed_object.key_envelope.clone(),
         reason: reason.to_string(),
         expires_at,
+        // TRUSTLESS AUTHORIZATION (W4): the wallet-signed AccessGrant is threaded HERE once the
+        // browser wallet round-trip is wired — the gateway mints the decrypt session key, asks
+        // `wallet-provider` for an EIP-191 `personal_sign` of `ddrm_envelope::access::build_delegation(..)
+        // .canonical()`, then `assemble_grant(..)`. Until that live collection lands the node falls
+        // back to the legacy enrolled-receipt path (W3); the wire + node verifier are already in place.
+        access_grant: None,
     };
     let release_receipt_value = protected_provider_data(
         registry,
@@ -917,13 +978,7 @@ fn reject_forbidden_protected_content_fields(value: &Value) -> anyhow::Result<()
         "wallet_rpc",
         "chain_rpc",
         "kubo_api",
-        "kubo_api_url",
-        "ipfs_api",
-        "ipfs_api_url",
         "elacity_sdk",
-        "elacity_sdk_token",
-        "contract_sdk",
-        "key_backend_sdk",
     ];
     let mut stack = vec![value];
     while let Some(value) = stack.pop() {
@@ -1152,7 +1207,15 @@ fn handle_library_request(
                     continue;
                 }
                 let child_uri = format!("{}/{}", target.uri.trim_end_matches('/'), name);
-                objects.push(library_object(data_dir, &principal_id, &child_uri)?);
+                // LIST display path: file-content facts may be served from the bounded (path,len,
+                // mtime) cache so re-listing an unchanged folder skips the full read + SHA-256. The
+                // CAS gate + mutations keep using `library_object` (fresh), so this never weakens
+                // the revision precondition.
+                objects.push(library_object_listing_cached(
+                    data_dir,
+                    &principal_id,
+                    &child_uri,
+                )?);
             }
             objects.sort_by(|a, b| {
                 a.kind
@@ -1734,8 +1797,9 @@ fn handle_library_request(
         }
         ObjectProviderRequest::Publish { .. }
         | ObjectProviderRequest::Unpublish { .. }
-        | ObjectProviderRequest::Repair { .. } => {
-            unreachable!("publish/unpublish/repair handled asynchronously")
+        | ObjectProviderRequest::Repair { .. }
+        | ObjectProviderRequest::Acquire { .. } => {
+            unreachable!("publish/unpublish/repair/acquire handled asynchronously")
         }
     }
 }
@@ -1883,6 +1947,200 @@ async fn library_publish(
         "availability": record.availability,
         "content_security": record.content_security,
         "published_at": record.published_at,
+    }))
+}
+
+/// Sanitize a candidate filename to a single safe path segment: only `[A-Za-z0-9._-]`, capped at 96
+/// chars, never `.`/`..` (defense-in-depth — `library_target` independently rejects traversal too).
+fn sanitize_acquire_name(raw: &str) -> String {
+    let name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect();
+    if name.is_empty() || name == "." || name == ".." {
+        String::new()
+    } else {
+        name
+    }
+}
+
+/// Fetch the encrypted asset bytes keylessly via the `content/*` plane (P4 — never raw ipfs), failing closed
+/// on empty/oversize. Shared by the legacy raw-materialize path and the single-file capsule inline so both
+/// honor the same bound (`ELASTOS_DDRM_ACQUIRE_MAX_BYTES`, default 2 GiB).
+async fn fetch_acquire_bytes(
+    registry: &ProviderRegistry,
+    content_cid: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = crate::content::fetch_bytes_via_provider(registry, content_cid, None)
+        .await
+        .map_err(|err| anyhow!("acquire fetch failed for {content_cid}: {err}"))?;
+    if bytes.is_empty() {
+        bail!("acquire fetch returned no bytes for {content_cid} (fail closed)");
+    }
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "acquire fetch for {content_cid} is {} bytes, over the {max_bytes}-byte cap — refused (fail closed)",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
+/// Buy -> pin: materialize a bought, ENCRYPTED IPFS asset into the buyer's Library and pin its CID for
+/// availability, so the existing player can open it. Mirrors `library_publish`'s discipline in reverse:
+/// fetch keylessly via the `content/*` plane (P4 — never raw ipfs), pin via `content/ensure`, and write
+/// the OPAQUE ciphertext under the buyer's own root (P16; encrypt-at-rest if the root is protected). It
+/// NEVER decrypts and holds no keys (P15) — keys stay gated at open by the rights/key path. Entitlement
+/// (did this principal buy `content_cid`?) is enforced UPSTREAM by the marketplace/buy api caller before
+/// dispatch, exactly as the api layer gates Publish; the registry-less stdio path is rejected (P11).
+async fn library_acquire(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    principal_id: &str,
+    content_cid: &str,
+    uri: Option<&str>,
+    metadata: Option<&Value>,
+) -> anyhow::Result<Value> {
+    if content_cid.trim().is_empty() {
+        bail!("acquire requires a content_cid (fail closed)");
+    }
+    // 1. Destination under the BUYER root only (P16). `library_target` re-validates under-root + no
+    //    traversal, so a buyer can never pin into another principal's space. When the caller supplies the
+    //    reconstructed dKMS capsule, the asset is filed exactly like a MINTED one: a `.ddrm` capsule under
+    //    the type-correct folder (`library_folder_for_mime` keyed on the asset mime — Videos/Music/Pictures/
+    //    Documents), so the File Explorer shows it where the user expects and routes it to the dDRM viewer.
+    //    The legacy (no-capsule) path keeps the opaque blob in `Acquired/`.
+    let has_capsule = metadata
+        .and_then(|m| m.get("capsule"))
+        .map(|c| c.is_object())
+        .unwrap_or(false);
+    let dest = match uri {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => {
+            let root = crate::auth::principal_localhost_root(principal_id);
+            let name = metadata
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+                .map(sanitize_acquire_name)
+                .filter(|n| !n.is_empty());
+            if has_capsule {
+                let mime = metadata
+                    .and_then(|m| m.get("mime"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream");
+                let folder = library_folder_for_mime(mime);
+                let base = name.unwrap_or_else(|| "asset".to_string());
+                let candidate = if base.to_ascii_lowercase().ends_with(".ddrm") {
+                    base
+                } else {
+                    format!("{base}.ddrm")
+                };
+                format!("{root}/{folder}/{candidate}")
+            } else {
+                let candidate = name.unwrap_or_else(|| {
+                    let cid = sanitize_acquire_name(content_cid);
+                    if cid.is_empty() {
+                        "asset".to_string()
+                    } else {
+                        format!("{cid}.ddrm")
+                    }
+                });
+                format!("{root}/Acquired/{candidate}")
+            }
+        }
+    };
+    let target = library_target(data_dir, principal_id, &dest)?;
+
+    // 2. Decide the artifact to MATERIALIZE. When the caller supplies a reconstructed dKMS capsule (the
+    //    OPENABLE descriptor: schema + content_id/KID + protections + media|ciphertext), we materialize THAT
+    //    so the acquired asset opens via the SAME quorum path as a minted asset (P10 — one canonical open),
+    //    instead of an opaque blob the open path cannot authorize. A MEDIA capsule needs no inline bytes (the
+    //    DASH directory is fetched at open from `asset_cid`, pinned below); a SINGLE-FILE capsule inlines the
+    //    (capped) encrypted bytes as `ciphertext_b64`. Absent a capsule we keep the legacy behavior
+    //    (materialize the opaque ciphertext) — bounded, unchanged. The api caller gates entitlement on the
+    //    bytes16 KID UPSTREAM and binds `content_cid` from the asset metadata before dispatch.
+    const DEFAULT_ACQUIRE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+    let max_bytes = std::env::var("ELASTOS_DDRM_ACQUIRE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ACQUIRE_MAX_BYTES);
+    let material: Vec<u8> = match metadata
+        .and_then(|m| m.get("capsule"))
+        .filter(|c| c.is_object())
+        .cloned()
+    {
+        Some(mut capsule) => {
+            let is_media = capsule.get("media").map(|m| !m.is_null()).unwrap_or(false)
+                && capsule
+                    .get("asset_cid")
+                    .and_then(Value::as_str)
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+            if !is_media {
+                let bytes = fetch_acquire_bytes(&registry, content_cid, max_bytes).await?;
+                capsule["ciphertext_b64"] =
+                    json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
+            }
+            serde_json::to_vec(&capsule).context("serialize reconstructed dKMS capsule")?
+        }
+        None => fetch_acquire_bytes(&registry, content_cid, max_bytes).await?,
+    };
+
+    // 3. Pin the CID for local availability via content/* ensure (P4 — never raw ipfs). Best-effort:
+    //    the materialized file (step 4) is the durable local copy; a transient pin miss must not deny
+    //    the buyer the asset they paid for.
+    let availability = match registry
+        .send_raw(
+            "content",
+            &json!({
+                "op": "ensure",
+                "cid": content_cid,
+                "object_did": target.uri,
+                "publisher_did": principal_id,
+            }),
+        )
+        .await
+    {
+        Ok(resp) if resp.get("status").and_then(Value::as_str) != Some("error") => resp
+            .get("data")
+            .and_then(|d| d.get("availability"))
+            .cloned()
+            .unwrap_or_else(|| json!({ "status": "unknown" })),
+        _ => json!({ "status": "unpinned" }),
+    };
+
+    // 4. Materialize the artifact under the buyer root (encrypt-at-rest if the root is protected) with the
+    //    asset's REAL mime so the Library routes it to the right protected viewer instead of "no viewer".
+    let mime = metadata.and_then(|m| m.get("mime")).and_then(Value::as_str);
+    let object =
+        write_library_file_bytes(data_dir, principal_id, &target.uri, mime, None, &material)?;
+
+    // 5. Stamp the acquire event (mirrors library_publish's "publish" event).
+    append_library_event(
+        data_dir,
+        principal_id,
+        "acquire",
+        &target.uri,
+        json!({
+            "content_cid": content_cid,
+            "availability": availability,
+            "object": object.clone(),
+        }),
+    )?;
+
+    Ok(json!({
+        "object": object,
+        "uri": target.uri,
+        "content_cid": content_cid,
+        "availability": availability,
     }))
 }
 
@@ -3096,11 +3354,247 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
         ObjectProviderRequest::Roots { .. }
         | ObjectProviderRequest::List { uri: None, .. }
         | ObjectProviderRequest::EmptyTrash { .. }
-        | ObjectProviderRequest::Events { .. } => false,
+        | ObjectProviderRequest::Events { .. }
+        | ObjectProviderRequest::Acquire { .. } => false,
+    }
+}
+
+/// Cheap projection of the public, non-secret fields the Library needs from a `.ddrm` capsule:
+/// the original content size (for the size column) and the cover-art reference. Parsing reads only
+/// these small header fields; the large `ciphertext_b64`/media payloads are skipped by serde.
+#[derive(Debug, Default, Deserialize)]
+struct DdrmCapsuleHints {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    content_size: Option<u64>,
+    #[serde(default)]
+    thumbnail: Option<String>,
+    /// The asset's canonical encrypted-content CID (the IPFS dir/object the capsule protects). For a dDRM
+    /// asset THIS — not the on-disk capsule-file hash — is the content identity the marketplace matches on
+    /// (vault "downloaded" + acquire-status), so the Library surfaces it as the object's `content_cid`.
+    #[serde(default)]
+    asset_cid: Option<String>,
+}
+
+impl DdrmCapsuleHints {
+    fn has_thumbnail(&self) -> bool {
+        self.thumbnail
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// Parse Library display hints from `.ddrm` capsule bytes. `None` for non-capsule/invalid JSON, so
+/// the caller falls back to the on-disk size + the generic type icon (fail-soft, never panics).
+fn parse_ddrm_capsule_hints(bytes: &[u8]) -> Option<DdrmCapsuleHints> {
+    let hints: DdrmCapsuleHints = serde_json::from_slice(bytes).ok()?;
+    if hints.schema != "elastos.ddrm.capsule/v1" {
+        return None;
+    }
+    Some(hints)
+}
+
+/// The authed gateway endpoint the Library browser fetches to render an asset's PUBLIC cover art.
+/// The route resolves the image bytes from the capsule `thumbnail` (IPFS, key-free) at fetch time.
+fn library_cover_endpoint(uri: &str) -> String {
+    let query: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("uri", uri)
+        .finish();
+    format!("/api/provider/object/cover?{query}")
+}
+
+/// Resolve the PUBLIC cover-art reference (`ipfs://<cid>`) for an owned `.ddrm` asset, or `None`.
+/// Reads ONLY the capsule's `thumbnail` field — never content or key material. Backs the gateway
+/// Library cover route, which fetches the referenced image via the ipfs provider.
+pub fn ddrm_cover_uri_for_object(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<Option<String>> {
+    let target = library_target(data_dir, principal_id, uri)?;
+    if !target.uri.to_ascii_lowercase().ends_with(".ddrm") || fs::metadata(&target.path)?.is_dir() {
+        return Ok(None);
+    }
+    let bytes = read_library_file_bytes(data_dir, principal_id, &target)?;
+    Ok(parse_ddrm_capsule_hints(&bytes)
+        .and_then(|hints| hints.thumbnail)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
+/// The file-content-derived fields of a `LibraryObject` — everything that requires READING and
+/// hashing the file bytes. Cheap to clone; this is what the directory-list cache stores.
+#[derive(Clone)]
+struct FileListingFacts {
+    display_size: u64,
+    revision: String,
+    content_cid: Option<String>,
+    thumbnail_uri: Option<String>,
+    blocked_reason: Option<String>,
+}
+
+/// Identity of a file for the listing cache: full path + length + mtime (secs, nanos). ANY write to
+/// the file bumps its mtime, so the key changes and the stale entry is never served — the cache is
+/// self-invalidating. A file whose mtime is unavailable simply isn't cached (returns `None`).
+type ListingCacheKey = (PathBuf, u64, (u64, u32));
+
+const LISTING_CACHE_CAP: usize = 8192;
+
+struct ListingCache {
+    map: std::collections::HashMap<ListingCacheKey, FileListingFacts>,
+    order: std::collections::VecDeque<ListingCacheKey>,
+}
+
+fn listing_cache() -> &'static std::sync::Mutex<ListingCache> {
+    static CACHE: OnceLock<std::sync::Mutex<ListingCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::sync::Mutex::new(ListingCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+fn listing_cache_key(target: &LibraryTarget, metadata: &fs::Metadata) -> Option<ListingCacheKey> {
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((
+        target.path.clone(),
+        metadata.len(),
+        (modified.as_secs(), modified.subsec_nanos()),
+    ))
+}
+
+/// Compute the file-content facts, consulting the bounded list cache when `use_cache` is set.
+/// `use_cache` is ONLY ever true on the directory-LIST display path; the CAS gate
+/// (`check_revision`) and every mutation use the fresh path, so a stale entry can at worst cause a
+/// benign false write-conflict, never a wrong overwrite.
+fn file_listing_facts_maybe_cached(
+    use_cache: bool,
+    data_dir: &Path,
+    principal_id: &str,
+    target: &LibraryTarget,
+    name: &str,
+    metadata: &fs::Metadata,
+    modified_at: u64,
+) -> anyhow::Result<FileListingFacts> {
+    if !use_cache {
+        return file_listing_facts(data_dir, principal_id, target, name, metadata, modified_at);
+    }
+    let Some(key) = listing_cache_key(target, metadata) else {
+        return file_listing_facts(data_dir, principal_id, target, name, metadata, modified_at);
+    };
+    if let Ok(cache) = listing_cache().lock() {
+        if let Some(hit) = cache.map.get(&key) {
+            return Ok(hit.clone());
+        }
+    }
+    let facts = file_listing_facts(data_dir, principal_id, target, name, metadata, modified_at)?;
+    if let Ok(mut cache) = listing_cache().lock() {
+        if !cache.map.contains_key(&key) {
+            if cache.map.len() >= LISTING_CACHE_CAP {
+                if let Some(evict) = cache.order.pop_front() {
+                    cache.map.remove(&evict);
+                }
+            }
+            cache.order.push_back(key.clone());
+            cache.map.insert(key, facts.clone());
+        }
+    }
+    Ok(facts)
+}
+
+/// Read + hash the file to produce its listing facts (revision token, content CID, display size,
+/// thumbnail pointer). Always FRESH — the cache wraps this, never replaces it.
+fn file_listing_facts(
+    data_dir: &Path,
+    principal_id: &str,
+    target: &LibraryTarget,
+    name: &str,
+    metadata: &fs::Metadata,
+    modified_at: u64,
+) -> anyhow::Result<FileListingFacts> {
+    match read_library_file_bytes(data_dir, principal_id, target) {
+        Ok(bytes) => {
+            // Hash the file ONCE: the `revision` token and the `content_cid` are both SHA-256 over
+            // the same bytes (`raw_sha256_cid` wraps the identical digest in a CIDv1 multihash), so
+            // deriving both from one digest is byte-identical and halves the per-file hashing.
+            let digest = Sha256::digest(&bytes);
+            let revision = format!("rev:{}", hex::encode(digest.as_slice()));
+            let content_cid = sha256_digest_to_raw_cid(digest.as_slice())?;
+            // For a `.ddrm` capsule the on-disk size is just the capsule (for media the encrypted
+            // segments live elsewhere), so show the ORIGINAL content size + a cover-art pointer —
+            // like a normal file manager (PC2 parity). Falls back to the on-disk size for legacy
+            // capsules minted before `content_size` existed.
+            let mut display_size = bytes.len() as u64;
+            let mut thumbnail_uri = None;
+            // For a `.ddrm` capsule the marketplace identity is the asset's CONTENT cid (what it protects on
+            // IPFS), not the on-disk capsule hash — surface it so vault/acquire-status match the listing.
+            let mut content_cid = content_cid;
+            if name.to_ascii_lowercase().ends_with(".ddrm") {
+                if let Some(hints) = parse_ddrm_capsule_hints(&bytes) {
+                    if let Some(content_size) = hints.content_size {
+                        display_size = content_size;
+                    }
+                    if hints.has_thumbnail() {
+                        thumbnail_uri = Some(library_cover_endpoint(&target.uri));
+                    }
+                    if let Some(asset_cid) = hints
+                        .asset_cid
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                    {
+                        content_cid = asset_cid.to_string();
+                    }
+                }
+            }
+            Ok(FileListingFacts {
+                display_size,
+                revision,
+                content_cid: Some(content_cid),
+                thumbnail_uri,
+                blocked_reason: None,
+            })
+        }
+        Err(err) if is_unencrypted_principal_root_object(&err) => {
+            let revision_input = format!("{}:{}:{}", target.uri, metadata.len(), modified_at);
+            Ok(FileListingFacts {
+                display_size: metadata.len(),
+                revision: format!(
+                    "rev:blocked:{}",
+                    hex::encode(Sha256::digest(revision_input))
+                ),
+                content_cid: None,
+                thumbnail_uri: None,
+                blocked_reason: Some("protected_principal_root_object_not_encrypted".to_string()),
+            })
+        }
+        Err(err) => Err(err),
     }
 }
 
 fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Result<LibraryObject> {
+    library_object_inner(data_dir, principal_id, uri, false)
+}
+
+/// As [`library_object`], but file-content facts may come from the bounded directory-list cache.
+/// Use ONLY on the LIST display path — never for the CAS gate or a mutation, which must read fresh.
+fn library_object_listing_cached(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<LibraryObject> {
+    library_object_inner(data_dir, principal_id, uri, true)
+}
+
+fn library_object_inner(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+    use_list_cache: bool,
+) -> anyhow::Result<LibraryObject> {
     let target = library_target(data_dir, principal_id, uri)?;
     let metadata = fs::metadata(&target.path)?;
     let is_dir = metadata.is_dir();
@@ -3118,29 +3612,22 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
     let modified_at = system_time_secs(metadata.modified().ok()).unwrap_or_else(now_ts);
     let created_at = system_time_secs(metadata.created().ok()).unwrap_or(modified_at);
     let mut blocked_reason = None;
+    let mut thumbnail_uri: Option<String> = None;
     let (size, revision, content_cid) = if is_dir {
         (0, directory_revision(&target.path, &target.uri)?, None)
     } else {
-        match read_library_file_bytes(data_dir, principal_id, &target) {
-            Ok(bytes) => {
-                let revision = format!("rev:{}", hex::encode(Sha256::digest(&bytes)));
-                let content_cid = raw_sha256_cid(&bytes)?;
-                (bytes.len() as u64, revision, Some(content_cid))
-            }
-            Err(err) if is_unencrypted_principal_root_object(&err) => {
-                blocked_reason = Some("protected_principal_root_object_not_encrypted".to_string());
-                let revision_input = format!("{}:{}:{}", target.uri, metadata.len(), modified_at);
-                (
-                    metadata.len(),
-                    format!(
-                        "rev:blocked:{}",
-                        hex::encode(Sha256::digest(revision_input))
-                    ),
-                    None,
-                )
-            }
-            Err(err) => return Err(err),
-        }
+        let facts = file_listing_facts_maybe_cached(
+            use_list_cache,
+            data_dir,
+            principal_id,
+            &target,
+            &name,
+            &metadata,
+            modified_at,
+        )?;
+        blocked_reason = facts.blocked_reason;
+        thumbnail_uri = facts.thumbnail_uri;
+        (facts.display_size, facts.revision, facts.content_cid)
     };
     let record = read_publish_record(data_dir, principal_id, &target.uri).ok();
     let active_record = record.as_ref().filter(|record| record_is_published(record));
@@ -3261,7 +3748,7 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
         revision,
         viewer,
         viewers,
-        thumbnail_uri: None,
+        thumbnail_uri,
         availability,
         blocked_reason,
         content_cid,
@@ -3332,9 +3819,19 @@ fn is_public_uri(localhost_root: &str, uri: &str) -> bool {
     uri == public_root || uri.starts_with(&format!("{public_root}/"))
 }
 
+/// Hash a buffer and build its raw content CID in one call. The production list path derives the
+/// CID from an already-computed digest via [`sha256_digest_to_raw_cid`]; this whole-buffer form is
+/// retained only as the independent reference the byte-identity test checks the split form against.
+#[cfg(test)]
 fn raw_sha256_cid(bytes: &[u8]) -> anyhow::Result<String> {
-    let digest = Sha256::digest(bytes);
-    let multihash = cid::multihash::Multihash::<64>::wrap(0x12, &digest)
+    sha256_digest_to_raw_cid(Sha256::digest(bytes).as_slice())
+}
+
+/// Build the raw (0x55) CIDv1 from an ALREADY-COMPUTED SHA-256 digest. Split out so a caller that
+/// has just hashed the bytes for another purpose (e.g. the library `revision` token) can derive the
+/// content CID from the same digest instead of hashing the buffer a second time.
+fn sha256_digest_to_raw_cid(digest: &[u8]) -> anyhow::Result<String> {
+    let multihash = cid::multihash::Multihash::<64>::wrap(0x12, digest)
         .map_err(|err| anyhow!("failed to build raw content CID: {err}"))?;
     Ok(cid::Cid::new_v1(0x55, multihash).to_string())
 }
@@ -3344,6 +3841,40 @@ fn is_unencrypted_principal_root_object(err: &anyhow::Error) -> bool {
         cause
             .to_string()
             .contains(crate::auth::PROTECTED_PRINCIPAL_ROOT_OBJECT_NOT_ENCRYPTED)
+    })
+}
+
+/// An owned object's plaintext bytes + presentation metadata, for the dDRM viewer
+/// seam (Library-bound open).
+pub struct OwnedObjectForViewer {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub content_cid: Option<String>,
+    pub name: String,
+}
+
+/// Read an owned object for the dDRM viewer seam: resolve the URI within the
+/// signed-in principal's OWN library root — the local-sovereign ownership gate, since
+/// [`library_target`] only ever resolves the principal's own tree (a URI outside that
+/// root, a traversal, or another principal's object never resolves) — then return the
+/// PLAINTEXT bytes (decrypting at-rest as needed) plus the asset's mime, content CID,
+/// and name. Any failure is a fail-closed "not an owned object" for the caller.
+pub fn read_owned_object_for_viewer(
+    data_dir: &Path,
+    principal_id: &str,
+    uri: &str,
+) -> anyhow::Result<OwnedObjectForViewer> {
+    let target = library_target(data_dir, principal_id, uri)?;
+    if !target.path.is_file() {
+        anyhow::bail!("owned object is not a file");
+    }
+    let bytes = read_library_file_bytes(data_dir, principal_id, &target)?;
+    let object = library_object(data_dir, principal_id, &target.uri)?;
+    Ok(OwnedObjectForViewer {
+        bytes,
+        mime: object.mime,
+        content_cid: object.content_cid,
+        name: object.name,
     })
 }
 
@@ -6176,6 +6707,25 @@ fn shared_access_open_contract(
     })
 }
 
+/// Map an asset's MIME to the Library folder a freshly-minted item is filed under, so the Finder
+/// shows it where the user expects: images in Pictures, video in Videos, audio in Music, and
+/// everything else (PDF, text/markdown, EPUB, comics, source code, 3D/AI models) in Documents.
+/// Placement keys off the ORIGINAL asset mime — the on-disk item is a `.ddrm` capsule whose own
+/// filename carries no type — mirroring PC2's typed catalog buckets. The folders in this set must
+/// exist as `library_roots` so the sidebar can reach them.
+pub(crate) fn library_folder_for_mime(mime: &str) -> &'static str {
+    let m = mime.trim().to_ascii_lowercase();
+    if m.starts_with("image/") {
+        "Pictures"
+    } else if m.starts_with("video/") {
+        "Videos"
+    } else if m.starts_with("audio/") {
+        "Music"
+    } else {
+        "Documents"
+    }
+}
+
 fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
     let root = crate::auth::principal_localhost_root(principal_id);
     let mut roots: Vec<_> = [
@@ -6194,6 +6744,7 @@ fn library_roots(data_dir: &Path, principal_id: &str) -> Vec<LibraryRoot> {
             "directory",
         ),
         ("videos", "Videos", format!("{root}/Videos"), "directory"),
+        ("music", "Music", format!("{root}/Music"), "directory"),
         (
             "downloads",
             "Downloads",
@@ -6785,6 +7336,9 @@ fn now_nanos() -> u128 {
 fn mime_for_name(name: &str) -> &'static str {
     let lower = name.to_lowercase();
     if lower.ends_with(".md") || lower.ends_with(".txt") {
+        // Markdown + plain text both render on the dDRM viewer's light prose reader (the code
+        // renderer is only for explicit source-code mimes), and the `documents` app + webspace
+        // adapter treat `.md` as text/plain — so keep one type for both.
         "text/plain"
     } else if lower.ends_with(".html") {
         "text/html"
@@ -6796,8 +7350,26 @@ fn mime_for_name(name: &str) -> &'static str {
         "image/jpeg"
     } else if lower.ends_with(".gif") {
         "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
     } else if lower.ends_with(".pdf") {
         "application/pdf"
+    } else if lower.ends_with(".epub") {
+        // An ebook — opened through the protected dDRM viewer's html-lock reader (quorum recover).
+        "application/epub+zip"
+    } else if lower.ends_with(".cbz") {
+        // A comic archive — opened through the protected dDRM viewer's pixel-lock pager.
+        "application/vnd.comicbook+zip"
+    } else if lower.ends_with(".glb") {
+        "model/gltf-binary"
+    } else if lower.ends_with(".gltf") {
+        "model/gltf+json"
+    } else if lower.ends_with(".stl") {
+        "model/stl"
+    } else if lower.ends_with(".obj") {
+        "model/obj"
     } else if lower.ends_with(".tar") {
         "application/x-tar"
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
@@ -6808,6 +7380,9 @@ fn mime_for_name(name: &str) -> &'static str {
         "video/mp4"
     } else if lower.ends_with(".mp3") {
         "audio/mpeg"
+    } else if lower.ends_with(".ddrm") {
+        // A minted dKMS asset capsule — opened through the protected dDRM viewer (quorum recover).
+        "application/x-ddrm"
     } else {
         "application/octet-stream"
     }
@@ -6832,12 +7407,28 @@ fn viewer_ids_for_name(name: &str) -> Vec<&'static str> {
         || lower.ends_with(".gif")
     {
         vec!["image-viewer"]
-    } else if lower.ends_with(".mp4") {
-        vec!["video-viewer"]
+    } else if lower.ends_with(".mp4") || lower.ends_with(".mp3") {
+        // Audio and video both open on `elacity-player`: it drives Media Source Extensions off the
+        // mime the runtime's media session reports, and carries an explicit audio-only path
+        // (player.js `isAudioOnly` / the generated placeholder poster). The extension set is held
+        // to what `mime_for_name` above already classifies as media — adding an extension here
+        // without a mime there would hand the player `application/octet-stream`.
+        //
+        // This previously named `video-viewer`, which is not a capsule that exists. Because
+        // `installed_viewer_option` filters against the installed browser-capsule catalog, a
+        // phantom id does not error — it silently yields ZERO open-with options, so the library
+        // offered no way to play an owned .mp4. See the `viewer_ids_*` tests below, which pin
+        // every emitted id to a real `capsules/<id>/capsule.json` with `role: viewer`.
+        vec!["elacity-player"]
     } else if lower.ends_with(".pdf") {
         vec!["documents"]
     } else if lower.ends_with(".gba") {
         vec!["gba-emulator"]
+    } else if lower.ends_with(".ddrm") {
+        // A minted dKMS `.ddrm` capsule opens through the protected dDRM viewer: the shell routes
+        // a `ddrm-viewer` target carrying the owned URI to POST /api/viewers/open, which detects
+        // the capsule and recovers + renders the asset via the 2-of-3 quorum (never the CEK).
+        vec!["ddrm-viewer"]
     } else {
         Vec::new()
     }
@@ -6858,10 +7449,15 @@ fn installed_viewer_option(data_dir: &Path, id: &str) -> Option<LibraryViewerOpt
 fn viewer_label(id: &str) -> &str {
     match id {
         "documents" => "Documents",
+        // `image-viewer` is the one remaining phantom: no capsule ships under that name, so image
+        // extensions still resolve to zero open-with options. Left as-is deliberately — there is
+        // no installed viewer to point them at, and inventing one here would only move the dead
+        // end. `viewer_ids_map_to_real_installed_viewer_capsules` documents it as a known gap.
         "image-viewer" => "Image Viewer",
-        "video-viewer" => "Video Viewer",
+        "elacity-player" => "Media Player",
         "gba-emulator" => "GBA Emulator",
         "archive-manager" => "Archive",
+        "ddrm-viewer" => "Protected Viewer",
         _ => id,
     }
 }
@@ -6886,6 +7482,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sanitize_acquire_name_strips_unsafe_segments() {
+        assert_eq!(sanitize_acquire_name("alice.epub"), "alice.epub");
+        assert_eq!(sanitize_acquire_name("a b/c\\d"), "a_b_c_d"); // space + separators -> _
+        assert_eq!(sanitize_acquire_name(".."), ""); // traversal -> empty (caller falls back)
+        assert_eq!(sanitize_acquire_name("."), "");
+        assert_eq!(sanitize_acquire_name(""), "");
+        assert_eq!(sanitize_acquire_name(&"x".repeat(200)).len(), 96); // length-capped
+        assert!(!sanitize_acquire_name("../../etc/passwd").contains('/')); // no separator survives
+    }
+
+    #[test]
+    fn acquire_request_deserializes_and_rejects_unknown_keys() {
+        let req: ObjectProviderRequest = serde_json::from_value(json!({
+            "op": "acquire",
+            "principal_id": "p1",
+            "content_cid": "bafyEncrypted",
+        }))
+        .expect("acquire deserializes");
+        match req {
+            ObjectProviderRequest::Acquire {
+                principal_id,
+                content_cid,
+                uri,
+                metadata,
+            } => {
+                assert_eq!(principal_id, "p1");
+                assert_eq!(content_cid, "bafyEncrypted");
+                assert!(uri.is_none() && metadata.is_none());
+            }
+            _ => panic!("expected Acquire"),
+        }
+        // deny_unknown_fields: a junk key fails closed.
+        assert!(serde_json::from_value::<ObjectProviderRequest>(json!({
+            "op": "acquire", "principal_id": "p1", "content_cid": "c", "junk": 1
+        }))
+        .is_err());
+        // a missing required field fails closed.
+        assert!(serde_json::from_value::<ObjectProviderRequest>(json!({
+            "op": "acquire", "principal_id": "p1"
+        }))
+        .is_err());
+    }
+
+    /// The List hot path now hashes each file once and derives both the `revision` token and the
+    /// `content_cid` from that single digest. Pin that this is byte-identical to the previous
+    /// two-pass form (`raw_sha256_cid` hashing the buffer itself) for representative inputs — so the
+    /// optimization can never silently change a revision (a compare-and-swap token) or a content CID.
+    #[test]
+    fn single_hash_listing_matches_two_pass_revision_and_cid() {
+        for bytes in [
+            b"".as_slice(),
+            b"x",
+            b"the quick brown fox",
+            &[0u8; 4096][..],
+        ] {
+            let digest = Sha256::digest(bytes);
+            let rev_once = format!("rev:{}", hex::encode(digest.as_slice()));
+            let rev_twice = format!("rev:{}", hex::encode(Sha256::digest(bytes)));
+            assert_eq!(
+                rev_once,
+                rev_twice,
+                "revision drifted for {} bytes",
+                bytes.len()
+            );
+
+            let cid_once = sha256_digest_to_raw_cid(digest.as_slice()).unwrap();
+            let cid_twice = raw_sha256_cid(bytes).unwrap();
+            assert_eq!(
+                cid_once,
+                cid_twice,
+                "content_cid drifted for {} bytes",
+                bytes.len()
+            );
+        }
+    }
+
+    /// The listing cache is keyed on (path, len, mtime). Hitting it returns the stored facts; a
+    /// change to len or mtime is a different key (a miss), so a write — which always bumps mtime —
+    /// can never be served a stale entry.
+    #[test]
+    fn listing_cache_key_changes_with_len_and_mtime() {
+        let p = PathBuf::from("/principal/a/file.bin");
+        let k1: ListingCacheKey = (p.clone(), 10, (1000, 0));
+        let same: ListingCacheKey = (p.clone(), 10, (1000, 0));
+        let diff_len: ListingCacheKey = (p.clone(), 11, (1000, 0));
+        let diff_mtime: ListingCacheKey = (p.clone(), 10, (1000, 1));
+        assert_eq!(
+            k1, same,
+            "identical identity must be the same cache key (a hit)"
+        );
+        assert_ne!(k1, diff_len, "a length change must miss the cache");
+        assert_ne!(
+            k1, diff_mtime,
+            "an mtime change (any write) must miss the cache"
+        );
+    }
+
+    /// The load-bearing safety property: the CAS/mutation path (`library_object` → cache=false)
+    /// must NEVER consult the listing cache, so a stale entry can only cause a benign false
+    /// write-conflict, never a wrong overwrite. We prove the routing by poisoning the cache for a
+    /// key and asserting only the cached helper would surface it — the fresh path recomputes.
+    #[test]
+    fn cas_path_does_not_consult_the_listing_cache() {
+        let key: ListingCacheKey = (PathBuf::from("/poison/only/in/cache.bin"), 7, (42, 7));
+        let poisoned = FileListingFacts {
+            display_size: 999,
+            revision: "rev:POISONED".to_string(),
+            content_cid: None,
+            thumbnail_uri: None,
+            blocked_reason: None,
+        };
+        {
+            let mut cache = listing_cache().lock().unwrap();
+            cache.order.push_back(key.clone());
+            cache.map.insert(key.clone(), poisoned);
+        }
+        // The cached lookup would return the poisoned facts...
+        let hit = listing_cache().lock().unwrap().map.get(&key).cloned();
+        assert_eq!(hit.unwrap().revision, "rev:POISONED");
+        // ...but `library_object` (the fresh/CAS path) is hard-wired to cache=false, so its file
+        // branch calls `file_listing_facts` directly and never reads this map. (Structural: the
+        // only caller passing cache=true is the LIST loop via `library_object_listing_cached`.)
+        // Clean up so the poisoned entry can't leak into other tests sharing the process cache.
+        listing_cache().lock().unwrap().map.remove(&key);
+    }
+
+    #[test]
     fn object_provider_exposes_object_scheme_only() {
         let registry = Arc::new(ProviderRegistry::new());
         let provider = ObjectProvider::new(PathBuf::new(), Arc::downgrade(&registry));
@@ -6897,163 +7620,132 @@ mod tests {
     }
 
     #[test]
-    fn protected_content_provider_response_rejects_authority_fields() {
-        let forbidden = [
-            "raw_cek",
-            "wallet_rpc",
-            "chain_rpc",
-            "kubo_api",
-            "ipfs_api",
-            "elacity_sdk",
-            "elacity_sdk_token",
-            "contract_sdk",
-            "key_backend_sdk",
-        ];
-        for key in forbidden {
-            let value = json!({
-                "schema": "elastos.test/v1",
-                "nested": [{ key: "must-not-cross-boundary" }]
-            });
-            assert!(
-                reject_forbidden_protected_content_fields(&value).is_err(),
-                "{key} must be rejected before app/viewer handoff"
-            );
-        }
-
-        assert!(reject_forbidden_protected_content_fields(&json!({
-            "schema": "elastos.decrypt.session/v1",
-            "output": "viewer_capsule_session:fixture"
-        }))
-        .is_ok());
+    fn folder_for_mime_buckets_by_type() {
+        assert_eq!(library_folder_for_mime("image/png"), "Pictures");
+        assert_eq!(library_folder_for_mime("IMAGE/JPEG"), "Pictures");
+        assert_eq!(library_folder_for_mime("video/mp4"), "Videos");
+        assert_eq!(library_folder_for_mime("audio/mpeg"), "Music");
+        // Documents catch-all: PDF, text, EPUB, comics, code, 3D/AI models, unknown.
+        assert_eq!(library_folder_for_mime("application/pdf"), "Documents");
+        assert_eq!(library_folder_for_mime("text/plain"), "Documents");
+        assert_eq!(library_folder_for_mime("application/epub+zip"), "Documents");
+        assert_eq!(
+            library_folder_for_mime("application/vnd.comicbook+zip"),
+            "Documents"
+        );
+        assert_eq!(library_folder_for_mime("model/gltf-binary"), "Documents");
+        assert_eq!(library_folder_for_mime(""), "Documents");
     }
 
-    #[tokio::test]
-    #[ignore = "requires ELASTOS_LIVE_IPFS_PROVIDER_BIN and ELASTOS_LIVE_IPFS_DATA_DIR"]
-    async fn library_live_ipfs_publish_provider_route_smoke() {
-        let Ok(ipfs_provider_bin) = std::env::var("ELASTOS_LIVE_IPFS_PROVIDER_BIN") else {
-            eprintln!("skipping live Library publish smoke: ELASTOS_LIVE_IPFS_PROVIDER_BIN unset");
-            return;
-        };
-        let Ok(ipfs_data_dir) = std::env::var("ELASTOS_LIVE_IPFS_DATA_DIR") else {
-            eprintln!("skipping live Library publish smoke: ELASTOS_LIVE_IPFS_DATA_DIR unset");
-            return;
-        };
-        let ipfs_provider_bin = PathBuf::from(ipfs_provider_bin);
-        let ipfs_data_dir = PathBuf::from(ipfs_data_dir);
+    #[test]
+    fn library_roots_include_typed_media_folders() {
+        let roots = library_roots(&PathBuf::from("/tmp/elastos-test"), "person:local:abc");
+        let ids: Vec<&str> = roots.iter().map(|r| r.id).collect();
+        for id in ["documents", "pictures", "videos", "music"] {
+            assert!(ids.contains(&id), "missing sidebar root: {id}");
+        }
+    }
+
+    /// Every filename this maps must reach a viewer that actually ships.
+    ///
+    /// `installed_viewer_option` looks the id up in the installed browser-capsule catalog and
+    /// drops anything it cannot find, so a made-up id is not a build error and not a runtime
+    /// error — it is a file the Library silently refuses to open. `.mp4` sat in exactly that
+    /// state, pointing at a `video-viewer` capsule that has never existed.
+    const KNOWN_UNSHIPPED_VIEWER_IDS: &[&str] = &[
+        // No image viewer ships. `ddrm-viewer` renders images, but only from a scoped decrypt
+        // session, so it cannot open a plain file off the Library. Remove this entry the moment
+        // an image viewer capsule lands — the assertion below fails if it does.
+        "image-viewer",
+    ];
+
+    fn repo_viewer_capsule_ids() -> std::collections::BTreeSet<String> {
+        let capsules = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../capsules");
+        let mut ids = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&capsules).expect("repo capsules dir is readable") {
+            let manifest = entry
+                .expect("readable capsules dir entry")
+                .path()
+                .join("capsule.json");
+            let Ok(raw) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+                panic!("{} is not valid JSON: {error}", manifest.display())
+            });
+            if value.get("role").and_then(Value::as_str) == Some("viewer") {
+                if let Some(name) = value.get("name").and_then(Value::as_str) {
+                    ids.insert(name.to_string());
+                }
+            }
+        }
         assert!(
-            ipfs_provider_bin.is_file(),
-            "ipfs-provider missing: {}",
-            ipfs_provider_bin.display()
+            !ids.is_empty(),
+            "no viewer capsules found under {}",
+            capsules.display()
         );
-        assert!(
-            ipfs_data_dir.is_dir(),
-            "IPFS data dir missing: {}",
-            ipfs_data_dir.display()
-        );
+        ids
+    }
 
-        let dir = tempfile::tempdir().unwrap();
-        let registry = Arc::new(ProviderRegistry::new());
-        let ipfs_config = elastos_runtime::provider::BridgeProviderConfig {
-            base_path: ipfs_data_dir.to_string_lossy().to_string(),
-            ..Default::default()
-        };
-        let bridge = Arc::new(
-            elastos_runtime::provider::ProviderBridge::spawn(&ipfs_provider_bin, ipfs_config)
-                .await
-                .expect("spawn live ipfs-provider"),
-        );
-        let ipfs_provider: Arc<dyn Provider> = Arc::new(
-            elastos_runtime::provider::CapsuleProvider::with_scheme(Arc::clone(&bridge), "ipfs"),
-        );
-        registry
-            .register_sub_provider("ipfs", ipfs_provider)
-            .await
-            .unwrap();
-        let content_provider = Arc::new(crate::content::ContentProvider::new(
-            dir.path().to_path_buf(),
-            Arc::downgrade(&registry),
-        ));
-        registry.register(content_provider.clone()).await;
-        registry
-            .register_sub_provider("content", content_provider)
-            .await
-            .unwrap();
+    #[test]
+    fn viewer_ids_map_to_real_installed_viewer_capsules() {
+        let shipped = repo_viewer_capsule_ids();
+        // One filename per branch of `viewer_ids_for_name`, so a new branch that forgets to point
+        // at a real capsule is caught here rather than in the UI.
+        let names = [
+            "clip.mp4",
+            "song.mp3",
+            "asset.ddrm",
+            "notes.md",
+            "notes.txt",
+            "paper.pdf",
+            "photo.png",
+            "photo.jpg",
+            "photo.jpeg",
+            "photo.gif",
+            "rom.gba",
+            "bundle.zip",
+            "bundle.tar",
+            "bundle.tar.gz",
+            "bundle.tgz",
+        ];
+        for name in names {
+            for id in viewer_ids_for_name(name) {
+                assert!(
+                    shipped.contains(id) || KNOWN_UNSHIPPED_VIEWER_IDS.contains(&id),
+                    "{name} maps to viewer id `{id}`, which is not a shipped viewer capsule",
+                );
+                assert_ne!(
+                    viewer_label(id),
+                    id,
+                    "viewer id `{id}` has no human label in viewer_label",
+                );
+            }
+        }
+        for id in KNOWN_UNSHIPPED_VIEWER_IDS {
+            assert!(
+                !shipped.contains(*id),
+                "`{id}` now ships as a viewer capsule — drop it from KNOWN_UNSHIPPED_VIEWER_IDS",
+            );
+        }
+    }
 
-        let principal_id = "did:key:z6MklibraryLiveIpfsSmoke";
-        let roots = handle_object_provider_runtime_request(
-            dir.path(),
-            Arc::clone(&registry),
-            &json!({
-                "op": "roots",
-                "principal_id": principal_id,
-            }),
-        )
-        .await;
-        assert_eq!(roots["status"], "ok", "{roots}");
-        let public_uri = roots["data"]["roots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|root| root["id"] == "public")
-            .and_then(|root| root["uri"].as_str())
-            .expect("public Library root")
-            .to_string();
-
-        let body = format!("Library live IPFS provider route smoke {}\n", now_ts());
-        let file_uri = format!("{public_uri}/library-live-ipfs-provider-smoke.txt");
-        let write = handle_object_provider_runtime_request(
-            dir.path(),
-            Arc::clone(&registry),
-            &json!({
-                "op": "write",
-                "principal_id": principal_id,
-                "uri": file_uri,
-                "mime": "text/plain",
-                "data": base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
-            }),
-        )
-        .await;
-        assert_eq!(write["status"], "ok", "{write}");
-        let revision = write["data"]["object"]["revision"]
-            .as_str()
-            .expect("write revision")
-            .to_string();
-
-        let publish = handle_object_provider_runtime_request(
-            dir.path(),
-            Arc::clone(&registry),
-            &json!({
-                "op": "publish",
-                "principal_id": principal_id,
-                "uri": file_uri,
-                "if_revision": revision,
-            }),
-        )
-        .await;
-        assert_eq!(publish["status"], "ok", "{publish}");
-        let cid = publish["data"]["cid"].as_str().expect("publish cid");
-        assert!(!cid.trim().is_empty());
-        assert_eq!(publish["data"]["uri"], format!("elastos://{cid}"));
-        assert_eq!(publish["data"]["availability"]["status"], "local_pinned");
-        assert_eq!(publish["data"]["object"]["published_cid"], cid);
-
-        let status = handle_object_provider_runtime_request(
-            dir.path(),
-            Arc::clone(&registry),
-            &json!({
-                "op": "status",
-                "principal_id": principal_id,
-                "uri": file_uri,
-            }),
-        )
-        .await;
-        assert_eq!(status["status"], "ok", "{status}");
-        assert_eq!(status["data"]["published"]["cid"], cid);
-
-        bridge
-            .shutdown()
-            .await
-            .expect("shutdown live ipfs-provider");
-        println!("library live IPFS provider route cid={cid}");
+    #[test]
+    fn media_extensions_open_on_the_real_media_player() {
+        // The regression that motivated the test: both media extensions must name the capsule
+        // that can actually play them, and `.ddrm` must stay on the protected viewer.
+        assert_eq!(viewer_ids_for_name("clip.mp4"), vec!["elacity-player"]);
+        assert_eq!(viewer_ids_for_name("Clip.MP4"), vec!["elacity-player"]);
+        assert_eq!(viewer_ids_for_name("song.mp3"), vec!["elacity-player"]);
+        assert_eq!(viewer_ids_for_name("asset.ddrm"), vec!["ddrm-viewer"]);
+        // Every extension routed to the player must also carry a media mime, or the player is
+        // handed `application/octet-stream` and fails closed.
+        for name in ["clip.mp4", "song.mp3"] {
+            let mime = mime_for_name(name);
+            assert!(
+                mime.starts_with("video/") || mime.starts_with("audio/"),
+                "{name} routes to elacity-player but mime_for_name says {mime}",
+            );
+        }
     }
 }

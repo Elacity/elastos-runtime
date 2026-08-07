@@ -487,14 +487,27 @@ pub async fn revoke_capability(
     // Check if it was granted
     match &request.status {
         elastos_runtime::capability::RequestStatus::Granted { token, .. } => {
-            // Revoke the token
-            state
+            // Revoke the token. Revocation now returns a Result (the audit append can
+            // refuse); a failure here means the revocation was NOT durably recorded, so
+            // surface it loudly rather than reporting success on a silent no-op.
+            if let Err(err) = state
                 .capability_manager
                 .revoke(*token.id(), "Revoked by user via API")
-                .await;
+                .await
+            {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Capability revocation failed: {err}"),
+                ));
+            }
 
             // Mark the request as revoked in the pending store
-            state.pending_store.revoke_request(&request_id).await;
+            if let Err(err) = state.pending_store.revoke_request(&request_id).await {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Capability revocation failed: {err}"),
+                ));
+            }
 
             Ok(Json(RevokeCapabilityOutput {
                 success: true,
@@ -541,8 +554,12 @@ pub async fn revoke_all_capabilities(
 ) -> Json<RevokeAllOutput> {
     let new_epoch = state.capability_manager.revoke_all(&input.reason);
 
-    // Mark all granted requests as revoked
-    state.pending_store.revoke_all_granted().await;
+    // Mark all granted requests as revoked. The epoch bump above already invalidates
+    // every outstanding token, so a store-marking failure cannot leave authority live —
+    // log it rather than failing the epoch revocation that already took effect.
+    if let Err(err) = state.pending_store.revoke_all_granted().await {
+        tracing::error!("failed to mark granted requests revoked after epoch bump: {err}");
+    }
 
     Json(RevokeAllOutput {
         success: true,

@@ -47,6 +47,29 @@ impl SignatureVerifier {
         Ok(())
     }
 
+    /// Build a verifier from an iterator of hex-encoded trusted keys, FAIL-CLOSED.
+    ///
+    /// This is the AUD-1 activation seed: the author-signature launch gate becomes
+    /// enabled (and fail-closed at launch) exactly when the founder configures
+    /// `trusted_keys`. Semantics, all-or-nothing:
+    /// - an EMPTY iterator yields a DISABLED verifier (`is_enabled() == false`) — the
+    ///   gate stays inert and launches are byte-for-byte unchanged;
+    /// - a single malformed/invalid-length/bad-point hex key returns `Err`, so the
+    ///   caller (serve startup) aborts LOUDLY rather than proceeding with a PARTIAL or
+    ///   empty keyset that would fail OPEN. Either every configured key is trusted, or
+    ///   the process refuses to start.
+    pub fn from_trusted_keys_hex<I, S>(keys: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut verifier = Self::new();
+        for key in keys {
+            verifier.add_trusted_key_hex(key.as_ref())?;
+        }
+        Ok(verifier)
+    }
+
     /// Load trusted keys from a file (one hex-encoded key per line)
     pub fn load_trusted_keys(&mut self, path: &Path) -> Result<usize> {
         let content = std::fs::read_to_string(path)?;
@@ -73,10 +96,20 @@ impl SignatureVerifier {
         self.trusted_keys.len()
     }
 
-    /// Verify a capsule's signature
+    /// Verify a capsule's signature, returning the matched trusted key.
+    ///
+    /// Returns `Ok(Some(key))` when a trusted key's real ed25519 check passes (so
+    /// the caller learns WHICH trusted key signed — the only honest signer
+    /// evidence the keyset carries; there is no DID in the manifest or keyset),
+    /// `Ok(None)` when no trusted key matches (including when none are
+    /// configured), and `Err` on a structurally invalid/missing signature.
     ///
     /// The signature covers: SHA256(manifest_json_without_signature) || SHA256(content)
-    pub fn verify_capsule(&self, manifest: &CapsuleManifest, content_hash: &[u8]) -> Result<bool> {
+    pub fn verify_capsule_signer(
+        &self,
+        manifest: &CapsuleManifest,
+        content_hash: &[u8],
+    ) -> Result<Option<VerifyingKey>> {
         let signature_b64 = manifest
             .signature
             .as_ref()
@@ -92,14 +125,23 @@ impl SignatureVerifier {
         // Build the message that was signed
         let message = build_signing_message(manifest, content_hash)?;
 
-        // Try each trusted key
+        // Try each trusted key; return the one that verifies.
         for key in &self.trusted_keys {
             if key.verify(&message, &signature).is_ok() {
-                return Ok(true);
+                return Ok(Some(*key));
             }
         }
 
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Verify a capsule's signature (boolean). Thin wrapper over
+    /// [`SignatureVerifier::verify_capsule_signer`] so there is one canonical
+    /// verify path.
+    pub fn verify_capsule(&self, manifest: &CapsuleManifest, content_hash: &[u8]) -> Result<bool> {
+        Ok(self
+            .verify_capsule_signer(manifest, content_hash)?
+            .is_some())
     }
 
     /// Check if verification is enabled (has trusted keys)
@@ -122,7 +164,17 @@ fn build_signing_message(manifest: &CapsuleManifest, content_hash: &[u8]) -> Res
     let mut manifest_for_hash = manifest.clone();
     manifest_for_hash.signature = None;
 
-    let manifest_json = serde_json::to_string(&manifest_for_hash).map_err(|e| {
+    // Canonicalize the signed form (AUD-1): round-trip through serde_json::Value so
+    // EVERY object key serializes in deterministic sorted order. The manifest's
+    // `providers` is a HashMap whose iteration order is process-random, so a direct
+    // to_string would sign in one process and FALSE-FAIL verification in another for
+    // any capsule with >=2 providers. serde_json::Value's object map is a sorted
+    // BTreeMap (preserve_order is off in this workspace), so to_value -> to_string is
+    // a stable canonical form used identically by sign and verify.
+    let manifest_value = serde_json::to_value(&manifest_for_hash).map_err(|e| {
+        ElastosError::InvalidManifest(format!("Failed to serialize manifest: {}", e))
+    })?;
+    let manifest_json = serde_json::to_string(&manifest_value).map_err(|e| {
         ElastosError::InvalidManifest(format!("Failed to serialize manifest: {}", e))
     })?;
 
@@ -164,6 +216,18 @@ pub fn hash_content(content: &[u8]) -> Vec<u8> {
     Sha256::digest(content).to_vec()
 }
 
+/// A short, non-secret fingerprint of a trusted public key: the first 16 hex
+/// chars of SHA-256(pubkey). This is the honest "verified signer" identity the
+/// ed25519 keyset can yield — never the self-asserted manifest author, never the
+/// raw signature bytes.
+pub fn key_fingerprint(key: &VerifyingKey) -> String {
+    Sha256::digest(key.to_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +260,122 @@ mod tests {
             viewer: None,
             signature: None,
         }
+    }
+
+    #[test]
+    fn signed_manifest_with_multiple_providers_verifies_across_serialization() {
+        // AUD-1 determinism: `providers` is a HashMap (process-random iteration order).
+        // The signed form is canonicalized (sorted keys), so a manifest signed in one
+        // process verifies after a serialize -> deserialize round-trip (the real
+        // sign-in-trust_cmd / verify-at-launch boundary), even with many providers.
+        let (signing_key, verifying_key) = generate_keypair();
+        let mut manifest = create_test_manifest();
+        let mut providers = std::collections::HashMap::new();
+        for k in ["zeta", "alpha", "mike", "bravo", "yankee", "delta"] {
+            providers.insert(k.to_string(), format!("vm-{k}"));
+        }
+        manifest.providers = Some(providers);
+        let content_hash = hash_content(b"entrypoint bytes");
+        sign_capsule(&signing_key, &mut manifest, &content_hash).unwrap();
+
+        // Cross-process boundary: serialize the signed manifest and deserialize a FRESH
+        // copy (a new HashMap whose iteration order may differ from the signer's).
+        let json = serde_json::to_string(&manifest).unwrap();
+        let reparsed: CapsuleManifest = serde_json::from_str(&json).unwrap();
+
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(verifying_key);
+        assert_eq!(
+            verifier
+                .verify_capsule_signer(&reparsed, &content_hash)
+                .unwrap(),
+            Some(verifying_key),
+            "a multi-provider signed manifest must verify after a serialize/deserialize round-trip"
+        );
+    }
+
+    // ── Flint G2 (loop 3a): verified-signer capability ───────────────
+
+    #[test]
+    fn verify_capsule_signer_returns_the_matched_key() {
+        let (signing_key, verifying_key) = generate_keypair();
+        let mut manifest = create_test_manifest();
+        let content_hash = hash_content(b"hello world");
+        sign_capsule(&signing_key, &mut manifest, &content_hash).unwrap();
+
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(verifying_key);
+
+        // A real ed25519 check resolves the exact trusted key that signed.
+        let signer = verifier
+            .verify_capsule_signer(&manifest, &content_hash)
+            .unwrap();
+        assert_eq!(
+            signer,
+            Some(verifying_key),
+            "must return the matched trusted key"
+        );
+
+        // The fingerprint is a stable, 16-hex, non-secret signer identity.
+        let fp = key_fingerprint(&verifying_key);
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, key_fingerprint(&verifying_key), "fingerprint is stable");
+    }
+
+    #[test]
+    fn verify_capsule_bool_wrapper_matches_signer_across_cases() {
+        // One canonical verify path: the bool wrapper must agree with the signer
+        // method on every case, and "Some/true" must come from a real check.
+        let (signing_key, verifying_key) = generate_keypair();
+        let (_other_sk, other_vk) = generate_keypair();
+        let mut manifest = create_test_manifest();
+        let content_hash = hash_content(b"payload");
+        sign_capsule(&signing_key, &mut manifest, &content_hash).unwrap();
+
+        let mut trusted = SignatureVerifier::new();
+        trusted.add_trusted_key(verifying_key);
+        // Trusted key present -> true / Some.
+        assert!(trusted.verify_capsule(&manifest, &content_hash).unwrap());
+        assert_eq!(
+            trusted.verify_capsule(&manifest, &content_hash).unwrap(),
+            trusted
+                .verify_capsule_signer(&manifest, &content_hash)
+                .unwrap()
+                .is_some()
+        );
+
+        // Untrusted key -> false / None (verification, not presence).
+        let mut wrong = SignatureVerifier::new();
+        wrong.add_trusted_key(other_vk);
+        assert!(!wrong.verify_capsule(&manifest, &content_hash).unwrap());
+        assert!(wrong
+            .verify_capsule_signer(&manifest, &content_hash)
+            .unwrap()
+            .is_none());
+
+        // No trusted keys (dev bypass surface) -> false / None.
+        let empty = SignatureVerifier::new();
+        assert!(!empty.verify_capsule(&manifest, &content_hash).unwrap());
+        assert!(empty
+            .verify_capsule_signer(&manifest, &content_hash)
+            .unwrap()
+            .is_none());
+
+        // Tampered content -> false / None (signature is domain-bound).
+        let tampered = hash_content(b"different");
+        assert!(!trusted.verify_capsule(&manifest, &tampered).unwrap());
+        assert!(trusted
+            .verify_capsule_signer(&manifest, &tampered)
+            .unwrap()
+            .is_none());
+
+        // Missing signature -> both Err (fail closed identically).
+        let unsigned = create_test_manifest();
+        assert!(trusted.verify_capsule(&unsigned, &content_hash).is_err());
+        assert!(trusted
+            .verify_capsule_signer(&unsigned, &content_hash)
+            .is_err());
     }
 
     #[test]
@@ -291,6 +471,47 @@ mod tests {
         verifier.add_trusted_key_hex(&hex_key).unwrap();
 
         assert_eq!(verifier.trusted_key_count(), 1);
+    }
+
+    #[test]
+    fn from_trusted_keys_hex_empty_is_disabled() {
+        // No configured keys ⇒ AUD-1 gate stays inert (launches byte-for-byte unchanged).
+        let verifier = SignatureVerifier::from_trusted_keys_hex(Vec::<String>::new()).unwrap();
+        assert!(
+            !verifier.is_enabled(),
+            "an empty keyset must leave the gate disabled"
+        );
+        assert_eq!(verifier.trusted_key_count(), 0);
+    }
+
+    #[test]
+    fn from_trusted_keys_hex_valid_keys_enable_the_gate() {
+        let (_, vk1) = generate_keypair();
+        let (_, vk2) = generate_keypair();
+        let keys = vec![hex::encode(vk1.as_bytes()), hex::encode(vk2.as_bytes())];
+        let verifier = SignatureVerifier::from_trusted_keys_hex(keys).unwrap();
+        assert!(
+            verifier.is_enabled(),
+            "configured keys must enable the gate"
+        );
+        assert_eq!(verifier.trusted_key_count(), 2);
+    }
+
+    #[test]
+    fn from_trusted_keys_hex_fails_closed_on_a_malformed_key() {
+        // A single bad entry must abort the build (Err) — never a PARTIAL keyset that
+        // would fail OPEN. A valid key before the bad one does not rescue it.
+        let (_, vk) = generate_keypair();
+        let keys = vec![hex::encode(vk.as_bytes()), "nothex".to_string()];
+        assert!(
+            SignatureVerifier::from_trusted_keys_hex(keys).is_err(),
+            "a malformed trusted key must fail closed, not yield a partial verifier"
+        );
+        // Valid hex but wrong byte length also fails closed (not a 32-byte ed25519 key).
+        assert!(
+            SignatureVerifier::from_trusted_keys_hex(vec!["deadbeef"]).is_err(),
+            "a wrong-length key must fail closed"
+        );
     }
 
     #[test]

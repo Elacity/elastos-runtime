@@ -50,11 +50,14 @@ impl SecureTimestamp {
 
     /// Create a timestamp in the future (for expiry)
     pub fn after_secs(secs: u64) -> Self {
+        // Saturating: a caller-supplied ttl near u64::MAX must not overflow (a debug-build panic /
+        // release wrap-to-the-past). Saturating to u64::MAX yields the far-future "effectively
+        // never" expiry the caller asked for — red-team F5, Sprint 15.
         let unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
-            + secs;
+            .saturating_add(secs);
         let monotonic_seq = MONOTONIC_COUNTER.fetch_add(1, Ordering::SeqCst);
         Self {
             unix_secs,
