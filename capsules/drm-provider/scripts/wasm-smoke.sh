@@ -8,7 +8,7 @@
 # non-sealed objects rejected, and a valid open emits ONLY the executable
 # DrmOpenPlanV1 (Day 67: `status: planned` — the plan the runtime host executes)
 # with NO session and NO key material; the rights/key/decrypt providers do the
-# actual work (see docs/convergence/DDRM_DECRYPT_RAIL.md).
+# actual work (see docs/dkms/history/DDRM_DECRYPT_RAIL.md).
 #
 # Usage: capsules/drm-provider/scripts/wasm-smoke.sh
 # Exit code: 0 if all cases pass, 1 otherwise.

@@ -7,7 +7,7 @@
 # fail-closed security contract holds in the sandbox: blocked raw authority
 # advertised, malformed input rejected, denied/mismatched rights receipts
 # rejected, and valid releases fail closed (not_configured) until the PQ-hybrid
-# dKMS backend exists (see docs/convergence/DDRM_DECRYPT_RAIL.md).
+# dKMS backend exists (see docs/dkms/history/DDRM_DECRYPT_RAIL.md).
 #
 # Usage: capsules/key-provider/scripts/wasm-smoke.sh
 # Exit code: 0 if all cases pass, 1 otherwise.

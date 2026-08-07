@@ -7,7 +7,7 @@
 # fail-closed security contract holds in the sandbox: blocked chain/wallet/key
 # authority advertised, malformed input and unsupported actions rejected, and
 # valid rights questions fail closed (not_configured) until the dDRM/chain policy
-# backend exists (see docs/convergence/DDRM_DECRYPT_RAIL.md).
+# backend exists (see docs/dkms/history/DDRM_DECRYPT_RAIL.md).
 #
 # Usage: capsules/rights-provider/scripts/wasm-smoke.sh
 # Exit code: 0 if all cases pass, 1 otherwise.

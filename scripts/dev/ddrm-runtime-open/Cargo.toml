@@ -10,7 +10,7 @@ publish = false
 # content id, publish-escrow fixture, mode) — NO smoke assembles the host. The producer's
 # escrow is a publish-time fixture this binary reads, not inline code. `ddrm-consumer-smoke.sh`
 # is now a thin caller that writes a config and INVOKES this binary.
-# See scripts/ddrm-consumer-smoke.sh and docs/convergence/SYSTEM_ARCHITECTURE_MAP.md.
+# See scripts/ddrm-consumer-smoke.sh and docs/dkms/history/SYSTEM_ARCHITECTURE_MAP.md.
 
 [[bin]]
 name = "ddrm-runtime-open"

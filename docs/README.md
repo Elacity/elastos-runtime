@@ -14,6 +14,9 @@ Each top-level ledger has one job:
 - [Getting started](GETTING_STARTED.md): user installation and source development
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
 - [Glossary](GLOSSARY.md): canonical terminology
+- [dKMS / dDRM / commerce hub](dkms/README.md): the onboarding entry for key
+  custody, content protection, and the commerce rail — start there for anything
+  protected-content, then follow its reading path
 
 ## Architecture and core model
 
@@ -26,6 +29,8 @@ Each top-level ledger has one job:
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
   discovery, and current Chat integration
 - [Design system](DESIGN_SYSTEM.md): first-party visual and interaction contract
+- [Confidential compute](CONFIDENTIAL_COMPUTE.md): TEE and hardware-enclave
+  direction; forward design, nothing implemented yet
 
 ## Runtime and interface contracts
 
@@ -60,6 +65,12 @@ Each top-level ledger has one job:
 - [Key provider](KEY_PROVIDER.md): protected content key release
 - [Decrypt provider](DECRYPT_PROVIDER.md): decrypt and render sessions
 - [Archive policy](ARCHIVE_POLICY.md): archive dependencies and family enablement
+- [DRM marketplace rail](DRM_MARKETPLACE_RAIL.md): marketplace payment rail
+  wiring, operator runbook, and honest bounds
+- [Payment endpoint contract](PAYMENT_ENDPOINT_CONTRACT.md): what an HTTPS
+  payment endpoint must honor
+- [Asset tiers](ASSET_TIERS.md): the 5-tier containment model and marketplace
+  asset taxonomy
 
 ## Browser contracts and decisions
 
@@ -73,11 +84,27 @@ Each top-level ledger has one job:
 - [0.6.0 release acceptance](RUNTIME_REPO_USER_STORY_CHECKLIST.md): source,
   installed-product, and release decision checklist
 - [Mac source-home staging](MAC.md): Apple silicon staging and Browser acceptance
+- [Home shell on macOS](RUN_HOME_MACOS.md): repeatable browser Home shell and
+  passkey login runbook
 - [Inspector testing](INSPECTOR_TESTING.md): local Inspector checks
 - [Sites](SITES.md): local site roots and public exposure
 - [Scripts](../scripts/README.md): build, proof, release, and operator commands
 - [Debugging](../DEBUG.md): developer diagnostics
 - [Security](../SECURITY.md): reporting policy and verified security findings
+
+## Audits and ledgers
+
+- [Known gaps](KNOWN_GAPS.md): the build-visible gap registry every open and
+  closed gap lands in
+- [Principles conformance](PRINCIPLES_CONFORMANCE.md): where code holds or
+  breaks [PRINCIPLES.md](../PRINCIPLES.md), ranked
+- [Capability audit](CAPABILITY_AUDIT.md): capability enforcement architecture,
+  what is proven, and the gaps
+- [Security audit](SECURITY_AUDIT.md): crypto correctness, identity binding,
+  secrets hygiene, and memory safety findings
+- [Code quality ledger](CODE_QUALITY_LEDGER.md): deferred structural cleanups
+- [ADR 0001](adr/0001-extract-app-and-service-logic-from-trusted-core.md):
+  shrink the trusted core by moving app and service logic into capsules
 
 ## Versioning
 

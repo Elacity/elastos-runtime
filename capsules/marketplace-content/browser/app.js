@@ -705,7 +705,7 @@
   }
 
   // NOTE: minting lives in the runtime's `creator` capsule, not here. The marketplace is buy/trade only.
-  // (Removed the in-shell Studio mint wizard — see docs/marketplace/SCOPE.md.)
+  // (Removed the in-shell Studio mint wizard — see docs/dkms/COMMERCE.md.)
 
   // ---- routing ----
   function router() {

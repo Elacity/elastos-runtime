@@ -42,6 +42,9 @@ elastos/storage/
 artifacts/
 artifacts-aarch64/
 
+# Local scratch build tree (vendored linux kernel source, cargo output, etc.)
+build/
+
 # Secrets and credentials
 .env
 *.pem
@@ -53,9 +56,8 @@ credentials.json
 # Cache
 .elastos/
 
-# Claude Code (user-specific settings; shared skills are tracked)
-.claude/*
-!.claude/skills/
+# Claude Code (user-specific settings)
+.claude/
 
 # External dependencies
 puter-upstream/

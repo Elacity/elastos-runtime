@@ -351,6 +351,22 @@ the public repository.
 - Final public installed-path proof waits for publishing the 0.6.0
   binary/artifact set.
 
+## Canonical Journey Proofs
+
+These reusable proof paths carried over from the flint baseline and remain the
+named acceptance commands for their journeys (the alignment gate pins them here
+so the ledger and the proofs cannot drift apart):
+
+- `scripts/local-identity-profile-smoke.sh` / `scripts/public-install-identity-smoke.sh`
+  — DID/profile proof path (source-local and installed-path).
+- `scripts/public-install-operator-smoke.sh` — installed-path operator-node
+  status/update acceptance path.
+- `scripts/audit-linux-runtime-portability.sh` — explicit public Linux runtime
+  portability proof (with `just verify-release` as the release-trust gate).
+- `scripts/protected-content-provider-contract-smoke.sh` — protected-content
+  provider boundary proof over the real DRM/rights/key/decrypt JSON line
+  protocols.
+
 ## Open Blockers
 
 - Product Browser completion is not claimed.

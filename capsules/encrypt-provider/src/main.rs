@@ -18,7 +18,7 @@
 //! piece PC2 does in the *host* today is CEK/KID generation
 //! (`dashPackager.ts::generateCEK` → `crypto.randomBytes`). This provider exists
 //! to close that gap by moving generation in-boundary. See
-//! `docs/convergence/DDRM_ENCRYPT_INVARIANT.md`.
+//! `docs/dkms/history/DDRM_ENCRYPT_INVARIANT.md`.
 //!
 //! Until the real in-boundary engine (keygen + CENC encrypt + CEK sealing) is
 //! wired, every operation validates fully and then fails closed.

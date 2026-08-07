@@ -68,7 +68,7 @@ echo
 
 if [[ $failures -eq 0 ]]; then
   echo "dDRM chain: ALL PROVIDERS PASS — fail-closed + wasm/WASI-proven end-to-end."
-  echo "(Live decrypt remains gated on the CEK/ciphertext rail; see docs/convergence/DDRM_DECRYPT_RAIL.md)"
+  echo "(Live decrypt remains gated on the CEK/ciphertext rail; see docs/dkms/history/DDRM_DECRYPT_RAIL.md)"
   exit 0
 fi
 echo "dDRM chain: ${failures} provider(s) FAILED" >&2

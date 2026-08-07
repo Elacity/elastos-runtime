@@ -11,7 +11,7 @@
 #
 # It also prints the `encrypt-provider` self-contained types as the explicit
 # "reconcile me to elastos-common once 0.4.0 stabilises" list (see
-# docs/convergence/DDRM_ENCRYPT_INVARIANT.md).
+# docs/dkms/history/DDRM_ENCRYPT_INVARIANT.md).
 #
 # Usage:
 #   scripts/ddrm-drift-check.sh
@@ -149,7 +149,7 @@ echo "    producer algorithm set is checked by the shared validator."
 echo "  Remaining local-by-design: the encrypt INPUT SealRequest — there is no"
 echo "    shared seal-request type yet. If one is added to protected_content"
 echo "    (e.g. EncryptSealRequestV1), pin it above and adopt it here."
-echo "  Tracking: docs/convergence/DDRM_ENCRYPT_INVARIANT.md"
+echo "  Tracking: docs/dkms/history/DDRM_ENCRYPT_INVARIANT.md"
 
 echo
 if [[ "$fail" -eq 0 ]]; then

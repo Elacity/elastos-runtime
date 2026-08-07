@@ -3,7 +3,7 @@
 //! The inverse-discipline twin of `buy_authority`: PURE — no RPC, no keys, no signing. It builds the
 //! UNSIGNED `eth_sendTransaction`-shaped calldata for the ERC-1155 access-token resale flow and hands it
 //! to `wallet-provider` for a human-approved signature (Principle 16). Selectors are keccak-pinned and were
-//! confirmed PRESENT in the deployed Base AuthorityGateway / Operative bytecode (docs/marketplace/CONTRACTS.md
+//! confirmed PRESENT in the deployed Base AuthorityGateway / Operative bytecode (docs/dkms/COMMERCE_CONTRACTS.md
 //! and verify-selectors.mjs). The caller must FIRST re-verify ownership live (`hasAccessByContentId`) and resolve
 //! the real ledger `tokenId` — same Phase-1 discipline as buy.
 //!

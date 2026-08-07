@@ -1,0 +1,29 @@
+{
+  "_comment": "elastos.dkms.authority/v2 — PUBLIC-ONLY descriptor for a 2-of-3 quorum. Lives on the RUNTIME host. Contains NO secret (a master/recipient secret is REJECTED by the parser). nodes[0] MUST equal the top-level identity. All three verifying_key_b64 MUST be distinct. Fill each node block from `dkms-preflight.sh identity` run on that node, and set authority_endpoint to that node's tcp: address on the private mesh.",
+  "schema": "elastos.dkms.authority/v2",
+
+  "verifying_key_b64": "__NODE_A_VERIFYING_KEY_B64__",
+  "recipient_pub_b64": "__NODE_A_RECIPIENT_PUB_B64__",
+  "authority_endpoint": "tcp:__NODE_A_WG_IP__:__NODE_A_PORT__",
+
+  "threshold": {
+    "t": 2,
+    "nodes": [
+      {
+        "verifying_key_b64": "__NODE_A_VERIFYING_KEY_B64__",
+        "recipient_pub_b64": "__NODE_A_RECIPIENT_PUB_B64__",
+        "authority_endpoint": "tcp:__NODE_A_WG_IP__:__NODE_A_PORT__"
+      },
+      {
+        "verifying_key_b64": "__NODE_B_VERIFYING_KEY_B64__",
+        "recipient_pub_b64": "__NODE_B_RECIPIENT_PUB_B64__",
+        "authority_endpoint": "tcp:__NODE_B_WG_IP__:__NODE_B_PORT__"
+      },
+      {
+        "verifying_key_b64": "__NODE_C_VERIFYING_KEY_B64__",
+        "recipient_pub_b64": "__NODE_C_RECIPIENT_PUB_B64__",
+        "authority_endpoint": "tcp:__NODE_C_WG_IP__:__NODE_C_PORT__"
+      }
+    ]
+  }
+}

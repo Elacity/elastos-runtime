@@ -1,4 +1,4 @@
-/* api.js — the /api/market/* client. Canonical contract: docs/marketplace/API_CONTRACT.md (the SSOT both
+/* api.js — the /api/market/* client. Canonical contract: docs/dkms/COMMERCE_API.md (the SSOT both
  * this shell and the gateway converge on). Falls back to MOCK so the shell runs standalone for review.
  *
  * BUILT (served by gateway.rs today; a call may set live=true):

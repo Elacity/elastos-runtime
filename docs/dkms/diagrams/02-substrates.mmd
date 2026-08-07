@@ -1,0 +1,29 @@
+flowchart LR
+    subgraph TIERS["Isolation tiers (same Capsule Runtime contract)"]
+        direction TB
+        T1["WASM / WASI<br/>UI + viewers<br/>(elacity-player, ddrm-viewer, chat-wasm)"]
+        T2["microVM<br/>hardware-isolated providers<br/>(decrypt, key, dkms…)"]
+        T3["host subprocess<br/>stdio JSON providers<br/>(dev / service plane)"]
+    end
+
+    subgraph LINUX["Linux host"]
+        KVM["crosvm + /dev/kvm<br/>virtio-serial bridge<br/>TAP only if explicitly needed"]
+    end
+
+    subgraph MAC["macOS host (today)"]
+        WASMMAC["WASM sandbox"]
+        PROC["process boundary<br/>(subprocess providers)"]
+        VZ["Apple Virtualization.framework<br/>(vz) — PROBED, future microVM backend"]
+    end
+
+    T2 --> KVM
+    T1 --> WASMMAC
+    T3 --> PROC
+    T2 -. "planned parity" .-> VZ
+
+    classDef l fill:#1565c0,color:#fff;
+    classDef m fill:#455a64,color:#fff;
+    classDef probe fill:#9e9e9e,color:#fff,stroke-dasharray: 5 5;
+    class KVM l;
+    class WASMMAC,PROC m;
+    class VZ probe;

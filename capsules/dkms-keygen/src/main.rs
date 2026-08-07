@@ -1,5 +1,5 @@
 //! `dkms-keygen` — operator-console tool for the dKMS deployment kit
-//! (`docs/convergence/dkms-deploy/`).
+//! (`docs/dkms/deploy/`).
 //!
 //! Mints the two NON-NODE identities the deployment references, using the runtime's OWN crypto as
 //! the single source of truth: `ddrm_envelope::seal::mldsa_seal_keypair` (ML-DSA-65 / FIPS 204,

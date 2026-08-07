@@ -4,7 +4,7 @@
 //! This captures, as executable + tested code, the exact wire contract by which
 //! a Content Encryption Key (CEK) is sealed to this provider's session keypair
 //! and unwrapped *inside* the provider. It is the concrete shape of the dDRM
-//! decrypt "rail" (Option A in `docs/convergence/DDRM_DECRYPT_RAIL.md`): the
+//! decrypt "rail" (Option A in `docs/dkms/history/DDRM_DECRYPT_RAIL.md`): the
 //! decrypt boundary RECEIVES VM/session-sealed material rather than reaching out
 //! for it.
 //!

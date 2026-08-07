@@ -16,7 +16,7 @@ use std::io::{self, BufRead, Write};
 
 // CENC/AES-128-CTR decrypt engine vendored from PC2 `cenc-decrypt`. Held here as a
 // provider-internal backend; wired into open_session/render behind the fail-closed
-// contract in a later step (see docs/convergence/CONVERGENCE_PLAYBOOK.md §6).
+// contract in a later step (see docs/dkms/history/CONVERGENCE_PLAYBOOK.md §6).
 #[allow(dead_code)]
 mod cenc;
 mod envelope;
@@ -1556,7 +1556,7 @@ fn audited_response(
 
 /// Decrypt a protected-content segment using session material (the decrypt-step core).
 ///
-/// Branch-by-Abstraction seam (see `docs/convergence/DDRM_DECRYPT_RAIL.md`): this is the
+/// Branch-by-Abstraction seam (see `docs/dkms/history/DDRM_DECRYPT_RAIL.md`): this is the
 /// decrypt-step backend for the Hybrid rail, where the decrypt boundary *receives* its
 /// material rather than reaching out for it. It is intentionally not yet reachable from
 /// `open_session`/`render` — the CEK + ciphertext transport rail is an open architecture
@@ -1627,7 +1627,7 @@ fn decrypt_session_segments(
 ///
 /// This joins the chain's two tested islands into the single in-boundary operation
 /// the Hybrid decrypt rail will invoke once Anders confirms the CEK-transport rail
-/// (`docs/convergence/DDRM_DECRYPT_RAIL.md`): the upstream CEK-sealing envelope
+/// (`docs/dkms/history/DDRM_DECRYPT_RAIL.md`): the upstream CEK-sealing envelope
 /// unwrap (`envelope::{parse, ecdh_unwrap, extract_cek}`) immediately followed by
 /// the decrypt-step core (`decrypt_session_segment`). It mirrors PC2
 /// `ddrm-decrypt::session::unwrap_envelope` (recover CEK) → cenc segment decrypt,

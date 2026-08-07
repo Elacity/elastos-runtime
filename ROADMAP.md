@@ -405,6 +405,13 @@ TPM or TEE evidence, protected-content provider deployment, and public key
 services. Each feature extends the existing capability and object contracts.
 It must not create a separate trust root or expose key material to apps.
 
+Forensic watermarking for **audio/video** is a dedicated track: rasterizable types already ship a
+two-layer (visible + invisible) per-buyer mark, but AV is key-protected, not yet fingerprinted. The
+plan — A/B forensic variant watermarking (video) and spread-spectrum/echo-hiding (audio), produced
+once at mint and selected per buyer from their signed grant at serve time, keeping the CEK boundary
+and one canonical path intact — is designed in [docs/AV_WATERMARKING.md](docs/AV_WATERMARKING.md).
+The heavy lift is a mint-time transcode pipeline, so it is a roadmap item, not a patch.
+
 ### AI and operator surfaces
 
 AI providers and agents need explicit identity, capabilities, budget policy,

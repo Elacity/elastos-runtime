@@ -9,7 +9,7 @@ publish = false
 # order, threads each binding edge (which step's artifact feeds which next-step field),
 # and fails closed if a step runs out of order or fails to produce its declared artifact.
 # It holds NO authority: the only thing that can touch a provider is the `StepRunner` the
-# runtime injects. The CEK never appears here. See docs/convergence/SYSTEM_ARCHITECTURE_MAP.md.
+# runtime injects. The CEK never appears here. See docs/dkms/history/SYSTEM_ARCHITECTURE_MAP.md.
 
 [lib]
 name = "ddrm_plan_runner"

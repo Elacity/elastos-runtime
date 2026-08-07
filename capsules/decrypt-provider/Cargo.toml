@@ -12,7 +12,7 @@ path = "src/main.rs"
 [features]
 # rail-prep: compile (and test) the in-boundary composition the Hybrid decrypt rail
 # will wire once Anders confirms the CEK-transport rail
-# (docs/convergence/DDRM_DECRYPT_RAIL.md): upstream CEK-sealing envelope unwrap ->
+# (docs/dkms/history/DDRM_DECRYPT_RAIL.md): upstream CEK-sealing envelope unwrap ->
 # decrypt-step cenc engine, colocated in this boundary. OFF by default (Parallel
 # Change) so the live dispatch and the default test surface stay unchanged.
 rail-prep = []
@@ -20,7 +20,7 @@ rail-prep = []
 # (x25519 + ml-kem-768 KEM -> AEAD-wrapped CEK; ml-dsa-65 signature behind an
 # abstraction). The PQ analogue of the classical src/envelope.rs, proven to
 # recover a CEK in Zeroizing and build to wasm32-wasip1. OFF by default; pulls the
-# PQ crates only when enabled. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
+# PQ crates only when enabled. See docs/dkms/history/DDRM_DECRYPT_RAIL.md §PQ.
 # The PQ-hybrid crypto now lives ONCE in the shared `ddrm-envelope` crate (the key
 # authority seals with it, this boundary unwraps with it). `pq_envelope.rs` re-exports
 # it, so x25519/aes-gcm are gone from here entirely; ml-kem + sha2 remain only because
@@ -30,7 +30,7 @@ pq-envelope = ["dep:ddrm-envelope", "dep:ml-kem", "dep:sha2"]
 # unwrap (pq-envelope) -> cenc decrypt -> scoped output, CEK in Zeroizing
 # throughout. Unifies the rail-prep composition (Day 18), in-boundary keygen
 # (Day 19) and the PQ envelope (Day 20) into one cross-engine proof. OFF by
-# default; enables pq-envelope. See docs/convergence/DDRM_DECRYPT_RAIL.md §PQ.
+# default; enables pq-envelope. See docs/dkms/history/DDRM_DECRYPT_RAIL.md §PQ.
 pq-rail-prep = ["pq-envelope"]
 # rail-shim: the transport adapter from a sealed-CEK carrier (rail Option A) to
 # the already-proven unwrap->cenc engines, for BOTH profiles (classical + PQ).
@@ -109,7 +109,7 @@ rail-material = ["rail-audit"]
 # into MSE. Built on the proven transcript-bound decrypt, so a reordered/substituted/
 # expired set fails closed before any byte is returned. Single-node rail for now;
 # threshold/quorum streaming is refused pending its wiring. OFF by default. See
-# docs/convergence/PC2_PLAYER_ALIGNMENT.md.
+# docs/dkms/history/PC2_PLAYER_ALIGNMENT.md.
 rail-stream = ["rail-material"]
 # vectors: replay the committed portable golden vectors (tests/vectors/) through
 # the engines — substrate-independent proof that survives refactor/rebase/port and

@@ -7,7 +7,7 @@
 # protocol over stdin/stdout. Asserts the fail-closed security contract holds in
 # the sandbox: blocked raw-authority advertised, malformed input rejected, and
 # decrypt sessions fail closed until the key/ciphertext rail lands
-# (see docs/convergence/DDRM_DECRYPT_RAIL.md).
+# (see docs/dkms/history/DDRM_DECRYPT_RAIL.md).
 #
 # Usage: capsules/decrypt-provider/scripts/wasm-smoke.sh
 # Exit code: 0 if all cases pass, 1 otherwise.
