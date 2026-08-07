@@ -325,6 +325,45 @@ img {
   outline-offset: 3px;
 }
 
+/* Money-verb confirmation. Reuses the clipboard prompt's chrome (same trusted-surface language),
+   plus a definition list for the exact terms being signed. Left-aligned and monospaced because
+   these are identifiers and amounts a user has to READ, not prose. */
+.home-spend-card {
+  width: min(460px, 100%);
+  text-align: left;
+}
+
+.home-spend-card h1,
+.home-spend-card .home-clipboard-eyebrow {
+  text-align: center;
+}
+
+.home-spend-terms {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) 1fr;
+  gap: 6px 14px;
+  margin: 18px 0 0;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.28);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.home-spend-terms dt {
+  color: var(--muted);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.home-spend-terms dd {
+  margin: 0;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 720px) {
   .home-unlock-card,
   .home-unlock[data-mode="prompt"] .home-unlock-card {

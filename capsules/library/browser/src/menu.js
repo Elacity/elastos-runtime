@@ -67,6 +67,13 @@ export function createLibraryMenu({ contextMenu, perf, showError }) {
         container.appendChild(divider);
         continue;
       }
+      // A custom row builds its own DOM (e.g. the file-manager-style colour-tag dots). It owns its own
+      // click handling; `hideMenu` is provided so it can dismiss the menu after acting.
+      if (typeof entry.custom === "function") {
+        const node = entry.custom({ hideMenu });
+        if (node) container.appendChild(node);
+        continue;
+      }
       const { label, action, disabled, checked } = entry;
       const children = Array.isArray(entry.children) ? entry.children : [];
       const wrapper = document.createElement("div");

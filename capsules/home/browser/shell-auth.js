@@ -2,7 +2,7 @@ import {
   clearHomeAuthorityToken,
   fetchJson,
   setHomeAuthorityToken,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260807a";
 
 const unlockPanel = document.querySelector("#home-unlock");
 const unlockCard = document.querySelector(".home-unlock-card");

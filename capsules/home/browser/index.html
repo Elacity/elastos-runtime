@@ -10,11 +10,11 @@
     <meta name="apple-mobile-web-app-title" content="ElastOS Home" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Home · ElastOS</title>
-    <script src="./home-boot-hint.js?v=home-20260725a"></script>
-    <link rel="manifest" href="./manifest.webmanifest?v=home-20260725a" />
+    <script src="./home-boot-hint.js?v=home-20260807a"></script>
+    <link rel="manifest" href="./manifest.webmanifest?v=home-20260807a" />
     <link rel="icon" href="./elastos-home-icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="./elastos-home-icon-192.png" />
-    <link rel="stylesheet" href="./style.css?v=home-20260726a" />
+    <link rel="stylesheet" href="./style.css?v=home-20260807a" />
   </head>
   <body data-home-status="booting" data-home-shell="resolving" data-home-gui="resolving">
     <div class="home-host-shell">
@@ -115,8 +115,49 @@
           </div>
         </div>
       </section>
+
+      <!--
+        Money-verb confirmation. This markup belongs to HOME, not to the frame asking to spend:
+        the terms are written in with textContent by home-spend-prompt.js, so a capsule frame can
+        supply strings but never markup, styling, or an extra button. It renders every field of
+        the request, because the whole request is what the step-up ceremony signs.
+      -->
+      <section
+        id="home-spend-prompt"
+        class="home-clipboard-prompt home-spend-prompt"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="home-spend-title"
+        aria-describedby="home-spend-summary"
+        aria-hidden="true"
+        tabindex="-1"
+        hidden
+      >
+        <div class="home-clipboard-card home-spend-card">
+          <p class="home-clipboard-eyebrow">ElastOS Wallet</p>
+          <h1 id="home-spend-title">Confirm spend</h1>
+          <p id="home-spend-summary"></p>
+          <dl id="home-spend-terms" class="home-spend-terms"></dl>
+          <div class="home-clipboard-actions">
+            <button
+              id="home-spend-allow"
+              class="home-clipboard-button"
+              type="button"
+            >
+              Confirm
+            </button>
+            <button
+              id="home-spend-cancel"
+              class="home-clipboard-button home-clipboard-button-secondary"
+              type="button"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      </section>
     </div>
 
-    <script type="module" src="./home-shell-host.js?v=home-20260731b"></script>
+    <script type="module" src="./home-shell-host.js?v=home-20260807a"></script>
   </body>
 </html>

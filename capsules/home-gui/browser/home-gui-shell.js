@@ -9,16 +9,16 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260731b";
+} from "./home-gui.js?v=home-20260807a";
 import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260807a";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260731b";
+} from "./home-gui-authority.js?v=home-20260807a";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -365,6 +365,11 @@ bindHomeGuiInteractions({
   },
   launchTarget: (target, query, options) =>
     requestHome("home:launch-target", { target, query }, options),
+  // Money verbs are brokered by Home: this shell frame is opaque-origin and carries a `home-gui`
+  // launch token, neither of which the gateway accepts on a node-signed spend. Home runs the
+  // step-up ceremony under its own authority and posts the verb same-origin.
+  moneyVerb: (operation, request) =>
+    requestHome("elastos.home.money-verb.request/v1", { operation, request }),
   signOut: () => requestHome("home:sign-out"),
 });
 setHomeGuiMounted(true);

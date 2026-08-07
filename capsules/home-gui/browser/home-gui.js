@@ -20,12 +20,12 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260807a";
 import {
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260725a";
+} from "./shell-chrome.js?v=home-20260807a";
 import {
   clearDesktopSelection,
   continueTargetDrag,
@@ -46,7 +46,7 @@ import {
   renderTaskbar,
   toggleLauncher,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260731b";
+} from "./shell-surface.js?v=home-20260807a";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -58,7 +58,7 @@ import {
   renewBrowserWindowAuthority,
   restoreShellSession,
   showDesktopHome,
-} from "./shell-windows.js?v=home-20260731b";
+} from "./shell-windows.js?v=home-20260807a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -88,6 +88,7 @@ export const homeGuiWindowHooks = Object.freeze({
 
 const homeGuiHostActions = {
   launchTarget: null,
+  moneyVerb: null,
   requestHomeUnlock: null,
   requestSummaryRefresh: null,
 };
@@ -101,6 +102,7 @@ configureWindowHooks({
   renderTaskbar,
   updateTaskbarState,
   launchTarget: (...args) => homeGuiHostActions.launchTarget?.(...args),
+  moneyVerb: (...args) => homeGuiHostActions.moneyVerb?.(...args),
 });
 
 function homeGuiHostNodes() {
@@ -590,6 +592,9 @@ export function bindHomeGuiInteractions(options = {}) {
     : null;
   homeGuiHostActions.launchTarget = typeof options.launchTarget === "function"
     ? options.launchTarget
+    : null;
+  homeGuiHostActions.moneyVerb = typeof options.moneyVerb === "function"
+    ? options.moneyVerb
     : null;
   homeGuiHostActions.requestSummaryRefresh = typeof options.requestSummaryRefresh === "function"
     ? options.requestSummaryRefresh

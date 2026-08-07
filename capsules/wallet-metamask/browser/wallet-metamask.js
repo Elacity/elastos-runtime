@@ -1,6 +1,6 @@
 import {
   createHomeClipboardClient,
-} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+} from "/apps/home/home-clipboard-client.js?v=home-20260807a";
 
 const CONNECTOR_ID = "wallet-metamask";
 const HOST_EFFECT_TYPE = "home:wallet-connector-effect";
@@ -17,6 +17,10 @@ const frameHomeToken = readLaunchToken();
 const homeOrigin = readQueryParam("home_origin");
 let hostEffectInFlight = false;
 let hostRequestSequence = 0;
+let refreshInFlight = false;
+// How often to pick up newly-queued approvals (e.g. a mint tx just enqueued by the Create
+// portal) without the user having to reconnect/reopen the Wallet.
+const APPROVAL_POLL_MS = 5000;
 
 const homeClipboard = createHomeClipboardClient({
   targetId: CONNECTOR_ID,
@@ -35,6 +39,23 @@ function boot() {
   refreshWalletState().catch((error) => {
     showStatus(errorMessage(error), "error");
   });
+  startApprovalAutoRefresh();
+}
+
+// Poll for newly-queued approvals so a mint/trade tx enqueued elsewhere (e.g. Create) appears
+// here on its own. Quiet by design: only when the tab is visible, we have a launch token, and
+// no host wallet effect (connect/approve) is already in flight; errors are swallowed (the next
+// tick retries).
+function startApprovalAutoRefresh() {
+  window.setInterval(() => {
+    if (!frameHomeToken || hostEffectInFlight || refreshInFlight) {
+      return;
+    }
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      return;
+    }
+    refreshWalletState().catch(() => {});
+  }, APPROVAL_POLL_MS);
 }
 
 async function onConnect() {
@@ -59,21 +80,29 @@ async function refreshWalletState() {
     showStatus("Open from Wallet to review approval requests.", "error");
     return;
   }
-  const [accountSummary, requestSummary] = await Promise.all([
-    fetchJson(`/api/apps/${CONNECTOR_ID}/wallet/accounts`, {
-      headers: shellHeaders(),
-    }),
-    fetchJson(`/api/apps/${CONNECTOR_ID}/wallet/approvals`, {
-      headers: shellHeaders(),
-    }),
-  ]);
-  const accounts = Array.isArray(accountSummary?.accounts) ? accountSummary.accounts : [];
-  const requests = Array.isArray(requestSummary?.approval_requests)
-    ? requestSummary.approval_requests
-    : [];
-  renderAccounts(accounts);
-  renderRequests(requests);
-  setState(accounts.length > 0 ? `${accounts.length} linked` : "0 linked");
+  if (refreshInFlight) {
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    const [accountSummary, requestSummary] = await Promise.all([
+      fetchJson(`/api/apps/${CONNECTOR_ID}/wallet/accounts`, {
+        headers: shellHeaders(),
+      }),
+      fetchJson(`/api/apps/${CONNECTOR_ID}/wallet/approvals`, {
+        headers: shellHeaders(),
+      }),
+    ]);
+    const accounts = Array.isArray(accountSummary?.accounts) ? accountSummary.accounts : [];
+    const requests = Array.isArray(requestSummary?.approval_requests)
+      ? requestSummary.approval_requests
+      : [];
+    renderAccounts(accounts);
+    renderRequests(requests);
+    setState(accounts.length > 0 ? `${accounts.length} linked` : "0 linked");
+  } finally {
+    refreshInFlight = false;
+  }
 }
 
 function renderAccounts(accounts) {

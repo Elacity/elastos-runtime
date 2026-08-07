@@ -15,8 +15,9 @@ import {
   homeActiveShellName,
   shellState,
   fetchJson,
+  homeAuthorityTokenValue,
   targetById,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260807a";
 import {
   bindHomeUnlock,
   hideHomeUnlock,
@@ -25,18 +26,22 @@ import {
   requestPasskeyStepUp,
   showHomeUnlock,
   signOutHome,
-} from "./shell-auth.js?v=home-20260725a";
+} from "./shell-auth.js?v=home-20260807a";
 import {
   handleHomeWalletConnectorEffect,
   WALLET_CONNECTOR_EFFECT_TYPE,
-} from "./home-wallet-connector-host.js?v=home-20260725a";
+} from "./home-wallet-connector-host.js?v=home-20260807a";
 import {
   createHomeClipboardFrameState,
   createHomeClipboardHost,
   createHomeClipboardPrompt,
   homeClipboardTargetSupported,
-} from "./home-clipboard-host.js?v=home-20260726a";
-import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260725a";
+} from "./home-clipboard-host.js?v=home-20260807a";
+import { loadOrCreateHomeBrowserContextId } from "./home-browser-context.js?v=home-20260807a";
+import {
+  createHomeSpendPrompt,
+  SPEND_DECLINED_MESSAGE,
+} from "./home-spend-prompt.js?v=home-20260807a";
 
 const SUMMARY_REFRESH_DEBOUNCE_MS = 150;
 const SUMMARY_REFRESH_RETRY_MS = 700;
@@ -75,11 +80,17 @@ const SHELL_MESSAGE_OPEN_TARGET_SOURCES = Object.freeze({
   inbox: "visible-target",
   library: new Set(["archive-manager", "documents", "gba-emulator", "library"]),
   marketplace: "runtime-target",
+  // The storefront hands a bought-and-pinned asset off to its runtime viewer; it opens nothing else.
+  "marketplace-content": new Set(["ddrm-viewer", "elacity-player", "library"]),
   people: new Set(["chat-room"]),
   services: new Set(["browser", "chat-room"]),
   system: "visible-target",
   "wallet": new Set(["wallet-metamask", "wallet-unisat"]),
 });
+// Object.freeze is shallow: the nested library Set stays mutable, so owned-asset
+// opens from Library into the DRM viewer/player can extend the source gate here
+// without reshaping the frozen declaration above (kept literal for auditability).
+SHELL_MESSAGE_OPEN_TARGET_SOURCES.library.add("ddrm-viewer").add("elacity-player");
 const SHELL_MESSAGE_OPEN_URI_SOURCES = new Set(["documents", "chat-room"]);
 const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   "chat-room": new Set(["documents"]),
@@ -87,8 +98,40 @@ const SHELL_MESSAGE_DELIVER_TARGET_SOURCES = Object.freeze({
   library: new Set(["archive-manager", "browser", "chat-room"]),
 });
 const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"]);
+// The node-signed money verbs, and who may ask Home to run one.
+//
+// These are NOT on the `PASSKEY_STEP_UP_TARGETS` bridge and must not be: that bridge mints a
+// step-up under the REQUESTING frame's own launch token, and the gateway binds a money-verb
+// assertion to the launch that authenticates the spend. `/api/market/buy` and `/api/create/mint`
+// accept only a `home` launch token presented from the EXACT Home origin
+// (gateway_home_token.rs::require_home_token_launch + require_exact_home_browser_origin), so an
+// opaque capsule frame — every app window and the Home GUI shell frame alike — can neither hold
+// the right token nor present the right origin. Widening the actor list server-side would hand a
+// capsule frame spend authority; instead Home brokers the whole verb here, under its own
+// authority, and the requesting frame never sees a step-up token at all.
+const MONEY_VERB_ROUTES = Object.freeze({
+  "market.buy": "/api/market/buy",
+  "create.mint": "/api/create/mint",
+});
+const MONEY_VERB_REQUEST_TYPE = "elastos.home.money-verb.request/v1";
+// Only frames with a REAL caller today. `creator` is deliberately absent: the Create portal
+// reaches chain through the capability bus (encrypt-provider -> publish-provider -> wallet
+// approval), so nothing in `capsules/creator/creator.js` posts `/api/create/mint`. Listing it
+// would enlarge the set of frames that can make Home raise a confirmation prompt and start a
+// step-up ceremony — a prompt-fatigue and social-engineering surface — for no capability today.
+// Re-adding it is this one line when the Create portal ships a caller.
+const MONEY_VERB_APP_SOURCES = new Set(["marketplace-content"]);
+const MONEY_VERB_SHELL_SOURCES = new Set([HOME_GUI_SHELL_ID]);
 const launchedAppContexts = new Map();
 const pendingBrowserAuthorityRenewals = new Map();
+const homeSpendPrompt = createHomeSpendPrompt({
+  root: document.querySelector("#home-spend-prompt"),
+  title: document.querySelector("#home-spend-title"),
+  summary: document.querySelector("#home-spend-summary"),
+  terms: document.querySelector("#home-spend-terms"),
+  allowButton: document.querySelector("#home-spend-allow"),
+  cancelButton: document.querySelector("#home-spend-cancel"),
+});
 const homeClipboardPrompt = createHomeClipboardPrompt({
   root: document.querySelector("#home-clipboard-prompt"),
   title: document.querySelector("#home-clipboard-title"),
@@ -1136,6 +1179,31 @@ window.addEventListener("message", (event) => {
     preclaimActiveShellSwitch(data.activeShell);
     return;
   }
+  if (data.type === MONEY_VERB_REQUEST_TYPE) {
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    const operation = typeof data.operation === "string" ? data.operation.trim() : "";
+    const request = data.request
+      && typeof data.request === "object"
+      && !Array.isArray(data.request)
+      ? data.request
+      : null;
+    if (
+      !canRunMoneyVerbFromHomeMessage(context)
+      || !hasExactMessageKeys(data, ["type", "requestId", "homeToken", "operation", "request"])
+      || !requestId
+      || requestId.length > 128
+      || !Object.prototype.hasOwnProperty.call(MONEY_VERB_ROUTES, operation)
+      || !request
+      || !isBoundedStepUpRequest(request)
+    ) {
+      console.warn("home ignored unauthorized money verb", context.targetId);
+      return;
+    }
+    runMoneyVerb(operation, request)
+      .then((result) => replyToShellRequest(event, requestId, result))
+      .catch((error) => replyToShellRequest(event, requestId, null, error));
+    return;
+  }
   if (data.type === "elastos.home.passkey-step-up.request/v1") {
     const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
     const operation = typeof data.operation === "string" ? data.operation.trim() : "";
@@ -1421,6 +1489,59 @@ function hasExactMessageKeys(message, expectedKeys) {
   const expected = [...expectedKeys].sort();
   return actual.length === expected.length
     && actual.every((key, index) => key === expected[index]);
+}
+
+// Run one money verb on behalf of an authorized frame.
+//
+// Three things must be true before this node signs, and all three are enforced below:
+// the caller is an admitted frame (checked at the message boundary), the USER agreed to these
+// exact terms in Home's own chrome (3), and the authenticator confirmed it (the step-up).
+//
+// Two invariants the gateway enforces and this must match exactly:
+//  1. The step-up assertion is bound to (operation, sha256(body minus `step_up_token`)) — so the
+//     ceremony signs over `request` verbatim and the POST body is `request` plus the token, with
+//     nothing added, dropped, or reordered in between.
+//  2. Authority is the SameSite=Strict Home session cookie the browser attaches to this
+//     same-origin POST. `fetchJson` deliberately sends `x-elastos-home-token` only on
+//     `/api/apps/home/launch`: a header here would be a second launch-token authority, and
+//     `gateway_home_token.rs::home_launch_token_credential` hard-fails on any disagreement.
+async function runMoneyVerb(operation, request) {
+  const route = MONEY_VERB_ROUTES[operation];
+  if (!route) {
+    throw new Error("Home refused an unrecognized money verb");
+  }
+  let appToken = homeAuthorityTokenValue();
+  if (!appToken) {
+    await refreshHomeSession();
+    appToken = homeAuthorityTokenValue();
+  }
+  if (!appToken) {
+    throw new Error("Home is not signed in — unlock Home before spending");
+  }
+  // 3. The user agreed to THESE terms. The step-up ceremony proves a human touched the
+  //    authenticator; it names no terms, so on its own it cannot distinguish the purchase the
+  //    user saw from one a compromised frame substituted. Home therefore renders the intent in
+  //    its OWN chrome first (home-spend-prompt.js — every field of `request`, textContent only)
+  //    and requires an explicit confirm. This runs BEFORE the ceremony so a declined spend never
+  //    prompts the authenticator at all.
+  if (!(await homeSpendPrompt.confirm(operation, request))) {
+    throw new Error(SPEND_DECLINED_MESSAGE);
+  }
+  const stepUpToken = await requestPasskeyStepUp(appToken, operation, request);
+  return fetchJson(route, {
+    method: "POST",
+    body: JSON.stringify({ ...request, step_up_token: stepUpToken }),
+  });
+}
+
+function canRunMoneyVerbFromHomeMessage(context) {
+  if (context.kind === "app-frame") {
+    return MONEY_VERB_APP_SOURCES.has(context.targetId);
+  }
+  if (context.kind === "shell-frame") {
+    return MONEY_VERB_SHELL_SOURCES.has(context.targetId);
+  }
+  return false;
 }
 
 function isBoundedStepUpRequest(request) {
