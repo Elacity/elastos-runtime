@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "elastos-auth"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "hex",
@@ -897,6 +897,7 @@ dependencies = [
  "sha2",
  "sha3",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]

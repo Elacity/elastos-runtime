@@ -1,6 +1,6 @@
 import {
   createHomeClipboardClient,
-} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+} from "/apps/home/home-clipboard-client.js?v=home-20260807a";
 
 const CONNECTOR_ID = "wallet-unisat";
 const BITCOIN_CHAIN_NAMESPACE = "bip122:000000000019d6689c085ae165831e93";

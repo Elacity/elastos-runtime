@@ -1,0 +1,54 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "content-market",
+  "version": "0.1.0",
+  "description": "Reconstructs a marketplace ContentListingV1 PURELY from on-chain mint calldata (contentId == bytes16 KID, tokenURI, opType, sell terms); holds no chain RPC, no IPFS, no keys",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://market/*",
+  "authority": {
+    "reason": "Decodes a content-mint's calldata back into a typed listing so the consumer can discover what a producer published. Reconstruction is pure: it reads only the calldata bytes, mints nothing, holds no keys, and fails closed on a foreign/malformed call. Human-facing enrichment (metadata.json title/poster/mime, live log scan) is delegated to ipfs-provider + chain-provider.",
+    "capabilities": [
+      {
+        "resource": "elastos://market/*",
+        "actions": ["read"],
+        "operations": ["status", "reconstruct_listing"]
+      }
+    ],
+    "audit_events": ["market.status", "market.reconstruct.denied"]
+  },
+  "interfaces": [
+    {
+      "id": "elastos.provider.market",
+      "version": "0.1.0",
+      "description": "Runtime provider affordance descriptors projected from content-market authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "status",
+          "description": "Request status through the content-market Runtime provider boundary for elastos://market/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://market/*",
+          "operation": "status"
+        },
+        {
+          "id": "reconstruct_listing",
+          "description": "Request reconstruct listing through the content-market Runtime provider boundary for elastos://market/*.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://market/*",
+          "operation": "reconstruct_listing"
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}

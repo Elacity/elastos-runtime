@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Viewer · ElastOS</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css?v=20260618-scrollfast">
+  <!-- Locally-vendored Three.js (no CDN at runtime): the 3D tier loads from the capsule's own
+       /vendor. The bare `three` specifier the addon loaders import resolves here. -->
+  <script type="importmap">
+    { "imports": { "three": "./vendor/three.module.js" } }
+  </script>
+</head>
+<body>
+  <script>
+    const accessMode = new URLSearchParams(window.location.search).has("home_token")
+      ? "shell"
+      : "gateway";
+    const hostMode = window.self === window.top ? "standalone" : "embedded";
+    document.body.setAttribute("data-viewer-access-mode", accessMode);
+    document.body.setAttribute("data-viewer-host-mode", hostMode);
+  </script>
+  <main id="app-shell" class="shell">
+    <section class="viewer-card">
+      <header class="viewer-bar">
+        <span id="kind-badge" class="badge" hidden></span>
+        <span id="title" class="title">Owned asset</span>
+        <span id="mime" class="mime" aria-live="polite"></span>
+      </header>
+      <div class="object-frame">
+        <div id="render-root" class="render-root" aria-live="polite"></div>
+        <div id="overlay" class="overlay" aria-live="polite">
+          <div class="overlay-copy">
+            <div class="icon" aria-hidden="true">&#128274;</div>
+            <p id="overlay-text">Opening protected asset…</p>
+          </div>
+        </div>
+      </div>
+      <p id="status" class="status" aria-live="polite" hidden></p>
+    </section>
+  </main>
+  <script type="module" src="viewer.js?v=20260807-fragment-token"></script>
+</body>
+</html>

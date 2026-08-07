@@ -1,0 +1,20 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "act-emitter",
+  "version": "0.1.0",
+  "description": "Spend/audit verification fixture: performs exactly N metered carrier_invoke storage writes via the shipped guest carrier client, so a budget of N yields spent=N and budget_exhausted at N+1.",
+  "author": "elastos",
+  "role": "app",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "requires": [],
+  "interfaces": [],
+  "resources": {
+    "memory_mb": 256,
+    "gpu": false
+  },
+  "permissions": {
+    "storage": ["localhost://Public/ActEmitter/*"],
+    "messaging": []
+  }
+}

@@ -474,22 +474,26 @@ fn save_channels(app: &App, args: &Args) {
     if app.storage_token.is_empty() || args.no_history {
         return;
     }
-    let _ = api::save_json(
+    if let Err(err) = api::save_json(
         &app.storage_token,
         "chat/channels.json",
         &app.channel_names(),
-    );
+    ) {
+        eprintln!("Failed to persist chat channels: {err}");
+    }
 }
 
 fn save_known_nicks(app: &App, args: &Args) {
     if app.storage_token.is_empty() || args.no_history {
         return;
     }
-    let _ = api::save_json(
+    if let Err(err) = api::save_json(
         &app.storage_token,
         "chat/known_nicks.json",
         &app.known_nicks,
-    );
+    ) {
+        eprintln!("Failed to persist known nicks: {err}");
+    }
 }
 
 fn sign_message(app: &App, sender_id: &str, ts: u64, content: &str) -> Option<String> {
@@ -722,7 +726,7 @@ fn poll_presence(app: &mut App) {
         ensure_room_discovery_subscription(app, &room);
 
         if let Some(ticket) = ticket.as_deref() {
-            let _ = session::announce_presence(
+            if let Err(err) = session::announce_presence(
                 &app.identity_token,
                 &app.peer_token,
                 &room,
@@ -730,7 +734,9 @@ fn poll_presence(app: &mut App) {
                 &app.pubkey,
                 Some(&app.session_id),
                 ticket,
-            );
+            ) {
+                eprintln!("Failed to announce presence in {room}: {err}");
+            }
         }
 
         let consumer_id = presence_consumer_id(&room);

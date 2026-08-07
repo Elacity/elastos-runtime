@@ -1489,12 +1489,27 @@ fn validate_public_ip(ip: IpAddr) -> Result<(), ()> {
             }
         }
         IpAddr::V6(ip) => {
+            // Normalize IPv4-in-IPv6 forms FIRST: a dual-stack kernel routes
+            // `::ffff:a.b.c.d` (IPv4-mapped) to the bare IPv4, so the v4
+            // private/loopback/link-local guards MUST apply to the embedded
+            // address. Without this, `::ffff:169.254.169.254` slips past every
+            // v6 predicate and reaches cloud metadata / loopback (audit T3 —
+            // confirmed end-to-end SSRF bypass).
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return validate_public_ip(IpAddr::V4(v4));
+            }
             if ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
             {
                 Err(())
+            } else if let Some(v4) = ip.to_ipv4() {
+                // Deprecated IPv4-compatible (`::a.b.c.d`) and any other ::x form
+                // that resolves to a v4 address. `::1`/`::` are already caught
+                // above, so this only reaches real embedded v4 addresses — apply
+                // the full v4 guard to them too, defensively.
+                validate_public_ip(IpAddr::V4(v4))
             } else {
                 Ok(())
             }
@@ -1599,7 +1614,17 @@ fn public_dns_resolver(netloc: &str) -> io::Result<Vec<SocketAddr>> {
 }
 
 fn http_agent(timeout_secs: u64, allow_private_targets: bool) -> ureq::Agent {
-    let builder = ureq::AgentBuilder::new().timeout(Duration::from_secs(timeout_secs));
+    // Fail-closed egress (audit T5): NEVER auto-follow redirects. ureq's default
+    // (5 redirects) would let an allowlisted host `302` the fetch to any other
+    // host — the private agent has no IP-validating resolver on redirect hops,
+    // and the backend host allowlist is only checked against the INITIAL URL —
+    // so a redirect could reach cloud metadata / a non-allowlisted host. With
+    // `redirects(0)` the mediator returns the 3xx to the caller instead of
+    // following; the capsule must re-issue `http_fetch` for the new URL, which
+    // re-runs the full URL + host + allowlist + resolver validation per hop.
+    let builder = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(timeout_secs))
+        .redirects(0);
     if allow_private_targets {
         builder.build()
     } else {
@@ -1651,6 +1676,28 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    /// Audit T3: IPv4-mapped IPv6 literals must NOT bypass the private-network
+    /// guard. A dual-stack kernel routes `::ffff:169.254.169.254` to the bare
+    /// IPv4, so the mapped forms must be refused exactly like their v4 forms.
+    #[test]
+    fn validate_public_ip_blocks_ipv4_mapped_private_targets() {
+        for mapped in [
+            "::ffff:169.254.169.254", // cloud metadata (link-local)
+            "::ffff:127.0.0.1",       // loopback
+            "::ffff:192.168.1.1",     // RFC1918
+            "::ffff:10.0.0.5",        // RFC1918
+        ] {
+            let ip: IpAddr = mapped.parse().expect("parse mapped v6");
+            assert!(
+                validate_public_ip(ip).is_err(),
+                "{mapped} must be blocked as a private/loopback/link-local target"
+            );
+        }
+        // A genuinely public v6 address still passes, and a public v4-mapped one too.
+        assert!(validate_public_ip("2606:4700:4700::1111".parse().unwrap()).is_ok());
+        assert!(validate_public_ip("::ffff:1.1.1.1".parse().unwrap()).is_ok());
+    }
 
     fn error_code(response: Response) -> String {
         serde_json::to_value(response).unwrap()["code"]

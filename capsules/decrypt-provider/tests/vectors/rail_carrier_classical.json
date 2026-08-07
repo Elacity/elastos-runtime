@@ -1,0 +1,8 @@
+{
+  "description": "rail Option A carrier (classical P-256): sealed CEK + segment -> decrypt_from_carrier; sealed_cek byte-identical to classical_cenc.json (PC2-conformant via session unwrap_envelope + decrypt_segment)",
+  "profile": "ClassicalP256",
+  "session_secret_key_b64": "0fXWTTgj315NjkrOGcz5oa2/WozIRDi3Wu3aJuhU9X8=",
+  "sealed_cek_b64": "AAAAAwAhAxb9aWu0rziiRcU8d38mNLxYp0wneFHPAAkoDOXhHPF2JMcgVm/XmuJcA4fSoPow2wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIPIfqylm8twGnxTswRU8LvK9y+iD5DK0c7pkmEeIRo+y",
+  "ciphertext_segment_b64": "AAAAPG1vb2YAAAA0dHJhZgAAABR0cnVuAAACAAAAAAEAAAAgAAAAGHNlbmMAAAAAAAAAASIiIiIiIiIiAAAAKG1kYXScNDPiT64BF0MfL13dprDn+6eX7LyGcmlu1lMPPiQQpA==",
+  "expected_plaintext_b64": "dGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyISE="
+}

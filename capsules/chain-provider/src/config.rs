@@ -1,7 +1,77 @@
 use super::*;
 use std::env;
 
+/// PC2's smoke-tested Base RPC pool (`src/utils/rpc.ts` / `config/default.json`): key-less,
+/// rate-tolerant public endpoints, round-robin with failover. Index 0 MUST stay key-less and
+/// rate-tolerant — a keyed provider at the head that exhausts quota silently degrades the
+/// rights read to "not owned" (the May 2026 PC2 video-playback incident).
+pub(super) const PC2_BASE_RPC_POOL: &[&str] = &[
+    "https://base-rpc.publicnode.com",
+    "https://base.drpc.org",
+    "https://mainnet.base.org",
+    "https://base-mainnet.public.blastapi.io",
+    "https://base.meowrpc.com",
+    "https://1rpc.io/base",
+];
+
+/// The subset of the Base pool that CORRECTLY serves `eth_getLogs` over a 10k-block range.
+/// Probed Jun 2026 against a known channel mid-window: only `mainnet.base.org` (official) and
+/// `base.gateway.tenderly.co` return the real logs. CRITICAL: `publicnode` is EXCLUDED — it
+/// SILENTLY TRUNCATES, returning HTTP 200 with `[]` for ranges it won't fully scan (a false
+/// "no channels", worse than an error). `drpc` free-tier times out (HTTP 408) at 10k, and
+/// `blastapi`/`meowrpc`/`1rpc.io` cap or refuse `eth_getLogs`. So channel discovery routes
+/// ONLY here — a lying endpoint can never be the one whose empty answer we trust (#11).
+pub(super) const PC2_BASE_LOG_RPC_POOL: &[&str] = &[
+    "https://mainnet.base.org",
+    "https://base.gateway.tenderly.co",
+];
+
+fn operator_base_head() -> Option<String> {
+    env::var("ELASTOS_CHAIN_BASE_RPC")
+        .or_else(|_| env::var("BASE_RPC_URL"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The effective Base pool: an operator-supplied head (`ELASTOS_CHAIN_BASE_RPC`, else the
+/// legacy `BASE_RPC_URL`) prepended to the public pool as failover, else the public pool
+/// as-is. Returns `(primary, fallbacks)` with no duplicates.
+fn base_rpc_pool() -> (String, Vec<String>) {
+    let mut ordered: Vec<String> = Vec::new();
+    if let Some(head) = operator_base_head() {
+        ordered.push(head);
+    }
+    for url in PC2_BASE_RPC_POOL {
+        let url = url.to_string();
+        if !ordered.iter().any(|u| u == &url) {
+            ordered.push(url);
+        }
+    }
+    let primary = ordered.remove(0);
+    (primary, ordered)
+}
+
+/// The Base `eth_getLogs` pool: the operator head (assumed range-capable since the operator
+/// chose it) followed by the probed range-capable publics, de-duplicated. Channel discovery
+/// routes log queries here so a strict public endpoint can never break the factory scan.
+fn base_log_rpc_pool() -> Vec<String> {
+    let mut ordered: Vec<String> = Vec::new();
+    if let Some(head) = operator_base_head() {
+        ordered.push(head);
+    }
+    for url in PC2_BASE_LOG_RPC_POOL {
+        let url = url.to_string();
+        if !ordered.iter().any(|u| u == &url) {
+            ordered.push(url);
+        }
+    }
+    ordered
+}
+
 pub(super) fn default_networks() -> Vec<ChainNetwork> {
+    let (base_rpc, base_fallbacks) = base_rpc_pool();
+    let base_log_rpcs = base_log_rpc_pool();
     vec![
         ChainNetwork {
             id: "ela-mainnet".to_string(),
@@ -13,6 +83,8 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             mainnet: true,
             explorer_url: Some("https://blockchain.elastos.io".to_string()),
             rpc_url: "https://blockchain.elastos.io/api/v1".to_string(),
+            rpc_fallback_urls: Vec::new(),
+            log_query_rpc_urls: Vec::new(),
             rights_methods: Vec::new(),
         },
         ChainNetwork {
@@ -25,6 +97,8 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             mainnet: true,
             explorer_url: Some("https://esc.elastos.io".to_string()),
             rpc_url: "https://api.elastos.io/esc".to_string(),
+            rpc_fallback_urls: Vec::new(),
+            log_query_rpc_urls: Vec::new(),
             rights_methods: Vec::new(),
         },
         ChainNetwork {
@@ -36,8 +110,9 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             provider: "Base".to_string(),
             mainnet: true,
             explorer_url: Some("https://basescan.org".to_string()),
-            rpc_url: env::var("BASE_RPC_URL")
-                .unwrap_or_else(|_| "https://mainnet.base.org".to_string()),
+            rpc_url: base_rpc,
+            rpc_fallback_urls: base_fallbacks,
+            log_query_rpc_urls: base_log_rpcs,
             rights_methods: Vec::new(),
         },
         ChainNetwork {
@@ -51,6 +126,8 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             explorer_url: Some("https://mempool.space".to_string()),
             rpc_url: env::var("BITCOIN_REST_URL")
                 .unwrap_or_else(|_| "https://mempool.space/api".to_string()),
+            rpc_fallback_urls: Vec::new(),
+            log_query_rpc_urls: Vec::new(),
             rights_methods: Vec::new(),
         },
     ]
@@ -66,6 +143,22 @@ pub(super) fn validate_networks(networks: &[ChainNetwork]) -> Result<(), String>
             return Err("network display name is required".to_string());
         }
         validate_rpc_url(network)?;
+        for fallback in &network.rpc_fallback_urls {
+            let probe = ChainNetwork {
+                rpc_url: fallback.clone(),
+                ..network.clone()
+            };
+            validate_rpc_url(&probe)
+                .map_err(|_| format!("invalid fallback RPC URL for {}", network.id))?;
+        }
+        for log_rpc in &network.log_query_rpc_urls {
+            let probe = ChainNetwork {
+                rpc_url: log_rpc.clone(),
+                ..network.clone()
+            };
+            validate_rpc_url(&probe)
+                .map_err(|_| format!("invalid log-query RPC URL for {}", network.id))?;
+        }
         if network.kind == ChainKind::EvmJsonRpc && network.chain_id.is_none() {
             return Err(format!("EVM network {} requires chain_id", network.id));
         }

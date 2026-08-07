@@ -26,6 +26,21 @@ pub(super) struct ChainNetwork {
     #[serde(default)]
     pub(super) explorer_url: Option<String>,
     pub(super) rpc_url: String,
+    /// Additional RPC endpoints tried (in order) when the primary `rpc_url` fails over
+    /// (transport error / HTTP 5xx-4xx / JSON-RPC error). Mirrors PC2's round-robin Base
+    /// RPC pool (`src/utils/rpc.ts`): the primary MUST be a key-less, rate-tolerant
+    /// endpoint; keyed providers belong at the back. A single point of RPC failure
+    /// silently degrades the rights read to "not owned", so the pool is fail-soft on
+    /// transport while the answer itself stays fail-closed.
+    #[serde(default)]
+    pub(super) rpc_fallback_urls: Vec<String>,
+    /// RPC endpoints permitted for `eth_getLogs` (channel discovery / event scans). A SUBSET
+    /// of the pool: many free Base endpoints cap (or refuse) `eth_getLogs` to tiny block
+    /// ranges (e.g. `1rpc.io` → 50 blocks, `blastapi` → 10, `meowrpc` → unsupported), which
+    /// would make the chunked factory scan fail. When non-empty, log queries route ONLY here
+    /// (operator head + range-capable publics); when empty, they fall back to the full pool.
+    #[serde(default)]
+    pub(super) log_query_rpc_urls: Vec<String>,
     #[serde(default)]
     pub(super) rights_methods: Vec<RightsMethod>,
 }
@@ -68,6 +83,11 @@ impl RightsMethod {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum RightsMethodAbi {
+    /// Real Base ABI: `hasAccessByContentId(address holder, bytes16 contentId)`
+    /// (selector `0x54d42821`). The production rights read.
+    HasAccessByContentIdAddressBytes16,
+    /// Legacy/guessed `(string,address,string)` shape — kept for config flexibility and
+    /// the local CID-keyed mock loop, but NOT the real Base ABI.
     HasAccessByContentIdStringAddressString,
 }
 
@@ -178,7 +198,151 @@ pub(super) enum Request {
         network: String,
         action: NodeLifecycleAction,
     },
+    /// Assemble the dDRM content-mint calldata (PURE: no RPC, no keys). Turns a
+    /// publish-provider `UnsignedMintV1` into the `{ to, data, value }` an external
+    /// signer (wallet-provider) signs and `broadcast_transaction` sends.
+    AssembleMint {
+        mint: Box<MintAssembly>,
+    },
+    /// Discover the dDRM channels (DigitalAsset collections) a creator owns by scanning the
+    /// channel factory's `ChannelCreated` logs filtered to the creator's address. READ-ONLY
+    /// (`eth_getLogs`); no keys. The factory + event topic + scan-from block default to the
+    /// real Base values (overridable) so the app never names a contract address itself.
+    ListChannels {
+        network: String,
+        #[serde(default)]
+        factory: Option<String>,
+        creator: String,
+        #[serde(default)]
+        from_block: Option<String>,
+    },
+    /// Resolve the REAL on-chain ledger `tokenId` for a `bytes16` content id (KID) by scanning the
+    /// channel's `AssetCreated` logs (the only mint event that emits on Base; it carries NO contentId)
+    /// and binding the KID through each candidate's mint `opRawData` calldata — preferring the canonical
+    /// `mint(string,uint16,bytes,bytes)` decode over the relayer-safe substring match. READ-ONLY
+    /// (`eth_getLogs` + per-candidate `eth_getTransactionByHash`); no keys. The Phase-1 buy MUST bind
+    /// this, never `word_from_id(content_id)`. FAILS CLOSED on no match OR an AMBIGUOUS binding (>1
+    /// distinct tokenId binds the KID) — the scan is not yet creator-constrained, so ambiguity is
+    /// treated as a hostile co-channel mint and the buy is refused. `ledger` is the channel ERC-1155
+    /// (`metadata.properties.ledger`). Follow-on: creator-constrain the scan to also RESOLVE the legit
+    /// asset under such griefing (and/or use `DigitalAssetRegistered` on the channel/factory contract,
+    /// which carries the indexed tokenId + bytes16 contentId but does NOT emit on EventHub).
+    ResolveTokenId {
+        network: String,
+        ledger: String,
+        content_id: String,
+        #[serde(default)]
+        from_block: Option<String>,
+    },
+    /// Assemble the `createChannel(uint8,uint8,string,string,bytes)` calldata (PURE: no RPC,
+    /// no keys) — the `{ to, data, value }` an external signer (wallet-provider) signs and
+    /// `broadcast_transaction` sends to deploy a new channel. Mirrors `AssembleMint`.
+    AssembleCreateChannel {
+        channel: Box<CreateChannelAssembly>,
+    },
+    /// Assemble the post-mint trade-enabling approval (PC2's 2nd mint tx). READ-then-PURE:
+    /// discover the just-minted asset's operative contract from its `AssetCreated` log
+    /// (`_to == creator`, `_channel == channel`), read the channel's `authority()` gateway,
+    /// and — unless the gateway is already approved — ABI-encode `setApprovalForAll(gateway,
+    /// true)` on the operative. Never signs/broadcasts; fails closed if no confirmed mint is
+    /// found yet (the caller retries once it is mined).
+    AssembleTradeApproval {
+        network: String,
+        channel: String,
+        creator: String,
+        /// PIN the approval to the JUST-MINTED asset by its `bytes16` content id (KID). When
+        /// present, the operative is resolved from the `AssetCreated` whose mint transaction
+        /// embeds THIS content id in `opRawData` — never the channel's newest mint — so a
+        /// freshly-minted asset is never falsely reported tradable because an EARLIER asset in
+        /// the same channel was already approved. Absent ⇒ legacy newest-in-channel resolution.
+        #[serde(default)]
+        content_id: Option<String>,
+        /// FAST PATH: the broadcast mint TRANSACTION hash (from the owner's wallet approval). When
+        /// present, the operative + token id are resolved from THAT transaction's own receipt
+        /// (`eth_getTransactionReceipt` → its `AssetCreated` log) in ONE cheap call, instead of a
+        /// wide `eth_getLogs` scan that public RPCs rate-limit/range-cap. The owner's wallet still
+        /// signs+broadcasts the mint (no delegation); this only READS the receipt of that tx. If
+        /// the receipt is not available yet (pending) or does not match, it falls back to the scan.
+        #[serde(default)]
+        tx_hash: Option<String>,
+    },
     Shutdown,
+}
+
+/// The structured `createChannel` the chain capability ABI-encodes. The selector + factory
+/// are supplied (configured), exactly like the mint selector — keccak is not computed
+/// in-capsule.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CreateChannelAssembly {
+    /// The configured 4-byte `createChannel` selector (default `0xc384baa2`).
+    pub selector: String,
+    /// The channel factory contract (createChannel `to`).
+    pub factory: String,
+    /// 0=…, channel type code (PC2 `_channelType`).
+    pub channel_type: u8,
+    /// Channel scope code (PC2 `_scope`).
+    pub scope: u8,
+    /// Human channel name (`_name`).
+    pub name: String,
+    /// Channel metadata token URI (`_tokenURI`).
+    pub token_uri: String,
+    /// Extra `bytes data` arg (default empty bytes).
+    #[serde(default)]
+    pub data_hex: Option<String>,
+    /// The payable `channelCreationFee` (hex quantity) the runtime read from CENTRAL_STORAGE;
+    /// the pure assembler never reads chain state. Defaults to `0x0`.
+    #[serde(default)]
+    pub value_wei: Option<String>,
+}
+
+/// The structured mint the chain capability ABI-encodes (publish-provider's
+/// `UnsignedMintV1`, plus the configured selector + the fee value the runtime read).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MintAssembly {
+    /// The configured 4-byte mint selector (`keccak256("mint(string,uint16,bytes,bytes)")
+    /// [..4]`) — supplied, not computed, mirroring the `has_access` selector.
+    pub selector: String,
+    /// The creator's Channel contract (mint `to`).
+    pub to: String,
+    /// `_uri` = `{metadataCid}/metadata.json`.
+    pub token_uri: String,
+    /// 0=FREE, 1=BUY_ONCE, 2=BUY_AND_RESELL.
+    pub op_type_code: u16,
+    /// On-chain `bytes16 contentId` (`0x` + 32 hex == KID).
+    pub content_id: String,
+    /// The payable mint fee (hex quantity) the runtime read from CENTRAL_STORAGE; the
+    /// pure assembler never reads chain state. Defaults to `0x0`.
+    #[serde(default)]
+    pub value_wei: Option<String>,
+    /// Paid listings only: the `opRawData` payee/royalty arrays + metadata URI.
+    #[serde(default)]
+    pub op_raw: Option<MintOpRaw>,
+    /// Paid listings only: the `sellRawData` sale terms.
+    #[serde(default)]
+    pub sell: Option<MintSell>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MintOpRaw {
+    /// `ipfs://{metadataCid}` (the folder root, app.js:1593).
+    pub metadata_uri: String,
+    pub addresses: Vec<String>,
+    pub role_types: Vec<u64>,
+    pub amounts: Vec<String>,
+    /// Present (and encoded as a trailing `uint16`) only for BUY_AND_RESELL.
+    #[serde(default)]
+    pub reseller_cut: Option<u16>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MintSell {
+    pub copies: String,
+    pub price_wei: String,
+    pub pay_token: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,0 +1,20 @@
+[package]
+name = "cenc-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "AES-128-CTR CENC (ISO 23001-7) content cipher primitive — container-agnostic, shared by encrypt-provider, decrypt-provider, and the ddrm-reader wasm."
+
+[lib]
+name = "cenc_core"
+path = "src/lib.rs"
+
+[dependencies]
+aes = "0.8"
+ctr = "0.9"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

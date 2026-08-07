@@ -1,6 +1,6 @@
 import {
   createHomeClipboardClient,
-} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+} from "/apps/home/home-clipboard-client.js?v=home-20260807a";
 
 const CONNECTOR_ID = "wallet-walletconnect";
 const connectButton = document.querySelector("#wallet-connect");

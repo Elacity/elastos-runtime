@@ -1,0 +1,26 @@
+[package]
+name = "media-provider"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ElastOS media packaging provider: transcode + DASH-fragment (PC2 parity) into PLAINTEXT segments + track/segment metadata. Holds NO key material; CENC + escrow stay in encrypt-provider (PRINCIPLE #15)."
+license = "MIT"
+
+[[bin]]
+name = "media-provider"
+path = "src/main.rs"
+
+# The fragmenter + metadata extractor + MPD generator live in ddrm-media (faithful
+# ports of PC2 mp4split.ts / mpdGenerator.ts). This provider orchestrates ffmpeg
+# (the only external tool — same as PC2) and feeds its output through them.
+[dependencies]
+ddrm-media = { path = "../ddrm-media" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

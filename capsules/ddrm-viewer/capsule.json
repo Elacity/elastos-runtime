@@ -1,0 +1,36 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "ddrm-viewer",
+  "version": "0.1.0",
+  "description": "Render an owned, protected NON-MEDIA asset (image, PDF, text/code, 3D) from a scoped decrypt session. Satisfies the elastos.viewer/document@1 interface; consumes only the scoped decrypted object bytes over a session handle, never the CEK, IV, or release receipt.",
+  "role": "viewer",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "author": "elastos",
+  "entrypoint": "index.html",
+  "interfaces": [
+    {
+      "id": "elastos.viewer.document",
+      "version": "1.0.0",
+      "description": "Render protected non-media objects (image, PDF, text/code, 3D) from a scoped decrypt session",
+      "methods": [
+        {
+          "id": "document.open",
+          "description": "Open a protected non-media asset via a scoped decrypt session, consuming only decrypted object bytes",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://content/asset",
+          "operation": "open"
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 96,
+    "gpu": false
+  }
+}

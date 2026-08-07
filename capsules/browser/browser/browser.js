@@ -12,7 +12,7 @@ import {
 } from "./browser-clipboard.js?v=browser-20260725b";
 import {
   createHomeClipboardClient,
-} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+} from "/apps/home/home-clipboard-client.js?v=home-20260807a";
 import {
   createRuntimePageCleanupController,
   runtimePageOwner,

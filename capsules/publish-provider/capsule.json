@@ -1,0 +1,27 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "publish-provider",
+  "version": "0.1.0",
+  "description": "Assembles the on-chain dDRM content mint (unsigned); binds contentId == bytes16 KID and derives the tokenURI, holding no chain-RPC or wallet key",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://publish/*",
+  "authority": {
+    "reason": "Assembles the content-mint transaction (contentId, tokenURI, opType) for chain-provider to broadcast and wallet-provider to sign. Holds no chain RPC, no wallet keys, and cannot broadcast — capability-clean by construction.",
+    "capabilities": [
+      {
+        "resource": "elastos://publish/*",
+        "actions": ["read"],
+        "operations": ["status", "prepare_publish"]
+      }
+    ],
+    "audit_events": ["publish.status", "publish.prepare.denied"]
+  },
+  "resources": {
+    "memory_mb": 64,
+    "gpu": false
+  },
+  "permissions": {}
+}
