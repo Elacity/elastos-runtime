@@ -255,15 +255,8 @@ fn prepare_store() -> &'static Mutex<PrepareState> {
 }
 
 fn prepare_cmd_path() -> Option<PathBuf> {
-    if let Some(p) = env_nonempty("CREATIVE_PREPARE_CMD") {
-        return Some(PathBuf::from(p));
-    }
-    let default = PathBuf::from("/Users/sash/Sparks/configs/h3/prepare-studio.sh");
-    if default.is_file() {
-        Some(default)
-    } else {
-        None
-    }
+    // Operator-owned only — never bake a machine-local path into the binary.
+    env_nonempty("CREATIVE_PREPARE_CMD").map(PathBuf::from)
 }
 
 fn prepare_snapshot() -> Value {
