@@ -87,12 +87,32 @@
  * [ ] Edit tags… shows #tags on session row; persist reload
  * [ ] Image attach → vision · unsupported (no fake caption)
  *
+ * Thinking markdown (§BB) + edit/table hang (§BC):
+ * [ ] Edit user message: full-width textarea, no blue focus ring
+ * [ ] Bold renders without visible ** markers
+ * [ ] Markdown tables stream without Page Unresponsive; final paint is a real table
+ * [ ] Stream paint uses same renderMarkdown as complete (bold/tables/lists) — no raw mid-stream fallback
+ * [ ] Chats survive refresh via host session.agent (no localStorage); replies flush on turn complete
+ *
  * Thinking markdown (§BB):
  * [ ] Thinking block renders bold/lists/fences (not raw **)
  * [ ] Mid-stream thinking paints markdown; Stop keeps raw source
  *
  * Sparks Flash dogfood: OLLAMA_URL=http://192.168.1.147:8888/v1/chat/completions
  * OLLAMA_MODEL=deepseek-v4-flash — see ~/elastos-mac-test-home/SPARK-FLASH-START.md
+ *
+ * Studio Generate (§BD):
+ * [ ] Agent → Studio shows CREATIVE profile / Generate ready
+ * [ ] Prompt + duration → job poll → mp4 plays (needs CREATIVE_URL + 2×)
+ * [ ] Character skill: face still → Ref2VA when Comfy up (CREATIVE_COMFY_URL)
+ * [ ] Character + optional voice clip → ref_audios / &lt;Audio 1&gt;
+ * [ ] Character honest when Comfy down (2× occupying spark3)
+ * [ ] No client-supplied upstream URL (SSRF-closed gateway)
+ * [ ] in-Home &lt;video&gt;: force video/mp4 blob + Save clip (ac)
+ * [ ] N-GPU picker 1×/2×/4× from status.scale; Character locked to 1× (ad)
+ * [ ] Character refs hidden under Generate (ae CSS)
+ * [ ] Allocator prepare on submit (af)
+ * [ ] Storyboard skill: shots → EDITING RULE compose → Generate (ag)
  */
 
-export const TIP = "home-20260804bb";
+export const TIP = "home-20260807aj";

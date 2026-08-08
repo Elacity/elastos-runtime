@@ -1,5 +1,5 @@
-/* Agent Settings / Usage pages + workbench panels.
-   Bound from agent-harness.js (ctx + host). Tip: home-20260804bb
+/* Agent Settings / Usage / Studio pages + workbench panels.
+   Bound from agent-harness.js (ctx + host). Tip: home-20260807aj
    UI ≠ authority (Principle 16): pages never mint grants. */
 
 import {
@@ -12,7 +12,7 @@ import {
   getHardwareEstimate,
   getPlanMarkdown,
   getTruthSnapshot,
-} from "./mock-agent-provider.js?v=home-20260804bb";
+} from "./mock-agent-provider.js?v=home-20260807aj";
 import {
   DEFAULT_LIVE_SYSTEM_PROMPT,
   MAX_LIVE_SYSTEM_PROMPT_CHARS,
@@ -24,7 +24,8 @@ import {
   fetchAgentBackends,
   saveAgentBackends,
   getAgentBackendsCache,
-} from "./agent-live.js?v=home-20260804bb";
+} from "./agent-live.js?v=home-20260807aj";
+import { renderStudioPage } from "./agent-studio.js?v=home-20260807aj";
 
 /** @type {null | object} */
 let ctx = null;
@@ -46,6 +47,10 @@ export const HARNESS_PAGES = {
   usage: {
     title: "Usage",
     sub: "On this device.",
+  },
+  studio: {
+    title: "Studio",
+    sub: "Generate video on this Home’s creative backend.",
   },
 };
 export const CONFIGURE_SECTIONS = new Set([
@@ -579,6 +584,8 @@ export function renderHarnessPage() {
     }
   } else if (harnessPage === "usage") {
     renderUsagePage();
+  } else if (harnessPage === "studio") {
+    renderStudioPage();
   }
 }
 

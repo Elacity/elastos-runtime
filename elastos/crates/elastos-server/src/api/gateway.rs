@@ -50,6 +50,8 @@ mod gateway_capsule_catalog;
 mod gateway_esp;
 #[path = "gateway_home_agent.rs"]
 mod gateway_home_agent;
+#[path = "gateway_home_creative.rs"]
+mod gateway_home_creative;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
@@ -88,6 +90,7 @@ use gateway_capsule_catalog::*;
 use gateway_esp::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_agent::*;
+use gateway_home_creative::*;
 use gateway_home_runtime::*;
 
 pub(crate) fn principal_root_protected_object_inventory(
@@ -150,6 +153,9 @@ pub(super) use gateway_wallet_adapter::RuntimeWalletAdapter;
 /// Maximum size for a single file fetched through the gateway (100 MB).
 const MAX_GATEWAY_FILE_SIZE: usize = 100 * 1024 * 1024;
 const LIBRARY_UPLOAD_CHUNK_MAX_BYTES: usize = 768 * 1024;
+/// Character jobs POST base64 face+voice (decoded caps 3×4MB + 8MB; data-URLs ~4/3).
+/// Character: up to 6×4 MiB stills + 1×8 MiB voice + JSON overhead.
+const HOME_CREATIVE_JOB_BODY_MAX_BYTES: usize = 48 * 1024 * 1024;
 const BROWSER_FILE_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
 const BROWSER_INPUT_BODY_MAX_BYTES: usize = (BROWSER_FILE_UPLOAD_BYTES.div_ceil(3) * 4) + 64 * 1024;
 const GATEWAY_VERSION: &str = env!("ELASTOS_VERSION");
@@ -866,6 +872,32 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/home/agent/backends",
             get(home_agent_backends_get).put(home_agent_backends_put),
+        )
+        .route(
+            "/api/apps/home/creative/status",
+            get(home_creative_status),
+        )
+        .route(
+            "/api/apps/home/creative/prepare",
+            post(home_creative_prepare),
+        )
+        .route(
+            "/api/apps/home/creative/stitch",
+            post(home_creative_jobs_stitch),
+        )
+        .route(
+            "/api/apps/home/creative/jobs",
+            get(home_creative_jobs_list).post(home_creative_jobs_create).layer(
+                DefaultBodyLimit::max(HOME_CREATIVE_JOB_BODY_MAX_BYTES),
+            ),
+        )
+        .route(
+            "/api/apps/home/creative/jobs/:id",
+            get(home_creative_jobs_get).delete(home_creative_jobs_delete),
+        )
+        .route(
+            "/api/apps/home/creative/jobs/:id/video",
+            get(home_creative_jobs_video),
         )
         .route(
             "/api/apps/home/agent/tools/library.read",

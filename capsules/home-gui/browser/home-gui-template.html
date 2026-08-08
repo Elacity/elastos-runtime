@@ -564,6 +564,10 @@
         <span>Home</span>
       </button>
       <nav class="agent-harness-nav" aria-label="Agent destinations">
+        <button type="button" class="agent-harness-nav-row" data-sidebar-nav="studio">
+          <span class="agent-harness-nav-mark" data-nav-icon="studio" aria-hidden="true"></span>
+          <span>Studio</span>
+        </button>
         <button type="button" class="agent-harness-nav-row" data-sidebar-nav="configure">
           <span class="agent-harness-nav-mark" data-nav-icon="configure" aria-hidden="true"></span>
           <span>Settings</span>
@@ -918,6 +922,141 @@
 
         <div class="agent-harness-page-section" data-page-section="usage" hidden>
           <div class="agent-usage" data-usage-page></div>
+        </div>
+
+        <div class="agent-harness-page-section" data-page-section="studio" hidden>
+          <div class="agent-studio" data-studio-page>
+            <p class="agent-studio-profile" data-studio-profile data-state="offline">
+              Checking creative backend…
+            </p>
+            <form class="agent-studio-form" data-studio-form method="post" action="#" onsubmit="return false;">
+              <div class="agent-studio-row">
+                <label class="agent-prompt-param">
+                  <span>Skill</span>
+                  <select data-studio-mode aria-label="Studio skill">
+                    <option value="generate" selected>Generate</option>
+                    <option value="storyboard">Storyboard</option>
+                    <option value="character">Character / Ref2VA</option>
+                  </select>
+                </label>
+                <label class="agent-prompt-param">
+                  <span>GPUs</span>
+                  <select data-studio-scale aria-label="GPU scale">
+                    <option value="1">1× · learn</option>
+                    <option value="2" selected>2× · everyday</option>
+                    <option value="4">4× · max</option>
+                  </select>
+                </label>
+              </div>
+              <p class="agent-studio-scale-note" data-studio-scale-note>
+                2× everyday · pair A chat stays up
+              </p>
+              <div class="agent-studio-storyboard" data-studio-storyboard hidden>
+                <label class="agent-prompt-label" for="agent-studio-shots">Shots (one per line)</label>
+                <textarea
+                  id="agent-studio-shots"
+                  class="agent-prompt-textarea"
+                  data-studio-shots
+                  rows="6"
+                  maxlength="10000"
+                  spellcheck="true"
+                  placeholder="Wide showroom, avocado carpet, camera zooms to velvet pedestal&#10;Pitchman rips gold cloth — ordinary grey rock on pedestal&#10;Hero macros of the rock under studio lights, stereo funk bed&#10;Salesman leans into camera: buy one, buy five"
+                ></textarea>
+                <p class="agent-studio-ref-note" data-studio-storyboard-note>
+                  One Generate per shot, then ffmpeg stitch on this Home (2–8 lines)
+                </p>
+              </div>
+              <label class="agent-prompt-label" for="agent-studio-prompt" data-studio-prompt-label>Prompt</label>
+              <textarea
+                id="agent-studio-prompt"
+                class="agent-prompt-textarea"
+                data-studio-prompt
+                rows="5"
+                maxlength="12000"
+                spellcheck="true"
+                placeholder="A quiet alley after rain — neon reflections, soft footsteps, stereo ambience"
+              ></textarea>
+              <div class="agent-studio-refs" data-studio-refs hidden>
+                <label class="agent-prompt-label" for="agent-studio-ref-files">Face / identity stills (up to 6)</label>
+                <input
+                  id="agent-studio-ref-files"
+                  class="agent-studio-ref-files"
+                  data-studio-ref-files
+                  type="file"
+                  accept="image/*"
+                  multiple
+                />
+                <p class="agent-studio-ref-note" data-studio-ref-note>No face stills selected</p>
+                <label class="agent-prompt-param">
+                  <span>Identity lock</span>
+                  <select data-studio-ref-size aria-label="Identity lock strength">
+                    <option value="match" selected>Match — faster</option>
+                    <option value="max">Max — stronger lock</option>
+                  </select>
+                </label>
+                <label class="agent-prompt-label" for="agent-studio-voice-file">Voice clip (optional)</label>
+                <input
+                  id="agent-studio-voice-file"
+                  class="agent-studio-ref-files"
+                  data-studio-voice-file
+                  type="file"
+                  accept="audio/*"
+                />
+                <p class="agent-studio-ref-note" data-studio-voice-note>No voice clip (optional)</p>
+              </div>
+              <div class="agent-studio-row">
+                <label class="agent-prompt-param">
+                  <span>Duration</span>
+                  <select data-studio-duration aria-label="Clip duration">
+                    <option value="2" selected>2s smoke</option>
+                    <option value="5">5s</option>
+                    <option value="10">10s</option>
+                    <option value="15">15s</option>
+                  </select>
+                </label>
+                <button type="submit" class="agent-studio-submit" data-studio-submit>
+                  Generate
+                </button>
+              </div>
+            </form>
+            <p class="agent-studio-status" data-studio-status data-tone="idle" role="status" hidden></p>
+            <div class="agent-studio-progress" data-studio-progress hidden>
+              <div class="agent-studio-progress-track">
+                <div class="agent-studio-progress-bar" data-studio-progress-bar></div>
+              </div>
+              <p class="agent-studio-progress-label" data-studio-progress-label></p>
+            </div>
+            <video
+              class="agent-studio-video"
+              data-studio-video
+              controls
+              playsinline
+              preload="auto"
+              hidden
+            ></video>
+            <a
+              class="agent-studio-download"
+              data-studio-download
+              download
+              hidden
+              >Save clip</a
+            >
+            <section class="agent-studio-library" data-studio-library aria-label="Clips on this Home">
+              <div class="agent-studio-library-head">
+                <h3 class="agent-studio-library-title">Clips on this Home</h3>
+                <button type="button" class="agent-studio-library-refresh" data-studio-library-refresh>
+                  Refresh
+                </button>
+              </div>
+              <ul class="agent-studio-library-list" data-studio-library-list></ul>
+              <p class="agent-studio-library-empty" data-studio-library-empty hidden>
+                No clips yet — Generate one above.
+              </p>
+            </section>
+            <p class="agent-harness-page-foot">
+              Allocator prepares Sparks on submit · Generate / Character · GPUs 1×/2×/4× · Clip library · UI ≠ authority
+            </p>
+          </div>
         </div>
       </div>
     </section>
