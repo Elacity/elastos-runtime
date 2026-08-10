@@ -16,6 +16,10 @@ const ROOM_ACCESS_REQUEST_KIND: &str = "room_access_request";
 const ROOM_ACCESS_REQUEST_ID_PREFIX: &str = "room-access-request:";
 const ROOM_ACCESS_REQUEST_TTL_SECS: u64 = 10 * 60;
 const EXTERNAL_HTTP_REQUEST_KIND: &str = "external_http_request";
+const CONTACT_REQUEST_KIND: &str = "contact_request";
+const CONTACT_REQUEST_ID_PREFIX: &str = "contact-request:";
+const DIRECT_MESSAGE_KIND: &str = "direct_message";
+const DIRECT_MESSAGE_ID_PREFIX: &str = "direct-message:";
 const NOTIFICATION_EVENTS_SCHEMA: &str = "elastos.notification-events/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -224,7 +228,181 @@ pub fn sync_room_notifications(data_dir: &Path, summary: &RoomSummary) -> anyhow
         }
     }
 
+    // Command and verified incoming-event boundaries sync this projection, so
+    // persist only a real change.
+    let serialized = serde_json::to_vec_pretty(&store)?;
+    let unchanged = match fs::read(&path) {
+        Ok(existing) => existing == serialized,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => store.entries.is_empty(),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    if unchanged {
+        return Ok(());
+    }
+
     write_json_atomic(&path, &store)
+}
+
+/// A pending incoming contact request projected from the principal-scoped
+/// contact store. This module never reads collaboration state itself.
+#[derive(Debug, Clone)]
+pub struct PendingContactRequestNotification {
+    pub request_hash: String,
+    pub display_name: String,
+    pub handle: Option<String>,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+/// Projects pending incoming contact requests into one read response.
+///
+/// The contact store remains the only durable truth. Home and Inbox reads do
+/// not copy these entries into the shared notification store, and a decided,
+/// revoked, or expired request disappears from the next projection naturally.
+pub fn project_contact_request_notifications(
+    summary: &mut NotificationSummary,
+    pending: &[PendingContactRequestNotification],
+) {
+    let now = now_ts();
+    summary
+        .entries
+        .retain(|entry| entry.kind != CONTACT_REQUEST_KIND);
+    let mut pending = pending
+        .iter()
+        .filter(|request| request.expires_at > now)
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.request_hash.cmp(&right.request_hash))
+    });
+    for request in pending {
+        let id = contact_request_notification_id(&request.request_hash);
+        let title = format!("{} wants to connect", request.display_name);
+        let body =
+            contact_request_notification_body(&request.display_name, request.handle.as_deref());
+        summary.entries.push(NotificationEntryView {
+            id,
+            source_app: "people".to_string(),
+            kind: CONTACT_REQUEST_KIND.to_string(),
+            title,
+            body,
+            action_ref: Some(NotificationActionRef {
+                app: "inbox".to_string(),
+                action_id: format!("contact-accept-request:{}", request.request_hash),
+            }),
+            created_at: request.created_at,
+            expires_at: Some(request.expires_at),
+            severity: NotificationSeverity::Attention,
+            read: false,
+            acted: false,
+            dismissed: false,
+        });
+    }
+    summary.unread_count = summary.entries.iter().filter(|entry| !entry.read).count();
+    summary.attention_count = summary
+        .entries
+        .iter()
+        .filter(|entry| entry.severity == NotificationSeverity::Attention)
+        .count();
+}
+
+fn contact_request_notification_body(display_name: &str, handle: Option<&str>) -> String {
+    match handle {
+        Some(handle) => format!(
+            "{display_name} (@{handle}) wants to add you as a contact. Accepting adds them to People."
+        ),
+        None => {
+            format!("{display_name} wants to add you as a contact. Accepting adds them to People.")
+        }
+    }
+}
+
+fn contact_request_notification_id(request_hash: &str) -> String {
+    format!("{CONTACT_REQUEST_ID_PREFIX}{request_hash}")
+}
+
+/// Records that a direct message arrived, one live entry per conversation.
+/// A repeat message resurfaces the entry; reading the conversation in Chat
+/// resolves it through [`mark_acted_for_action`] with the same action id.
+/// The sender name is the signed Profile name the receive path verified —
+/// this module never invents one.
+pub fn upsert_direct_message_notification(
+    data_dir: &Path,
+    conversation_id: &str,
+    sender_display_name: &str,
+    now: u64,
+) -> anyhow::Result<()> {
+    let id = direct_message_notification_id(conversation_id);
+    let path = notifications_path(data_dir)?;
+    let mut store = read_json_or_default::<NotificationStore>(&path)?;
+    let already_exists = store.entries.iter().any(|entry| entry.id == id);
+    if store.schema.trim().is_empty() {
+        store.schema = NOTIFICATIONS_SCHEMA.to_string();
+    }
+    let title = format!("New message from {sender_display_name}");
+    let body = format!("{sender_display_name} sent you a message in Chat.");
+    let action_ref = Some(NotificationActionRef {
+        app: "chat-room".to_string(),
+        action_id: direct_message_notification_action_id(conversation_id),
+    });
+
+    if let Some(existing) = store.entries.iter_mut().find(|entry| entry.id == id) {
+        existing.source_app = "chat-room".to_string();
+        existing.kind = DIRECT_MESSAGE_KIND.to_string();
+        existing.title = title;
+        existing.body = body;
+        existing.action_ref = action_ref;
+        existing.created_at = now;
+        existing.severity = NotificationSeverity::Attention;
+        existing.read = false;
+        existing.acted = false;
+        existing.dismissed = false;
+        return write_json_atomic(&path, &store);
+    }
+
+    store.entries.push(NotificationEntryRecord {
+        id: id.clone(),
+        source_app: "chat-room".to_string(),
+        kind: DIRECT_MESSAGE_KIND.to_string(),
+        title: title.clone(),
+        body: body.clone(),
+        action_ref: action_ref.clone(),
+        created_at: now,
+        expires_at: None,
+        severity: NotificationSeverity::Attention,
+        read: false,
+        acted: false,
+        dismissed: false,
+    });
+    if !already_exists {
+        record_event(
+            data_dir,
+            NotificationEventRecord {
+                id: format!("appeared:{id}"),
+                notification_id: id,
+                source_app: "chat-room".to_string(),
+                title,
+                body,
+                action_ref,
+                created_at: now,
+                disposition: NotificationEventDisposition::Appeared,
+                resolution: None,
+            },
+        )?;
+    }
+    write_json_atomic(&path, &store)
+}
+
+/// The action id that resolves a conversation's message notification. Chat's
+/// conversation read marks it acted; the entry's own action ref carries the
+/// same id so an Inbox resolution and a Chat read converge on one record.
+pub fn direct_message_notification_action_id(conversation_id: &str) -> String {
+    format!("chat-open-direct:{conversation_id}")
+}
+
+fn direct_message_notification_id(conversation_id: &str) -> String {
+    format!("{DIRECT_MESSAGE_ID_PREFIX}{conversation_id}")
 }
 
 pub fn load_summary(data_dir: &Path) -> anyhow::Result<NotificationSummary> {
@@ -604,6 +782,104 @@ mod tests {
         assert!(updated);
         let summary = load_summary(tmp.path()).unwrap();
         assert!(summary.entries.is_empty());
+    }
+
+    #[test]
+    fn contact_request_notification_explains_the_people_consequence_only() {
+        assert_eq!(
+            contact_request_notification_body("Morgan", None),
+            "Morgan wants to add you as a contact. Accepting adds them to People."
+        );
+        assert_eq!(
+            contact_request_notification_body("Morgan", Some("morgan")),
+            "Morgan (@morgan) wants to add you as a contact. Accepting adds them to People."
+        );
+    }
+
+    #[test]
+    fn contact_request_notifications_are_pure_inbox_projections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = now_ts();
+        let pending = vec![PendingContactRequestNotification {
+            request_hash: "sha256:req".to_string(),
+            display_name: "Morgan".to_string(),
+            handle: Some("morgan".to_string()),
+            created_at: now,
+            expires_at: now + 600,
+        }];
+        let mut summary = load_summary(tmp.path()).unwrap();
+        project_contact_request_notifications(&mut summary, &pending);
+        assert_eq!(summary.entries.len(), 1);
+        assert_eq!(summary.attention_count, 1);
+        let entry = &summary.entries[0];
+        assert_eq!(entry.kind, CONTACT_REQUEST_KIND);
+        assert_eq!(entry.id, "contact-request:sha256:req");
+        assert_eq!(entry.source_app, "people");
+        assert_eq!(entry.title, "Morgan wants to connect");
+        // The notification points at Inbox and never carries the decision:
+        // its action is the Inbox review reference, resolved by Inbox alone.
+        assert_eq!(
+            entry.action_ref,
+            Some(NotificationActionRef {
+                app: "inbox".to_string(),
+                action_id: "contact-accept-request:sha256:req".to_string(),
+            })
+        );
+        assert_eq!(entry.expires_at, Some(now + 600));
+        assert!(!notifications_path(tmp.path()).unwrap().exists());
+
+        // Re-projecting replaces the dynamic row instead of duplicating it.
+        project_contact_request_notifications(&mut summary, &pending);
+        assert_eq!(summary.entries.len(), 1);
+
+        // A decided (or revoked, or expired) request leaves the pending
+        // projection without mutating a second durable store.
+        project_contact_request_notifications(&mut summary, &[]);
+        assert!(summary.entries.is_empty());
+        assert!(!notifications_path(tmp.path()).unwrap().exists());
+    }
+
+    #[test]
+    fn direct_message_notification_resolves_on_read_and_resurfaces_on_new_mail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conversation = "direct:sha256:abc";
+        upsert_direct_message_notification(tmp.path(), conversation, "Alice", 100).unwrap();
+        let summary = load_summary(tmp.path()).unwrap();
+        assert_eq!(summary.entries.len(), 1);
+        assert_eq!(summary.entries[0].kind, DIRECT_MESSAGE_KIND);
+        assert_eq!(summary.entries[0].id, "direct-message:direct:sha256:abc");
+        assert_eq!(summary.entries[0].title, "New message from Alice");
+        assert_eq!(summary.entries[0].source_app, "chat-room");
+        assert_eq!(
+            summary.entries[0]
+                .action_ref
+                .as_ref()
+                .map(|action| action.action_id.as_str()),
+            Some("chat-open-direct:direct:sha256:abc")
+        );
+
+        // A second message keeps one entry per conversation.
+        upsert_direct_message_notification(tmp.path(), conversation, "Alice", 101).unwrap();
+        assert_eq!(load_summary(tmp.path()).unwrap().entries.len(), 1);
+
+        // Reading the conversation resolves it.
+        let acted = mark_acted_for_action(
+            tmp.path(),
+            &direct_message_notification_action_id(conversation),
+        )
+        .unwrap();
+        assert_eq!(acted, 1);
+        assert!(load_summary(tmp.path()).unwrap().entries.is_empty());
+
+        // New mail after a read resurfaces the same entry, unread again.
+        upsert_direct_message_notification(tmp.path(), conversation, "Alice Renamed", 102).unwrap();
+        let resurfaced = load_summary(tmp.path()).unwrap();
+        assert_eq!(resurfaced.entries.len(), 1);
+        assert!(!resurfaced.entries[0].read);
+        assert_eq!(
+            resurfaced.entries[0].title,
+            "New message from Alice Renamed"
+        );
     }
 
     #[test]
