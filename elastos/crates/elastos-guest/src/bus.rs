@@ -57,7 +57,7 @@ pub fn provider_invoke(
     body: serde_json::Value,
     grant: Option<String>,
 ) -> RuntimeRequest {
-    RuntimeRequest::CarrierInvoke {
+    RuntimeRequest::ResourceInvoke {
         uri: resource.into(),
         operation: operation.into(),
         body,
@@ -66,7 +66,7 @@ pub fn provider_invoke(
 }
 
 pub fn invoke_request(request: InvokeRequest) -> RuntimeRequest {
-    RuntimeRequest::CarrierInvoke {
+    RuntimeRequest::ResourceInvoke {
         uri: request.resource,
         operation: request.operation,
         body: request.body,
@@ -87,14 +87,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn component_invoke_matches_runtime_carrier_invoke_request() {
+    fn component_invoke_matches_runtime_resource_invoke_request() {
         let component = invoke_request(InvokeRequest {
             resource: "localhost://Users/self/Documents/a.md".into(),
             operation: "read".into(),
             body: serde_json::json!({ "path": "localhost://Users/self/Documents/a.md" }),
             grant: Some("grant-token".into()),
         });
-        let runtime_request = RuntimeRequest::CarrierInvoke {
+        let runtime_request = RuntimeRequest::ResourceInvoke {
             uri: "localhost://Users/self/Documents/a.md".into(),
             operation: "read".into(),
             body: serde_json::json!({ "path": "localhost://Users/self/Documents/a.md" }),

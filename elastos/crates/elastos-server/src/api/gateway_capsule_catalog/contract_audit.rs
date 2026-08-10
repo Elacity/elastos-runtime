@@ -148,7 +148,6 @@ pub(super) async fn capsule_contract_audit_summary(
         installed_external_components: &installed_external_components,
         launch_targets: &launch_targets,
         registry,
-        carrier_registered,
     };
     let mut capsules = Vec::new();
     for contract in manifests.values() {
@@ -376,13 +375,6 @@ async fn audit_manifest(
             "provider namespace has no live Runtime registration",
         ));
     }
-    if manifest.permissions.carrier && !context.carrier_registered {
-        issues.push(issue(
-            "carrier_boundary_unavailable",
-            Some(&manifest.name),
-            "provider declares Carrier authority but Runtime has no Carrier invoker",
-        ));
-    }
     audit_authority_boundary(manifest, issues);
 
     if let (Some(authority), Some(registration)) =
@@ -450,12 +442,8 @@ async fn audit_manifest(
                 "runtime-mediated-only"
             }
             .to_string(),
-            carrier: if manifest.permissions.carrier {
-                if context.carrier_registered {
-                    "runtime-carrier"
-                } else {
-                    "unavailable"
-                }
+            host_process: if manifest.permissions.host_process {
+                "runtime-owned-host-process"
             } else {
                 "none"
             }
@@ -486,7 +474,6 @@ struct CapsuleAuditContext<'a> {
     installed_external_components: &'a BTreeSet<String>,
     launch_targets: &'a BTreeMap<String, HomeTargetSummary>,
     registry: Option<&'a ProviderRegistry>,
-    carrier_registered: bool,
 }
 
 async fn audit_capabilities(
@@ -799,7 +786,7 @@ struct CapsuleMethodAudit {
 struct CapsuleBoundarySummary {
     execution: String,
     provider: String,
-    carrier: String,
+    host_process: String,
     direct_network: bool,
 }
 
@@ -924,6 +911,9 @@ mod tests {
     fn gateway_state(data_dir: &Path, registry: Arc<ProviderRegistry>) -> GatewayState {
         GatewayState {
             provider_registry: Some(registry),
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
             identity_manager: Arc::new(OnceLock::new()),
             cache_dir: data_dir.join("cache"),
             data_dir: data_dir.to_path_buf(),
@@ -1231,5 +1221,33 @@ mod tests {
             issue.code == "provider_not_registered"
                 && issue.capsule.as_deref() == Some("ipfs-provider")
         }));
+    }
+
+    #[tokio::test]
+    async fn audit_projects_host_process_boundary_for_host_process_providers() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_components(data_dir.path(), &["tunnel-provider"]);
+        install_manifest(data_dir.path(), "tunnel-provider");
+
+        let report = capsule_contract_audit_summary(&gateway_state(
+            data_dir.path(),
+            Arc::new(ProviderRegistry::new()),
+        ))
+        .await;
+        let tunnel = report
+            .capsules
+            .iter()
+            .find(|capsule| capsule.name == "tunnel-provider")
+            .expect("tunnel-provider must be audited");
+        let tunnel_json = serde_json::to_value(tunnel).expect("contract summary serializes");
+
+        assert_eq!(
+            tunnel_json.pointer("/boundary/host_process"),
+            Some(&serde_json::json!("runtime-owned-host-process"))
+        );
+        assert!(
+            tunnel_json.pointer("/boundary/carrier").is_none(),
+            "legacy carrier boundary field must be absent"
+        );
     }
 }

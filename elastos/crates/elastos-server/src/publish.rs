@@ -39,13 +39,13 @@ const HOME_PUBLISH_CAPSULES: &[&str] = &[
 ];
 const DEFAULT_PUBLISH_CAPSULES: &[&str] = HOME_PUBLISH_CAPSULES;
 const DEMO_PUBLISH_CAPSULES: &[&str] = &[
-    "chat",
     "gba-emulator",
     "gba-ucity",
     "chat-room",
     "ipfs-provider",
     "tunnel-provider",
 ];
+const RETIRED_PRODUCT_CAPSULES: &[&str] = &["agent", "chat"];
 const REQUIRED_SUPPORTED_PUBLISH_CAPSULES: &[&str] = &[
     "shell",
     "localhost-provider",
@@ -790,7 +790,11 @@ fn publish_profile_capsules(profile: &str, available: &[String]) -> anyhow::Resu
             "wallet-provider".to_string(),
             "webspace-provider".to_string(),
         ],
-        "full" => available.to_vec(),
+        "full" => available
+            .iter()
+            .filter(|name| !RETIRED_PRODUCT_CAPSULES.contains(&name.as_str()))
+            .cloned()
+            .collect(),
         other => {
             anyhow::bail!(
                 "Unknown publish profile '{}'. Available profiles: home, demo, providers, full",
@@ -834,6 +838,9 @@ fn expand_capsule_dependencies(
     visiting: &mut BTreeSet<String>,
     selected: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
+    if RETIRED_PRODUCT_CAPSULES.contains(&name) {
+        anyhow::bail!("Capsule '{}' is retired and cannot be published", name);
+    }
     let Some(manifest) = manifests.get(name) else {
         anyhow::bail!(
             "Unknown capsule '{}'. Available capsules: {}",
@@ -1185,7 +1192,11 @@ fn operator_release_notes(
         }
     }
 
-    if current.selected_capsules.iter().any(|name| name == "chat") {
+    if current
+        .selected_capsules
+        .iter()
+        .any(|name| name == "chat-room")
+    {
         notes.push("retest chat keyboard input, history persistence, and peer sync".to_string());
     }
     if current
@@ -1563,7 +1574,7 @@ mod tests {
         publish_profile_capsules, release_discovery_topics, save_publish_state, select_capsules,
         source_discovery_uri, validate_publish_inputs, validate_publishable_manifest,
         PublishReleaseOptions, PublishState, ReleaseLedgerEntry, ReleaseLedgerPlatform,
-        DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES,
+        DEFAULT_PUBLISH_CAPSULES, DEMO_PUBLISH_CAPSULES, RETIRED_PRODUCT_CAPSULES,
     };
     use elastos_common::{
         CapsuleManifest, CapsuleType, MicroVmConfig, Permissions, RequirementKind, ResourceLimits,
@@ -1601,6 +1612,7 @@ mod tests {
             permissions: Permissions::default(),
             microvm: Some(MicroVmConfig::default()),
             providers: None,
+            icon: None,
             viewer: None,
             signature: None,
         }
@@ -1657,7 +1669,7 @@ mod tests {
 
     #[test]
     fn test_select_capsules_rejects_unknown_name() {
-        let manifests = test_manifests(&[("chat", &[])]);
+        let manifests = test_manifests(&[("sample-app", &[])]);
         let err = select_capsules("demo", &["missing".to_string()], &manifests).unwrap_err();
         assert!(err.to_string().contains("Unknown capsule"));
     }
@@ -1665,21 +1677,21 @@ mod tests {
     #[test]
     fn test_select_capsules_expands_transitive_capsule_dependencies() {
         let manifests = test_manifests(&[
-            ("chat", &["did-provider"]),
+            ("sample-app", &["did-provider"]),
             ("did-provider", &[]),
             ("shell", &[]),
         ]);
         let selected = select_capsules(
             "demo",
-            &["shell".to_string(), "chat".to_string()],
+            &["shell".to_string(), "sample-app".to_string()],
             &manifests,
         )
         .unwrap();
         assert_eq!(
             selected,
             vec![
-                "chat".to_string(),
                 "did-provider".to_string(),
+                "sample-app".to_string(),
                 "shell".to_string(),
             ]
         );
@@ -1687,25 +1699,33 @@ mod tests {
 
     #[test]
     fn test_select_capsules_rejects_missing_transitive_dependency() {
-        let manifests = test_manifests(&[("chat", &["ipfs-provider"])]);
-        let err = select_capsules("demo", &["chat".to_string()], &manifests).unwrap_err();
+        let manifests = test_manifests(&[("sample-app", &["ipfs-provider"])]);
+        let err = select_capsules("demo", &["sample-app".to_string()], &manifests).unwrap_err();
         assert!(err.to_string().contains("requires capsule 'ipfs-provider'"));
+    }
+
+    #[test]
+    fn test_select_capsules_rejects_retired_product_capsules() {
+        let manifests = test_manifests(&[("chat", &[]), ("agent", &[])]);
+        for retired in RETIRED_PRODUCT_CAPSULES {
+            let err = select_capsules("demo", &[retired.to_string()], &manifests).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("is retired and cannot be published"));
+        }
     }
 
     #[test]
     fn test_publish_profile_full_uses_all_available_capsules() {
         let available = vec![
             "chat".to_string(),
+            "agent".to_string(),
             "shell".to_string(),
             "did-provider".to_string(),
         ];
         assert_eq!(
             publish_profile_capsules("full", &available).unwrap(),
-            vec![
-                "chat".to_string(),
-                "did-provider".to_string(),
-                "shell".to_string()
-            ]
+            vec!["did-provider".to_string(), "shell".to_string()]
         );
     }
 
@@ -1755,8 +1775,8 @@ mod tests {
     fn test_discover_available_capsules_reads_workspace_layout() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let capsules = discover_available_capsules(&root).unwrap();
-        assert!(capsules.iter().any(|name| name == "chat"));
-        assert!(capsules.iter().any(|name| name == "shell"));
+        assert!(capsules.iter().any(|name| name == "chat-room"));
+        assert!(capsules.iter().any(|name| name == "home-cli"));
         assert!(capsules.iter().any(|name| name == "ipfs-provider"));
     }
 
@@ -2065,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn test_operator_release_notes_flag_chat_and_update_risks() {
+    fn test_operator_release_notes_flag_chat_room_and_update_risks() {
         let current = ReleaseLedgerEntry {
             version: "0.11.0".to_string(),
             channel: "stable".to_string(),
@@ -2075,7 +2095,7 @@ mod tests {
             published_at: 42,
             signer_did: "did:key:z6Mktest".to_string(),
             selected_capsules: vec![
-                "chat".to_string(),
+                "chat-room".to_string(),
                 "peer-provider".to_string(),
                 "ipfs-provider".to_string(),
             ],
@@ -2085,7 +2105,7 @@ mod tests {
                     binary_cid: "bin".to_string(),
                     components_cid: "components".to_string(),
                     capsules: BTreeMap::from([
-                        ("chat".to_string(), "cid-chat-2".to_string()),
+                        ("chat-room".to_string(), "cid-chat-2".to_string()),
                         ("peer-provider".to_string(), "cid-peer-1".to_string()),
                     ]),
                 },
@@ -2099,13 +2119,13 @@ mod tests {
             head_cid: "old-head".to_string(),
             published_at: 1,
             signer_did: "did:key:z6Mktest".to_string(),
-            selected_capsules: vec!["chat".to_string()],
+            selected_capsules: vec!["chat-room".to_string()],
             platforms: BTreeMap::from([(
                 "x86_64-linux".to_string(),
                 ReleaseLedgerPlatform {
                     binary_cid: "old-bin".to_string(),
                     components_cid: "old-components".to_string(),
-                    capsules: BTreeMap::from([("chat".to_string(), "cid-chat-1".to_string())]),
+                    capsules: BTreeMap::from([("chat-room".to_string(), "cid-chat-1".to_string())]),
                 },
             )]),
         };

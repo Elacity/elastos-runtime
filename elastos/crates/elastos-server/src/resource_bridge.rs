@@ -1,4 +1,4 @@
-//! Carrier bridge for capsule stdio ↔ provider dispatch.
+//! Capsule resource bridge for stdio ↔ provider dispatch.
 //!
 //! The product bridge reads JSON-line requests from a Unix socket connected to
 //! a microVM console, dispatches to providers, and writes responses back.
@@ -29,7 +29,7 @@ use elastos_runtime::provider::ProviderRegistry;
 
 const CAPABILITY_APPROVAL_POLL_MS: u64 = 100;
 const CAPABILITY_APPROVAL_MAX_POLLS: usize = 300;
-const MAX_CARRIER_FRAME_BYTES: usize = 1_048_576;
+const MAX_RESOURCE_FRAME_BYTES: usize = 1_048_576;
 
 /// Resources needed by the bridge to handle requests.
 #[derive(Clone)]
@@ -47,13 +47,13 @@ pub struct BridgeContext {
     pub data_dir: Option<PathBuf>,
 }
 
-/// Spawn a Carrier bridge handler for a microVM capsule.
+/// Spawn a resource bridge handler for a microVM capsule.
 ///
 /// Listens on a Unix socket that crosvm serial port 2 connects to.
 /// Must be called BEFORE starting the VM so the socket exists when crosvm launches.
 /// Reads `RequestEnvelope` JSON lines, dispatches to providers,
 /// writes `ResponseEnvelope` JSON lines back.
-pub async fn spawn_carrier_bridge(
+pub async fn spawn_resource_bridge(
     socket_path: &Path,
     _provider_registry: Arc<ProviderRegistry>,
     _session_token: String,
@@ -63,7 +63,7 @@ pub async fn spawn_carrier_bridge(
     // crosvm --serial type=unix-stream connects to this socket on launch.
     let _ = tokio::fs::remove_file(socket_path).await;
     let listener = tokio::net::UnixListener::bind(socket_path)
-        .context("Failed to bind microVM Carrier bridge socket")?;
+        .context("Failed to bind microVM resource bridge socket")?;
 
     let socket_display = socket_path.display().to_string();
     let ctx = bridge_ctx;
@@ -75,12 +75,12 @@ pub async fn spawn_carrier_bridge(
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("Carrier bridge accept failed: {}", e);
+                tracing::warn!("Resource bridge accept failed: {}", e);
                 return;
             }
         };
         tracing::info!(
-            "Carrier microVM bridge: bidirectional connection accepted for {}",
+            "Resource microVM bridge: bidirectional connection accepted for {}",
             socket_display
         );
         let (reader, mut writer) = stream.into_split();
@@ -93,14 +93,14 @@ pub async fn spawn_carrier_bridge(
                 Ok(0) => break, // EOF — guest shut down
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::debug!("Carrier bridge read error: {}", e);
+                    tracing::debug!("Resource bridge read error: {}", e);
                     break;
                 }
             }
 
-            if line.len() > MAX_CARRIER_FRAME_BYTES {
+            if line.len() > MAX_RESOURCE_FRAME_BYTES {
                 tracing::warn!(
-                    "Carrier bridge: oversized line ({} bytes), dropping",
+                    "Resource bridge: oversized line ({} bytes), dropping",
                     line.len()
                 );
                 let error = serialize_bridge_response(request_too_large_envelope());
@@ -134,7 +134,7 @@ pub async fn spawn_carrier_bridge(
                 break;
             }
         }
-        tracing::info!("Carrier bridge closed for {}", socket_display);
+        tracing::info!("Resource bridge closed for {}", socket_display);
     });
 
     Ok(())
@@ -172,7 +172,7 @@ fn is_runtime_control_request(request_type: &str) -> bool {
     )
 }
 
-struct CarrierInvokeDispatch {
+struct ResourceInvokeDispatch {
     scheme: String,
     operation: String,
     request: serde_json::Value,
@@ -180,15 +180,15 @@ struct CarrierInvokeDispatch {
     required_action: Action,
 }
 
-fn carrier_invoke_dispatch(
+fn resource_invoke_dispatch(
     request: &serde_json::Value,
     principal_id: Option<&str>,
-) -> Result<CarrierInvokeDispatch, String> {
+) -> Result<ResourceInvokeDispatch, String> {
     let uri = request["uri"]
         .as_str()
-        .ok_or_else(|| "carrier_invoke missing uri".to_string())?;
+        .ok_or_else(|| "resource_invoke missing uri".to_string())?;
     if !is_supported_resource_scheme(uri) {
-        return Err("carrier URI must use elastos:// or localhost://".to_string());
+        return Err("resource URI must use elastos:// or localhost://".to_string());
     }
     if is_system_only_backend_resource(uri) {
         return Err("system backends are not app capabilities; use elastos://content".to_string());
@@ -198,10 +198,10 @@ fn carrier_invoke_dispatch(
     let operation = request["operation"]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "carrier_invoke missing operation".to_string())?
+        .ok_or_else(|| "resource_invoke missing operation".to_string())?
         .to_string();
 
-    let scheme = provider_scheme_for_carrier_uri(&uri)?;
+    let scheme = provider_scheme_for_resource_uri(&uri)?;
     let mut body = request
         .get("body")
         .cloned()
@@ -241,7 +241,7 @@ fn carrier_invoke_dispatch(
     ensure_generic_wallet_capability(&resource, required_action)?;
     body["op"] = serde_json::Value::String(operation.clone());
 
-    Ok(CarrierInvokeDispatch {
+    Ok(ResourceInvokeDispatch {
         scheme,
         operation,
         request: body,
@@ -270,7 +270,7 @@ fn manifest_allows_resource(
 }
 
 fn manifest_denied_response(resource: &str) -> serde_json::Value {
-    carrier_error_response(
+    resource_error_response(
         "manifest_capability_denied",
         &format!("capsule manifest does not declare authority for {resource}"),
     )
@@ -279,7 +279,7 @@ fn manifest_denied_response(resource: &str) -> serde_json::Value {
 fn emit_component_invoke_audit(
     bridge_ctx: &BridgeContext,
     audit_id: &str,
-    dispatch: &CarrierInvokeDispatch,
+    dispatch: &ResourceInvokeDispatch,
     phase: &str,
     outcome: Option<&str>,
 ) {
@@ -316,7 +316,7 @@ fn emit_component_invoke_audit(
 fn finish_component_invoke(
     bridge_ctx: &BridgeContext,
     audit_id: &str,
-    dispatch: &CarrierInvokeDispatch,
+    dispatch: &ResourceInvokeDispatch,
     outcome: &str,
     mut response: serde_json::Value,
 ) -> serde_json::Value {
@@ -330,15 +330,15 @@ fn finish_component_invoke(
     response
 }
 
-async fn authorize_and_dispatch_carrier_invoke(
+async fn authorize_and_dispatch_resource_invoke(
     request: &serde_json::Value,
     bridge_ctx: &BridgeContext,
 ) -> serde_json::Value {
     let token_b64 = request["token"].as_str().unwrap_or("");
-    let dispatch = match carrier_invoke_dispatch(request, bridge_ctx.principal_id.as_deref()) {
+    let dispatch = match resource_invoke_dispatch(request, bridge_ctx.principal_id.as_deref()) {
         Ok(dispatch) => dispatch,
         Err(message) => {
-            return carrier_error_response("invalid_carrier_invoke", &message);
+            return resource_error_response("invalid_resource_invoke", &message);
         }
     };
     let audit_id = format!(
@@ -367,9 +367,9 @@ async fn authorize_and_dispatch_carrier_invoke(
             &audit_id,
             &dispatch,
             "denied",
-            carrier_error_response(
+            resource_error_response(
                 "missing_token",
-                "carrier_invoke requires a capability token",
+                "resource_invoke requires a capability token",
             ),
         );
     }
@@ -382,7 +382,7 @@ async fn authorize_and_dispatch_carrier_invoke(
                 &audit_id,
                 &dispatch,
                 "denied",
-                carrier_error_response("invalid_token", "Invalid capability token"),
+                resource_error_response("invalid_token", "Invalid capability token"),
             )
         }
     };
@@ -404,17 +404,17 @@ async fn authorize_and_dispatch_carrier_invoke(
             &audit_id,
             &dispatch,
             "denied",
-            carrier_error_response("capability_denied", "Capability validation failed"),
+            resource_error_response("capability_denied", "Capability validation failed"),
         );
     }
 
-    if let Some(response) = protected_principal_root_carrier_response(
+    if let Some(response) = protected_principal_root_resource_response(
         bridge_ctx,
         &dispatch.operation,
         &dispatch.request,
     ) {
         let outcome =
-            if response.get("type").and_then(|value| value.as_str()) == Some("carrier_result") {
+            if response.get("type").and_then(|value| value.as_str()) == Some("resource_result") {
                 "ok"
             } else {
                 "error"
@@ -433,13 +433,13 @@ async fn authorize_and_dispatch_carrier_invoke(
             &dispatch,
             "ok",
             serde_json::json!({
-                "type": "carrier_result",
+                "type": "resource_result",
                 "result": result,
             }),
         ),
         Err(e) => {
             tracing::warn!(
-                "Bridge carrier_invoke failed for {}/{}: {}",
+                "Bridge resource_invoke failed for {}/{}: {}",
                 dispatch.scheme,
                 dispatch.operation,
                 e
@@ -449,13 +449,13 @@ async fn authorize_and_dispatch_carrier_invoke(
                 &audit_id,
                 &dispatch,
                 "error",
-                carrier_error_response("provider_error", "Provider operation failed"),
+                resource_error_response("provider_error", "Provider operation failed"),
             )
         }
     }
 }
 
-fn protected_principal_root_carrier_response(
+fn protected_principal_root_resource_response(
     bridge_ctx: &BridgeContext,
     operation: &str,
     request: &serde_json::Value,
@@ -463,20 +463,20 @@ fn protected_principal_root_carrier_response(
     let rooted = principal_root_read_write_uri(operation, request)?;
 
     let Some(principal_id) = bridge_ctx.principal_id.as_deref() else {
-        return Some(carrier_error_response(
+        return Some(resource_error_response(
             "principal_context_required",
             "localhost://Users requires a principal-scoped launch context",
         ));
     };
     let localhost_root = crate::auth::principal_localhost_root(principal_id);
     if rooted != localhost_root && !rooted.starts_with(&format!("{localhost_root}/")) {
-        return Some(carrier_error_response(
+        return Some(resource_error_response(
             "principal_context_required",
             "localhost://Users roots must use Users/self or the active principal root",
         ));
     }
     let Some(data_dir) = bridge_ctx.data_dir.as_deref() else {
-        return Some(carrier_error_response(
+        return Some(resource_error_response(
             "principal_context_required",
             "principal-root storage requires a local runtime data directory",
         ));
@@ -486,7 +486,7 @@ fn protected_principal_root_carrier_response(
         Ok(Some(_)) => {}
         Ok(None) => return None,
         Err(err) => {
-            return Some(carrier_error_response(
+            return Some(resource_error_response(
                 "principal_root_protection_invalid",
                 &err.to_string(),
             ));
@@ -494,7 +494,7 @@ fn protected_principal_root_carrier_response(
     }
 
     let Some(path) = rooted_localhost_fs_path(data_dir, &rooted) else {
-        return Some(carrier_error_response(
+        return Some(resource_error_response(
             "invalid_localhost_path",
             "invalid principal-root object path",
         ));
@@ -525,7 +525,7 @@ fn protected_principal_root_carrier_response(
         "write" => {
             let content = match request_content_bytes(request) {
                 Ok(content) => content,
-                Err(message) => return Some(carrier_error_response("invalid_content", &message)),
+                Err(message) => return Some(resource_error_response("invalid_content", &message)),
             };
             let append = request
                 .get("append")
@@ -605,7 +605,7 @@ fn apply_read_window(bytes: Vec<u8>, offset: Option<u64>, length: Option<u64>) -
 
 fn provider_ok_result(data: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
-        "type": "carrier_result",
+        "type": "resource_result",
         "result": {
             "status": "ok",
             "data": data,
@@ -615,7 +615,7 @@ fn provider_ok_result(data: serde_json::Value) -> serde_json::Value {
 
 fn provider_error_result(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({
-        "type": "carrier_result",
+        "type": "resource_result",
         "result": {
             "status": "error",
             "code": code,
@@ -624,7 +624,7 @@ fn provider_error_result(code: &str, message: &str) -> serde_json::Value {
     })
 }
 
-fn carrier_error_response(code: &str, message: &str) -> serde_json::Value {
+fn resource_error_response(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "error",
         "code": code,
@@ -635,25 +635,29 @@ fn carrier_error_response(code: &str, message: &str) -> serde_json::Value {
 fn bridge_error_envelope(id: u64, code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({
         "id": id,
-        "response": carrier_error_response(code, message),
+        "response": resource_error_response(code, message),
     })
 }
 
 fn request_too_large_envelope() -> serde_json::Value {
-    bridge_error_envelope(0, "request_too_large", "carrier frame exceeds maximum size")
+    bridge_error_envelope(
+        0,
+        "request_too_large",
+        "resource frame exceeds maximum size",
+    )
 }
 
 fn response_too_large_envelope(id: u64) -> serde_json::Value {
     bridge_error_envelope(
         id,
         "response_too_large",
-        "carrier response exceeds maximum size",
+        "resource response exceeds maximum size",
     )
 }
 
 fn serialize_bridge_response(response: serde_json::Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
-    if bytes.len() > MAX_CARRIER_FRAME_BYTES {
+    if bytes.len() > MAX_RESOURCE_FRAME_BYTES {
         let id = response
             .get("id")
             .and_then(|value| value.as_u64())
@@ -711,7 +715,7 @@ fn is_unscoped_current_user_alias(uri_or_resource: &str) -> bool {
     rooted == "localhost://Users/self" || rooted.starts_with("localhost://Users/self/")
 }
 
-fn provider_scheme_for_carrier_uri(uri: &str) -> Result<String, String> {
+fn provider_scheme_for_resource_uri(uri: &str) -> Result<String, String> {
     if uri.starts_with("localhost://") {
         if rooted_localhost_uri(uri).is_none() {
             return Err(format!("Invalid rooted localhost URI: {}", uri));
@@ -721,7 +725,7 @@ fn provider_scheme_for_carrier_uri(uri: &str) -> Result<String, String> {
 
     let rest = uri
         .strip_prefix("elastos://")
-        .ok_or_else(|| "carrier URI must use elastos:// or localhost://".to_string())?;
+        .ok_or_else(|| "resource URI must use elastos:// or localhost://".to_string())?;
     let scheme = rest
         .split(['/', '?', '#'])
         .next()
@@ -731,7 +735,7 @@ fn provider_scheme_for_carrier_uri(uri: &str) -> Result<String, String> {
 }
 
 /// Handle a single request from a component capsule host call.
-pub(crate) async fn handle_component_carrier_request(
+pub(crate) async fn handle_component_resource_request(
     line: &str,
     ctx: BridgeContext,
 ) -> Result<serde_json::Value> {
@@ -740,7 +744,7 @@ pub(crate) async fn handle_component_carrier_request(
 
 /// Handle a single request from the guest capsule.
 async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde_json::Value> {
-    if line.len() > MAX_CARRIER_FRAME_BYTES {
+    if line.len() > MAX_RESOURCE_FRAME_BYTES {
         return Ok(request_too_large_envelope());
     }
 
@@ -752,11 +756,11 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
     let request_type = request["type"].as_str().unwrap_or("");
 
     let response = match request_type {
-        "carrier_invoke" => {
+        "resource_invoke" => {
             let bridge_ctx = ctx
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no bridge context"))?;
-            authorize_and_dispatch_carrier_invoke(request, bridge_ctx).await
+            authorize_and_dispatch_resource_invoke(request, bridge_ctx).await
         }
 
         "request_capability" => {
@@ -1017,7 +1021,7 @@ pub async fn handle_remote_request_with_audit_dir(
     principal_id: Option<&str>,
     audit_data_dir: Option<&Path>,
 ) -> Result<serde_json::Value> {
-    if line.len() > MAX_CARRIER_FRAME_BYTES {
+    if line.len() > MAX_RESOURCE_FRAME_BYTES {
         return Ok(request_too_large_envelope());
     }
 
@@ -1037,15 +1041,15 @@ pub async fn handle_remote_request_with_audit_dir(
     let client = reqwest::Client::new();
 
     let response = match request_type {
-        "carrier_invoke" => {
-            let dispatch = match carrier_invoke_dispatch(request, principal_id) {
+        "resource_invoke" => {
+            let dispatch = match resource_invoke_dispatch(request, principal_id) {
                 Ok(dispatch) => dispatch,
                 Err(message) => {
                     return Ok(serde_json::json!({
                         "id": id,
                         "response": {
                             "type": "error",
-                            "code": "invalid_carrier_invoke",
+                            "code": "invalid_resource_invoke",
                             "message": message,
                         }
                     }));
@@ -1061,9 +1065,9 @@ pub async fn handle_remote_request_with_audit_dir(
             if cap_token.is_empty() {
                 return Ok(serde_json::json!({
                     "id": id,
-                    "response": carrier_error_response(
+                    "response": resource_error_response(
                         "missing_token",
-                        "carrier_invoke requires a capability token",
+                        "resource_invoke requires a capability token",
                     ),
                 }));
             }
@@ -1071,7 +1075,7 @@ pub async fn handle_remote_request_with_audit_dir(
             if principal_root_read_write_uri(&dispatch.operation, &dispatch.request).is_some() {
                 return Ok(serde_json::json!({
                     "id": id,
-                    "response": carrier_error_response(
+                    "response": resource_error_response(
                         "principal_context_required",
                         "principal-root storage requires an in-runtime protected storage bridge",
                     ),
@@ -1098,7 +1102,7 @@ pub async fn handle_remote_request_with_audit_dir(
             }
 
             tracing::debug!(
-                "[remote-carrier-bridge] carrier_invoke {}/{} token_present={}",
+                "[remote-resource-bridge] resource_invoke {}/{} token_present={}",
                 dispatch.scheme,
                 dispatch.operation,
                 !cap_token.is_empty()
@@ -1137,7 +1141,7 @@ pub async fn handle_remote_request_with_audit_dir(
             let status = resp.status();
             let body: serde_json::Value = resp.json().await?;
             tracing::debug!(
-                "[remote-carrier-bridge] {}/{} -> {}",
+                "[remote-resource-bridge] {}/{} -> {}",
                 dispatch.scheme,
                 dispatch.operation,
                 status
@@ -1157,7 +1161,7 @@ pub async fn handle_remote_request_with_audit_dir(
                 )?;
             }
             serde_json::json!({
-                "type": "carrier_result",
+                "type": "resource_result",
                 "result": body,
                 "audit": audit_id,
             })
@@ -1525,22 +1529,22 @@ mod tests {
         assert!(is_runtime_control_request("launch_capsule"));
         assert!(is_runtime_control_request("storage_read"));
         assert!(is_runtime_control_request("provider_call"));
-        assert!(!is_runtime_control_request("carrier_invoke"));
+        assert!(!is_runtime_control_request("resource_invoke"));
         assert!(!is_runtime_control_request("request_capability"));
     }
 
     #[test]
-    fn carrier_invoke_dispatch_uses_uri_resource_contract() {
-        let dispatch = carrier_invoke_dispatch(
+    fn resource_invoke_dispatch_uses_uri_resource_contract() {
+        let dispatch = resource_invoke_dispatch(
             &serde_json::json!({
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": "localhost://Local/SharedByLocalUsersAndBots/Home/a.md",
                 "operation": "read",
                 "body": {}
             }),
             None,
         )
-        .expect("localhost carrier invoke should dispatch");
+        .expect("localhost resource invoke should dispatch");
 
         assert_eq!(dispatch.scheme, "localhost");
         assert_eq!(dispatch.operation, "read");
@@ -1558,10 +1562,10 @@ mod tests {
     }
 
     #[test]
-    fn carrier_invoke_dispatch_rejects_unscoped_current_user_alias() {
-        let result = carrier_invoke_dispatch(
+    fn resource_invoke_dispatch_rejects_unscoped_current_user_alias() {
+        let result = resource_invoke_dispatch(
             &serde_json::json!({
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": "localhost://Users/self/Documents/a.md",
                 "operation": "read",
                 "body": {}
@@ -1581,12 +1585,12 @@ mod tests {
     }
 
     #[test]
-    fn carrier_invoke_dispatch_scopes_current_user_alias_with_principal() {
+    fn resource_invoke_dispatch_scopes_current_user_alias_with_principal() {
         let principal_id = "person:local:test-principal";
         let expected_root = crate::auth::principal_localhost_root(principal_id);
-        let dispatch = carrier_invoke_dispatch(
+        let dispatch = resource_invoke_dispatch(
             &serde_json::json!({
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": "localhost://Users/self/Documents/a.md",
                 "operation": "read",
                 "body": {}
@@ -1607,13 +1611,13 @@ mod tests {
     }
 
     #[test]
-    fn carrier_invoke_dispatch_allows_active_explicit_principal_root() {
+    fn resource_invoke_dispatch_allows_active_explicit_principal_root() {
         let principal_id = "person:local:test-principal";
         let principal_root = crate::auth::principal_localhost_root(principal_id);
         let path = format!("{principal_root}/Documents/a.md");
-        let dispatch = carrier_invoke_dispatch(
+        let dispatch = resource_invoke_dispatch(
             &serde_json::json!({
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": path,
                 "operation": "read",
                 "body": {}
@@ -1626,12 +1630,12 @@ mod tests {
     }
 
     #[test]
-    fn carrier_invoke_dispatch_rejects_foreign_principal_root() {
+    fn resource_invoke_dispatch_rejects_foreign_principal_root() {
         let active_principal_id = "person:local:active";
         let foreign_root = crate::auth::principal_localhost_root("person:local:foreign");
-        let result = carrier_invoke_dispatch(
+        let result = resource_invoke_dispatch(
             &serde_json::json!({
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": format!("{foreign_root}/Documents/a.md"),
                 "operation": "read",
                 "body": {}
@@ -1646,17 +1650,17 @@ mod tests {
     }
 
     #[test]
-    fn carrier_invoke_dispatch_derives_chain_network() {
-        let dispatch = carrier_invoke_dispatch(
+    fn resource_invoke_dispatch_derives_chain_network() {
+        let dispatch = resource_invoke_dispatch(
             &serde_json::json!({
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": "elastos://chain/esc-mainnet/block_number",
                 "operation": "block_number",
                 "body": {}
             }),
             None,
         )
-        .expect("chain carrier invoke should dispatch");
+        .expect("chain resource invoke should dispatch");
 
         assert_eq!(dispatch.scheme, "chain");
         assert_eq!(
@@ -1673,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn carrier_invoke_dispatch_rejects_wallet_signing_and_raw_contract() {
+    fn resource_invoke_dispatch_rejects_wallet_signing_and_raw_contract() {
         for (uri, operation) in [
             (
                 "elastos://wallet/eip155:20/sign/transaction_intent",
@@ -1682,9 +1686,9 @@ mod tests {
             ("elastos://wallet/account/list", "accounts"),
             ("elastos://wallet/meta/status", "wallet_contract"),
         ] {
-            let error = carrier_invoke_dispatch(
+            let error = resource_invoke_dispatch(
                 &serde_json::json!({
-                    "type": "carrier_invoke",
+                    "type": "resource_invoke",
                     "uri": uri,
                     "operation": operation,
                     "body": {
@@ -1702,10 +1706,10 @@ mod tests {
     }
 
     #[test]
-    fn carrier_invoke_dispatch_bounds_wallet_status_body() {
-        let dispatch = carrier_invoke_dispatch(
+    fn resource_invoke_dispatch_bounds_wallet_status_body() {
+        let dispatch = resource_invoke_dispatch(
             &serde_json::json!({
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": "elastos://wallet/meta/status",
                 "operation": "status",
                 "body": {
@@ -1808,7 +1812,7 @@ mod tests {
     #[tokio::test]
     async fn handle_remote_request_enforces_manifest_bound_before_provider_proxy() {
         let response = handle_remote_request(
-            r#"{"id":15,"request":{"type":"carrier_invoke","uri":"localhost://Local/SharedByLocalUsersAndBots/Home/denied/a.md","operation":"read","token":"tok","body":{}}}"#,
+            r#"{"id":15,"request":{"type":"resource_invoke","uri":"localhost://Local/SharedByLocalUsersAndBots/Home/denied/a.md","operation":"read","token":"tok","body":{}}}"#,
             "http://127.0.0.1:12345",
             "client-token",
             "test-capsule",
@@ -1826,7 +1830,7 @@ mod tests {
     #[tokio::test]
     async fn attached_bridge_wallet_contract_fails_before_http_dispatch() {
         let response = handle_remote_request(
-            r#"{"id":16,"request":{"type":"carrier_invoke","uri":"elastos://wallet/meta/status","operation":"wallet_contract","token":"caller-token","body":{"principal_id":"caller-selected-principal","request":{"operation":{"kind":"list_accounts"}}}}}"#,
+            r#"{"id":16,"request":{"type":"resource_invoke","uri":"elastos://wallet/meta/status","operation":"wallet_contract","token":"caller-token","body":{"principal_id":"caller-selected-principal","request":{"operation":{"kind":"list_accounts"}}}}}"#,
             "http://127.0.0.1:12345",
             "client-token",
             "test-capsule",
@@ -1838,7 +1842,7 @@ mod tests {
 
         assert_eq!(response["id"], 16);
         assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "invalid_carrier_invoke");
+        assert_eq!(response["response"]["code"], "invalid_resource_invoke");
     }
 
     #[tokio::test]
@@ -1867,7 +1871,7 @@ mod tests {
             crate::auth::principal_localhost_root(principal_id)
         );
         let response = handle_remote_request(
-            r#"{"id":13,"request":{"type":"carrier_invoke","uri":"localhost://Users/self/Documents/a.md","operation":"read","token":"tok","body":{}}}"#,
+            r#"{"id":13,"request":{"type":"resource_invoke","uri":"localhost://Users/self/Documents/a.md","operation":"read","token":"tok","body":{}}}"#,
             "http://127.0.0.1:12345",
             "client-token",
             "test-capsule",
@@ -1902,7 +1906,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_rejects_oversized_frame_before_json_parse() {
-        let line = "x".repeat(MAX_CARRIER_FRAME_BYTES + 1);
+        let line = "x".repeat(MAX_RESOURCE_FRAME_BYTES + 1);
         let response = handle_request(&line, &None)
             .await
             .expect("oversized bridge frame should produce a structured error");
@@ -1914,7 +1918,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_remote_request_rejects_oversized_frame_before_http_setup() {
-        let line = "x".repeat(MAX_CARRIER_FRAME_BYTES + 1);
+        let line = "x".repeat(MAX_RESOURCE_FRAME_BYTES + 1);
         let response = handle_remote_request(
             &line,
             "https://example.com",
@@ -1936,15 +1940,15 @@ mod tests {
         let response = serde_json::json!({
             "id": 44,
             "response": {
-                "type": "carrier_result",
+                "type": "resource_result",
                 "result": {
-                    "content": "x".repeat(MAX_CARRIER_FRAME_BYTES)
+                    "content": "x".repeat(MAX_RESOURCE_FRAME_BYTES)
                 }
             }
         });
 
         let bytes = serialize_bridge_response(response);
-        assert!(bytes.len() <= MAX_CARRIER_FRAME_BYTES);
+        assert!(bytes.len() <= MAX_RESOURCE_FRAME_BYTES);
         let decoded: serde_json::Value =
             serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap()).unwrap();
         assert_eq!(decoded["id"], 44);
@@ -2073,7 +2077,7 @@ mod tests {
         let write_line = serde_json::json!({
             "id": 21,
             "request": {
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": "localhost://Users/self/.AppData/LocalHost/Chat/state.json",
                 "operation": "write",
                 "token": write_token,
@@ -2090,7 +2094,7 @@ mod tests {
             .expect("protected write should produce a bridge response");
 
         assert_eq!(write_response["id"], 21);
-        assert_eq!(write_response["response"]["type"], "carrier_result");
+        assert_eq!(write_response["response"]["type"], "resource_result");
         assert_eq!(write_response["response"]["result"]["status"], "ok");
 
         let path = rooted_localhost_fs_path(temp.path(), &object_uri).unwrap();
@@ -2103,7 +2107,7 @@ mod tests {
         let read_line = serde_json::json!({
             "id": 22,
             "request": {
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": "localhost://Users/self/.AppData/LocalHost/Chat/state.json",
                 "operation": "read",
                 "token": read_token,
@@ -2121,14 +2125,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_invoke_localhost_uses_envelope_token_and_redacts_body_token() {
+    async fn resource_invoke_localhost_uses_envelope_token_and_redacts_body_token() {
         let ctx = bridge_context();
         let provider = Arc::new(CapturingProvider::default());
         ctx.provider_registry.register(provider.clone()).await;
         let uri = "localhost://Local/SharedByLocalUsersAndBots/Home/a.md";
-        let preview = carrier_invoke_dispatch(
+        let preview = resource_invoke_dispatch(
             &serde_json::json!({
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": uri,
                 "operation": "read",
                 "body": {
@@ -2143,7 +2147,7 @@ mod tests {
         let line = serde_json::json!({
             "id": 31,
             "request": {
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": uri,
                 "operation": "read",
                 "token": token,
@@ -2157,10 +2161,10 @@ mod tests {
 
         let response = handle_request(&line, &Some(ctx))
             .await
-            .expect("carrier invoke should dispatch through provider");
+            .expect("resource invoke should dispatch through provider");
 
         assert_eq!(response["id"], 31);
-        assert_eq!(response["response"]["type"], "carrier_result");
+        assert_eq!(response["response"]["type"], "resource_result");
         assert_eq!(response["response"]["result"]["status"], "ok");
         let requests = provider.requests().await;
         assert_eq!(requests.len(), 1);
@@ -2173,7 +2177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_invoke_validates_canonical_operation_action_not_token_action() {
+    async fn resource_invoke_validates_canonical_operation_action_not_token_action() {
         let ctx = bridge_context();
         let provider = Arc::new(CapturingProvider::default());
         ctx.provider_registry.register(provider.clone()).await;
@@ -2182,7 +2186,7 @@ mod tests {
         let line = serde_json::json!({
             "id": 33,
             "request": {
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": uri,
                 "operation": "read",
                 "token": write_token,
@@ -2219,7 +2223,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_invoke_enforces_manifest_capability_upper_bound() {
+    async fn resource_invoke_enforces_manifest_capability_upper_bound() {
         let mut ctx = bridge_context();
         ctx.manifest_capabilities =
             vec!["localhost://Local/SharedByLocalUsersAndBots/Home/allowed/*".to_string()];
@@ -2230,7 +2234,7 @@ mod tests {
         let line = serde_json::json!({
             "id": 34,
             "request": {
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": uri,
                 "operation": "read",
                 "token": read_token,
@@ -2253,7 +2257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_wallet_status_is_bounded_and_non_principal_specific() {
+    async fn resource_wallet_status_is_bounded_and_non_principal_specific() {
         let mut ctx = bridge_context();
         ctx.manifest_capabilities = vec![WALLET_STATUS_RESOURCE.to_string()];
         let provider = Arc::new(CapturingWalletProvider::default());
@@ -2262,7 +2266,7 @@ mod tests {
         let line = serde_json::json!({
             "id": 37,
             "request": {
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": WALLET_STATUS_RESOURCE,
                 "operation": "status",
                 "token": token,
@@ -2280,7 +2284,7 @@ mod tests {
             .expect("read-only Wallet status should produce a bridge response");
 
         assert_eq!(response["id"], 37);
-        assert_eq!(response["response"]["type"], "carrier_result");
+        assert_eq!(response["response"]["type"], "resource_result");
         let requests = provider.requests().await;
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0], serde_json::json!({"op": "status"}));
@@ -2292,8 +2296,8 @@ mod tests {
         ctx.manifest_capabilities = vec!["elastos://wallet/*".to_string()];
         let provider = Arc::new(CapturingWalletProvider::default());
         ctx.provider_registry.register(provider.clone()).await;
-        let response = handle_component_carrier_request(
-            r#"{"id":35,"request":{"type":"carrier_invoke","uri":"elastos://wallet/meta/status","operation":"wallet_contract","token":"caller-token","body":{"principal_id":"caller-selected-principal","request":{"operation":{"kind":"list_accounts"}}}}}"#,
+        let response = handle_component_resource_request(
+            r#"{"id":35,"request":{"type":"resource_invoke","uri":"elastos://wallet/meta/status","operation":"wallet_contract","token":"caller-token","body":{"principal_id":"caller-selected-principal","request":{"operation":{"kind":"list_accounts"}}}}}"#,
             ctx,
         )
         .await
@@ -2301,7 +2305,7 @@ mod tests {
 
         assert_eq!(response["id"], 35);
         assert_eq!(response["response"]["type"], "error");
-        assert_eq!(response["response"]["code"], "invalid_carrier_invoke");
+        assert_eq!(response["response"]["code"], "invalid_resource_invoke");
         assert!(
             provider.requests().await.is_empty(),
             "raw component Wallet dispatch must not reach ProviderRegistry"
@@ -2309,7 +2313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_wallet_operations_fail_before_provider_invocation() {
+    async fn resource_wallet_operations_fail_before_provider_invocation() {
         let mut ctx = bridge_context();
         ctx.manifest_capabilities = vec!["elastos://wallet/*".to_string()];
         let provider = Arc::new(CapturingWalletProvider::default());
@@ -2327,7 +2331,7 @@ mod tests {
             let line = serde_json::json!({
                 "id": id,
                 "request": {
-                    "type": "carrier_invoke",
+                    "type": "resource_invoke",
                     "uri": uri,
                     "operation": operation,
                     "token": "caller-token",
@@ -2340,11 +2344,11 @@ mod tests {
             .to_string();
             let response = handle_request(&line, &Some(ctx.clone()))
                 .await
-                .expect("Carrier bridge should reject generic Wallet authority");
+                .expect("Resource bridge should reject generic Wallet authority");
 
             assert_eq!(response["id"], id);
             assert_eq!(response["response"]["type"], "error");
-            assert_eq!(response["response"]["code"], "invalid_carrier_invoke");
+            assert_eq!(response["response"]["code"], "invalid_resource_invoke");
         }
 
         assert!(
@@ -2375,7 +2379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_invoke_localhost_rejects_missing_envelope_token_even_with_body_token() {
+    async fn resource_invoke_localhost_rejects_missing_envelope_token_even_with_body_token() {
         let ctx = bridge_context();
         let provider = Arc::new(CapturingProvider::default());
         ctx.provider_registry.register(provider.clone()).await;
@@ -2383,7 +2387,7 @@ mod tests {
         let line = serde_json::json!({
             "id": 32,
             "request": {
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": uri,
                 "operation": "read",
                 "body": {
@@ -2396,7 +2400,7 @@ mod tests {
 
         let response = handle_request(&line, &Some(ctx))
             .await
-            .expect("carrier invoke should reject missing envelope token");
+            .expect("resource invoke should reject missing envelope token");
 
         assert_eq!(response["id"], 32);
         assert_eq!(response["response"]["type"], "error");
@@ -2408,7 +2412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_request_rejects_users_root_carrier_invoke_without_data_dir() {
+    async fn handle_request_rejects_users_root_resource_invoke_without_data_dir() {
         let principal_id = "person:local:active";
         let mut ctx = bridge_context();
         ctx.principal_id = Some(principal_id.to_string());
@@ -2421,7 +2425,7 @@ mod tests {
         let line = serde_json::json!({
             "id": 23,
             "request": {
-                "type": "carrier_invoke",
+                "type": "resource_invoke",
                 "uri": "localhost://Users/self/Documents/a.md",
                 "operation": "read",
                 "token": read_token,

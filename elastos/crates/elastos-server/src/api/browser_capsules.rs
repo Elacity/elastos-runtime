@@ -49,6 +49,10 @@ pub(crate) struct LaunchableBrowserCapsule {
     pub name: String,
     pub description: Option<String>,
     pub role: CapsuleRole,
+    /// Capsule-relative entrypoint, the anchor icon routes resolve against.
+    pub entrypoint: String,
+    /// Capsule-relative icon directory as declared in the manifest.
+    pub icon: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +62,8 @@ pub(crate) struct ViewerBoundCapsule {
     pub viewer: String,
     pub entrypoint: String,
     pub storage: Vec<String>,
+    /// Capsule-relative icon directory as declared in the manifest.
+    pub icon: Option<String>,
 }
 
 pub async fn serve_browser_app_root(AxumPath(app): AxumPath<String>) -> Response {
@@ -239,6 +245,8 @@ pub(crate) fn list_launchable_browser_capsules(data_dir: &Path) -> Vec<Launchabl
                 name: capsule.manifest.name,
                 description: capsule.manifest.description,
                 role: capsule.manifest.role,
+                entrypoint: capsule.manifest.entrypoint,
+                icon: capsule.manifest.icon,
             },
         );
     }
@@ -267,6 +275,7 @@ pub(crate) fn list_viewer_bound_capsules(data_dir: &Path, viewer: &str) -> Vec<V
                 viewer: viewer.to_string(),
                 entrypoint: manifest.entrypoint,
                 storage: manifest.permissions.storage,
+                icon: manifest.icon,
             },
         );
     }
@@ -310,6 +319,7 @@ pub(crate) fn resolve_viewer_bound_capsule(
             viewer: viewer.to_string(),
             entrypoint: manifest.entrypoint,
             storage: manifest.permissions.storage,
+            icon: manifest.icon,
         });
     }
 
