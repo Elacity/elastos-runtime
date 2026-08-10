@@ -22,14 +22,6 @@ key and revocation state are committed atomically, operators must verify the
 persisted key and restart result instead of treating command completion as a
 durable rotation receipt.
 
-### No replay protection in chat signatures
-
-**Severity:** Medium
-**Files:** `capsules/chat/src/session.rs`, `capsules/chat/src/app.rs`
-**Status:** Open
-
-The signing payload is `SHA256(sender_id:ts:content)` with no nonce, topic binding, or timestamp freshness validation. The same signed message is valid on any channel and can be replayed indefinitely.
-
 ### Empty capability tokens in carrier service
 
 **Severity:** Medium
@@ -41,26 +33,6 @@ Host-plane Carrier service providers receive empty capability tokens on all requ
 ## Resolved Findings
 
 These findings are fixed in the current branch but remain listed as security history because they shaped the runtime contract.
-
-### Chat message verification enforcement
-
-**Severity:** Medium (reduced from High)
-**Files:** `capsules/chat/src/main.rs`, `capsules/chat/src/main_stdio.rs`, `elastos/crates/elastos-server/src/chat_cmd.rs`
-**Status:** Fixed (2026-03-28)
-
-All chat surfaces (native, WASM, agent) now sign outgoing messages via the DID provider and verify incoming messages. Unknown senders with unverified or unsigned messages are dropped before display, nick recording, or peer attachment. The shared verification logic lives in `elastos_common::chat_protocol`.
-
-**Residual risk:** Chat is still a pre-release surface. The signing payload lacks replay protection (see open finding above).
-
-### Presence announcement signing
-
-**Severity:** Medium (reduced from High)
-**Files:** `capsules/chat/src/session.rs`
-**Status:** Fixed (2026-03-28)
-
-Presence announcements are now signed via the DID provider. Unsigned presence messages are dropped on receive. This prevents fake presence injection with arbitrary tickets.
-
-**Residual risk:** No freshness check on presence signatures — replay of valid presence is still possible.
 
 ### Bridge line length limits
 

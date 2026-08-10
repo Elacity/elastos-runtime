@@ -33,7 +33,7 @@ the [Mac staging runbook](docs/MAC.md).
 
 ## Build from source
 
-The workspace requires Rust 1.89 or newer.
+The workspace requires Rust 1.91 or newer.
 
 ```bash
 cargo install just

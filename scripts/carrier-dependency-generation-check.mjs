@@ -193,6 +193,9 @@ requireText(
   /minor < 91/,
   "source-home setup must reject Rust older than 1.91",
 );
+for (const path of ["README.md", "docs/GETTING_STARTED.md", "elastos/README.md"]) {
+  requireText(path, /Rust 1\.91(\.0)?\+?|Rust 1\.91 or newer/, `${path} must document the Rust 1.91 floor`);
+}
 const serverManifest = requireText(
   "elastos/crates/elastos-server/Cargo.toml",
   /ed25519-dalek3 = \{ package = "ed25519-dalek", version = "=3\.0\.0-rc\.0" \}/,

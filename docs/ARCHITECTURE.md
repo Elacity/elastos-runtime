@@ -52,10 +52,13 @@ migrated substrates. In the 0.6 review tree, the Component runner is exercised
 by a conformance fixture and authoring template; all shipped first-party UI Apps
 remain `elastos.runtime-projection/v1` web projections.
 
-The Runtime-owned trusted-source Room bootstrap exception may use configured
-publisher transport state to seed Room gossip. It remains Runtime-only and must
-not expose raw tickets, decoded endpoints, or direct Carrier socket authority to
-capsules or UI.
+A verified signed collaboration-network profile supplies the Runtime's bounded
+bootstrap peers and authenticates the content-addressed default-conversation
+grant. The Runtime collaboration service, durable core, and transport driver own
+that authority and give Carrier only opaque signed envelopes. Configured Chat
+text receives typed projections from the Runtime-owned product port and never
+receives tickets, endpoints, raw sockets, or Carrier topics. The route-owned Room
+gossip exception is gone; People/discovery migration remains separate open work.
 
 Sequencing and incomplete work belong in [ROADMAP.md](../ROADMAP.md) and
 [TASKS.md](../TASKS.md). This document defines the following authority

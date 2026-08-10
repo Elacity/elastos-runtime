@@ -80,12 +80,21 @@ refresh and preflight must fail when the rootfs bridge does not support
 `elastos.browser.vm-guest-control-bridge.config/v1`,
 `control_socket_ready_timeout_ms`, and `control_request_timeout_ms`.
 
-## People Discovery Invariant
+## People Discovery And Presence Invariant
 
-People discovery is opt-in, short-lived, and principal-rooted. UI and API
-summaries must derive visible state from the discovery expiry, not just a
-persisted boolean. Expired discovery must not publish presence until explicitly
-enabled again.
+People Discovery is explicit and opt-in. It projects a bounded set of signed,
+TTL-bound advertisements plus exact recipient contact requests and acceptances
+for the configured signed collaboration network. The seed/relay may help
+delivery, but it is never identity, contact, membership, or conversation
+authority.
+
+Signed presence is separate. It is a read-only projection of verified,
+unexpired presence for accepted contacts and active group participants in the
+configured signed collaboration network and default conversation. Presence
+presentation is self-asserted by the signing device key; it is not identity,
+contact, admission, or authorization. Missing collaboration configuration
+yields an explicit empty, unconfigured view, and reading People must not create
+identity, collaboration, or transport state.
 
 ## Service Selection Invariant
 
