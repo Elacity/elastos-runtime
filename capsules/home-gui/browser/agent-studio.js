@@ -1,7 +1,7 @@
 /* Home Studio — Generate + Storyboard + Character via CREATIVE_* jobs.
-   Tip: home-20260809bd — P2 Character refs + library delete */
+   Tip: home-20260810mr — P2 Character refs + library delete */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260809bd";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260810mr";
 
 const DURATIONS = [2, 5, 10, 15, 30];
 const SCALES = [1, 2, 4];
@@ -22,6 +22,39 @@ let scaleCatalog = null;
 
 function creativeUrl(path) {
   return new URL(path, window.location.href).href;
+}
+
+/** P4.5 dogfood pivot: Generate mode runs through the model contract (runs.*).
+ * Always on for generate; character/storyboard stay on the legacy path until
+ * their adapters exist. Set `window.__studioContract = false` in the console
+ * to force the legacy generate path for comparison/debugging. */
+function useModelContract() {
+  try {
+    return globalThis.__studioContract !== false;
+  } catch {
+    return true;
+  }
+}
+
+/** Call the model-provider via the gateway provider proxy. */
+async function modelCall(op, body = {}) {
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    throw new Error("missing home launch token");
+  }
+  const res = await fetch(creativeUrl(`/api/provider/model/${op}`), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-elastos-home-token": token,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.status === "error") {
+    throw new Error(data?.message || data?.code || `model ${op} failed (${res.status})`);
+  }
+  return data?.data ?? data;
 }
 
 function creativeErrorMessage(err, fallback) {
@@ -494,7 +527,103 @@ async function waitForJob(jobId) {
   }
 }
 
+/** P4.5: run a generate job through the model contract (runs.*). */
+async function waitForRun(runId) {
+  let cursor = 0;
+  for (;;) {
+    const data = await modelCall("runs_events", { run_id: runId, cursor });
+    cursor = data?.cursor ?? cursor;
+    const state = String(data?.state || "");
+    const events = Array.isArray(data?.events) ? data.events : [];
+    const lastProgress = [...events].reverse().find((e) => e?.type === "progress");
+    if (lastProgress) {
+      const pct = lastProgress.total
+        ? Math.round((lastProgress.completed / lastProgress.total) * 100)
+        : undefined;
+      setProgress(pct, lastProgress.phase, "");
+    }
+    const errEvent = events.find((e) => e?.type === "error");
+    if (state === "succeeded") {
+      const result = events.find((e) => e?.type === "result");
+      const artifactId = result?.objects?.[0]?.id;
+      return { artifactId };
+    }
+    if (state === "failed") {
+      throw new Error(errEvent?.message || "run failed");
+    }
+    if (state === "cancelled") {
+      throw new Error("run cancelled");
+    }
+    await sleep(POLL_MS);
+  }
+}
+
+/** P4.5: contract path for generate mode (offer:h3-video:2x). */
+async function startJobViaContract(payload) {
+  stopPoll();
+  clearVideo();
+  setBusy(true);
+  try {
+    await ensurePrepared("generate");
+  } catch (err) {
+    setBusy(false);
+    hideProgress();
+    setStatus(creativeErrorMessage(err, "Could not prepare Studio"), "error");
+    return;
+  }
+
+  setStatus("Queued (contract)…", "busy");
+  setProgress(0, "Queued", `${payload.duration}s`);
+
+  let created;
+  try {
+    created = await modelCall("runs_create", {
+      offer_id: "offer:h3-video:2x",
+      operation: "generate",
+      inputs: {
+        prompt: payload.prompt,
+        duration_seconds: payload.duration,
+      },
+    });
+  } catch (err) {
+    setBusy(false);
+    hideProgress();
+    setStatus(creativeErrorMessage(err, "Could not start run"), "error");
+    return;
+  }
+
+  const runId = String(created?.run_id || "");
+  if (!runId) {
+    setBusy(false);
+    hideProgress();
+    setStatus("Contract returned no run id", "error");
+    return;
+  }
+
+  activeJobId = runId;
+  setStatus(`Run ${runId.slice(0, 14)}…`, "busy");
+  try {
+    const { artifactId } = await waitForRun(runId);
+    activeJobId = null;
+    setBusy(false);
+    setStatus("Done — clip ready on this Home. (contract)", "ok");
+    setProgress(100, "Done", "");
+    if (artifactId) {
+      await loadVideo(artifactId);
+    }
+    refreshLibrary();
+  } catch (err) {
+    activeJobId = null;
+    setBusy(false);
+    hideProgress();
+    setStatus(creativeErrorMessage(err, "Run failed"), "error");
+  }
+}
+
 async function startJob(payload) {
+  if (useModelContract() && backendMode(payload.mode) === "generate") {
+    return startJobViaContract(payload);
+  }
   stopPoll();
   clearVideo();
   setBusy(true);

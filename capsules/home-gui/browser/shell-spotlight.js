@@ -3,19 +3,19 @@ import {
   mountGlyph,
   allVisibleTargets,
   desktopObjects,
-} from "./shell-core.js?v=home-20260809bd";
-import { openFileObject } from "./shell-surface.js?v=home-20260809bd";
+} from "./shell-core.js?v=home-20260810mr";
+import { openFileObject } from "./shell-surface.js?v=home-20260810mr";
 import {
   openTarget,
   focusWindow,
   browserWindowEntries,
   sortWindowEntriesByZOrder,
   browserWindowDisplayTitle,
-} from "./shell-windows.js?v=home-20260809bd";
+} from "./shell-windows.js?v=home-20260810mr";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260809bd";
+} from "./shell-motion.js?v=home-20260810mr";
 
 /* Spotlight: shell-wide search (macOS anatomy — dimmed backdrop, centered
  * floating bar, grouped results that grow beneath it). Searches everything

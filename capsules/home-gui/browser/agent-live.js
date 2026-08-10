@@ -4,7 +4,7 @@
    (home-gui-only allowlist, home launch token).
    Tip: home-20260804bb */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260809bd";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260810mr";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
@@ -587,6 +587,132 @@ export function abortLiveChatStream() {
       /* ignore */
     }
     liveAbort = null;
+  }
+  if (liveContractRunId) {
+    const runId = liveContractRunId;
+    liveContractRunId = null;
+    /* fire-and-forget: best-effort cancel of the contract run */
+    modelRunCall("runs_cancel", { run_id: runId }).catch(() => {});
+  }
+}
+
+/* ---- P4.5c: chat via the model contract (runs.*) ---- */
+
+let liveContractRunId = null;
+
+/** Escape hatch: `window.__chatContract = false` forces the legacy SSE path. */
+export function useChatContract() {
+  try {
+    return globalThis.__chatContract !== false;
+  } catch {
+    return true;
+  }
+}
+
+async function modelRunCall(op, body = {}) {
+  const token = getHomeGuiLaunchToken();
+  if (!token) {
+    const error = new Error("missing home launch token in Home GUI shell");
+    error.code = "missing-home-launch-token";
+    throw error;
+  }
+  const res = await fetch(
+    new URL(`/api/provider/model/${op}`, window.location.href).href,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-elastos-home-token": token,
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.status === "error") {
+    const error = new Error(data?.message || data?.code || `model ${op} failed (${res.status})`);
+    error.code = data?.code || "model_error";
+    error.status = res.status;
+    throw error;
+  }
+  return data?.data ?? data;
+}
+
+const CONTRACT_POLL_MS = 250;
+
+/**
+ * Contract twin of streamLiveChatCompletion: identical onDelta({ reasoning,
+ * content, done }) accumulated-string interface and return shape, but the
+ * transport is runs_create + runs_events cursor-poll on offer:flash-chat:pair-a.
+ */
+export async function streamChatViaContract(
+  messages,
+  { onDelta, maxTokens = DEFAULT_LIVE_MAX_TOKENS, temperature = DEFAULT_LIVE_TEMPERATURE } = {},
+) {
+  abortLiveChatStream();
+  const startedAt = Date.now();
+
+  const created = await modelRunCall("runs_create", {
+    offer_id: "offer:flash-chat:pair-a",
+    operation: "generate",
+    inputs: {
+      messages,
+      max_tokens: clampLiveMaxTokens(maxTokens),
+      temperature: clampLiveTemperature(temperature),
+    },
+  });
+  const runId = String(created?.run_id || "");
+  if (!runId) {
+    const error = new Error("contract returned no run id");
+    error.code = "no_run_id";
+    throw error;
+  }
+  liveContractRunId = runId;
+
+  let cursor = 0;
+  let reasoning = "";
+  let content = "";
+  const emit = (done = false) => onDelta?.({ reasoning, content, done });
+  const finish = (extra = {}) => ({
+    reasoning,
+    content,
+    usage: null,
+    latencyMs: Date.now() - startedAt,
+    aborted: false,
+    ...extra,
+  });
+
+  try {
+    for (;;) {
+      const data = await modelRunCall("runs_events", { run_id: runId, cursor });
+      cursor = data?.cursor ?? cursor;
+      const state = String(data?.state || "");
+      const events = Array.isArray(data?.events) ? data.events : [];
+      for (const ev of events) {
+        if (ev?.type === "thinking" && typeof ev.delta === "string") {
+          reasoning += ev.delta;
+        } else if (ev?.type === "text" && typeof ev.delta === "string") {
+          content += ev.delta;
+        }
+      }
+      emit(state === "succeeded" || state === "failed" || state === "cancelled");
+      if (state === "succeeded") {
+        return finish();
+      }
+      if (state === "failed") {
+        const errEvent = events.find((e) => e?.type === "error");
+        const error = new Error(errEvent?.message || "run failed");
+        error.code = errEvent?.code || "run_failed";
+        throw error;
+      }
+      if (state === "cancelled") {
+        return finish({ aborted: true });
+      }
+      await new Promise((resolve) => setTimeout(resolve, CONTRACT_POLL_MS));
+    }
+  } finally {
+    if (liveContractRunId === runId) {
+      liveContractRunId = null;
+    }
   }
 }
 

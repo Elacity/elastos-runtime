@@ -6,20 +6,20 @@
 import {
   listProjects,
   createProject,
-} from "./mock-agent-provider.js?v=home-20260809bd";
-import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260809bd";
-import { closeHarnessPage } from "./agent-configure.js?v=home-20260809bd";
+} from "./mock-agent-provider.js?v=home-20260810mr";
+import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260810mr";
+import { closeHarnessPage } from "./agent-configure.js?v=home-20260810mr";
 import {
   renderActiveSession,
   renderFollowUpQueue,
   stopMockStream,
   setTitle,
   titleFromPrompt,
-} from "./agent-stream.js?v=home-20260809bd";
+} from "./agent-stream.js?v=home-20260810mr";
 import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
-} from "./agent-shelf.js?v=home-20260809bd";
+} from "./agent-shelf.js?v=home-20260810mr";
 
 /** @type {null | object} */
 let ctx = null;

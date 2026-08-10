@@ -1,5 +1,5 @@
 /* Agent Settings / Usage / Studio pages + workbench panels.
-   Bound from agent-harness.js (ctx + host). Tip: home-20260809bd
+   Bound from agent-harness.js (ctx + host). Tip: home-20260810mr
    UI ≠ authority (Principle 16): pages never mint grants. */
 
 import {
@@ -12,7 +12,7 @@ import {
   getHardwareEstimate,
   getPlanMarkdown,
   getTruthSnapshot,
-} from "./mock-agent-provider.js?v=home-20260809bd";
+} from "./mock-agent-provider.js?v=home-20260810mr";
 import {
   DEFAULT_LIVE_SYSTEM_PROMPT,
   MAX_LIVE_SYSTEM_PROMPT_CHARS,
@@ -24,8 +24,8 @@ import {
   fetchAgentBackends,
   saveAgentBackends,
   getAgentBackendsCache,
-} from "./agent-live.js?v=home-20260809bd";
-import { renderStudioPage } from "./agent-studio.js?v=home-20260809bd";
+} from "./agent-live.js?v=home-20260810mr";
+import { renderStudioPage } from "./agent-studio.js?v=home-20260810mr";
 
 /** @type {null | object} */
 let ctx = null;

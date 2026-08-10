@@ -14,22 +14,27 @@ import {
   clearLastStreamFailure,
   splitThinkTaggedContent,
   getSelectedModel,
-} from "./mock-agent-provider.js?v=home-20260809bd";
+} from "./mock-agent-provider.js?v=home-20260810mr";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamLiveChatCompletion,
+  streamChatViaContract,
+  useChatContract,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260809bd";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260809bd";
+} from "./agent-live.js?v=home-20260810mr";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260810mr";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260809bd";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260809bd";
+} from "./agent-grants.js?v=home-20260810mr";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260810mr";
+/* Vendored, self-hosted (no CDN — Principle: capsules are self-contained).
+   Static asset: stable URL, immutable, cached forever. */
+import { renderToString as renderMathToString } from "./vendor/katex/katex.mjs";
 
 /** @type {null | object} */
 let ctx = null;
@@ -72,6 +77,29 @@ export function escapeHtml(text) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+/* TeX arriving from escapeHtml'd text has entities; KaTeX wants real chars. */
+function unescapeForMath(tex) {
+  return String(tex)
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&amp;", "&");
+}
+
+/* Typeset via vendored KaTeX; on any parse error degrade to the raw TeX in a
+   muted code pill — honest fallback, never broken HTML. */
+function renderMath(tex, displayMode) {
+  try {
+    return (
+      `<span class="agent-md-math${displayMode ? " agent-md-math-display" : ""}">` +
+      renderMathToString(unescapeForMath(tex), { displayMode, throwOnError: true }) +
+      `</span>`
+    );
+  } catch {
+    return `<code class="agent-md-math-raw">${escapeHtml(tex)}</code>`;
+  }
 }
 
 /** GFM-safe markdown subset — escape first, then format.
@@ -216,6 +244,12 @@ function paintTurnUsageMeta(row, turn) {
 
 function formatInlineMarkdown(escaped) {
   return escaped
+    .replaceAll(/\\\((.+?)\\\)/g, (_, tex) => renderMath(tex, false))
+    .replaceAll(/\\\[(.+?)\\\]/g, (_, tex) => renderMath(tex, true))
+    .replaceAll(/\$\$([^$]+?)\$\$/g, (_, tex) => renderMath(tex, true))
+    /* Pandoc-style $...$: no space inside the delimiters, close not followed
+       by a digit — keeps "costs $5 and $10" as plain text. */
+    .replaceAll(/\$([^\s$](?:[^$\n]*[^\s$])?)\$(?!\d)/g, (_, tex) => renderMath(tex, false))
     .replaceAll(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, href) => {
       return `<a class="agent-md-a" href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
     })
@@ -278,6 +312,46 @@ function renderMarkdownBlocks(raw) {
         continue;
       }
     }
+    /* Display math block: \[ ... \] or $$ ... $$ starting at line start,
+       single- or multi-line. Trailing text after the closer, or no closer yet
+       (streaming), falls through to normal paragraph handling — the inline
+       pass still catches it, or the next delta completes the block. */
+    const mathOpen = /^\s*(\\\[|\$\$)/.exec(line);
+    if (mathOpen) {
+      const open = mathOpen[1];
+      const close = open === "\\[" ? "\\]" : "$$";
+      const trimmedLine = line.trim();
+      const first = trimmedLine.slice(trimmedLine.indexOf(open) + open.length);
+      let tex = null;
+      let next = i + 1;
+      const inlineAt = first.lastIndexOf(close);
+      if (inlineAt !== -1 && !first.slice(inlineAt + close.length).trim()) {
+        tex = first.slice(0, inlineAt);
+      } else if (inlineAt === -1) {
+        const buf = [first];
+        let j = i + 1;
+        while (j < lines.length) {
+          const at = lines[j].indexOf(close);
+          if (at !== -1) {
+            if (!lines[j].slice(at + close.length).trim()) {
+              buf.push(lines[j].slice(0, at));
+              tex = buf.join("\n");
+              next = j + 1;
+            }
+            break;
+          }
+          buf.push(lines[j]);
+          j += 1;
+        }
+      }
+      if (tex !== null) {
+        if (tex.trim()) {
+          html += `<div class="agent-md-math-block">${renderMath(tex, true)}</div>`;
+        }
+        i = next;
+        continue;
+      }
+    }
     const heading = /^(#{1,3})\s+(.+)$/.exec(line.trim());
     if (heading) {
       const level = heading[1].length;
@@ -317,7 +391,8 @@ function renderMarkdownBlocks(raw) {
       !lines[i].includes("|") &&
       !/^(#{1,3})\s+/.test(lines[i].trim()) &&
       !/^\s*([-*+]|\d+\.)\s+/.test(lines[i]) &&
-      !/^>\s?/.test(lines[i].trim())
+      !/^>\s?/.test(lines[i].trim()) &&
+      !/^\s*(\\\[|\$\$)/.test(lines[i])
     ) {
       para.push(lines[i]);
       i += 1;
@@ -1049,7 +1124,8 @@ async function startLiveTurnForPrompt(userText) {
   };
 
   try {
-    const result = await streamLiveChatCompletion(
+    const chatFn = useChatContract() ? streamChatViaContract : streamLiveChatCompletion;
+    const result = await chatFn(
       buildLiveMessages(session?.messages || [], {
         systemPrompt: ctx.systemPrompt,
         notes: ctx.agentNotes,
