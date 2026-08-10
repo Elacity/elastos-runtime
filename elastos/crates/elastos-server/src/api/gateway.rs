@@ -66,6 +66,8 @@ mod gateway_inbox;
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_model_grants.rs"]
+mod gateway_model_grants;
 #[path = "gateway_passkey_step_up.rs"]
 mod gateway_passkey_step_up;
 #[path = "gateway_provider_proxy.rs"]

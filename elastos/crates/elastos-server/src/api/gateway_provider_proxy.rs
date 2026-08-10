@@ -1411,6 +1411,62 @@ pub(super) async fn gateway_provider_proxy(
             .into_response();
     }
     request["op"] = serde_json::Value::String(op.clone());
+
+    // P4 grants: model/runs_create is a metered side effect. Deny by default
+    // unless this principal holds a grant for elastos://model/<offer>/runs_create.
+    // App-allowlist (above) is identity of the *shell*; this is consent of the
+    // *principal*. Backing store is gateway_model_grants; the runtime grant model
+    // (CapabilityManager) replaces it without touching this call-site.
+    if scheme == "model" && op == "runs_create" {
+        let offer_id = request
+            .get("offer_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let resource =
+            crate::provider_resource::build_capability_resource("model", "runs_create", &request)
+                .unwrap_or_else(|_| format!("elastos://model/{offer_id}/runs_create"));
+        // Dev/dogfood seeding (operator opt-in only): ELASTOS_MODEL_SEED_GRANT=1
+        // auto-records the grant on first use so a fresh install can exercise the
+        // flow. Off by default → fail-closed is preserved. This is the swap point
+        // for the runtime's consent-UX grant issuance.
+        if !super::gateway_model_grants::has_grant(&state.data_dir, &principal_id, &resource)
+            && std::env::var("ELASTOS_MODEL_SEED_GRANT").ok().as_deref() == Some("1")
+        {
+            let _ = super::gateway_model_grants::record_grant(
+                &state.data_dir,
+                &principal_id,
+                &resource,
+            );
+        }
+        if !super::gateway_model_grants::has_grant(&state.data_dir, &principal_id, &resource) {
+            let request_id = format!("model-run-grant:{principal_id}:{offer_id}:{}", now_ts());
+            let _ = append_provider_effect_audit(
+                &state.data_dir,
+                ProviderEffectAuditInput {
+                    capsule_id: HOME_GUI_SHELL_ID,
+                    event_type: "model.run.grant_denied",
+                    principal_id: &principal_id,
+                    session_id: &session_id,
+                    request_id: &request_id,
+                    result: "denied",
+                    reason: &format!("runs_create denied: no grant for resource {resource}"),
+                },
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "status": "denied",
+                    "code": "grant_required",
+                    "offer_id": offer_id,
+                    "resource": resource,
+                    "principal_id": principal_id,
+                    "grant_model": "principal_scoped_provider_grant",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     if scheme == "documents" || scheme == "object" || scheme == "net" {
         request["principal_id"] = serde_json::Value::String(principal_id.clone());
     }

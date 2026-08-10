@@ -27,6 +27,10 @@ impl Provider for MockModelProvider {
                 "status": "ok",
                 "data": { "provider": "model-provider", "version": "0.1.0-dev" }
             })),
+            Some("runs_create") => Ok(json!({
+                "status": "ok",
+                "data": { "run_id": "run:test", "state": "queued" }
+            })),
             _ => Err(ProviderError::Provider("unsupported op".into())),
         }
     }
@@ -133,4 +137,58 @@ async fn model_provider_requires_token() {
         .await
         .unwrap();
     assert!(response.status().is_client_error());
+}
+
+// P4 GATE: deny-by-default on runs_create without a grant; succeed once granted.
+#[tokio::test]
+async fn model_runs_create_requires_grant_then_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(model_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), HOME_GUI_SHELL_ID).unwrap();
+    let principal = local_home_launch_token_context(dir.path())
+        .unwrap()
+        .principal_id;
+    let offer = "offer:chat";
+    let body = serde_json::json!({ "offer_id": offer, "input": { "prompt": "hi" } }).to_string();
+
+    let build = |token: &str, body: &str| {
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/provider/model/runs_create")
+            .header("x-elastos-home-token", token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // Ungranted: typed 403 grant_required, fail-closed.
+    let response = app.clone().oneshot(build(&token, &body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["status"], "denied");
+    assert_eq!(payload["code"], "grant_required");
+    assert_eq!(payload["offer_id"], offer);
+    assert_eq!(payload["grant_model"], "principal_scoped_provider_grant");
+
+    // Grant the principal, then the same call dispatches to the provider.
+    super::super::gateway_model_grants::record_grant(
+        dir.path(),
+        &principal,
+        &format!("elastos://model/{offer}/runs_create"),
+    )
+    .unwrap();
+    let response = app.clone().oneshot(build(&token, &body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["status"], "ok");
 }
