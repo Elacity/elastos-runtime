@@ -153,8 +153,8 @@ function fillOffersPanel(offers) {
   }
   for (const offer of rows) {
     const li = document.createElement("li");
-    const modelId = String(offer?.descriptor?.model?.id || offer?.offer_id || "model");
-    const modalities = (offer?.descriptor?.operations || [])
+    const modelId = String(offer?.model?.id || offer?.descriptor?.model?.id || offer?.offer_id || "model");
+    const modalities = (offer?.operations || offer?.descriptor?.operations || [])
       .flatMap((op) => [
         ...(op?.inputs || []).flatMap((i) => i?.modalities || []),
         ...(op?.outputs || []).flatMap((o) => o?.modalities || []),

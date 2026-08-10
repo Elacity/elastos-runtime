@@ -82,7 +82,9 @@ function chatOfferRows(offers) {
   const list = Array.isArray(offers?.offers) ? offers.offers : [];
   return list
     .filter((o) => {
-      const ops = Array.isArray(o?.descriptor?.operations) ? o.descriptor.operations : [];
+      const ops = Array.isArray(o?.operations)
+        ? o.operations
+        : (Array.isArray(o?.descriptor?.operations) ? o.descriptor.operations : []);
       return ops.some(
         (op) =>
           (op?.inputs || []).some((i) => (i?.modalities || []).includes("text")) &&
@@ -90,7 +92,7 @@ function chatOfferRows(offers) {
       );
     })
     .map((o) => {
-      const modelId = String(o?.descriptor?.model?.id || o?.offer_id || "model");
+      const modelId = String(o?.model?.id || o?.descriptor?.model?.id || o?.offer_id || "model");
       return {
         id: `live:${modelId}`,
         label: modelId,
