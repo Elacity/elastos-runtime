@@ -496,8 +496,9 @@ pub(super) async fn chat_room_session_start(
             Some(port) => port.conversation_poll(&data_dir, &output.token, 0)?,
             None => crate::room_service::room_poll(&data_dir, &output.token, 0)?,
         };
-        // The configured shared room renders signed Profile names only. The
-        // plain room keeps its server-stamped home-session and guest names.
+        // The configured shared room refreshes only already-verified signed
+        // Profile names here. The plain room keeps its server-stamped
+        // home-session and guest names.
         if configured {
             let authority = gateway_home_system::load_configured_contact_authority_for_context(
                 &data_dir,
@@ -1226,30 +1227,29 @@ fn room_local_profile_identity(
     Some((member_did, card.display_name))
 }
 
-/// Binds shared-room attribution to signed Profile identity. A collaboration
-/// sender (a row with a verified member DID) either carries its Profile
-/// display name or is explicitly unverified — no device-hash or placeholder
-/// name reaches the product. Session rows without a member DID are invited
-/// guests and keep their session names; history and invite semantics are
-/// untouched, only the read projection changes.
+/// Binds configured shared-room attribution to signed Profile identity.
+/// A visible row must already carry a verified Profile+endpoint binding from
+/// the room projection; this helper may refresh the display name from signed
+/// Profile sources, but it never upgrades an unverified row. The plain room
+/// keeps its server-stamped home-session and guest names.
 pub(super) fn apply_profile_attribution_to_room_poll(
     poll: &mut crate::room_service::RoomPollView,
     names: &std::collections::HashMap<String, String>,
 ) {
     for object in &mut poll.objects {
-        let Some(did) = object.sender_member_did.as_deref() else {
+        if object.sender_profile_verified != Some(true) {
+            continue;
+        }
+        let Some(did) = object
+            .sender_member_did
+            .as_deref()
+            .map(str::trim)
+            .filter(|did| !did.is_empty())
+        else {
             continue;
         };
-        match names.get(did) {
-            Some(display_name) => {
-                object.sender = display_name.clone();
-                object.sender_profile_verified = Some(true);
-            }
-            None if object.sender_profile_verified != Some(true) => {
-                object.sender = String::new();
-                object.sender_profile_verified = Some(false);
-            }
-            None => {}
+        if let Some(display_name) = names.get(did) {
+            object.sender = display_name.clone();
         }
     }
     apply_profile_attribution_to_participants(&mut poll.participants, names);
@@ -1260,19 +1260,19 @@ pub(super) fn apply_profile_attribution_to_participants(
     names: &std::collections::HashMap<String, String>,
 ) {
     for participant in participants {
-        let Some(did) = participant.member_did.as_deref() else {
+        if participant.profile_verified != Some(true) {
+            continue;
+        }
+        let Some(did) = participant
+            .member_did
+            .as_deref()
+            .map(str::trim)
+            .filter(|did| !did.is_empty())
+        else {
             continue;
         };
-        match names.get(did) {
-            Some(display_name) => {
-                participant.display_name = display_name.clone();
-                participant.profile_verified = Some(true);
-            }
-            None if participant.profile_verified != Some(true) => {
-                participant.display_name = String::new();
-                participant.profile_verified = Some(false);
-            }
-            None => {}
+        if let Some(display_name) = names.get(did) {
+            participant.display_name = display_name.clone();
         }
     }
 }
@@ -1435,10 +1435,11 @@ pub(super) async fn room_service_poll(
             Some(port) => port.conversation_poll(&data_dir, &token, body.since)?,
             None => crate::room_service::room_poll(&data_dir, &token, body.since)?,
         };
-        // The configured shared room renders signed Profile names only: the
-        // principal's contact authority plus room membership cards name every
-        // collaboration sender, or the row is explicitly unverified. The
-        // plain room keeps its server-stamped home-session and guest names.
+        // The configured shared room refreshes only already-verified signed
+        // Profile names here: contact authority plus room membership cards
+        // may refresh the display name, but they never upgrade an unverified
+        // row. The plain room keeps its server-stamped home-session and
+        // guest names.
         if let Some(context) = launch_context.as_ref() {
             let authority = gateway_home_system::load_configured_contact_authority_for_context(
                 &data_dir,
