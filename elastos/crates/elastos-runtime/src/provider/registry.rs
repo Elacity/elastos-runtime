@@ -119,6 +119,10 @@ pub enum ProviderError {
     Provider(String),
     /// No provider for scheme
     NoProvider(String),
+    /// No verified route to the requested peer. Returned before any provider
+    /// effect, so a caller can distinguish an unreachable peer from a provider
+    /// that ran and failed.
+    Unavailable(String),
     /// IO error
     Io(std::io::Error),
 }
@@ -153,13 +157,32 @@ static NEXT_PROVIDER_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Carrier route for Runtime-mediated provider-to-provider invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderCarrierRoute {
+pub enum ProviderCarrierRoute {
     /// Internal Carrier connect ticket. Receipts intentionally do not expose it.
-    pub connect_ticket: String,
-    /// Optional expected remote peer DID/node identity for audit and policy.
-    pub peer_did: Option<String>,
-    /// Optional per-hop timeout. Runtime rejects zero-duration values.
-    pub timeout_ms: Option<u64>,
+    ConnectTicket {
+        connect_ticket: String,
+        /// Optional expected remote peer DID/node identity for audit and policy.
+        peer_did: Option<String>,
+        /// Optional per-hop timeout. Runtime rejects zero-duration values.
+        timeout_ms: Option<u64>,
+    },
+    /// Internal Carrier peer-DID route. Runtime resolves addressing privately.
+    PeerDid {
+        /// Expected remote peer DID/node identity for audit and policy.
+        peer_did: String,
+        /// Optional per-hop timeout. Runtime rejects zero-duration values.
+        timeout_ms: Option<u64>,
+    },
+}
+
+impl ProviderCarrierRoute {
+    pub fn timeout_ms(&self) -> Option<u64> {
+        match self {
+            Self::ConnectTicket { timeout_ms, .. } | Self::PeerDid { timeout_ms, .. } => {
+                *timeout_ms
+            }
+        }
+    }
 }
 
 /// Runtime transport used for provider-to-provider invocation.
@@ -414,6 +437,7 @@ impl std::fmt::Display for ProviderError {
             ProviderError::InvalidUri(uri) => write!(f, "invalid URI: {}", uri),
             ProviderError::Provider(msg) => write!(f, "provider error: {}", msg),
             ProviderError::NoProvider(scheme) => write!(f, "no provider for scheme: {}", scheme),
+            ProviderError::Unavailable(msg) => write!(f, "peer unavailable: {}", msg),
             ProviderError::Io(e) => write!(f, "IO error: {}", e),
         }
     }
@@ -478,6 +502,8 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "availability",
     "block-graph",
     "object",
+    "collaboration-direct",
+    "collaboration-profile",
 ];
 
 /// Registry of providers
@@ -982,12 +1008,23 @@ fn validate_provider_transfer_contract(
         }
     }
     if let Some(route) = invocation.transport.carrier_route() {
-        if route.connect_ticket.trim().is_empty() {
-            return Err(ProviderError::Provider(
-                "Carrier provider invocation requires connect_ticket".to_string(),
-            ));
+        match route {
+            ProviderCarrierRoute::ConnectTicket { connect_ticket, .. } => {
+                if connect_ticket.trim().is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Carrier provider invocation requires connect_ticket".to_string(),
+                    ));
+                }
+            }
+            ProviderCarrierRoute::PeerDid { peer_did, .. } => {
+                if peer_did.trim().is_empty() {
+                    return Err(ProviderError::Provider(
+                        "Carrier provider invocation requires peer_did".to_string(),
+                    ));
+                }
+            }
         }
-        if route.timeout_ms == Some(0) {
+        if route.timeout_ms() == Some(0) {
             return Err(ProviderError::Provider(
                 "Carrier provider invocation timeout_ms must be greater than zero".to_string(),
             ));
@@ -1000,10 +1037,20 @@ fn apply_provider_transfer_response(
     response: &mut serde_json::Value,
     invocation: &ProviderInvocation,
 ) -> Result<(), ProviderError> {
-    match invocation.transfer {
+    let result = match invocation.transfer {
         ProviderTransfer::Json => Ok(()),
         ProviderTransfer::Bytes => apply_provider_byte_range(response, invocation),
         ProviderTransfer::Stream => apply_provider_stream_response(response, invocation),
+    };
+    redact_public_provider_runtime_metadata(response);
+    result
+}
+
+fn redact_public_provider_runtime_metadata(response: &mut serde_json::Value) {
+    if let Some(runtime_invocation) = response.pointer_mut("/data/runtime_invocation") {
+        if let Some(object) = runtime_invocation.as_object_mut() {
+            object.insert("carrier".to_string(), serde_json::Value::Null);
+        }
     }
 }
 
@@ -1384,7 +1431,7 @@ fn provider_transfer_receipt(invocation: &ProviderInvocation, status: &str) -> s
         "op": invocation.op,
         "capability": provider_invocation_capability(invocation),
         "transport": invocation.transport.as_str(),
-        "carrier": provider_carrier_route_receipt(invocation),
+        "carrier": serde_json::Value::Null,
         "transfer": invocation.transfer.as_str(),
         "range": range,
         "progress": progress,
@@ -1407,7 +1454,7 @@ fn provider_invocation_envelope(invocation: &ProviderInvocation) -> serde_json::
         "op": invocation.op,
         "capability": provider_invocation_capability(invocation),
         "transport": invocation.transport.as_str(),
-        "carrier": provider_carrier_route_receipt(invocation),
+        "carrier": serde_json::Value::Null,
         "transfer": invocation.transfer.as_str(),
         "range": invocation.range.map(|range| serde_json::json!({
             "start": range.start,
@@ -1425,16 +1472,6 @@ fn provider_invocation_envelope(invocation: &ProviderInvocation) -> serde_json::
         }
     }
     envelope
-}
-
-fn provider_carrier_route_receipt(invocation: &ProviderInvocation) -> Option<serde_json::Value> {
-    invocation.transport.carrier_route().map(|route| {
-        serde_json::json!({
-            "route": "connect_ticket",
-            "peer_did": route.peer_did.as_deref(),
-            "timeout_ms": route.timeout_ms,
-        })
-    })
 }
 
 fn provider_invocation_capability(invocation: &ProviderInvocation) -> String {
@@ -1639,10 +1676,25 @@ mod tests {
             invocation: &ProviderInvocation,
             request: serde_json::Value,
         ) -> Result<serde_json::Value, ProviderError> {
+            let (connect_ticket, peer_did, timeout_ms) = match route {
+                ProviderCarrierRoute::ConnectTicket {
+                    connect_ticket,
+                    peer_did,
+                    timeout_ms,
+                } => (
+                    Some(connect_ticket.as_str()),
+                    peer_did.as_deref(),
+                    *timeout_ms,
+                ),
+                ProviderCarrierRoute::PeerDid {
+                    peer_did,
+                    timeout_ms,
+                } => (None, Some(peer_did.as_str()), *timeout_ms),
+            };
             self.requests.lock().await.push(serde_json::json!({
-                "connect_ticket": route.connect_ticket.as_str(),
-                "peer_did": route.peer_did.as_deref(),
-                "timeout_ms": route.timeout_ms,
+                "connect_ticket": connect_ticket,
+                "peer_did": peer_did,
+                "timeout_ms": timeout_ms,
                 "source": invocation.source.as_str(),
                 "target": invocation.target.as_str(),
                 "op": invocation.op.as_str(),
@@ -2076,32 +2128,58 @@ mod tests {
     async fn test_provider_invocation_rejects_predeclared_runtime_metadata() {
         let registry = ProviderRegistry::new();
         registry.register(Arc::new(RawMockProvider)).await;
-
-        for reserved in ["_runtime_invocation", "_runtime_transfer"] {
-            let err = registry
-                .invoke_provider(ProviderInvocation {
-                    source: "content-provider".to_string(),
-                    target: "raw".to_string(),
-                    op: "ping".to_string(),
-                    request: serde_json::json!({
-                        "op": "ping",
-                        reserved: {
-                            "schema": "spoofed"
+        let err = registry
+            .invoke_provider(ProviderInvocation {
+                source: "content-provider".to_string(),
+                target: "raw".to_string(),
+                op: "ping".to_string(),
+                request: serde_json::json!({
+                    "op": "ping",
+                    "_runtime_invocation": {
+                        "schema": "elastos.provider.invocation/v1",
+                        "transport": "carrier-provider-plane",
+                        "carrier": {
+                            "route": "peer_did",
+                            "peer_did": "did:key:zInjected"
                         }
-                    }),
-                    transfer: ProviderTransfer::Json,
-                    range: None,
-                    progress: None,
-                    transport: ProviderInvocationTransport::Local,
-                })
-                .await
-                .expect_err("runtime metadata should be reserved");
+                    }
+                }),
+                transfer: ProviderTransfer::Json,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+            .await
+            .expect_err("runtime metadata should be reserved");
 
-            assert!(err
-                .to_string()
-                .contains("provider invocation request must not predeclare runtime field"));
-            assert!(err.to_string().contains(reserved));
-        }
+        assert!(err
+            .to_string()
+            .contains("provider invocation request must not predeclare runtime field"));
+        assert!(err.to_string().contains("_runtime_invocation"));
+
+        let err = registry
+            .invoke_provider(ProviderInvocation {
+                source: "content-provider".to_string(),
+                target: "raw".to_string(),
+                op: "ping".to_string(),
+                request: serde_json::json!({
+                    "op": "ping",
+                    "_runtime_transfer": {
+                        "schema": "spoofed"
+                    }
+                }),
+                transfer: ProviderTransfer::Json,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Local,
+            })
+            .await
+            .expect_err("runtime metadata should be reserved");
+
+        assert!(err
+            .to_string()
+            .contains("provider invocation request must not predeclare runtime field"));
+        assert!(err.to_string().contains("_runtime_transfer"));
     }
 
     #[tokio::test]
@@ -2116,11 +2194,13 @@ mod tests {
                 transfer: ProviderTransfer::Bytes,
                 range: None,
                 progress: None,
-                transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
-                    connect_ticket: "ticket-secret".to_string(),
-                    peer_did: Some("did:key:zRemote".to_string()),
-                    timeout_ms: Some(5_000),
-                }),
+                transport: ProviderInvocationTransport::Carrier(
+                    ProviderCarrierRoute::ConnectTicket {
+                        connect_ticket: "ticket-secret".to_string(),
+                        peer_did: Some("did:key:zRemote".to_string()),
+                        timeout_ms: Some(5_000),
+                    },
+                ),
             })
             .await
             .expect_err("Carrier invocation without invoker should fail closed");
@@ -2153,11 +2233,13 @@ mod tests {
                     request_id: "carrier-transfer:test".to_string(),
                     expected_bytes: Some(4),
                 }),
-                transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute {
-                    connect_ticket: "ticket-secret".to_string(),
-                    peer_did: Some("did:key:zRemote".to_string()),
-                    timeout_ms: Some(5_000),
-                }),
+                transport: ProviderInvocationTransport::Carrier(
+                    ProviderCarrierRoute::ConnectTicket {
+                        connect_ticket: "ticket-secret".to_string(),
+                        peer_did: Some("did:key:zRemote".to_string()),
+                        timeout_ms: Some(5_000),
+                    },
+                ),
             })
             .await
             .unwrap();
@@ -2171,20 +2253,16 @@ mod tests {
             "carrier-provider-plane"
         );
         assert_eq!(
-            response["data"]["runtime_invocation"]["carrier"]["route"],
-            "connect_ticket"
-        );
-        assert_eq!(
-            response["data"]["runtime_invocation"]["carrier"]["peer_did"],
-            "did:key:zRemote"
+            response["data"]["runtime_invocation"]["carrier"],
+            serde_json::Value::Null
         );
         assert_eq!(
             response["_runtime_transfer"]["transport"],
             "carrier-provider-plane"
         );
         assert_eq!(
-            response["_runtime_transfer"]["carrier"]["route"],
-            "connect_ticket"
+            response["_runtime_transfer"]["carrier"],
+            serde_json::Value::Null
         );
         assert_eq!(
             response["_runtime_transfer"]["progress"]["request_id"],
@@ -2196,8 +2274,54 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["connect_ticket"], "ticket-secret");
         assert_eq!(
+            requests[0]["request"]["_runtime_invocation"]["carrier"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
             requests[0]["request"]["_runtime_invocation"]["capability"],
             "provider:content-provider->content:fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_invocation_peer_did_route_remains_runtime_internal() {
+        let registry = ProviderRegistry::new();
+        let invoker = Arc::new(MockCarrierInvoker::default());
+        registry.set_carrier_invoker(invoker.clone()).await;
+
+        let response = registry
+            .invoke_provider(ProviderInvocation {
+                source: "content-provider".to_string(),
+                target: "content".to_string(),
+                op: "fetch".to_string(),
+                request: serde_json::json!({ "op": "fetch" }),
+                transfer: ProviderTransfer::Json,
+                range: None,
+                progress: None,
+                transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                    peer_did: "did:key:zPeer".to_string(),
+                    timeout_ms: Some(2_000),
+                }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response["data"]["runtime_invocation"]["carrier"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            response["_runtime_transfer"]["carrier"],
+            serde_json::Value::Null
+        );
+
+        let requests = invoker.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["connect_ticket"], serde_json::Value::Null);
+        assert_eq!(requests[0]["peer_did"], "did:key:zPeer");
+        assert_eq!(
+            requests[0]["request"]["_runtime_invocation"]["carrier"],
+            serde_json::Value::Null
         );
     }
 

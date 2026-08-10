@@ -29,6 +29,10 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) provider_cid: String,
     pub(crate) shell_cid: Option<String>,
     pub(crate) host_helpers: Vec<api::server::HostHelperProcess>,
+    pub(crate) carrier_service: Option<elastos_server::carrier::CarrierRuntimeService>,
+    pub(crate) collaboration_context: api::gateway::GatewayCollaborationContext,
+    pub(crate) collaboration_service:
+        Option<elastos_server::collaboration_startup::CollaborationRuntimeService>,
 }
 
 const CONTENT_REPAIR_SCHEDULER_ENV: &str = "ELASTOS_CONTENT_REPAIR_SCHEDULER";
@@ -204,6 +208,10 @@ async fn setup_server_infrastructure_impl(
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let _ = ownership::repair_path_recursive(&data_dir);
+    let collaboration_configuration =
+        elastos_server::collaboration_startup::load_and_accept_collaboration_startup_configuration(
+            &data_dir,
+        )?;
 
     let audit_log = Arc::new(primitives::audit::AuditLog::new());
     let session_registry = Arc::new(session::SessionRegistry::new(audit_log.clone()));
@@ -237,6 +245,7 @@ async fn setup_server_infrastructure_impl(
     let provider_registry = Arc::new(provider::ProviderRegistry::new());
     let mut managed_host_processes = Vec::new();
     let mut external_availability_registered = false;
+    let mut carrier_service = None;
     let content_provider = Arc::new(ContentProvider::new(
         data_dir.clone(),
         Arc::downgrade(&provider_registry),
@@ -944,6 +953,7 @@ async fn setup_server_infrastructure_impl(
     // Carrier is fundamental infrastructure: gossip, content, identity.
     // Identity is DID (derived from device_key), not raw device_key.
     let (carrier_signing_key, carrier_did) = elastos_identity::derive_did(&device_key);
+    let mut collaboration_carrier_provider: Option<Arc<dyn provider::Provider>> = None;
     {
         match elastos_server::carrier::start_carrier_node_with_registry(
             &carrier_signing_key,
@@ -956,13 +966,16 @@ async fn setup_server_infrastructure_impl(
             Ok(carrier_node) => {
                 provider_registry
                     .set_carrier_invoker(Arc::new(
-                        elastos_server::carrier::CarrierProviderInvoker::new(),
+                        elastos_server::carrier::CarrierProviderInvoker::with_carrier_endpoint(
+                            carrier_node.endpoint.clone(),
+                        ),
                     ))
                     .await;
                 let gossip_provider: Arc<dyn provider::Provider> =
                     Arc::new(elastos_server::carrier::CarrierGossipProvider::new(
                         carrier_node.gossip_state.clone(),
                     ));
+                collaboration_carrier_provider = Some(gossip_provider.clone());
                 if let Err(e) = provider_registry
                     .register_sub_provider("peer", gossip_provider)
                     .await
@@ -985,13 +998,9 @@ async fn setup_server_infrastructure_impl(
                         tracing::warn!("Failed to register Carrier availability provider: {}", e);
                     }
                 }
-                // Hold the carrier node alive. Dropping it kills the endpoint.
-                tokio::spawn(async move {
-                    let _node = carrier_node;
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                    }
-                });
+                carrier_service = Some(elastos_server::carrier::CarrierRuntimeService::new(
+                    carrier_node,
+                ));
                 tracing::info!("Carrier node online (P2P + gossip)");
             }
             Err(e) => {
@@ -999,6 +1008,20 @@ async fn setup_server_infrastructure_impl(
             }
         }
     }
+
+    let collaboration_service =
+        elastos_server::collaboration_startup::start_collaboration_runtime_service(
+            &data_dir,
+            carrier_signing_key,
+            collaboration_configuration,
+            collaboration_carrier_provider,
+            provider_registry.clone(),
+        )
+        .await?;
+    let collaboration_context = collaboration_service
+        .as_ref()
+        .map(|service| service.gateway_context())
+        .unwrap_or_default();
 
     maybe_spawn_content_repair_scheduler(provider_registry.clone());
 
@@ -1059,6 +1082,9 @@ async fn setup_server_infrastructure_impl(
         provider_cid,
         shell_cid,
         host_helpers: managed_host_processes,
+        carrier_service,
+        collaboration_context,
+        collaboration_service,
     })
 }
 
@@ -2020,5 +2046,39 @@ mod tests {
         {
             assert!(browser_local_exit_socket_ready(&relay_path).unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn carrier_runtime_service_shutdown_releases_endpoint_for_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_key = elastos_identity::load_or_create_device_key(dir.path()).unwrap();
+        let (signing_key, did) = elastos_identity::derive_did(&device_key);
+
+        let node = elastos_server::carrier::start_carrier_node_with_registry(
+            &signing_key,
+            &did,
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !node.endpoint.bound_sockets().is_empty(),
+            "carrier endpoint should be bound before readiness is published"
+        );
+
+        let mut service = elastos_server::carrier::CarrierRuntimeService::new(node);
+        service.shutdown().await.unwrap();
+
+        let restarted = elastos_server::carrier::start_carrier_node_with_registry(
+            &signing_key,
+            &did,
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut restarted_service = elastos_server::carrier::CarrierRuntimeService::new(restarted);
+        restarted_service.shutdown().await.unwrap();
     }
 }

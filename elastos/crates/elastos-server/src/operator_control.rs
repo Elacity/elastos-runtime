@@ -719,8 +719,18 @@ fn build_http_client(timeout_secs: u64) -> Result<reqwest::Client> {
 }
 
 async fn read_runtime_coords(data_dir: &Path) -> Option<crate::runtime_control::RuntimeCoords> {
-    let path = crate::runtime_control::runtime_coord_path(data_dir);
-    crate::runtime_control::read_operator_runtime_coords(&path).await
+    crate::runtime_control::read_attachable_runtime_coords(
+        data_dir,
+        crate::runtime_control::AttachableRuntimeKind::Operator,
+    )
+    .await
+}
+
+async fn read_runtime_coords_for_kind(
+    data_dir: &Path,
+    runtime_kind: crate::runtime_control::AttachableRuntimeKind,
+) -> Option<crate::runtime_control::RuntimeCoords> {
+    crate::runtime_control::read_attachable_runtime_coords(data_dir, runtime_kind).await
 }
 
 async fn attach_shell_token(
@@ -828,6 +838,33 @@ async fn fetch_ticket_and_node_id(
         .map(|value| value.to_string())
         .ok_or_else(|| anyhow::anyhow!("ticket response missing node_id"))?;
     Ok((ticket, node_id))
+}
+
+pub(crate) async fn fetch_local_carrier_bootstrap(
+    data_dir: &Path,
+    runtime_kind: crate::runtime_control::AttachableRuntimeKind,
+) -> Result<(String, String)> {
+    let coords = read_runtime_coords_for_kind(data_dir, runtime_kind)
+        .await
+        .ok_or_else(|| {
+            let message = match runtime_kind {
+                crate::runtime_control::AttachableRuntimeKind::Operator => {
+                    crate::runtime_control::OPERATOR_RUNTIME_REQUIRED_MESSAGE
+                }
+                crate::runtime_control::AttachableRuntimeKind::Gateway => {
+                    "This command requires a running gateway in the explicit data root."
+                }
+            };
+            anyhow::anyhow!(message)
+        })?;
+    let client = build_http_client(5)
+        .map_err(|_| anyhow::anyhow!("failed to create local Runtime operator client"))?;
+    let shell_token = attach_shell_token(&client, &coords)
+        .await
+        .map_err(|_| anyhow::anyhow!("failed to attach to the local Runtime"))?;
+    fetch_ticket_and_node_id(&client, &coords.api_url, &shell_token)
+        .await
+        .map_err(|_| anyhow::anyhow!("local Carrier Provider get_ticket failed"))
 }
 
 fn load_default_trusted_source(data_dir: &Path) -> Result<TrustedSource> {
@@ -1636,12 +1673,75 @@ fn public_key_from_did(did: &str) -> Result<iroh::PublicKey> {
 mod tests {
     use super::*;
     use crate::carrier::start_carrier_node;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use elastos_runtime::signature::generate_keypair;
+    use tokio::net::TcpListener;
 
     fn write_test_device_key(data_dir: &Path, key: &[u8; 32]) {
         let identity_dir = data_dir.join("identity");
         std::fs::create_dir_all(&identity_dir).unwrap();
         std::fs::write(identity_dir.join("device.key"), key).unwrap();
+    }
+
+    async fn start_ticket_provider(
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/api/provider/peer/get_ticket",
+            post(move |headers: HeaderMap| {
+                let body = body.clone();
+                async move {
+                    if headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        != Some("Bearer shell-test")
+                    {
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
+                    (status, Json(body)).into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (api_url, task)
+    }
+
+    #[tokio::test]
+    async fn ticket_provider_helper_requests_only_get_ticket_and_redacts_failure() {
+        let (api_url, task) = start_ticket_provider(
+            StatusCode::OK,
+            serde_json::json!({
+                "data": {"ticket": "ticket-secret", "node_id": "node-public"}
+            }),
+        )
+        .await;
+        let client = build_http_client(2).unwrap();
+        assert_eq!(
+            fetch_ticket_and_node_id(&client, &api_url, "shell-test")
+                .await
+                .unwrap(),
+            ("ticket-secret".to_string(), "node-public".to_string())
+        );
+        task.abort();
+
+        let (api_url, task) = start_ticket_provider(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"error": "ticket-secret"}),
+        )
+        .await;
+        let error = fetch_ticket_and_node_id(&client, &api_url, "shell-test")
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("ticket-secret"));
+        task.abort();
     }
 
     #[test]

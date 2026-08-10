@@ -125,26 +125,21 @@ pub async fn run(
 
     if profile.is_none() && with.is_empty() {
         println!(
-            "Using default setup profile: {} (managed Home + native Carrier chat).",
+            "Using default setup profile: {} (managed Home).",
             DEFAULT_SETUP_PROFILE
         );
         println!("Use `--profile demo` for site/share/browser demo surfaces.");
-        println!("Use `--profile chat` for the packaged microVM chat path.");
         println!("Use `--profile blockchain` for typed chain/wallet/DRM provider development.");
         println!("Use `--profile operator` for explicit serve/node/run/agent flows.");
         println!();
     } else if let Some(selected_profile) = selected_profile {
         match selected_profile {
             "home" => {
-                println!("Selected profile: home (managed Home + native Carrier chat)");
+                println!("Selected profile: home (managed Home)");
                 println!();
             }
             "demo" => {
                 println!("Selected profile: demo (Home + site/share/browser demo surfaces)");
-                println!();
-            }
-            "chat" => {
-                println!("Selected profile: chat (packaged microVM chat on a KVM-capable host)");
                 println!();
             }
             "blockchain" => {
@@ -1304,14 +1299,13 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
     println!("Quick start:");
     println!("  elastos setup                # default home profile");
     println!("  elastos setup --profile demo # Home + site/share/browser demo surfaces");
-    println!("  elastos setup --profile chat # packaged full-screen chat");
     println!("  elastos setup --profile blockchain # typed chain/wallet/DRM provider development");
     println!("  elastos setup --profile operator # explicit serve/node/run/agent runtime");
     println!();
     print_profile_section(
         "Recommended profiles:",
         manifest,
-        &["home", "demo", "chat", "blockchain", "operator"],
+        &["home", "demo", "blockchain", "operator"],
     );
     print_profile_section(
         "Advanced profiles:",
@@ -1322,7 +1316,6 @@ fn list_components(manifest: &ComponentsManifest, data_dir: &Path, platform: &st
     let listed = [
         "home",
         "demo",
-        "chat",
         "blockchain",
         "operator",
         "minimal",
@@ -2166,7 +2159,7 @@ mod tests {
                 }
             }
         }
-        assert!(manifest.profiles.contains_key("chat"));
+        assert!(!manifest.profiles.contains_key("chat"));
         assert!(manifest.profiles.contains_key("blockchain"));
         assert!(manifest.profiles.contains_key("operator"));
         assert!(manifest.profiles.contains_key("full"));
@@ -2200,8 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_profile_name_preserves_chat_profile() {
-        assert_eq!(normalize_profile_name("chat"), "chat");
+    fn test_normalize_profile_name_preserves_home_profile() {
         assert_eq!(normalize_profile_name("home"), "home");
     }
 

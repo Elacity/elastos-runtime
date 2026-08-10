@@ -79,6 +79,8 @@ pub async fn run_serve(
                     .map_err(|e| anyhow::anyhow!("Failed to init crosvm provider: {}", e))?;
 
                 let infra = crate::setup_server_infrastructure().await?;
+                let mut collaboration_service = infra.collaboration_service;
+                let mut carrier_service = infra.carrier_service;
                 let audit_log = infra.audit_log.clone();
                 let session_registry = infra.session_registry.clone();
                 let capability_manager = infra.capability_manager.clone();
@@ -240,12 +242,20 @@ pub async fn run_serve(
                 if let Err(e) = vm_provider.stop(&handle).await {
                     tracing::warn!("Error stopping VM: {}", e);
                 }
+                if let Some(service) = collaboration_service.as_mut() {
+                    service.shutdown().await?;
+                }
+                if let Some(service) = carrier_service.as_mut() {
+                    service.shutdown().await?;
+                }
                 println!("MicroVM stopped.");
                 return Ok(());
             }
 
             if manifest.capsule_type == elastos_common::CapsuleType::Wasm {
                 let infra = crate::setup_server_infrastructure().await?;
+                let mut collaboration_service = infra.collaboration_service;
+                let mut carrier_service = infra.carrier_service;
                 runtime
                     .set_provider_registry(
                         infra.provider_registry.clone(),
@@ -256,14 +266,19 @@ pub async fn run_serve(
                     .await;
 
                 eprintln!(
-                    "[serve] WASM capsule '{}' with Carrier bridge active",
+                    "[serve] WASM capsule '{}' with resource bridge active",
                     manifest.name
                 );
 
-                let handle = runtime
-                    .run_local(&capsule_dir, vec![])
-                    .await
-                    .map_err(|e| anyhow::anyhow!("WASM capsule failed: {}", e))?;
+                let run_result = runtime.run_local(&capsule_dir, vec![]).await;
+                if let Some(service) = collaboration_service.as_mut() {
+                    service.shutdown().await?;
+                }
+                if let Some(service) = carrier_service.as_mut() {
+                    service.shutdown().await?;
+                }
+                let handle =
+                    run_result.map_err(|e| anyhow::anyhow!("WASM capsule failed: {}", e))?;
 
                 eprintln!("[serve] WASM capsule '{}' exited", handle.manifest.name);
                 return Ok(());
@@ -275,6 +290,9 @@ pub async fn run_serve(
     }
 
     let infra = crate::setup_server_infrastructure().await?;
+    let collaboration_context = infra.collaboration_context.clone();
+    let mut collaboration_service = infra.collaboration_service;
+    let mut carrier_service = infra.carrier_service;
     runtime
         .set_provider_registry(
             infra.provider_registry.clone(),
@@ -365,6 +383,15 @@ pub async fn run_serve(
                 infra.session_registry.clone(),
             );
             s.set_provider_registry(infra.provider_registry.clone());
+            if let Some(port) = collaboration_context.chat_product_port.clone() {
+                s.set_collaboration_chat_product_port(port);
+            }
+            if let Some(port) = collaboration_context.presence_product_port.clone() {
+                s.set_collaboration_presence_product_port(port);
+            }
+            if let Some(service) = collaboration_context.discovery_service.clone() {
+                s.set_collaboration_discovery_service(service);
+            }
             s.set_capability_manager(infra.capability_manager.clone());
             s.set_pending_store(infra.pending_store.clone());
             Some(Arc::new(s))
@@ -425,7 +452,7 @@ pub async fn run_serve(
         });
     }
 
-    elastos_server::api::server::start_server_with_sessions(
+    let server_result = elastos_server::api::server::start_server_with_sessions(
         elastos_server::api::server::ServerConfig {
             runtime,
             session_registry: infra.session_registry,
@@ -446,7 +473,19 @@ pub async fn run_serve(
             host_helpers: infra.host_helpers,
         },
     )
-    .await?;
+    .await;
+    let collaboration_shutdown = async {
+        if let Some(service) = collaboration_service.as_mut() {
+            service.shutdown().await?;
+        }
+        if let Some(service) = carrier_service.as_mut() {
+            service.shutdown().await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    server_result?;
+    collaboration_shutdown?;
 
     Ok(())
 }
