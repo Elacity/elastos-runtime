@@ -1,0 +1,12 @@
+[package]
+name = "model-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS Model provider - one offers/runs contract for model inference from configured backends"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2", features = ["json"] }
+sha2 = "0.10"

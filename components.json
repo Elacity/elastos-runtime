@@ -202,6 +202,15 @@
         "aarch64-linux"
       ]
     },
+    "model-provider": {
+      "cid": "",
+      "sha256": "",
+      "size": 0,
+      "platforms": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
     "llama-provider": {
       "cid": "",
       "sha256": "",

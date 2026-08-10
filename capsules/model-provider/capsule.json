@@ -1,0 +1,97 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "model-provider",
+  "version": "0.1.0",
+  "description": "Model provider - serves model inference offers/runs from configured backends without exposing upstream URLs, ports, or credentials to app capsules",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://model/*",
+  "authority": {
+    "reason": "Serves model inference offers/runs from configured backends (local, LAN, Carrier-reached, hosted) without exposing upstream URLs, ports, or credentials to app capsules.",
+    "capabilities": [
+      {
+        "resource": "elastos://model/*",
+        "actions": ["execute"],
+        "operations": [
+          "offers_list",
+          "runs_create",
+          "runs_get",
+          "runs_events",
+          "runs_cancel",
+          "ping"
+        ]
+      }
+    ],
+    "audit_events": ["model.run_create", "model.run_cancel", "model.offer_select"]
+  },
+  "interfaces": [
+    {
+      "id": "elastos.provider.model",
+      "version": "0.7.0",
+      "description": "Runtime provider affordance descriptors projected from model-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "offers_list",
+          "description": "List model inference offers configured on this provider.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "offers_list"
+        },
+        {
+          "id": "runs_create",
+          "description": "Create a model run against a granted offer.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://model/*",
+          "operation": "runs_create"
+        },
+        {
+          "id": "runs_get",
+          "description": "Read run state.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "runs_get"
+        },
+        {
+          "id": "runs_events",
+          "description": "Read run events from a cursor.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "runs_events"
+        },
+        {
+          "id": "runs_cancel",
+          "description": "Cancel a running model run.",
+          "risk": "privileged",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://model/*",
+          "operation": "runs_cancel"
+        },
+        {
+          "id": "ping",
+          "description": "Liveness probe.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "ping"
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 128,
+    "gpu": false
+  },
+  "permissions": {}
+}
