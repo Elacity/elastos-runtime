@@ -8,14 +8,14 @@ import {
   setReasoningVisible,
   getUsageLedger,
   applyUsageLedger,
-} from "./mock-agent-provider.js?v=home-20260804bb";
+} from "./mock-agent-provider.js?v=home-20260809bd";
 import {
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
   normalizeAgentNotes,
-} from "./agent-live.js?v=home-20260804bb";
-import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260804bb";
+} from "./agent-live.js?v=home-20260809bd";
+import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260809bd";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;

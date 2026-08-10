@@ -11,14 +11,14 @@ import {
   wantsLibraryTool,
   wantsWalletTool,
   wantsWebSearchTool,
-} from "./mock-agent-provider.js?v=home-20260804bb";
+} from "./mock-agent-provider.js?v=home-20260809bd";
 import {
   requestAgentLibraryRead,
   fetchAgentLibraryReadStatus,
   cancelAgentLibraryRead,
   requestAgentWebSearch,
-} from "./agent-live.js?v=home-20260804bb";
-import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260804bb";
+} from "./agent-live.js?v=home-20260809bd";
+import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260809bd";
 
 /** @type {null | Record<string, Function>} */
 let store = null;

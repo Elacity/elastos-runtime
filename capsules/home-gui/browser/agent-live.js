@@ -4,7 +4,7 @@
    (home-gui-only allowlist, home launch token).
    Tip: home-20260804bb */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260804bb";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260809bd";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;

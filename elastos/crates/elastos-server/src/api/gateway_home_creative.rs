@@ -43,7 +43,8 @@ const DEFAULT_CREATIVE_COMFY_URL: &str = "http://127.0.0.1:18188";
 const DEFAULT_CREATIVE_PROFILE: &str = "h3-serve";
 const DEFAULT_CREATIVE_SCALE: u8 = 2;
 const CREATIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const CREATIVE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/* 30s clips can run ~20–40 min on 2×; keep headroom past the old 15s dogfood. */
+const CREATIVE_TOTAL_TIMEOUT: Duration = Duration::from_secs(50 * 60);
 const COMFY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const GENERATE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROMPT_CHARS: usize = 12_000;
@@ -478,8 +479,9 @@ fn require_home_gui(state: &GatewayState, headers: &HeaderMap) -> Result<(), Str
 
 fn clamp_duration(raw: Option<f64>) -> Result<f64, &'static str> {
     let d = raw.unwrap_or(2.0);
-    if ![2.0, 5.0, 10.0, 15.0].contains(&d) {
-        return Err("duration must be 2, 5, 10, or 15");
+    // 30s = dogfood experiment (may OOM / mush); Home UI exposes as "30s experiment".
+    if ![2.0, 5.0, 10.0, 15.0, 30.0].contains(&d) {
+        return Err("duration must be 2, 5, 10, 15, or 30");
     }
     Ok(d)
 }

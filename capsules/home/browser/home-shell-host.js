@@ -49,6 +49,13 @@ const ACTIVE_SHELL_HINT_KEY = "elastos.home.active-shell-hint";
 const HOME_CLI_SHELL_ID = "home-cli";
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
+const UI_PREFERENCE_KEYS = Object.freeze({
+  theme: new Set(["auto", "light", "dark"]),
+  accent: new Set(["blue", "purple", "pink", "red", "orange", "yellow", "green", "graphite"]),
+  dockAutoHide: new Set(["on", "off"]),
+  sounds: new Set(["on", "off"]),
+});
+const UI_PREFERENCE_STORE_PREFIX = "elastos.ui.";
 const MAX_LAUNCHED_APP_CONTEXTS = 128;
 const BROWSER_AUTHORITY_RENEWAL_GUI_TIMEOUT_MS = 30_000;
 const BROWSER_AUTHORITY_RENEWAL_TIMEOUT_MS = 35_000;
@@ -235,6 +242,63 @@ async function closeHomeGuiWindow(homeToken) {
   requireHomeGuiActive("close window");
   postToActiveShell({ type: "home:gui-command", command: "close-window", homeToken });
   retireLaunchedAppContext(homeToken);
+}
+
+/* Menus are self-declared UI, not authority: the host verifies the sender
+   frame and forwards only that window's launch token + menus to the GUI. */
+function setHomeGuiMenuManifest(menus, homeToken = "") {
+  requireHomeGuiActive("set menu manifest");
+  postToActiveShell({
+    type: "home:gui-command",
+    command: "set-menu-manifest",
+    windowId: "",
+    menus,
+    homeToken: homeToken || "",
+  });
+}
+
+function readUiPreferences() {
+  const preferences = {};
+  for (const key of Object.keys(UI_PREFERENCE_KEYS)) {
+    try {
+      const value = window.localStorage?.getItem(`${UI_PREFERENCE_STORE_PREFIX}${key}`) || "";
+      if (UI_PREFERENCE_KEYS[key].has(value)) {
+        preferences[key] = value;
+      }
+    } catch (_error) {
+      // Host storage unavailable — defaults apply.
+    }
+  }
+  return preferences;
+}
+
+function writeUiPreference(key, value) {
+  if (!UI_PREFERENCE_KEYS[key]?.has(value)) {
+    return false;
+  }
+  try {
+    window.localStorage?.setItem(`${UI_PREFERENCE_STORE_PREFIX}${key}`, value);
+  } catch (_error) {
+    // Still relay: the GUI applies for this session even without persistence.
+  }
+  postToActiveShell({
+    type: "home:gui-command",
+    command: "ui-preference",
+    preferences: { [key]: value },
+  });
+  return true;
+}
+
+function pushUiPreferencesToActiveShell() {
+  const preferences = readUiPreferences();
+  if (Object.keys(preferences).length === 0) {
+    return;
+  }
+  postToActiveShell({
+    type: "home:gui-command",
+    command: "ui-preference",
+    preferences,
+  });
 }
 
 function postBrowserAuthorityRenewalResult(record, result) {
@@ -1052,10 +1116,38 @@ window.addEventListener("message", (event) => {
             browserContextId,
           });
         }
+        pushUiPreferencesToActiveShell();
       }
       if (shellState.currentSummary) {
         postToActiveShell({ type: "home:shell-summary", summary: shellState.currentSummary });
       }
+    }
+    return;
+  }
+  if (data.type === "home:ui-preference") {
+    // Cosmetic shell preferences: System Personalization + Control Centre only.
+    const trustedSystemApp = context.kind === "app-frame" && context.targetId === SYSTEM_APP_ID;
+    const trustedGuiShell = context.kind === "shell-frame" && context.targetId === HOME_GUI_SHELL_ID;
+    if (!trustedSystemApp && !trustedGuiShell) {
+      console.warn("home ignored unauthorized ui-preference message", context.targetId);
+      return;
+    }
+    const requestId = typeof data.requestId === "string" ? data.requestId.trim() : "";
+    if (data.action === "read") {
+      replyToShellRequest(event, requestId, readUiPreferences());
+      return;
+    }
+    const key = typeof data.key === "string" ? data.key.trim() : "";
+    const value = typeof data.value === "string" ? data.value.trim() : "";
+    if (!writeUiPreference(key, value)) {
+      console.warn("home ignored invalid ui-preference", key, value);
+      if (requestId) {
+        replyToShellRequest(event, requestId, null, new Error("Home rejected the preference"));
+      }
+      return;
+    }
+    if (requestId) {
+      replyToShellRequest(event, requestId, true);
     }
     return;
   }
@@ -1123,6 +1215,19 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
+    return;
+  }
+  if (data.type === "home:menu-manifest") {
+    // A window may only shape its OWN menu bar entry — bind by sender token.
+    if (context.kind !== "app-frame" || !context.homeToken) {
+      console.warn("home ignored unauthorized menu-manifest message", context.targetId);
+      return;
+    }
+    try {
+      setHomeGuiMenuManifest(data.menus, context.homeToken);
+    } catch (error) {
+      console.error("home menu-manifest failed", error);
+    }
     return;
   }
   if (data.type === "home:active-shell-applied") {

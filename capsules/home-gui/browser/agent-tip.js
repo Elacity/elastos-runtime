@@ -115,4 +115,4 @@
  * [ ] Storyboard skill: shots → EDITING RULE compose → Generate (ag)
  */
 
-export const TIP = "home-20260807aj";
+export const TIP = "home-20260809bd";

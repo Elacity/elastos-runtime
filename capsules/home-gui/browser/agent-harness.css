@@ -111,7 +111,8 @@
 */
 .taskbar.is-agent-face {
   height: auto;
-  min-height: 108px;
+  /* Snug empty/single-line composer — was 108px and left a tall dead band above the toolbar. */
+  min-height: 88px;
   max-height: min(72vh, 520px);
   /* Clip growing transcript — never spill text outside the glass pill. */
   overflow: hidden;
@@ -663,10 +664,11 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   background: transparent;
   color: var(--harness-sidebar-fg);
   font-family: var(--harness-sidebar-type);
-  font-size: 14px;
-  font-weight: 400;
-  line-height: 21px;
-  letter-spacing: normal;
+  /* Same type size family as chat stream text. */
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 26px;
+  letter-spacing: -0.01em;
   cursor: pointer;
   text-align: left;
 }
@@ -682,13 +684,13 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
 }
 
 .agent-harness-home-mark {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 3px;
   background: currentColor;
   opacity: 0.75;
-  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 7.2 8 2.8l5.5 4.4V13a1 1 0 0 1-1 1H9.2v-3.2H6.8V14H3.5a1 1 0 0 1-1-1V7.2Z' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") center / 14px no-repeat;
-  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 7.2 8 2.8l5.5 4.4V13a1 1 0 0 1-1 1H9.2v-3.2H6.8V14H3.5a1 1 0 0 1-1-1V7.2Z' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") center / 14px no-repeat;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 7.2 8 2.8l5.5 4.4V13a1 1 0 0 1-1 1H9.2v-3.2H6.8V14H3.5a1 1 0 0 1-1-1V7.2Z' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") center / 16px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M2.5 7.2 8 2.8l5.5 4.4V13a1 1 0 0 1-1 1H9.2v-3.2H6.8V14H3.5a1 1 0 0 1-1-1V7.2Z' stroke='black' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") center / 16px no-repeat;
 }
 
 /* Session search — Claude-style modal (desktop) / full screen (narrow). */
@@ -892,7 +894,11 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   background: transparent;
   color: var(--harness-sidebar-fg);
   font-family: var(--harness-sidebar-type);
-  font-size: 14px;
+  /* Same type size family as chat stream text. */
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 26px;
+  letter-spacing: -0.01em;
   font-weight: 400;
   line-height: 21px;
   letter-spacing: normal;
@@ -912,12 +918,12 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
 
 .agent-harness-nav-mark {
   flex: 0 0 auto;
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   background: currentColor;
   opacity: 0.75;
-  -webkit-mask: none center / 14px no-repeat;
-  mask: none center / 14px no-repeat;
+  -webkit-mask: none center / 16px no-repeat;
+  mask: none center / 16px no-repeat;
 }
 
 .agent-harness-nav-mark[data-nav-icon="configure"] {
@@ -996,8 +1002,9 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   margin-left: auto;
   padding: 8px 16px;
   border-radius: 8px;
-  border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
-  background: color-mix(in srgb, currentColor 12%, transparent);
+  /* Match composer/settings controls — fill-only, no bespoke bordered pill. */
+  border: 0;
+  background: color-mix(in srgb, currentColor 10%, transparent);
   color: inherit;
   font: inherit;
   font-weight: 560;
@@ -1005,7 +1012,7 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
 }
 
 .agent-studio-submit:hover:not(:disabled) {
-  background: color-mix(in srgb, currentColor 18%, transparent);
+  background: color-mix(in srgb, currentColor 16%, transparent);
 }
 
 .agent-studio-submit:disabled {
@@ -1132,10 +1139,12 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
 }
 
 .agent-studio-library-row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 6px;
-  align-items: stretch;
+  position: relative;
+  border-radius: 8px;
+}
+
+.agent-studio-library-row:hover {
+  background: color-mix(in srgb, currentColor 4%, transparent);
 }
 
 .agent-studio-library-item {
@@ -1160,22 +1169,36 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
 }
 
 .agent-studio-library-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
   margin: 0;
-  padding: 0 8px;
+  padding: 0;
   border: 0;
-  border-radius: 8px;
-  background: transparent;
+  border-radius: 50%;
+  background: color-mix(in srgb, currentColor 14%, transparent);
   color: inherit;
   font: inherit;
-  font-size: 11px;
-  opacity: 0.55;
-  text-decoration: underline;
-  text-underline-offset: 2px;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0;
   cursor: pointer;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.agent-studio-library-row:hover .agent-studio-library-remove,
+.agent-studio-library-remove:focus-visible {
+  opacity: 0.85;
 }
 
 .agent-studio-library-remove:hover {
   opacity: 1;
+  background: color-mix(in srgb, #e5484d 88%, transparent);
+  color: #fff;
 }
 
 .agent-studio-library-prompt {
@@ -1621,6 +1644,21 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   background: var(--harness-room);
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text) 28%, transparent) transparent;
+  /* Match Chat stream: fade/clip content into the floating composer. */
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    #000 0,
+    #000 calc(100% - var(--harness-composer-clearance) - 8px),
+    rgba(0, 0, 0, 0.55) calc(100% - var(--harness-composer-clearance) + 28px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    #000 0,
+    #000 calc(100% - var(--harness-composer-clearance) - 8px),
+    rgba(0, 0, 0, 0.55) calc(100% - var(--harness-composer-clearance) + 28px),
+    transparent 100%
+  );
 }
 
 .agent-harness-page[hidden] {
@@ -1966,7 +2004,8 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   width: 100%;
   min-height: 160px;
   padding: 12px 14px;
-  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+  /* Fill-only field (same language as chat composer); focus ring carries affordance. */
+  border: 0;
   border-radius: 14px;
   background: color-mix(in srgb, var(--text) 5%, transparent);
   color: var(--text);
@@ -2696,7 +2735,7 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   color: color-mix(in srgb, var(--text) 88%, transparent);
 }
 
-/* Thinking — a quiet ChatGPT-style disclosure line, not a boxed card. */
+/* Thinking — collapsed by default; shimmer header + optional stage; expand for full stream. */
 .agent-thinking {
   margin: 2px 0 10px;
   color: color-mix(in srgb, var(--text) 55%, transparent);
@@ -2707,11 +2746,15 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  max-width: 100%;
   padding: 4px 0;
   cursor: pointer;
   list-style: none;
-  font-size: 12.5px;
-  font-weight: 520;
+  /* Match stream body metrics (16/600/26). */
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 26px;
   user-select: none;
 }
 
@@ -2719,23 +2762,44 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   color: color-mix(in srgb, var(--text) 80%, transparent);
 }
 
+.agent-thinking-label {
+  flex: 0 0 auto;
+}
+
+/* Continuous wave shimmer (linear loop) — ease-in-out made it stutter at the turn. */
 .agent-thinking.is-streaming .agent-thinking-label {
-  animation: agent-thinking-shimmer 1.6s ease-in-out infinite;
+  background-image: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--text) 40%, transparent) 0%,
+    color-mix(in srgb, var(--text) 40%, transparent) 28%,
+    color-mix(in srgb, var(--text) 96%, transparent) 50%,
+    color-mix(in srgb, var(--text) 40%, transparent) 72%,
+    color-mix(in srgb, var(--text) 40%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: agent-thinking-shimmer 2.8s linear infinite;
 }
 
 @keyframes agent-thinking-shimmer {
-  0%,
-  100% {
-    opacity: 0.55;
+  from {
+    background-position: 200% 0;
   }
-  50% {
-    opacity: 1;
+  to {
+    background-position: -200% 0;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .agent-thinking.is-streaming .agent-thinking-label {
     animation: none;
+    background-image: none;
+    color: inherit;
+    -webkit-text-fill-color: currentColor;
+    opacity: 0.75;
   }
 }
 
@@ -2775,8 +2839,11 @@ body.agent-harness-sidebar-collapsed #agent-harness-search-open-main {
   overflow: hidden;
   border-left: 2px solid color-mix(in srgb, var(--text) 12%, transparent);
   font-family: inherit;
-  font-size: 12.5px;
-  line-height: 1.5;
+  /* Match stream body metrics (16/600/26). */
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 26px;
   opacity: 0.88;
   text-wrap: pretty;
 }
@@ -3332,7 +3399,8 @@ html[data-agent-reasoning="off"] .agent-thinking {
   align-self: flex-end;
   width: auto;
   max-width: min(85%, 560px);
-  text-align: right;
+  /* Bubble sits on the right; lines read LTR left-aligned inside it. */
+  text-align: left;
 }
 
 /* Edit mode — expand to the stream column so the textarea is not bubble-narrow. */
@@ -3386,16 +3454,33 @@ html[data-agent-reasoning="off"] .agent-thinking {
 .agent-msg-retry,
 .agent-md-copy {
   appearance: none;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
   margin: 0;
-  padding: 3px 8px;
+  padding: 0;
   border: 0;
   border-radius: 7px;
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-  color: color-mix(in srgb, var(--text) 70%, transparent);
+  background: transparent;
+  color: color-mix(in srgb, var(--text) 55%, transparent);
   font: inherit;
-  font-size: 11px;
-  font-weight: 560;
   cursor: pointer;
+}
+
+.agent-msg-action svg,
+.agent-msg-retry svg,
+.agent-md-copy svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+.agent-msg-action:hover,
+.agent-msg-retry:hover,
+.agent-md-copy:hover {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  color: color-mix(in srgb, var(--text) 82%, transparent);
 }
 
 .agent-msg-action:disabled {
@@ -3477,8 +3562,8 @@ html[data-agent-reasoning="off"] .agent-thinking {
 }
 
 .agent-msg-action.is-danger:hover {
-  background: color-mix(in srgb, #e85d5d 18%, transparent);
-  color: color-mix(in srgb, #e85d5d 80%, var(--text));
+  background: color-mix(in srgb, #e85d5d 14%, transparent);
+  color: #e85d5d;
 }
 
 /* ChatGPT-style edit: filled shell, no border ring, Cancel + Send inside. */
@@ -4210,7 +4295,8 @@ html[data-agent-reasoning="off"] .agent-thinking {
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
-  gap: 12px;
+  /* Match the comfortable gap when multi-line text is present. */
+  gap: 6px;
   padding: 0;
   overflow: hidden;
 }
@@ -4218,7 +4304,8 @@ html[data-agent-reasoning="off"] .agent-thinking {
 .agent-composer-field {
   display: block;
   margin: 0;
-  flex: 1 1 auto;
+  /* Size to the textarea — don't stretch and leave empty air above the toolbar. */
+  flex: 0 1 auto;
   min-height: 28px;
   min-width: 0;
   overflow: hidden;

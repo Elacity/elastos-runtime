@@ -6,20 +6,20 @@
 import {
   listProjects,
   createProject,
-} from "./mock-agent-provider.js?v=home-20260804bb";
-import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260804bb";
-import { closeHarnessPage } from "./agent-configure.js?v=home-20260804bb";
+} from "./mock-agent-provider.js?v=home-20260809bd";
+import { persistAgentWorkspaceSoon } from "./agent-workspace.js?v=home-20260809bd";
+import { closeHarnessPage } from "./agent-configure.js?v=home-20260809bd";
 import {
   renderActiveSession,
   renderFollowUpQueue,
   stopMockStream,
   setTitle,
   titleFromPrompt,
-} from "./agent-stream.js?v=home-20260804bb";
+} from "./agent-stream.js?v=home-20260809bd";
 import {
   syncAgentSendButton,
   composerInput as shelfComposerInput,
-} from "./agent-shelf.js?v=home-20260804bb";
+} from "./agent-shelf.js?v=home-20260809bd";
 
 /** @type {null | object} */
 let ctx = null;
@@ -508,14 +508,15 @@ export function submitProjectCreate() {
 }
 
 export function ensureSessionForPrompt(prompt) {
+  /* Always continue the active chat. Previously we only returned `existing` when
+     it was empty / still titled "New chat", so the 2nd user turn minted a fresh
+     session and Live saw no history (felt like a brand-new chat every message). */
   if (ctx.activeSessionId) {
     const existing = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
-    if (existing && existing.messages.length === 0) {
-      existing.title = titleFromPrompt(prompt);
-      return existing;
-    }
-    if (existing && existing.title === "New chat") {
-      existing.title = titleFromPrompt(prompt);
+    if (existing) {
+      if (existing.messages.length === 0 || existing.title === "New chat") {
+        existing.title = titleFromPrompt(prompt);
+      }
       return existing;
     }
   }

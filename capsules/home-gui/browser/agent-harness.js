@@ -12,11 +12,11 @@ import {
   snapAppsShelfFace,
   bindShelfAttachHost,
   addComposerAttachment,
-} from "./agent-shelf.js?v=home-20260804bb";
+} from "./agent-shelf.js?v=home-20260809bd";
 import {
   shellState,
   desktopObjects,
-} from "./shell-core.js?v=home-20260804bb";
+} from "./shell-core.js?v=home-20260809bd";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -26,8 +26,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260804bb";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260804bb";
+} from "./shell-stages.js?v=home-20260809bd";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260809bd";
 import {
   resetMockCapabilities,
   getSelectedModel,
@@ -45,18 +45,18 @@ import {
   requestModelGet,
   removeProject,
   getLastStreamFailure,
-} from "./mock-agent-provider.js?v=home-20260804bb";
+} from "./mock-agent-provider.js?v=home-20260809bd";
 import {
   bindAgentWorkspaceSnapshot,
-} from "./shell-windows.js?v=home-20260804bb";
-import { TIP } from "./agent-tip.js?v=home-20260804bb";
-import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260804bb";
+} from "./shell-windows.js?v=home-20260809bd";
+import { TIP } from "./agent-tip.js?v=home-20260809bd";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260809bd";
 import {
   bindAgentWorkspaceStore,
   getAgentWorkspaceSnapshot,
   applyAgentWorkspaceSnapshot,
   persistAgentWorkspaceSoon,
-} from "./agent-workspace.js?v=home-20260804bb";
+} from "./agent-workspace.js?v=home-20260809bd";
 import {
   bindAgentConfigure,
   harnessPageOpen,
@@ -69,7 +69,7 @@ import {
   setWorkbenchTab,
   syncWorkbenchPanels,
   syncWorkbenchOpenUi,
-} from "./agent-configure.js?v=home-20260804bb";
+} from "./agent-configure.js?v=home-20260809bd";
 import {
   bindAgentGrants,
   syncTruthStrip,
@@ -80,7 +80,7 @@ import {
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
   getReadyLibraryReadGrant,
-} from "./agent-grants.js?v=home-20260804bb";
+} from "./agent-grants.js?v=home-20260809bd";
 import {
   bindAgentStream,
   clearStreamTimer,
@@ -109,7 +109,7 @@ import {
   updateJumpToLatestVisibility,
   ensureJumpToLatest,
   setStreamStatus,
-} from "./agent-stream.js?v=home-20260804bb";
+} from "./agent-stream.js?v=home-20260809bd";
 import {
   getLiveInferenceState,
   probeLiveInference,
@@ -118,7 +118,7 @@ import {
   fetchAgentBackends,
   getAgentBackendsCache,
   extractAgentLibraryRead,
-} from "./agent-live.js?v=home-20260804bb";
+} from "./agent-live.js?v=home-20260809bd";
 import {
   bindAgentSessions,
   relativeTime,
@@ -146,7 +146,7 @@ import {
   closeSessionActions,
   openSessionActions,
   runSessionAction,
-} from "./agent-sessions.js?v=home-20260804bb";
+} from "./agent-sessions.js?v=home-20260809bd";
 export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
 let workbenchTab = "outputs";

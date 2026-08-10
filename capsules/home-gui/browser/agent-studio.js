@@ -1,9 +1,9 @@
 /* Home Studio — Generate + Storyboard + Character via CREATIVE_* jobs.
-   Tip: home-20260807aj — P2 Character refs + library delete */
+   Tip: home-20260809bd — P2 Character refs + library delete */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260807aj";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260809bd";
 
-const DURATIONS = [2, 5, 10, 15];
+const DURATIONS = [2, 5, 10, 15, 30];
 const SCALES = [1, 2, 4];
 const POLL_MS = 2000;
 const MAX_PROMPT = 12_000;
@@ -177,6 +177,7 @@ function syncScaleUi() {
   }
   const mode = currentMode();
   const select = panel.querySelector("[data-studio-scale]");
+  // Scale note line removed from markup (Occam); keep updater inert if absent.
   const note = panel.querySelector("[data-studio-scale-note]");
   if (!select) {
     return;
@@ -797,7 +798,7 @@ async function refreshLibrary() {
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "agent-studio-library-remove";
-      remove.textContent = "Remove";
+      remove.textContent = "×";
       remove.setAttribute("aria-label", `Remove clip ${id.slice(0, 8)}`);
       remove.addEventListener("click", (event) => {
         event.preventDefault();
@@ -852,7 +853,7 @@ export function bindAgentStudio() {
           if (note) {
             note.textContent = urls.length
               ? `${urls.length} face still(s) ready (max ${MAX_REF_IMAGES})`
-              : "No face stills selected";
+              : "Face stills + optional voice clip lock the person.";
           }
         })
         .catch((err) => {
@@ -897,7 +898,10 @@ export function bindAgentStudio() {
     if (activeJobId) {
       return;
     }
-    const duration = Number(form.querySelector("[data-studio-duration]")?.value);
+    let duration = Number(form.querySelector("[data-studio-duration]")?.value);
+    if (!duration || !DURATIONS.includes(duration)) {
+      duration = 10;
+    }
     const mode = currentMode();
     const scale = mode === "character" ? 1 : currentScale();
     let prompt = String(form.querySelector("[data-studio-prompt]")?.value || "").trim();
@@ -905,10 +909,6 @@ export function bindAgentStudio() {
       const shots = parseStoryboardShots(form.querySelector("[data-studio-shots]")?.value || "");
       if (!shots.length) {
         setStatus("Add at least one shot (one line each)", "error");
-        return;
-      }
-      if (!DURATIONS.includes(duration)) {
-        setStatus("Duration must be 2, 5, 10, or 15", "error");
         return;
       }
       if (!SCALES.includes(scale)) {
@@ -940,7 +940,7 @@ export function bindAgentStudio() {
       return;
     }
     if (!DURATIONS.includes(duration)) {
-      setStatus("Duration must be 2, 5, 10, or 15", "error");
+      setStatus("Duration must be 5, 10, 15, or 30", "error");
       return;
     }
     if (!SCALES.includes(scale)) {

@@ -14,22 +14,22 @@ import {
   clearLastStreamFailure,
   splitThinkTaggedContent,
   getSelectedModel,
-} from "./mock-agent-provider.js?v=home-20260804bb";
+} from "./mock-agent-provider.js?v=home-20260809bd";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamLiveChatCompletion,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260804bb";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260804bb";
+} from "./agent-live.js?v=home-20260809bd";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260809bd";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260804bb";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260804bb";
+} from "./agent-grants.js?v=home-20260809bd";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260809bd";
 
 /** @type {null | object} */
 let ctx = null;
@@ -130,6 +130,63 @@ function paintThinkingBody(body, text, { streaming = false } = {}) {
 
 function thinkingBodyRaw(body) {
   return String(body?.dataset?.mdSource || body?.textContent || "");
+}
+
+function syncThinkingHeader(details, { streaming = false } = {}) {
+  if (!details) {
+    return;
+  }
+  const label = details.querySelector(".agent-thinking-label");
+  if (!streaming || !label || details.classList.contains("is-complete")) {
+    return;
+  }
+  /* Show latest activity as the header while streaming: prefer markdown headers
+     (##, ###), else bold lines (**Analyzing…**). Convert to verb form. */
+  const raw = String(details.querySelector(".agent-thinking-body")?.dataset?.mdSource || "");
+  if (!raw) {
+    label.textContent = "Thinking";
+    return;
+  }
+  let activity = "";
+  const lines = raw.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim();
+    const md = line.match(/^#{1,6}\s+(.+)$/);
+    if (md) {
+      activity = md[1];
+      break;
+    }
+    const bold = line.match(/^\*\*(.+?)\*\*/);
+    if (bold) {
+      activity = bold[1];
+      break;
+    }
+  }
+  if (!activity) {
+    activity = "Thinking";
+  }
+  /* Verbify: “Analyze” → “Analyzing”, “Draft” → “Drafting”, etc. */
+  activity = activity.replace(/^([A-Z][a-z]+)\s/, (m, verb) => {
+    const lower = verb.toLowerCase();
+    const map = {
+      analyze: "Analyzing", draft: "Drafting", translate: "Translating",
+      deconstruct: "Deconstructing", construct: "Constructing", build: "Building",
+      create: "Creating", generate: "Generating", write: "Writing",
+      structure: "Structuring", plan: "Planning", review: "Reviewing",
+      check: "Checking", verify: "Verifying", validate: "Validating",
+      process: "Processing", parse: "Parsing", read: "Reading",
+      think: "Thinking", consider: "Considering", evaluate: "Evaluating",
+      summarize: "Summarizing", outline: "Outlining", sketch: "Sketching",
+      design: "Designing", implement: "Implementing", fix: "Fixing",
+      debug: "Debugging", test: "Testing", refine: "Refining",
+      polish: "Polishing", finalize: "Finalizing", complete: "Completing",
+    };
+    return (map[lower] || verb + "ing") + " ";
+  });
+  /* Trim to ~48 chars so it stays one line. */
+  const max = 48;
+  const short = activity.length > max ? `${activity.slice(0, max - 1).trim()}…` : activity;
+  label.textContent = short;
 }
 
 function paintTurnUsageMeta(row, turn) {
@@ -379,7 +436,7 @@ export function finishThinkingBlock(details, startedAt) {
   if (label) {
     label.textContent = `Thought for ${sec}s`;
   }
-  /* Collapse after a beat — frontier-style; honor reduced motion by skipping delay animation only. */
+  /* Stay collapsed by default; if the user expanded mid-stream, fold after a beat. */
   if (details.open && ctx.reasoningVisible) {
     const collapse = () => {
       if (details.isConnected && ctx.reasoningVisible) {
@@ -518,20 +575,16 @@ export function showEmptyState() {
   const empty = document.createElement("div");
   empty.className = "agent-harness-empty";
   empty.setAttribute("role", "status");
+  // Occam: one header + one sub — grant literacy lives on the grant card, not here.
   const sub =
     ctx.sessionMode === "build"
-      ? "Build mode · plan & outputs theatre · no write authority yet"
-      : "Private on this machine · tools start at zero · grants ask once";
-  const teach = getLiveInferenceState().live
-    ? "Live on this Home · tools still ask once · Deny / Allow never mint Capsule power"
-    : "Preview path when Live is down · Deny / Allow once never mint Capsule power";
+      ? "Build mode · plan & outputs · no write authority yet"
+      : "Private on this machine · tools ask once";
   empty.innerHTML =
     `<p class="agent-harness-empty-greeting"></p>` +
-    `<p class="agent-harness-empty-sub"></p>` +
-    `<p class="agent-harness-empty-teach"></p>`;
+    `<p class="agent-harness-empty-sub"></p>`;
   empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
   empty.querySelector(".agent-harness-empty-sub").textContent = sub;
-  empty.querySelector(".agent-harness-empty-teach").textContent = teach;
   /* Viewport — not the dock-width column — so the hero sits in true room center. */
   viewport.append(empty);
 }
@@ -600,7 +653,7 @@ export function renderActiveSession() {
 /** Re-bind mock capability map to this session’s grant messages (preview). */
 
 
-export function appendThinkingBlock(text, { streaming = false, open = true } = {}) {
+export function appendThinkingBlock(text, { streaming = false, open = false } = {}) {
   const stream = host.streamEl();
   if (!stream) {
     return null;
@@ -610,12 +663,13 @@ export function appendThinkingBlock(text, { streaming = false, open = true } = {
   details.className = `agent-thinking${streaming ? " is-streaming" : ""}`;
   details.dataset.block = "thinking";
   details.dataset.startedAt = String(Date.now());
+  /* Collapsed by default — shimmer header stays live; expand for full stream. */
   if (open && ctx.reasoningVisible) {
     details.open = true;
   }
   const summary = document.createElement("summary");
   summary.className = "agent-thinking-summary";
-  summary.title = "Preview reasoning — not authority";
+  summary.title = "Show full thinking — preview only, not authority";
   summary.innerHTML =
     `<span class="agent-thinking-chevron" aria-hidden="true"></span>` +
     `<span class="agent-thinking-label">Thinking</span>`;
@@ -626,6 +680,7 @@ export function appendThinkingBlock(text, { streaming = false, open = true } = {
   paintThinkingBody(body, text, { streaming });
   bodyWrap.append(body);
   details.append(summary, bodyWrap);
+  syncThinkingHeader(details, { streaming });
   stream.append(details);
   host.scrollStreamToEnd();
   return details;
@@ -673,40 +728,39 @@ export function appendMessage(
 
   const actions = document.createElement("div");
   actions.className = "agent-msg-actions";
-  const copyBtn = document.createElement("button");
-  copyBtn.type = "button";
-  copyBtn.className = "agent-msg-action";
+  const makeIcon = (svg, label, extra = "") => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `agent-msg-action${extra ? ` ${extra}` : ""}`;
+    btn.innerHTML = svg;
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    return btn;
+  };
+  const ICONS = {
+    copy: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"/></svg>`,
+    edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.7 1.7 0 0 1 2 2L5 13l-2.6.6L3 11l8.5-8.5Z"/></svg>`,
+    regen: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5A5.5 5.5 0 1 0 14 9.5"/><path d="M13.5 2.5v4h-4"/></svg>`,
+    trash: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 2h3M4 4l.6 8.6A1.6 1.6 0 0 0 6.2 14h3.6a1.6 1.6 0 0 0 1.6-1.4L12 4"/></svg>`,
+  };
+  const copyBtn = makeIcon(ICONS.copy, "Copy");
   copyBtn.dataset.copyMessage = "1";
-  copyBtn.textContent = "Copy";
-  copyBtn.title = "Copy message";
   actions.append(copyBtn);
   if (role === "user" && !streaming) {
-    const edit = document.createElement("button");
-    edit.type = "button";
-    edit.className = "agent-msg-action";
+    const edit = makeIcon(ICONS.edit, "Edit and resubmit");
     edit.dataset.editMessage = "1";
-    edit.textContent = "Edit";
-    edit.title = "Edit and resubmit";
     edit.disabled = Boolean(ctx.turnBusy);
     actions.append(edit);
   }
   if (role === "agent") {
-    const regen = document.createElement("button");
-    regen.type = "button";
-    regen.className = "agent-msg-action";
+    const regen = makeIcon(ICONS.regen, "Regenerate reply");
     regen.dataset.regenerate = "1";
     regen.disabled = streaming || Boolean(ctx.turnBusy);
-    regen.title = "Regenerate reply";
-    regen.textContent = "Regenerate";
     actions.append(regen);
   }
   if (!streaming) {
-    const del = document.createElement("button");
-    del.type = "button";
-    del.className = "agent-msg-action is-danger";
+    const del = makeIcon(ICONS.trash, "Delete", "is-danger");
     del.dataset.deleteMessage = "1";
-    del.textContent = "Delete";
-    del.title = "Delete message";
     del.disabled = Boolean(ctx.turnBusy);
     actions.append(del);
   }
@@ -936,7 +990,7 @@ async function startLiveTurnForPrompt(userText) {
   const thinkStartedAt = Date.now();
   let thinkingEl = appendThinkingBlock("", {
     streaming: true,
-    open: Boolean(ctx.reasoningVisible),
+    open: false,
   });
   if (thinkingEl && !ctx.reasoningVisible) {
     thinkingEl.hidden = true;
@@ -962,15 +1016,14 @@ async function startLiveTurnForPrompt(userText) {
       if (!thinkingEl) {
         thinkingEl = appendThinkingBlock(reasoning, {
           streaming: true,
-          open: Boolean(ctx.reasoningVisible),
+          open: false,
         });
       } else {
         const body = thinkingEl.querySelector(".agent-thinking-body");
         paintThinkingBody(body, reasoning, { streaming: true });
+        syncThinkingHeader(thinkingEl, { streaming: true });
         thinkingEl.hidden = !ctx.reasoningVisible && !content;
-        if (ctx.reasoningVisible) {
-          thinkingEl.open = true;
-        }
+        /* Keep collapsed unless the user opened the disclosure. */
       }
     }
     if (content) {
@@ -1195,7 +1248,7 @@ function startTurnReveal({
   const thinking = showThinking
     ? appendThinkingBlock("", {
         streaming: ctx.reasoningVisible,
-        open: ctx.reasoningVisible,
+        open: false,
       })
     : null;
   const thinkBody = thinking?.querySelector(".agent-thinking-body");
@@ -1243,10 +1296,13 @@ function startTurnReveal({
 
     if (phase === "thinking" && thinkBody) {
       thinkIndex = Math.min(thinkingText.length, thinkIndex + 3 + (thinkIndex % 2));
-      paintThinkingBody(thinkBody, thinkingText.slice(0, thinkIndex), {
+      const partial = thinkingText.slice(0, thinkIndex);
+      paintThinkingBody(thinkBody, partial, {
         streaming: true,
       });
-      if (scroller) {
+      syncThinkingHeader(thinking, { streaming: true });
+      /* Only chase the stream if the user expanded the disclosure. */
+      if (thinking?.open && scroller) {
         scroller.scrollTop = scroller.scrollHeight;
       }
       if (thinkIndex >= thinkingText.length) {
