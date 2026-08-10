@@ -48,6 +48,8 @@ mod gateway_browser;
 mod gateway_capsule_catalog;
 #[path = "gateway_esp.rs"]
 mod gateway_esp;
+#[path = "gateway_home_creative.rs"]
+mod gateway_home_creative;
 #[path = "gateway_home_runtime.rs"]
 mod gateway_home_runtime;
 #[path = "gateway_home_system.rs"]
@@ -84,6 +86,7 @@ mod gateway_wallet_adapter;
 use gateway_browser::browser_runtime_stream_socket_path;
 use gateway_capsule_catalog::*;
 use gateway_esp::*;
+use gateway_home_creative::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
 use gateway_home_runtime::*;
 
@@ -861,6 +864,30 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/apps/home/appearance/background-image",
             get(home_background_image),
+        )
+        .route(
+            "/api/apps/home/creative/status",
+            get(home_creative_status),
+        )
+        .route(
+            "/api/apps/home/creative/prepare",
+            post(home_creative_prepare),
+        )
+        .route(
+            "/api/apps/home/creative/stitch",
+            post(home_creative_jobs_stitch),
+        )
+        .route(
+            "/api/apps/home/creative/jobs",
+            get(home_creative_jobs_list),
+        )
+        .route(
+            "/api/apps/home/creative/jobs/:id",
+            delete(home_creative_jobs_delete),
+        )
+        .route(
+            "/api/apps/home/creative/jobs/:id/video",
+            get(home_creative_jobs_video),
         )
         .route("/api/apps/home/runtime/ensure", post(home_runtime_ensure))
         .route("/api/apps/home/launch", post(home_launch))
