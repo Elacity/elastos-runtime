@@ -101,6 +101,7 @@ const canonicalClientImports = Object.freeze({
     "targetId: CONNECTOR_ID",
   "capsules/library/browser/src/app.js": 'targetId: "library"',
   "capsules/documents/browser/index.html": 'targetId: "documents"',
+  "capsules/chat-room/browser/index.html": 'targetId: "chat-room"',
 });
 for (const [path, targetBinding] of Object.entries(canonicalClientImports)) {
   const source = readFileSync(join(repoRoot, path), "utf8");
@@ -130,6 +131,10 @@ const libraryDialogSource = readFileSync(
   join(repoRoot, "capsules/library/browser/src/dialog.js"),
   "utf8",
 );
+const chatRoomUiSource = readFileSync(
+  join(repoRoot, "capsules/chat-room-ui/src/lib.rs"),
+  "utf8",
+);
 assert(
   protocolSource.includes("HOME_CLIPBOARD_TARGET_PURPOSE_POLICY") &&
     protocolSource.includes('"browser.text"') &&
@@ -146,6 +151,13 @@ assert(
     hostSource.includes("context.targetId") &&
     !hostSource.includes("data.targetId"),
   "Home Clipboard must share one closed protocol policy and derive target identity from verified frame context",
+);
+assert(
+  protocolSource.includes('"conversation.invite"') &&
+    hostSource.includes('"chat-room:conversation.invite:write"') &&
+    chatRoomUiSource.includes('JsValue::from_str("elastosChatCopyInvite")') &&
+    !chatRoomUiSource.includes('JsValue::from_str("clipboard")'),
+  "Chat invite copies must use the canonical trusted Home Clipboard path",
 );
 assert(
   protocolSource.includes(

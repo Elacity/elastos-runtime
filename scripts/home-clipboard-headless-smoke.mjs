@@ -9,6 +9,7 @@ const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const homeRoot = join(repoRoot, "capsules/home/browser");
 const fixtureTargets = Object.freeze({
   browser: "headless-browser-clipboard-token",
+  "chat-room": "headless-chat-room-clipboard-token",
   library: "headless-library-clipboard-token",
   wallet: "headless-wallet-clipboard-token",
 });
@@ -208,6 +209,11 @@ function childDocument() {
         browserRead: () => capture(client.readText()),
         browserWrite: (requestId = undefined) =>
           capture(client.writeText("headless Browser copy", { requestId })),
+        conversationInvite: () =>
+          capture(client.writeText(
+            "elastos://peer/invite?token=headless-conversation-invite",
+            { purpose: "conversation.invite" },
+          )),
         cancel() {
           const requestId = client.newRequestId();
           const pending = capture(client.writeText("0xcancel", {
@@ -379,15 +385,17 @@ try {
 
   const browserFrame = page.frames().find((frame) =>
     frame.url().includes("target=browser"));
+  const chatFrame = page.frames().find((frame) =>
+    frame.url().includes("target=chat-room"));
   const libraryFrame = page.frames().find((frame) =>
     frame.url().includes("target=library"));
   const walletFrame = page.frames().find((frame) =>
     frame.url().includes("target=wallet"));
   assert(
-    browserFrame && libraryFrame && walletFrame,
+    browserFrame && chatFrame && libraryFrame && walletFrame,
     "opaque Clipboard fixture frames are missing",
   );
-  for (const frame of [browserFrame, libraryFrame, walletFrame]) {
+  for (const frame of [browserFrame, chatFrame, libraryFrame, walletFrame]) {
     await frame.waitForFunction(
       () => document.body.dataset.clientReady === "true" &&
         window.__clipboardChild.ready(),
@@ -514,13 +522,29 @@ try {
   await page.locator("#home-clipboard-allow").click();
   assert((await resourceUriWrite).ok, "Library resource URI write did not complete");
 
+  const conversationInviteWrite = chatFrame.evaluate(
+    () => window.__clipboardChild.conversationInvite(),
+  );
+  await page.locator("#home-clipboard-prompt").waitFor({ state: "visible" });
+  assert(
+    /conversation invite/i.test(
+      await page.locator("#home-clipboard-title").textContent(),
+    ),
+    "Chat invite did not receive its explicit Home prompt",
+  );
+  await page.locator("#home-clipboard-allow").click();
+  assert(
+    (await conversationInviteWrite).ok,
+    "Chat conversation invite write did not complete",
+  );
+
   const cancelled = walletFrame.evaluate(() => window.__clipboardChild.cancel());
   const cancelledResult = await cancelled;
   assert(cancelledResult.error === "cancelled", "client cancellation failed", {
     cancelledResult,
   });
   assert(
-    (await page.evaluate(() => window.__clipboardFixture.effects.writes)) === 5,
+    (await page.evaluate(() => window.__clipboardFixture.effects.writes)) === 6,
     "cancelled request reached the OS Clipboard",
   );
 
@@ -621,7 +645,7 @@ try {
 
   const effects = await page.evaluate(() => window.__clipboardFixture.effects);
   assert(
-    effects.reads === 1 && effects.writes === 5,
+    effects.reads === 1 && effects.writes === 6,
     "Home Clipboard edge performed an unexpected OS effect count",
     effects,
   );
@@ -629,13 +653,14 @@ try {
     `${JSON.stringify({
       schema: "elastos.home.clipboard-headless-smoke/v1",
       ok: true,
-      opaque_frames: 3,
+      opaque_frames: 4,
       browser_read: true,
       browser_write: true,
       wallet_address_write: true,
       recovery_key_write: true,
       library_identifier_write: true,
       library_resource_uri_write: true,
+      conversation_invite_write: true,
       recovery_prompt_secret_safe: true,
       cancellation: true,
       timeout: true,

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+const moduleVersion = "home-20260802a";
 const requests = [];
 const injectedProviderCalls = [];
 let extraWindowOpenCount = 0;
@@ -221,6 +221,7 @@ const summary = {
   targets: [
     { target: "browser", title: "Browser", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "inbox", title: "Inbox", attach_kind: "iframe", role: "app", target_kind: "app" },
+    { target: "people", title: "People", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "system", title: "System", attach_kind: "iframe", role: "app", target_kind: "app" },
     { target: "wallet", title: "Wallet", attach_kind: "iframe", role: "app", target_kind: "app" },
   ],
@@ -486,6 +487,14 @@ globalThis.fetch = async (url, init = {}) => {
         route: "/apps/system/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=system-token",
         target: "system",
         title: "System",
+      });
+    }
+    if (body?.target === "people") {
+      return jsonResponse({
+        attach_kind: "iframe",
+        route: "/apps/people/?home_origin=http%3A%2F%2Flocalhost%3A61180#home_token=people-token",
+        target: "people",
+        title: "People",
       });
     }
     if (body?.target === "wallet") {
@@ -837,6 +846,186 @@ function sendChildMessage(origin, source, data) {
     listener({ origin, source, data });
   }
 }
+
+const peopleLaunchesBeforeAuthorityProof = requests.filter(
+  (request) => request.url === "/api/apps/home/launch" && request.body?.target === "people",
+).length;
+const peopleCommandsBeforeAuthorityProof = shellMessages.filter(
+  (message) =>
+    message.payload?.type === "home:gui-command" &&
+    message.payload?.command === "open-target" &&
+    message.payload?.target === "people",
+).length;
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:open-target",
+  target: "people",
+  query: {},
+  homeToken: "gui-token",
+});
+for (
+  let attempt = 0;
+  attempt < 50 && shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "people",
+  ).length === peopleCommandsBeforeAuthorityProof;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "people",
+  ).length === peopleCommandsBeforeAuthorityProof + 1,
+  "Home did not hand the People action to the established Home GUI",
+  shellMessages,
+);
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-people-authority-proof",
+  target: "people",
+  query: {},
+  homeToken: "gui-token",
+});
+for (
+  let attempt = 0;
+  attempt < 50 && requests.filter(
+    (request) => request.url === "/api/apps/home/launch" && request.body?.target === "people",
+  ).length === peopleLaunchesBeforeAuthorityProof;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  requests.filter(
+    (request) => request.url === "/api/apps/home/launch" && request.body?.target === "people",
+  ).length === peopleLaunchesBeforeAuthorityProof + 1,
+  "The established Home GUI could not launch People for the authority proof",
+  requests,
+);
+for (
+  let attempt = 0;
+  attempt < 50 && !shellMessages.some(
+    (message) => message.payload?.requestId === "launch-people-authority-proof",
+  );
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  shellMessages.some((message) =>
+    message.payload?.type === "home:shell-response" &&
+    message.payload?.requestId === "launch-people-authority-proof" &&
+    message.payload?.result?.route?.includes("#home_token=people-token")
+  ),
+  "Home GUI did not complete the People launch before its frame attached",
+  shellMessages,
+);
+const peopleFrameWindow = { postMessage() {} };
+sendChildMessage("null", peopleFrameWindow, {
+  type: "home:app-ready",
+  homeToken: "people-token",
+});
+const systemLaunchesBeforePeopleAction = requests.filter(
+  (request) => request.url === "/api/apps/home/launch" && request.body?.target === "system",
+).length;
+const systemCommandsBeforePeopleAction = shellMessages.filter(
+  (message) =>
+    message.payload?.type === "home:gui-command" &&
+    message.payload?.command === "open-target" &&
+    message.payload?.target === "system",
+).length;
+sendChildMessage("null", peopleFrameWindow, {
+  type: "home:open-target",
+  target: "system",
+  query: {},
+  homeToken: "people-token",
+});
+for (
+  let attempt = 0;
+  attempt < 50 && shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "system",
+  ).length === systemCommandsBeforePeopleAction;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+assert(
+  shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "system",
+  ).length === systemCommandsBeforePeopleAction + 1,
+  "The attached People frame could not hand its System action to Home GUI",
+  shellMessages,
+);
+sendChildMessage("null", shellFrameWindow, {
+  type: "home:launch-target",
+  requestId: "launch-system-from-people",
+  target: "system",
+  query: {},
+  homeToken: "gui-token",
+});
+for (
+  let attempt = 0;
+  attempt < 50 && requests.filter(
+    (request) => request.url === "/api/apps/home/launch" && request.body?.target === "system",
+  ).length === systemLaunchesBeforePeopleAction;
+  attempt += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+const peopleSystemLaunch = requests.filter(
+  (request) => request.url === "/api/apps/home/launch" && request.body?.target === "system",
+).at(-1);
+assert(
+  peopleSystemLaunch &&
+    requests.filter(
+      (request) => request.url === "/api/apps/home/launch" && request.body?.target === "system",
+    ).length === systemLaunchesBeforePeopleAction + 1 &&
+    JSON.stringify(peopleSystemLaunch.body?.query) === JSON.stringify({
+      home_origin: "http://localhost:61180",
+    }),
+  "People could not open System through its exact bounded Home authority",
+  requests,
+);
+const walletLaunchesBeforeDeniedPeopleAction = requests.filter(
+  (request) => request.url === "/api/apps/home/launch" && request.body?.target === "wallet",
+).length;
+const walletCommandsBeforeDeniedPeopleAction = shellMessages.filter(
+  (message) =>
+    message.payload?.type === "home:gui-command" &&
+    message.payload?.command === "open-target" &&
+    message.payload?.target === "wallet",
+).length;
+sendChildMessage("null", peopleFrameWindow, {
+  type: "home:open-target",
+  target: "wallet",
+  query: {},
+  homeToken: "people-token",
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert(
+  shellMessages.filter(
+    (message) =>
+      message.payload?.type === "home:gui-command" &&
+      message.payload?.command === "open-target" &&
+      message.payload?.target === "wallet",
+  ).length === walletCommandsBeforeDeniedPeopleAction &&
+  requests.filter(
+    (request) => request.url === "/api/apps/home/launch" && request.body?.target === "wallet",
+  ).length === walletLaunchesBeforeDeniedPeopleAction,
+  "People gained unrelated Home open-target authority",
+  requests,
+);
 
 function announceProvider(rdns, uuid, provider) {
   dispatchWindowEvent({

@@ -184,6 +184,9 @@ function listMarkdownFiles(dir = repoRootPath) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -205,6 +208,9 @@ function listTextFiles(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -414,6 +420,9 @@ function listFilesRecursive(dir) {
   for (const entry of entries) {
     if (
       entry.name === ".git" ||
+      entry.name === ".superpowers" ||
+      entry.name === "superpowers" ||
+      entry.name === ".claude" ||
       entry.name === "target" ||
       entry.name === "node_modules"
     ) {
@@ -1195,6 +1204,7 @@ const peopleCapsule = read("capsules/people/capsule.json");
 const peopleIndex = read("capsules/people/browser/index.html");
 const peopleScript = read("capsules/people/browser/people.js");
 const peopleStyle = read("capsules/people/browser/style.css");
+const peopleDiscoverySmoke = read("scripts/people-discovery-smoke.mjs");
 const debugGuide = read("DEBUG.md");
 const servicesIndex = read("capsules/services/browser/index.html");
 const servicesScript = read("capsules/services/browser/services.js");
@@ -1687,7 +1697,7 @@ const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-p
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
-const homeGuiAssetVersion = "home-20260805b";
+const homeGuiAssetVersion = "home-20260812a";
 const homeShellHostAssetVersion = "home-20260802a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
@@ -1704,7 +1714,7 @@ for (const [file, source] of [
   );
 }
 assert(
-  homeShellRegressionSmoke.includes(`const moduleVersion = "${homeAssetVersion}";`),
+  homeShellRegressionSmoke.includes(`const moduleVersion = "${homeGuiAssetVersion}";`),
   "home-shell-regression-smoke.mjs must load the same Home GUI module graph as production",
 );
 assertUsersSelfReferencesAreApproved();
@@ -2061,7 +2071,7 @@ assert(
 );
 assert(
   !shellIndex.includes(`/apps/home-gui/style.css?v=${homeAssetVersion}`) &&
-    homeGuiIndex.includes(`./style.css?v=${homeAssetVersion}`) &&
+    homeGuiIndex.includes(`./style.css?v=${homeGuiAssetVersion}`) &&
     homeGuiIndex.includes(`./home-gui-shell.js?v=${homeGuiAssetVersion}`) &&
     homeGuiShell.includes(`./home-gui.js?v=${homeGuiAssetVersion}`),
   "Home GUI must own its document, stylesheet, and entry module on its isolated capsule origin",
@@ -2108,13 +2118,13 @@ assert(
   "Home home-shell-host.js must not statically import the GUI window manager",
 );
 assert(
-  homeGuiJs.includes(`./shell-core.js?v=${homeAssetVersion}`) &&
+  homeGuiJs.includes(`./shell-core.js?v=${homeGuiAssetVersion}`) &&
     homeGuiJs.includes(`./shell-surface.js?v=${homeGuiAssetVersion}`) &&
     homeGuiJs.includes(`./shell-windows.js?v=${homeGuiAssetVersion}`),
   "Home home-gui facade must import the current GUI surface/window module instances",
 );
 assert(
-  shellSurface.includes(`./shell-core.js?v=${homeAssetVersion}`),
+  shellSurface.includes(`./shell-core.js?v=${homeGuiAssetVersion}`),
   "Home shell-surface must import the home-gui-owned shell-core module instance",
 );
 assert(
@@ -2443,6 +2453,7 @@ assert(
     peopleStyle.includes(".people-sidebar-icon-discovery") &&
     peopleStyle.includes(".discovery-header") &&
     !peopleStyle.includes(".online-badge") &&
+    peopleDiscoverySmoke.includes("people-discovery-smoke: PASS") &&
     peopleCapsule.includes('"id": "presence.read"') &&
     !shellWindows.includes("renderPeopleWindowBody") &&
     !shellWindows.includes("/api/apps/people/") &&
@@ -2766,22 +2777,34 @@ assert(
     gatewayApi,
     "pub(super) fn apply_profile_attribution_to_room_poll",
     "Room attribution projection",
-  ).includes("String::new()") &&
+  ).includes("object.sender_profile_verified != Some(true)") &&
+    !sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_room_poll",
+      "Room attribution projection",
+    ).includes("String::new()") &&
     sourceBlock(
+      gatewayApi,
+      "pub(super) fn apply_profile_attribution_to_participants",
+      "Participant attribution projection",
+    ).includes("participant.profile_verified != Some(true)") &&
+    !sourceBlock(
       gatewayApi,
       "pub(super) fn apply_profile_attribution_to_participants",
       "Participant attribution projection",
     ).includes("String::new()") &&
     !gatewayApi.includes("fn home_people_fallback_display_name") &&
-    !gatewayApi.includes("Conversation member ") &&
-    gatewayApi.includes("HOME_PEOPLE_UNVERIFIED_MEMBER_NAME"),
-  "A verified device with no signed Profile head stays visibly unverified: no invented, placeholder, or device-hash names in normal UI",
+    !gatewayApi.includes("Conversation member "),
+  "Configured shared Chat name refresh never upgrades authority: gateway renames only rows already verified by room_service",
 );
 assert(
-  chatRoomUi.includes("const UNVERIFIED_MEMBER_NAME") &&
-    chatRoomUi.includes("sender_profile_verified") &&
-    chatRoomUi.includes("fn participant_shown_name"),
-  "Chat renders the explicit unverified marker for verified devices without signed Profile heads",
+  chatRoomUi.includes("filter_configured_shared_poll") &&
+    chatRoomUi.includes("configured_shared_object_visible") &&
+    chatRoomUi.includes("configured_shared_participant_visible") &&
+    !chatRoomUi.includes("const UNVERIFIED_MEMBER_NAME") &&
+    !chatRoomUi.includes("participant-name-unverified") &&
+    !chatRoomUi.includes("sender-unverified"),
+  "Configured shared Chat omits false/None rows defensively instead of rendering placeholder people",
 );
 assert(
   authGatewayApi.includes('schema: "elastos.auth.passkey.verify/v2"') &&
@@ -7354,9 +7377,12 @@ assert(
   "Home must expose an explicit sign-out path that clears the browser session through Runtime",
 );
 assert(
-  shellStyle.includes(".sign-out-btn") &&
-    shellStyle.includes('background-image: url("data:image/svg+xml'),
-  "Home sign-out toolbar icon must use a complete SVG glyph",
+  homeGuiTemplateHtml.includes('id="toolbar-sign-out"') &&
+    homeGuiTemplateHtml.includes(
+      "<path d=\"M6.5 3.5H4.2A1.7 1.7 0 0 0 2.5 5.2v5.6A1.7 1.7 0 0 0 4.2 12.5h2.3M7 8h6.5M11.2 5.5 13.5 8l-2.3 2.5\"",
+    ) &&
+    !shellStyle.includes('.sign-out-btn .toolbar-identity-item-icon {\n  background-image: url("data:image/svg+xml'),
+  "Home sign-out toolbar icon must use the inline SVG glyph without a duplicate CSS background image",
 );
 assert(
   !shellStyle.includes(".sign-out-btn::before") &&
