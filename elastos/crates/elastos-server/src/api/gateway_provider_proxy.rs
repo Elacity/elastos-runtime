@@ -1357,6 +1357,20 @@ pub(super) async fn gateway_provider_proxy(
                     .into_response()
             }
         },
+        // Model provider: offers/runs contract for inference (chat, video).
+        // Home shells only; upstreams live in operator config, never in requests.
+        "model" => match op.as_str() {
+            "offers_list" | "runs_create" | "runs_get" | "runs_events" | "runs_cancel" | "ping" => {
+                &[HOME_GUI_SHELL_ID]
+            }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "Gateway provider operation not found",
+                )
+                    .into_response()
+            }
+        },
         _ => return (StatusCode::NOT_FOUND, "Gateway provider not found").into_response(),
     };
     let context =

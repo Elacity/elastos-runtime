@@ -479,6 +479,28 @@ async fn setup_server_infrastructure_impl(
             }
         }
 
+        if let Some(path) = crate::find_installed_provider_binary("model-provider") {
+            let model_config = provider::BridgeProviderConfig {
+                base_path: data_dir.to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            match provider::ProviderBridge::spawn(&path, model_config).await {
+                Ok(bridge) => {
+                    let provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "model"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("model", provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://model sub-provider: {}", e);
+                    }
+                    tracing::info!("model-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn model-provider: {}", e),
+            }
+        }
+
         if let Some(availability_config) = availability_provider_config_from_env() {
             if let Some(path) = crate::find_installed_provider_binary("availability-provider") {
                 if let Err(e) = verify_provider_binary("availability-provider", &path) {
