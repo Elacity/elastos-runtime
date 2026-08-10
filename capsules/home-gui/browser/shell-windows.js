@@ -20,7 +20,7 @@ import {
   ignoreRepeatedAction,
   pushUiPreferencesToFrameWindow,
   targetById,
-} from "./shell-core.js?v=home-20260810mr";
+} from "./shell-core.js?v=home-20260810ps";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,8 +30,8 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260810mr";
-import { playUiSound } from "./shell-sounds.js?v=home-20260810mr";
+} from "./shell-window-geometry.js?v=home-20260810ps";
+import { playUiSound } from "./shell-sounds.js?v=home-20260810ps";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -50,8 +50,8 @@ import {
   exitFullscreenStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260810mr";
-import { TIP as SHELL_TIP } from "./agent-tip.js?v=home-20260810mr";
+} from "./shell-stages.js?v=home-20260810ps";
+import { TIP as SHELL_TIP } from "./agent-tip.js?v=home-20260810ps";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -2009,6 +2009,15 @@ export async function restoreShellSession() {
     }
   } else {
     renderWindowTaskbar();
+  }
+
+  /* Hydrate the agent workspace whenever restoreAgentSurface didn't run this boot
+     (agent stage not active / nothing restored). Without this, the harness's empty
+     in-memory sessions would overwrite the durable chat history on the next persist. */
+  try {
+    const harness = await import(`./agent-harness.js?v=${SHELL_TIP}`);
+    harness.applyAgentWorkspaceSnapshot?.(storedSession?.agent);
+  } catch (_error) {
   }
 
   persistBrowserSession();

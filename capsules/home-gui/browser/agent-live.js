@@ -3,9 +3,9 @@
    readiness = offers_list (an offer is advertised only when its backend is
    configured — never advertise what we can't serve). Chat carries no tool,
    grant, or capsule authority (Principle 16).
-   Tip: home-20260810mr */
+   Tip: home-20260810ps */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260810mr";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260810ps";
 
 /** Re-probe at most this often unless forced (online event, harness open). */
 const PROBE_TTL_MS = 15000;
@@ -18,7 +18,7 @@ export const DEFAULT_LIVE_SYSTEM_PROMPT =
   "You have no tools and no capsule authority in this session; answer from " +
   "knowledge only, and say so plainly when a task would need a tool or grant.";
 
-export const DEFAULT_LIVE_MAX_TOKENS = 2048;
+export const DEFAULT_LIVE_MAX_TOKENS = 8192;
 export const DEFAULT_LIVE_TEMPERATURE = 0.7;
 export const MAX_LIVE_SYSTEM_PROMPT_CHARS = 8_000;
 export const MAX_AGENT_NOTES_CHARS = 4_000;
@@ -342,6 +342,15 @@ export function abortLiveChatStream() {
     /* fire-and-forget: best-effort cancel of the contract run */
     modelRunCall("runs_cancel", { run_id: runId }).catch(() => {});
   }
+}
+
+/* Detach the UI from the in-flight run WITHOUT cancelling it. The model contract
+   runs server-side (runs_events is a client cursor-poll, not a held connection),
+   so the run continues; the UI simply stops consuming its events. Navigation-away
+   uses this so a long generation isn't killed; explicit Stop still uses
+   abortLiveChatStream (runs_cancel). */
+export function detachLiveChatStream() {
+  liveContractRunId = null;
 }
 
 /* ---- Chat via the model contract (runs.*) ---- */

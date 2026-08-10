@@ -12,11 +12,11 @@ import {
   snapAppsShelfFace,
   bindShelfAttachHost,
   addComposerAttachment,
-} from "./agent-shelf.js?v=home-20260810mr";
+} from "./agent-shelf.js?v=home-20260810ps";
 import {
   shellState,
   desktopObjects,
-} from "./shell-core.js?v=home-20260810mr";
+} from "./shell-core.js?v=home-20260810ps";
 import {
   enableHarnessMenubarReveal,
   clearHarnessMenubarReveal,
@@ -26,8 +26,8 @@ import {
   isAgentSpace,
   setActiveStage,
   syncSpacePager,
-} from "./shell-stages.js?v=home-20260810mr";
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260810mr";
+} from "./shell-stages.js?v=home-20260810ps";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260810ps";
 import {
   resetMockCapabilities,
   getSelectedModel,
@@ -45,18 +45,18 @@ import {
   requestModelGet,
   removeProject,
   getLastStreamFailure,
-} from "./mock-agent-provider.js?v=home-20260810mr";
+} from "./mock-agent-provider.js?v=home-20260810ps";
 import {
   bindAgentWorkspaceSnapshot,
-} from "./shell-windows.js?v=home-20260810mr";
-import { TIP } from "./agent-tip.js?v=home-20260810mr";
-import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260810mr";
+} from "./shell-windows.js?v=home-20260810ps";
+import { TIP } from "./agent-tip.js?v=home-20260810ps";
+import { registerAgentHarnessApi } from "./agent-send.js?v=home-20260810ps";
 import {
   bindAgentWorkspaceStore,
   getAgentWorkspaceSnapshot,
   applyAgentWorkspaceSnapshot,
   persistAgentWorkspaceSoon,
-} from "./agent-workspace.js?v=home-20260810mr";
+} from "./agent-workspace.js?v=home-20260810ps";
 import {
   bindAgentConfigure,
   harnessPageOpen,
@@ -69,7 +69,7 @@ import {
   setWorkbenchTab,
   syncWorkbenchPanels,
   syncWorkbenchOpenUi,
-} from "./agent-configure.js?v=home-20260810mr";
+} from "./agent-configure.js?v=home-20260810ps";
 import {
   bindAgentGrants,
   syncTruthStrip,
@@ -80,7 +80,7 @@ import {
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
   getReadyLibraryReadGrant,
-} from "./agent-grants.js?v=home-20260810mr";
+} from "./agent-grants.js?v=home-20260810ps";
 import {
   bindAgentStream,
   clearStreamTimer,
@@ -109,12 +109,12 @@ import {
   updateJumpToLatestVisibility,
   ensureJumpToLatest,
   setStreamStatus,
-} from "./agent-stream.js?v=home-20260810mr";
+} from "./agent-stream.js?v=home-20260810ps";
 import {
   getLiveInferenceState,
   probeLiveInference,
   extractAgentLibraryRead,
-} from "./agent-live.js?v=home-20260810mr";
+} from "./agent-live.js?v=home-20260810ps";
 import {
   bindAgentSessions,
   relativeTime,
@@ -142,7 +142,7 @@ import {
   closeSessionActions,
   openSessionActions,
   runSessionAction,
-} from "./agent-sessions.js?v=home-20260810mr";
+} from "./agent-sessions.js?v=home-20260810ps";
 export { getAgentWorkspaceSnapshot, applyAgentWorkspaceSnapshot };
 
 let workbenchTab = "outputs";
@@ -244,7 +244,7 @@ let toolMode = "read";
 let systemPrompt = "";
 /** Wave 7 — sticky On-Home notes (host-persisted; appended to Live system). */
 let agentNotes = "";
-let maxTokens = 2048;
+let maxTokens = 8192;
 let temperature = 0.7;
 
 
@@ -275,7 +275,7 @@ bindAgentWorkspaceStore({
   },
   getMaxTokens: () => maxTokens,
   setMaxTokens: (v) => {
-    maxTokens = Number(v) || 2048;
+    maxTokens = Number(v) || 8192;
   },
   getTemperature: () => temperature,
   setTemperature: (v) => {
@@ -300,7 +300,18 @@ bindAgentWorkspaceStore({
   setWorkspaceHydrated: (v) => {
     workspaceHydrated = v;
   },
+  getWorkspaceHydrated: () => workspaceHydrated,
 });
+
+/* The workspace may have no saved blob to restore (restoreAgentSurface only runs
+   when the Agent stage is active), which would leave workspaceHydrated=false and
+   block every persist. Mark hydrated at bind so saving works from a clean boot;
+   applyAgentWorkspaceSnapshot (when a saved blob exists) still overwrites this. */
+export function ensureAgentWorkspaceHydrated() {
+  if (!workspaceHydrated) {
+    workspaceHydrated = true;
+  }
+}
 
 bindAgentConfigure(
   {
@@ -350,7 +361,7 @@ bindAgentConfigure(
       return maxTokens;
     },
     set maxTokens(v) {
-      maxTokens = Number(v) || 2048;
+      maxTokens = Number(v) || 8192;
     },
     get temperature() {
       return temperature;
@@ -1507,7 +1518,9 @@ export function hideAgentHarness({ restoreShelfApps = true, syncStage = true } =
     return;
   }
   const motionGen = (harnessMotionGen += 1);
-  stopMockStream({ keepPartial: true });
+  /* Navigation detach: don't cancel a live run just because the user left the
+     Agent Space — the contract run continues server-side; we only stop consuming it. */
+  stopMockStream({ keepPartial: true, cancelRun: false });
   stopParticles();
   active = false;
   closeHarnessDrawer();
@@ -1681,6 +1694,7 @@ export function bindAgentHarness() {
     stopAgentHarnessStream,
   });
   bindAgentWorkspaceSnapshot(getAgentWorkspaceSnapshot);
+  ensureAgentWorkspaceHydrated();
   window.addEventListener("online", () => {
     syncAgentInferenceStatus();
     void probeLiveInference({ force: true }).then(() => {

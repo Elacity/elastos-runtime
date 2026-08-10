@@ -5988,6 +5988,61 @@ async fn test_home_browser_state_drops_unknown_targets() {
     assert_eq!(json["recent_targets"], json!(["people", "system"]));
 }
 
+// Regression: a windowless session carrying agent chats / stage state must survive
+// the save. Before, sanitize dropped any session with zero known-target windows —
+// wiping the agent workspace (chat history) on every save made from the Agent stage.
+#[tokio::test]
+async fn test_home_browser_state_preserves_windowless_agent_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let app = gateway_router(test_state(dir.path()));
+
+    let agent_blob = json!({
+        "v": 1,
+        "activeSessionId": "s1",
+        "maxTokens": 8192,
+        "sessions": [
+            { "id": "s1", "title": "chat one", "messages": [ { "role": "user", "text": "hi" } ] }
+        ]
+    });
+    let (status, updated) = home_test_post_json(
+        &app,
+        "/api/apps/home/state",
+        &authority.home_token,
+        "http://localhost:61180",
+        json!({
+            "session": {
+                "browser_context_id": "browser:test",
+                "windows": [],
+                "active_stage": "agent",
+                "agent": agent_blob
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Session must be preserved (not dropped) even though it has no windows.
+    assert_eq!(updated["session"]["active_stage"], json!("agent"));
+    assert_eq!(
+        updated["session"]["agent"]["sessions"].as_array().unwrap().len(),
+        1
+    );
+
+    // And it must round-trip through a reload.
+    let (status, loaded) = home_test_get_json(
+        &app,
+        "/api/apps/home/state",
+        &authority.home_token,
+        "http://localhost:61180",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        loaded["session"]["agent"]["sessions"][0]["title"],
+        json!("chat one")
+    );
+}
+
 #[tokio::test]
 async fn test_home_browser_state_recovers_from_malformed_saved_state() {
     let dir = tempfile::tempdir().unwrap();

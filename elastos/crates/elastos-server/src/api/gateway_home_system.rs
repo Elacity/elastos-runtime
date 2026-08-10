@@ -4971,16 +4971,28 @@ fn sanitize_home_session_targets(
     known_targets: &BTreeSet<String>,
 ) -> Option<serde_json::Value> {
     let session_object = session.as_object_mut()?;
-    let windows = session_object
+    if let Some(windows) = session_object
         .get_mut("windows")
-        .and_then(|value| value.as_array_mut())?;
-    windows.retain(|window| {
-        window
-            .get("target")
-            .and_then(|target| target.as_str())
-            .is_some_and(|target| known_targets.contains(target))
-    });
-    if windows.is_empty() {
+        .and_then(|value| value.as_array_mut())
+    {
+        windows.retain(|window| {
+            window
+                .get("target")
+                .and_then(|target| target.as_str())
+                .is_some_and(|target| known_targets.contains(target))
+        });
+    }
+    // Only drop the session when it carries nothing worth keeping. A session with
+    // zero open app windows but agent chats / desktops / space state is still the
+    // user's durable workspace — dropping it wiped chat history on every save.
+    let has_state = ["agent", "desktops", "space_order", "active_stage"]
+        .iter()
+        .any(|key| session_object.get(*key).is_some_and(|v| !v.is_null()));
+    let has_windows = session_object
+        .get("windows")
+        .and_then(|value| value.as_array())
+        .is_some_and(|windows| !windows.is_empty());
+    if !has_state && !has_windows {
         return None;
     }
     Some(session)

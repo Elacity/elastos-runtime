@@ -1,8 +1,8 @@
 /* Home Studio — Generate + Storyboard + Character via CREATIVE_* jobs.
-   Tip: home-20260810mr — P2 Character refs + library delete */
+   Tip: home-20260810ps — P2 Character refs + library delete */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260810mr";
-import { modelRunCall as modelCall } from "./agent-live.js?v=home-20260810mr";
+import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260810ps";
+import { modelRunCall as modelCall } from "./agent-live.js?v=home-20260810ps";
 
 const DURATIONS = [2, 5, 10, 15, 30];
 const SCALES = [1, 2, 4];

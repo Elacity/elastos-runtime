@@ -2,11 +2,11 @@ import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20260810mr";
+} from "./shell-core.js?v=home-20260810ps";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260810mr";
+} from "./home-gui-authority.js?v=home-20260810ps";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -51,7 +51,7 @@ const {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
-} = await import("./home-gui.js?v=home-20260810mr");
+} = await import("./home-gui.js?v=home-20260810ps");
 
 function requestId() {
   if (window.crypto?.randomUUID) {

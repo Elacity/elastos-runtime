@@ -24,12 +24,12 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260810mr";
+} from "./shell-core.js?v=home-20260810ps";
 import {
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260810mr";
+} from "./shell-chrome.js?v=home-20260810ps";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -57,9 +57,9 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260810mr";
-import { bindAgentShelf } from "./agent-shelf.js?v=home-20260810mr";
-import { bindAgentHarness } from "./agent-harness.js?v=home-20260810mr";
+} from "./shell-surface.js?v=home-20260810ps";
+import { bindAgentShelf } from "./agent-shelf.js?v=home-20260810ps";
+import { bindAgentHarness } from "./agent-harness.js?v=home-20260810ps";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -72,48 +72,48 @@ import {
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260810mr";
+} from "./shell-windows.js?v=home-20260810ps";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260810mr";
+} from "./shell-keyboard.js?v=home-20260810ps";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260810mr";
+} from "./shell-spotlight.js?v=home-20260810ps";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260810mr";
+} from "./shell-notifications.js?v=home-20260810ps";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260810mr";
+} from "./shell-menubar.js?v=home-20260810ps";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260810mr";
-import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260810mr";
+} from "./shell-quicklook.js?v=home-20260810ps";
+import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260810ps";
 import {
   bindMobilePlaneSwipe,
   bindSpaceEdgePeek,
   bindSpacePager,
   toggleActiveFullscreenStage,
-} from "./shell-stages.js?v=home-20260810mr";
-import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260810mr";
-import { setFocusModeEnabled } from "./shell-core.js?v=home-20260810mr";
+} from "./shell-stages.js?v=home-20260810ps";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260810ps";
+import { setFocusModeEnabled } from "./shell-core.js?v=home-20260810ps";
 import {
   bindControlCentre,
   hideControlCentre,
   syncControlCentre,
-} from "./shell-control-centre.js?v=home-20260810mr";
+} from "./shell-control-centre.js?v=home-20260810ps";
 import {
   bindWalletRail,
   retireWalletRail,
@@ -122,7 +122,7 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260810mr";
+} from "./shell-wallet-rail.js?v=home-20260810ps";
 import {
   bindInboxRail,
   retireInboxRail,
@@ -131,7 +131,7 @@ import {
   inboxRailFrame,
   inboxRailOpen,
   inboxRailSessionMounted,
-} from "./shell-inbox-rail.js?v=home-20260810mr";
+} from "./shell-inbox-rail.js?v=home-20260810ps";
 import {
   bindConnectorSheet,
   connectorSheetFrame,
@@ -140,7 +140,7 @@ import {
   noteConnectorSheetSummaryRefresh,
   retireConnectorSheet,
   showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260810mr";
+} from "./shell-connector-sheet.js?v=home-20260810ps";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";

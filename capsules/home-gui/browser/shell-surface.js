@@ -50,7 +50,7 @@ import {
   mutateDesktopObject,
   formatBadgeCount,
   focusModeEnabled,
-} from "./shell-core.js?v=home-20260810mr";
+} from "./shell-core.js?v=home-20260810ps";
 import {
   browserWindowEntries,
   sortWindowEntriesByZOrder,
@@ -64,20 +64,20 @@ import {
   hideAllTargetWindows,
   closeAllTargetWindows,
   focusWindow,
-} from "./shell-windows.js?v=home-20260810mr";
-import { playUiSound } from "./shell-sounds.js?v=home-20260810mr";
+} from "./shell-windows.js?v=home-20260810ps";
+import { playUiSound } from "./shell-sounds.js?v=home-20260810ps";
 import {
   closeOtherShellPopovers,
   registerShellPopover,
   setOverlayOpen,
-} from "./shell-popovers.js?v=home-20260810mr";
+} from "./shell-popovers.js?v=home-20260810ps";
 import {
   dismissWithMotion,
   prepareSurfaceOpen,
-} from "./shell-motion.js?v=home-20260810mr";
-import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260810mr";
-import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260810mr";
-import { TIP as SHELF_TIP } from "./agent-tip.js?v=home-20260810mr";
+} from "./shell-motion.js?v=home-20260810ps";
+import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260810ps";
+import { closeExpose, isExposeOpen } from "./shell-expose.js?v=home-20260810ps";
+import { TIP as SHELF_TIP } from "./agent-tip.js?v=home-20260810ps";
 
 const DESKTOP_LONG_PRESS_MS = 520;
 const DESKTOP_RENAME_BLUR_GUARD_MS = 350;

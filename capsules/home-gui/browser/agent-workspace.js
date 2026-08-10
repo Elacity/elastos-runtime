@@ -8,14 +8,14 @@ import {
   setReasoningVisible,
   getUsageLedger,
   applyUsageLedger,
-} from "./mock-agent-provider.js?v=home-20260810mr";
+} from "./mock-agent-provider.js?v=home-20260810ps";
 import {
   clampLiveMaxTokens,
   clampLiveTemperature,
   normalizeLiveSystemPrompt,
   normalizeAgentNotes,
-} from "./agent-live.js?v=home-20260810mr";
-import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260810mr";
+} from "./agent-live.js?v=home-20260810ps";
+import { scheduleAgentWorkspacePersist } from "./shell-windows.js?v=home-20260810ps";
 
 export const AGENT_WORKSPACE_V = 1;
 const MAX_PERSISTED_SESSIONS = 24;
@@ -107,6 +107,12 @@ export function getAgentWorkspaceSnapshot() {
   if (!store) {
     return null;
   }
+  /* Never snapshot before the saved workspace has been applied: a pre-hydration
+     persist would otherwise overwrite durable chat sessions with an empty list
+     (data loss on refresh). */
+  if (store.getWorkspaceHydrated?.() === false) {
+    return null;
+  }
   const sessionMode = store.getSessionMode();
   const toolMode = store.getToolMode();
   return {
@@ -132,10 +138,15 @@ export function getAgentWorkspaceSnapshot() {
 }
 
 export function applyAgentWorkspaceSnapshot(raw) {
-  if (!store || !raw || typeof raw !== "object" || Number(raw.v) !== AGENT_WORKSPACE_V) {
+  if (!store) {
     return false;
   }
+  /* Mark hydrated even when there's no valid saved blob (fresh install): otherwise
+     the hydration guard would stay on forever and the workspace would never persist. */
   store.setWorkspaceHydrated(true);
+  if (!raw || typeof raw !== "object" || Number(raw.v) !== AGENT_WORKSPACE_V) {
+    return false;
+  }
   if (Array.isArray(raw.projects)) {
     replaceProjects(raw.projects);
   }

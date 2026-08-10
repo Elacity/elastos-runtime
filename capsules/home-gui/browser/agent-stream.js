@@ -14,22 +14,23 @@ import {
   clearLastStreamFailure,
   splitThinkTaggedContent,
   getSelectedModel,
-} from "./mock-agent-provider.js?v=home-20260810mr";
+} from "./mock-agent-provider.js?v=home-20260810ps";
 import {
   getLiveInferenceState,
   probeLiveInference,
   buildLiveMessages,
   streamChatViaContract,
   abortLiveChatStream,
-} from "./agent-live.js?v=home-20260810mr";
-import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260810mr";
+  detachLiveChatStream,
+} from "./agent-live.js?v=home-20260810ps";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260810ps";
 import {
   maybeOfferToolAfterReply,
   syncTruthStrip,
   appendGrantCard,
   hydrateCapabilitiesFromSession,
-} from "./agent-grants.js?v=home-20260810mr";
-import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260810mr";
+} from "./agent-grants.js?v=home-20260810ps";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260810ps";
 /* Vendored, self-hosted (no CDN — Principle: capsules are self-contained).
    Static asset: stable URL, immutable, cached forever. */
 import { renderToString as renderMathToString } from "./vendor/katex/katex.mjs";
@@ -983,8 +984,14 @@ export function regenerateLastAgentTurn() {
   return true;
 }
 
-export function stopMockStream({ keepPartial = true, drainQueue = false } = {}) {
-  abortLiveChatStream();
+export function stopMockStream({ keepPartial = true, drainQueue = false, cancelRun = true } = {}) {
+  /* cancelRun=false = navigation detach: leave the server-side run alive, just stop
+     consuming its events. Explicit Stop (default) still fires runs_cancel. */
+  if (cancelRun) {
+    abortLiveChatStream();
+  } else {
+    detachLiveChatStream();
+  }
   clearStreamTimer();
   ctx.streamGeneration += 1;
   ctx.turnBusy = false;

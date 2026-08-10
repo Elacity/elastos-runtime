@@ -7,20 +7,20 @@
 
    Send opens Agent Harness (Home drops, dock stays) — see agent-harness.js. */
 
-import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260810mr";
-import { TIP } from "./agent-tip.js?v=home-20260810mr";
+import { registerEscapeHandler } from "./shell-popovers.js?v=home-20260810ps";
+import { TIP } from "./agent-tip.js?v=home-20260810ps";
 import {
   agentHarnessActive,
   hideAgentHarness,
   sendToAgentHarness,
   showAgentHarness,
   stopAgentHarnessStream,
-} from "./agent-send.js?v=home-20260810mr";
-import { extractAgentLibraryRead } from "./agent-live.js?v=home-20260810mr";
+} from "./agent-send.js?v=home-20260810ps";
+import { extractAgentLibraryRead } from "./agent-live.js?v=home-20260810ps";
 import {
   formatLibraryKbContext,
   getReadyLibraryReadGrant,
-} from "./agent-grants.js?v=home-20260810mr";
+} from "./agent-grants.js?v=home-20260810ps";
 
 let bound = false;
 let morphGeneration = 0;

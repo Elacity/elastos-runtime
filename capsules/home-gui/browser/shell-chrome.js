@@ -1,7 +1,7 @@
 import {
   clockNode,
   toolbarIdentityMenuName,
-} from "./shell-core.js?v=home-20260810mr";
+} from "./shell-core.js?v=home-20260810ps";
 
 function identityDisplayName(summary) {
   const raw =
