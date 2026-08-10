@@ -1,0 +1,1448 @@
+/* Agent message stream + turn theatre.
+   Bound from agent-harness.js. Tip: home-20260804bb
+   Live: gateway SSE (/api/apps/home/agent/chat/stream) with AbortController
+   stop; mock remains the honest fallback when Live is down.
+   UI ≠ authority (Principle 16) — chat carries no tool or grant power.
+   Wave 1: edit/resubmit, per-msg delete, markdown, stream status, Stop persist. */
+
+import {
+  MOCK_REPLY,
+  getMockTurn,
+  noteMockTurnTokens,
+  noteLiveTurnUsage,
+  noteStreamFailure,
+  clearLastStreamFailure,
+  splitThinkTaggedContent,
+  getSelectedModel,
+} from "./mock-agent-provider.js?v=home-20260810mr";
+import {
+  getLiveInferenceState,
+  probeLiveInference,
+  buildLiveMessages,
+  streamChatViaContract,
+  abortLiveChatStream,
+} from "./agent-live.js?v=home-20260810mr";
+import { setAgentComposerProcessing } from "./agent-shelf.js?v=home-20260810mr";
+import {
+  maybeOfferToolAfterReply,
+  syncTruthStrip,
+  appendGrantCard,
+  hydrateCapabilitiesFromSession,
+} from "./agent-grants.js?v=home-20260810mr";
+import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260810mr";
+/* Vendored, self-hosted (no CDN — Principle: capsules are self-contained).
+   Static asset: stable URL, immutable, cached forever. */
+import { renderToString as renderMathToString } from "./vendor/katex/katex.mjs";
+
+/** @type {null | object} */
+let ctx = null;
+/** @type {null | Record<string, Function>} */
+let host = null;
+
+export function bindAgentStream(nextCtx, nextHost = {}) {
+  ctx = nextCtx;
+  host = nextHost;
+}
+
+export function clearStreamTimer() {
+  if (ctx.streamTimer) {
+    window.clearInterval(ctx.streamTimer);
+    window.cancelAnimationFrame(ctx.streamTimer);
+    ctx.streamTimer = 0;
+  }
+}
+
+export function titleFromPrompt(prompt) {
+  let cleaned = String(prompt || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[*_>#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) {
+    return "New chat";
+  }
+  const sentence = cleaned.split(/(?<=[.!?])\s+/)[0] || cleaned;
+  cleaned = sentence.length > 8 && sentence.length <= 64 ? sentence : cleaned;
+  return cleaned.length > 42 ? `${cleaned.slice(0, 41)}…` : cleaned;
+}
+
+export function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+/* TeX arriving from escapeHtml'd text has entities; KaTeX wants real chars. */
+function unescapeForMath(tex) {
+  return String(tex)
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&amp;", "&");
+}
+
+/* Typeset via vendored KaTeX; on any parse error degrade to the raw TeX in a
+   muted code pill — honest fallback, never broken HTML. */
+function renderMath(tex, displayMode) {
+  try {
+    return (
+      `<span class="agent-md-math${displayMode ? " agent-md-math-display" : ""}">` +
+      renderMathToString(unescapeForMath(tex), { displayMode, throwOnError: true }) +
+      `</span>`
+    );
+  } catch {
+    return `<code class="agent-md-math-raw">${escapeHtml(tex)}</code>`;
+  }
+}
+
+/** GFM-safe markdown subset — escape first, then format.
+ *  Tables, lists, links, headings, fences, inline code/bold/italic.
+ *  UI must never treat model HTML as authority (Principle 16).
+ *  `streaming: true` virtually closes an open fence so mid-reply code blocks
+ *  paint as code instead of raw ``` until the model finishes the fence. */
+export function renderMarkdown(text, { streaming = false } = {}) {
+  let source = String(text ?? "");
+  if (streaming) {
+    const fenceMarks = source.split("```").length - 1;
+    if (fenceMarks % 2 === 1) {
+      source += "\n```";
+    }
+  }
+  const parts = source.split(/```([\s\S]*?)```/g);
+  let html = "";
+  for (let i = 0; i < parts.length; i += 1) {
+    if (i % 2 === 1) {
+      const fence = parts[i];
+      const nl = fence.indexOf("\n");
+      const lang = nl === -1 ? "" : fence.slice(0, nl).trim();
+      const code = nl === -1 ? fence : fence.slice(nl + 1);
+      const safe = escapeHtml(code.replace(/\n$/, ""));
+      html +=
+        `<div class="agent-md-code">` +
+        `<div class="agent-md-code-head"><span>${escapeHtml(lang || "code")}</span>` +
+        `<button type="button" class="agent-md-copy" data-copy="1">Copy</button></div>` +
+        `<pre><code>${safe}</code></pre></div>`;
+      continue;
+    }
+    html += renderMarkdownBlocks(parts[i]);
+  }
+  return html;
+}
+
+/** Keep raw markdown on the node so Stop/Copy don't lose markers after HTML paint. */
+function paintAgentMessageBody(body, text, { streaming = false } = {}) {
+  if (!body) {
+    return;
+  }
+  const raw = String(text ?? "");
+  body.dataset.mdSource = raw;
+  body.innerHTML = renderMarkdown(raw, { streaming });
+}
+
+/** Thinking uses the same markdown subset as replies (lists/bold/fences). */
+function paintThinkingBody(body, text, { streaming = false } = {}) {
+  if (!body) {
+    return;
+  }
+  const raw = String(text ?? "");
+  body.dataset.mdSource = raw;
+  body.innerHTML = renderMarkdown(raw, { streaming });
+}
+
+function thinkingBodyRaw(body) {
+  return String(body?.dataset?.mdSource || body?.textContent || "");
+}
+
+function syncThinkingHeader(details, { streaming = false } = {}) {
+  if (!details) {
+    return;
+  }
+  const label = details.querySelector(".agent-thinking-label");
+  if (!streaming || !label || details.classList.contains("is-complete")) {
+    return;
+  }
+  /* Show latest activity as the header while streaming: prefer markdown headers
+     (##, ###), else bold lines (**Analyzing…**). Convert to verb form. */
+  const raw = String(details.querySelector(".agent-thinking-body")?.dataset?.mdSource || "");
+  if (!raw) {
+    label.textContent = "Thinking";
+    return;
+  }
+  let activity = "";
+  const lines = raw.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim();
+    const md = line.match(/^#{1,6}\s+(.+)$/);
+    if (md) {
+      activity = md[1];
+      break;
+    }
+    const bold = line.match(/^\*\*(.+?)\*\*/);
+    if (bold) {
+      activity = bold[1];
+      break;
+    }
+  }
+  if (!activity) {
+    activity = "Thinking";
+  }
+  /* Verbify: “Analyze” → “Analyzing”, “Draft” → “Drafting”, etc. */
+  activity = activity.replace(/^([A-Z][a-z]+)\s/, (m, verb) => {
+    const lower = verb.toLowerCase();
+    const map = {
+      analyze: "Analyzing", draft: "Drafting", translate: "Translating",
+      deconstruct: "Deconstructing", construct: "Constructing", build: "Building",
+      create: "Creating", generate: "Generating", write: "Writing",
+      structure: "Structuring", plan: "Planning", review: "Reviewing",
+      check: "Checking", verify: "Verifying", validate: "Validating",
+      process: "Processing", parse: "Parsing", read: "Reading",
+      think: "Thinking", consider: "Considering", evaluate: "Evaluating",
+      summarize: "Summarizing", outline: "Outlining", sketch: "Sketching",
+      design: "Designing", implement: "Implementing", fix: "Fixing",
+      debug: "Debugging", test: "Testing", refine: "Refining",
+      polish: "Polishing", finalize: "Finalizing", complete: "Completing",
+    };
+    return (map[lower] || verb + "ing") + " ";
+  });
+  /* Trim to ~48 chars so it stays one line. */
+  const max = 48;
+  const short = activity.length > max ? `${activity.slice(0, max - 1).trim()}…` : activity;
+  label.textContent = short;
+}
+
+function paintTurnUsageMeta(row, turn) {
+  if (!row || !turn) {
+    return;
+  }
+  let meta = row.querySelector(".agent-msg-meta");
+  if (!meta) {
+    meta = document.createElement("div");
+    meta.className = "agent-msg-meta";
+    row.append(meta);
+  }
+  const latency = turn.latencyMs
+    ? turn.latencyMs >= 1000
+      ? `${(turn.latencyMs / 1000).toFixed(1)}s`
+      : `${turn.latencyMs}ms`
+    : "";
+  const tokens = turn.tokens ? `${turn.tokens} tok` : "";
+  const source =
+    turn.source === "estimated" || turn.omitted
+      ? "est."
+      : turn.source === "live"
+        ? "live"
+        : "preview";
+  meta.textContent = [latency, tokens, source].filter(Boolean).join(" · ");
+}
+
+function formatInlineMarkdown(escaped) {
+  return escaped
+    .replaceAll(/\\\((.+?)\\\)/g, (_, tex) => renderMath(tex, false))
+    .replaceAll(/\\\[(.+?)\\\]/g, (_, tex) => renderMath(tex, true))
+    .replaceAll(/\$\$([^$]+?)\$\$/g, (_, tex) => renderMath(tex, true))
+    /* Pandoc-style $...$: no space inside the delimiters, close not followed
+       by a digit — keeps "costs $5 and $10" as plain text. */
+    .replaceAll(/\$([^\s$](?:[^$\n]*[^\s$])?)\$(?!\d)/g, (_, tex) => renderMath(tex, false))
+    .replaceAll(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, href) => {
+      return `<a class="agent-md-a" href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    })
+    .replaceAll(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replaceAll(/\*([^*\n]+)\*/g, "<em>$1</em>")
+    .replaceAll(/`([^`]+)`/g, '<code class="agent-md-inline">$1</code>');
+}
+
+function renderMarkdownBlocks(raw) {
+  const lines = String(raw).replace(/\r\n/g, "\n").split("\n");
+  let html = "";
+  let i = 0;
+  const flushParagraph = (buf) => {
+    const trimmed = buf.join("\n").trim();
+    if (!trimmed) {
+      return;
+    }
+    html += `<p class="agent-md-p">${formatInlineMarkdown(escapeHtml(trimmed)).replaceAll("\n", "<br>")}</p>`;
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i += 1;
+      continue;
+    }
+    /* Table: header | --- | rows */
+    if (
+      line.includes("|") &&
+      i + 1 < lines.length &&
+      /^\s*\|?[\s:-|]+\|?\s*$/.test(lines[i + 1])
+    ) {
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|")) {
+        rows.push(lines[i]);
+        i += 1;
+        if (rows.length === 1 && i < lines.length && /^\s*\|?[\s:-|]+\|?\s*$/.test(lines[i])) {
+          i += 1; /* skip separator */
+        } else if (rows.length > 1 && (!lines[i] || !lines[i].includes("|"))) {
+          break;
+        }
+      }
+      if (rows.length) {
+        const cells = (row) =>
+          row
+            .trim()
+            .replace(/^\|/, "")
+            .replace(/\|$/, "")
+            .split("|")
+            .map((c) => formatInlineMarkdown(escapeHtml(c.trim())));
+        const head = cells(rows[0]);
+        html += `<div class="agent-md-table-wrap"><table class="agent-md-table"><thead><tr>${head
+          .map((c) => `<th>${c}</th>`)
+          .join("")}</tr></thead><tbody>`;
+        for (const row of rows.slice(1)) {
+          html += `<tr>${cells(row)
+            .map((c) => `<td>${c}</td>`)
+            .join("")}</tr>`;
+        }
+        html += `</tbody></table></div>`;
+        continue;
+      }
+    }
+    /* Display math block: \[ ... \] or $$ ... $$ starting at line start,
+       single- or multi-line. Trailing text after the closer, or no closer yet
+       (streaming), falls through to normal paragraph handling — the inline
+       pass still catches it, or the next delta completes the block. */
+    const mathOpen = /^\s*(\\\[|\$\$)/.exec(line);
+    if (mathOpen) {
+      const open = mathOpen[1];
+      const close = open === "\\[" ? "\\]" : "$$";
+      const trimmedLine = line.trim();
+      const first = trimmedLine.slice(trimmedLine.indexOf(open) + open.length);
+      let tex = null;
+      let next = i + 1;
+      const inlineAt = first.lastIndexOf(close);
+      if (inlineAt !== -1 && !first.slice(inlineAt + close.length).trim()) {
+        tex = first.slice(0, inlineAt);
+      } else if (inlineAt === -1) {
+        const buf = [first];
+        let j = i + 1;
+        while (j < lines.length) {
+          const at = lines[j].indexOf(close);
+          if (at !== -1) {
+            if (!lines[j].slice(at + close.length).trim()) {
+              buf.push(lines[j].slice(0, at));
+              tex = buf.join("\n");
+              next = j + 1;
+            }
+            break;
+          }
+          buf.push(lines[j]);
+          j += 1;
+        }
+      }
+      if (tex !== null) {
+        if (tex.trim()) {
+          html += `<div class="agent-md-math-block">${renderMath(tex, true)}</div>`;
+        }
+        i = next;
+        continue;
+      }
+    }
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line.trim());
+    if (heading) {
+      const level = heading[1].length;
+      html += `<h${level} class="agent-md-h agent-md-h${level}">${formatInlineMarkdown(
+        escapeHtml(heading[2]),
+      )}</h${level}>`;
+      i += 1;
+      continue;
+    }
+    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+      const ordered = /^\s*\d+\.\s+/.test(line);
+      const tag = ordered ? "ol" : "ul";
+      html += `<${tag} class="agent-md-list">`;
+      while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
+        const item = lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, "");
+        html += `<li>${formatInlineMarkdown(escapeHtml(item))}</li>`;
+        i += 1;
+      }
+      html += `</${tag}>`;
+      continue;
+    }
+    if (/^>\s?/.test(line.trim())) {
+      const quote = [];
+      while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
+        quote.push(lines[i].replace(/^\s*>\s?/, ""));
+        i += 1;
+      }
+      html += `<blockquote class="agent-md-quote">${formatInlineMarkdown(
+        escapeHtml(quote.join("\n")),
+      ).replaceAll("\n", "<br>")}</blockquote>`;
+      continue;
+    }
+    const para = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !lines[i].includes("|") &&
+      !/^(#{1,3})\s+/.test(lines[i].trim()) &&
+      !/^\s*([-*+]|\d+\.)\s+/.test(lines[i]) &&
+      !/^>\s?/.test(lines[i].trim()) &&
+      !/^\s*(\\\[|\$\$)/.test(lines[i])
+    ) {
+      para.push(lines[i]);
+      i += 1;
+    }
+    flushParagraph(para);
+  }
+  return html;
+}
+
+export function formatStreamError(err) {
+  const code = err?.code || "";
+  if (code === "aborted") {
+    return "Stopped";
+  }
+  if (code === "missing-home-launch-token") {
+    return "Live unavailable — Home launch token missing (unlock Home and reopen Agent)";
+  }
+  if (code === "upstream_http") {
+    const status = err?.status ? ` (${err.status})` : "";
+    return `Live upstream error${status} — check the model offer backend, then retry`;
+  }
+  if (code === "no_body") {
+    return "Live stream had no body — gateway or upstream misconfigured";
+  }
+  if (String(err?.name || "") === "TimeoutError" || /timeout/i.test(String(err?.message || ""))) {
+    return "Live timed out — retry, or check the offer backend";
+  }
+  return err?.message
+    ? `Live failed: ${String(err.message).slice(0, 160)}`
+    : "Live failed — falling back to labeled Preview mock";
+}
+
+export function setStreamStatus(label, { tone = "idle" } = {}) {
+  const el = document.querySelector("[data-agent-stream-status]");
+  if (!el) {
+    return;
+  }
+  const text = String(label || "").trim();
+  el.hidden = !text;
+  el.dataset.tone = tone;
+  el.textContent = text;
+}
+
+export function ensureJumpToLatest() {
+  let btn = document.querySelector("[data-agent-jump-latest]");
+  if (btn) {
+    return btn;
+  }
+  const viewport = host.streamViewportEl?.() || document.querySelector(".agent-harness-stream-viewport");
+  if (!viewport) {
+    return null;
+  }
+  btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "agent-jump-latest";
+  btn.dataset.agentJumpLatest = "1";
+  btn.hidden = true;
+  btn.textContent = "Jump to latest";
+  viewport.append(btn);
+  return btn;
+}
+
+export function updateJumpToLatestVisibility() {
+  const scroller = host.streamScrollEl?.();
+  const btn = ensureJumpToLatest();
+  if (!scroller || !btn) {
+    return;
+  }
+  const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+  btn.hidden = distance < 96 || !ctx?.turnBusy && distance < 160;
+  /* Show whenever user is meaningfully above bottom during/after turns. */
+  btn.hidden = distance < 120;
+}
+
+export function persistPartialAgentReply(text, thinking = "") {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  const answer = String(text || "").trim();
+  if (!session || !answer) {
+    return;
+  }
+  const last = session.messages[session.messages.length - 1];
+  if (last?.role === "agent" && last.text === answer) {
+    return;
+  }
+  session.messages.push(
+    thinking
+      ? { role: "agent", text: answer, thinking, partial: true }
+      : { role: "agent", text: answer, partial: true },
+  );
+  session.updatedAt = Date.now();
+  host.renderSessions?.();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+}
+
+export function setTitle(title) {
+  const el = host.titleEl();
+  if (el) {
+    el.textContent = title;
+  }
+}
+
+
+export function finishThinkingBlock(details, startedAt) {
+  if (!details) {
+    return;
+  }
+  details.classList.remove("is-streaming");
+  details.classList.add("is-complete");
+  const ms = Math.max(400, Date.now() - (startedAt || Date.now()));
+  const sec = (ms / 1000).toFixed(ms >= 10000 ? 0 : 1);
+  const label = details.querySelector(".agent-thinking-label");
+  if (label) {
+    label.textContent = `Thought for ${sec}s`;
+  }
+  /* Stay collapsed by default; if the user expanded mid-stream, fold after a beat. */
+  if (details.open && ctx.reasoningVisible) {
+    const collapse = () => {
+      if (details.isConnected && ctx.reasoningVisible) {
+        details.open = false;
+      }
+    };
+    if (host.prefersReducedMotion()) {
+      collapse();
+    } else {
+      window.setTimeout(collapse, 900);
+    }
+  }
+}
+
+export function appendToolTimelineRow(tool) {
+  const stream = host.streamEl();
+  if (!stream || !tool) {
+    return null;
+  }
+  const row = document.createElement("div");
+  row.className = "agent-tool-row is-running";
+  row.dataset.toolId = tool.id;
+  row.innerHTML =
+    `<span class="agent-tool-row-spinner" aria-hidden="true"></span>` +
+    `<div class="agent-tool-row-copy">` +
+    `<span class="agent-tool-row-name"></span>` +
+    `<span class="agent-tool-row-detail"></span>` +
+    `</div>` +
+    `<span class="agent-tool-row-status">Running</span>`;
+  row.querySelector(".agent-tool-row-name").textContent = tool.label;
+  row.querySelector(".agent-tool-row-detail").textContent = tool.detail || tool.kind || "";
+  stream.append(row);
+  host.scrollStreamToEnd();
+  return row;
+}
+
+
+export function appendFollowUpChips(prompts) {
+  const stream = host.streamEl();
+  if (!stream || !prompts?.length) {
+    return null;
+  }
+  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
+  const root = document.createElement("div");
+  root.className = "agent-followups";
+  root.setAttribute("aria-label", "Suggested follow-ups");
+  for (const text of prompts) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "agent-followup-chip";
+    chip.dataset.starter = text;
+    chip.textContent = text;
+    root.append(chip);
+  }
+  stream.append(root);
+  host.scrollStreamToEnd();
+  return root;
+}
+
+export function renderFollowUpQueue() {
+  const root = document.querySelector("[data-agent-queue]");
+  if (!root) {
+    return;
+  }
+  root.replaceChildren();
+  root.hidden = ctx.followUpQueue.length === 0;
+  if (!ctx.followUpQueue.length) {
+    requestAnimationFrame(() => host.syncComposerGeometry?.());
+    return;
+  }
+  for (const item of ctx.followUpQueue) {
+    const row = document.createElement("div");
+    row.className = "agent-queue-item";
+    row.dataset.queueId = item.id;
+    const text = document.createElement("span");
+    text.className = "agent-queue-item-text";
+    text.textContent = item.text;
+    text.title = item.text;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "agent-queue-item-remove";
+    remove.dataset.queueId = item.id;
+    remove.setAttribute("aria-label", "Remove from queue");
+    remove.title = "Remove from queue";
+    remove.innerHTML = `<span aria-hidden="true">×</span>`;
+    row.append(text, remove);
+    root.append(row);
+  }
+  /* Dock grew — remeasure stream clearance under the taller Shelf. */
+  requestAnimationFrame(() => host.syncComposerGeometry?.());
+}
+
+export function enqueueFollowUp(text) {
+  ctx.followUpQueue.push({ id: `q-${Date.now()}-${ctx.followUpQueue.length}`, text });
+  renderFollowUpQueue();
+}
+
+export function drainFollowUpQueue() {
+  if (!ctx.followUpQueue.length || !ctx.active) {
+    return;
+  }
+  const next = ctx.followUpQueue.shift();
+  renderFollowUpQueue();
+  if (!next?.text) {
+    return;
+  }
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId) || host.ensureSessionForPrompt(next.text);
+  session.messages.push({ role: "user", text: next.text });
+  host.renderSessions();
+  appendMessage("user", next.text);
+  startTurnForPrompt(next.text);
+}
+
+
+/**
+ * Inbox-grammar grant card (preview mock). Deny / Allow once update mock
+ * state only — never Capsule/Carrier (Principle 16).
+ */
+
+
+
+
+
+export function showEmptyState() {
+  const column = host.streamEl();
+  const viewport = host.streamViewportEl();
+  if (!column || !viewport) {
+    return;
+  }
+  column.replaceChildren();
+  host.clearEmptyState();
+  const name = host.signedInFirstName();
+  const greeting = name
+    ? `What's on your mind, ${name}?`
+    : "What's on your mind?";
+  const empty = document.createElement("div");
+  empty.className = "agent-harness-empty";
+  empty.setAttribute("role", "status");
+  // Occam: one header + one sub — grant literacy lives on the grant card, not here.
+  const sub =
+    ctx.sessionMode === "build"
+      ? "Build mode · plan & outputs · no write authority yet"
+      : "Private on this machine · tools ask once";
+  empty.innerHTML =
+    `<p class="agent-harness-empty-greeting"></p>` +
+    `<p class="agent-harness-empty-sub"></p>`;
+  empty.querySelector(".agent-harness-empty-greeting").textContent = greeting;
+  empty.querySelector(".agent-harness-empty-sub").textContent = sub;
+  /* Viewport — not the dock-width column — so the hero sits in true room center. */
+  viewport.append(empty);
+}
+
+function clearVisibleTranscript() {
+  host.clearEmptyState?.();
+  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
+  const column = host.streamEl?.();
+  const scroll = host.streamScrollEl?.();
+  if (column) {
+    column.replaceChildren();
+  }
+  /* Live/mock turns must never leave sibling nodes beside the column — those
+     survive column.replaceChildren() and make New chat look like a no-op. */
+  if (scroll && scroll !== column) {
+    for (const node of [...scroll.children]) {
+      if (node === column || node.id === "agent-harness-stream-column") {
+        continue;
+      }
+      node.remove();
+    }
+  }
+}
+
+export function renderActiveSession() {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  const stream = host.streamEl();
+  if (!stream) {
+    return;
+  }
+  if (!session) {
+    setTitle("New chat");
+    clearVisibleTranscript();
+    showEmptyState();
+    return;
+  }
+  setTitle(session.title);
+  clearVisibleTranscript();
+  if (!session.messages.length) {
+    showEmptyState();
+    return;
+  }
+  host.clearEmptyState();
+  hydrateCapabilitiesFromSession(session);
+  session.messages.forEach((msg, index) => {
+    if (msg.role === "grant") {
+      appendGrantCard(msg);
+    } else {
+      if (msg.role === "agent" && msg.thinking) {
+        const think = appendThinkingBlock(msg.thinking, {
+          streaming: false,
+          open: false,
+        });
+        if (think) {
+          finishThinkingBlock(think, Number(msg.updatedAt) || Date.now());
+        }
+      }
+      appendMessage(msg.role, msg.text, { msgIndex: index });
+    }
+  });
+  syncTruthStrip();
+  setStreamStatus("");
+  updateJumpToLatestVisibility();
+}
+
+/** Re-bind mock capability map to this session’s grant messages (preview). */
+
+
+export function appendThinkingBlock(text, { streaming = false, open = false } = {}) {
+  const stream = host.streamEl();
+  if (!stream) {
+    return null;
+  }
+  host.clearEmptyState();
+  const details = document.createElement("details");
+  details.className = `agent-thinking${streaming ? " is-streaming" : ""}`;
+  details.dataset.block = "thinking";
+  details.dataset.startedAt = String(Date.now());
+  /* Collapsed by default — shimmer header stays live; expand for full stream. */
+  if (open && ctx.reasoningVisible) {
+    details.open = true;
+  }
+  const summary = document.createElement("summary");
+  summary.className = "agent-thinking-summary";
+  summary.title = "Show full thinking — preview only, not authority";
+  summary.innerHTML =
+    `<span class="agent-thinking-chevron" aria-hidden="true"></span>` +
+    `<span class="agent-thinking-label">Thinking</span>`;
+  const bodyWrap = document.createElement("div");
+  bodyWrap.className = "agent-thinking-body-wrap";
+  const body = document.createElement("div");
+  body.className = "agent-thinking-body";
+  paintThinkingBody(body, text, { streaming });
+  bodyWrap.append(body);
+  details.append(summary, bodyWrap);
+  syncThinkingHeader(details, { streaming });
+  stream.append(details);
+  host.scrollStreamToEnd();
+  return details;
+}
+
+export function finishToolTimelineRow(row, { status = "done", statusLabel = "Done" } = {}) {
+  if (!row) {
+    return;
+  }
+  row.classList.remove("is-running");
+  row.classList.add(status === "error" || status === "denied" ? "is-denied" : "is-done");
+  const statusEl = row.querySelector(".agent-tool-row-status");
+  if (statusEl) {
+    statusEl.textContent = statusLabel;
+  }
+}
+
+export function appendMessage(
+  role,
+  text,
+  { streaming = false, asHtml = false, msgIndex = null } = {},
+) {
+  const stream = host.streamEl();
+  if (!stream) {
+    return null;
+  }
+  host.clearEmptyState();
+
+  const row = document.createElement("div");
+  row.className = `agent-msg agent-msg-${role}${streaming ? " is-streaming" : ""}`;
+  row.dataset.role = role;
+  if (msgIndex != null) {
+    row.dataset.msgIndex = String(msgIndex);
+  }
+
+  const body = document.createElement("div");
+  body.className = "agent-msg-body";
+  if (asHtml) {
+    body.innerHTML = text;
+  } else if (role === "agent") {
+    paintAgentMessageBody(body, text, { streaming });
+  } else {
+    body.textContent = text;
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "agent-msg-actions";
+  const makeIcon = (svg, label, extra = "") => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `agent-msg-action${extra ? ` ${extra}` : ""}`;
+    btn.innerHTML = svg;
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    return btn;
+  };
+  const ICONS = {
+    copy: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"/></svg>`,
+    edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.7 1.7 0 0 1 2 2L5 13l-2.6.6L3 11l8.5-8.5Z"/></svg>`,
+    regen: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 6.5A5.5 5.5 0 1 0 14 9.5"/><path d="M13.5 2.5v4h-4"/></svg>`,
+    trash: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 2h3M4 4l.6 8.6A1.6 1.6 0 0 0 6.2 14h3.6a1.6 1.6 0 0 0 1.6-1.4L12 4"/></svg>`,
+  };
+  const copyBtn = makeIcon(ICONS.copy, "Copy");
+  copyBtn.dataset.copyMessage = "1";
+  actions.append(copyBtn);
+  if (role === "user" && !streaming) {
+    const edit = makeIcon(ICONS.edit, "Edit and resubmit");
+    edit.dataset.editMessage = "1";
+    edit.disabled = Boolean(ctx.turnBusy);
+    actions.append(edit);
+  }
+  if (role === "agent") {
+    const regen = makeIcon(ICONS.regen, "Regenerate reply");
+    regen.dataset.regenerate = "1";
+    regen.disabled = streaming || Boolean(ctx.turnBusy);
+    actions.append(regen);
+  }
+  if (!streaming) {
+    const del = makeIcon(ICONS.trash, "Delete", "is-danger");
+    del.dataset.deleteMessage = "1";
+    del.disabled = Boolean(ctx.turnBusy);
+    actions.append(del);
+  }
+
+  if (!streaming) {
+    row.classList.add("agent-msg-enter");
+  }
+  row.append(body, actions);
+  stream.append(row);
+  host.scrollStreamToEnd();
+  updateJumpToLatestVisibility();
+  return row;
+}
+
+export function deleteMessageAt(msgIndex) {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (!session || ctx.turnBusy) {
+    return false;
+  }
+  const index = Number(msgIndex);
+  if (!Number.isInteger(index) || index < 0 || index >= session.messages.length) {
+    return false;
+  }
+  if (!window.confirm("Delete this message from the chat?")) {
+    return false;
+  }
+  session.messages.splice(index, 1);
+  session.updatedAt = Date.now();
+  host.renderSessions?.();
+  renderActiveSession();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+  return true;
+}
+
+export function beginEditUserMessage(msgIndex) {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (!session || ctx.turnBusy) {
+    return false;
+  }
+  const index = Number(msgIndex);
+  const msg = session.messages[index];
+  if (!msg || msg.role !== "user") {
+    return false;
+  }
+  const row = host.streamEl()?.querySelector(`.agent-msg-user[data-msg-index="${index}"]`);
+  if (!row || row.querySelector("[data-edit-form]")) {
+    return false;
+  }
+  const body = row.querySelector(".agent-msg-body");
+  const actions = row.querySelector(".agent-msg-actions");
+  if (!body) {
+    return false;
+  }
+  if (actions) {
+    actions.hidden = true;
+  }
+  const form = document.createElement("form");
+  form.className = "agent-msg-edit-form";
+  form.dataset.editForm = "1";
+  const ta = document.createElement("textarea");
+  ta.className = "agent-msg-edit-input";
+  ta.value = msg.text;
+  ta.rows = Math.min(8, Math.max(2, msg.text.split("\n").length + 1));
+  const bar = document.createElement("div");
+  bar.className = "agent-msg-edit-bar";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "agent-msg-action";
+  cancel.dataset.editCancel = "1";
+  cancel.textContent = "Cancel";
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "agent-msg-action";
+  save.textContent = "Save & submit";
+  bar.append(cancel, save);
+  form.append(ta, bar);
+  body.replaceWith(form);
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  return true;
+}
+
+export function cancelEditUserMessage(msgIndex) {
+  renderActiveSession();
+  return true;
+}
+
+export function submitEditUserMessage(msgIndex, nextText) {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  const text = String(nextText || "").trim();
+  if (!session || !text || ctx.turnBusy) {
+    return false;
+  }
+  const index = Number(msgIndex);
+  const msg = session.messages[index];
+  if (!msg || msg.role !== "user") {
+    return false;
+  }
+  session.messages = session.messages.slice(0, index);
+  session.messages.push({ role: "user", text });
+  if (session.title === "New chat" || index === 0) {
+    session.title = titleFromPrompt(text);
+  }
+  session.updatedAt = Date.now();
+  host.renderSessions?.();
+  renderActiveSession();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+  startTurnForPrompt(text);
+  return true;
+}
+
+/** Drop trailing agent turns after the last user message, then restream. */
+export function regenerateLastAgentTurn() {
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  if (!session || ctx.turnBusy) {
+    return false;
+  }
+  let lastUser = -1;
+  for (let i = session.messages.length - 1; i >= 0; i -= 1) {
+    if (session.messages[i].role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  if (lastUser < 0) {
+    return false;
+  }
+  const prompt = session.messages[lastUser].text;
+  session.messages = session.messages.slice(0, lastUser + 1);
+  session.updatedAt = Date.now();
+  host.renderSessions?.();
+  renderActiveSession();
+  try {
+    host.persistAgentWorkspaceSoon?.();
+  } catch {
+    /* optional */
+  }
+  startTurnForPrompt(prompt);
+  return true;
+}
+
+export function stopMockStream({ keepPartial = true, drainQueue = false } = {}) {
+  abortLiveChatStream();
+  clearStreamTimer();
+  ctx.streamGeneration += 1;
+  ctx.turnBusy = false;
+  setAgentComposerProcessing(false);
+  setStreamStatus("");
+  const thinking = host.streamEl()?.querySelector(".agent-thinking.is-streaming");
+  let thinkingText = "";
+  if (thinking) {
+    thinkingText = thinkingBodyRaw(thinking.querySelector(".agent-thinking-body"));
+    finishThinkingBlock(thinking, Number(thinking.dataset.startedAt) || Date.now());
+  }
+  const streaming = host.streamEl()?.querySelector(".agent-msg-agent.is-streaming");
+  if (streaming) {
+    streaming.classList.remove("is-streaming");
+    if (!keepPartial) {
+      streaming.remove();
+      thinking?.remove();
+    } else {
+      const body = streaming.querySelector(".agent-msg-body");
+      const raw = String(body?.dataset.mdSource || body?.textContent || "").trim();
+      if (body && raw) {
+        paintAgentMessageBody(body, raw, { streaming: false });
+        const regen = streaming.querySelector("[data-regenerate]");
+        if (regen) {
+          regen.disabled = false;
+        }
+        persistPartialAgentReply(raw, thinkingText);
+        if (!streaming.querySelector(".agent-msg-stopped")) {
+          const note = document.createElement("div");
+          note.className = "agent-msg-stopped";
+          note.innerHTML =
+            `<span>Stopped</span>` +
+            `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
+          streaming.append(note);
+        }
+      } else {
+        streaming.remove();
+        if (!thinkingText.trim()) {
+          thinking?.remove();
+        }
+      }
+    }
+  }
+  if (drainQueue) {
+    window.requestAnimationFrame(() => drainFollowUpQueue());
+  }
+}
+
+export function startMockStream(replyText) {
+  startMockStreamForPrompt("", replyText);
+}
+
+/** One decision point (one canonical path): live when the probe says live,
+ *  otherwise the honest mock theatre. All turn starters route through here. */
+export function startTurnForPrompt(userText) {
+  if (getLiveInferenceState().live) {
+    void startLiveTurnForPrompt(userText);
+    return;
+  }
+  startMockStreamForPrompt(userText);
+}
+
+/** Live turn: gateway SSE proxy → incremental Thinking + answer (OWUI-feel,
+ *  ElastOS authority path). Stop aborts the fetch. Failure → labeled mock. */
+async function startLiveTurnForPrompt(userText) {
+  abortLiveChatStream();
+  clearStreamTimer();
+  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
+  const generation = (ctx.streamGeneration += 1);
+  ctx.turnBusy = true;
+  setAgentComposerProcessing(true);
+  setStreamStatus("Connecting…", { tone: "connecting" });
+  ensureJumpToLatest();
+
+  const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+  const thinkStartedAt = Date.now();
+  let thinkingEl = appendThinkingBlock("", {
+    streaming: true,
+    open: false,
+  });
+  if (thinkingEl && !ctx.reasoningVisible) {
+    thinkingEl.hidden = true;
+  }
+  let answerRow = null;
+  let answerBody = null;
+  let lastPaint = 0;
+  let finalReasoning = "";
+  let finalContent = "";
+  let sawFirstToken = false;
+
+  const paint = (reasoning, content, { force = false } = {}) => {
+    const now = Date.now();
+    if (!force && now - lastPaint < 40) {
+      return;
+    }
+    lastPaint = now;
+    if ((reasoning || content) && !sawFirstToken) {
+      sawFirstToken = true;
+      setStreamStatus("Generating…", { tone: "generating" });
+    }
+    if (reasoning) {
+      if (!thinkingEl) {
+        thinkingEl = appendThinkingBlock(reasoning, {
+          streaming: true,
+          open: false,
+        });
+      } else {
+        const body = thinkingEl.querySelector(".agent-thinking-body");
+        paintThinkingBody(body, reasoning, { streaming: true });
+        syncThinkingHeader(thinkingEl, { streaming: true });
+        thinkingEl.hidden = !ctx.reasoningVisible && !content;
+        /* Keep collapsed unless the user opened the disclosure. */
+      }
+    }
+    if (content) {
+      if (!answerRow) {
+        answerRow = appendMessage("agent", content, { streaming: true });
+        answerBody = answerRow?.querySelector(".agent-msg-body") || null;
+      } else if (answerBody) {
+        paintAgentMessageBody(answerBody, content, { streaming: true });
+      }
+      const scroller = host.streamScrollEl?.();
+      if (scroller) {
+        const distance =
+          scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+        if (distance < 140) {
+          host.scrollStreamToEnd?.();
+        } else {
+          updateJumpToLatestVisibility();
+        }
+      } else {
+        host.scrollStreamToEnd?.();
+      }
+    }
+  };
+
+  try {
+    const result = await streamChatViaContract(
+      buildLiveMessages(session?.messages || [], {
+        systemPrompt: ctx.systemPrompt,
+        notes: ctx.agentNotes,
+      }),
+      {
+        maxTokens: ctx.maxTokens,
+        temperature: ctx.temperature,
+        onDelta: ({ reasoning, content }) => {
+          if (generation !== ctx.streamGeneration) {
+            return;
+          }
+          finalReasoning = reasoning || finalReasoning;
+          finalContent = content || finalContent;
+          paint(finalReasoning, finalContent);
+        },
+      },
+    );
+    finalReasoning = result.reasoning || finalReasoning;
+    finalContent = result.content || finalContent;
+    paint(finalReasoning, finalContent, { force: true });
+
+    let answer = String(finalContent || "").trim();
+    let thinking = String(finalReasoning || "").trim();
+    if (!answer && thinking) {
+      /* Flash often spends the budget in reasoning — surface it honestly. */
+      answer = thinking;
+      thinking = "";
+    }
+    const split = splitThinkTaggedContent(answer);
+    if (split.thinking && !thinking) {
+      thinking = split.thinking;
+      answer = split.answer || answer;
+    }
+
+    const superseded = generation !== ctx.streamGeneration;
+    const stoppedEarly = result.aborted || superseded;
+    /* Stop already finalized DOM + partial persist via stopMockStream. */
+    if (superseded) {
+      return;
+    }
+
+    if (thinkingEl) {
+      if (thinking) {
+        const body = thinkingEl.querySelector(".agent-thinking-body");
+        paintThinkingBody(body, thinking, { streaming: false });
+        thinkingEl.hidden = false;
+        finishThinkingBlock(thinkingEl, thinkStartedAt);
+      } else {
+        thinkingEl.remove();
+        thinkingEl = null;
+      }
+    }
+
+    if (!answer) {
+      thinkingEl?.remove();
+      answerRow?.remove();
+      if (!stoppedEarly) {
+        noteStreamFailure("Live returned empty");
+        host.syncInferenceStatus?.();
+        setStreamStatus("Live returned empty — labeled Preview mock", {
+          tone: "error",
+        });
+        void probeLiveInference({ force: true }).then(() => host.syncInferenceStatus?.());
+        startMockStreamForPrompt(userText);
+      }
+      return;
+    }
+
+    if (!answerRow) {
+      answerRow = appendMessage("agent", answer, { streaming: true });
+      answerBody = answerRow?.querySelector(".agent-msg-body") || null;
+    }
+    if (answerBody) {
+      paintAgentMessageBody(answerBody, answer, { streaming: false });
+    }
+    answerRow?.classList.remove("is-streaming");
+    const regen = answerRow?.querySelector("[data-regenerate]");
+    if (regen) {
+      regen.disabled = false;
+    }
+
+    const turnUsage = noteLiveTurnUsage({
+      usage: result.usage || null,
+      latencyMs: result.latencyMs || 0,
+      model: getLiveInferenceState()?.model || getSelectedModel()?.label || "live",
+      content: answer,
+      reasoning: thinking,
+      source: "live",
+    });
+    clearLastStreamFailure();
+    paintTurnUsageMeta(answerRow, turnUsage);
+    host.syncInferenceStatus?.();
+    try {
+      host.renderHarnessPage?.();
+    } catch {
+      /* usage page refresh optional */
+    }
+
+    if (session) {
+      session.messages.push(
+        thinking
+          ? { role: "agent", text: answer, thinking, ...(stoppedEarly ? { partial: true } : {}) }
+          : { role: "agent", text: answer, ...(stoppedEarly ? { partial: true } : {}) },
+      );
+      session.updatedAt = Date.now();
+      host.renderSessions?.();
+      try {
+        host.persistAgentWorkspaceSoon?.();
+      } catch {
+        /* optional */
+      }
+    }
+    if (stoppedEarly && answerRow && !answerRow.querySelector(".agent-msg-stopped")) {
+      const note = document.createElement("div");
+      note.className = "agent-msg-stopped";
+      note.innerHTML =
+        `<span>Stopped</span>` +
+        `<button type="button" class="agent-msg-retry" data-retry="1">Retry</button>`;
+      answerRow.append(note);
+    }
+    /* Collapse thinking once an answer exists (Wave 1.07). */
+    if (thinkingEl && answer && thinkingEl.open && ctx.reasoningVisible) {
+      finishThinkingBlock(thinkingEl, thinkStartedAt);
+    }
+    syncTruthStrip();
+    syncWorkbenchPanels();
+    if (!stoppedEarly) {
+      void maybeOfferToolAfterReply();
+    }
+  } catch (err) {
+    if (generation !== ctx.streamGeneration) {
+      return;
+    }
+    if (err?.code === "aborted") {
+      const partial = String(finalContent || finalReasoning || "").trim();
+      if (partial) {
+        persistPartialAgentReply(
+          String(finalContent || "").trim() || partial,
+          String(finalReasoning || "").trim(),
+        );
+      }
+      setStreamStatus("Stopped", { tone: "idle" });
+      return;
+    }
+    const honest = formatStreamError(err);
+    noteStreamFailure(honest);
+    host.syncInferenceStatus?.();
+    setStreamStatus(`${honest} · Preview mock`, { tone: "error" });
+    thinkingEl?.remove();
+    answerRow?.remove();
+    void probeLiveInference({ force: true }).then(() => host.syncInferenceStatus?.());
+    startMockStreamForPrompt(userText);
+    return;
+  } finally {
+    if (generation === ctx.streamGeneration) {
+      ctx.turnBusy = false;
+      setAgentComposerProcessing(false);
+      if (!document.querySelector("[data-agent-stream-status]")?.textContent?.includes("Preview mock")) {
+        setStreamStatus("");
+      }
+      window.requestAnimationFrame(() => drainFollowUpQueue());
+    }
+  }
+}
+
+export function startMockStreamForPrompt(userText, replyOverride) {
+  const turn = getMockTurn(userText);
+  startTurnReveal({
+    thinkingText: turn.thinking,
+    replyText: replyOverride || turn.answer || MOCK_REPLY,
+    toolPreview: turn.toolPreview,
+    followUps: turn.followUps || [],
+    approxTokens: null,
+    live: false,
+  });
+}
+
+function startTurnReveal({
+  thinkingText,
+  replyText,
+  toolPreview,
+  followUps,
+  approxTokens,
+  live,
+}) {
+  stopMockStream({ keepPartial: true });
+  document.querySelectorAll(".agent-followups").forEach((node) => node.remove());
+  const generation = (ctx.streamGeneration += 1);
+  const thinkStartedAt = Date.now();
+  ctx.turnBusy = true;
+  setAgentComposerProcessing(true);
+
+  /* Live turns without reasoning content get no thinking block — never
+     theatre an empty "Thought for…" over a real reply (§AL.3 honesty). */
+  const showThinking = !live || Boolean(thinkingText);
+  const thinking = showThinking
+    ? appendThinkingBlock("", {
+        streaming: ctx.reasoningVisible,
+        open: false,
+      })
+    : null;
+  const thinkBody = thinking?.querySelector(".agent-thinking-body");
+  if (thinking && !ctx.reasoningVisible) {
+    thinking.hidden = true;
+    paintThinkingBody(thinkBody, thinkingText, { streaming: false });
+  }
+
+  let phase = showThinking && ctx.reasoningVisible ? "thinking" : "tool";
+  let thinkIndex = 0;
+  let toolRow = null;
+  let toolTicks = 0;
+  let answerRow = null;
+  let answerBody = null;
+  let answerIndex = 0;
+
+  const beginToolOrAnswer = () => {
+    finishThinkingBlock(thinking, thinkStartedAt);
+    if (toolPreview) {
+      phase = "tool";
+      toolTicks = 0;
+      toolRow = appendToolTimelineRow(toolPreview);
+    } else {
+      beginAnswer();
+    }
+  };
+
+  const beginAnswer = () => {
+    phase = "answer";
+    answerRow = appendMessage("agent", "", { streaming: true });
+    answerBody = answerRow?.querySelector(".agent-msg-body");
+    answerIndex = 0;
+  };
+
+  if (phase === "tool") {
+    beginToolOrAnswer();
+  }
+
+  ctx.streamTimer = window.setInterval(() => {
+    if (generation !== ctx.streamGeneration) {
+      clearStreamTimer();
+      return;
+    }
+    const scroller = host.streamScrollEl();
+
+    if (phase === "thinking" && thinkBody) {
+      thinkIndex = Math.min(thinkingText.length, thinkIndex + 3 + (thinkIndex % 2));
+      const partial = thinkingText.slice(0, thinkIndex);
+      paintThinkingBody(thinkBody, partial, {
+        streaming: true,
+      });
+      syncThinkingHeader(thinking, { streaming: true });
+      /* Only chase the stream if the user expanded the disclosure. */
+      if (thinking?.open && scroller) {
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+      if (thinkIndex >= thinkingText.length) {
+        paintThinkingBody(thinkBody, thinkingText, { streaming: false });
+        beginToolOrAnswer();
+      }
+      return;
+    }
+
+    if (phase === "tool") {
+      toolTicks += 1;
+      if (toolTicks >= 14) {
+        const denied = toolPreview?.kind === "deny";
+        finishToolTimelineRow(toolRow, {
+          status: denied ? "denied" : "done",
+          statusLabel: denied ? "Needs ceremony" : "Ready to ask",
+        });
+        beginAnswer();
+      }
+      return;
+    }
+
+    if (!answerBody) {
+      clearStreamTimer();
+      ctx.turnBusy = false;
+      setAgentComposerProcessing(false);
+      drainFollowUpQueue();
+      return;
+    }
+
+    answerIndex = Math.min(replyText.length, answerIndex + 2 + (answerIndex % 3));
+    const partial = replyText.slice(0, answerIndex);
+    paintAgentMessageBody(answerBody, partial, {
+      streaming: answerIndex < replyText.length,
+    });
+    if (scroller) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+    if (answerIndex >= replyText.length) {
+      clearStreamTimer();
+      answerRow?.classList.remove("is-streaming");
+      answerRow?.classList.add("agent-msg-enter");
+      paintAgentMessageBody(answerBody, replyText, { streaming: false });
+      const regen = answerRow?.querySelector("[data-regenerate]");
+      if (regen) {
+        regen.disabled = false;
+      }
+      ctx.turnBusy = false;
+      setAgentComposerProcessing(false);
+      const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
+      if (session) {
+        session.messages.push({
+          role: "agent",
+          text: replyText,
+          thinking: thinkingText,
+          ...(live ? { live: true } : {}),
+        });
+      }
+      noteMockTurnTokens(
+        approxTokens || Math.max(200, Math.round(replyText.length / 3)),
+      );
+      void maybeOfferToolAfterReply();
+      appendFollowUpChips(followUps);
+      syncTruthStrip();
+      syncWorkbenchPanels();
+      host.scrollStreamToEnd();
+      drainFollowUpQueue();
+    }
+  }, 33);
+}

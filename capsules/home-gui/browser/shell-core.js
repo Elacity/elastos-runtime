@@ -1,3 +1,4 @@
+import { TIP as APP_ICON_ASSET_VERSION } from "./agent-tip.js?v=home-20260810mr";
 export let desktop = document.querySelector("#desktop");
 export let desktopBackdrop = document.querySelector(".desktop-backdrop");
 export let desktopWorkspace = document.querySelector(".desktop-workspace");
@@ -9,11 +10,21 @@ export let launcherEmptyState = document.querySelector("#launcher-empty-state");
 export let launcherSearch = document.querySelector("#launcher-search");
 export let launcherToggleButton = document.querySelector("#launcher-toggle");
 export let closeLauncherButton = document.querySelector("#close-launcher");
+export let launcherViewToggle = document.querySelector("#launcher-view-toggle");
 export let toolbarHomeButton = document.querySelector("#toolbar-home");
+export let toolbarIdentityAvatar = document.querySelector("#toolbar-identity-avatar");
+export let toolbarIdentityMonogram = document.querySelector("#toolbar-identity-monogram");
+export let toolbarIdentityAvatarImage = document.querySelector("#toolbar-identity-avatar-image");
+export let toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
 export let toolbarInboxButton = document.querySelector("#toolbar-inbox");
 export let toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
-export let toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
-export let toolbarSignOutButton = document.querySelector("#toolbar-sign-out");
+export let toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
+export let toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
+export let toolbarSystem = document.querySelector("#toolbar-system");
+export let toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
+export let toolbarIdentityMenuName = document.querySelector("#toolbar-identity-menu-name");
+export let identityMenuSystemButton = document.querySelector("#identity-menu-system");
+export let identityMenuShowDesktopButton = document.querySelector("#identity-menu-show-desktop");
 export let homeNotificationToast = document.querySelector("#home-notification-toast");
 export let homeNotificationTitle = document.querySelector("#home-notification-title");
 export let homeNotificationBody = document.querySelector("#home-notification-body");
@@ -42,6 +53,9 @@ const DESKTOP_ICON_GAP_Y = 104;
 const DEFAULT_DESKTOP_LAYOUT_WIDTH = 1280;
 const DEFAULT_DESKTOP_LAYOUT_HEIGHT = 720;
 const HOME_BROWSER_CONTEXT_PATTERN = /^browser:[0-9a-f]{32}$/;
+/* Opaque home-gui has no durable localStorage — adopt host-persisted session id. */
+let browserContextDurable = false;
+
 export const WINDOW_MIN_WIDTH = 320;
 export const WINDOW_MIN_HEIGHT = 220;
 export const WINDOW_SNAP_THRESHOLD = 28;
@@ -50,11 +64,44 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260725a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260810mr", import.meta.url).href;
+const HOME_GUI_UI_STYLESHEET_ID = "home-gui-elastos-ui";
+const HOME_GUI_UI_STYLESHEET_URL = new URL("./elastos-ui.css?v=home-20260810mr", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260725a", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260810mr", import.meta.url).href;
+const HOME_GUI_AGENT_STYLESHEET_ID = "home-gui-agent-stylesheet";
+const HOME_GUI_AGENT_STYLESHEET_URL = new URL(
+  "./agent-harness.css?v=home-20260810mr",
+  import.meta.url,
+).href;
+
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
+
+export function getHomeGuiLaunchToken() {
+  if (homeGuiLaunchToken) {
+    return homeGuiLaunchToken;
+  }
+  try {
+    const fromGlobal = globalThis.__elastosHomeGuiLaunchToken;
+    if (typeof fromGlobal === "string" && fromGlobal.trim()) {
+      homeGuiLaunchToken = fromGlobal.trim();
+      return homeGuiLaunchToken;
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const fromSession = sessionStorage.getItem("elastos.home-gui.launch-token");
+    if (typeof fromSession === "string" && fromSession.trim()) {
+      homeGuiLaunchToken = fromSession.trim();
+      return homeGuiLaunchToken;
+    }
+  } catch {
+    /* opaque / blocked storage */
+  }
+  return "";
+}
 
 export function setHomeGuiLaunchToken(token) {
   const normalized = typeof token === "string" ? token.trim() : "";
@@ -62,6 +109,16 @@ export function setHomeGuiLaunchToken(token) {
     throw new Error("Home GUI launch token is required");
   }
   homeGuiLaunchToken = normalized;
+  try {
+    globalThis.__elastosHomeGuiLaunchToken = normalized;
+  } catch {
+    /* ignore */
+  }
+  try {
+    sessionStorage.setItem("elastos.home-gui.launch-token", normalized);
+  } catch {
+    /* opaque / blocked storage */
+  }
 }
 
 export const shellState = {
@@ -70,6 +127,12 @@ export const shellState = {
   zIndexCounter: 100,
   browserWindowSerial: 0,
   activeWindowId: null,
+  /** "desktop" | "desk-*" | windowId — active Space */
+  activeStageId: "desktop",
+  /** Extra Desktop Spaces created via Mission Control + (ids like desk-2). */
+  extraDesktops: [],
+  /** Optional Mission Control Spaces order (desktop / desk-* / window ids). */
+  spaceOrder: [],
   clockTimer: null,
   summaryRefreshDebounceTimer: null,
   summaryRefreshInFlight: false,
@@ -93,7 +156,7 @@ export const shellState = {
     taskbar: [],
     desktop: {},
     desktopLabels: {},
-    desktopHidden: [],
+    desktopApps: [],
     desktopIconsVisible: true,
   },
   dragState: null,
@@ -102,6 +165,7 @@ export const shellState = {
   contextMenuTarget: { kind: "desktop" },
   contextMenuIgnoreOutsideUntil: 0,
   selectedDesktopTargetId: null,
+  marqueeSelection: new Set(),
   recentTargetIds: [],
   selectedLauncherTargetId: null,
   launcherIgnoreOutsideUntil: 0,
@@ -114,6 +178,40 @@ export const shellState = {
   requestSummaryRefresh: null,
   homeGuiMounted: false,
 };
+
+// Keyboard focus trap for modal shell surfaces (launcher, unlock). Wraps Tab
+// and Shift+Tab within the container's visible, enabled controls. Returns true
+// when the event was handled.
+export function trapTabWithin(container, event) {
+  if (event.key !== "Tab" || !container) {
+    return false;
+  }
+  const focusables = Array.from(
+    container.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(
+    (element) => !element.hidden && !element.disabled && element.offsetParent !== null,
+  );
+  if (focusables.length === 0) {
+    event.preventDefault();
+    return true;
+  }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !container.contains(active))) {
+    event.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!event.shiftKey && (active === last || !container.contains(active))) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
 
 export function retireHomeGuiWindowState() {
   if (shellState.windows.size === 0) {
@@ -138,11 +236,21 @@ function bindHomeGuiDomRefs() {
   launcherSearch = document.querySelector("#launcher-search");
   launcherToggleButton = document.querySelector("#launcher-toggle");
   closeLauncherButton = document.querySelector("#close-launcher");
+  launcherViewToggle = document.querySelector("#launcher-view-toggle");
   toolbarHomeButton = document.querySelector("#toolbar-home");
+  toolbarIdentityAvatar = document.querySelector("#toolbar-identity-avatar");
+  toolbarIdentityMonogram = document.querySelector("#toolbar-identity-monogram");
+  toolbarIdentityAvatarImage = document.querySelector("#toolbar-identity-avatar-image");
+  toolbarActiveTitleNode = document.querySelector("#toolbar-active-title");
   toolbarInboxButton = document.querySelector("#toolbar-inbox");
   toolbarInboxCount = document.querySelector("#toolbar-inbox-count");
-  toolbarFullscreenButton = document.querySelector("#toolbar-fullscreen");
-  toolbarSignOutButton = document.querySelector("#toolbar-sign-out");
+  toolbarFullscreenButton = document.querySelector("#control-centre-fullscreen");
+  toolbarSignOutButton = document.querySelector("#identity-menu-sign-out");
+  toolbarSystem = document.querySelector("#toolbar-system");
+  toolbarIdentityMenu = document.querySelector("#toolbar-identity-menu");
+  toolbarIdentityMenuName = document.querySelector("#toolbar-identity-menu-name");
+  identityMenuSystemButton = document.querySelector("#identity-menu-system");
+  identityMenuShowDesktopButton = document.querySelector("#identity-menu-show-desktop");
   homeNotificationToast = document.querySelector("#home-notification-toast");
   homeNotificationTitle = document.querySelector("#home-notification-title");
   homeNotificationBody = document.querySelector("#home-notification-body");
@@ -214,15 +322,30 @@ export async function ensureHomeGuiDom() {
 }
 
 function ensureHomeGuiStylesheet() {
-  if (document.querySelector(`#${HOME_GUI_STYLESHEET_ID}`)) {
-    return;
-  }
-  const link = document.createElement("link");
-  link.id = HOME_GUI_STYLESHEET_ID;
-  link.rel = "stylesheet";
-  link.href = HOME_GUI_STYLESHEET_URL;
   const head = document.head || document.querySelector("head");
-  head?.appendChild?.(link);
+  // Token sheet first so --el-accent / data-el-accent actually resolve in the shell
+  // (maximize + other chrome). Capsule frames already load this; Home GUI did not.
+  if (!document.querySelector(`#${HOME_GUI_UI_STYLESHEET_ID}`)) {
+    const uiLink = document.createElement("link");
+    uiLink.id = HOME_GUI_UI_STYLESHEET_ID;
+    uiLink.rel = "stylesheet";
+    uiLink.href = HOME_GUI_UI_STYLESHEET_URL;
+    head?.appendChild?.(uiLink);
+  }
+  if (!document.querySelector(`#${HOME_GUI_STYLESHEET_ID}`)) {
+    const link = document.createElement("link");
+    link.id = HOME_GUI_STYLESHEET_ID;
+    link.rel = "stylesheet";
+    link.href = HOME_GUI_STYLESHEET_URL;
+    head?.appendChild?.(link);
+  }
+  if (!document.querySelector(`#${HOME_GUI_AGENT_STYLESHEET_ID}`)) {
+    const agentLink = document.createElement("link");
+    agentLink.id = HOME_GUI_AGENT_STYLESHEET_ID;
+    agentLink.rel = "stylesheet";
+    agentLink.href = HOME_GUI_AGENT_STYLESHEET_URL;
+    head?.appendChild?.(agentLink);
+  }
 }
 
 export function beginShellInteraction() {
@@ -241,13 +364,21 @@ export function shellInteractionActive(graceMs = 250) {
 }
 
 export async function fetchJson(url, init) {
+  const token = getHomeGuiLaunchToken();
+  const headers = {
+    "content-type": "application/json",
+    ...(token ? { "x-elastos-home-token": token } : {}),
+  };
+  if (init?.headers && typeof init.headers === "object" && !(init.headers instanceof Headers)) {
+    Object.assign(headers, init.headers);
+  } else if (init?.headers instanceof Headers) {
+    init.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+  }
   const response = await fetch(url, {
     ...init,
-    headers: {
-      "content-type": "application/json",
-      ...(homeGuiLaunchToken ? { "x-elastos-home-token": homeGuiLaunchToken } : {}),
-      ...(init && init.headers ? init.headers : {}),
-    },
+    headers,
   });
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
@@ -258,6 +389,15 @@ export async function fetchJson(url, init) {
     throw error;
   }
   return response.json();
+}
+
+/* Narrow Desktop-URI mutations — mkdir/write/rename/trash only. The gateway
+   fail-closes outside {localhost_root}/Desktop. See ANDERS_REVIEW_PACK. */
+export async function mutateDesktopObject(op, payload = {}) {
+  return fetchJson("/api/apps/home/desktop/objects", {
+    method: "POST",
+    body: JSON.stringify({ op, ...payload }),
+  });
 }
 
 export function allVisibleTargets(summary) {
@@ -310,11 +450,13 @@ export function desktopEntryExists(summary, entryId) {
 }
 
 export function desktopLayoutEntries(summary) {
-  const appEntries = allVisibleTargets(summary).map((target) => ({
-    id: target.target,
-    kind: "target",
-    target,
-  }));
+  const appEntries = allVisibleTargets(summary)
+    .filter((target) => isTargetOnDesktop(target.target))
+    .map((target) => ({
+      id: target.target,
+      kind: "target",
+      target,
+    }));
   const objectEntries = desktopObjects(summary).map((object) => ({
     id: desktopObjectEntryId(object),
     kind: "object",
@@ -363,8 +505,185 @@ export function targetTitle(summary, targetId) {
 }
 
 export function canonicalTargetTitle(targetId, title) {
+  if (targetId === "marketplace") {
+    return "Apps";
+  }
   const normalizedTitle = normalizeText(title);
   return normalizedTitle || targetId;
+}
+
+/* Window chrome modes (presentation-only). Fail closed to standard.
+   unified-sidebar: split-view apps — lights over the leading column.
+   unified-toolbar: Browser-style — lights over the tool row; no window title
+   (menubar already shows the focused app name). */
+export const WINDOW_CHROME_STANDARD = "standard";
+export const WINDOW_CHROME_UNIFIED_SIDEBAR = "unified-sidebar";
+export const WINDOW_CHROME_UNIFIED_TOOLBAR = "unified-toolbar";
+
+const WINDOW_CHROME_BY_TARGET = {
+  marketplace: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  system: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  library: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  services: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  people: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  documents: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  browser: WINDOW_CHROME_UNIFIED_TOOLBAR,
+  /* Inbox WINDOW has a real left filter column — same grammar as Library.
+     Shell Inbox rail is a separate surface (not this map). */
+  inbox: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  /* Chat People column is leading — earns unified-sidebar. */
+  chat: WINDOW_CHROME_UNIFIED_SIDEBAR,
+  "chat-room": WINDOW_CHROME_UNIFIED_SIDEBAR,
+};
+
+/* Standard apps that keep a titlebar but share one plate with the body. */
+const WINDOW_CHROME_CONTINUOUS_TARGETS = new Set([
+  "wallet",
+  "archive-manager",
+  "gba-emulator",
+  "wallet-metamask",
+  "wallet-unisat",
+  "wallet-walletconnect",
+]);
+
+export function parseWindowChromeMode(value) {
+  if (value === WINDOW_CHROME_UNIFIED_SIDEBAR) {
+    return WINDOW_CHROME_UNIFIED_SIDEBAR;
+  }
+  if (value === WINDOW_CHROME_UNIFIED_TOOLBAR) {
+    return WINDOW_CHROME_UNIFIED_TOOLBAR;
+  }
+  return WINDOW_CHROME_STANDARD;
+}
+
+export function windowChromeModeForTarget(targetId) {
+  return parseWindowChromeMode(WINDOW_CHROME_BY_TARGET[String(targetId || "")]);
+}
+
+export function windowChromeContinuousForTarget(targetId) {
+  const id = String(targetId || "");
+  return (
+    windowChromeModeForTarget(id) === WINDOW_CHROME_STANDARD &&
+    WINDOW_CHROME_CONTINUOUS_TARGETS.has(id)
+  );
+}
+
+/* TEMPORARY tip-lag defense for Chat only. Canonical mode is
+   WINDOW_CHROME_BY_TARGET → applyWindowChrome class/dataset. Remove once
+   Chat no longer flashes a full titlebar when CSS tips lag. */
+const FORCED_UNIFIED_HEAD_PROPS = [
+  "position",
+  "top",
+  "left",
+  "right",
+  "z-index",
+  "width",
+  "height",
+  "min-height",
+  "margin",
+  "margin-bottom",
+  "padding",
+  "background",
+  "background-color",
+  "box-shadow",
+  "filter",
+  "border-radius",
+];
+const FORCED_UNIFIED_BODY_PROPS = ["height", "min-height", "margin"];
+
+function clearForcedUnifiedSidebarGeometry(windowNode) {
+  const head = windowNode.querySelector(".window-head");
+  const body = windowNode.querySelector(".window-body");
+  for (const prop of FORCED_UNIFIED_HEAD_PROPS) {
+    head?.style.removeProperty(prop);
+  }
+  for (const prop of FORCED_UNIFIED_BODY_PROPS) {
+    body?.style.removeProperty(prop);
+  }
+}
+
+function forceUnifiedSidebarGeometry(windowNode) {
+  const head = windowNode.querySelector(".window-head");
+  const body = windowNode.querySelector(".window-body");
+  if (head) {
+    head.style.setProperty("position", "absolute", "important");
+    head.style.setProperty("top", "0", "important");
+    head.style.setProperty("left", "0", "important");
+    head.style.setProperty("right", "auto", "important");
+    head.style.setProperty("z-index", "6", "important");
+    head.style.setProperty(
+      "width",
+      "var(--window-chrome-sidebar-width, 220px)",
+      "important",
+    );
+    head.style.setProperty("height", "52px", "important");
+    head.style.setProperty("min-height", "52px", "important");
+    head.style.setProperty("margin", "0", "important");
+    head.style.setProperty("margin-bottom", "0", "important");
+    head.style.setProperty("padding", "14px 10px 0 12px", "important");
+    head.style.setProperty("background", "transparent", "important");
+    head.style.setProperty("background-color", "transparent", "important");
+    head.style.setProperty("box-shadow", "none", "important");
+    head.style.setProperty("filter", "none", "important");
+    head.style.setProperty("border-radius", "12px 0 0 0", "important");
+  }
+  if (body) {
+    body.style.setProperty("height", "100%", "important");
+    body.style.setProperty("min-height", "0", "important");
+    body.style.setProperty("margin", "0", "important");
+  }
+}
+
+export function applyWindowChrome(windowNode, targetId) {
+  if (!windowNode) {
+    return WINDOW_CHROME_STANDARD;
+  }
+  const id = String(targetId || "");
+  /* Map is the sole mode source — Chat is listed in WINDOW_CHROME_BY_TARGET. */
+  const mode = windowChromeModeForTarget(id);
+  const continuous =
+    mode === WINDOW_CHROME_STANDARD && windowChromeContinuousForTarget(id);
+  windowNode.dataset.target = id || windowNode.dataset.target || "";
+  windowNode.dataset.chrome = mode;
+  windowNode.classList.toggle(
+    "window-chrome-unified-sidebar",
+    mode === WINDOW_CHROME_UNIFIED_SIDEBAR,
+  );
+  windowNode.classList.toggle(
+    "window-chrome-unified-toolbar",
+    mode === WINDOW_CHROME_UNIFIED_TOOLBAR,
+  );
+  windowNode.classList.toggle("window-chrome-continuous", continuous);
+  if (mode === WINDOW_CHROME_UNIFIED_SIDEBAR) {
+    windowNode.style.setProperty("--window-chrome-sidebar-width", "220px");
+    windowNode.classList.remove("window-chrome-continuous");
+    if (id === "chat" || id === "chat-room") {
+      forceUnifiedSidebarGeometry(windowNode);
+    } else {
+      clearForcedUnifiedSidebarGeometry(windowNode);
+    }
+  } else {
+    windowNode.style.removeProperty("--window-chrome-sidebar-width");
+    clearForcedUnifiedSidebarGeometry(windowNode);
+  }
+  const titleEl = windowNode.querySelector(".window-head-title");
+  const iconEl = windowNode.querySelector(".window-head-icon");
+  if (
+    mode === WINDOW_CHROME_UNIFIED_SIDEBAR ||
+    mode === WINDOW_CHROME_UNIFIED_TOOLBAR
+  ) {
+    if (titleEl) {
+      titleEl.textContent = "";
+      titleEl.setAttribute("aria-hidden", "true");
+    }
+    if (iconEl) {
+      iconEl.setAttribute("aria-hidden", "true");
+    }
+  } else {
+    titleEl?.removeAttribute("aria-hidden");
+    iconEl?.removeAttribute("aria-hidden");
+  }
+  return mode;
 }
 
 export function desktopLabelForTarget(summary, targetId) {
@@ -393,23 +712,41 @@ function sortedDesktopTargets(summary) {
 export function initializeShellLayout(summary) {
   syncHomeBrowserState(summary);
   const stored = shellState.homeBrowserState.layout;
-  const normalizedDesktopHidden = normalizeDesktopHiddenTargets(
-    stored ? stored.desktopHidden : null,
+  /* Desktop philosophy (macOS): the desktop belongs to the user's objects —
+     files, folders, Trash. Apps live in the dock and the launcher. App icons
+     appear on the desktop only when the user explicitly adds them, so the
+     app list is opt-in (desktopApps), not opt-out. */
+  const normalizedDesktopApps = normalizeDesktopAppTargets(
+    stored && Array.isArray(stored.desktopApps)
+      ? stored.desktopApps
+      : defaultDesktopTargets(summary),
     summary,
   );
+  /* Layouts saved before the desktopApps model migrate here: their desktop
+     empties of app icons, so they get the default dock pins exactly once —
+     otherwise "where did my apps go" has no visible answer. Layouts that
+     know the model keep whatever dock the user chose, including empty. */
+  const migratingLayout = Boolean(stored) && !Array.isArray(stored.desktopApps);
+  const storedTaskbar = stored && Array.isArray(stored.taskbar) ? stored.taskbar : [];
   shellState.shellLayoutState = {
-    taskbar: normalizeTaskbarLayout(stored ? stored.taskbar : null, summary),
+    taskbar: normalizeTaskbarLayout(
+      !stored || (migratingLayout && storedTaskbar.length === 0)
+        ? defaultTaskbarPins(summary)
+        : storedTaskbar,
+      summary,
+    ),
     desktop: {},
     desktopLabels: normalizeDesktopLabels(stored ? stored.desktopLabels : null, summary),
-    desktopHidden: normalizedDesktopHidden,
+    desktopApps: normalizedDesktopApps,
     desktopIconsVisible: normalizeDesktopIconsVisible(stored ? stored.desktopIconsVisible : null),
   };
 
   let changed =
     !stored ||
+    migratingLayout ||
     !arrayEquals(
-      Array.isArray(stored.desktopHidden) ? stored.desktopHidden : [],
-      normalizedDesktopHidden,
+      Array.isArray(stored.desktopApps) ? stored.desktopApps : [],
+      normalizedDesktopApps,
     ) ||
     typeof stored.desktopIconsVisible !== "boolean";
   const storedDesktop = stored && stored.desktop && typeof stored.desktop === "object"
@@ -453,7 +790,25 @@ export function loadShellSessionState() {
   if (!session || typeof session !== "object") {
     return null;
   }
-  return session.browser_context_id === shellState.browserContextId ? session : null;
+  const storedContext = typeof session.browser_context_id === "string"
+    ? session.browser_context_id.trim()
+    : "";
+  if (!storedContext.startsWith("browser:")) {
+    /* Pre-context sessions still restore; next save stamps a context id. */
+    return session;
+  }
+  if (storedContext === shellState.browserContextId) {
+    return session;
+  }
+  /* Opaque GUI: localStorage throws, so each boot minted a fresh id and
+     wrongly dropped (then wiped) the host-persisted window session. Adopt
+     the server context. Real-origin browsers keep durable localStorage and
+     still reject foreign contexts after site-data clear. */
+  if (!browserContextDurable) {
+    shellState.browserContextId = storedContext;
+    return session;
+  }
+  return null;
 }
 
 export function saveShellSessionState(session) {
@@ -570,7 +925,7 @@ function normalizeDesktopLabels(labels, summary) {
   return normalized;
 }
 
-function normalizeDesktopHiddenTargets(targetIds, summary) {
+function normalizeDesktopAppTargets(targetIds, summary) {
   const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
   const normalized = [];
   for (const targetId of Array.isArray(targetIds) ? targetIds : []) {
@@ -584,6 +939,25 @@ function normalizeDesktopHiddenTargets(targetIds, summary) {
     normalized.push(targetId);
   }
   return normalized;
+}
+
+/* Fresh principals get a working dock instead of an empty bar: the everyday
+   surfaces, pinned in a fixed order. Purely a first-run default — the saved
+   layout owns the dock from the first change onward. */
+const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat-room", "system"];
+
+function defaultTaskbarPins(summary) {
+  const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
+  return DEFAULT_TASKBAR_PINS.filter((targetId) => knownTargets.has(targetId));
+}
+
+/* First-run desktop membership: object-kind targets (content projections)
+   belong on the desktop; app targets do not — they live in the dock and the
+   launcher until the user explicitly adds them. */
+function defaultDesktopTargets(summary) {
+  return allVisibleTargets(summary)
+    .filter((target) => target.target_kind === "object")
+    .map((target) => target.target);
 }
 
 function normalizeDesktopIconsVisible(value) {
@@ -665,6 +1039,22 @@ export function clampDesktopPosition(position) {
   };
 }
 
+// Snap a dropped icon to the nearest grid cell; fall back to the free-form
+// position when that cell is already occupied by another icon.
+export function snapDesktopPosition(entryId, position) {
+  const clamped = clampDesktopPosition(position);
+  const snapped = clampDesktopPosition({
+    x: DESKTOP_ICON_MARGIN +
+      Math.round((clamped.x - DESKTOP_ICON_MARGIN) / DESKTOP_ICON_GAP_X) * DESKTOP_ICON_GAP_X,
+    y: DESKTOP_ICON_MARGIN +
+      Math.round((clamped.y - DESKTOP_ICON_MARGIN) / DESKTOP_ICON_GAP_Y) * DESKTOP_ICON_GAP_Y,
+  });
+  if (desktopPositionOverlapsAny(snapped, occupiedDesktopPositionsExcept(entryId))) {
+    return clamped;
+  }
+  return snapped;
+}
+
 export function desktopPositionForTarget(targetId, defaultIndex) {
   const stored = shellState.shellLayoutState.desktop[targetId];
   if (stored) {
@@ -699,31 +1089,31 @@ export function setDesktopIconsVisible(visible) {
 }
 
 export function isTargetOnDesktop(targetId) {
-  return !shellState.shellLayoutState.desktopHidden.includes(targetId);
+  return shellState.shellLayoutState.desktopApps.includes(targetId);
 }
 
 export function addTargetToDesktop(targetId) {
-  const next = shellState.shellLayoutState.desktopHidden.filter(
-    (candidate) => candidate !== targetId,
-  );
-  if (arrayEquals(next, shellState.shellLayoutState.desktopHidden)) {
+  if (!shellState.currentSummary || !targetById(shellState.currentSummary, targetId)) {
     return false;
   }
-  shellState.shellLayoutState.desktopHidden = next;
+  if (shellState.shellLayoutState.desktopApps.includes(targetId)) {
+    return false;
+  }
+  shellState.shellLayoutState.desktopApps = [
+    ...shellState.shellLayoutState.desktopApps,
+    targetId,
+  ];
   return true;
 }
 
 export function removeTargetFromDesktop(targetId) {
-  if (!shellState.currentSummary || !targetById(shellState.currentSummary, targetId)) {
+  const next = shellState.shellLayoutState.desktopApps.filter(
+    (candidate) => candidate !== targetId,
+  );
+  if (arrayEquals(next, shellState.shellLayoutState.desktopApps)) {
     return false;
   }
-  if (shellState.shellLayoutState.desktopHidden.includes(targetId)) {
-    return false;
-  }
-  shellState.shellLayoutState.desktopHidden = [
-    ...shellState.shellLayoutState.desktopHidden,
-    targetId,
-  ];
+  shellState.shellLayoutState.desktopApps = next;
   return true;
 }
 
@@ -807,20 +1197,154 @@ export function clampDesktopLayoutToViewport() {
   return changed;
 }
 
+/* Tip-busted with home-gui assets so Shelf/Apps pick up new masters. */
+const APP_ICON_IDS = new Set([
+  "browser",
+  "library",
+  "documents",
+  "inbox",
+  "wallet",
+  "system",
+  "controls",
+  "chat-room",
+  "people",
+  "services",
+  "marketplace",
+  "archive-manager",
+  "gba-emulator",
+  "gba-ucity",
+  "bin",
+  "home",
+  "home-cli",
+  "home-gui",
+  "apps-launcher",
+  "capsules",
+  "security",
+  "elastos",
+  "intelligence",
+  "browser-engine",
+  "browser-exit",
+  "chains",
+  "content-index",
+  "content-storage",
+  "identity",
+  "network",
+  "storage",
+  "wallet-security",
+  "webspaces",
+  "metamask",
+  "unisat",
+  "walletconnect",
+]);
+
+/* Capsule / target names that do not match their icon folder id. */
+const APP_ICON_ALIASES = {
+  trash: "bin",
+  "trash-full": "bin",
+  chat: "chat-room",
+  launcher: "apps-launcher",
+  "browser-engine-adapter": "browser-engine",
+  "exit-provider": "browser-exit",
+  "chain-provider": "chains",
+  "content-block-graph-provider": "content-index",
+  "object-provider": "content-storage",
+  "did-provider": "identity",
+  "net-provider": "network",
+  "ipfs-provider": "storage",
+  "wallet-provider": "wallet-security",
+  "key-provider": "wallet-security",
+  "webspace-provider": "webspaces",
+  "site-provider": "webspaces",
+  "wallet-metamask": "metamask",
+  "wallet-unisat": "unisat",
+  "wallet-walletconnect": "walletconnect",
+  wc: "walletconnect",
+};
+
+export function resolveAppIconId(targetId) {
+  const id = String(targetId || "");
+  if (!id) {
+    return null;
+  }
+  if (APP_ICON_ALIASES[id]) {
+    return APP_ICON_ALIASES[id];
+  }
+  if (APP_ICON_IDS.has(id)) {
+    return id;
+  }
+  if (id.includes("wallet")) {
+    return "wallet";
+  }
+  if (id.includes("ucity")) {
+    return "gba-ucity";
+  }
+  if (id.includes("gba") || id.includes("emu") || id.includes("game")) {
+    return "gba-emulator";
+  }
+  if (id.includes("doc") || id.includes("md") || id.includes("viewer")) {
+    return "documents";
+  }
+  if (id.includes("file")) {
+    return "library";
+  }
+  if (id.includes("room")) {
+    return "chat-room";
+  }
+  return null;
+}
+
+function appIconMarkup(iconId) {
+  const v = APP_ICON_ASSET_VERSION;
+  const src128 = `./icons/${iconId}/icon-128.png?v=${v}`;
+  return `<img class="app-icon-img" src="${src128}" srcset="./icons/${iconId}/icon-64.png?v=${v} 64w, ./icons/${iconId}/icon-128.png?v=${v} 128w, ./icons/${iconId}/icon-256.png?v=${v} 256w" sizes="(max-width: 640px) 48px, 64px" alt="" draggable="false" />`;
+}
+
 export function mountGlyph(container, targetId, forcedTone) {
+  if (!container) {
+    return;
+  }
+  const iconId = resolveAppIconId(targetId);
+  if (iconId) {
+    container.dataset.tone = "raster";
+    container.dataset.icon = iconId;
+    delete container.dataset.forcedTone;
+    container.innerHTML = appIconMarkup(iconId);
+    return;
+  }
   const tone = forcedTone || glyphTone(targetId);
   container.dataset.tone = tone;
+  delete container.dataset.icon;
   container.innerHTML = glyphSvg(targetId);
+}
+
+export function formatBadgeCount(count, cap = 99) {
+  const n = Math.max(0, Number(count) || 0);
+  if (n === 0) {
+    return "";
+  }
+  return n > cap ? `${cap}+` : String(n);
+}
+
+/* Focus: host-persisted cosmetic pref. Mutes desktop toasts only — never
+   hides Inbox/Wallet rails or badge counts. */
+let focusModeMemory = "";
+
+export function focusModeEnabled() {
+  return focusModeMemory === "on";
+}
+
+export function setFocusModeEnabled(on) {
+  focusModeMemory = on ? "on" : "off";
 }
 
 export function glyphTone(targetId) {
   if (targetId === "trash" || targetId === "trash-full") {
     return "system";
   }
-  if (targetId === SYSTEM_APP_ID) {
+  if (targetId === SYSTEM_APP_ID || targetId === "home-cli") {
     return "system";
   }
-  if (targetId === "inbox") {
+  if (targetId === "inbox" || targetId === "library" || targetId === "archive-manager") {
     return "docs";
   }
   if (targetId === "marketplace") {
@@ -835,7 +1359,10 @@ export function glyphTone(targetId) {
   if (targetId.includes("file")) {
     return "docs";
   }
-  if (targetId.includes("room")) {
+  if (targetId === "chat" || targetId === "chat-room") {
+    return "room";
+  }
+  if (targetId.includes("room") || targetId === "services") {
     return "room";
   }
   if (targetId === PEOPLE_TARGET_ID) {
@@ -894,6 +1421,15 @@ function glyphSvg(targetId) {
         <path d="M6 9.25V18a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 18 18V9.25" />
         <path d="M9 13.25h6" />
         <path d="M9 16.25h4" />
+      </svg>
+    `;
+  }
+  if (targetId === "chat" || targetId === "chat-room") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5.5 6.75A2.25 2.25 0 0 1 7.75 4.5h8.5A2.25 2.25 0 0 1 18.5 6.75v6.5A2.25 2.25 0 0 1 16.25 15.5H12l-3.75 3.25V15.5H7.75A2.25 2.25 0 0 1 5.5 13.25Z" />
+        <path d="M9 9.25h6" />
+        <path d="M9 12h4" />
       </svg>
     `;
   }
@@ -964,6 +1500,43 @@ function glyphSvg(targetId) {
         <path d="M14 3.75V8h4" />
         <path d="M9 12h6" />
         <path d="M9 15h6" />
+      </svg>
+    `;
+  }
+  if (targetId === "library") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5 4.5v15" />
+        <path d="M9.5 4.5v15" />
+        <path d="M13.5 5.2l4.6 1.2-3.6 13.4-4.6-1.2z" />
+      </svg>
+    `;
+  }
+  if (targetId === "services") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="7" cy="12" r="2.5" />
+        <circle cx="17" cy="12" r="2.5" />
+        <path d="M9.5 12c1.2-2.8 3.8-2.8 5 0" />
+      </svg>
+    `;
+  }
+  if (targetId === "archive-manager") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M5.5 7.5h13v11a1.5 1.5 0 0 1-1.5 1.5h-10a1.5 1.5 0 0 1-1.5-1.5z" />
+        <path d="M5.5 7.5 7 4.5h10l1.5 3" />
+        <path d="M12 10.5v6" />
+        <path d="M10.25 13h3.5" />
+      </svg>
+    `;
+  }
+  if (targetId === "home-cli") {
+    return `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3.5" y="5" width="17" height="14" rx="2" />
+        <path d="m8 10 3 2-3 2" />
+        <path d="M13 14h3.5" />
       </svg>
     `;
   }
@@ -1041,4 +1614,33 @@ export function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+/* ---- Shell UI preferences snapshot ----
+   The Home host is the canonical store (opaque frames have no localStorage);
+   the GUI keeps the last relayed snapshot here so frames that mount LATER
+   (windows, wallet rail, connector sheet) can be brought up to the current
+   theme on load — change-time broadcasts only reach frames already open. */
+const sharedUiPreferences = {};
+
+export function rememberSharedUiPreferences(preferences) {
+  if (preferences && typeof preferences === "object") {
+    Object.assign(sharedUiPreferences, preferences);
+  }
+}
+
+export function pushUiPreferencesToFrameWindow(frameWindow) {
+  if (!frameWindow || Object.keys(sharedUiPreferences).length === 0) {
+    return;
+  }
+  try {
+    // Recipient is an opaque-sandboxed capsule frame ("null" origin); the
+    // payload is cosmetic theme state, no secrets.
+    frameWindow.postMessage(
+      { type: "elastos:ui-preference", preferences: { ...sharedUiPreferences } },
+      "*",
+    );
+  } catch (_error) {
+    // Frame mid-teardown.
+  }
 }

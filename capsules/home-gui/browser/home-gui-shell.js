@@ -1,24 +1,12 @@
 import {
-  bindHomeGuiInteractions,
-  attachAuthorizedHomeGuiTarget,
-  closeHomeGuiWindowForToken,
-  openHomeGuiTarget,
-  relaunchHomeGuiWindowForToken,
-  renewHomeGuiBrowserWindowAuthority,
-  restoreHomeGuiSession,
-  setHomeGuiMounted,
-  showHomeGuiDesktop,
-  syncHomeGuiProjection,
-} from "./home-gui.js?v=home-20260731b";
-import {
   acceptHomeBrowserContextId,
   hasHomeBrowserContextId,
   setHomeGuiLaunchToken,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260810mr";
 import {
   isTrustedHomeGuiMessage,
   projectHomeGuiAuthority,
-} from "./home-gui-authority.js?v=home-20260731b";
+} from "./home-gui-authority.js?v=home-20260810mr";
 
 const route = new URL(window.location.href);
 const fragment = new URLSearchParams(route.hash.replace(/^#/, ""));
@@ -42,10 +30,28 @@ let restoredSession = false;
 if (!homeToken || !homeOrigin || window.parent === window) {
   throw new Error("Home GUI requires an isolated Home launch");
 }
+/* Token must be set before home-gui.js evaluates — bindAgentHarness() probes
+   live inference during module init, and a miss caches Preview for PROBE_TTL. */
 setHomeGuiLaunchToken(homeToken);
 
 route.hash = "";
 window.history.replaceState(null, "", `${route.pathname}${route.search}`);
+
+const {
+  applyHomeGuiUiPreferences,
+  bindHomeGuiInteractions,
+  attachAuthorizedHomeGuiTarget,
+  closeHomeGuiWindowForToken,
+  noteHomeGuiConnectorSheetSummaryRefresh,
+  openHomeGuiTarget,
+  relaunchHomeGuiWindowForToken,
+  renewHomeGuiBrowserWindowAuthority,
+  restoreHomeGuiSession,
+  setHomeGuiMenuManifest,
+  setHomeGuiMounted,
+  showHomeGuiDesktop,
+  syncHomeGuiProjection,
+} = await import("./home-gui.js?v=home-20260810mr");
 
 function requestId() {
   if (window.crypto?.randomUUID) {
@@ -152,8 +158,39 @@ function handleGuiCommand(message) {
     showHomeGuiDesktop();
     return true;
   }
+  if (command === "set-menu-manifest") {
+    setHomeGuiMenuManifest(message.windowId, message.menus, message.homeToken);
+    return true;
+  }
+  if (command === "connector-summary-refresh") {
+    noteHomeGuiConnectorSheetSummaryRefresh(message.homeToken);
+    return true;
+  }
+  if (command === "ui-preference") {
+    applyHomeGuiUiPreferences(message.preferences);
+    return true;
+  }
   return false;
 }
+
+// Control Centre / GUI chrome write shell preferences through the host — the
+// only real-origin document, so the only working localStorage. The module
+// raises a DOM event; we carry the token.
+window.addEventListener("elastos:ui-preference-changed", (event) => {
+  const detail = event?.detail || {};
+  if (typeof detail.key !== "string" || typeof detail.value !== "string") {
+    return;
+  }
+  postToHome({ type: "home:ui-preference", action: "write", key: detail.key, value: detail.value });
+});
+
+// ElastOS menu Lock Screen — same host-mediated unlock prompt as 401/403
+// launch failures. Cosmetic chrome only; no new runtime surface.
+window.addEventListener("elastos:request-lock", () => {
+  requestHome("home:request-unlock").catch((error) => {
+    console.error("home-gui lock request failed", error);
+  });
+});
 
 async function handleBrowserAuthorityRenewalCommand(message) {
   const requestId =
