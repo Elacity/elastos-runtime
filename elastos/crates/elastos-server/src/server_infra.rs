@@ -524,6 +524,49 @@ async fn setup_server_infrastructure_impl(
         }
     }
 
+    // Model provider (offers/runs contract). Upstream URLs/ports/keys arrive
+    // only via operator-owned env → Init config.extra; never from callers
+    // (SSRF-closed). Replaces the ai/llama split on the contract path.
+    if let Some(path) = crate::find_installed_provider_binary("model-provider") {
+        let mut model_extra = serde_json::Map::new();
+        // Chat backend: reuse the operator's Flash/OpenAI-compat endpoint.
+        if let Some(v) = std::env::var("OLLAMA_URL").ok().filter(|v| {
+            v.starts_with("http://") || v.starts_with("https://")
+        }).map(|v| v.trim_end_matches('/').trim_end_matches("/chat/completions").to_string()) {
+            model_extra.insert("flash_url".into(), serde_json::Value::String(v));
+        }
+        if let Ok(v) = std::env::var("OLLAMA_MODEL") {
+            model_extra.insert("flash_model".into(), serde_json::Value::String(v));
+        }
+        // Video backend: H3 Generate upstream base (tunnel). CREATIVE_URL points
+        // at .../v1/videos/sync; the provider derives the base.
+        if let Some(v) = std::env::var("CREATIVE_URL").ok().filter(|v| {
+            v.starts_with("http://") || v.starts_with("https://")
+        }).map(|v| v.trim_end_matches('/').trim_end_matches("/v1/videos/sync").to_string()) {
+            model_extra.insert("h3_url".into(), serde_json::Value::String(v));
+        }
+        let model_config = provider::BridgeProviderConfig {
+            base_path: data_dir.to_string_lossy().to_string(),
+            extra: serde_json::Value::Object(model_extra),
+            ..Default::default()
+        };
+        match provider::ProviderBridge::spawn(&path, model_config).await {
+            Ok(bridge) => {
+                let provider: Arc<dyn provider::Provider> = Arc::new(
+                    provider::CapsuleProvider::with_scheme(Arc::new(bridge), "model"),
+                );
+                if let Err(e) = provider_registry
+                    .register_sub_provider("model", provider)
+                    .await
+                {
+                    tracing::warn!("Failed to register elastos://model sub-provider: {}", e);
+                }
+                tracing::info!("model-provider capsule from {}", path.display());
+            }
+            Err(e) => tracing::warn!("Failed to spawn model-provider: {}", e),
+        }
+    }
+
     if let Some(path) = crate::find_installed_provider_binary("content-block-graph-provider") {
         if let Err(e) = verify_provider_binary("content-block-graph-provider", &path) {
             tracing::warn!(

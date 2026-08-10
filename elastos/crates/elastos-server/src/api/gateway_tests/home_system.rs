@@ -1427,7 +1427,7 @@ async fn test_services_remote_exit_request_delivers_provider_inbox_notification(
     let request_id = action_id
         .strip_prefix("service-approve-request:")
         .expect("service approve action id prefix");
-    let approval_token = intent_token_for_app_context(
+    let approval_token = step_up_token_for_app_context(
         right.path(),
         INBOX_CAPSULE_ID,
         &right_inbox_token,

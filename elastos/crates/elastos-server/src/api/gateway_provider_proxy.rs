@@ -1370,6 +1370,18 @@ pub(super) async fn gateway_provider_proxy(
                     .into_response()
             }
         },
+        // Model provider offers/runs contract (P4.5 dogfood pivot).
+        "model" => match op.as_str() {
+            "offers_list" | "runs_create" | "runs_get" | "runs_events" | "runs_cancel"
+            | "ping" => &[HOME_GUI_SHELL_ID],
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "Gateway provider operation not found",
+                )
+                    .into_response()
+            }
+        },
         "inspect" => match op.as_str() {
             "capsules" | "capsule" | "self" | "plan" | "request_act" => &[SYSTEM_CAPSULE_ID],
             _ => {
