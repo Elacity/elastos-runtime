@@ -733,6 +733,7 @@ mod esp;
 #[path = "../gateway_browser_route_tests.rs"]
 mod gateway_browser_route_tests;
 mod gba;
+mod home_creative;
 mod home_system;
 mod inspect;
 mod library;
