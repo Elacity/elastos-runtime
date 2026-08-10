@@ -16,7 +16,7 @@ When running Cargo from the repository root, pass
 
 ## Requirements
 
-- Rust 1.89.0, pinned by the repository's
+- Rust 1.91.0, pinned by the repository's
   [`rust-toolchain.toml`](../rust-toolchain.toml)
 - Git
 

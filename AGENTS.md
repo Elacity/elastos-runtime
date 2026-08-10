@@ -6,8 +6,8 @@ lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 
 ## Branch Roles
 
-- `main` is the stable release line; it currently represents 0.5.0.
-- `upstream/0.6-dev` is the current 0.6 development integration line.
+- `main` is the stable release line; it currently represents 0.6.0.
+- `upstream/0.7-dev` is the current development integration line.
 - Feature and fix branches remain unpublished working lines until they are
   explicitly pushed for review.
 - Do not assume a `review/*` or `live` ref exists. Identify the exact public

@@ -35,6 +35,14 @@ The default human proof for Home. A passkey proves control of a local account to
 the runtime and unlocks short-lived sessions. It is not a wallet, not a DID, and
 normally does not expose raw key material for encryption.
 
+## Profile DID
+
+The stable person/contact identity used by signed People, discovery, accepted
+contacts, and direct-conversation identity. A Profile DID belongs to a
+principal-owned signed Profile document and remains stable across device
+replacement or revocation. It is not the passkey and not the local principal
+identifier.
+
 ## WebAuthn PRF
 
 A WebAuthn extension that can derive credential-bound secret output during a
@@ -46,9 +54,10 @@ session data.
 ## Device DID (`did:key`)
 
 The self-certifying device/node identity derived from local key material. The
-runtime currently uses `did:key` for Carrier/node signing and local provider
-identity. It is useful without a blockchain, but it does not prove a global
-name claim.
+runtime currently uses `did:key` for Carrier/node signing, routing, delivery
+attribution, and local provider identity. It is useful without a blockchain,
+but it is device/transport identity, not person/contact identity, and it does
+not prove a global name claim.
 
 ## Account DID (`did:elastos` / EID)
 
