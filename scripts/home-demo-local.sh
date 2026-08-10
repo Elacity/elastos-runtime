@@ -17,10 +17,6 @@ host_cargo() {
     HOME="$HOST_HOME" cargo "$@"
 }
 
-host_shell() {
-    HOME="$HOST_HOME" "$@"
-}
-
 usage() {
     cat <<'EOF'
 Usage:
@@ -31,15 +27,12 @@ Usage:
 
 What it does:
   1. Builds the repo-local elastos binary and Home CLI component (unless --skip-build)
-  2. Builds a local full-screen chat microVM bundle and stages it into the temp home
-  3. Installs into a clean temp home using the canonical maintainer DID + gateway
-  4. Generates a local override manifest so `setup --profile demo` and
-     `setup --profile chat` can use the current source demo profile plus the
-     locally staged chat bundle
-  5. Reuses host-installed `crosvm` / `vmlinux` when available
-  6. Runs `setup --profile demo` and `setup --profile chat`
-  7. Stages a tiny MyWebSite demo page
-  8. Launches repo-local `elastos` into Home (unless --prepare-only)
+  2. Installs into a clean temp home using the canonical maintainer DID + gateway
+  3. Generates a local override manifest for the current demo profile
+  4. Reuses host-installed `crosvm` / `vmlinux` when available
+  5. Runs `setup --profile demo`
+  6. Stages a tiny MyWebSite demo page
+  7. Launches repo-local `elastos` into Home (unless --prepare-only)
 
 When it finishes preparing, it prints the demo HOME path so you can reuse it.
 EOF
@@ -84,11 +77,9 @@ SITE_SRC="${DEMO_HOME}/demo-site"
 
 case "$(uname -m)" in
     x86_64)
-        CAPSULE_PLATFORM="x86_64-linux"
         SETUP_PLATFORM="linux-amd64"
         ;;
     aarch64|arm64)
-        CAPSULE_PLATFORM="aarch64-linux"
         SETUP_PLATFORM="linux-arm64"
         ;;
     *)
@@ -147,11 +138,6 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     host_cargo build --manifest-path "$ROOT/capsules/home-cli/Cargo.toml" --release --bin home-cli
 fi
 
-if [[ "$SKIP_BUILD" -eq 0 || ! -f "$ROOT/artifacts/chat.capsule.tar.gz" ]]; then
-    echo "[home-demo-local] build full-screen chat microVM bundle"
-    host_shell bash "$ROOT/scripts/build/build-rootfs.sh" chat --output "$ROOT/artifacts"
-fi
-
 echo "[home-demo-local] install clean temp-home runtime"
 HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
@@ -162,29 +148,6 @@ ELASTOS_SOURCE_CONNECT_TICKET="$HOST_SOURCE_CONNECT_TICKET" \
 ELASTOS_PUBLISHER_NODE_ID="$HOST_PUBLISHER_NODE_ID" \
 ELASTOS_IPNS_NAME="$HOST_IPNS_NAME" \
 bash "$ROOT/scripts/install.sh"
-
-echo "[home-demo-local] stage local chat bundle"
-CHAT_ARTIFACT_RAW="$ROOT/artifacts/chat.capsule.tar.gz"
-CHAT_ARTIFACT_STAGE="$DEMO_HOME/.chat-artifact-stage"
-CHAT_ARTIFACT="$DEMO_HOME/chat-${SETUP_PLATFORM}.tar.gz"
-CHAT_RELEASE_PATH="chat-local-${SETUP_PLATFORM}.tar.gz"
-HOST_PUBLISHER_ARTIFACTS="$HOST_HOME/.local/share/elastos/ElastOS/SystemServices/Publisher/artifacts"
-rm -rf "$CHAT_ARTIFACT_STAGE"
-mkdir -p "$CHAT_ARTIFACT_STAGE/chat"
-tar -xzf "$CHAT_ARTIFACT_RAW" -C "$CHAT_ARTIFACT_STAGE/chat"
-tar -czf "$CHAT_ARTIFACT" -C "$CHAT_ARTIFACT_STAGE" chat
-mkdir -p "$HOST_PUBLISHER_ARTIFACTS"
-cp "$CHAT_ARTIFACT" "$HOST_PUBLISHER_ARTIFACTS/$CHAT_RELEASE_PATH"
-CHAT_SHA="$(sha256sum "$CHAT_ARTIFACT" | awk '{print $1}')"
-CHAT_SIZE="$(stat -c '%s' "$CHAT_ARTIFACT")"
-CHAT_CID="local-chat-${CHAT_SHA:0:16}"
-CHAT_DIR="$XDG_DATA_HOME/elastos/capsules/chat"
-mkdir -p "$XDG_DATA_HOME/elastos/capsules"
-rm -rf "$CHAT_DIR"
-mkdir -p "$CHAT_DIR"
-tar -xzf "$CHAT_ARTIFACT" -C "$CHAT_DIR"
-printf '%s\n' "$CHAT_CID" > "$CHAT_DIR/.elastos-cid"
-printf '%s\n' "$CHAT_SHA" > "$CHAT_DIR/.elastos-artifact-sha256"
 
 echo "[home-demo-local] stage host KVM assets when available"
 mkdir -p "$XDG_DATA_HOME/elastos/bin"
@@ -212,14 +175,13 @@ LOCAL_MANIFEST="$DEMO_HOME/components.local.json"
 export HOST_CROSVM_PATH HOST_CROSVM_SHA HOST_CROSVM_SIZE
 export HOST_VMLINUX_PATH HOST_VMLINUX_SHA HOST_VMLINUX_SIZE
 python3 - "$ROOT/components.json" "$XDG_DATA_HOME/elastos/components.json" "$LOCAL_MANIFEST" \
-    "$SETUP_PLATFORM" "$CAPSULE_PLATFORM" "$CHAT_CID" "$CHAT_SHA" "$CHAT_SIZE" <<'PY'
+    "$SETUP_PLATFORM" <<'PY'
 import copy
 import json
 import os
 import sys
 
-source_path, installed_path, output_path, setup_platform, capsule_platform, chat_cid, chat_sha, chat_size = sys.argv[1:9]
-chat_size = int(chat_size)
+source_path, installed_path, output_path, setup_platform = sys.argv[1:5]
 
 with open(source_path, "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -238,30 +200,6 @@ for name, source_component in data.get("external", {}).items():
         merged = copy.deepcopy(source_platforms.get(plat, {}))
         merged.update(plat_info)
         source_platforms[plat] = merged
-
-data.setdefault("capsules", {})["chat"] = {
-    "cid": chat_cid,
-    "sha256": chat_sha,
-    "size": chat_size,
-    "platforms": [capsule_platform],
-}
-
-chat_component = data.setdefault("external", {}).setdefault("chat", {})
-chat_component.setdefault("version", "0.1.0")
-chat_component.setdefault("install_path", "capsules/chat")
-chat_component.setdefault(
-    "description",
-    "Packaged microVM chat bundle for the full-screen Carrier chat path",
-)
-chat_platforms = chat_component.setdefault("platforms", {})
-chat_platforms[setup_platform] = {
-    "cid": chat_cid,
-    "checksum": f"sha256:{chat_sha}",
-    "size": chat_size,
-    "release_path": f"chat-local-{setup_platform}.tar.gz",
-    "extract_path": "chat",
-    "install_path": "capsules/chat",
-}
 
 for name, install_path_env, sha_env, size_env in (
     ("crosvm", "HOST_CROSVM_PATH", "HOST_CROSVM_SHA", "HOST_CROSVM_SIZE"),
@@ -294,12 +232,6 @@ HOME="$DEMO_HOME" \
 XDG_DATA_HOME="$XDG_DATA_HOME" \
 ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
 "$ROOT/elastos/target/debug/elastos" setup --profile demo
-
-echo "[home-demo-local] setup chat profile"
-HOME="$DEMO_HOME" \
-XDG_DATA_HOME="$XDG_DATA_HOME" \
-ELASTOS_DATA_DIR="$ELASTOS_DATA_DIR" \
-"$ROOT/elastos/target/debug/elastos" setup --profile chat
 
 mkdir -p "$SITE_SRC"
 cat > "$SITE_SRC/index.html" <<'HTML'
