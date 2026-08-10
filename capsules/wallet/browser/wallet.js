@@ -1,11 +1,9 @@
-import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260523a";
-import {
-  createWalletApi,
+import { createWalletActivity } from "./wallet-activity.js?v=wallet-20260720k";
+import { createWalletApi,
   readHomeOrigin,
   readLaunchToken,
-  readQueryParam,
-} from "./wallet-api.js?v=wallet-20260715a";
-import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260523a";
+  readQueryParam } from "./wallet-api.js?v=wallet-20260720k";
+import { createWalletAccountActions } from "./wallet-account-actions.js?v=wallet-20260720k";
 import {
   BALANCE_NETWORKS,
   MANAGED_CHAIN_NAMESPACES,
@@ -13,8 +11,9 @@ import {
   METHOD_MONOGRAMS,
   accountDisplayBalance,
   accountName,
+  cardAddressDisplay,
+  cardNetworkLabel,
   chainLabel,
-  cssEscape,
   delta24h,
   formatAmount,
   formatMoney,
@@ -24,31 +23,29 @@ import {
   readText,
   shortAddress,
   validateAddress,
-} from "./wallet-format.js?v=wallet-20260523a";
-import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260711c";
-import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260711b";
-import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260523a";
-import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260731a";
-import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260711b";
-import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260523a";
-import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260726b";
+} from "./wallet-format.js?v=wallet-20260720k";
+import { createWalletFlows } from "./wallet-flows.js?v=wallet-20260720k";
+import { createWalletCreateAccountFlow } from "./wallet-create-account-flow.js?v=wallet-20260720k";
+import { createWalletReceiveFlow } from "./wallet-receive-flow.js?v=wallet-20260720k";
+import { createWalletRequests } from "./wallet-requests.js?v=wallet-20260720k";
+import { createWalletSendFlow } from "./wallet-send-flow.js?v=wallet-20260720k";
+import { createWalletStateLoader } from "./wallet-state.js?v=wallet-20260720k";
+import { createWalletPreferences } from "./wallet-preferences.js?v=wallet-20260720k";
 import {
   accountCard,
   copyButton,
+  copyIconButton,
   createWalletRender,
   emptyHero,
+  methodMark,
   setBusy,
   textNode,
-} from "./wallet-render.js?v=wallet-20260711c";
-import {
-  createHomeClipboardClient,
-} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+} from "./wallet-render.js?v=wallet-20260720k";
 
 const statusNode = document.querySelector("#wallet-status");
 const homeParentOrigin = readHomeOrigin();
 const accountsNode = document.querySelector("#wallet-accounts");
-const requestsNode = document.querySelector("#wallet-requests");
-const requestsPanelNode = document.querySelector("#wallet-requests-panel");
+const requestsNode = document.querySelector("#wallet-hero-pending");
 const stateNode = document.querySelector("#wallet-account-state");
 const accountActionsNode = document.querySelector(".wallet-section-actions");
 const balanceStateNode = document.querySelector("#wallet-balance-state");
@@ -57,18 +54,27 @@ const deltaNode = document.querySelector("#wallet-delta");
 const deltaValueNode = document.querySelector("#wallet-delta-value");
 const sendButton = document.querySelector("#wallet-send");
 const receiveButton = document.querySelector("#wallet-receive");
-const accountDetailNode = document.querySelector("#wallet-account-detail");
+const getStartedNode = document.querySelector("#wallet-get-started");
+const connectCtaButton = document.querySelector("#wallet-connect-cta");
+const signersSection = document.querySelector("#wallet-signers");
+const accountCardNode = document.querySelector("#wallet-account-card");
+const accountCardAddressNode = document.querySelector("#wallet-account-card-address");
+const accountCardCopyNode = document.querySelector("#wallet-account-card-copy");
+const accountCardNameNode = document.querySelector("#wallet-account-card-name");
+const accountCardNetworkNode = document.querySelector("#wallet-account-card-network");
+const heroSceneNode = document.querySelector(".wallet-hero-scene");
+const heroNode = document.querySelector(".wallet-hero");
+const heroBackNode = document.querySelector("#wallet-hero-back");
+const accountsSectionNode = document.querySelector(".wallet-accounts-section");
+const accountsBackNode = document.querySelector("#wallet-accounts-back");
 const modalBackdropNode = document.querySelector("#wallet-modal-backdrop");
 const modalNode = document.querySelector("#wallet-modal");
 const activityNode = document.querySelector("#wallet-activity");
 
 let activeHomeToken = readLaunchToken();
-const homeClipboard = createHomeClipboardClient({
-  targetId: "wallet",
-  homeOrigin: homeParentOrigin,
-  homeToken: activeHomeToken,
-});
-homeClipboard.start();
+if (activeHomeToken && homeParentOrigin && window.top !== window) {
+  window.top.postMessage({ type: "home:app-ready", homeToken: activeHomeToken }, homeParentOrigin);
+}
 let currentAccounts = [];
 let currentDefaults = [];
 let currentBalanceRows = [];
@@ -80,19 +86,27 @@ let currentRequests = [];
 let selectedAccountId = "";
 let reviewWalletRequestId = readQueryParam("wallet_request");
 let refreshWalletStateInFlight = null;
-const { fetchJson, notifyHomeSummaryChanged, requestPasskeyStepUp, shellHeaders } = createWalletApi({
+const { fetchJson, notifyHomeSummaryChanged, requestFreshPasskeyHomeToken, shellHeaders } = createWalletApi({
   getHomeToken: () => activeHomeToken,
 });
 const { showStatus } = createWalletRender({ statusNode });
 const {
   closeModal,
+  flowHost,
   flowRow,
   flowStaticRow,
   modalButton,
   openFlowModal,
   openInfoModal,
-} = createWalletFlows({ modalNode, modalBackdropNode, showStatus });
-const { renderActivity } = createWalletActivity({ activityNode, textNode });
+} = createWalletFlows({
+  modalNode,
+  modalBackdropNode,
+  heroNode,
+  heroBackNode,
+  accountsSectionNode,
+  accountsBackNode,
+  showStatus,
+});
 const { loadBalanceRows, loadPrices } = createWalletStateLoader({ fetchJson, shellHeaders });
 const {
   applyCurrencySelection,
@@ -102,47 +116,51 @@ const {
   getDisplayCurrency,
   getPrivacyMode,
   openApprovalMethod,
+  openDrawer,
   renderMethods,
+  togglePrivacy,
 } = createWalletPreferences({
+  closeModal,
   fetchJson,
   getHomeToken: () => activeHomeToken,
+  modalButton,
   notifyHomeSummaryChanged,
+  openFlowModal,
   renderAll,
-  requestPasskeyStepUp,
+  requestFreshPasskeyHomeToken,
   refreshWalletState,
   shellHeaders,
   showStatus,
 });
 const {
   onRequestClick,
+  openPendingReview,
   pendingWalletRequests,
   renderRequests,
 } = createWalletRequests({
   fetchJson,
   notifyHomeSummaryChanged,
   openApprovalMethod,
-  requestPasskeyStepUp,
+  requestFreshPasskeyHomeToken,
   refreshWalletState,
   requestsNode,
-  requestsPanelNode,
   shellHeaders,
   showStatus,
 });
+const { renderActivity } = createWalletActivity({
+  activityNode,
+  textNode,
+});
 const {
-  loadAccountQr,
   openReceiveFlow,
-  qrForAccount,
   renderReceiveAddress,
 } = createWalletReceiveFlow({
   buildViewAccounts,
   closeModal,
-  copyButton,
   fetchJson,
   flowRow,
   modalButton,
-  onQrReady: updateAccountQr,
   openFlowModal,
-  openInfoModal,
   selectedOrDefaultAccount,
   shellHeaders,
   textNode,
@@ -152,15 +170,15 @@ const { onCreateManagedWallet, openCreateAccountFlow, openImportRecoveryKeyFlow 
   buildViewAccounts,
   closeModal,
   fetchJson,
+  flowHost,
   flowRow,
   modalButton,
-  modalNode,
   nextAccountName,
   notifyHomeSummaryChanged,
   openFlowModal,
   readText,
   refreshWalletState,
-  requestPasskeyStepUp,
+  requestFreshPasskeyHomeToken,
   setBusy,
   shellHeaders,
   showStatus,
@@ -184,7 +202,7 @@ const { canSendFromAccount, openSendFlow } = createWalletSendFlow({
   readText,
   refreshWalletState,
   renderActivity,
-  requestPasskeyStepUp,
+  requestFreshPasskeyHomeToken,
   selectedOrDefaultAccount,
   setBusy,
   setCurrentRequests: (requests) => {
@@ -202,11 +220,11 @@ const { onAccountClick, onDocumentClick } = createWalletAccountActions({
   closeModal,
   copyText,
   fetchJson,
+  flowHost,
   flowRow,
   flowStaticRow,
   getSelectedAccountId: () => selectedAccountId,
   modalButton,
-  modalNode,
   notifyHomeSummaryChanged,
   openAccountDetail,
   openApprovalMethod,
@@ -214,7 +232,7 @@ const { onAccountClick, onDocumentClick } = createWalletAccountActions({
   openInfoModal,
   refreshWalletState,
   renderReceiveAddress,
-  requestPasskeyStepUp,
+  requestFreshPasskeyHomeToken,
   shellHeaders,
   showStatus,
 });
@@ -229,18 +247,153 @@ function boot() {
   document.addEventListener("click", onWalletActionClick);
   sendButton?.addEventListener("click", openSendFlow);
   receiveButton?.addEventListener("click", openReceiveFlow);
+  connectCtaButton?.addEventListener("click", focusSignersSection);
   modalBackdropNode?.addEventListener("click", closeModal);
   document.addEventListener("click", onDocumentClick);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      closeModal();
-      closeDrawers();
+    if (event.key !== "Escape") {
+      return;
+    }
+    const settingsDrawer = document.querySelector("#wallet-settings-drawer");
+    const activityDrawer = document.querySelector("#wallet-activity-drawer");
+    const hadOverlay = Boolean(
+      (modalNode && !modalNode.hidden)
+        || (settingsDrawer && !settingsDrawer.hidden)
+        || (activityDrawer && !activityDrawer.hidden)
+        || heroNode?.classList.contains("is-flipped")
+        || accountsSectionNode?.classList.contains("is-flipped"),
+    );
+    closeModal();
+    closeDrawers();
+    // Escape clears selection only when nothing was open — don't yank the
+    // hero account while dismissing Send/Receive or a drawer.
+    if (!hadOverlay) {
       clearAccountSelection();
     }
   });
   bindPreferenceEvents();
+  document.querySelector("#wallet-activity-open")?.addEventListener("click", openActivityChrome);
+  applyRailPresentationChrome();
   window.addEventListener("message", onRuntimeEvents);
+  window.addEventListener("message", onWalletRefreshMessage);
+  window.addEventListener("message", onShellMenuCommand);
+  window.addEventListener("message", onWalletChromeCommand);
+  announceShellMenuManifest();
   refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+}
+
+function applyRailPresentationChrome() {
+  // Rail: 3D card flip + Home owns nav chrome. Window: in-place morph (no flip).
+  const presentation = readQueryParam("presentation") === "rail" ? "rail" : "window";
+  document.documentElement.dataset.walletPresentation = presentation;
+  if (presentation === "rail") {
+    document.querySelector(".wallet-hero-nav")?.setAttribute("hidden", "");
+  }
+}
+
+function openActivityChrome() {
+  // Badge counts pending under Send/Receive — open that when any exist;
+  // otherwise show history in the Activity drawer.
+  const pending = pendingWalletRequests(currentRequests);
+  if (pending.length > 0) {
+    closeDrawers();
+    openPendingReview();
+    return;
+  }
+  openDrawer("activity");
+}
+
+function onWalletChromeCommand(event) {
+  // Rail chrome buttons live in the opaque-sandboxed Home GUI frame: its
+  // security origin serializes to "null" (location.origin here is the URL
+  // origin, never "null"). Pin the sender to our direct parent instead.
+  if (event.origin !== "null" || event.source !== window.parent) {
+    return;
+  }
+  const message = event.data;
+  if (message?.type !== "elastos:wallet-chrome-command" || typeof message.cmd !== "string") {
+    return;
+  }
+  switch (message.cmd) {
+    case "open-activity":
+    case "open-approvals":
+      openActivityChrome();
+      return;
+    case "open-settings":
+      openDrawer("settings");
+      return;
+    case "toggle-privacy":
+      togglePrivacy();
+      return;
+    case "close-overlays":
+      closeModal();
+      closeDrawers();
+      return;
+    default:
+  }
+}
+
+// Shell menu bar: declare File/Account menus to Home; commands come back as
+// elastos:menu-command and route to the same flows the buttons open. Every
+// entry still ends at the same passkey/approval gates — menus add no authority.
+function announceShellMenuManifest() {
+  if (!activeHomeToken || !homeParentOrigin || window.top === window) {
+    return;
+  }
+  window.top.postMessage({
+    type: "home:menu-manifest",
+    homeToken: activeHomeToken,
+    menus: [
+      {
+        title: "File",
+        items: [
+          { label: "Send...", cmd: "send" },
+          { label: "Receive...", cmd: "receive" },
+          "-",
+          { label: "Refresh", cmd: "refresh" },
+          "-",
+          { label: "Close Window", cmd: "__close-window" },
+        ],
+      },
+      {
+        title: "Account",
+        items: [
+          { label: "Create Account...", cmd: "create-account" },
+          { label: "Import Recovery Key...", cmd: "import-recovery-key" },
+        ],
+      },
+    ],
+  }, homeParentOrigin);
+}
+
+function onShellMenuCommand(event) {
+  // Menu commands come from the GUI menubar — our direct parent frame, which
+  // is opaque-sandboxed (security origin "null"), not the top-level host.
+  if (event.origin !== "null" || event.source !== window.parent) {
+    return;
+  }
+  const message = event.data;
+  if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+    return;
+  }
+  switch (message.cmd) {
+    case "send":
+      openSendFlow();
+      return;
+    case "receive":
+      openReceiveFlow();
+      return;
+    case "refresh":
+      refreshWalletState().catch((error) => showStatus(String(error.message || error), "error"));
+      return;
+    case "create-account":
+      openCreateAccountFlow();
+      return;
+    case "import-recovery-key":
+      openImportRecoveryKeyFlow();
+      return;
+    default:
+  }
 }
 
 function onRuntimeEvents(event) {
@@ -256,6 +409,22 @@ function onRuntimeEvents(event) {
       showStatus(String(error.message || error), "error"),
     );
   }
+}
+
+/* Shell pokes this after a connector ceremony succeeds. home:refresh-summary
+   only updates Home chrome — it does not reload Wallet accounts by itself. */
+function onWalletRefreshMessage(event) {
+  // Posted by the GUI rail / connector sheet — opaque parent frame ("null").
+  if (event.origin !== "null" || event.source !== window.parent) {
+    return;
+  }
+  const message = event.data || {};
+  if (message.type !== "elastos:wallet-refresh") {
+    return;
+  }
+  refreshWalletState().catch((error) =>
+    showStatus(String(error.message || error), "error"),
+  );
 }
 
 function walletRuntimeEventIsRelevant(event) {
@@ -330,13 +499,10 @@ async function loadWalletState() {
 function renderAll() {
   const allAccounts = buildViewAccounts();
   const pending = pendingWalletRequests(currentRequests);
-  const reviewRequests = reviewWalletRequestId
-    ? pending.filter((request) => readText(request.request_id) === reviewWalletRequestId)
-    : pending;
   renderHero(allAccounts);
   renderHeroAccount(allAccounts);
   renderAccounts(allAccounts);
-  const focusedRequestVisible = renderRequests(reviewRequests, reviewWalletRequestId);
+  const focusedRequestVisible = renderRequests(pending, reviewWalletRequestId);
   if (reviewWalletRequestId && focusedRequestVisible) {
     showStatus("Review and approve this request in Wallet.", "muted");
   } else if (reviewWalletRequestId) {
@@ -344,7 +510,39 @@ function renderAll() {
   }
   renderMethods(allAccounts, currentApprovalMethods);
   renderActivity(currentRequests);
+  renderApprovalsBadge(pending.length);
   updateFlowButtons(allAccounts);
+}
+
+function renderApprovalsBadge(pendingCount) {
+  const badge = document.querySelector("#wallet-approvals-badge");
+  const button = document.querySelector("#wallet-activity-open");
+  const count = Math.max(0, Number(pendingCount) || 0);
+  if (badge && button) {
+    if (count <= 0) {
+      badge.hidden = true;
+      badge.textContent = "";
+      button.setAttribute("aria-label", "Activity");
+    } else {
+      badge.hidden = false;
+      badge.textContent = count > 9 ? "9+" : String(count);
+      button.setAttribute(
+        "aria-label",
+        count === 1 ? "Activity, 1 pending" : `Activity, ${count} pending`,
+      );
+    }
+  }
+  if (window.parent !== window) {
+    // Parent is the opaque-sandboxed GUI frame: a concrete URL target never
+    // matches its "null" origin, so post with "*" (badge count is not secret).
+    window.parent.postMessage(
+      {
+        type: "wallet:pending-count",
+        count,
+      },
+      "*",
+    );
+  }
 }
 
 function buildViewAccounts() {
@@ -503,55 +701,43 @@ function renderHero(accounts) {
 
 function renderHeroAccount(accounts) {
   const account = selectedOrDefaultAccount(accounts);
-  accountDetailNode.replaceChildren();
+  if (!accountCardNode) {
+    return;
+  }
   if (!account) {
-    accountDetailNode.hidden = true;
+    accountCardNode.hidden = true;
+    heroSceneNode?.classList.remove("has-account-card");
+    if (accountCardCopyNode) {
+      accountCardCopyNode.replaceChildren();
+    }
     return;
   }
-  accountDetailNode.hidden = false;
-  accountDetailNode.setAttribute("aria-label", selectedAccountId ? "Selected account" : "Default account");
 
-  const inline = document.createElement("div");
-  inline.className = "wallet-detail-inline";
+  const privacy = getPrivacyMode();
+  const addressText = cardAddressDisplay(account.address, { privacy });
+  const networkText = cardNetworkLabel(account);
+  const selectionLabel = selectedAccountId ? `Selected · ${account.name}` : `Default · ${account.name}`;
 
-  const summary = document.createElement("div");
-  summary.className = "wallet-detail-summary";
-  summary.append(
-    textNode("strong", selectedAccountId ? account.name : `Default: ${account.name}`),
-    textNode("span", `${account.network} · ${account.method === "metamask" ? "MetaMask" : account.method === "btc" ? "Bitcoin" : "Passkey"}`),
-  );
+  accountCardNode.hidden = false;
+  heroSceneNode?.classList.add("has-account-card");
+  accountCardNode.classList.toggle("is-selected", Boolean(selectedAccountId));
+  accountCardNode.setAttribute("aria-label", `${selectionLabel}. ${networkText}`);
+  accountCardNode.title = `${account.name} · ${account.address}`;
 
-  const receive = document.createElement("div");
-  receive.className = "wallet-detail-qr";
-  receive.dataset.walletDetailQr = account.account_id;
-  const cachedQr = qrForAccount(account);
-  if (cachedQr) {
-    receive.innerHTML = cachedQr;
-  } else {
-    receive.append(textNode("span", "QR", "wallet-state"));
-    loadAccountQr(account);
+  if (accountCardAddressNode) {
+    accountCardAddressNode.textContent = addressText;
+    accountCardAddressNode.dataset.walletCopyAddress = account.address;
   }
-
-  const address = document.createElement("div");
-  address.className = "wallet-detail-address";
-  address.append(copyButton(account.address));
-
-  inline.append(summary, receive, address);
-  accountDetailNode.append(inline);
-}
-
-function updateAccountQr(account, svg) {
-  const qrBox = accountDetailNode.querySelector(
-    `[data-wallet-detail-qr="${cssEscape(account.account_id)}"]`,
-  );
-  if (!qrBox) {
-    return;
+  if (accountCardNameNode) {
+    accountCardNameNode.textContent = account.name;
   }
-  if (svg) {
-    qrBox.replaceChildren();
-    qrBox.innerHTML = svg;
-  } else {
-    qrBox.replaceChildren(textNode("span", "QR unavailable", "wallet-state"));
+  if (accountCardNetworkNode) {
+    accountCardNetworkNode.textContent = networkText;
+  }
+  if (accountCardCopyNode) {
+    accountCardCopyNode.replaceChildren(
+      copyIconButton(account.address, `Copy ${account.name} address`),
+    );
   }
 }
 
@@ -594,8 +780,9 @@ function accountMatchesDefault(account, defaultAccount) {
 function renderAccounts(accounts) {
   accountsNode.replaceChildren();
   stateNode.textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"}`;
+  // Create / Import stay visible even with accounts — never bury the path.
   if (accountActionsNode) {
-    accountActionsNode.hidden = accounts.length > 0;
+    accountActionsNode.hidden = false;
   }
   if (accounts.length === 0) {
     accountsNode.append(emptyHero());
@@ -612,8 +799,36 @@ function renderAccounts(accounts) {
 }
 
 function updateFlowButtons(accounts) {
-  sendButton.disabled = accounts.length === 0;
-  receiveButton.disabled = accounts.length === 0;
+  const empty = accounts.length === 0;
+  const canSend = accounts.some((account) => canSendFromAccount(account));
+  // Keep Send clickable when accounts exist but none are built-in sendable —
+  // the hero flip explains MetaMask vs Wallet Send instead of a dead control.
+  sendButton.disabled = empty;
+  receiveButton.disabled = empty;
+  if (sendButton) {
+    sendButton.hidden = empty;
+    sendButton.title = empty || canSend
+      ? "Send"
+      : "Wallet Send needs a built-in passkey account";
+    sendButton.setAttribute("aria-description", sendButton.title);
+  }
+  if (receiveButton) {
+    receiveButton.hidden = empty;
+  }
+  if (getStartedNode) {
+    getStartedNode.hidden = !empty;
+  }
+}
+
+function focusSignersSection() {
+  if (!signersSection) {
+    return;
+  }
+  signersSection.classList.add("is-highlighted");
+  signersSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  window.setTimeout(() => {
+    signersSection.classList.remove("is-highlighted");
+  }, 1600);
 }
 
 function openAccountDetail(accountId) {
@@ -634,10 +849,34 @@ function clearAccountSelection() {
   renderAll();
 }
 
-async function copyText(value, purpose = "wallet.address") {
+async function copyText(value) {
   const text = readText(value);
   if (!text) {
     throw new Error("Nothing to copy.");
   }
-  await homeClipboard.writeText(text, { purpose });
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Opaque frames without clipboard-write reject Clipboard API — try legacy path.
+  }
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.setAttribute("readonly", "");
+  input.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;";
+  document.body.appendChild(input);
+  input.focus();
+  input.select();
+  input.setSelectionRange(0, text.length);
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } finally {
+    input.remove();
+  }
+  if (!ok) {
+    throw new Error("Clipboard is unavailable in this window. Reopen Wallet and try again.");
+  }
 }

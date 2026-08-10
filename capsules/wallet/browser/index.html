@@ -4,58 +4,147 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wallet · ElastOS</title>
-<link rel="stylesheet" href="./style.css?v=wallet-20260523a">
+<script src="./elastos-theme.js"></script>
+<link rel="stylesheet" href="./elastos-ui.css">
+<link rel="stylesheet" href="./style.css?v=wallet-20260720m">
 </head>
 <body>
   <main class="wallet-shell" aria-label="Wallet">
     <section class="wallet-page">
-      <section class="wallet-hero" aria-label="Wallet balance">
-        <p id="wallet-status" class="wallet-status" hidden></p>
+      <!-- Nav is hero chrome (entropy), but outside the bordered flip card so
+           Send/Receive height morph never moves Activity/Settings/Hide. -->
+      <section class="wallet-hero" aria-label="Wallet balance" data-face="front">
         <nav class="wallet-hero-actions" aria-label="Wallet actions">
-          <button id="wallet-activity-open" class="wallet-nav-button" type="button" aria-label="Open activity">↻ Activity</button>
-          <button id="wallet-privacy" class="wallet-icon-button" type="button" aria-label="Hide balances" aria-pressed="false">◌</button>
-          <button id="wallet-settings-open" class="wallet-nav-button" type="button" aria-label="Open settings">✦ Settings</button>
+          <p id="wallet-status" class="wallet-status" hidden role="status" aria-live="polite"></p>
+          <div class="wallet-hero-nav">
+            <!-- Same marks as Home rail head so window ↔ rail chrome stays one language. -->
+            <button id="wallet-activity-open" class="wallet-nav-button wallet-nav-button-text" type="button" aria-label="Activity">
+              <svg class="wallet-nav-icon-svg" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3.25" y="2.5" width="9.5" height="11" rx="1.5" />
+                <path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" />
+              </svg>
+              <span>Activity</span>
+              <span id="wallet-approvals-badge" class="wallet-nav-badge" hidden></span>
+            </button>
+            <button id="wallet-settings-open" class="wallet-nav-button wallet-nav-button-text" type="button" aria-label="Open settings" title="Settings">
+              <svg class="wallet-nav-icon-svg" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+              </svg>
+              <span>Settings</span>
+            </button>
+            <button id="wallet-privacy" class="wallet-nav-button wallet-nav-button-text" type="button" aria-label="Hide balances" aria-pressed="false" title="Hide balances">
+              <svg class="wallet-nav-icon-svg" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M1.75 8s2.5-3.75 6.25-3.75S14.25 8 14.25 8s-2.5 3.75-6.25 3.75S1.75 8 1.75 8Z" />
+                <circle cx="8" cy="8" r="1.75" />
+              </svg>
+              <span>Hide</span>
+            </button>
+          </div>
         </nav>
-        <div class="wallet-hero-row">
-          <div class="wallet-hero-balance">
-            <p class="eyebrow">Total balance</p>
-            <div id="wallet-total-balance" class="wallet-total-value" aria-live="polite">$—,———</div>
-            <div class="wallet-action-row">
-              <button id="wallet-send" class="wallet-button" type="button">↗ Send</button>
-              <button id="wallet-receive" class="wallet-button wallet-button-secondary" type="button">↙ Receive</button>
+        <div class="wallet-hero-scene">
+          <div class="wallet-hero-flip">
+            <div class="wallet-hero-face wallet-hero-face-front">
+              <!-- Window: balance+actions left, identity card right. Rail: stack. -->
+              <div class="wallet-hero-row">
+                <div class="wallet-hero-balance">
+                  <div class="wallet-hero-balance-label-row">
+                    <p class="eyebrow">Total balance</p>
+                  </div>
+                  <div class="wallet-hero-balance-top">
+                    <div id="wallet-total-balance" class="wallet-total-value" aria-live="polite">$—,———</div>
+                    <div id="wallet-delta" class="wallet-delta" hidden>
+                      <span id="wallet-delta-value">+0.00% · 24h</span>
+                    </div>
+                  </div>
+                </div>
+                <section
+                  id="wallet-account-card"
+                  class="wallet-account-card"
+                  aria-label="Selected account"
+                  hidden
+                >
+                  <div class="wallet-account-card-top">
+                    <div class="wallet-account-card-brand">
+                      <img
+                        class="wallet-account-card-logo"
+                        src="./elastos-logo.svg"
+                        alt="ElastOS"
+                        draggable="false"
+                      />
+                    </div>
+                    <div class="wallet-account-card-chip" aria-hidden="true">
+                      <span class="wallet-account-card-chip-pads"></span>
+                    </div>
+                  </div>
+                  <div class="wallet-account-card-number-row">
+                    <code id="wallet-account-card-address" class="wallet-account-card-address"></code>
+                    <span id="wallet-account-card-copy" class="wallet-account-card-copy"></span>
+                  </div>
+                  <div class="wallet-account-card-foot">
+                    <span id="wallet-account-card-name" class="wallet-account-card-name"></span>
+                    <span id="wallet-account-card-network" class="wallet-account-card-network"></span>
+                  </div>
+                </section>
+                <div class="wallet-action-row">
+                  <button id="wallet-send" class="wallet-button" type="button">↗ Send</button>
+                  <button id="wallet-receive" class="wallet-button wallet-button-secondary" type="button">↙ Receive</button>
+                </div>
+                <!-- Pending approvals live under Send/Receive (history stays in Activity drawer). -->
+                <div id="wallet-hero-pending" class="wallet-hero-pending" hidden aria-live="polite"></div>
+                <div id="wallet-get-started" class="wallet-action-row wallet-get-started" hidden>
+                  <button class="wallet-button" type="button" data-wallet-create-account>Create account</button>
+                  <button id="wallet-connect-cta" class="wallet-button wallet-button-secondary" type="button">
+                    Connect a wallet
+                  </button>
+                </div>
+              </div>
+              <p id="wallet-balance-state" class="wallet-state">Loading balances</p>
             </div>
+            <div
+              id="wallet-hero-back"
+              class="wallet-hero-face wallet-hero-face-back"
+              hidden
+              aria-live="polite"
+            ></div>
           </div>
-          <div id="wallet-delta" class="wallet-delta" hidden>
-            <svg id="wallet-sparkline" class="wallet-sparkline" viewBox="0 0 56 20" aria-hidden="true">
-              <polyline points="0,15 8,13 16,14 24,9 32,10 40,6 48,8 56,4" />
-            </svg>
-            <span id="wallet-delta-value">+0.00% · 24h</span>
-          </div>
-          <section id="wallet-account-detail" class="wallet-detail" aria-label="Default account"></section>
         </div>
-        <p id="wallet-balance-state" class="wallet-state">Loading balances</p>
       </section>
 
-      <section class="wallet-section" aria-label="Accounts">
+      <section class="wallet-section wallet-accounts-section" aria-label="Accounts" data-face="front">
         <div class="wallet-section-heading">
           <div>
             <h1>Accounts</h1>
             <span id="wallet-account-state" class="wallet-state">0 accounts</span>
           </div>
           <div class="wallet-section-actions" aria-label="Account actions">
-            <button class="wallet-button wallet-button-secondary" type="button" data-wallet-create-account>+ Create account</button>
-            <button class="wallet-button wallet-button-secondary" type="button" data-wallet-import-recovery-key>Import Wallet key</button>
+            <button class="wallet-button wallet-button-secondary" type="button" data-wallet-create-account aria-label="Create account">+ Create</button>
+            <button class="wallet-button wallet-button-secondary" type="button" data-wallet-import-recovery-key aria-label="Import Wallet key">↓ Import</button>
           </div>
         </div>
-        <div id="wallet-accounts" class="wallet-account-grid" aria-live="polite"></div>
+        <div class="wallet-accounts-scene">
+          <div class="wallet-accounts-flip">
+            <div class="wallet-accounts-face wallet-accounts-face-front">
+              <div id="wallet-accounts" class="wallet-account-grid" aria-live="polite"></div>
+            </div>
+            <div
+              id="wallet-accounts-back"
+              class="wallet-accounts-face wallet-accounts-face-back"
+              hidden
+              aria-live="polite"
+            ></div>
+          </div>
+        </div>
       </section>
 
-      <section id="wallet-requests-panel" class="wallet-section wallet-requests-panel" hidden>
+      <section id="wallet-signers" class="wallet-section" aria-label="Wallets and signers">
         <div class="wallet-section-heading">
-          <h2>Requests</h2>
-          <span class="wallet-state">Approve only what you recognize.</span>
+          <div>
+            <h2>Wallets &amp; signers</h2>
+            <span class="wallet-state">Built-in accounts for Wallet Send, or link MetaMask / UniSat / WalletConnect to approve.</span>
+          </div>
         </div>
-        <div id="wallet-requests" class="wallet-request-list" aria-live="polite"></div>
+        <div id="wallet-methods" class="wallet-methods"></div>
       </section>
     </section>
 
@@ -63,42 +152,31 @@
 
     <aside id="wallet-settings-drawer" class="wallet-drawer wallet-settings-drawer" hidden aria-label="Settings">
       <header class="wallet-drawer-header">
+        <div>
+          <p class="eyebrow">Wallet</p>
+          <h2>Settings</h2>
+        </div>
         <button class="wallet-icon-button" type="button" data-wallet-close-drawer aria-label="Close settings">×</button>
       </header>
       <div class="wallet-settings">
         <div class="wallet-settings-main">
           <section class="wallet-settings-card">
-            <h3>Manage accounts</h3>
-            <button id="wallet-create" class="wallet-button" type="button" data-wallet-create-account>Create account</button>
-            <button id="wallet-import-recovery-key" class="wallet-button wallet-button-secondary" type="button" data-wallet-import-recovery-key>Import Wallet recovery key</button>
-          </section>
-          <section class="wallet-settings-card">
             <h3>Display currency</h3>
             <div id="wallet-currency-settings" class="wallet-segmented wallet-segmented-full" role="group" aria-label="Settings currency">
-              <button type="button" data-wallet-currency="btc">BTC</button>
               <button type="button" data-wallet-currency="usd">USD</button>
+              <button type="button" data-wallet-currency="btc">BTC</button>
               <button type="button" data-wallet-currency="ela">ELA</button>
             </div>
           </section>
-          <section class="wallet-settings-card">
-            <h3>Privacy mode</h3>
-            <button id="wallet-privacy-settings" class="wallet-button wallet-button-secondary" type="button">Hide balances</button>
-          </section>
         </div>
-        <aside class="wallet-settings-side" aria-label="Approval methods">
-          <section class="wallet-settings-card">
-            <h3>Approval methods</h3>
-            <div id="wallet-methods" class="wallet-methods"></div>
-          </section>
-        </aside>
       </div>
     </aside>
 
     <aside id="wallet-activity-drawer" class="wallet-drawer" hidden aria-label="Activity">
       <header class="wallet-drawer-header">
         <div>
-          <p class="eyebrow">Activity</p>
-          <h2>Recent requests</h2>
+          <p class="eyebrow">Wallet</p>
+          <h2>Recent activity</h2>
         </div>
         <button class="wallet-icon-button" type="button" data-wallet-close-drawer aria-label="Close activity">×</button>
       </header>
@@ -108,6 +186,6 @@
     <div id="wallet-modal-backdrop" class="wallet-modal-backdrop" hidden></div>
     <section id="wallet-modal" class="wallet-modal" hidden aria-live="polite"></section>
   </main>
-  <script type="module" src="./wallet.js?v=wallet-20260726b"></script>
+  <script type="module" src="./wallet.js?v=wallet-20260720k"></script>
 </body>
 </html>

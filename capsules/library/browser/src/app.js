@@ -34,9 +34,6 @@ import {
   visibleObjectsForState,
 } from "./state.js";
 import { createLibraryUploads } from "./uploads.js";
-import {
-  createHomeClipboardClient,
-} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
     const viewPreferences = new Map();
     const viewPreferenceStore = {
@@ -50,12 +47,9 @@ import {
       perfTarget: (window.__libraryPerf = window.__libraryPerf || {}),
     });
     const homeOrigin = queryParams.get("home_origin") || "";
-    const homeClipboard = createHomeClipboardClient({
-      targetId: "library",
-      homeOrigin,
-      homeToken: state.homeToken,
-    });
-    homeClipboard.start();
+    if (state.homeToken && homeOrigin && window.top !== window) {
+      window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeOrigin);
+    }
     const {
       providerApi: runtimeProviderApi,
       uploadObject,
@@ -318,12 +312,6 @@ import {
       startCreateObject,
       state,
       uploadObject,
-      writeResourceIdentifier: (identifier) =>
-        homeClipboard.writeText(identifier, {
-          purpose: "resource.identifier",
-        }),
-      writeResourceUri: (uri) =>
-        homeClipboard.writeText(uri, { purpose: "resource.uri" }),
     }));
 
     function isAttachMode() {
@@ -937,14 +925,7 @@ import {
       const localContentCid = contentCid(object);
       const publicCid = publishedCid(object);
       if (localContentCid) {
-        actions.push(
-          menuAction("Copy Content CID", () =>
-            copyText(
-              localContentCid,
-              "content CID",
-              "resource.identifier",
-            )),
-        );
+        actions.push(menuAction("Copy Content CID", () => copyText(localContentCid, "content CID")));
       }
       if (object.published && publicCid) {
         actions.push(menuAction("Copy Published Link", () => copyText("elastos://" + publicCid, "published link")));
@@ -1278,11 +1259,13 @@ import {
 
     // Shell menu bar: declare File/View menus to Home; commands come back as
     // elastos:menu-command and route to the same functions the toolbar uses.
+    // Post to window.top with homeOrigin — the opaque GUI parent cannot receive
+    // a URL-origin target, and only the host relays manifests into the menubar.
     function announceMenuManifest() {
-      if (!state.homeToken || window.parent === window) {
+      if (!state.homeToken || !homeOrigin || window.top === window) {
         return;
       }
-      window.parent.postMessage({
+      window.top.postMessage({
         type: "home:menu-manifest",
         homeToken: state.homeToken,
         menus: [
@@ -1309,7 +1292,7 @@ import {
             ],
           },
         ],
-      }, window.location.origin);
+      }, homeOrigin);
     }
 
     function handleMenuCommand(cmd) {
@@ -1340,7 +1323,8 @@ import {
     }
 
     window.addEventListener("message", (event) => {
-      if (event.origin !== window.location.origin) {
+      // Menu commands come from the opaque GUI parent (security origin "null").
+      if (event.origin !== "null" || event.source !== window.parent) {
         return;
       }
       const message = event.data;

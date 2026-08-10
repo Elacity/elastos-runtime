@@ -54,15 +54,15 @@ export function createLibraryDialog({
     const technicalRows = [
       ["Object ID", identity.objectId],
       ["Object kind", identity.kind],
-      ["Content ID", copyableValue(identity.contentId, "content ID", "resource.identifier")],
-      ["Published CID", copyableValue(identity.publishedId, "published CID", "resource.identifier")],
+      ["Content ID", copyableValue(identity.contentId, "content ID")],
+      ["Published CID", copyableValue(identity.publishedId, "published CID")],
       ["Service", identity.provider],
       ["Object URI", copyableValue(object.uri || "-", "object URI")],
       ["Content URI", copyableValue(identity.contentUri, "content URI")],
-      ["Head", copyableValue(identity.headId, "object head", "resource.identifier")],
+      ["Head", copyableValue(identity.headId, "object head")],
       ["Revision", object.revision || "-"],
       ["Resolver", identity.resolver],
-      ["Resolver Target", copyableValue(identity.resolverTarget, "resolver target", "resource.identifier")],
+      ["Resolver Target", copyableValue(identity.resolverTarget, "resolver target")],
       ["Access Policy", identity.accessPolicy],
       ["Availability", availability.status],
       ["Replicas", availability.replicas],
@@ -142,13 +142,12 @@ export function createLibraryDialog({
       const text = displayValue(value.value);
       if (text === "-") return { title: text, html: escapeHtml(text) };
       const label = value.label || "value";
-      const purpose = value.purpose || "resource.uri";
       return {
         title: text,
         html: `
           <span class="props-copy-value">
             <code class="props-copy-text">${escapeHtml(text)}</code>
-            <button class="props-copy-btn" type="button" data-prop-copy="${escapeHtml(text)}" data-copy-label="${escapeHtml(label)}" data-copy-purpose="${escapeHtml(purpose)}" title="Copy ${escapeHtml(label)}">
+            <button class="props-copy-btn el-copy-btn" type="button" data-prop-copy="${escapeHtml(text)}" data-copy-label="${escapeHtml(label)}" title="Copy ${escapeHtml(label)}">
               ${copyIconSvg()}
             </button>
           </span>
@@ -166,8 +165,8 @@ export function createLibraryDialog({
     return { title: text, html: escapeHtml(text) };
   }
 
-  function copyableValue(value, label, purpose = "resource.uri") {
-    return { kind: "copyable", value, label, purpose };
+  function copyableValue(value, label) {
+    return { kind: "copyable", value, label };
   }
 
   function badgeValue(value, tone) {
@@ -179,7 +178,10 @@ export function createLibraryDialog({
   }
 
   function copyIconSvg() {
-    return '<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+    return [
+      '<svg class="el-copy-icon" aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
+      '<svg class="el-copy-check" aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" hidden><path d="M3.25 8.25l3 3 6.5-6.5"></path></svg>',
+    ].join("");
   }
 
   function propertiesVisibilitySummary(object = {}, identity = {}, remoteAccess = {}) {
@@ -871,19 +873,22 @@ export function createLibraryDialog({
       if (propertyCopy) {
         const value = propertyCopy.getAttribute("data-prop-copy") || "";
         const label = propertyCopy.getAttribute("data-copy-label") || "value";
-        const purpose =
-          propertyCopy.getAttribute("data-copy-purpose") || "resource.uri";
         if (value && copyText) {
-          copyText(value, label, purpose)
-            .then(() => {
-              propertyCopy.classList.add("copied");
-              propertyCopy.setAttribute("aria-label", `Copied ${label}`);
-              setTimeout(() => {
-                propertyCopy.classList.remove("copied");
-                propertyCopy.removeAttribute("aria-label");
-              }, 1200);
-            })
-            .catch(() => {});
+          copyText(value, label).catch(() => {});
+          propertyCopy.classList.add("copied");
+          propertyCopy.dataset.copied = "true";
+          propertyCopy.setAttribute("aria-label", `Copied ${label}`);
+          const copyIcon = propertyCopy.querySelector(".el-copy-icon");
+          const checkIcon = propertyCopy.querySelector(".el-copy-check");
+          if (copyIcon) copyIcon.hidden = true;
+          if (checkIcon) checkIcon.hidden = false;
+          setTimeout(() => {
+            propertyCopy.classList.remove("copied");
+            delete propertyCopy.dataset.copied;
+            propertyCopy.removeAttribute("aria-label");
+            if (copyIcon) copyIcon.hidden = false;
+            if (checkIcon) checkIcon.hidden = true;
+          }, 1400);
         }
         return;
       }

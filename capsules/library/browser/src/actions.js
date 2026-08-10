@@ -44,8 +44,6 @@ export function createLibraryActions({
   startCreateObject,
   state,
   uploadObject,
-  writeResourceIdentifier,
-  writeResourceUri,
 }) {
   async function openObject(object) {
     if (!object) return;
@@ -563,14 +561,8 @@ export function createLibraryActions({
     await loadCurrentFolder();
   }
 
-  async function copyText(value, label, purpose = "resource.uri") {
-    if (purpose === "resource.identifier") {
-      await writeResourceIdentifier(value);
-    } else if (purpose === "resource.uri") {
-      await writeResourceUri(value);
-    } else {
-      throw new Error("Library Clipboard purpose is denied.");
-    }
+  async function copyText(value, label) {
+    await navigator.clipboard.writeText(value);
     setStatus(`Copied ${label}.`);
   }
 

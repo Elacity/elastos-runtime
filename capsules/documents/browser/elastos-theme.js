@@ -6,24 +6,22 @@
  * have NO localStorage (every access throws), so the Home host is the
  * canonical store and preferences travel by message:
  *
- *   host localStorage["elastos.ui.theme"]         = "dark" | "light" | "auto"
- *   host localStorage["elastos.ui.accent"]        = preset | "custom"
- *   host localStorage["elastos.ui.accentCustom"]  = "#rrggbb" (when custom)
+ *   host localStorage["elastos.ui.theme"]  = "dark" | "light" | "auto"
+ *   host localStorage["elastos.ui.accent"] = "blue" | "purple" | "pink" |
+ *       "red" | "orange" | "yellow" | "green" | "graphite"
  *
  * Dark is the default theme when unset; blue is the default accent. "auto"
  * follows prefers-color-scheme. The resolved theme is applied as
  * data-el-theme="light" on <html> (absence means dark); the accent as
  * data-el-accent (absence means blue) — both activate token blocks in
- * elastos-ui.css. Custom accent sets data-el-accent="custom" and writes
- * --el-accent / --el-accent-ink inline. Cross-document sync is the shell's
- * `elastos:ui-preference` message (opaque parent only); localStorage +
- * `storage` events remain a best-effort path for standalone same-origin docs.
+ * elastos-ui.css. Cross-document sync is the shell's `elastos:ui-preference`
+ * message (opaque parent only); localStorage + `storage` events remain a
+ * best-effort path for standalone same-origin documents.
  */
 (function () {
   const KEY = "elastos.ui.theme";
   const ACCENT_KEY = "elastos.ui.accent";
-  const ACCENT_CUSTOM_KEY = "elastos.ui.accentCustom";
-  const ACCENT_PRESETS = [
+  const ACCENTS = [
     "blue",
     "purple",
     "pink",
@@ -33,7 +31,6 @@
     "green",
     "graphite",
   ];
-  const DEFAULT_CUSTOM_HEX = "#4f7fff";
   const media = window.matchMedia
     ? window.matchMedia("(prefers-color-scheme: light)")
     : null;
@@ -43,7 +40,6 @@
   // persistence stays with the shell's canonical store.
   let memoryPreference = "";
   let memoryAccent = "";
-  let memoryAccentCustom = "";
 
   function preference() {
     if (memoryPreference) {
@@ -67,79 +63,19 @@
     return pref;
   }
 
-  function normalizeHex(value) {
-    if (typeof value !== "string") {
-      return "";
-    }
-    let hex = value.trim();
-    if (/^#[0-9A-Fa-f]{3}$/.test(hex)) {
-      hex = `#${hex[1]}${hex[1]}${hex[2]}${hex[2]}${hex[3]}${hex[3]}`;
-    }
-    if (!/^#[0-9A-Fa-f]{6}$/.test(hex)) {
-      return "";
-    }
-    return hex.toLowerCase();
-  }
-
-  function accentInkForHex(hex) {
-    const normalized = normalizeHex(hex);
-    if (!normalized) {
-      return "#ffffff";
-    }
-    const channel = (offset) => Number.parseInt(normalized.slice(offset, offset + 2), 16) / 255;
-    const linearize = (channelValue) => (
-      channelValue <= 0.03928
-        ? channelValue / 12.92
-        : ((channelValue + 0.055) / 1.055) ** 2.4
-    );
-    const luminance = (
-      0.2126 * linearize(channel(1))
-      + 0.7152 * linearize(channel(3))
-      + 0.0722 * linearize(channel(5))
-    );
-    return luminance > 0.55 ? "#161616" : "#ffffff";
-  }
-
   function accentPreference() {
     if (memoryAccent) {
       return memoryAccent;
     }
     try {
       const value = localStorage.getItem(ACCENT_KEY);
-      if (ACCENT_PRESETS.includes(value) || value === "custom") {
+      if (ACCENTS.includes(value)) {
         return value;
       }
     } catch (_error) {
       // Storage may be unavailable; fall through to the default.
     }
     return "blue";
-  }
-
-  function accentCustomPreference() {
-    if (memoryAccentCustom) {
-      return memoryAccentCustom;
-    }
-    try {
-      const value = normalizeHex(localStorage.getItem(ACCENT_CUSTOM_KEY) || "");
-      if (value) {
-        return value;
-      }
-    } catch (_error) {
-      // Storage may be unavailable; fall through to the default.
-    }
-    return DEFAULT_CUSTOM_HEX;
-  }
-
-  function clearInlineAccent() {
-    document.documentElement.style.removeProperty("--el-accent");
-    document.documentElement.style.removeProperty("--el-accent-ink");
-  }
-
-  function applyCustomAccentVars(hex) {
-    const normalized = normalizeHex(hex) || DEFAULT_CUSTOM_HEX;
-    document.documentElement.setAttribute("data-el-accent", "custom");
-    document.documentElement.style.setProperty("--el-accent", normalized);
-    document.documentElement.style.setProperty("--el-accent-ink", accentInkForHex(normalized));
   }
 
   function apply() {
@@ -149,11 +85,6 @@
       document.documentElement.removeAttribute("data-el-theme");
     }
     const accent = accentPreference();
-    if (accent === "custom") {
-      applyCustomAccentVars(accentCustomPreference());
-      return;
-    }
-    clearInlineAccent();
     if (accent === "blue") {
       document.documentElement.removeAttribute("data-el-accent");
     } else {
@@ -164,12 +95,7 @@
   apply();
 
   window.addEventListener("storage", (event) => {
-    if (
-      event.key === KEY
-      || event.key === ACCENT_KEY
-      || event.key === ACCENT_CUSTOM_KEY
-      || event.key === null
-    ) {
+    if (event.key === KEY || event.key === ACCENT_KEY || event.key === null) {
       apply();
     }
   });
@@ -201,9 +127,6 @@
     if (typeof preferences.theme === "string") {
       window.elastosTheme.set(preferences.theme);
     }
-    if (typeof preferences.accentCustom === "string") {
-      window.elastosTheme.setAccentCustom(preferences.accentCustom);
-    }
     if (typeof preferences.accent === "string") {
       window.elastosTheme.setAccent(preferences.accent);
     }
@@ -222,13 +145,10 @@
       }
       apply();
     },
-    accents: ACCENT_PRESETS.slice(),
+    accents: ACCENTS.slice(),
     accent: accentPreference,
-    accentCustom: accentCustomPreference,
-    normalizeHex,
-    accentInkForHex,
     setAccent(value) {
-      const accent = ACCENT_PRESETS.includes(value) || value === "custom" ? value : "blue";
+      const accent = ACCENTS.includes(value) ? value : "blue";
       memoryAccent = accent;
       try {
         localStorage.setItem(ACCENT_KEY, accent);
@@ -236,22 +156,6 @@
         // Storage unavailable (opaque frame) — the memory override applies.
       }
       apply();
-    },
-    setAccentCustom(value) {
-      const hex = normalizeHex(value);
-      if (!hex) {
-        return false;
-      }
-      memoryAccentCustom = hex;
-      try {
-        localStorage.setItem(ACCENT_CUSTOM_KEY, hex);
-      } catch (_error) {
-        // Storage unavailable (opaque frame) — the memory override applies.
-      }
-      if (accentPreference() === "custom") {
-        apply();
-      }
-      return true;
     },
   };
 })();

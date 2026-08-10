@@ -11,7 +11,7 @@ export function createWalletCreateAccountFlow({
   openFlowModal,
   readText,
   refreshWalletState,
-  requestPasskeyStepUp,
+  requestFreshPasskeyHomeToken,
   setBusy,
   shellHeaders,
   showStatus,
@@ -195,15 +195,15 @@ export function createWalletCreateAccountFlow({
         recovery_key: recoveryKey,
         label: label || null,
       };
-      const stepUpToken = await requestPasskeyStepUp(
+      const homeToken = await requestFreshPasskeyHomeToken(
         "wallet.recovery-key.import",
         intent,
       );
       await fetchJson("/api/apps/wallet/wallet/accounts/import-recovery-key", {
         method: "POST",
-        headers: shellHeaders({ "content-type": "application/json" }),
+        headers: shellHeaders({ "content-type": "application/json" }, homeToken),
         body: JSON.stringify({
-          step_up_token: stepUpToken,
+          home_token: homeToken,
           ...intent,
         }),
       });
