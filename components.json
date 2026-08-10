@@ -570,6 +570,33 @@
         }
       }
     },
+    "model-provider": {
+      "install_path": "bin/model-provider",
+      "description": "Model provider - serves model inference offers/runs from configured backends without exposing upstream URLs, ports, or credentials to app capsules",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "model-provider-linux-amd64",
+          "install_path": "bin/model-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "model-provider-linux-arm64",
+          "install_path": "bin/model-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "model-provider-darwin-arm64",
+          "install_path": "bin/model-provider"
+        }
+      }
+    },
     "content-block-graph-provider": {
       "install_path": "bin/content-block-graph-provider",
       "description": "Host block graph provider binary for Runtime-mediated arbitrary DAG repair",

@@ -493,7 +493,8 @@ provider_names() {
         webspace-provider \
         object-provider \
         content-block-graph-provider \
-        ipfs-provider
+        ipfs-provider \
+        model-provider
 }
 
 PROVIDER_NAMES_JSON="$(provider_names | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
