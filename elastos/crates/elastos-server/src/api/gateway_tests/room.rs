@@ -1,6 +1,38 @@
 use super::*;
 
+mod direct;
+
 struct MockPeerProvider;
+
+fn room_store_snapshot(data_dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn collect(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        output: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(current) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(root, &path, output);
+            } else if path.is_file() {
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                output.insert(relative, std::fs::read(path).unwrap());
+            }
+        }
+    }
+
+    let root = elastos_common::localhost::rooted_localhost_fs_path(
+        data_dir,
+        crate::room_service::room_root_uri(),
+    )
+    .unwrap();
+    let mut output = std::collections::BTreeMap::new();
+    collect(&root, &root, &mut output);
+    output
+}
 
 #[async_trait::async_trait]
 impl Provider for MockPeerProvider {
@@ -40,92 +72,6 @@ impl Provider for MockPeerProvider {
             })),
         }
     }
-}
-
-async fn poll_chat_room_until<F>(
-    app: Router,
-    token: &str,
-    predicate: F,
-    label: &str,
-) -> serde_json::Value
-where
-    F: Fn(&serde_json::Value) -> bool,
-{
-    let mut last = serde_json::Value::Null;
-    for _ in 0..80 {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/chat-room/poll")
-                    .header(AUTHORIZATION, format!("Bearer {token}"))
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"since":0}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        last = serde_json::from_slice(&body).unwrap();
-        if predicate(&last) {
-            return last;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("{label} did not converge; last poll: {last}");
-}
-
-async fn summary_chat_room_until<F>(app: Router, predicate: F, label: &str) -> serde_json::Value
-where
-    F: Fn(&serde_json::Value) -> bool,
-{
-    let mut last = serde_json::Value::Null;
-    for _ in 0..80 {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/apps/chat-room/summary")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        last = serde_json::from_slice(&body).unwrap();
-        if predicate(&last) {
-            return last;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("{label} did not converge; last summary: {last}");
-}
-
-async fn wait_for_peer_request<F>(
-    runtime: &FakeRuntimeHandle,
-    predicate: F,
-    label: &str,
-) -> serde_json::Value
-where
-    F: Fn(&serde_json::Value) -> bool,
-{
-    for _ in 0..80 {
-        let requests = runtime.provider_requests.lock().await;
-        if let Some(request) = requests.iter().find(|request| predicate(request)) {
-            return request.clone();
-        }
-        drop(requests);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let requests = runtime.provider_requests.lock().await;
-    panic!("{label} did not occur; requests: {requests:?}");
 }
 
 #[tokio::test]
@@ -186,6 +132,9 @@ async fn test_gateway_carrier_bootstrap_route_returns_live_ticket() {
         .unwrap();
     let app = gateway_router(GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
@@ -229,6 +178,9 @@ async fn test_gateway_carrier_bootstrap_prefers_managed_runtime_ticket() {
         .unwrap();
     let app = gateway_router(GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
@@ -265,6 +217,9 @@ async fn test_gateway_carrier_bootstrap_publisher_role_uses_gateway_ticket() {
         .unwrap();
     let app = gateway_router(GatewayState {
         provider_registry: Some(registry),
+        collaboration_chat_product_port: None,
+        collaboration_presence_product_port: None,
+        collaboration_discovery_service: None,
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
@@ -293,8 +248,6 @@ async fn test_gateway_carrier_bootstrap_publisher_role_uses_gateway_ticket() {
 #[tokio::test]
 async fn test_chat_room_summary_is_available_without_shell_launch_token() {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "summary-peer").await;
     let app = gateway_router(test_state(dir.path()));
 
     let summary = app
@@ -315,389 +268,19 @@ async fn test_chat_room_summary_is_available_without_shell_launch_token() {
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(payload["room_slug"], "chat-room");
     assert!(payload["browser_access_allowed"].is_boolean());
-}
-
-#[tokio::test]
-async fn test_chat_room_transport_uses_home_identity_with_split_managed_runtime_identity() {
-    let home_dir = tempfile::tempdir().unwrap();
-    let runtime_identity_dir = tempfile::tempdir().unwrap();
-    let (_, home_did) = elastos_identity::load_or_create_did(home_dir.path()).unwrap();
-    let (_, runtime_did) =
-        elastos_identity::load_or_create_did(runtime_identity_dir.path()).unwrap();
-    assert_ne!(home_did, runtime_did);
-
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime_with_identity_dir(
-        home_dir.path(),
-        runtime_identity_dir.path(),
-        bus,
-        "split-identity-peer",
-    )
-    .await;
-
-    crate::room_service::seed_room_owner(
-        home_dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: home_did.clone(),
-            title: "Split Identity Room".to_string(),
-        },
-    )
-    .unwrap();
-    let room_token = crate::room_service::start_local_runtime_session(
-        home_dir.path(),
-        &home_did,
-        "Owner",
-        "Home",
-    )
-    .unwrap()
-    .token;
-    let app = gateway_router(test_state(home_dir.path()));
-
-    let send = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/apps/chat-room/objects/send")
-                .header(AUTHORIZATION, format!("Bearer {room_token}"))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"body":"split identity transport check"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = send.status();
-    let body = axum::body::to_bytes(send.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-
-    let sent = wait_for_peer_request(
-        &runtime,
-        |request| request["scheme"] == "peer" && request["op"] == "gossip_send",
-        "room send Carrier broadcast",
-    )
-    .await;
-    assert_eq!(sent["body"]["sender_id"].as_str(), Some(home_did.as_str()));
-    assert_ne!(
-        sent["body"]["sender_id"].as_str(),
-        Some(runtime_did.as_str())
+    assert_eq!(payload["transport"]["configured"], false);
+    assert_eq!(payload["transport"]["available"], false);
+    assert_eq!(
+        payload["transport"]["status"],
+        "Collaboration is isolated on this Runtime."
     );
-
-    let message = sent["body"]["message"].as_str().unwrap();
-    let ts = sent["body"]["ts"].as_u64().unwrap();
-    let signature = sent["body"]["signature"].as_str().unwrap();
-    let payload_hex = elastos_common::chat_protocol::signing_payload_hex(&home_did, ts, message);
-    let payload = hex::decode(payload_hex).unwrap();
-    let sig_bytes = hex::decode(signature).unwrap();
-    let signature = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
-    crate::crypto::decode_did_key(&home_did)
-        .unwrap()
-        .verify(&payload, &signature)
-        .unwrap();
-    assert!(crate::crypto::decode_did_key(&runtime_did)
-        .unwrap()
-        .verify(&payload, &signature)
-        .is_err());
-}
-
-#[tokio::test]
-async fn test_chat_room_poll_does_not_rebroadcast_local_backlog() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_, did) = elastos_identity::load_or_create_did(dir.path()).unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime(dir.path(), bus, "poll-no-replay-peer").await;
-
-    crate::room_service::seed_room_owner(
-        dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: did.clone(),
-            title: "No Replay Room".to_string(),
-        },
-    )
-    .unwrap();
-    let room_token =
-        crate::room_service::start_local_runtime_session(dir.path(), &did, "Owner", "Home")
-            .unwrap()
-            .token;
-    let appended = crate::room_service::append_object_with_transport(
-        dir.path(),
-        &room_token,
-        "local backlog should not replay",
-    )
-    .unwrap();
-    assert!(appended.transport_envelope.is_some());
-
-    let app = gateway_router(test_state(dir.path()));
-    let poll = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/apps/chat-room/poll")
-                .header(AUTHORIZATION, format!("Bearer {room_token}"))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"since":0}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = poll.status();
-    let body = axum::body::to_bytes(poll.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-
-    let requests = runtime.provider_requests.lock().await;
-    assert!(
-        !requests
-            .iter()
-            .any(|request| request["scheme"] == "peer" && request["op"] == "gossip_send"),
-        "poll should receive from Carrier, not rebroadcast stale local history"
-    );
-}
-
-#[tokio::test]
-async fn test_chat_room_transport_uses_trusted_source_bootstrap() {
-    let dir = tempfile::tempdir().unwrap();
-    save_trusted_sources(
-        dir.path(),
-        &TrustedSourcesConfig {
-            schema: "elastos.trusted-sources/v1".to_string(),
-            default_source: "default".to_string(),
-            sources: vec![TrustedSource {
-                name: "default".to_string(),
-                publisher_dids: vec![],
-                channel: "stable".to_string(),
-                discovery_uri: String::new(),
-                connect_ticket: "trusted-source-ticket".to_string(),
-                gateways: vec![],
-                install_path: String::new(),
-                installed_version: String::new(),
-                head_cid: String::new(),
-                publisher_node_id: "trusted-source-peer".to_string(),
-                ipns_name: String::new(),
-            }],
-        },
-    )
-    .unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime(dir.path(), bus, "trusted-source-client").await;
-    let app = gateway_router(test_state(dir.path()));
-
-    let summary = summary_chat_room_until(
-        app,
-        |summary| summary["transport"]["connected_peer_count"] == 1,
-        "trusted-source bootstrap",
-    )
-    .await;
-    assert_eq!(summary["transport"]["connected_peer_count"], 1);
-    let summary_text = summary.to_string();
-    assert!(
-        !summary_text.contains("trusted-source-ticket"),
-        "Chat Room summary must not expose raw trusted-source ticket authority"
-    );
-    assert!(
-        !summary_text.contains("connect_ticket"),
-        "Chat Room summary must not expose trusted-source connect_ticket fields"
-    );
-    let _ = wait_for_peer_request(
-        &runtime,
-        |request| {
-            request["scheme"] == "peer"
-                && request["op"] == "remember_peer"
-                && request["body"]["ticket"] == "trusted-source-ticket"
-        },
-        "trusted-source Carrier peer remember",
-    )
-    .await;
-    let _ = wait_for_peer_request(
-        &runtime,
-        |request| {
-            request["scheme"] == "peer"
-                && request["op"] == "gossip_join"
-                && request["body"]["topic"] == "__elastos_internal/room-sync-v1/chat-room"
-                && request["body"]["mode"] == "direct"
-        },
-        "trusted-source direct topic join",
-    )
-    .await;
-    let _ = wait_for_peer_request(
-        &runtime,
-        |request| {
-            request["scheme"] == "peer"
-                && request["op"] == "gossip_join_peers"
-                && request["body"]["topic"] == "__elastos_internal/room-sync-v1/chat-room"
-                && request["body"]["peers"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|peer| peer == "trusted-source-peer")
-        },
-        "trusted-source topic peer join",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_chat_room_transport_prefers_live_gateway_bootstrap() {
-    let bootstrap_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bootstrap_addr = bootstrap_listener.local_addr().unwrap();
-    let bootstrap_server = tokio::spawn(async move {
-        let app = axum::Router::new().route(
-            "/.well-known/elastos/carrier-bootstrap.json",
-            get(|| async {
-                axum::Json(json!({
-                    "schema": "elastos.carrier.bootstrap/v1",
-                    "transport": "carrier",
-                    "ticket": "fresh-gateway-ticket",
-                    "node_id": "fresh-gateway-node"
-                }))
-            }),
-        );
-        axum::serve(bootstrap_listener, app).await.unwrap();
-    });
-
-    let dir = tempfile::tempdir().unwrap();
-    save_trusted_sources(
-        dir.path(),
-        &TrustedSourcesConfig {
-            schema: "elastos.trusted-sources/v1".to_string(),
-            default_source: "default".to_string(),
-            sources: vec![TrustedSource {
-                name: "default".to_string(),
-                publisher_dids: vec![],
-                channel: "stable".to_string(),
-                discovery_uri: String::new(),
-                connect_ticket: "stale-stamped-ticket".to_string(),
-                gateways: vec![format!("http://{bootstrap_addr}")],
-                install_path: String::new(),
-                installed_version: String::new(),
-                head_cid: String::new(),
-                publisher_node_id: "stale-source-peer".to_string(),
-                ipns_name: String::new(),
-            }],
-        },
-    )
-    .unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime(dir.path(), bus, "live-bootstrap-client").await;
-    let app = gateway_router(test_state(dir.path()));
-
-    let _ = summary_chat_room_until(
-        app,
-        |summary| summary["transport"]["connected_peer_count"] == 1,
-        "live gateway bootstrap",
-    )
-    .await;
-    let _ = wait_for_peer_request(
-        &runtime,
-        |request| {
-            request["scheme"] == "peer"
-                && request["op"] == "remember_peer"
-                && request["body"]["ticket"] == "fresh-gateway-ticket"
-        },
-        "live gateway Carrier peer remember",
-    )
-    .await;
-    let requests = runtime.provider_requests.lock().await;
-    assert!(!requests.iter().any(|request| {
-        request["scheme"] == "peer"
-            && request["op"] == "remember_peer"
-            && request["body"]["ticket"] == "stale-stamped-ticket"
-    }));
-    bootstrap_server.abort();
-}
-
-#[tokio::test]
-async fn test_chat_room_transport_joins_bootstrap_peer_after_topic_already_joined() {
-    let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime(dir.path(), bus, "late-bootstrap-client").await;
-    let app = gateway_router(test_state(dir.path()));
-
-    let first = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/apps/chat-room/summary")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    let _ = wait_for_peer_request(
-        &runtime,
-        |request| {
-            request["scheme"] == "peer"
-                && request["op"] == "gossip_join"
-                && request["body"]["mode"] == "dht"
-        },
-        "initial DHT topic join",
-    )
-    .await;
-
-    save_trusted_sources(
-        dir.path(),
-        &TrustedSourcesConfig {
-            schema: "elastos.trusted-sources/v1".to_string(),
-            default_source: "default".to_string(),
-            sources: vec![TrustedSource {
-                name: "default".to_string(),
-                publisher_dids: vec![],
-                channel: "stable".to_string(),
-                discovery_uri: String::new(),
-                connect_ticket: "trusted-source-ticket".to_string(),
-                gateways: vec![],
-                install_path: String::new(),
-                installed_version: String::new(),
-                head_cid: String::new(),
-                publisher_node_id: "trusted-source-peer".to_string(),
-                ipns_name: String::new(),
-            }],
-        },
-    )
-    .unwrap();
-
-    let _ = wait_for_peer_request(
-        &runtime,
-        |request| {
-            request["scheme"] == "peer"
-                && request["op"] == "gossip_join"
-                && request["body"]["mode"] == "direct"
-        },
-        "late direct topic join",
-    )
-    .await;
-    let _ = wait_for_peer_request(
-        &runtime,
-        |request| {
-            request["scheme"] == "peer"
-                && request["op"] == "gossip_join_peers"
-                && request["body"]["peers"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|peer| peer == "trusted-source-peer")
-        },
-        "late trusted-source topic peer join",
-    )
-    .await;
-    let summary = summary_chat_room_until(
-        app,
-        |summary| summary["transport"]["connected_peer_count"] == 1,
-        "late trusted-source bootstrap",
-    )
-    .await;
-    assert_eq!(summary["transport"]["connected_peer_count"], 1);
 }
 
 #[tokio::test]
 async fn test_chat_room_session_start_connects_open_room_local_runtime() {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "open-room-peer").await;
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_profile(dir.path(), "anders");
 
     let launch = app
         .clone()
@@ -743,10 +326,9 @@ async fn test_chat_room_session_start_connects_open_room_local_runtime() {
 #[tokio::test]
 async fn test_chat_room_join_link_create_returns_elastos_join_object() {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "join-link-peer").await;
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let profile = load_profile_for_authority(dir.path(), &authority);
 
     let launch = app
         .clone()
@@ -818,30 +400,37 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
         crate::room_service::decode_room_join_invite_token(invite_token).unwrap();
     assert_eq!(payload["issuer_gateway"], "https://elastos.elacitylabs.com");
     assert_eq!(payload["room_title"], "Chat");
-    assert_eq!(payload["invited_by"], signer_did);
+    assert_eq!(
+        payload["invited_by_profile_did"],
+        profile.document().profile_did
+    );
     assert_eq!(
         envelope.payload.issuer_gateway,
         "https://elastos.elacitylabs.com"
     );
     assert_eq!(envelope.payload.room_title, "Chat");
-    assert_eq!(envelope.payload.invited_by, signer_did);
+    assert_eq!(
+        envelope.payload.invited_by_profile_did,
+        profile.document().profile_did
+    );
+    assert_ne!(signer_did, profile.document().profile_did);
 }
 
 #[tokio::test]
 async fn test_chat_room_session_start_requires_active_local_member_for_seeded_room() {
     let dir = tempfile::tempdir().unwrap();
+    let (_owner_device_did, owner_profile) =
+        test_signed_room_profile(dir.path(), 41, "Owner", Some("owner"));
     crate::room_service::seed_room_owner(
         dir.path(),
+        &owner_profile,
         crate::room_service::RoomOwnerSeedInput {
-            owner_did: "did:key:z6seededowner".to_string(),
             title: "Exclusive Room".to_string(),
         },
     )
     .unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "seeded-room-peer").await;
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_profile(dir.path(), "anders");
 
     let launch = app
         .clone()
@@ -889,19 +478,17 @@ async fn test_chat_room_session_start_requires_active_local_member_for_seeded_ro
 #[tokio::test]
 async fn test_chat_room_session_start_connects_active_local_member() {
     let dir = tempfile::tempdir().unwrap();
-    let (_, did) = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let profile = load_profile_for_authority(dir.path(), &authority);
     crate::room_service::seed_room_owner(
         dir.path(),
+        &profile,
         crate::room_service::RoomOwnerSeedInput {
-            owner_did: did.clone(),
             title: "Local Room".to_string(),
         },
     )
     .unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "active-room-peer").await;
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
 
     let launch = app
         .clone()
@@ -928,7 +515,7 @@ async fn test_chat_room_session_start_connects_active_local_member() {
             test_browser_request("localhost:61180", "null")
                 .method("POST")
                 .uri("/api/apps/chat-room/session/start")
-                .header("x-elastos-home-token", token)
+                .header("x-elastos-home-token", token.as_str())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -944,61 +531,151 @@ async fn test_chat_room_session_start_connects_active_local_member() {
     assert!(cookie.starts_with("room-session="));
     assert_eq!(payload["status"], "connected");
     assert_eq!(payload["display_name"], "anders");
+    assert!(payload["poll"]["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|participant| participant.get("member_did").is_none()));
 }
 
 #[tokio::test]
-async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_cookie() {
+async fn test_chat_room_configured_send_uses_signed_home_authority_and_scoped_port() {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "shell-room-peer").await;
-    let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let (_owner_device_did, owner_profile) =
+        test_signed_room_profile(dir.path(), 42, "Hostile Owner", Some("hostile-owner"));
+    let owner_profile_did = owner_profile.document().profile_did.clone();
+    crate::room_service::seed_room_owner(
+        dir.path(),
+        &owner_profile,
+        crate::room_service::RoomOwnerSeedInput {
+            title: "Hostile legacy room".to_string(),
+        },
+    )
+    .unwrap();
+    crate::room_service::update_room_access_policy(
+        dir.path(),
+        crate::room_service::RoomAccessPolicyUpdateInput {
+            actor_did: owner_profile_did,
+            allow_guest_invites: false,
+            allow_member_invites: false,
+            allow_members_to_host_guests: false,
+        },
+    )
+    .unwrap();
+    let room_root = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        crate::room_service::room_root_uri(),
+    )
+    .unwrap();
+    let members_path = room_root.join("room/members.json");
+    let control_path = room_root.join("room/control.json");
+    let objects_path = room_root.join("room/objects.json");
+    let members_before = std::fs::read(&members_path).unwrap();
+    let control_before = std::fs::read(&control_path).unwrap();
+    let unscoped_objects_before =
+        serde_json::from_slice::<Vec<serde_json::Value>>(&std::fs::read(&objects_path).unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|object| object.get("collaboration_scope").is_none())
+            .count();
+    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let port = crate::collaboration_product::test_chat_product_port(
+        dir.path(),
+        "route-network",
+        "route-conversation",
+    );
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port = Some(port.clone());
+    let app = gateway_router(state);
+    let token =
+        projection_launch_token_for_authority_context(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
 
-    let launch = app
-        .clone()
-        .oneshot(
-            test_browser_request("localhost:61180", "http://localhost:61180")
-                .method("POST")
-                .uri("/api/apps/home/launch")
-                .header("x-elastos-home-token", authority.home_token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"target":"chat-room"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(launch.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let route = payload["route"].as_str().unwrap();
-    let token = test_launch_token_from_route(route);
-
-    let send = app
+    for request in [
+        Request::builder()
+            .uri("/api/apps/chat-room/summary")
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .uri("/api/apps/chat-room/summary")
+            .header("x-elastos-home-token", "forged")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let summary = app
         .clone()
         .oneshot(
             test_browser_request("localhost:61180", "null")
-                .method("POST")
-                .uri("/api/apps/chat-room/objects/send")
+                .uri("/api/apps/chat-room/summary")
                 .header("x-elastos-home-token", token.as_str())
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"body":"hello from shell"}"#))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    let status = send.status();
-    let send_body = axum::body::to_bytes(send.into_body(), usize::MAX)
+    let summary_status = summary.status();
+    let summary_body = axum::body::to_bytes(summary.into_body(), usize::MAX)
         .await
         .unwrap();
     assert_eq!(
-        status,
+        summary_status,
         StatusCode::OK,
         "{}",
-        String::from_utf8_lossy(&send_body)
+        String::from_utf8_lossy(&summary_body)
     );
+    let summary: serde_json::Value = serde_json::from_slice(&summary_body).unwrap();
+    assert_eq!(summary["transport"]["configured"], true);
+    assert_eq!(summary["transport"]["available"], true);
+    assert!(summary["transport"].get("connected_peer_count").is_none());
+    assert!(summary["transport"].get("topic").is_none());
+    assert_eq!(summary["browser_access_allowed"], false);
+    assert!(summary.get("room_control").is_none());
+    assert!(summary.get("pending_requests").is_none());
+    assert!(summary.get("active_sessions").is_none());
+    assert!(summary.get("canonical_hosted_guest_url").is_none());
 
-    let poll = app
+    for request in [
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/chat-room/session/start")
+            .body(Body::empty())
+            .unwrap(),
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/chat-room/session/start")
+            .header("x-elastos-home-token", "forged")
+            .body(Body::empty())
+            .unwrap(),
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/chat-room/poll")
+            .header("x-elastos-home-token", "forged")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"since":0}"#))
+            .unwrap(),
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/chat-room/session/leave")
+            .header("x-elastos-home-token", "forged")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    assert!(crate::room_service::load_summary(dir.path())
+        .unwrap()
+        .active_sessions
+        .is_empty());
+    let missing_session_poll = app
+        .clone()
         .oneshot(
             test_browser_request("localhost:61180", "null")
                 .method("POST")
@@ -1010,23 +687,493 @@ async fn test_chat_room_shell_requests_use_shell_launch_authority_without_room_c
         )
         .await
         .unwrap();
-    let status = poll.status();
-    let poll_body = axum::body::to_bytes(poll.into_body(), usize::MAX)
+    assert_eq!(missing_session_poll.status(), StatusCode::UNAUTHORIZED);
+    assert!(crate::room_service::load_summary(dir.path())
+        .unwrap()
+        .active_sessions
+        .is_empty());
+
+    let session = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/session/start")
+                .header("x-elastos-home-token", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::OK);
+    let room_cookie = room_cookie_header(&session);
+    let session_body = axum::body::to_bytes(session.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let session_payload: serde_json::Value = serde_json::from_slice(&session_body).unwrap();
+    assert!(session_payload.get("session_token").is_none());
+    assert_eq!(session_payload["poll"]["transport"]["configured"], true);
+    assert_eq!(session_payload["poll"]["objects"], json!([]));
+    assert_eq!(
+        crate::room_service::load_summary(dir.path())
+            .unwrap()
+            .active_sessions
+            .len(),
+        1
+    );
+
+    let send_request = || {
+        test_browser_request("localhost:61180", "null")
+            .method("POST")
+            .uri("/api/apps/chat-room/objects/send")
+            .header("x-elastos-home-token", token.as_str())
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"request_id":"chat-message:00112233445566778899aabbccddeeff","body":"hello from collaboration"}"#,
+            ))
+            .unwrap()
+    };
+    let first = app.clone().oneshot(send_request()).await.unwrap();
+    let first_status = first.status();
+    let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
         .await
         .unwrap();
     assert_eq!(
-        status,
+        first_status,
         StatusCode::OK,
         "{}",
-        String::from_utf8_lossy(&poll_body)
+        String::from_utf8_lossy(&first_body)
     );
-    let payload: serde_json::Value = serde_json::from_slice(&poll_body).unwrap();
-    let objects = payload["objects"].as_array().cloned().unwrap_or_default();
-    assert!(objects.iter().any(|object| {
-        object["kind"].as_str() == Some("text")
-            && object["sender"].as_str() == Some("anders")
-            && object["body"].as_str() == Some("hello from shell")
-    }));
+    let first: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    let replay = app.clone().oneshot(send_request()).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(replay.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(replay["seq"], first["seq"]);
+    assert_eq!(port.test_live_unresolved_outgoing().unwrap(), 1);
+
+    let conflicting = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/objects/send")
+                .header("x-elastos-home-token", token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"request_id":"chat-message:00112233445566778899aabbccddeeff","body":"changed"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflicting.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(port.test_live_unresolved_outgoing().unwrap(), 1);
+
+    let poll = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/poll")
+                .header("x-elastos-home-token", token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"since":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(poll.status(), StatusCode::OK);
+    let poll: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(poll.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(poll["transport"]["available"], true);
+    assert_eq!(poll["transport"]["configured"], true);
+    assert!(poll["transport"].get("connected_peer_count").is_none());
+    assert!(poll["transport"].get("topic").is_none());
+    assert_eq!(poll["objects"].as_array().unwrap().len(), 1);
+    assert_eq!(poll["objects"][0]["body"], "hello from collaboration");
+    assert_eq!(poll["objects"][0]["from_current_session"], true);
+
+    let cookie_only_summary = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/chat-room/summary")
+                .header(COOKIE, room_cookie.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cookie_only_summary.status(), StatusCode::UNAUTHORIZED);
+    let cookie_only_poll = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/chat-room/poll")
+                .header(COOKIE, room_cookie.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"since":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cookie_only_poll.status(), StatusCode::UNAUTHORIZED);
+    let cookie_only_leave = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/chat-room/session/leave")
+                .header(COOKIE, room_cookie.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cookie_only_leave.status(), StatusCode::UNAUTHORIZED);
+    let direct = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/chat-room/objects/send")
+                .header(COOKIE, room_cookie.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"request_id":"chat-message:direct","body":"not authorized"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct.status(), StatusCode::UNAUTHORIZED);
+    let forged = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/chat-room/objects/send")
+                .header("x-elastos-home-token", "forged")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"request_id":"chat-message:forged","body":"not authorized"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+
+    let uploads_path = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        crate::room_service::room_root_uri(),
+    )
+    .unwrap()
+    .join("local/uploads.json");
+    let uploads_before = std::fs::read(&uploads_path).unwrap();
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/apps/chat-room/upload/start")
+                .header("x-elastos-home-token", token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"file_name":"unsupported.txt","mime_type":"text/plain","size_bytes":4}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::CONFLICT);
+    assert_eq!(std::fs::read(uploads_path).unwrap(), uploads_before);
+
+    let leave = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/session/leave")
+                .header("x-elastos-home-token", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(leave.status(), StatusCode::OK);
+    assert!(crate::room_service::load_summary(dir.path())
+        .unwrap()
+        .active_sessions
+        .is_empty());
+    let late_poll = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/poll")
+                .header("x-elastos-home-token", token.as_str())
+                .header(COOKIE, room_cookie.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"since":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(late_poll.status(), StatusCode::UNAUTHORIZED);
+    assert!(crate::room_service::load_summary(dir.path())
+        .unwrap()
+        .active_sessions
+        .is_empty());
+    let other_authority = passkey_authority_with_name_role(
+        dir.path(),
+        Some("other"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    provision_signed_profile(dir.path(), &other_authority, "other");
+    let other_token = projection_launch_token_for_authority_context(
+        dir.path(),
+        CHAT_ROOM_CAPSULE_ID,
+        &other_authority,
+    );
+    let changed_principal = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/objects/send")
+                .header("x-elastos-home-token", other_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"request_id":"chat-message:00112233445566778899aabbccddeeff","body":"hello from collaboration"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed_principal.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(port.test_live_unresolved_outgoing().unwrap(), 1);
+    let other_leave = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/session/leave")
+                .header("x-elastos-home-token", other_token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_leave.status(), StatusCode::OK);
+    assert!(crate::room_service::load_summary(dir.path())
+        .unwrap()
+        .active_sessions
+        .is_empty());
+    assert_eq!(std::fs::read(members_path).unwrap(), members_before);
+    assert_eq!(std::fs::read(control_path).unwrap(), control_before);
+    let unscoped_objects_after =
+        serde_json::from_slice::<Vec<serde_json::Value>>(&std::fs::read(objects_path).unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|object| object.get("collaboration_scope").is_none())
+            .count();
+    assert_eq!(unscoped_objects_after, unscoped_objects_before);
+}
+
+#[tokio::test]
+async fn configured_chat_rejects_every_legacy_control_and_guest_route_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_owner_device_did, owner_profile) =
+        test_signed_room_profile(dir.path(), 43, "Legacy Owner", Some("legacy-owner"));
+    crate::room_service::seed_room_owner(
+        dir.path(),
+        &owner_profile,
+        crate::room_service::RoomOwnerSeedInput {
+            title: "Legacy room".to_string(),
+        },
+    )
+    .unwrap();
+    let room_root = elastos_common::localhost::rooted_localhost_fs_path(
+        dir.path(),
+        crate::room_service::room_root_uri(),
+    )
+    .unwrap();
+    let attachment_dir = room_root.join("room/attachments");
+    std::fs::create_dir_all(&attachment_dir).unwrap();
+    std::fs::write(attachment_dir.join("preserve.bin"), b"preserve").unwrap();
+
+    let port = crate::collaboration_product::test_chat_product_port(
+        dir.path(),
+        "configured-network",
+        "configured-conversation",
+    );
+    let mut state = test_state(dir.path());
+    state.collaboration_chat_product_port = Some(port);
+    let app = gateway_router(state);
+    let before = room_store_snapshot(dir.path());
+    let acceptance = serde_json::json!({
+        "acceptance": {
+            "payload": {
+                "schema": "elastos.room.accept.v1",
+                "room_slug": "chat-room",
+                "room_title": "Legacy room",
+                "owner_did": "did:key:z6legacy-owner",
+                "current_key_epoch": 1,
+                "invite_id": "invite",
+                "member_did": "did:key:z6member",
+                "role": "member",
+                "invited_by": "did:key:z6legacy-owner",
+                "accepted_at": 1
+            },
+            "signature": "invalid",
+            "signer_did": "did:key:z6member"
+        }
+    });
+    let requests = vec![
+        Request::builder().method("POST").uri("/api/apps/chat-room/requests/request/approve").body(Body::empty()).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/requests/request/deny").body(Body::empty()).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/guests/session/kick").body(Body::empty()).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/access-policy").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"allow_guest_invites":true,"allow_member_invites":true,"allow_members_to_host_guests":true}"#)).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/members/invite").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"member_did":"did:key:z6member","role":"member"}"#)).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/members/remove").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"member_did":"did:key:z6member"}"#)).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/invites/revoke").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"invite_id":"invite"}"#)).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/invites/create-link").header(CONTENT_TYPE, "application/json").body(Body::from("{}")).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/invites/claim").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"token":"invite","member_did":"did:key:z6member"}"#)).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/invites/acceptance").header(CONTENT_TYPE, "application/json").body(Body::from(acceptance.to_string())).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/invites/join").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"invite":"invite"}"#)).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/upload/start").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"file_name":"blocked.txt","mime_type":"text/plain","size_bytes":1}"#)).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/upload/upload/chunk").header("x-elastos-upload-offset", "0").body(Body::from("x")).unwrap(),
+        Request::builder().method("POST").uri("/api/apps/chat-room/upload/upload/finish").body(Body::empty()).unwrap(),
+        Request::builder().uri("/api/apps/chat-room/attachments/attachment").body(Body::empty()).unwrap(),
+        Request::builder().method("POST").uri("/api/browser/session/request").header(CONTENT_TYPE, "application/json").body(Body::from(r#"{"display_name":"Guest","device_label":"Browser","capabilities":["room.access"]}"#)).unwrap(),
+        Request::builder().uri("/api/browser/session/request/request").header(COOKIE, "browser-session-request=request").body(Body::empty()).unwrap(),
+    ];
+    for request in requests {
+        let method = request.method().clone();
+        let uri = request.uri().to_string();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "{} {}",
+            method,
+            uri
+        );
+    }
+    assert_eq!(room_store_snapshot(dir.path()), before);
+    assert_eq!(
+        std::fs::read(attachment_dir.join("preserve.bin")).unwrap(),
+        b"preserve"
+    );
+}
+
+#[tokio::test]
+async fn unconfigured_chat_room_access_policy_uses_strict_post_guard_decoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_profile(dir.path(), "anders");
+    let profile = load_profile_for_authority(dir.path(), &authority);
+    crate::room_service::seed_room_owner(
+        dir.path(),
+        &profile,
+        crate::room_service::RoomOwnerSeedInput {
+            title: "Strict Room".to_string(),
+        },
+    )
+    .unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let token =
+        projection_launch_token_for_authority_context(dir.path(), CHAT_ROOM_CAPSULE_ID, &authority);
+    let before = room_store_snapshot(dir.path());
+
+    let invalid = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/access-policy")
+                .header("x-elastos-home-token", token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"allow_guest_invites":true,"allow_member_invites":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(room_store_snapshot(dir.path()), before);
+
+    let valid = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/access-policy")
+                .header("x-elastos-home-token", token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"allow_guest_invites":false,"allow_member_invites":false,"allow_members_to_host_guests":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = valid.status();
+    let body = axum::body::to_bytes(valid.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["allow_guest_invites"], false);
+    assert_eq!(payload["allow_member_invites"], false);
+    assert_eq!(payload["allow_members_to_host_guests"], false);
+
+    let summary = crate::room_service::load_summary(dir.path()).unwrap();
+    assert!(!summary.room_control.access_policy.allow_guest_invites);
+    assert!(!summary.room_control.access_policy.allow_member_invites);
+    assert!(
+        !summary
+            .room_control
+            .access_policy
+            .allow_members_to_host_guests
+    );
+}
+
+#[test]
+fn gateway_room_source_has_no_route_owned_resource_bridge() {
+    let source = include_str!("../gateway_room.rs");
+    for removed in [
+        concat!("RoomTransport", "Bridge"),
+        concat!("ROOM_", "TRANSPORT_"),
+        concat!("room", "-sync"),
+        concat!("gossip_", "send"),
+        concat!("gossip_", "recv"),
+        concat!("append_object", "_with_transport"),
+        concat!("leave_session", "_with_transport"),
+    ] {
+        assert!(!source.contains(removed), "stale route bridge: {removed}");
+    }
+
+    let carrier_source = include_str!("../../carrier.rs");
+    assert!(
+        !carrier_source.contains(concat!("room-sync", "-v1")),
+        "retired Chat room-sync topic must be absent from Carrier source"
+    );
+    let browser_sessions = include_str!("../browser_sessions.rs");
+    assert!(
+        browser_sessions.contains("configured_collaboration_browser_session_unsupported_response")
+    );
+    assert!(source.contains("start_configured_chat_room_session"));
+    assert!(source.contains("configured_legacy_room_control_unsupported_response"));
 }
 
 #[tokio::test]
@@ -1124,10 +1271,8 @@ async fn test_chat_room_shell_can_kick_guest_without_exposing_session_token() {
 #[tokio::test]
 async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_session() {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "room-cookie-peer").await;
     let app = gateway_router(test_state(dir.path()));
-    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let authority = passkey_authority_with_profile(dir.path(), "anders");
 
     let launch = app
         .clone()
@@ -1190,7 +1335,9 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
                 .uri("/api/apps/chat-room/objects/send")
                 .header(COOKIE, both_cookies)
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"body":"home identity wins"}"#))
+                .body(Body::from(
+                    r#"{"request_id":"chat-message:local-home-wins","body":"home identity wins"}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -1224,8 +1371,6 @@ async fn test_chat_room_cookie_auth_prefers_home_room_session_over_browser_sessi
 #[tokio::test]
 async fn test_chat_room_shell_can_approve_browser_access_request() {
     let dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _runtime = start_fake_runtime(dir.path(), bus, "approve-browser-peer").await;
     let app = gateway_router(test_state(dir.path()));
 
     let launch = app
@@ -1377,6 +1522,7 @@ async fn test_room_service_summary_does_not_create_identity_on_read() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(!dir.path().join("identity").join("device.key").exists());
+    assert!(load_home_runtime_coords(dir.path()).is_none());
 }
 
 #[tokio::test]
@@ -1439,10 +1585,12 @@ async fn test_room_service_summary_includes_hosted_guest_urls() {
 #[tokio::test]
 async fn test_room_service_summary_blocks_browser_access_when_seeded_room_has_no_runtime_member() {
     let dir = tempfile::tempdir().unwrap();
+    let (_owner_device_did, owner_profile) =
+        test_signed_room_profile(dir.path(), 44, "Owner", Some("owner"));
     crate::room_service::seed_room_owner(
         dir.path(),
+        &owner_profile,
         crate::room_service::RoomOwnerSeedInput {
-            owner_did: "did:key:z6owner".to_string(),
             title: "Exec Room".to_string(),
         },
     )
@@ -1464,11 +1612,16 @@ async fn test_room_service_summary_blocks_browser_access_when_seeded_room_has_no
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["browser_access_allowed"].as_bool(), Some(false));
-    assert_eq!(json["owner_did"].as_str(), None);
+    assert!(json["room_control"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|member| member.get("member_did").is_none()));
+    assert!(json["room_control"].get("owner_did").is_none());
     assert!(json["browser_access_block_reason"]
         .as_str()
         .unwrap()
-        .contains("no active room member DID available"));
+        .contains("not part of this conversation"));
 }
 
 #[tokio::test]
@@ -1521,10 +1674,12 @@ async fn test_browser_session_request_and_status_routes_chat_room() {
 #[tokio::test]
 async fn test_browser_session_pair_is_forbidden_when_seeded_room_has_no_runtime_member() {
     let dir = tempfile::tempdir().unwrap();
+    let (_owner_device_did, owner_profile) =
+        test_signed_room_profile(dir.path(), 45, "Owner", Some("owner"));
     crate::room_service::seed_room_owner(
         dir.path(),
+        &owner_profile,
         crate::room_service::RoomOwnerSeedInput {
-            owner_did: "did:key:z6owner".to_string(),
             title: "Exec Room".to_string(),
         },
     )
@@ -1626,7 +1781,9 @@ async fn test_room_service_browser_access_and_object_flow() {
                 .uri("/api/apps/chat-room/objects/send")
                 .header("cookie", &room_cookie)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"body":"Hello room"}"#))
+                .body(Body::from(
+                    r#"{"request_id":"chat-message:local-browser","body":"Hello room"}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -1993,848 +2150,4 @@ async fn test_room_service_session_leave_appends_system_object() {
 
     let summary = crate::room_service::load_summary(dir.path()).unwrap();
     assert_eq!(summary.active_session_count, 0);
-}
-
-#[tokio::test]
-async fn test_room_service_cross_runtime_room_syncs_over_carrier() {
-    let owner_dir = tempfile::tempdir().unwrap();
-    let guest_dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let owner_runtime = start_fake_runtime(owner_dir.path(), bus.clone(), "owner-peer").await;
-    let guest_runtime = start_fake_runtime(guest_dir.path(), bus.clone(), "guest-peer").await;
-
-    assert!(owner_runtime.api_url.starts_with("http://127.0.0.1:"));
-    assert!(guest_runtime.api_url.starts_with("http://127.0.0.1:"));
-
-    let owner_did = elastos_identity::load_or_create_did(owner_dir.path())
-        .unwrap()
-        .1;
-    let guest_did = elastos_identity::load_or_create_did(guest_dir.path())
-        .unwrap()
-        .1;
-
-    let _ = crate::room_service::seed_room_owner(
-        owner_dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
-            title: "Exec Room".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        owner_dir.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: owner_did.clone(),
-            invited_did: guest_did.clone(),
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    let invite_json = serde_json::to_vec(&invite).unwrap();
-    crate::room_service::import_room_invite_envelope(guest_dir.path(), &invite_json).unwrap();
-    crate::room_service::accept_room_invite(
-        guest_dir.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: guest_did.clone(),
-            invite_id: invite.payload.invite_id.clone(),
-        },
-    )
-    .unwrap();
-    let acceptance = crate::room_service::export_room_acceptance_envelope(
-        guest_dir.path(),
-        &invite.payload.invite_id,
-    )
-    .unwrap();
-    let acceptance_json = serde_json::to_vec(&acceptance).unwrap();
-    crate::room_service::import_room_acceptance_envelope(owner_dir.path(), &acceptance_json)
-        .unwrap();
-
-    let owner_session = crate::room_service::start_local_runtime_session_with_transport(
-        owner_dir.path(),
-        &owner_did,
-        "Owner",
-        "WSL",
-    )
-    .unwrap();
-    let owner_token = owner_session.session.token.clone();
-
-    let guest_session = crate::room_service::start_local_runtime_session_with_transport(
-        guest_dir.path(),
-        &guest_did,
-        "Guest",
-        "Jetson",
-    )
-    .unwrap();
-    let guest_token = guest_session.session.token.clone();
-
-    let owner_state = test_state(owner_dir.path());
-    let guest_state = test_state(guest_dir.path());
-    let _ =
-        super::gateway_room::room_transport_view(&owner_state, owner_session.transport_envelope)
-            .await;
-    let _ =
-        super::gateway_room::room_transport_view(&guest_state, guest_session.transport_envelope)
-            .await;
-    let owner_gateway = gateway_router(owner_state.clone());
-    let guest_gateway = gateway_router(guest_state.clone());
-
-    let send_response = owner_gateway
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/apps/chat-room/objects/send")
-                .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"body":"hello across runtimes"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(send_response.status(), StatusCode::OK);
-
-    let poll = poll_chat_room_until(
-        guest_gateway.clone(),
-        &guest_token,
-        |poll| {
-            poll["transport"]["connected_peer_count"].as_u64() == Some(1)
-                && poll["objects"].as_array().is_some_and(|objects| {
-                    objects
-                        .iter()
-                        .any(|object| object["body"].as_str() == Some("hello across runtimes"))
-                })
-        },
-        "cross-runtime message sync",
-    )
-    .await;
-    assert_eq!(poll["transport"]["connected_peer_count"].as_u64(), Some(1));
-    assert!(poll["transport"]["status"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("Carrier conversation sync connected to 1 ElastOS peer"));
-    let participants = poll["participants"].as_array().cloned().unwrap_or_default();
-    assert_eq!(participants.len(), 2);
-    assert!(participants.iter().any(|participant| {
-        participant["member_did"].as_str() == Some(owner_did.as_str())
-            && participant["display_name"].as_str() == Some("Owner")
-    }));
-    assert!(participants.iter().any(|participant| {
-        participant["member_did"].as_str() == Some(guest_did.as_str())
-            && participant["display_name"].as_str() == Some("Guest")
-    }));
-    let objects = poll["objects"].as_array().cloned().unwrap_or_default();
-    assert!(objects
-        .iter()
-        .any(|object| object["body"].as_str() == Some("hello across runtimes")));
-}
-
-#[tokio::test]
-async fn test_room_service_retries_recent_local_objects_after_missed_carrier_send() {
-    let owner_dir = tempfile::tempdir().unwrap();
-    let guest_dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _owner_runtime = start_fake_runtime(owner_dir.path(), bus.clone(), "owner-peer").await;
-    let _guest_runtime = start_fake_runtime(guest_dir.path(), bus.clone(), "guest-peer").await;
-
-    let owner_did = elastos_identity::load_or_create_did(owner_dir.path())
-        .unwrap()
-        .1;
-    let guest_did = elastos_identity::load_or_create_did(guest_dir.path())
-        .unwrap()
-        .1;
-
-    let _ = crate::room_service::seed_room_owner(
-        owner_dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
-            title: "Retry Room".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        owner_dir.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: owner_did.clone(),
-            invited_did: guest_did.clone(),
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    let invite_json = serde_json::to_vec(&invite).unwrap();
-    crate::room_service::import_room_invite_envelope(guest_dir.path(), &invite_json).unwrap();
-    crate::room_service::accept_room_invite(
-        guest_dir.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: guest_did.clone(),
-            invite_id: invite.payload.invite_id.clone(),
-        },
-    )
-    .unwrap();
-    let acceptance = crate::room_service::export_room_acceptance_envelope(
-        guest_dir.path(),
-        &invite.payload.invite_id,
-    )
-    .unwrap();
-    let acceptance_json = serde_json::to_vec(&acceptance).unwrap();
-    crate::room_service::import_room_acceptance_envelope(owner_dir.path(), &acceptance_json)
-        .unwrap();
-
-    let owner_session = crate::room_service::start_local_runtime_session_with_transport(
-        owner_dir.path(),
-        &owner_did,
-        "Owner",
-        "WSL",
-    )
-    .unwrap();
-    let owner_token = owner_session.session.token.clone();
-
-    let guest_session = crate::room_service::start_local_runtime_session_with_transport(
-        guest_dir.path(),
-        &guest_did,
-        "Guest",
-        "Jetson",
-    )
-    .unwrap();
-    let guest_token = guest_session.session.token.clone();
-
-    let owner_state = test_state(owner_dir.path());
-    let guest_state = test_state(guest_dir.path());
-    let _ =
-        super::gateway_room::room_transport_view(&owner_state, owner_session.transport_envelope)
-            .await;
-    let _ =
-        super::gateway_room::room_transport_view(&guest_state, guest_session.transport_envelope)
-            .await;
-    let owner_gateway = gateway_router(owner_state.clone());
-    let guest_gateway = gateway_router(guest_state.clone());
-
-    let marker = "carrier retry after missed accepted send";
-    {
-        let mut bus = bus.lock().await;
-        bus.drop_remote_message_substrings.push(marker.to_string());
-    }
-
-    let send_response = owner_gateway
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/apps/chat-room/objects/send")
-                .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                .header("content-type", "application/json")
-                .body(Body::from(format!(r#"{{"body":"{marker}"}}"#)))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(send_response.status(), StatusCode::OK);
-
-    let poll = poll_chat_room_until(
-        guest_gateway.clone(),
-        &guest_token,
-        |poll| {
-            poll["objects"].as_array().is_some_and(|objects| {
-                objects
-                    .iter()
-                    .any(|object| object["body"].as_str() == Some(marker))
-            })
-        },
-        "missed Carrier send retry",
-    )
-    .await;
-    assert!(poll["objects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|object| { object["body"].as_str() == Some(marker) }));
-}
-
-#[tokio::test]
-async fn test_room_transport_stops_send_batch_after_local_only_carrier_result() {
-    let dir = tempfile::tempdir().unwrap();
-    save_trusted_sources(
-        dir.path(),
-        &TrustedSourcesConfig {
-            schema: "elastos.trusted-sources/v1".to_string(),
-            default_source: "default".to_string(),
-            sources: vec![TrustedSource {
-                name: "default".to_string(),
-                publisher_dids: vec![],
-                channel: "stable".to_string(),
-                discovery_uri: String::new(),
-                connect_ticket: "trusted-source-ticket".to_string(),
-                gateways: vec![],
-                install_path: String::new(),
-                installed_version: String::new(),
-                head_cid: String::new(),
-                publisher_node_id: "trusted-source-peer".to_string(),
-                ipns_name: String::new(),
-            }],
-        },
-    )
-    .unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let runtime = start_fake_runtime(dir.path(), bus.clone(), "owner-peer").await;
-    let owner_did = elastos_identity::load_or_create_did(dir.path()).unwrap().1;
-    crate::room_service::seed_room_owner(
-        dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
-            title: "Bounded Send Room".to_string(),
-        },
-    )
-    .unwrap();
-    let session = crate::room_service::start_local_runtime_session_with_transport(
-        dir.path(),
-        &owner_did,
-        "Owner",
-        "WSL",
-    )
-    .unwrap();
-    let token = session.session.token.clone();
-    let state = test_state(dir.path());
-    let app = gateway_router(state.clone());
-    let _ = super::gateway_room::room_transport_view(&state, session.transport_envelope).await;
-    let _ = summary_chat_room_until(
-        app.clone(),
-        |summary| summary["transport"]["connected_peer_count"] == 1,
-        "bounded send peer bootstrap",
-    )
-    .await;
-
-    runtime.provider_requests.lock().await.clear();
-    let first = "local-only carrier send should stop batch";
-    let second = "queued message must wait after local-only";
-    {
-        let mut bus = bus.lock().await;
-        bus.local_only_message_substrings.push(first.to_string());
-    }
-
-    for body in [first, second] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/apps/chat-room/objects/send")
-                    .header(AUTHORIZATION, format!("Bearer {}", token))
-                    .header("content-type", "application/json")
-                    .body(Body::from(format!(r#"{{"body":"{body}"}}"#)))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    wait_for_peer_request(
-        &runtime,
-        |request| {
-            request["scheme"] == "peer"
-                && request["op"] == "gossip_send"
-                && request["body"]["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains(first))
-        },
-        "first local-only Carrier send",
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let requests = runtime.provider_requests.lock().await;
-    assert!(
-        !requests.iter().any(|request| {
-            request["scheme"] == "peer"
-                && request["op"] == "gossip_send"
-                && request["body"]["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains(second))
-        }),
-        "bridge should stop the send batch after the first local-only Carrier result"
-    );
-}
-
-#[tokio::test]
-async fn test_room_service_cross_runtime_attachment_syncs_over_carrier() {
-    let owner_dir = tempfile::tempdir().unwrap();
-    let guest_dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _owner_runtime = start_fake_runtime(owner_dir.path(), bus.clone(), "owner-peer").await;
-    let _guest_runtime = start_fake_runtime(guest_dir.path(), bus.clone(), "guest-peer").await;
-
-    let owner_did = elastos_identity::load_or_create_did(owner_dir.path())
-        .unwrap()
-        .1;
-    let guest_did = elastos_identity::load_or_create_did(guest_dir.path())
-        .unwrap()
-        .1;
-
-    let _ = crate::room_service::seed_room_owner(
-        owner_dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
-            title: "Exec Room".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        owner_dir.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: owner_did.clone(),
-            invited_did: guest_did.clone(),
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    let invite_json = serde_json::to_vec(&invite).unwrap();
-    crate::room_service::import_room_invite_envelope(guest_dir.path(), &invite_json).unwrap();
-    crate::room_service::accept_room_invite(
-        guest_dir.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: guest_did.clone(),
-            invite_id: invite.payload.invite_id.clone(),
-        },
-    )
-    .unwrap();
-    let acceptance = crate::room_service::export_room_acceptance_envelope(
-        guest_dir.path(),
-        &invite.payload.invite_id,
-    )
-    .unwrap();
-    let acceptance_json = serde_json::to_vec(&acceptance).unwrap();
-    crate::room_service::import_room_acceptance_envelope(owner_dir.path(), &acceptance_json)
-        .unwrap();
-
-    let owner_session = crate::room_service::start_local_runtime_session_with_transport(
-        owner_dir.path(),
-        &owner_did,
-        "Owner",
-        "WSL",
-    )
-    .unwrap();
-    let owner_token = owner_session.session.token.clone();
-
-    let guest_session = crate::room_service::start_local_runtime_session_with_transport(
-        guest_dir.path(),
-        &guest_did,
-        "Guest",
-        "Jetson",
-    )
-    .unwrap();
-    let guest_token = guest_session.session.token.clone();
-
-    let owner_state = test_state(owner_dir.path());
-    let guest_state = test_state(guest_dir.path());
-    let _ =
-        super::gateway_room::room_transport_view(&owner_state, owner_session.transport_envelope)
-            .await;
-    let _ =
-        super::gateway_room::room_transport_view(&guest_state, guest_session.transport_envelope)
-            .await;
-    let owner_gateway = gateway_router(owner_state.clone());
-    let guest_gateway = gateway_router(guest_state.clone());
-
-    let start_response = owner_gateway
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/apps/chat-room/upload/start")
-                .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"file_name":"photo.png","mime_type":"image/png","size_bytes":8}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(start_response.status(), StatusCode::OK);
-    let start_body = axum::body::to_bytes(start_response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let start_json: serde_json::Value = serde_json::from_slice(&start_body).unwrap();
-    let upload_id = start_json["upload_id"].as_str().unwrap().to_string();
-
-    let chunk_response = owner_gateway
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/apps/chat-room/upload/{upload_id}/chunk"))
-                .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                .header("x-elastos-upload-offset", "0")
-                .body(Body::from(Vec::from(&b"png-data"[..])))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(chunk_response.status(), StatusCode::OK);
-
-    let finish_response = owner_gateway
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/apps/chat-room/upload/{upload_id}/finish"))
-                .header(AUTHORIZATION, format!("Bearer {}", owner_token))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(finish_response.status(), StatusCode::OK);
-
-    let poll = poll_chat_room_until(
-        guest_gateway.clone(),
-        &guest_token,
-        |poll| {
-            poll["objects"].as_array().is_some_and(|objects| {
-                objects
-                    .iter()
-                    .any(|object| object["kind"].as_str() == Some("attachment"))
-            })
-        },
-        "cross-runtime attachment sync",
-    )
-    .await;
-    let attachment_object = poll["objects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|object| object["kind"].as_str() == Some("attachment"))
-        .cloned()
-        .expect("attachment object");
-    let attachment_id = attachment_object["attachment"]["attachment_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        attachment_object["attachment"]["file_name"].as_str(),
-        Some("photo.png")
-    );
-    assert_eq!(
-        attachment_object["attachment"]["mime_type"].as_str(),
-        Some("image/png")
-    );
-
-    let attachment_response = guest_gateway
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/api/apps/chat-room/attachments/{attachment_id}"))
-                .header(AUTHORIZATION, format!("Bearer {}", guest_token))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(attachment_response.status(), StatusCode::OK);
-    assert_eq!(
-        attachment_response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("image/png")
-    );
-    let attachment_body = axum::body::to_bytes(attachment_response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(attachment_body.as_ref(), b"png-data");
-}
-
-#[tokio::test]
-async fn test_room_service_replays_durable_local_objects_over_carrier() {
-    let owner_dir = tempfile::tempdir().unwrap();
-    let guest_dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _owner_runtime = start_fake_runtime(owner_dir.path(), bus.clone(), "owner-peer").await;
-    let _guest_runtime = start_fake_runtime(guest_dir.path(), bus.clone(), "guest-peer").await;
-
-    let owner_did = elastos_identity::load_or_create_did(owner_dir.path())
-        .unwrap()
-        .1;
-    let guest_did = elastos_identity::load_or_create_did(guest_dir.path())
-        .unwrap()
-        .1;
-
-    let _ = crate::room_service::seed_room_owner(
-        owner_dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
-            title: "Exec Room".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        owner_dir.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: owner_did.clone(),
-            invited_did: guest_did.clone(),
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    let invite_json = serde_json::to_vec(&invite).unwrap();
-    crate::room_service::import_room_invite_envelope(guest_dir.path(), &invite_json).unwrap();
-    crate::room_service::accept_room_invite(
-        guest_dir.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: guest_did.clone(),
-            invite_id: invite.payload.invite_id.clone(),
-        },
-    )
-    .unwrap();
-    let acceptance = crate::room_service::export_room_acceptance_envelope(
-        guest_dir.path(),
-        &invite.payload.invite_id,
-    )
-    .unwrap();
-    let acceptance_json = serde_json::to_vec(&acceptance).unwrap();
-    crate::room_service::import_room_acceptance_envelope(owner_dir.path(), &acceptance_json)
-        .unwrap();
-
-    let owner_session = crate::room_service::start_local_runtime_session_with_transport(
-        owner_dir.path(),
-        &owner_did,
-        "Owner",
-        "WSL",
-    )
-    .unwrap();
-    let owner_token = owner_session.session.token.clone();
-    let guest_session = crate::room_service::start_local_runtime_session_with_transport(
-        guest_dir.path(),
-        &guest_did,
-        "Guest",
-        "Mac",
-    )
-    .unwrap();
-    let guest_token = guest_session.session.token.clone();
-
-    crate::room_service::append_object(
-        owner_dir.path(),
-        &owner_token,
-        "durable object without in-memory enqueue",
-    )
-    .unwrap();
-
-    let owner_state = test_state(owner_dir.path());
-    let guest_state = test_state(guest_dir.path());
-    let _ = super::gateway_room::room_transport_view(&owner_state, None).await;
-    let _ =
-        super::gateway_room::room_transport_view(&guest_state, guest_session.transport_envelope)
-            .await;
-    let guest_gateway = gateway_router(guest_state.clone());
-
-    let poll = poll_chat_room_until(
-        guest_gateway,
-        &guest_token,
-        |poll| {
-            poll["objects"].as_array().is_some_and(|objects| {
-                objects.iter().any(|object| {
-                    object["body"].as_str() == Some("durable object without in-memory enqueue")
-                })
-            })
-        },
-        "durable room object replay",
-    )
-    .await;
-    assert!(poll["objects"].as_array().unwrap().iter().any(|object| {
-        object["body"].as_str() == Some("durable object without in-memory enqueue")
-    }));
-}
-
-#[tokio::test]
-async fn test_room_service_cross_runtime_presence_syncs_join_and_leave() {
-    let owner_dir = tempfile::tempdir().unwrap();
-    let guest_dir = tempfile::tempdir().unwrap();
-    let bus = Arc::new(TokioMutex::new(FakePeerBus::default()));
-    let _owner_runtime = start_fake_runtime(owner_dir.path(), bus.clone(), "owner-peer").await;
-    let _guest_runtime = start_fake_runtime(guest_dir.path(), bus.clone(), "guest-peer").await;
-
-    let owner_did = elastos_identity::load_or_create_did(owner_dir.path())
-        .unwrap()
-        .1;
-    let guest_did = elastos_identity::load_or_create_did(guest_dir.path())
-        .unwrap()
-        .1;
-
-    let _ = crate::room_service::seed_room_owner(
-        owner_dir.path(),
-        crate::room_service::RoomOwnerSeedInput {
-            owner_did: owner_did.clone(),
-            title: "Exec Room".to_string(),
-        },
-    )
-    .unwrap();
-    let invite = crate::room_service::export_room_invite_envelope(
-        owner_dir.path(),
-        crate::room_service::RoomInviteInput {
-            actor_did: owner_did.clone(),
-            invited_did: guest_did.clone(),
-            role: crate::room_service::RoomRole::Member,
-        },
-    )
-    .unwrap();
-    let invite_json = serde_json::to_vec(&invite).unwrap();
-    crate::room_service::import_room_invite_envelope(guest_dir.path(), &invite_json).unwrap();
-    crate::room_service::accept_room_invite(
-        guest_dir.path(),
-        crate::room_service::RoomInviteAcceptInput {
-            actor_did: guest_did.clone(),
-            invite_id: invite.payload.invite_id.clone(),
-        },
-    )
-    .unwrap();
-    let acceptance = crate::room_service::export_room_acceptance_envelope(
-        guest_dir.path(),
-        &invite.payload.invite_id,
-    )
-    .unwrap();
-    let acceptance_json = serde_json::to_vec(&acceptance).unwrap();
-    crate::room_service::import_room_acceptance_envelope(owner_dir.path(), &acceptance_json)
-        .unwrap();
-
-    let owner_session = crate::room_service::start_local_runtime_session_with_transport(
-        owner_dir.path(),
-        &owner_did,
-        "Owner",
-        "WSL",
-    )
-    .unwrap();
-    let owner_token = owner_session.session.token.clone();
-
-    let guest_session = crate::room_service::start_local_runtime_session_with_transport(
-        guest_dir.path(),
-        &guest_did,
-        "Guest",
-        "Jetson",
-    )
-    .unwrap();
-    let guest_token = guest_session.session.token.clone();
-
-    let owner_state = test_state(owner_dir.path());
-    let guest_state = test_state(guest_dir.path());
-    let _ =
-        super::gateway_room::room_transport_view(&owner_state, owner_session.transport_envelope)
-            .await;
-    let _ =
-        super::gateway_room::room_transport_view(&guest_state, guest_session.transport_envelope)
-            .await;
-    let owner_gateway = gateway_router(owner_state.clone());
-    let guest_gateway = gateway_router(guest_state.clone());
-
-    let guest_poll = poll_chat_room_until(
-        guest_gateway.clone(),
-        &guest_token,
-        |poll| {
-            poll["objects"].as_array().is_some_and(|objects| {
-                objects.iter().any(|object| {
-                    object["kind"].as_str() == Some("system")
-                        && object["sender"].as_str() == Some("Owner")
-                        && object["body"].as_str() == Some("joined the room")
-                })
-            })
-        },
-        "guest sees owner join",
-    )
-    .await;
-    let guest_objects = guest_poll["objects"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(guest_objects.iter().any(|object| {
-        object["kind"].as_str() == Some("system")
-            && object["sender"].as_str() == Some("Owner")
-            && object["body"].as_str() == Some("joined the room")
-    }));
-    let guest_participants = guest_poll["participants"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(guest_participants.len(), 2);
-
-    let owner_poll = poll_chat_room_until(
-        owner_gateway.clone(),
-        &owner_token,
-        |poll| {
-            poll["objects"].as_array().is_some_and(|objects| {
-                objects.iter().any(|object| {
-                    object["kind"].as_str() == Some("system")
-                        && object["sender"].as_str() == Some("Guest")
-                        && object["body"].as_str() == Some("joined the room")
-                })
-            })
-        },
-        "owner sees guest join",
-    )
-    .await;
-    let owner_objects = owner_poll["objects"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(owner_objects.iter().any(|object| {
-        object["kind"].as_str() == Some("system")
-            && object["sender"].as_str() == Some("Guest")
-            && object["body"].as_str() == Some("joined the room")
-    }));
-    let owner_participants = owner_poll["participants"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(owner_participants.len(), 2);
-
-    let guest_leave = guest_gateway
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/apps/chat-room/session/leave")
-                .header(AUTHORIZATION, format!("Bearer {}", guest_token))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(guest_leave.status(), StatusCode::OK);
-
-    let owner_after_leave_json = poll_chat_room_until(
-        owner_gateway.clone(),
-        &owner_token,
-        |poll| {
-            poll["objects"].as_array().is_some_and(|objects| {
-                objects.iter().any(|object| {
-                    object["kind"].as_str() == Some("system")
-                        && object["sender"].as_str() == Some("Guest")
-                        && object["body"].as_str() == Some("left the room")
-                })
-            }) && poll["participants"].as_array().is_some_and(|participants| {
-                participants.len() == 1
-                    && participants.iter().any(|participant| {
-                        participant["member_did"].as_str() == Some(owner_did.as_str())
-                            && participant["display_name"].as_str() == Some("Owner")
-                    })
-            })
-        },
-        "owner sees guest leave",
-    )
-    .await;
-    let owner_after_leave_objects = owner_after_leave_json["objects"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        owner_after_leave_objects.iter().any(|object| {
-            object["kind"].as_str() == Some("system")
-                && object["sender"].as_str() == Some("Guest")
-                && object["body"].as_str() == Some("left the room")
-        }),
-        "owner after leave poll: {owner_after_leave_json}"
-    );
-    let owner_after_leave_participants = owner_after_leave_json["participants"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(owner_after_leave_participants.len(), 1);
-    assert!(owner_after_leave_participants.iter().any(|participant| {
-        participant["member_did"].as_str() == Some(owner_did.as_str())
-            && participant["display_name"].as_str() == Some("Owner")
-    }));
 }
