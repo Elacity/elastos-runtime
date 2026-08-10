@@ -1,10 +1,12 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>People · ElastOS</title>
-  <link rel="stylesheet" href="./style.css?v=people-20260713a">
+  <script src="./elastos-theme.js"></script>
+  <link rel="stylesheet" href="./elastos-ui.css">
+  <link rel="stylesheet" href="./style.css?v=people-20260805a">
 </head>
 <body>
   <section id="locked-shell" class="locked-shell hidden">
@@ -28,50 +30,60 @@
     </aside>
 
     <section class="people-main">
-      <div id="people-status" class="people-status" role="status" hidden></div>
       <div class="people-content">
-        <section id="people" class="people-section" aria-label="People">
-          <section class="profile-card" aria-labelledby="profile-title">
-            <div>
-              <h2 id="profile-title">My Profile</h2>
-              <p>Shown to people you connect with.</p>
-            </div>
-            <form id="profile-form" class="profile-form">
-              <label for="profile-name">Display name</label>
-              <input id="profile-name" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name">
-              <button type="submit">Save</button>
-            </form>
-          </section>
-          <div id="people-list" class="people-list"></div>
-        </section>
+        <div class="people-content-inner">
+          <h1 class="people-page-title">People</h1>
+          <div id="people-status" class="people-status" role="status" hidden></div>
 
-        <section id="discovery" class="people-section" aria-label="Discovery">
-          <div class="discovery-header">
-            <div>
-              <h2>Discovery</h2>
-              <p id="discovery-copy">Find another ElastOS home nearby.</p>
-            </div>
-            <div class="discovery-actions">
-              <span id="discovery-countdown" class="discovery-countdown" hidden></span>
-              <button id="toggle-discovery" type="button">Turn On</button>
-              <button id="refresh-discovery" type="button">Refresh</button>
-            </div>
-          </div>
-          <div class="discovery-grid">
-            <section>
-              <h3>Visible People</h3>
-              <div id="discovered-list" class="people-list"></div>
+          <section id="people" class="people-section" aria-label="People">
+            <section class="profile-card" aria-labelledby="profile-title">
+              <div>
+                <h2 id="profile-title">Create your Profile</h2>
+                <p id="profile-description">Your Profile is your signed identity for People and Chat.</p>
+              </div>
+              <form id="profile-form" class="profile-form">
+                <label for="profile-name">Display name</label>
+                <input id="profile-name" type="text" maxlength="32" autocomplete="nickname" placeholder="Your name">
+                <button id="profile-submit" type="submit">Create Profile</button>
+              </form>
             </section>
-            <section>
-              <h3>Requests</h3>
-              <div id="request-list" class="people-list"></div>
+            <div id="people-list" class="people-list"></div>
+          </section>
+
+          <section id="discovery" class="people-section" aria-label="Discovery" hidden>
+            <div class="discovery-header">
+              <div>
+                <p>Choose whether other people can find you and send connection requests.</p>
+              </div>
+              <div class="discovery-actions">
+                <button id="discovery-toggle" type="button" data-action="discovery-toggle">Turn On</button>
+                <button id="discovery-refresh" type="button" data-action="discovery-refresh">Refresh</button>
+              </div>
+            </div>
+            <section class="profile-card" aria-labelledby="discovery-status-title">
+              <div>
+                <h3 id="discovery-status-title">Status</h3>
+                <p id="discovery-status"></p>
+              </div>
             </section>
-          </div>
-        </section>
+            <div class="discovery-grid">
+              <section aria-labelledby="discovery-visible-title">
+                <h3 id="discovery-visible-title">Visible people</h3>
+                <p>People who chose to be visible.</p>
+                <div id="discovery-list" class="people-list"></div>
+              </section>
+              <section aria-labelledby="discovery-requests-title">
+                <h3 id="discovery-requests-title">Requests</h3>
+                <p>People who want to connect.</p>
+                <div id="discovery-requests-list" class="people-list"></div>
+              </section>
+            </div>
+          </section>
+        </div>
       </div>
     </section>
   </main>
 
-  <script type="module" src="./people.js?v=people-20260713a"></script>
+  <script type="module" src="./people.js?v=people-20260805a"></script>
 </body>
 </html>
