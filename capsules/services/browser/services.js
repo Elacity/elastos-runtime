@@ -17,12 +17,23 @@ const VISIBLE_SERVICE_KINDS = new Set([BROWSER_ENGINE_SERVICE_KIND, EXIT_SERVICE
 let currentServices = null;
 let pendingServiceAction = null;
 
+const SECTION_TITLES = {
+  "mine-services": "This device",
+  "other-services": "From People",
+};
+
 announceReady();
 
 boot().catch((error) => {
-  showStatus(error.message || "Services failed to load.", "error");
-  lockedShell?.classList.remove("hidden");
-  servicesShell?.classList.add("hidden");
+  // Only the no-token path owns the locked card. API/boot errors stay in-app.
+  if (!homeToken) {
+    lockedShell?.classList.remove("hidden");
+    servicesShell?.classList.add("hidden");
+    return;
+  }
+  lockedShell?.classList.add("hidden");
+  servicesShell?.classList.remove("hidden");
+  showStatus(error.message || "Sharing failed to load.", "error");
 });
 
 async function boot() {
@@ -51,25 +62,40 @@ function bindNavigation() {
       activateServicesSection(target);
     });
   }
+  activateServicesSection("mine-services", { initial: true });
 }
 
 function activateServicesSection(target, options = {}) {
   const targetId = readText(target);
-  if (!targetId) {
+  if (!targetId || !SECTION_TITLES[targetId]) {
     return;
   }
-  document.getElementById(targetId)?.scrollIntoView({
-    block: "start",
-    behavior: options.behavior || "smooth",
-  });
   for (const item of document.querySelectorAll("[data-section-target]")) {
-    item.classList.toggle("active", item.getAttribute("data-section-target") === targetId);
+    const selected = item.getAttribute("data-section-target") === targetId;
+    item.classList.toggle("active", selected);
+    if (selected) {
+      item.setAttribute("aria-current", "page");
+    } else {
+      item.removeAttribute("aria-current");
+    }
+  }
+  for (const section of document.querySelectorAll(".pc2-section[id]")) {
+    const selected = section.id === targetId;
+    section.classList.toggle("is-active-destination", selected);
+    section.hidden = !selected;
+  }
+  const titleNode = document.querySelector(".services-page-title");
+  if (titleNode) {
+    titleNode.textContent = SECTION_TITLES[targetId];
+  }
+  if (!options.initial) {
+    document.getElementById(targetId)?.scrollIntoView({ block: "start", behavior: "smooth" });
   }
 }
 
 function bindActions() {
   refreshButton?.addEventListener("click", () => {
-    refreshServices().catch((error) => showStatus(error.message || "Could not refresh Services.", "error"));
+    refreshServices().catch((error) => showStatus(error.message || "Could not refresh Sharing.", "error"));
   });
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : event.target?.parentElement;
@@ -92,13 +118,13 @@ function bindActions() {
 
 async function refreshServices() {
   setBusy(true);
-  showStatus("Refreshing Services...", "muted");
+  showStatus("Refreshing Sharing...", "muted");
   try {
     const services = await fetchJson("/api/apps/services/summary", {
       headers: shellHeaders(),
     });
     renderServices(services);
-    showStatus("Services updated.", "ok");
+    showStatus("Sharing updated.", "ok");
   } finally {
     setBusy(false);
   }
@@ -118,8 +144,8 @@ function renderServices(services) {
     source: "mine",
     selectedTitle: "Shared",
     availableTitle: "Available on this device",
-    emptySelected: "No Services are shared.",
-    emptyAvailable: "No Browser Engine or Browser Exit service is installed on this device.",
+    emptySelected: "Nothing shared yet.",
+    emptyAvailable: "No shareable services on this device.",
   });
   otherServicesList.innerHTML = renderServiceSection({
     selected: remoteOffers,
@@ -127,8 +153,8 @@ function renderServices(services) {
     source: "others",
     selectedTitle: "Subscribed",
     availableTitle: "Available from People",
-    emptySelected: "No Services from others are subscribed.",
-    emptyAvailable: "No Browser Engine or Browser Exit services are available from People you are connected with.",
+    emptySelected: "No subscriptions yet.",
+    emptyAvailable: "No services from People yet.",
   });
 }
 
@@ -468,7 +494,7 @@ function showStatus(text, tone = "muted") {
     return;
   }
   statusNode.textContent = tone === "error"
-    ? publicServicesError(text, "Services could not be updated.")
+    ? publicServicesError(text, "Sharing could not be updated.")
     : text;
   statusNode.dataset.tone = tone;
   statusNode.hidden = !text;

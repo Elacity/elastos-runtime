@@ -1,14 +1,21 @@
-import { readText, relativeTime, requestTitle, shortAddress } from "./wallet-format.js?v=wallet-20260523a";
+import { readText, relativeTime, requestTitle, shortAddress } from "./wallet-format.js?v=wallet-20260720k";
 
-export function createWalletActivity({ activityNode, textNode }) {
+export function createWalletActivity({
+  activityNode,
+  textNode,
+}) {
   function renderActivity(requests) {
     activityNode.replaceChildren();
-    if (requests.length === 0) {
-      activityNode.append(textNode("p", "No wallet activity yet.", "wallet-state"));
+    // History only — pending actions live under Send/Receive in the hero.
+    const history = [...requests]
+      .filter((request) => readText(request.status) !== "pending")
+      .sort((a, b) => activityTime(b) - activityTime(a))
+      .slice(0, 12);
+    if (history.length === 0) {
+      activityNode.append(textNode("p", "No activity yet.", "wallet-state"));
       return;
     }
-    const recent = [...requests].sort((a, b) => activityTime(b) - activityTime(a)).slice(0, 12);
-    for (const request of recent) {
+    for (const request of history) {
       const row = document.createElement("article");
       row.className = "wallet-activity-row";
       row.innerHTML = `<span class="wallet-activity-icon">${activityIcon(request)}</span>`;

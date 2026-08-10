@@ -25,6 +25,7 @@ import { createLibraryPreview } from "./preview.js";
 import { createLibraryRealtime } from "./realtime.js";
 import { createLibraryRenderer, iconPlaceholder } from "./render.js?v=library-20260711d";
 import { createLibrarySelection } from "./selection.js";
+import { TAG_COLORS, getTag, setTag } from "./tags.js";
 import {
   MUTATING_PROVIDER_OPS,
   cacheFolderListing,
@@ -49,6 +50,9 @@ import {
       perfTarget: (window.__libraryPerf = window.__libraryPerf || {}),
     });
     const homeOrigin = queryParams.get("home_origin") || "";
+    if (state.homeToken && homeOrigin && window.top !== window) {
+      window.top.postMessage({ type: "home:app-ready", homeToken: state.homeToken }, homeOrigin);
+    }
     const homeClipboard = createHomeClipboardClient({
       targetId: "library",
       homeOrigin,
@@ -76,6 +80,9 @@ import {
       newFolderButton: document.getElementById("new-folder-button"),
       pickerActionButton: document.getElementById("picker-action-button"),
       search: document.getElementById("search"),
+      searchToggle: document.getElementById("search-toggle"),
+      toolbarSearch: document.getElementById("toolbar-search"),
+      moreButton: document.getElementById("more-button"),
       currentTitle: document.getElementById("current-title"),
       statusText: document.getElementById("status-text"),
       refreshButton: document.getElementById("refresh-button"),
@@ -91,6 +98,7 @@ import {
       contextMenu: document.getElementById("context-menu"),
       dialog: document.getElementById("dialog"),
       sidebar: document.querySelector(".sidebar"),
+      sidebarResizer: document.getElementById("sidebar-resizer"),
     };
     let renderContent = () => {};
     let renderFooter = () => {};
@@ -396,7 +404,7 @@ import {
       return folderObject?.metadata?.readonly !== false;
     }
 
-    function setFolderStatus(text) {
+    function setFolderStatus(_text) {
       if (isArchivePickerMode()) {
         setStatus("");
         return;
@@ -405,7 +413,9 @@ import {
         setStatus(attachStatusText());
         return;
       }
-      setStatus(text);
+      // The object count lives in the footer statusbar (with selection state);
+      // the toolbar strip only carries transient messages and picker prompts.
+      setStatus("");
     }
 
     function syncModeChrome() {
@@ -427,7 +437,7 @@ import {
         setStatus("");
         return;
       }
-      setStatus("Ready.");
+      setStatus("");
     }
 
     async function completeAttachPicker() {
@@ -565,7 +575,7 @@ import {
       } else {
         state.loading = true;
         state.currentObject = null;
-        setStatus("Loading...");
+        setStatus("Loading…");
       }
       try {
         const data = await providerApi("list", { uri });
@@ -671,7 +681,7 @@ import {
         button.draggable = true;
         button.title = "Drag to reorder";
         button.innerHTML = `
-          ${iconPlaceholder(placeIcon(root), "place-icon window-sidebar-item-icon")}
+          ${placeIconMarkup(root)}
           <span class="place-label">${escapeHtml(root.label)}</span>
         `;
         elements.places.appendChild(button);
@@ -738,10 +748,23 @@ import {
         documents: "icons/sidebar-folder-documents.svg",
         pictures: "icons/sidebar-folder-pictures.svg",
         videos: "icons/sidebar-folder-videos.svg",
+        music: "icons/sidebar-folder.svg",
         downloads: "icons/sidebar-folder.svg",
         public: "icons/sidebar-folder-public.svg",
         webspaces: "icons/sidebar-folder.svg",
       }[id] || "icons/sidebar-folder.svg";
+    }
+
+    /* Favorites icons paint with --el-accent via CSS mask (SVGs are baked #0063f4).
+       Trash keeps its rendered asset. */
+    function placeIconMarkup(root) {
+      const id = typeof root === "string" ? root : root?.id;
+      const src = placeIcon(root);
+      if (id === "trash") {
+        return iconPlaceholder(src, "place-icon window-sidebar-item-icon");
+      }
+      const safeSrc = escapeHtml(src);
+      return `<span class="place-icon place-icon-accent window-sidebar-item-icon" style="--place-mask: url(&quot;${safeSrc}&quot;)" aria-hidden="true"></span>`;
     }
 
     function renderBreadcrumbs() {
@@ -781,6 +804,61 @@ import {
 
     function visibleObjects() {
       return visibleObjectsForState(state);
+    }
+
+    // Apply (or, when colorId is falsy, clear) a colour tag on every given object, then refresh
+    // just those rows. Tags live in the local preference store (see tags.js), so this is instant and local.
+    function applyTag(objects, colorId) {
+      for (const object of objects) {
+        if (!object || !object.uri) continue;
+        setTag(object.uri, colorId);
+        state.objectNodeCache.delete(object.uri); // bust the render cache so the dot updates
+      }
+      scheduleContentRender();
+    }
+
+    // A file-manager-style colour-tag row: seven dots + Clear. A dot already on every selected item is
+    // shown active; clicking it toggles it off. Returns a custom menu entry that builds its own DOM.
+    function tagsMenuRow(objects) {
+      const uris = objects.map((object) => object.uri).filter(Boolean);
+      const current = uris.length
+        ? uris.map((uri) => getTag(uri)).reduce((a, b) => (a === b ? a : ""))
+        : "";
+      return {
+        custom: ({ hideMenu }) => {
+          const row = document.createElement("div");
+          row.className = "menu-tags-row";
+          for (const color of TAG_COLORS) {
+            const dot = document.createElement("button");
+            dot.type = "button";
+            dot.className = "menu-tag-dot";
+            dot.style.setProperty("--tag-color", color.hex);
+            dot.title = color.label;
+            dot.setAttribute("aria-label", `Tag ${color.label}`);
+            if (current && current === color.id) dot.dataset.active = "true";
+            dot.addEventListener("click", (event) => {
+              event.stopPropagation();
+              // Toggle: clicking the colour already on all selected items clears it.
+              applyTag(objects, current === color.id ? "" : color.id);
+              hideMenu();
+            });
+            row.appendChild(dot);
+          }
+          const clear = document.createElement("button");
+          clear.type = "button";
+          clear.className = "menu-tag-clear";
+          clear.title = "Clear tag";
+          clear.setAttribute("aria-label", "Clear tag");
+          clear.textContent = "\u2715";
+          clear.addEventListener("click", (event) => {
+            event.stopPropagation();
+            applyTag(objects, "");
+            hideMenu();
+          });
+          row.appendChild(clear);
+          return row;
+        },
+      };
     }
 
     function showMenuForObject(object, x, y) {
@@ -862,17 +940,14 @@ import {
       const localContentCid = contentCid(object);
       const publicCid = publishedCid(object);
       if (localContentCid) {
-        actions.push(
-          menuAction("Copy Content CID", () =>
-            copyText(
-              localContentCid,
-              "content CID",
-              "resource.identifier",
-            )),
-        );
+        actions.push(menuAction("Copy Content CID", () => copyText(localContentCid, "content CID", "resource.identifier")));
       }
       if (object.published && publicCid) {
-        actions.push(menuAction("Copy Published Link", () => copyText("elastos://" + publicCid, "published link")));
+        actions.push(menuAction("Copy Published Link", () => copyText("elastos://" + publicCid, "published link", "resource.uri")));
+      }
+      if (!inTrash(object)) {
+        actions.push("-");
+        actions.push(tagsMenuRow([object]));
       }
       actions.push(menuAction("Properties", () => showProperties(object)));
       renderMenu(actions, x, y);
@@ -941,6 +1016,10 @@ import {
       if (active.some((object) => hasCapability(object, "trash"))) actions.push(menuAction("Delete", trashSelectedObjects));
       if (trash.length) actions.push(menuAction("Restore", restoreSelectedObjects));
       if (permanentlyDeletable) actions.push(menuAction("Delete Permanently", deleteSelectedObjects));
+      if (active.length) {
+        actions.push("-");
+        actions.push(tagsMenuRow(active));
+      }
       renderMenu(actions, x, y);
     }
 
@@ -984,6 +1063,40 @@ import {
       renderMenu(actions, x, y);
     }
 
+    // The toolbar "…" menu: folder actions only. View is omitted (the segmented
+    // toggle sits right beside the button) and Show Hidden stays in the
+    // background context menu — the toolbar carries the everyday actions.
+    function showToolbarMenu(x, y) {
+      const readOnly = currentFolderReadOnly();
+      const actions = [];
+      actions.push(menuAction("Sort By", null, {
+        children: [
+          menuAction("Name", () => setSort("name"), { checked: state.sort === "name" }),
+          menuAction("Date Modified", () => setSort("modified"), { checked: state.sort === "modified" }),
+          menuAction("Type", () => setSort("type"), { checked: state.sort === "type" }),
+          menuAction("Size", () => setSort("size"), { checked: state.sort === "size" }),
+          "-",
+          menuAction("Ascending", () => setSortOrder("asc"), { checked: state.sortOrder !== "desc" }),
+          menuAction("Descending", () => setSortOrder("desc"), { checked: state.sortOrder === "desc" }),
+        ],
+      }));
+      actions.push("-");
+      if (!readOnly) {
+        actions.push(menuAction("New", null, {
+          children: [
+            menuAction("Folder", createFolder),
+            menuAction("Text Document", createTextDocument),
+          ],
+        }));
+      }
+      if (canPasteInto(state.currentUri)) actions.push(menuAction("Paste", () => pasteClipboardTo(state.currentUri)));
+      if (!readOnly) actions.push(menuAction("Upload Here", () => elements.fileInput.click()));
+      actions.push("-");
+      actions.push(menuAction("Refresh", loadCurrentFolder));
+      actions.push(menuAction("Properties", () => showFolderProperties()));
+      renderMenu(actions, x, y);
+    }
+
     function showFolderProperties() {
       const root = rootForUri(state.currentUri);
       showProperties({
@@ -1020,10 +1133,92 @@ import {
 
     function setView(view) {
       state.view = view === "list" ? "list" : "grid";
-      viewPreferenceStore.setItem("library.view", state.view);
+      viewPreferenceStore.setItem("library.contentView", state.view);
       syncContentViewMode();
       syncViewButtons();
       renderFooter();
+    }
+
+    function applySidebarWidth(widthPx) {
+      const width = Math.min(420, Math.max(160, Math.round(widthPx)));
+      state.sidebarWidth = width;
+      if (elements.libraryShell) {
+        elements.libraryShell.style.setProperty("--library-sidebar-w", `${width}px`);
+      }
+      if (elements.sidebarResizer) {
+        elements.sidebarResizer.setAttribute("aria-valuenow", String(width));
+      }
+      return width;
+    }
+
+    function persistSidebarWidth(widthPx) {
+      const width = applySidebarWidth(widthPx);
+      viewPreferenceStore.setItem("library.sidebarWidth", String(width));
+    }
+
+    function bindSidebarResize() {
+      const handle = elements.sidebarResizer;
+      const shell = elements.libraryShell;
+      if (!handle || !shell) {
+        return;
+      }
+      handle.setAttribute("aria-valuemin", "160");
+      handle.setAttribute("aria-valuemax", "420");
+      applySidebarWidth(state.sidebarWidth);
+
+      let drag = null;
+      const onMove = (event) => {
+        if (!drag) {
+          return;
+        }
+        const x = event.clientX ?? event.touches?.[0]?.clientX;
+        if (!Number.isFinite(x)) {
+          return;
+        }
+        applySidebarWidth(drag.startWidth + (x - drag.startX));
+      };
+      const onUp = () => {
+        if (!drag) {
+          return;
+        }
+        persistSidebarWidth(state.sidebarWidth);
+        drag = null;
+        document.body.classList.remove("library-sidebar-resizing");
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+      };
+      handle.addEventListener("pointerdown", (event) => {
+        if (event.button != null && event.button !== 0) {
+          return;
+        }
+        event.preventDefault();
+        drag = {
+          startX: event.clientX,
+          startWidth: state.sidebarWidth || 220,
+        };
+        document.body.classList.add("library-sidebar-resizing");
+        handle.setPointerCapture?.(event.pointerId);
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+        window.addEventListener("pointercancel", onUp);
+      });
+      handle.addEventListener("keydown", (event) => {
+        const step = event.shiftKey ? 24 : 12;
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          persistSidebarWidth(state.sidebarWidth - step);
+        } else if (event.key === "ArrowRight") {
+          event.preventDefault();
+          persistSidebarWidth(state.sidebarWidth + step);
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          persistSidebarWidth(160);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          persistSidebarWidth(420);
+        }
+      });
     }
 
     function showError(error) {
@@ -1067,6 +1262,7 @@ import {
         showError,
         showMenuForObject,
         showPlaceMenu,
+        showToolbarMenu,
         startRename,
         state,
         stopLibraryEventStream,
@@ -1076,6 +1272,82 @@ import {
       });
     }
 
+    // Shell menu bar: declare File/View menus to Home; commands come back as
+    // elastos:menu-command and route to the same functions the toolbar uses.
+    // Post to window.top with homeOrigin — the opaque GUI parent cannot receive
+    // a URL-origin target, and only the host relays manifests into the menubar.
+    function announceMenuManifest() {
+      if (!state.homeToken || !homeOrigin || window.top === window) {
+        return;
+      }
+      window.top.postMessage({
+        type: "home:menu-manifest",
+        homeToken: state.homeToken,
+        menus: [
+          {
+            title: "File",
+            items: [
+              { label: "New Folder", cmd: "new-folder" },
+              { label: "New Text Document", cmd: "new-text-document" },
+              "-",
+              { label: "Upload Files...", cmd: "upload" },
+              "-",
+              { label: "New Window", cmd: "__new-window" },
+              { label: "Close Window", cmd: "__close-window" },
+            ],
+          },
+          {
+            title: "View",
+            items: [
+              { label: "As Icons", cmd: "view-icons" },
+              { label: "As Details", cmd: "view-details" },
+              "-",
+              { label: "Show Hidden", cmd: "toggle-hidden" },
+              { label: "Refresh", cmd: "refresh" },
+            ],
+          },
+        ],
+      }, homeOrigin);
+    }
+
+    function handleMenuCommand(cmd) {
+      switch (cmd) {
+        case "new-folder":
+          createFolder().catch(showError);
+          return;
+        case "new-text-document":
+          createTextDocument();
+          return;
+        case "upload":
+          elements.fileInput.click();
+          return;
+        case "view-icons":
+          setView("grid");
+          return;
+        case "view-details":
+          setView("list");
+          return;
+        case "toggle-hidden":
+          toggleShowHidden();
+          return;
+        case "refresh":
+          loadCurrentFolder().catch(showError);
+          return;
+        default:
+      }
+    }
+
+    window.addEventListener("message", (event) => {
+      // Menu commands come from the opaque GUI parent (security origin "null").
+      if (event.origin !== "null" || event.source !== window.parent) {
+        return;
+      }
+      const message = event.data;
+      if (message?.type === "elastos:menu-command" && typeof message.cmd === "string") {
+        handleMenuCommand(message.cmd);
+      }
+    });
+
     async function boot() {
       if (!state.homeToken) {
         elements.lockedShell.classList.remove("hidden");
@@ -1084,7 +1356,10 @@ import {
       elements.libraryShell.classList.remove("hidden");
       elements.content.dataset.view = state.view;
       syncModeChrome();
+      bindSidebarResize();
       bindEvents();
+      announceMenuManifest();
+      syncViewButtons();
       try {
         await loadRoots();
         installBrowserHistory();
