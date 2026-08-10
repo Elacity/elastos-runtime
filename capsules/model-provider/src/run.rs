@@ -40,6 +40,7 @@ pub enum RunEvent {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ObjectDescriptor {
+    pub id: String,
     pub media_type: String,
     pub sha256: String,
     pub size: u64,

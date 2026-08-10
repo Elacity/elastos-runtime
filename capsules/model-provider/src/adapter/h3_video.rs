@@ -67,11 +67,14 @@ pub fn run_video(run: Arc<Mutex<Run>>, upstream_url: String, output_dir: PathBuf
         phase: "starting".to_string(),
     });
 
+    let _ = run_id; // run-scoped logging only; the artifact is content-addressed below
     if let Err(err) = std::fs::create_dir_all(&output_dir) {
         fail("output_dir", &err.to_string());
         return;
     }
-    let out_path = output_dir.join(format!("{run_id}.mp4"));
+    // Stream to a .partial file; the artifact id (sha256[..32]) is only known
+    // once hashing completes, then we rename atomically.
+    let partial_path = output_dir.join(format!("{run_id}.mp4.partial"));
 
     let extra = serde_json::json!({
         "task": "t2va",
@@ -124,7 +127,7 @@ pub fn run_video(run: Arc<Mutex<Run>>, upstream_url: String, output_dir: PathBuf
         phase: "saving".to_string(),
     });
 
-    let mut file = match std::fs::File::create(&out_path) {
+    let mut file = match std::fs::File::create(&partial_path) {
         Ok(file) => file,
         Err(err) => {
             fail("output_write", &err.to_string());
@@ -139,13 +142,13 @@ pub fn run_video(run: Arc<Mutex<Run>>, upstream_url: String, output_dir: PathBuf
     loop {
         if cancel.load(Ordering::Relaxed) {
             drop(file);
-            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(&partial_path);
             push(RunState::Cancelled.into());
             return;
         }
         if started.elapsed() > RUN_CEILING {
             drop(file);
-            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(&partial_path);
             fail("timeout", "run exceeded 3000s policy ceiling");
             return;
         }
@@ -156,13 +159,13 @@ pub fn run_video(run: Arc<Mutex<Run>>, upstream_url: String, output_dir: PathBuf
                 size += n as u64;
                 if let Err(err) = file.write_all(&buffer[..n]) {
                     fail("output_write", &err.to_string());
-                    let _ = std::fs::remove_file(&out_path);
+                    let _ = std::fs::remove_file(&partial_path);
                     return;
                 }
             }
             Err(err) => {
                 fail("stream_error", &err.to_string());
-                let _ = std::fs::remove_file(&out_path);
+                let _ = std::fs::remove_file(&partial_path);
                 return;
             }
         }
@@ -170,14 +173,25 @@ pub fn run_video(run: Arc<Mutex<Run>>, upstream_url: String, output_dir: PathBuf
     drop(file);
 
     if size == 0 {
-        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&partial_path);
         fail("empty_result", "upstream returned no video bytes");
         return;
     }
 
     let sha256 = format!("{:x}", hasher.finalize());
+    // Artifact id = first 32 hex of the content hash: deterministic, content-
+    // addressed, and matches the creative library's `is_creative_job_id`
+    // (32-hex) shape so library + video endpoints resolve it with zero changes.
+    let artifact_id = sha256[..32].to_string();
+    let out_path = output_dir.join(format!("{artifact_id}.mp4"));
+    if let Err(err) = std::fs::rename(&partial_path, &out_path) {
+        fail("output_write", &err.to_string());
+        let _ = std::fs::remove_file(&partial_path);
+        return;
+    }
+
     let sidecar = serde_json::json!({
-        "id": run_id,
+        "id": artifact_id,
         "status": "done",
         "mode": "generate",
         "scale": 2,
@@ -187,12 +201,13 @@ pub fn run_video(run: Arc<Mutex<Run>>, upstream_url: String, output_dir: PathBuf
         "size": size,
     });
     let _ = std::fs::write(
-        output_dir.join(format!("{run_id}.json")),
+        output_dir.join(format!("{artifact_id}.json")),
         sidecar.to_string(),
     );
 
     push(RunEvent::Result {
         objects: vec![ObjectDescriptor {
+            id: artifact_id,
             media_type: "video/mp4".to_string(),
             sha256,
             size,
