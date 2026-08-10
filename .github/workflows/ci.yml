@@ -30,6 +30,10 @@ jobs:
           bash scripts/check-wci-alignment.sh
           node scripts/home-entropy-check.mjs
           node scripts/browser-entropy-check.mjs
+      - name: product UI source proofs
+        run: |
+          node scripts/home-shell-regression-smoke.mjs
+          node scripts/people-discovery-smoke.mjs
       - name: Browser close handshake
         run: node --test scripts/browser-window-close-handshake.test.mjs
       - name: cargo clippy

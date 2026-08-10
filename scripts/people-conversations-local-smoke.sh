@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "[people-conversations-local-smoke] home entropy guard"
 node "$ROOT/scripts/home-entropy-check.mjs"
 
+echo "[people-conversations-local-smoke] People ignores stale summary responses"
+node "$ROOT/scripts/people-refresh-generation.test.mjs"
+
 echo "[people-conversations-local-smoke] Chat Room gateway creates ElastOS peer invite objects"
 cargo test --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server \
     test_chat_room_join_link_create_returns_elastos_join_object --lib -- --test-threads=1
@@ -21,6 +24,10 @@ cargo test --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server \
 echo "[people-conversations-local-smoke] People projects accepted conversation contacts"
 cargo test --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server \
     test_home_summary_reports_people_contacts_from_accepted_conversation_members --lib -- --test-threads=1
+
+echo "[people-conversations-local-smoke] Discovery establishes contacts across two Homes"
+cargo test --manifest-path "$ROOT/elastos/Cargo.toml" -p elastos-server \
+    test_people_discovery_request_accept_contact_round_trip --lib -- --test-threads=1
 
 echo "[people-conversations-local-smoke] Chat UI decodes Home launch invite query"
 cargo test --manifest-path "$ROOT/capsules/chat-room-ui/Cargo.toml" --lib \

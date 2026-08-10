@@ -13,7 +13,7 @@ run cargo test --manifest-path elastos/Cargo.toml -p elastos-server passkey -- -
 run cargo test --manifest-path elastos/Cargo.toml -p elastos-identity extension_payloads -- --nocapture
 run cargo test --manifest-path elastos/Cargo.toml -p elastos-server recovery -- --nocapture
 run cargo test --manifest-path elastos/Cargo.toml -p elastos-auth principal_root_protection -- --nocapture
-run cargo test --manifest-path elastos/Cargo.toml -p elastos-server carrier_bridge -- --nocapture
+run cargo test --manifest-path elastos/Cargo.toml -p elastos-server resource_bridge -- --nocapture
 run cargo test --manifest-path elastos/Cargo.toml -p elastos-server principal_launch -- --nocapture
 run cargo test --manifest-path elastos/Cargo.toml -p elastos-server supervisor_launch -- --nocapture
 run cargo test --manifest-path elastos/Cargo.toml -p elastos-server test_home_launch_starts_chat_room_capsule_and_reports_runtime_activity -- --nocapture
