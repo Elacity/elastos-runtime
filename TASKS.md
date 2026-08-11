@@ -30,8 +30,10 @@ product on localhost or the public seed.
 
 The first normal cross-Runtime Chat send exposed a Runtime abort in the old
 Iroh 0.96.1 transport generation. The reviewed Iroh 1.0.2 source port is now
-part of this closeout. Its source tests pass; the installed localhost and public
-seed proof remains in steps 3 and 4 below.
+part of this closeout. Its source tests pass; localhost now has installed
+artifact parity plus machine Browser open/connect/close/zero-residue proof, and
+the remaining installed localhost/manual Browser usability plus public-seed
+proof remain in steps 3 and 4 below.
 
 Finish these steps in order. Do not add product scope while they are open:
 
@@ -45,8 +47,12 @@ Finish these steps in order. Do not add product scope while they are open:
    acceptance: Profile creation and rename, opt-in discovery state, Inbox
    request handling, Chat selection and settings, trusted Clipboard, restart,
    and no unexpected writes from read-only summaries.
-   The current candidate is installed with artifact parity and HTTP 200. The
-   product acceptance in this step is still open.
+   The current candidate is installed with artifact parity and HTTP 200.
+   Existing localhost evidence now covers People, Chat, Inbox, trusted
+   Clipboard, restart continuity, and a machine Browser open/connect/close path
+   with zero ownership/stream/reconciliation residue. Manual Browser visible
+   video/input usability on the installed localhost candidate is still open, so
+   this step remains open.
 4. [ ] Install that same commit on the public seed and pass the real two-Runtime
    journey: overlapping bounded discovery, one request, Inbox-only acceptance,
    direct messages both ways, rename, remove, re-add, shared-room continuity,

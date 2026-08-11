@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-10 UTC
+Last updated: 2026-08-11 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Historical
@@ -23,8 +23,9 @@ the public repository.
   inside the old Iroh 0.96.1 `iroh-quinn` transport. The source candidate now
   uses one coordinated Carrier generation: Iroh 1.0.2, iroh-gossip 0.101.0,
   mDNS 0.4.0, and distributed-topic-tracker 0.3.5. Focused Carrier,
-  collaboration, and two-node source tests pass. Installed product retesting is
-  still required.
+  collaboration, and two-node source tests pass. Localhost artifact parity and
+  machine Browser open/connect/close/zero-residue proof now exist; public-seed
+  retesting and manual Browser visible video/input usability remain open.
 - The Runtime implements the WASM Component Model path through
   `elastos.component/v1` and the Runtime-mediated `elastos:bus@v1` authority
   contract. The conformance fixture and authoring template exercise it; all 18
@@ -125,6 +126,13 @@ the public repository.
 
 - Browser is included in 0.6.0 as a bounded Runtime Browser, not as a fully
   reliable general-purpose Browser claim.
+- On the installed collaboration candidate at localhost, accepted machine proof
+  now covers Browser launch, TURN/media-relay connection, Runtime-mediated
+  traffic, exact terminal close, and zero remaining ownership, stream, and
+  reconciliation files for that page/session.
+- That localhost machine proof does not yet prove human-visible decoded video,
+  Browser text input, scrolling, or audio. Manual Browser usability remains
+  open.
 - Accepted localhost evidence covers the installed macOS VZ candidate's launch,
   decoded display, navigation through Runtime-only networking, and injected
   provider availability.
@@ -394,9 +402,12 @@ the public repository.
 - The collaboration path on `codex/post-0.6-consolidation` is unpublished and
   has no upstream. Its disposable, fixture-owned two-Runtime product journey
   passed on exact source-built artifacts. The current candidate is installed on
-  normal localhost with source/installed artifact parity and HTTP 200, but its
-  one-Runtime product acceptance is not complete. The public seed has not been
-  updated to this candidate and is not matching product evidence.
+  normal localhost with source/installed artifact parity, HTTP 200, accepted
+  People/Chat/Inbox/Clipboard/restart evidence, and machine Browser
+  open/connect/close/zero-residue proof, but its one-Runtime product acceptance
+  is not complete because manual Browser visible video/input usability remains
+  open. The public seed has not been updated to this candidate and is not
+  matching product evidence.
 - Bilateral signed contact removal is implemented with the complete People
   states: a pair-scoped signed revocation delivered over the direct channel
   with durable retry, visible removed state on both sides, retained heads as
