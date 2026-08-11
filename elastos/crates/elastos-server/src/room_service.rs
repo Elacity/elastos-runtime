@@ -463,7 +463,6 @@ pub struct RoomInviteInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomJoinInviteInput {
-    pub issuer_gateway: String,
     pub inviter_profile: crate::collaboration_profile_authority::SignedCollaborationProfileDocument,
 }
 
@@ -471,7 +470,6 @@ pub struct RoomJoinInviteInput {
 pub struct RoomJoinInviteView {
     pub token: String,
     pub invite_url: String,
-    pub issuer_gateway: String,
     pub room_title: String,
     pub invited_by_profile_did: String,
     pub expires_at: u64,
@@ -491,7 +489,6 @@ pub struct SignedRoomJoinInvitePayload {
     pub schema: String,
     pub room_slug: String,
     pub room_title: String,
-    pub issuer_gateway: String,
     pub invited_by_profile_did: String,
     pub inviter_profile: crate::collaboration_profile_authority::SignedCollaborationProfileDocument,
     pub role: RoomRole,
@@ -1208,7 +1205,6 @@ pub fn export_room_join_invite(
     data_dir: &Path,
     input: RoomJoinInviteInput,
 ) -> anyhow::Result<RoomJoinInviteView> {
-    let issuer_gateway = normalize_join_invite_gateway(&input.issuer_gateway)?;
     let inviter_profile = crate::collaboration_profile_authority::verify_signed_profile_document(
         &input.inviter_profile,
     )?;
@@ -1233,7 +1229,6 @@ pub fn export_room_join_invite(
             schema: ROOM_JOIN_INVITE_SCHEMA.to_string(),
             room_slug: state.room_slug.clone(),
             room_title: state.control.title.clone(),
-            issuer_gateway: issuer_gateway.clone(),
             invited_by_profile_did: actor_did.clone(),
             inviter_profile: inviter_profile.signed_envelope().clone(),
             role: RoomRole::Member,
@@ -1256,7 +1251,6 @@ pub fn export_room_join_invite(
     Ok(RoomJoinInviteView {
         invite_url: format!("elastos://peer/invite?token={token}"),
         token,
-        issuer_gateway: payload.issuer_gateway,
         room_title: payload.room_title,
         invited_by_profile_did: payload.invited_by_profile_did,
         expires_at: payload.expires_at,
@@ -1319,10 +1313,6 @@ fn validate_room_join_invite_token(token_or_url: &str) -> anyhow::Result<Validat
     }
     if payload.expires_at <= now_ts() {
         anyhow::bail!("conversation join invite is expired");
-    }
-    let normalized_gateway = normalize_join_invite_gateway(&payload.issuer_gateway)?;
-    if normalized_gateway != payload.issuer_gateway {
-        anyhow::bail!("conversation join invite issuer gateway is not canonical");
     }
     if envelope.signer_did != signer_did {
         anyhow::bail!("join invite signer does not match envelope signer DID");
@@ -5135,21 +5125,6 @@ fn classify_link_object(input: &str) -> Option<LinkPreviewView> {
     })
 }
 
-fn normalize_join_invite_gateway(input: &str) -> anyhow::Result<String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("conversation join invite gateway must not be empty");
-    }
-    let parsed = Url::parse(trimmed).context("conversation join invite gateway is not a URL")?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        anyhow::bail!("conversation join invite gateway must use http or https");
-    }
-    if parsed.host_str().is_none() {
-        anyhow::bail!("conversation join invite gateway must include a host");
-    }
-    Ok(parsed.origin().ascii_serialization())
-}
-
 fn short_link_label(value: &str) -> String {
     if value.len() <= 18 {
         value.to_string()
@@ -5267,12 +5242,10 @@ mod tests {
     fn export_room_join_invite_for_test(
         data_dir: &Path,
         inviter: &RoomTestActor,
-        issuer_gateway: &str,
     ) -> RoomJoinInviteView {
         export_room_join_invite(
             data_dir,
             RoomJoinInviteInput {
-                issuer_gateway: issuer_gateway.to_string(),
                 inviter_profile: inviter.profile.signed_envelope().clone(),
             },
         )
@@ -5836,7 +5809,6 @@ mod tests {
         let join = export_room_join_invite(
             owner.path(),
             RoomJoinInviteInput {
-                issuer_gateway: "https://elastos.example".to_string(),
                 inviter_profile: owner_actor.profile.signed_envelope().clone(),
             },
         )
@@ -5862,7 +5834,6 @@ mod tests {
             owner_actor.profile_did
         );
         assert!(inviter_profile.authorizes_endpoint(&signer_did));
-        assert_eq!(decoded.payload.issuer_gateway, "https://elastos.example");
         assert_eq!(decoded.payload.role, RoomRole::Member);
         assert_eq!(inviter_profile.document().display_name, "Owner");
 
@@ -5957,7 +5928,6 @@ mod tests {
         let join = export_room_join_invite(
             owner.path(),
             RoomJoinInviteInput {
-                issuer_gateway: "https://elastos.example".to_string(),
                 inviter_profile: owner_actor.profile.signed_envelope().clone(),
             },
         )
@@ -6021,7 +5991,6 @@ mod tests {
         let join = export_room_join_invite(
             owner.path(),
             RoomJoinInviteInput {
-                issuer_gateway: "https://elastos.example".to_string(),
                 inviter_profile: owner_actor.profile.signed_envelope().clone(),
             },
         )
@@ -6056,8 +6025,7 @@ mod tests {
         let owner = tempfile::tempdir().unwrap();
         let owner_actor = room_test_profile(owner.path(), 92, "Owner", Some("owner"));
         seed_room_owner_for_test(owner.path(), &owner_actor.profile, "Shared Chat");
-        let join =
-            export_room_join_invite_for_test(owner.path(), &owner_actor, "https://elastos.example");
+        let join = export_room_join_invite_for_test(owner.path(), &owner_actor);
 
         assert_meaningful_bootstrap_state_rejects_adoption(
             owner.path(),
@@ -6164,7 +6132,6 @@ mod tests {
         let join = export_room_join_invite(
             owner.path(),
             RoomJoinInviteInput {
-                issuer_gateway: "https://elastos.example".to_string(),
                 inviter_profile: owner_actor.profile.signed_envelope().clone(),
             },
         )

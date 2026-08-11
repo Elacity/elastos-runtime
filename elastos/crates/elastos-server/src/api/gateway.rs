@@ -66,6 +66,8 @@ mod gateway_inbox;
 mod gateway_inspect_actions;
 #[path = "gateway_marketplace.rs"]
 mod gateway_marketplace;
+#[path = "gateway_origin.rs"]
+mod gateway_origin;
 #[path = "gateway_passkey_step_up.rs"]
 mod gateway_passkey_step_up;
 #[path = "gateway_provider_proxy.rs"]
@@ -128,6 +130,7 @@ use gateway_home_wallet_connector::*;
 use gateway_inbox::*;
 use gateway_inspect_actions::*;
 use gateway_marketplace::*;
+use gateway_origin::*;
 use gateway_passkey_step_up::*;
 pub(super) use gateway_passkey_step_up::{
     consume_or_recover_passkey_step_up_effect, consume_passkey_step_up_token,

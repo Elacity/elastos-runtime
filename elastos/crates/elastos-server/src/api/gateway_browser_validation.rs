@@ -2,36 +2,10 @@
 
 use super::*;
 
-pub(in crate::api::gateway) fn browser_request_origin(headers: &HeaderMap) -> Option<String> {
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let default_proto = if browser_origin_host_is_loopback(host) {
-        "http"
-    } else {
-        "https"
-    };
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| *value == "http" || *value == "https")
-        .unwrap_or(default_proto);
-    Some(format!("{proto}://{host}"))
-}
-
-fn browser_origin_host_is_loopback(host: &str) -> bool {
-    let trimmed = host.trim();
-    let host = if let Some(rest) = trimmed.strip_prefix('[') {
-        rest.split(']').next().unwrap_or_default()
-    } else {
-        trimmed.split(':').next().unwrap_or_default()
-    }
-    .to_ascii_lowercase();
-    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+pub(in crate::api::gateway) fn browser_request_origin(
+    headers: &HeaderMap,
+) -> anyhow::Result<String> {
+    Ok(effective_gateway_origin(headers)?.origin().to_string())
 }
 
 pub(in crate::api::gateway) fn browser_url_to_stream_target(

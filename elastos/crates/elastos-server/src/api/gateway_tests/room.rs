@@ -375,9 +375,7 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
                 .uri("/api/apps/chat-room/invites/create-link")
                 .header("x-elastos-home-token", token.as_str())
                 .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"issuer_gateway":"https://elastos.elacitylabs.com"}"#,
-                ))
+                .body(Body::from(r#"{}"#))
                 .unwrap(),
         )
         .await
@@ -398,22 +396,70 @@ async fn test_chat_room_join_link_create_returns_elastos_join_object() {
     );
     let (envelope, signer_did) =
         crate::room_service::decode_room_join_invite_token(invite_token).unwrap();
-    assert_eq!(payload["issuer_gateway"], "https://elastos.elacitylabs.com");
     assert_eq!(payload["room_title"], "Chat");
     assert_eq!(
         payload["invited_by_profile_did"],
         profile.document().profile_did
     );
-    assert_eq!(
-        envelope.payload.issuer_gateway,
-        "https://elastos.elacitylabs.com"
-    );
+    assert!(payload.get("issuer_gateway").is_none());
     assert_eq!(envelope.payload.room_title, "Chat");
     assert_eq!(
         envelope.payload.invited_by_profile_did,
         profile.document().profile_did
     );
     assert_ne!(signer_did, profile.document().profile_did);
+}
+
+#[tokio::test]
+async fn test_chat_room_join_link_create_rejects_caller_supplied_issuer_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_profile(dir.path(), "anders");
+
+    let launch = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/apps/home/launch")
+                .header("x-elastos-home-token", authority.home_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target":"chat-room"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(launch.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let route = payload["route"].as_str().unwrap();
+    let token = test_launch_token_from_route(route);
+
+    let response = app
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/chat-room/invites/create-link")
+                .header("x-elastos-home-token", token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"issuer_gateway":"https://elastos.elacitylabs.com"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 #[tokio::test]

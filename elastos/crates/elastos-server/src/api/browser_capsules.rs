@@ -663,7 +663,8 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         write_test_wasm_browser_capsule(data_dir.path(), "home-cli", "Home CLI", "shell");
         let mut headers = test_request_headers();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("host", "home.example.test".parse().unwrap());
+        headers.insert("origin", "https://home.example.test".parse().unwrap());
 
         let response =
             serve_browser_capsule_path(data_dir.path(), &headers, "home-cli", None).await;
@@ -673,8 +674,8 @@ mod tests {
             .get("content-security-policy")
             .and_then(|value| value.to_str().ok())
             .unwrap();
-        assert!(csp.contains("connect-src https://localhost:61180 wss://localhost:61180"));
-        assert!(!csp.contains("ws://localhost:61180"));
+        assert!(csp.contains("connect-src https://home.example.test wss://home.example.test"));
+        assert!(!csp.contains("ws://home.example.test"));
     }
 
     #[test]

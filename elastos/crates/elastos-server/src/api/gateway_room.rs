@@ -218,10 +218,7 @@ pub(super) struct ChatRoomInviteRevokeBody {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ChatRoomJoinInviteCreateBody {
-    #[serde(default)]
-    issuer_gateway: Option<String>,
-}
+pub(super) struct ChatRoomJoinInviteCreateBody {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -840,7 +837,7 @@ pub(super) async fn chat_room_join_invite_create(
     if state.collaboration_chat_product_port.is_some() {
         return configured_legacy_room_control_unsupported_response();
     }
-    let body = match decode_guarded_room_body::<ChatRoomJoinInviteCreateBody>(body) {
+    let _body = match decode_guarded_room_body::<ChatRoomJoinInviteCreateBody>(body) {
         Ok(body) => body,
         Err((status, message)) => return (status, message).into_response(),
     };
@@ -849,19 +846,6 @@ pub(super) async fn chat_room_join_invite_create(
             Ok(context) => context,
             Err(err) => return room_service_error_response(err),
         };
-    let issuer_gateway = match body
-        .issuer_gateway
-        .or_else(|| chat_room_invite_gateway_origin(&headers))
-    {
-        Some(value) => value,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "conversation invite needs a gateway origin",
-            )
-                .into_response()
-        }
-    };
     let profile = match trusted_chat_room_profile_authority(&state.data_dir, &context) {
         Ok(profile) => profile,
         Err(err) => return room_service_error_response(err),
@@ -872,7 +856,6 @@ pub(super) async fn chat_room_join_invite_create(
         crate::room_service::export_room_join_invite(
             &data_dir,
             crate::room_service::RoomJoinInviteInput {
-                issuer_gateway,
                 inviter_profile: profile.signed_envelope().clone(),
             },
         )
@@ -948,33 +931,6 @@ pub(super) async fn chat_room_join_invite_join(
         "Room join claims are unavailable through this legacy transport path.",
     )
         .into_response()
-}
-
-pub(super) fn chat_room_invite_gateway_origin(headers: &HeaderMap) -> Option<String> {
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| *value == "http" || *value == "https")
-        .unwrap_or_else(|| {
-            if host.starts_with("127.0.0.1")
-                || host.starts_with("localhost")
-                || host.starts_with("[::1]")
-            {
-                "http"
-            } else {
-                "https"
-            }
-        });
-    Some(format!("{proto}://{host}"))
 }
 
 fn load_room_summary_with_identity(
@@ -1715,40 +1671,9 @@ pub(super) async fn room_service_attachment_get(
 }
 
 pub(crate) fn request_uses_tls(headers: &HeaderMap) -> bool {
-    if headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
-    {
-        return true;
-    }
-
-    if headers
-        .get("forwarded")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().contains("proto=https"))
-    {
-        return true;
-    }
-
-    request_host(headers).is_some_and(|host| !request_host_is_local(&host))
-}
-
-fn request_host_is_local(host: &str) -> bool {
-    let host = host
-        .trim()
-        .trim_end_matches('.')
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase();
-    let host = if host == "::1" {
-        host.as_str()
-    } else {
-        host.split(':').next().unwrap_or(host.as_str())
-    };
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || matches!(host, "127.0.0.1" | "0.0.0.0" | "::1")
+    effective_gateway_origin(headers)
+        .map(|origin| origin.secure())
+        .unwrap_or(false)
 }
 
 pub(crate) fn set_room_session_cookie_header(
