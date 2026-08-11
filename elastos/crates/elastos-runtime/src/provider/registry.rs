@@ -186,9 +186,10 @@ impl ProviderCarrierRoute {
 }
 
 /// Runtime transport used for provider-to-provider invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ProviderInvocationTransport {
     /// In-process Runtime provider registry.
+    #[default]
     Local,
     /// Carrier provider plane. Apps never select this directly.
     Carrier(ProviderCarrierRoute),
@@ -207,12 +208,6 @@ impl ProviderInvocationTransport {
             ProviderInvocationTransport::Local => None,
             ProviderInvocationTransport::Carrier(route) => Some(route),
         }
-    }
-}
-
-impl Default for ProviderInvocationTransport {
-    fn default() -> Self {
-        Self::Local
     }
 }
 

@@ -259,18 +259,13 @@ impl Default for RoomAccessPolicyView {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RoomRole {
     Owner,
     Admin,
+    #[default]
     Member,
-}
-
-impl Default for RoomRole {
-    fn default() -> Self {
-        Self::Member
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,19 +658,14 @@ struct RoomInviteRecord {
     acted_by: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum InviteStatus {
+    #[default]
     Pending,
     Accepted,
     Revoked,
     Expired,
-}
-
-impl Default for InviteStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

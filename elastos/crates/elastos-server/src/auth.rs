@@ -406,18 +406,13 @@ pub struct PrincipalRecord {
     pub updated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePrincipalRole {
+    // Existing local runtimes with a single pre-role passkey remain recoverable.
+    #[default]
     Admin,
     Guest,
-}
-
-impl Default for RuntimePrincipalRole {
-    fn default() -> Self {
-        // Existing local runtimes with a single pre-role passkey remain recoverable.
-        Self::Admin
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

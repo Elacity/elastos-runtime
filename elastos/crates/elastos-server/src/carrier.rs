@@ -28,12 +28,15 @@ use base64::Engine as _;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, SecretKey, Watcher};
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 // AutoDiscoveryGossip trait extends Gossip with DHT-based peer discovery.
 // RecordPublisher publishes topic records to DHT so peers can find each other.
 // DHT auto-discovery imports — used by native `elastos chat` path (main.rs).
 // Provider gossip_join uses deterministic subscribe_with_opts for now.
 #[allow(unused_imports)]
-use distributed_topic_tracker::{AutoDiscoveryGossip, RecordPublisher, TopicId};
+use distributed_topic_tracker::{
+    AutoDiscoveryGossip, Config as TopicTrackerConfig, RecordPublisher, TimeoutConfig, TopicId,
+};
 use futures_lite::StreamExt;
 use iroh_gossip::net::Gossip;
 use serde::{Deserialize, Serialize};
@@ -298,13 +301,23 @@ pub struct CarrierNode {
 
 impl CarrierNode {
     pub(crate) async fn shutdown(self) {
-        {
+        let tasks = {
             let mut state = self.gossip_state.lock().await;
-            for (_, task) in state.receiver_tasks.drain() {
-                task.abort();
-            }
+            let tasks = state
+                .receiver_tasks
+                .drain()
+                .map(|(_, task)| task)
+                .collect::<Vec<_>>();
             state.senders.clear();
             state.joined_topics.clear();
+            tasks
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Err(err) = self.gossip.shutdown().await {
+            tracing::warn!(error = %err, "carrier gossip shutdown failed during runtime shutdown");
         }
         self.endpoint.close().await;
     }
@@ -387,6 +400,14 @@ impl GossipState {
             peers: Arc::new(Mutex::new(Vec::new())),
             topic_peers: Arc::new(Mutex::new(HashMap::new())),
             did,
+        }
+    }
+}
+
+impl Drop for GossipState {
+    fn drop(&mut self) {
+        for task in self.receiver_tasks.values() {
+            task.abort();
         }
     }
 }
@@ -622,7 +643,7 @@ fn is_trusted_source_runtime(data_dir: &std::path::Path) -> bool {
         || publisher_artifacts_path(data_dir).exists()
 }
 
-fn register_topic_state(
+async fn register_topic_state(
     state: &mut GossipState,
     topic_name: &str,
     sender: distributed_topic_tracker::GossipSender,
@@ -635,6 +656,7 @@ fn register_topic_state(
         .insert(topic_name.to_string(), receiver_task)
     {
         existing.abort();
+        let _ = existing.await;
     }
 }
 
@@ -669,7 +691,7 @@ async fn join_gossip_topic_direct(
         .await?;
     let (iroh_sender, iroh_receiver) = joined.split();
     let dtt_sender =
-        distributed_topic_tracker::GossipSender::new(iroh_sender, state.gossip.clone());
+        distributed_topic_tracker::GossipSender::new(iroh_sender, TimeoutConfig::default());
     state
         .buffers
         .lock()
@@ -690,7 +712,7 @@ async fn join_gossip_topic_direct(
         )
         .await;
     });
-    register_topic_state(state, topic_name, dtt_sender, receiver_task);
+    register_topic_state(state, topic_name, dtt_sender, receiver_task).await;
     Ok(())
 }
 
@@ -712,10 +734,10 @@ async fn join_gossip_topic(
     let topic_id = TopicId::new(topic_name.to_string());
     let record_publisher = RecordPublisher::new(
         topic_id,
-        dtt_sk.verifying_key(),
         dtt_sk,
         None,
         TOPIC_DISCOVERY_SECRET.to_vec(),
+        TopicTrackerConfig::default(),
     );
     info!(
         "carrier: gossip_join '{}' via DHT auto-discovery ({} connected bootstrap peer(s))",
@@ -747,7 +769,7 @@ async fn join_gossip_topic(
         )
         .await;
     });
-    register_topic_state(state, topic_name, sender, receiver_task);
+    register_topic_state(state, topic_name, sender, receiver_task).await;
     Ok(())
 }
 
@@ -802,15 +824,12 @@ pub async fn start_carrier_node_with_registry(
 ) -> Result<CarrierNode> {
     let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
-    // Build endpoint. Uses iroh default relays unless ELASTOS_RELAY_URL is set.
-    // Don't override address_lookup — the default includes pkarr for DHT discovery.
-    let mut builder = Endpoint::builder().secret_key(secret_key.clone());
+    // Build an endpoint with Iroh's N0 DNS and relay services unless a custom
+    // relay is configured. Topic discovery remains the tracker's DHT layer.
+    let mut builder = Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key.clone());
     if let Ok(relay_url) = std::env::var("ELASTOS_RELAY_URL") {
         if let Ok(url) = relay_url.parse::<url::Url>() {
-            let config = iroh::RelayConfig {
-                url: url.into(),
-                quic: Some(Default::default()),
-            };
+            let config = iroh::RelayConfig::new(url.into(), Some(Default::default()));
             builder =
                 builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([config])));
             info!("carrier: using custom relay {}", relay_url);
@@ -822,23 +841,26 @@ pub async fn start_carrier_node_with_registry(
     {
         Ok(builder) => match builder.bind().await {
             Ok(ep) => ep,
-            Err(_) => Endpoint::builder()
+            Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
                 .secret_key(secret_key)
                 .bind()
                 .await
                 .context("Failed to bind Carrier endpoint")?,
         },
-        Err(_) => Endpoint::builder()
+        Err(_) => Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .bind()
             .await
             .context("Failed to bind Carrier endpoint")?,
     };
 
-    // Add mDNS for LAN discovery (supplements the default pkarr/DNS).
+    // Add mDNS for LAN discovery alongside the N0 preset lookup services.
     if carrier_mdns_enabled() {
-        if let Ok(mdns) = iroh::address_lookup::MdnsAddressLookup::builder().build(endpoint.id()) {
-            endpoint.address_lookup().add(mdns);
+        if let Ok(mdns) = MdnsAddressLookup::builder().build(endpoint.id()) {
+            endpoint
+                .address_lookup()
+                .context("Carrier endpoint closed before mDNS setup")?
+                .add(mdns);
         }
     } else {
         info!("carrier: mDNS discovery disabled by ELASTOS_CARRIER_MDNS");
@@ -846,7 +868,10 @@ pub async fn start_carrier_node_with_registry(
 
     // Add MemoryLookup for explicit peer addresses (--connect tickets)
     let memory_lookup = MemoryLookup::new();
-    endpoint.address_lookup().add(memory_lookup.clone());
+    endpoint
+        .address_lookup()
+        .context("Carrier endpoint closed before address lookup setup")?
+        .add(memory_lookup.clone());
 
     let gossip = spawn_carrier_gossip(&endpoint);
 
@@ -5457,6 +5482,7 @@ impl Provider for CarrierGossipProvider {
                 }
                 if let Some(task) = removed_task {
                     task.abort();
+                    let _ = task.await;
                 }
 
                 state
@@ -6057,12 +6083,24 @@ enum CarrierGossipReceiver {
 }
 
 impl CarrierGossipReceiver {
-    async fn next(
-        &mut self,
-    ) -> Option<std::result::Result<iroh_gossip::api::Event, iroh_gossip::api::ApiError>> {
+    async fn next(&mut self) -> anyhow::Result<Option<iroh_gossip::api::Event>> {
         match self {
-            Self::Direct(receiver) => receiver.next().await,
-            Self::Discovered(receiver) => receiver.next().await,
+            Self::Direct(receiver) => match receiver.next().await {
+                Some(Ok(event)) => Ok(Some(event)),
+                Some(Err(err)) => Err(err.into()),
+                None => Ok(None),
+            },
+            Self::Discovered(receiver) => match receiver.next().await {
+                Ok(event) => Ok(Some(event)),
+                Err(err) => {
+                    if receiver.is_joined().await.unwrap_or(false) {
+                        Err(err.into())
+                    } else {
+                        tracing::warn!("carrier discovered gossip receiver ended: {err}");
+                        Ok(None)
+                    }
+                }
+            },
         }
     }
 }
@@ -6076,14 +6114,14 @@ async fn recv_loop(
 ) {
     loop {
         match receiver.next().await {
-            Some(Ok(event)) => {
+            Ok(Some(event)) => {
                 handle_gossip_event(event, &buffers, &peers, &topic_peers, &topic).await;
             }
-            Some(Err(e)) => {
+            Err(e) => {
                 tracing::warn!("carrier recv_loop error on '{}': {}", topic, e);
                 // Continue — transient errors should not kill the receiver
             }
-            None => {
+            Ok(None) => {
                 tracing::info!("carrier recv_loop ended for '{}' (stream closed)", topic);
                 break;
             }
@@ -6095,11 +6133,10 @@ async fn recv_loop(
 
 /// Runtime-owned Carrier peer invoker.
 ///
-/// The peer-DID route resolves through the long-lived Carrier endpoint so an
-/// invocation reuses that endpoint's discovery context and address book. An
-/// invoker built without that endpoint has no verified route to any peer and
-/// reports the peer as unavailable rather than opening a discovery-isolated
-/// endpoint of its own.
+/// Peer-DID and connect-ticket routes use the long-lived Carrier endpoint, so
+/// every invocation keeps one Runtime endpoint identity and its discovery
+/// context. An invoker built without that endpoint has no verified remote
+/// route and fails before a provider effect.
 #[derive(Default)]
 pub struct CarrierProviderInvoker {
     peer_endpoint: Option<Endpoint>,
@@ -6116,6 +6153,12 @@ pub struct BrowserCarrierStreamRequest {
     pub principal_id: Option<String>,
     pub reason: Option<String>,
     pub timeout_ms: Option<u64>,
+}
+
+pub struct BrowserCarrierStream {
+    pub send: iroh::endpoint::SendStream,
+    pub recv: iroh::endpoint::RecvStream,
+    _client: CarrierClient,
 }
 
 impl CarrierProviderInvoker {
@@ -6149,6 +6192,11 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                 peer_did,
                 ..
             } => {
+                let peer_endpoint = self.peer_endpoint.as_ref().ok_or_else(|| {
+                    ProviderError::Unavailable(
+                        "Carrier peer routing is not available on this Runtime".to_string(),
+                    )
+                })?;
                 let mut endpoints = decode_ticket_endpoints(connect_ticket);
                 if let Some(peer_did) = peer_did.as_deref() {
                     endpoints.retain(|endpoint| carrier_endpoint_matches_peer(endpoint, peer_did));
@@ -6167,7 +6215,13 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
 
                 let mut errors = Vec::new();
                 for (index, endpoint) in endpoints.into_iter().enumerate() {
-                    match CarrierClient::connect_endpoint_addr(endpoint, timeout_secs).await {
+                    match CarrierClient::connect_known_endpoint(
+                        peer_endpoint,
+                        endpoint,
+                        timeout_secs,
+                    )
+                    .await
+                    {
                         Ok(client) => {
                             match client.invoke_provider(invocation, request.clone()).await {
                                 Ok(response) => return Ok(response),
@@ -6235,7 +6289,7 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
 
 pub async fn open_browser_carrier_stream(
     request: &BrowserCarrierStreamRequest,
-) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+) -> Result<BrowserCarrierStream> {
     let timeout_ms = request.timeout_ms.unwrap_or(5_000).clamp(1, 60_000);
     let timeout_secs = timeout_ms.div_ceil(1_000);
     let mut endpoints = decode_ticket_endpoints(&request.connect_ticket);
@@ -6253,7 +6307,13 @@ pub async fn open_browser_carrier_stream(
     for (index, endpoint) in endpoints.into_iter().enumerate() {
         match CarrierClient::connect_endpoint_addr(endpoint, timeout_secs).await {
             Ok(client) => match client.open_browser_exit_stream(request).await {
-                Ok(streams) => return Ok(streams),
+                Ok((send, recv)) => {
+                    return Ok(BrowserCarrierStream {
+                        send,
+                        recv,
+                        _client: client,
+                    })
+                }
                 Err(err) => errors.push(format!("ticket[{index}] stream open failed: {err}")),
             },
             Err(err) => errors.push(format!("ticket[{index}] connect failed: {err}")),
@@ -6293,7 +6353,15 @@ impl CarrierClient {
         peer: iroh::PublicKey,
         timeout_secs: u64,
     ) -> Result<Self> {
-        let addr = iroh::EndpointAddr::from(peer);
+        Self::connect_known_endpoint(endpoint, iroh::EndpointAddr::from(peer), timeout_secs).await
+    }
+
+    pub(crate) async fn connect_known_endpoint(
+        endpoint: &Endpoint,
+        addr: iroh::EndpointAddr,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        let peer = addr.id;
         let conn = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             endpoint.connect(addr, CARRIER_ALPN),
@@ -6317,7 +6385,7 @@ impl CarrierClient {
         let mut rng_bytes = [0u8; 32];
         getrandom::getrandom(&mut rng_bytes).map_err(|e| anyhow::anyhow!("rng: {}", e))?;
         let secret_key = SecretKey::from_bytes(&rng_bytes);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .bind()
             .await
@@ -6734,15 +6802,186 @@ mod tests {
     }
 
     async fn shutdown_test_carrier_node(node: CarrierNode) {
-        {
+        let tasks = {
             let mut state = node.gossip_state.lock().await;
-            for (_, task) in state.receiver_tasks.drain() {
-                task.abort();
-            }
+            let tasks = state
+                .receiver_tasks
+                .drain()
+                .map(|(_, task)| task)
+                .collect::<Vec<_>>();
             state.senders.clear();
             state.joined_topics.clear();
+            tasks
+        };
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
         }
+        tokio::time::timeout(Duration::from_secs(5), node.gossip.shutdown())
+            .await
+            .expect("test gossip shutdown timed out")
+            .expect("test gossip shutdown failed");
         node.endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_carrier_gossip_leave_rejoin_and_shutdown_finish_receiver_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, did) = elastos_identity::derive_did(&[73u8; 32]);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/tracker-handle-teardown";
+
+        let first_join = provider
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join",
+                "topic": topic,
+                "mode": "direct",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(first_join["status"], "ok");
+        let first_task = node
+            .gossip_state
+            .lock()
+            .await
+            .receiver_tasks
+            .get(topic)
+            .expect("joined topic has a receiver task")
+            .abort_handle();
+
+        let leave = provider
+            .send_raw(&serde_json::json!({"op": "gossip_leave", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(leave["status"], "ok");
+        assert!(first_task.is_finished());
+        {
+            let state = node.gossip_state.lock().await;
+            assert!(!state.joined_topics.contains(topic));
+            assert!(!state.senders.contains_key(topic));
+            assert!(!state.receiver_tasks.contains_key(topic));
+        }
+
+        let second_join = provider
+            .send_raw(&serde_json::json!({
+                "op": "gossip_join",
+                "topic": topic,
+                "mode": "direct",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(second_join["status"], "ok");
+        let second_task = node
+            .gossip_state
+            .lock()
+            .await
+            .receiver_tasks
+            .get(topic)
+            .expect("rejoined topic has a receiver task")
+            .abort_handle();
+
+        shutdown_test_carrier_node(node).await;
+        assert!(second_task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_carrier_tracker_leave_rejoin_and_shutdown_finish_receiver_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sk, did) = elastos_identity::derive_did(&[74u8; 32]);
+        let node = start_carrier_node(&sk, &did, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let provider = CarrierGossipProvider::new(node.gossip_state.clone());
+        let topic = "__test/tracker-auto-discovery-handle-teardown";
+
+        let first_join = provider
+            .send_raw(&serde_json::json!({"op": "gossip_join", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(first_join["status"], "ok");
+        let first_task = node
+            .gossip_state
+            .lock()
+            .await
+            .receiver_tasks
+            .get(topic)
+            .expect("tracked topic has a receiver task")
+            .abort_handle();
+
+        let leave = provider
+            .send_raw(&serde_json::json!({"op": "gossip_leave", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(leave["status"], "ok");
+        assert!(first_task.is_finished());
+
+        let second_join = provider
+            .send_raw(&serde_json::json!({"op": "gossip_join", "topic": topic}))
+            .await
+            .unwrap();
+        assert_eq!(second_join["status"], "ok");
+        let second_task = node
+            .gossip_state
+            .lock()
+            .await
+            .receiver_tasks
+            .get(topic)
+            .expect("rejoined tracked topic has a receiver task")
+            .abort_handle();
+
+        shutdown_test_carrier_node(node).await;
+        assert!(second_task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn test_gossip_state_drop_aborts_receiver_tasks() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+            .bind()
+            .await
+            .unwrap();
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let memory_lookup = MemoryLookup::new();
+        let mut state =
+            GossipState::new(endpoint.clone(), gossip.clone(), memory_lookup, None, None);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("receiver task did not start");
+        let task_abort = task.abort_handle();
+        state.receiver_tasks.insert("drop-test".into(), task);
+
+        drop(state);
+
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("receiver task was not dropped")
+            .expect("receiver task drop signal was lost");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !task_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted receiver task did not finish");
+        gossip.shutdown().await.unwrap();
+        endpoint.close().await;
     }
 
     struct MockCarrierIpfsProvider;
@@ -8132,6 +8371,26 @@ mod tests {
         }
     }
 
+    fn connect_ticket_invocation(
+        remote_addr: iroh::EndpointAddr,
+        remote_did: &str,
+    ) -> ProviderInvocation {
+        ProviderInvocation {
+            source: "content-provider".to_string(),
+            target: "content".to_string(),
+            op: "fetch".to_string(),
+            request: serde_json::json!({ "op": "fetch" }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Carrier(ProviderCarrierRoute::ConnectTicket {
+                connect_ticket: encode_ticket_for(remote_addr),
+                peer_did: Some(remote_did.to_string()),
+                timeout_ms: Some(5_000),
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn test_peer_did_route_reaches_resolved_provider_without_exposing_topology() {
         let fixture = peer_did_route_fixture(60, 61).await;
@@ -8170,6 +8429,61 @@ mod tests {
         );
         assert_eq!(requests[0]["_runtime_invocation"]["target"], "content");
         drop(requests);
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_route_reuses_runtime_endpoint_identity() {
+        let fixture = peer_did_route_fixture(72, 73).await;
+
+        for expected in 1..=2usize {
+            let response = fixture
+                .local_registry
+                .invoke_provider(connect_ticket_invocation(
+                    fixture.remote_addr.clone(),
+                    &fixture.remote_did,
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(response["status"], "ok");
+            assert_eq!(fixture.remote_requests.lock().unwrap().len(), expected);
+            assert_eq!(
+                fixture.remote_requests.lock().unwrap()[expected - 1]["_runtime_invocation"]
+                    ["carrier"]["source_endpoint_did"],
+                public_key_to_did(&fixture.local_node.endpoint.id())
+            );
+            assert!(!fixture.local_node.endpoint.is_closed());
+        }
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_route_without_runtime_endpoint_fails_before_provider_effect() {
+        let fixture = peer_did_route_fixture(74, 75).await;
+        fixture
+            .local_registry
+            .set_carrier_invoker(Arc::new(CarrierProviderInvoker::new()))
+            .await;
+
+        let err = fixture
+            .local_registry
+            .invoke_provider(connect_ticket_invocation(
+                fixture.remote_addr.clone(),
+                &fixture.remote_did,
+            ))
+            .await
+            .expect_err("ticket route without the Runtime endpoint must fail closed");
+
+        assert!(
+            matches!(err, ProviderError::Unavailable(_)),
+            "expected typed peer-unavailable, got {err:?}"
+        );
+        assert!(fixture.remote_requests.lock().unwrap().is_empty());
 
         shutdown_test_carrier_node(fixture.remote_node).await;
         shutdown_test_carrier_node(fixture.local_node).await;
@@ -8391,11 +8705,11 @@ mod tests {
             timeout_ms: Some(5_000),
         };
 
-        let (mut send, mut recv) = open_browser_carrier_stream(&request).await.unwrap();
-        send.write_all(b"ping").await.unwrap();
-        send.finish().unwrap();
+        let mut stream = open_browser_carrier_stream(&request).await.unwrap();
+        stream.send.write_all(b"ping").await.unwrap();
+        stream.send.finish().unwrap();
         let mut response = [0_u8; 4];
-        recv.read_exact(&mut response).await.unwrap();
+        stream.recv.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"pong");
 
         relay_task.await.unwrap();
@@ -9652,13 +9966,16 @@ mod tests {
             1_700_000_000,
         );
         let (local_sk, local_did) = elastos_identity::derive_did(&[21u8; 32]);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
             .bind()
             .await
             .unwrap();
         let memory_lookup = MemoryLookup::new();
-        endpoint.address_lookup().add(memory_lookup.clone());
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
         let gossip = spawn_carrier_gossip(&endpoint);
         let state = Arc::new(Mutex::new(GossipState::new(
             endpoint.clone(),
@@ -9858,13 +10175,16 @@ mod tests {
             1_700_000_000,
         );
         let (local_sk, local_did) = elastos_identity::derive_did(&[24u8; 32]);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(iroh::SecretKey::from_bytes(&local_sk.to_bytes()))
             .bind()
             .await
             .unwrap();
         let memory_lookup = MemoryLookup::new();
-        endpoint.address_lookup().add(memory_lookup.clone());
+        endpoint
+            .address_lookup()
+            .unwrap()
+            .add(memory_lookup.clone());
         let gossip = spawn_carrier_gossip(&endpoint);
         let state = Arc::new(Mutex::new(GossipState::new(
             endpoint.clone(),

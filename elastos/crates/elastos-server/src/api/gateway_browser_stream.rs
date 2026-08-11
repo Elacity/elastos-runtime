@@ -1198,17 +1198,18 @@ async fn bridge_browser_runtime_stream_to_carrier(
     let request = browser_carrier_stream_request_for_open(&route, &open_log)?;
     let stream_id = request.stream_id.clone();
     let target = request.target.clone();
-    let (mut carrier_send, mut carrier_recv) = open_browser_carrier_stream(&request).await?;
-    carrier_send.write_all(&open_line).await?;
+    let mut carrier_stream = open_browser_carrier_stream(&request).await?;
+    carrier_stream.send.write_all(&open_line).await?;
+    let (carrier_send, carrier_recv) = (&mut carrier_stream.send, &mut carrier_stream.recv);
     let (mut stream_read, mut stream_write) = stream.into_split();
     let to_carrier = async {
-        let copied = copy(&mut stream_read, &mut carrier_send).await?;
+        let copied = copy(&mut stream_read, carrier_send).await?;
         carrier_send.finish()?;
         carrier_send.stopped().await.ok();
         Ok::<u64, anyhow::Error>(copied)
     };
     let from_carrier = async {
-        let copied = copy(&mut carrier_recv, &mut stream_write).await?;
+        let copied = copy(carrier_recv, &mut stream_write).await?;
         stream_write.shutdown().await.ok();
         Ok::<u64, anyhow::Error>(copied)
     };

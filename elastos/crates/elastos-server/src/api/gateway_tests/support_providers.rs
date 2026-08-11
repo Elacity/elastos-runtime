@@ -108,7 +108,7 @@ fn reset_mock_chain_broadcast_count(signed_transaction: &str) {
         .unwrap()
         .remove(signed_transaction);
     if signed_transaction.starts_with("0x")
-        && signed_transaction.len() % 2 == 0
+        && signed_transaction.len().is_multiple_of(2)
         && signed_transaction[2..]
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())

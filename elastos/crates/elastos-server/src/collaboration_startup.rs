@@ -35,6 +35,7 @@ pub(crate) const MAX_STARTUP_CONFIG_BYTES: usize = 3 * 1024 * 1024;
 const COLLABORATION_WORKER_CADENCE: Duration = Duration::from_secs(5);
 const COLLABORATION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_OWNED_PRESENCE_CADENCE: Duration = Duration::from_secs(15);
+const MAX_COLLABORATION_DIAGNOSTIC_CHARS: usize = 160;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +77,46 @@ pub struct CollaborationRuntimeService {
     worker_product_port: Option<CollaborationChatProductPort>,
     #[cfg(test)]
     worker_presence_port: Option<CollaborationPresenceProductPort>,
+}
+
+fn bounded_one_line_diagnostic(raw: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut bounded = String::new();
+    for token in raw.split_whitespace() {
+        let token = if token.starts_with('/') || token.starts_with("file://") {
+            "<path>"
+        } else {
+            token
+        };
+        let separator = if bounded.is_empty() { "" } else { " " };
+        let current_chars = bounded.chars().count();
+        let remaining = max_chars.saturating_sub(current_chars);
+        let separator_chars = separator.chars().count();
+        let needed = separator_chars + token.chars().count();
+        if needed <= remaining {
+            bounded.push_str(separator);
+            bounded.push_str(token);
+            continue;
+        }
+        if remaining > separator_chars + 3 {
+            bounded.push_str(separator);
+            for ch in token.chars().take(remaining - separator_chars - 3) {
+                bounded.push(ch);
+            }
+            bounded.push_str("...");
+        } else if bounded.is_empty() {
+            bounded.extend("...".chars().take(remaining));
+        }
+        break;
+    }
+    bounded
+}
+
+fn bounded_presence_projection_diagnostic(err: &impl std::fmt::Display) -> String {
+    bounded_one_line_diagnostic(&err.to_string(), MAX_COLLABORATION_DIAGNOSTIC_CHARS)
 }
 
 /// Load and durably accept the sole collaboration configuration from the
@@ -459,16 +500,19 @@ async fn run_collaboration_worker_cycle_with_presence(
     match presence_port.pending_outgoing_presences(now) {
         Ok(presences) => {
             for presence in &presences {
-                if presence_port
-                    .project_prepared_presence(presence, now)
-                    .is_err()
-                {
-                    tracing::warn!("collaboration presence outgoing projection cycle failed");
+                if let Err(err) = presence_port.project_prepared_presence(presence, now) {
+                    tracing::warn!(
+                        diagnostic = %bounded_presence_projection_diagnostic(&err),
+                        "collaboration presence outgoing projection cycle failed"
+                    );
                     break;
                 }
             }
         }
-        Err(_) => tracing::warn!("collaboration presence outgoing projection cycle failed"),
+        Err(err) => tracing::warn!(
+            diagnostic = %bounded_presence_projection_diagnostic(&err),
+            "collaboration presence outgoing projection cycle failed"
+        ),
     }
     if driver.retry_outgoing_once(now).await.is_err() {
         tracing::warn!("collaboration outgoing retry cycle failed");
@@ -665,6 +709,29 @@ mod tests {
     const SERVICE: &str = "chat";
     const NOW: u64 = 1_800_000_000;
     const TTL: u64 = 300;
+
+    #[test]
+    fn bounded_presence_projection_diagnostic_truncates_long_utf8_without_path_leaks() {
+        let raw = format!(
+            "presence projection failed /private/tmp/very-secret-state.json {}",
+            "é".repeat(MAX_COLLABORATION_DIAGNOSTIC_CHARS)
+        );
+        let bounded = bounded_presence_projection_diagnostic(&raw);
+        assert!(bounded.chars().count() <= MAX_COLLABORATION_DIAGNOSTIC_CHARS);
+        assert!(bounded.ends_with("..."));
+        assert!(bounded.contains("<path>"));
+        assert!(!bounded.contains("/private/tmp/very-secret-state.json"));
+    }
+
+    #[test]
+    fn bounded_presence_projection_diagnostic_flattens_multiline_errors() {
+        let raw = "presence projection failed\n/Users/anders/secret\nretry\tlater";
+        let bounded = bounded_presence_projection_diagnostic(&raw);
+        assert_eq!(bounded, "presence projection failed <path> retry later");
+        assert!(!bounded.contains('\n'));
+        assert!(!bounded.contains('\r'));
+        assert!(!bounded.contains('\t'));
+    }
 
     fn profile_for_endpoint(
         endpoint_key: &SigningKey,

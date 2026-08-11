@@ -1599,7 +1599,7 @@ impl OperatorClient {
         let mut rng_bytes = [0u8; 32];
         getrandom::getrandom(&mut rng_bytes).map_err(|err| anyhow::anyhow!("rng: {}", err))?;
         let secret_key = SecretKey::from_bytes(&rng_bytes);
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .bind()
             .await
