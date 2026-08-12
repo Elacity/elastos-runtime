@@ -73,6 +73,7 @@ export function createHomeClipboardClient({
 } = {}) {
   let generation = "";
   let pending = null;
+  let readyWait = null;
   let retired = false;
   let started = false;
 
@@ -104,6 +105,25 @@ export function createHomeClipboardClient({
       throw new Error("Trusted Home Clipboard is unavailable.");
     }
     targetWindow.postMessage(message, homeOrigin);
+  }
+
+  function postReady() {
+    post({ type: "home:app-ready", homeToken });
+  }
+
+  function clearReadyWait(error = null) {
+    const record = readyWait;
+    if (!record) {
+      return false;
+    }
+    readyWait = null;
+    clearTimeoutFn(record.timeoutId);
+    if (error) {
+      record.reject(error);
+    } else {
+      record.resolve(true);
+    }
+    return true;
   }
 
   function clearPending(record, error = null, value = undefined) {
@@ -154,6 +174,7 @@ export function createHomeClipboardClient({
       clearPending(pending, error);
     }
     generation = data.generation;
+    clearReadyWait();
   }
 
   function handleMessage(event) {
@@ -275,64 +296,109 @@ export function createHomeClipboardClient({
     started = true;
     sourceWindow.addEventListener?.("message", handleMessage);
     sourceWindow.addEventListener?.("pagehide", teardown, { once: true });
-    post({ type: "home:app-ready", homeToken });
+    postReady();
     return true;
   }
 
-  function request(operation, purpose, text, requestId) {
-    if (!available()) {
-      return Promise.reject(new Error("Trusted Home Clipboard is unavailable."));
+  function ensureReady() {
+    if (available()) {
+      return Promise.resolve(true);
     }
-    if (pending) {
-      return Promise.reject(new Error("A Clipboard request is already active."));
+    if (!canReachHome()) {
+      return Promise.reject(
+        new Error("Trusted Home Clipboard is unavailable."),
+      );
     }
-    const resolvedRequestId = requestId || homeClipboardRequestId(cryptoRef);
-    if (
-      !homeClipboardValidToken(
-        resolvedRequestId,
-        MAX_HOME_CLIPBOARD_REQUEST_ID_BYTES,
-      )
-    ) {
-      return Promise.reject(new Error("Clipboard request id is invalid."));
+    const startedNow = !started && start();
+    if (available()) {
+      return Promise.resolve(true);
     }
-    if (!homeClipboardValidPayload(targetId, purpose, operation, text)) {
-      return Promise.reject(new Error("Clipboard operation or payload is denied."));
+    if (readyWait) {
+      return readyWait.promise;
     }
     return new Promise((resolve, reject) => {
       const record = {
-        operation,
-        purpose,
-        requestId: resolvedRequestId,
         resolve,
         reject,
         timeoutId: 0,
       };
-      pending = record;
+      readyWait = record;
       record.timeoutId = setTimeoutFn(() => {
-        const error = new Error("Home Clipboard request timed out.");
-        error.code = "timeout";
-        clearPending(record, error);
+        const error = new Error("Trusted Home Clipboard is unavailable.");
+        error.code = "unavailable";
+        clearReadyWait(error);
       }, timeoutMs);
-      const message = {
-        type: HOME_CLIPBOARD_REQUEST_TYPE,
-        schema: HOME_CLIPBOARD_REQUEST_SCHEMA,
-        requestId: resolvedRequestId,
-        homeToken,
-        parentOrigin: homeOrigin,
-        generation,
-        operation,
-        purpose,
-        mime_type: HOME_CLIPBOARD_MIME_TYPE,
-      };
-      if (operation === "write") {
-        message.text = text;
-      }
-      try {
-        post(message);
-      } catch (error) {
-        clearPending(record, error);
+      if (!startedNow) {
+        try {
+          postReady();
+        } catch (error) {
+          clearReadyWait(error);
+        }
       }
     });
+  }
+
+  function request(operation, purpose, text, requestId) {
+    const sendRequest = () => {
+      if (pending) {
+        throw new Error("A Clipboard request is already active.");
+      }
+      const resolvedRequestId = requestId || homeClipboardRequestId(cryptoRef);
+      if (
+        !homeClipboardValidToken(
+          resolvedRequestId,
+          MAX_HOME_CLIPBOARD_REQUEST_ID_BYTES,
+        )
+      ) {
+        throw new Error("Clipboard request id is invalid.");
+      }
+      if (!homeClipboardValidPayload(targetId, purpose, operation, text)) {
+        throw new Error("Clipboard operation or payload is denied.");
+      }
+      return new Promise((resolve, reject) => {
+        const record = {
+          operation,
+          purpose,
+          requestId: resolvedRequestId,
+          resolve,
+          reject,
+          timeoutId: 0,
+        };
+        pending = record;
+        record.timeoutId = setTimeoutFn(() => {
+          const error = new Error("Home Clipboard request timed out.");
+          error.code = "timeout";
+          clearPending(record, error);
+        }, timeoutMs);
+        const message = {
+          type: HOME_CLIPBOARD_REQUEST_TYPE,
+          schema: HOME_CLIPBOARD_REQUEST_SCHEMA,
+          requestId: resolvedRequestId,
+          homeToken,
+          parentOrigin: homeOrigin,
+          generation,
+          operation,
+          purpose,
+          mime_type: HOME_CLIPBOARD_MIME_TYPE,
+        };
+        if (operation === "write") {
+          message.text = text;
+        }
+        try {
+          post(message);
+        } catch (error) {
+          clearPending(record, error);
+        }
+      });
+    };
+    if (available()) {
+      try {
+        return sendRequest();
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
+    return ensureReady().then(sendRequest);
   }
 
   function cancel(requestId) {
@@ -365,6 +431,11 @@ export function createHomeClipboardClient({
       const error = new Error("Clipboard frame retired.");
       error.code = "retired";
       clearPending(record, error);
+    }
+    if (readyWait) {
+      const error = new Error("Clipboard frame retired.");
+      error.code = "retired";
+      clearReadyWait(error);
     }
     if (available()) {
       try {

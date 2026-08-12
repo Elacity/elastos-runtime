@@ -394,33 +394,12 @@ fn people_line_action(input: &str, snapshot: &HomeSnapshot) -> Result<Option<Str
         return Ok(None);
     }
 
-    let mut args = parts.collect::<Vec<_>>();
-    if normalize_lookup(raw_name) == "discovery" {
-        args.insert(0, "discovery");
-    }
+    let args = parts.collect::<Vec<_>>();
     if args.is_empty() {
         return Ok(None);
     }
 
     let action_id = match normalize_lookup(args[0]).as_str() {
-        "discovery" => match args.get(1).map(|value| normalize_lookup(value)).as_deref() {
-            Some("on" | "enable" | "start") => "people-discovery-enable".to_string(),
-            Some("off" | "disable" | "stop") => "people-discovery-disable".to_string(),
-            Some("refresh" | "reload") => "people-discovery-refresh".to_string(),
-            _ => anyhow::bail!("usage: people discovery on|off|refresh"),
-        },
-        "request" | "add" => {
-            let Some(peer_id) = line_arg_tail(&args, 1) else {
-                anyhow::bail!("usage: people request <peer-id>");
-            };
-            format!("people-request-peer:{peer_id}")
-        }
-        "accept" => {
-            let Some(request_id) = line_arg_tail(&args, 1) else {
-                anyhow::bail!("usage: people accept <request-id>");
-            };
-            format!("people-accept-request:{request_id}")
-        }
         "remove" | "delete" => {
             let Some(contact_ref) = line_arg_tail(&args, 1) else {
                 anyhow::bail!("usage: people remove <contact-id>");
@@ -1607,7 +1586,7 @@ fn print_cli_contract(snapshot: &HomeSnapshot) {
     println!(
         "  gates:      {DESCRIPTOR_AUTHORITY_COPY}; Runtime/provider/Inbox gates decide access"
     );
-    println!("  carrier:    capsule-to-capsule actions stay provider/Carrier intents");
+    println!("  runtime:    capsule-to-capsule actions stay Runtime/provider intents");
 }
 
 fn print_cli_terminal_contract(snapshot: &HomeSnapshot) {

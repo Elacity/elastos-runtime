@@ -98,7 +98,7 @@ button:disabled {
   min-width: 0;
   flex-direction: column;
   gap: 2px;
-  padding: var(--window-chrome-safe-top, 52px) 12px 16px;
+  padding: 12px 12px 16px;
   border-right: 1px solid color-mix(in srgb, var(--el-hairline) 70%, transparent);
   background: color-mix(in srgb, var(--el-inset) 78%, transparent);
   backdrop-filter: blur(22px);

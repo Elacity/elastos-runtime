@@ -238,18 +238,8 @@ fn render_people_tab(buf: &mut String, snapshot: &HomeSnapshot, state: &TuiState
 
     push_section_lines(
         &mut right,
-        "Discovery",
-        &people_discovery_lines(snapshot, column_width),
-    );
-    push_section_lines(
-        &mut right,
-        "Add People",
-        &people_visible_peer_lines(snapshot, column_width),
-    );
-    push_section_lines(
-        &mut right,
-        "Requests",
-        &people_request_lines(snapshot, column_width),
+        "Online",
+        &["Open People from Home to see signed online presence.".to_string()],
     );
 
     let people_actions = people_actions(snapshot);
@@ -524,14 +514,6 @@ fn selected_marker(selected: bool) -> &'static str {
 fn people_overview_lines(snapshot: &HomeSnapshot, width: usize) -> Vec<String> {
     let mut lines = people_profile_lines(snapshot, width);
     lines.push(format!("Contacts   {}", snapshot.people.contacts.len()));
-    lines.push(format!(
-        "Discovery  {}",
-        people_discovery_state_label(&snapshot.people.discovery)
-    ));
-    let peers = people_visible_peers(snapshot);
-    lines.push(format!("Visible    {}", peers.len()));
-    let requests = people_visible_requests(snapshot);
-    lines.push(format!("Requests   {}", requests.len()));
     lines
 }
 
@@ -548,7 +530,7 @@ fn people_profile_lines(snapshot: &HomeSnapshot, width: usize) -> Vec<String> {
 
 fn people_contact_lines(snapshot: &HomeSnapshot, width: usize) -> Vec<String> {
     if snapshot.people.contacts.is_empty() {
-        return vec!["No people yet. Turn on Discovery to find another ElastOS home.".to_string()];
+        return vec!["No contacts yet. Open People from Home to see who is online.".to_string()];
     }
     snapshot
         .people
@@ -594,91 +576,6 @@ fn people_contact_lines(snapshot: &HomeSnapshot, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn people_discovery_lines(snapshot: &HomeSnapshot, _width: usize) -> Vec<String> {
-    let discovery = &snapshot.people.discovery;
-    let mut lines = vec![
-        format!("State      {}", people_discovery_state_label(discovery)),
-        format!(
-            "Status     {}",
-            if discovery.status_message.trim().is_empty() {
-                discovery.status.as_str()
-            } else {
-                discovery.status_message.as_str()
-            }
-        ),
-    ];
-    if discovery.enabled {
-        lines.push(format!(
-            "Remaining  {}",
-            people_discovery_remaining_text(discovery.remaining_seconds.unwrap_or(0))
-        ));
-    }
-    let peers = people_visible_peers(snapshot);
-    if !peers.is_empty() {
-        lines.push(format!("Visible    {}", peers.len()));
-    }
-    let requests = people_visible_requests(snapshot);
-    if !requests.is_empty() {
-        lines.push(format!("Requests   {}", requests.len()));
-    }
-    lines
-}
-
-fn people_visible_peer_lines(snapshot: &HomeSnapshot, _width: usize) -> Vec<String> {
-    let peers = people_visible_peers(snapshot);
-    if peers.is_empty() {
-        return vec![
-            "No people visible for adding yet.".to_string(),
-            "Use Turn On or Refresh while another ElastOS home is discoverable.".to_string(),
-        ];
-    }
-    peers
-        .into_iter()
-        .take(8)
-        .map(|peer| {
-            let mut line = format!(
-                "{} - {}",
-                people_peer_display_name(peer, "Visible person"),
-                if peer.status.trim().is_empty() {
-                    "visible"
-                } else {
-                    peer.status.as_str()
-                }
-            );
-            if !peer.peer_id.trim().is_empty() {
-                line.push_str(&format!(" - Add: people request {}", peer.peer_id));
-            }
-            line
-        })
-        .collect()
-}
-
-fn people_request_lines(snapshot: &HomeSnapshot, _width: usize) -> Vec<String> {
-    let requests = people_visible_requests(snapshot);
-    if requests.is_empty() {
-        return vec!["No People requests waiting.".to_string()];
-    }
-    requests
-        .into_iter()
-        .take(8)
-        .map(|request| {
-            let mut line = format!(
-                "{} - {}",
-                people_request_display_name(request, "Person"),
-                if request.status.trim().is_empty() {
-                    "requested"
-                } else {
-                    request.status.as_str()
-                }
-            );
-            if request.status == "incoming" && !request.request_id.trim().is_empty() {
-                line.push_str(&format!(" - Accept: people accept {}", request.request_id));
-            }
-            line
-        })
-        .collect()
-}
-
 fn people_debug_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     let mut lines = vec![
         format!("You        {}", snapshot.user),
@@ -687,21 +584,6 @@ fn people_debug_lines(snapshot: &HomeSnapshot) -> Vec<String> {
         format!("ContactsSchema {}", snapshot.people.schema),
         format!("Contacts   {}", snapshot.people.contact_count),
         format!("Services   {}", snapshot.people.service_offer_count),
-        format!(
-            "Discovery  {}",
-            people_discovery_state_label(&snapshot.people.discovery)
-        ),
-        format!("DiscoverySchema {}", snapshot.people.discovery.schema),
-        format!("Topic      {}", snapshot.people.discovery.topic),
-        format!(
-            "LocalPeer  {}",
-            snapshot
-                .people
-                .discovery
-                .local_peer_id
-                .as_deref()
-                .unwrap_or("not advertised")
-        ),
         format!("Network    {}", network_summary(snapshot)),
         format!(
             "Source     {}",
@@ -732,9 +614,6 @@ fn people_debug_lines(snapshot: &HomeSnapshot) -> Vec<String> {
     } else {
         lines.push("Ticket     waiting for runtime".to_string());
     }
-    if let Some(delay) = snapshot.people.discovery.next_refresh_after_ms {
-        lines.push(format!("RefreshMs  {delay}"));
-    }
     for contact in snapshot.people.contacts.iter().take(3) {
         if let Some(last_seen_at) = contact.last_seen_at {
             lines.push(format!(
@@ -742,31 +621,6 @@ fn people_debug_lines(snapshot: &HomeSnapshot) -> Vec<String> {
                 people_contact_display_name(contact, "Person"),
                 last_seen_at
             ));
-        }
-    }
-    for peer in snapshot.people.discovery.discovered_peers.iter().take(3) {
-        if peer.last_seen_at > 0 {
-            lines.push(format!(
-                "PeerSeen   {} {}",
-                people_peer_display_name(peer, "Visible person"),
-                peer.last_seen_at
-            ));
-        }
-    }
-    for request in snapshot.people.discovery.requests.iter().take(3) {
-        if request.created_at > 0 {
-            lines.push(format!(
-                "ReqCreated {} {}",
-                people_request_display_name(request, "Person"),
-                request.created_at
-            ));
-        }
-        if let Some(invite_id) = request
-            .invite_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            lines.push(format!("ReqInvite  {}", truncate(invite_id, 42)));
         }
     }
     lines.push(format!(
@@ -989,14 +843,14 @@ fn network_summary(snapshot: &HomeSnapshot) -> String {
     let peers = snapshot.runtime.peer_count.unwrap_or(0);
     if peers == 0 {
         if snapshot.runtime.ticket.is_some() {
-            "Carrier bootstrap ready; waiting for another participant".to_string()
+            "Collaboration ready; waiting for another participant".to_string()
         } else {
             "starting up".to_string()
         }
     } else if peers == 1 {
-        "1 Carrier endpoint reachable".to_string()
+        "1 collaboration connection active".to_string()
     } else {
-        format!("{} Carrier endpoints reachable", peers)
+        format!("{peers} collaboration connections active")
     }
 }
 

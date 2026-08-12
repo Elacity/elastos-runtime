@@ -1732,7 +1732,7 @@ async function onRecoveryDownload() {
       recoveryPasswordInput.value = "";
     }
     showRecoveryStatus("", "success");
-    showRecoveryNote("Recovery Kit downloaded. Store it offline; it can recover Home data and included built-in Wallet accounts.", "success");
+    showRecoveryNote("Recovery Kit downloaded. Store it offline; it can recover Home data, included built-in Wallet accounts, and your signed People identity with its contacts.", "success");
     setRecoveryButton("Download Recovery Kit", false);
   } catch (error) {
     showRecoveryStatus("Not set", "error");
@@ -1926,16 +1926,28 @@ function recoveryImportSuccessMessage(response) {
   const count = Number(response && response.wallet_restore && response.wallet_restore.imported_count
     ? response.wallet_restore.imported_count
     : 0);
+  const parts = [];
   if (count > 0) {
-    return `Recovery Kit imported. Restored ${count} built-in Wallet ${count === 1 ? "account" : "accounts"}.`;
+    parts.push(`Restored ${count} built-in Wallet ${count === 1 ? "account" : "accounts"}.`);
   }
-  return "Recovery Kit imported.";
+  const people = response && response.people_identity_restore;
+  if (people && readText(people.status) === "restored") {
+    parts.push(people.contact_store_restored
+      ? "Restored your signed People identity and contacts."
+      : "Restored your signed People identity.");
+    if (people.rebound_device === true) {
+      parts.push("This device is now authorized for your Profile; contacts learn it automatically.");
+    }
+  }
+  return parts.length > 0 ? `Recovery Kit imported. ${parts.join(" ")}` : "Recovery Kit imported.";
 }
 
 function recoveryImportIsComplete(response) {
+  const people = response && response.people_identity_restore;
   return readText(response && response.schema) === "elastos.full-recovery-bundle.import.response/v2"
     && readText(response && response.wallet_restore && response.wallet_restore.status) === "complete"
-    && readText(response && response.runtime_audit && response.runtime_audit.status) === "complete";
+    && readText(response && response.runtime_audit && response.runtime_audit.status) === "complete"
+    && (!people || readText(people.status) !== "incomplete");
 }
 
 function recoveryImportIncompleteMessage(response) {
@@ -1945,6 +1957,11 @@ function recoveryImportIncompleteMessage(response) {
   const auditComplete = readText(
     response && response.runtime_audit && response.runtime_audit.status,
   ) === "complete";
+  const people = response && response.people_identity_restore;
+  if (people && readText(people.status) === "incomplete") {
+    const detail = readText(people.reason);
+    return `Root recovered, but your People identity did not restore${detail ? ` (${detail})` : ""}. Your Profile and contacts are not back yet — this is not a complete account restore.`;
+  }
   if (walletComplete && !auditComplete) {
     return "Root recovered and Wallet restored, but required Runtime audit evidence is incomplete. Retry Recovery completion safely below.";
   }
