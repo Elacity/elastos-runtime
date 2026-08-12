@@ -31,6 +31,19 @@ pub const REQUEST_FRESHNESS_WINDOW_SECONDS: u64 = 60;
 pub const DELEGATION_CLOCK_SKEW_SECONDS: u64 = 5;
 /// EIP-1271 magic value (bytes4 selector of `isValidSignature`) — success marker.
 pub const EIP1271_MAGIC_VALUE: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
+/// Max distinct addresses a single delegation may cover, and thus the max number of
+/// on-chain `hasAccessByContentId` subjects one grant can fan out into (DKMS-1/DKMS-4).
+/// The default and first compatible policy is **owner-only**, so this is `1`: a
+/// delegation covers exactly its signing owner. Raising it requires a separately
+/// verified relation proof per non-owner subject (see the plan's "Authorization
+/// identity" invariant) — a wallet signature over a list is NOT proof of control.
+pub const MAX_COVERED_ADDRESSES: usize = 1;
+/// Max encoded length of a single covered-address string (`0x` + 40 hex = 42). A cheap
+/// per-entry DoS guard applied BEFORE any hex parsing or normalization.
+pub const MAX_ADDRESS_STR_LEN: usize = 42;
+/// Max encoded length of the whole covered-address list — a coarser second bound that
+/// sits under the transport frame cap. Owner-only ⇒ one 42-byte address.
+pub const MAX_COVERED_LIST_BYTES: usize = MAX_COVERED_ADDRESSES * MAX_ADDRESS_STR_LEN;
 
 /// Why a verify failed — every variant FAILS CLOSED. Mirrors PC2's `VerifyErrorCode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +63,12 @@ pub enum AccessVerifyError {
     PubMalformed,
     Replayed,
     Revoked,
+    /// The `covered_addresses` set is empty, over-cardinality, over-size, malformed,
+    /// duplicated, or names an address unrelated to the signing owner (owner-only policy).
+    CoveredInvalid,
+    /// A bounded replay collection is full of UNEXPIRED records (DKMS-3). Fails closed: the node
+    /// never evicts a live seen/revoked/in-flight record to admit new work.
+    CapacityExhausted,
 }
 
 impl core::fmt::Display for AccessVerifyError {
@@ -71,6 +90,8 @@ impl core::fmt::Display for AccessVerifyError {
             PubMalformed => "pub_malformed",
             Replayed => "replayed",
             Revoked => "revoked",
+            CoveredInvalid => "covered_invalid",
+            CapacityExhausted => "capacity_exhausted",
         };
         f.write_str(s)
     }
@@ -367,57 +388,34 @@ pub fn verify_request_sig(session_pub_b64: &str, canonical_request: &str, reques
     }
 }
 
-// ── Anti-replay + revocation (node-held state; PC2's two maps) ────────────────
+// ── Verify-then-reserve orchestration (DKMS-3 two-phase pipeline) ─────────────
 
-/// Per-process revocation + per-request single-use nonce tracking, mirroring PC2's
-/// `revokedDelegations` + `seenRequestNonces`. The node holds one of these; the
-/// quorum's PQ channel + the delegation window bound the rest.
-#[derive(Default)]
-pub struct ReplayGuard {
-    revoked: std::collections::HashMap<String, u64>,
-    seen: std::collections::HashMap<String, u64>,
-}
-
-impl ReplayGuard {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Revoke a delegation (by its nonce) until its natural expiry.
-    pub fn revoke(&mut self, delegation_nonce_b64: &str, expires_at: u64) {
-        self.revoked.insert(delegation_nonce_b64.to_string(), expires_at);
-    }
-
-    fn is_revoked(&mut self, delegation_nonce_b64: &str, now: u64) -> bool {
-        match self.revoked.get(delegation_nonce_b64).copied() {
-            None => false,
-            Some(exp) if exp < now => {
-                self.revoked.remove(delegation_nonce_b64);
-                false
-            }
-            Some(_) => true,
-        }
-    }
-
-    /// Record `(delegation_nonce, request_nonce)`; `Err(Replayed)` if already seen,
-    /// `Err(Revoked)` if the delegation was revoked. Cheap — call before sig math.
-    pub fn check_and_record(
-        &mut self,
-        delegation_nonce_b64: &str,
-        request_nonce_b64: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> Result<(), AccessVerifyError> {
-        if self.is_revoked(delegation_nonce_b64, now) {
-            return Err(AccessVerifyError::Revoked);
-        }
-        let key = format!("{delegation_nonce_b64}:{request_nonce_b64}");
-        if self.seen.contains_key(&key) {
-            return Err(AccessVerifyError::Replayed);
-        }
-        self.seen.insert(key, expires_at);
-        Ok(())
-    }
+/// Phases 1–4 of the DKMS-3 pipeline in one place, the single source both the node and its tests
+/// use: PURE verification ([`verify_access_grant`] — structural + owner sig + request sig, possibly
+/// an EIP-1271 RPC, with NO replay lock held) followed by a short locked replay RESERVATION
+/// ([`crate::replay::ReplayStore::begin`]). Because the reservation is the LAST step, a
+/// structural-, owner-signature-, or request-signature-invalid grant returns before any nonce is
+/// reserved — an invalid signature can never burn the owner's nonce.
+///
+/// On success it returns the [`VerifiedAccess`] AND an RAII [`crate::replay::Reservation`]. The
+/// caller then runs the on-chain access read with NO lock held and either
+/// [`crate::replay::Reservation::commit`]s it (success → the pair becomes single-use) or drops it
+/// (any failure/denial/unavailability → the reservation aborts and the nonce is NOT burned).
+pub fn verify_and_reserve(
+    grant: &AccessGrantV1,
+    ctx: &AccessVerifyContext,
+    store: &crate::replay::ReplayStore,
+    eip1271: Option<&dyn Eip1271Caller>,
+) -> Result<(VerifiedAccess, crate::replay::Reservation), AccessVerifyError> {
+    // Phases 1–3: pure verification. Returns before any replay reservation on ANY failure.
+    let verified = verify_access_grant(grant, ctx, eip1271)?;
+    // Nonces are already validated (b64-decodable + length-capped) by the structural phase above;
+    // decode them to raw bytes for the fixed-size hashed replay keys.
+    let del_nonce = b64_decode(&grant.delegation.nonce_b64).ok_or(AccessVerifyError::DelMalformed)?;
+    let req_nonce = b64_decode(&grant.request.request_nonce_b64).ok_or(AccessVerifyError::ReqMalformed)?;
+    // Phase 4: short locked begin → InFlight. Rejects replay/revoked/capacity, fail-closed.
+    let reservation = store.begin(&del_nonce, &req_nonce, grant.delegation.expires_at, ctx.now)?;
+    Ok((verified, reservation))
 }
 
 // ── Orchestration ────────────────────────────────────────────────────────────
@@ -437,6 +435,69 @@ fn is_evm_address(s: &str) -> bool {
     h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Canonicalize an EVM address to lowercased `0x` + 40 hex, or `None` if it is
+/// malformed or exceeds [`MAX_ADDRESS_STR_LEN`]. The length guard is applied FIRST so
+/// an attacker-supplied oversized string is rejected before any hex work. This is the
+/// single canonical form used for equality, deduplication, cache keys, and RPC
+/// construction (Authorization-identity invariant #5).
+pub fn normalize_evm_address(s: &str) -> Option<String> {
+    if s.len() > MAX_ADDRESS_STR_LEN {
+        return None;
+    }
+    let h = strip_0x(s);
+    if h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(format!("0x{}", h.to_ascii_lowercase()))
+    } else {
+        None
+    }
+}
+
+/// Owner-only covered-address policy (DKMS-1 + DKMS-4). PURE — performs NO signature
+/// or RPC work, so it is safe to call before any cryptography and cheap enough to run
+/// as the first structural gate. It rejects, fail-closed:
+///   * an empty list, or one exceeding [`MAX_COVERED_ADDRESSES`] (cardinality FIRST —
+///     the cheapest guard, so an oversized list never reaches per-entry parsing);
+///   * a list whose encoded size exceeds [`MAX_COVERED_LIST_BYTES`];
+///   * any malformed / non-canonical / oversized entry;
+///   * a duplicate (after canonicalization);
+///   * any address unrelated to `owner_address` — under owner-only, every covered
+///     entry must canonicalize to the owner. A wallet signature over a list is NOT
+///     proof the signer controls every listed address.
+///
+/// On success it returns the VALIDATED, canonical subject set the node will query
+/// (`[owner]`) — never the caller's original list. Callers must use this returned set,
+/// so an unrelated or duplicate address can never multiply on-chain reads.
+pub fn validate_covered_addresses(
+    owner_address: &str,
+    covered: &[String],
+) -> Result<Vec<String>, AccessVerifyError> {
+    use AccessVerifyError::CoveredInvalid;
+    // Cardinality first — cheapest possible guard, before any string is inspected.
+    if covered.is_empty() || covered.len() > MAX_COVERED_ADDRESSES {
+        return Err(CoveredInvalid);
+    }
+    // Coarse encoded-size bound over the whole list (a second boundary under the frame cap).
+    let total: usize = covered.iter().map(|a| a.len()).sum();
+    if total > MAX_COVERED_LIST_BYTES {
+        return Err(CoveredInvalid);
+    }
+    let owner = normalize_evm_address(owner_address).ok_or(CoveredInvalid)?;
+    let mut validated: Vec<String> = Vec::with_capacity(covered.len());
+    for entry in covered {
+        let norm = normalize_evm_address(entry).ok_or(CoveredInvalid)?;
+        // Duplicate (defense-in-depth for any future MAX_COVERED_ADDRESSES > 1).
+        if validated.contains(&norm) {
+            return Err(CoveredInvalid);
+        }
+        // Owner-only: an unrelated address the signer merely listed cannot be covered.
+        if norm != owner {
+            return Err(CoveredInvalid);
+        }
+        validated.push(norm);
+    }
+    Ok(validated)
+}
+
 /// Normalize a kid to lowercased `0x` + 32 hex; `None` if not a 16-byte hex id.
 fn normalize_kid(s: &str) -> Option<String> {
     let h = strip_0x(s);
@@ -447,15 +508,18 @@ fn normalize_kid(s: &str) -> Option<String> {
     }
 }
 
-/// Structural + cryptographic verification of an access grant — every check fails
-/// closed. Mirrors PC2's `verifySecureViewBundle`. Deliberately does NOT run the
-/// on-chain `hasAccessByContentId`: that is the node's job (W2), per covered address
-/// in the returned [`VerifiedAccess`]. `replay` is optional node-held state; `eip1271`
-/// is optional smart-account support.
+/// PURE structural + cryptographic verification of an access grant — phases 1–3 of the DKMS-3
+/// pipeline (structural checks, EOA/EIP-1271 owner signature, ML-DSA request signature). Every
+/// check fails closed. Deliberately does NOT run the on-chain `hasAccessByContentId` (that is the
+/// node's job, per covered address in the returned [`VerifiedAccess`]) and — since DKMS-3 —
+/// deliberately does NOT touch replay state: the bounded, two-phase replay RESERVATION is a
+/// separate step ([`crate::replay::ReplayStore::begin`]) run only AFTER this returns `Ok`, so an
+/// invalid signature can never reserve or burn a nonce. See [`verify_and_reserve`] for the composed
+/// verify-then-reserve orchestration the node uses. `eip1271` is optional smart-account support and
+/// may itself perform RPC; no replay lock is held while it does.
 pub fn verify_access_grant(
     grant: &AccessGrantV1,
     ctx: &AccessVerifyContext,
-    replay: Option<&mut ReplayGuard>,
     eip1271: Option<&dyn Eip1271Caller>,
 ) -> Result<VerifiedAccess, AccessVerifyError> {
     use AccessVerifyError::*;
@@ -480,14 +544,18 @@ pub fn verify_access_grant(
     if !is_evm_address(&del.owner_address) {
         return Err(DelMalformed);
     }
-    if del.covered_addresses.is_empty() || !del.covered_addresses.iter().all(|a| is_evm_address(a)) {
-        return Err(DelMalformed);
-    }
+    // Owner-only bound + binding (DKMS-1/DKMS-4): reject empty/over-cardinality/over-size/
+    // malformed/duplicate/unrelated covered sets BEFORE any signature or RPC work, and keep
+    // only the validated canonical subject set the node will query.
+    let validated_subjects = validate_covered_addresses(&del.owner_address, &del.covered_addresses)?;
     if del.session_pub_b64.is_empty() || b64_decode(&del.session_pub_b64).is_none() {
         return Err(PubMalformed);
     }
-    if del.nonce_b64.is_empty() || b64_decode(&del.nonce_b64).is_none() {
-        return Err(DelMalformed);
+    // Decode the delegation nonce here and cap its DECODED length before it can ever be hashed into
+    // a replay key (DKMS-3: validate nonce sizes before hashing/insertion).
+    match b64_decode(&del.nonce_b64) {
+        Some(bytes) if !bytes.is_empty() && bytes.len() <= crate::replay::MAX_NONCE_BYTES => {}
+        _ => return Err(DelMalformed),
     }
     if del.expires_at < del.issued_at {
         return Err(DelMalformed);
@@ -513,17 +581,14 @@ pub fn verify_access_grant(
     if req.node_set_id_b64 != del.node_set_id_b64 {
         return Err(BadNodeSet);
     }
-    if req.request_nonce_b64.is_empty() || b64_decode(&req.request_nonce_b64).is_none() {
-        return Err(ReqMalformed);
+    // Decode + length-cap the request nonce before it can be hashed into a replay key (DKMS-3).
+    match b64_decode(&req.request_nonce_b64) {
+        Some(bytes) if !bytes.is_empty() && bytes.len() <= crate::replay::MAX_NONCE_BYTES => {}
+        _ => return Err(ReqMalformed),
     }
     let skew = ctx.now.abs_diff(req.requested_at);
     if skew > REQUEST_FRESHNESS_WINDOW_SECONDS {
         return Err(ReqStaleOrFuture);
-    }
-
-    // ── revocation + replay (cheap, before sig math) ──
-    if let Some(guard) = replay {
-        guard.check_and_record(&del.nonce_b64, &req.request_nonce_b64, del.expires_at, ctx.now)?;
     }
 
     // ── delegation signature: EIP-191 first, EIP-1271 fallback (smart accounts) ──
@@ -554,7 +619,8 @@ pub fn verify_access_grant(
 
     Ok(VerifiedAccess {
         recovered_owner,
-        covered_addresses: del.covered_addresses.clone(),
+        // The VALIDATED, canonical owner-only subject set — never the caller's clone.
+        covered_addresses: validated_subjects,
         kid_hex: kid,
     })
 }
@@ -688,6 +754,52 @@ pub mod testkit {
             owner,
         )
     }
+
+    /// Build a grant whose `owner_address` is `smart_account` (a contract) while the
+    /// delegation signature is a real EIP-191 signature by the `seed` EOA. EIP-191
+    /// recovery therefore yields the EOA, NOT the owner, so a node MUST fall back to
+    /// EIP-1271 to bind it — the shape that makes an "EIP-1271 was never dialed"
+    /// assertion falsifiable. `covered` defaults to `[smart_account]` when empty.
+    pub fn signed_grant_smart_account(
+        node_set_id_b64: &str,
+        kid_hex: &str,
+        chain_id: u64,
+        now: u64,
+        window_secs: u64,
+        smart_account: &str,
+        covered: &[String],
+        seed: u8,
+    ) -> AccessGrantV1 {
+        let sk = SigningKey::from_slice(&[seed.max(1); 32]).expect("valid scalar");
+        let (signer, session_vk) = mldsa_seal_keypair([seed.max(2); 32]);
+        let covered = if covered.is_empty() { vec![smart_account.to_string()] } else { covered.to_vec() };
+        let del = AccessDelegationV1 {
+            domain: DELEGATION_DOMAIN.to_string(),
+            chain_id,
+            kid_hex: kid_hex.to_string(),
+            node_set_id_b64: node_set_id_b64.to_string(),
+            owner_address: smart_account.to_string(),
+            covered_addresses: covered,
+            session_pub_b64: b64_encode(&session_vk),
+            issued_at: now,
+            expires_at: now + window_secs,
+            nonce_b64: b64_encode(&[seed; 16]),
+        };
+        let prehash = eip191_message_hash(del.canonical().as_bytes());
+        let (sig, recid) = sk.sign_prehash_recoverable(&prehash).expect("sign");
+        let mut sb = sig.to_bytes().to_vec();
+        sb.push(recid.to_byte() + 27);
+        let delegation_sig_hex = format!("0x{}", hex::encode(sb));
+        let req = AccessRequestV1 {
+            domain: REQUEST_DOMAIN.to_string(),
+            kid_hex: kid_hex.to_string(),
+            node_set_id_b64: node_set_id_b64.to_string(),
+            requested_at: now,
+            request_nonce_b64: b64_encode(&[seed.wrapping_add(1); 8]),
+        };
+        let request_sig_b64 = b64_encode(&signer.sign(req.canonical().as_bytes()));
+        AccessGrantV1 { delegation: del, delegation_sig_hex, request: req, request_sig_b64 }
+    }
 }
 
 #[cfg(test)]
@@ -759,8 +871,7 @@ mod tests {
     #[test]
     fn happy_path_verifies_and_recovers_owner() {
         let (grant, ctx) = mk_grant();
-        let mut guard = ReplayGuard::new();
-        let v = verify_access_grant(&grant, &ctx, Some(&mut guard), None).expect("ok");
+        let v = verify_access_grant(&grant, &ctx, None).expect("ok");
         assert!(eq_addr(&v.recovered_owner, &grant.delegation.owner_address));
         assert_eq!(v.covered_addresses, grant.delegation.covered_addresses);
         assert_eq!(v.kid_hex, kid());
@@ -780,10 +891,135 @@ mod tests {
     #[test]
     fn tampered_covered_addresses_fails_closed() {
         let (mut grant, ctx) = mk_grant();
-        // mutate AFTER signing → recovered owner no longer matches → del_sig_invalid
+        // Adding an unrelated address is now caught by the owner-only covered-set bound in the
+        // structural phase, BEFORE any signature/RPC work — the earliest, cheapest fail-closed.
         grant.delegation.covered_addresses.push("0x000000000000000000000000000000000000dead".to_string());
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
-        assert_eq!(err, AccessVerifyError::DelSigInvalid);
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
+        assert_eq!(err, AccessVerifyError::CoveredInvalid);
+    }
+
+    // ── DKMS-1 / DKMS-4: pure covered-address validation (owner-only) ────────────────────────────
+
+    fn addr(byte: u8) -> String {
+        format!("0x{}", hex::encode([byte; 20]))
+    }
+
+    #[test]
+    fn covered_owner_only_accepts_exactly_the_owner() {
+        let owner = addr(0xAB);
+        let v = validate_covered_addresses(&owner, &[owner.clone()]).expect("owner-only ok");
+        assert_eq!(v, vec![owner]);
+    }
+
+    #[test]
+    fn covered_is_case_normalized_to_the_owner() {
+        let owner = addr(0xCD); // lowercased 0x form
+        let upper = format!("0x{}", "CD".repeat(20));
+        let v = validate_covered_addresses(&owner, &[upper]).expect("case-variant owner ok");
+        assert_eq!(v, vec![owner], "a case-variant of the owner canonicalizes to the owner");
+    }
+
+    #[test]
+    fn covered_rejects_an_unrelated_entitled_address() {
+        let owner = addr(0x11);
+        let stranger = addr(0x22);
+        // owner-only: the stranger alone, and [owner, stranger], are both refused.
+        assert_eq!(
+            validate_covered_addresses(&owner, &[stranger.clone()]),
+            Err(AccessVerifyError::CoveredInvalid),
+        );
+        assert_eq!(
+            validate_covered_addresses(&owner, &[owner.clone(), stranger]),
+            Err(AccessVerifyError::CoveredInvalid),
+        );
+    }
+
+    #[test]
+    fn covered_rejects_empty_zero_and_over_limit() {
+        let owner = addr(0x33);
+        // zero
+        assert_eq!(validate_covered_addresses(&owner, &[]), Err(AccessVerifyError::CoveredInvalid));
+        // one (== limit for owner-only) is accepted
+        assert!(validate_covered_addresses(&owner, &[owner.clone()]).is_ok());
+        // limit + 1 (duplicated owner) exceeds MAX_COVERED_ADDRESSES
+        assert_eq!(MAX_COVERED_ADDRESSES, 1, "owner-only policy");
+        let over = vec![owner.clone(); MAX_COVERED_ADDRESSES + 1];
+        assert_eq!(validate_covered_addresses(&owner, &over), Err(AccessVerifyError::CoveredInvalid));
+    }
+
+    #[test]
+    fn covered_rejects_duplicates_and_oversized_and_malformed_entries() {
+        let owner = addr(0x44);
+        // duplicate owner (also over-cardinality here — rejected either way, fail closed)
+        assert_eq!(
+            validate_covered_addresses(&owner, &[owner.clone(), owner.clone()]),
+            Err(AccessVerifyError::CoveredInvalid),
+        );
+        // oversized single entry (way past MAX_ADDRESS_STR_LEN) — rejected before hex parsing
+        let oversized = format!("0x{}", "ab".repeat(64));
+        assert!(oversized.len() > MAX_ADDRESS_STR_LEN);
+        assert_eq!(
+            validate_covered_addresses(&owner, &[oversized]),
+            Err(AccessVerifyError::CoveredInvalid),
+        );
+        // malformed (not hex / wrong length)
+        assert_eq!(
+            validate_covered_addresses(&owner, &["0xnothex".to_string()]),
+            Err(AccessVerifyError::CoveredInvalid),
+        );
+    }
+
+    /// EOA and EIP-1271 (smart-account) owners must bind subjects identically: the same
+    /// owner-only covered-set rule applies regardless of how the owner signature is proven.
+    #[test]
+    fn eip1271_owner_has_equivalent_subject_binding() {
+        let (sk, _signer_addr) = wallet(11);
+        let (signer, session_vk) = mldsa_seal_keypair([5u8; 32]);
+        let contract_owner = "0x00000000000000000000000000000000c0ffee01".to_string();
+        let stranger = "0x00000000000000000000000000000000000000ff".to_string();
+        let mk = |covered: Vec<String>| {
+            let del = AccessDelegationV1 {
+                domain: DELEGATION_DOMAIN.to_string(),
+                chain_id: 8453,
+                kid_hex: kid(),
+                node_set_id_b64: node_set(),
+                owner_address: contract_owner.clone(),
+                covered_addresses: covered,
+                session_pub_b64: b64_encode(&session_vk),
+                issued_at: NOW,
+                expires_at: NOW + 3600,
+                nonce_b64: b64_encode(&[1u8; 16]),
+            };
+            let delegation_sig_hex = sign_eip191(&sk, &del.canonical()); // EOA-signed, not the contract
+            let req = AccessRequestV1 {
+                domain: REQUEST_DOMAIN.to_string(),
+                kid_hex: kid(),
+                node_set_id_b64: node_set(),
+                requested_at: NOW,
+                request_nonce_b64: b64_encode(&[2u8; 8]),
+            };
+            let request_sig_b64 = b64_encode(&signer.sign(req.canonical().as_bytes()));
+            AccessGrantV1 { delegation: del, delegation_sig_hex, request: req, request_sig_b64 }
+        };
+        let ctx = AccessVerifyContext {
+            expected_node_set_id_b64: node_set(),
+            expected_chain_id: 8453,
+            expected_kid_hex: kid(),
+            now: NOW,
+        };
+        let mut magic = EIP1271_MAGIC_VALUE.to_vec();
+        magic.extend_from_slice(&[0u8; 28]);
+        let good = MockEip1271 { owner: contract_owner.clone(), ret: magic };
+
+        // Owner-only [contract_owner] verifies and yields exactly the contract owner as the subject.
+        let v = verify_access_grant(&mk(vec![contract_owner.clone()]), &ctx, Some(&good)).expect("ok");
+        assert_eq!(v.covered_addresses, vec![contract_owner.clone()]);
+        assert!(eq_addr(&v.recovered_owner, &contract_owner));
+
+        // A stranger listed alongside the smart-account owner is refused BEFORE the EIP-1271 dial —
+        // identical binding rule to the EOA case.
+        let err = verify_access_grant(&mk(vec![contract_owner.clone(), stranger]), &ctx, Some(&good)).unwrap_err();
+        assert_eq!(err, AccessVerifyError::CoveredInvalid);
     }
 
     /// H1 invariant — the forensic watermark anchor is safe-by-construction.
@@ -803,7 +1039,7 @@ mod tests {
             "test wallets must differ"
         );
         grant.delegation_sig_hex = sign_eip191(&other_sk, &grant.delegation.canonical());
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::DelSigInvalid);
     }
 
@@ -811,33 +1047,45 @@ mod tests {
     fn stripped_request_sig_fails_closed() {
         let (mut grant, ctx) = mk_grant();
         grant.request_sig_b64 = String::new();
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::ReqSigInvalid);
+    }
+
+    /// Mirror of the node's authorize path WITHOUT an on-chain read: verify (phases 1–3) then
+    /// reserve+commit (phases 4+6). Proves the reservation contract at the envelope level — an
+    /// invalid grant returns before `begin`, and a committed pair becomes single-use.
+    fn authorize_once(
+        grant: &AccessGrantV1,
+        ctx: &AccessVerifyContext,
+        store: &crate::replay::ReplayStore,
+    ) -> Result<(), AccessVerifyError> {
+        let (_verified, reservation) = verify_and_reserve(grant, ctx, store, None)?;
+        reservation.commit();
+        Ok(())
     }
 
     #[test]
     fn request_replay_is_rejected() {
         let (grant, ctx) = mk_grant();
-        let mut guard = ReplayGuard::new();
-        verify_access_grant(&grant, &ctx, Some(&mut guard), None).expect("first ok");
-        let err = verify_access_grant(&grant, &ctx, Some(&mut guard), None).unwrap_err();
-        assert_eq!(err, AccessVerifyError::Replayed);
+        let store = crate::replay::ReplayStore::new();
+        authorize_once(&grant, &ctx, &store).expect("first ok");
+        assert_eq!(authorize_once(&grant, &ctx, &store).unwrap_err(), AccessVerifyError::Replayed);
     }
 
     #[test]
     fn revoked_delegation_is_rejected() {
         let (grant, ctx) = mk_grant();
-        let mut guard = ReplayGuard::new();
-        guard.revoke(&grant.delegation.nonce_b64, grant.delegation.expires_at);
-        let err = verify_access_grant(&grant, &ctx, Some(&mut guard), None).unwrap_err();
-        assert_eq!(err, AccessVerifyError::Revoked);
+        let store = crate::replay::ReplayStore::new();
+        let nonce = b64_decode(&grant.delegation.nonce_b64).unwrap();
+        store.revoke(&nonce, grant.delegation.expires_at, ctx.now).expect("revoke ok");
+        assert_eq!(authorize_once(&grant, &ctx, &store).unwrap_err(), AccessVerifyError::Revoked);
     }
 
     #[test]
     fn expired_window_fails_closed() {
         let (grant, mut ctx) = mk_grant();
         ctx.now = grant.delegation.expires_at + 1;
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::DelExpired);
     }
 
@@ -845,7 +1093,7 @@ mod tests {
     fn not_yet_valid_fails_closed() {
         let (grant, mut ctx) = mk_grant();
         ctx.now = grant.delegation.issued_at - (DELEGATION_CLOCK_SKEW_SECONDS + 1);
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::DelNotYetValid);
     }
 
@@ -882,7 +1130,7 @@ mod tests {
             expected_kid_hex: kid(),
             now: NOW,
         };
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::DelWindowTooWide);
     }
 
@@ -890,7 +1138,7 @@ mod tests {
     fn wrong_kid_fails_closed() {
         let (grant, mut ctx) = mk_grant();
         ctx.expected_kid_hex = format!("0x{}", "cd".repeat(16));
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::BadKid);
     }
 
@@ -900,7 +1148,7 @@ mod tests {
         // sign the request with a DIFFERENT session key than session_pub_b64 advertises
         let (other_signer, _other_vk) = mldsa_seal_keypair([9u8; 32]);
         grant.request_sig_b64 = b64_encode(&other_signer.sign(grant.request.canonical().as_bytes()));
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::ReqSigInvalid);
     }
 
@@ -908,7 +1156,7 @@ mod tests {
     fn foreign_quorum_fails_closed() {
         let (grant, mut ctx) = mk_grant();
         ctx.expected_node_set_id_b64 = b64_encode(b"some-other-quorum");
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::BadNodeSet);
     }
 
@@ -965,12 +1213,12 @@ mod tests {
         let mut magic = EIP1271_MAGIC_VALUE.to_vec();
         magic.extend_from_slice(&[0u8; 28]);
         let good = MockEip1271 { owner: contract_owner.clone(), ret: magic };
-        let v = verify_access_grant(&grant, &ctx, None, Some(&good)).expect("eip1271 ok");
+        let v = verify_access_grant(&grant, &ctx, Some(&good)).expect("eip1271 ok");
         assert!(eq_addr(&v.recovered_owner, &contract_owner));
 
         // non-magic return → fail closed
         let bad = MockEip1271 { owner: contract_owner, ret: vec![0u8; 32] };
-        let err = verify_access_grant(&grant, &ctx, None, Some(&bad)).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, Some(&bad)).unwrap_err();
         assert_eq!(err, AccessVerifyError::DelSigInvalid);
     }
 
@@ -990,7 +1238,7 @@ mod tests {
     fn malformed_delegation_sig_fails_closed() {
         let (mut grant, ctx) = mk_grant();
         grant.delegation_sig_hex = "0xdeadbeef".to_string();
-        let err = verify_access_grant(&grant, &ctx, None, None).unwrap_err();
+        let err = verify_access_grant(&grant, &ctx, None).unwrap_err();
         assert_eq!(err, AccessVerifyError::DelSigInvalid);
     }
 
@@ -1034,8 +1282,91 @@ mod tests {
             expected_kid_hex: kid(),
             now: NOW,
         };
-        let v = verify_access_grant(&grant, &ctx, None, None).expect("client-built grant verifies");
+        let v = verify_access_grant(&grant, &ctx, None).expect("client-built grant verifies");
         assert!(eq_addr(&v.recovered_owner, &owner));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // Stage 0 regression tests — each asserts the SECURE behavior and is `#[ignore]`d until the
+    // stage that implements it. They are the contract the fixes must turn green; do NOT weaken an
+    // assertion to make a stage pass.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /// DKMS-3 (P0): the replay entry is inserted BEFORE any signature is checked, so anything that
+    /// can reach the node with a copy of a delegation — a hostile gateway, a MITM, a buggy client —
+    /// can BURN the owner's `(delegation_nonce, request_nonce)` by sending it with a broken
+    /// signature. The legitimate request that follows is then refused as a replay: an unauthenticated
+    /// denial of service against a paid-for open.
+    ///
+    /// Secure contract: structural-invalid, owner-signature-invalid and request-signature-invalid
+    /// input never consumes (nor permanently reserves) a nonce.
+    #[test]
+    fn an_invalid_signature_never_burns_the_owners_nonce() {
+        // (a) the per-request (session-key) signature is invalid.
+        let (good, ctx) = mk_grant();
+        let mut stripped = good.clone();
+        stripped.request_sig_b64 = String::new();
+        let store = crate::replay::ReplayStore::new();
+        assert_eq!(
+            authorize_once(&stripped, &ctx, &store).unwrap_err(),
+            AccessVerifyError::ReqSigInvalid,
+            "sanity: the forged request signature is what gets rejected",
+        );
+        assert_eq!(store.tracked_len(), 0, "a request-signature-invalid attempt reserved nothing");
+        assert!(
+            authorize_once(&good, &ctx, &store).is_ok(),
+            "a request-signature-invalid attempt must NOT consume the owner's nonce",
+        );
+
+        // (b) the wallet (delegation) signature is invalid — signed by a different wallet.
+        let (good, ctx) = mk_grant();
+        let mut forged = good.clone();
+        let (other_sk, _addr) = wallet(99);
+        forged.delegation_sig_hex = sign_eip191(&other_sk, &forged.delegation.canonical());
+        let store = crate::replay::ReplayStore::new();
+        assert_eq!(
+            authorize_once(&forged, &ctx, &store).unwrap_err(),
+            AccessVerifyError::DelSigInvalid,
+            "sanity: the wrong-wallet delegation signature is what gets rejected",
+        );
+        assert_eq!(store.tracked_len(), 0, "an owner-signature-invalid attempt reserved nothing");
+        assert!(
+            authorize_once(&good, &ctx, &store).is_ok(),
+            "an owner-signature-invalid attempt must NOT consume the owner's nonce",
+        );
+    }
+
+    /// DKMS-3 (P0): the `seen` map is never pruned and has no bound, so every accepted request
+    /// grows node memory for the lifetime of the process — long after the delegation those entries
+    /// protect has expired and can no longer be replayed at all.
+    ///
+    /// Secure contract: seen entries expire no later than the delegation's bounded expiry, so the
+    /// collection's size is bounded by the live delegation window rather than by uptime.
+    #[test]
+    fn seen_replay_entries_expire_with_the_delegation_they_protect() {
+        let store = crate::replay::ReplayStore::new();
+        let expires_at = NOW + 60;
+        for i in 0..2_000u32 {
+            store
+                .begin(b"delegation-A", format!("request-{i}").as_bytes(), expires_at, NOW)
+                .expect("a first use of each request nonce is accepted")
+                .commit();
+        }
+        assert_eq!(store.tracked_len(), 2_000, "baseline: every accepted request is remembered");
+
+        // The delegation has now expired: none of those 2000 entries can protect anything, because
+        // a grant carrying them would be rejected as `DelExpired` before replay is even consulted.
+        // A begin at a later clock prunes all of them (time-ordered, no full-map scan) before it runs.
+        store
+            .begin(b"delegation-B", b"request-0", NOW + 200, expires_at + 1)
+            .expect("a fresh delegation is accepted after the first expired")
+            .commit();
+        assert!(
+            store.tracked_len() <= 1,
+            "seen entries must expire no later than the delegation expiry they protect — {} stale \
+             entries were still retained (unbounded growth for the life of the process)",
+            store.tracked_len(),
+        );
     }
 
     #[test]

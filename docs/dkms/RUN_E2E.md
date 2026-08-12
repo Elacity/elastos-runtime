@@ -114,7 +114,8 @@ client can never override them):
 |---|---|
 | `DKMS_AUTHORITY_KEY_STORE=<path>` | the node's durable master-seed store (node-local; the runtime never reads it) |
 | `DKMS_AUTHORITY_LISTEN=<unixpath>` or `tcp:HOST:PORT` | bind + listen as a framed remote authority (default: stdin/stdout one-shot) |
-| `DKMS_AUTHORITY_ALLOWED_CALLERS=<b64vk,…>` | allow-list of known caller verifying keys; an unlisted caller is refused at `hello` |
+| `DKMS_AUTHORITY_ALLOWED_CALLERS=<b64vk,…>` | allow-list of known caller verifying keys; an unlisted caller is refused at `hello`. DKMS-8: validated fail-closed BEFORE the listener binds — empty, malformed, or duplicate ⇒ the daemon exits non-zero (never silently anonymous) |
+| `DKMS_AUTHORITY_ALLOW_ANONYMOUS=1` | EXPLICIT anonymous opt-in: with NO allow-list, serve any well-formed caller. Required to run anonymous — unset allow-list AND unset flag is a startup error, so anonymous is always a deliberate choice. Contradicts an allow-list (both set ⇒ fails closed) |
 | `DKMS_AUTHORITY_OPERATOR_VK=<b64vk>` | the operator identity that authorizes lifecycle ops (`rotate_share`, `revoke_caller`); absent ⇒ those fail closed |
 
 ```bash

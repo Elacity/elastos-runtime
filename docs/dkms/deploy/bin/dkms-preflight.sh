@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # dKMS deployment preflight checker — grounded entirely in the real capsule surfaces:
-#   * node identity     : `dkms-authority` stdio `init` -> seal_verifying_key_b64 / seal_recipient_pub_b64
-#                         (capsules/dkms-authority/src/main.rs::init, deterministic from the master store)
+#   * node identity     : `dkms-authority provision` (OFFLINE) -> seal_verifying_key_b64 / seal_recipient_pub_b64
+#                         (capsules/dkms-authority/src/main.rs::run_provision, deterministic from the master store)
 #   * node env          : DKMS_AUTHORITY_{LISTEN,KEY_STORE,ALLOWED_CALLERS,OPERATOR_VK}
 #   * descriptor schema : elastos.dkms.authority/v2 (validated via dkms-validate-descriptor.py)
 #   * reachability      : a raw TCP connect to each published tcp:HOST:PORT endpoint
@@ -46,30 +46,25 @@ tcp_probe() {
   return 1
 }
 
-# Read a node's published identity via the REAL stdio init protocol.
+# Read a node's published identity via the OFFLINE `provision` subcommand (DKMS-7): identity is
+# created/loaded from the operator-owned state root, never over the wire.
 read_identity() {
   local bin="$1" store="$2"
-  printf '{"op":"init","config":{"authority_key_store":"%s"}}\n' "$store" \
-    | "$bin" 2>/dev/null | tail -n 1
+  DKMS_AUTHORITY_KEY_STORE="$store" "$bin" provision 2>/dev/null | tail -n 1
 }
 
 cmd_identity() {
   local bin="${1:-}" store="${2:-}"
   [[ -n "$bin" && -n "$store" ]] || { echo "usage: dkms-preflight.sh identity NODE_BIN STORE_PATH" >&2; exit 2; }
-  echo "== node identity (provision/read; stdio init) =="
+  echo "== node identity (offline provision; operator state root) =="
   [[ -x "$bin" ]] || { red "node binary $bin is not executable"; return 1; }
   green "node binary present: $("$bin" --version 2>/dev/null || basename "$bin")"
   local out; out="$(read_identity "$bin" "$store")"
-  local status; status="$(echo "$out" | jq -r '.status // empty' 2>/dev/null)"
-  if [[ "$status" != "ok" ]]; then
-    red "init did not return ok: $(echo "$out" | jq -r '.error // .reason // .' 2>/dev/null | head -c 200)"
-    return 1
-  fi
   local vk rp
-  vk="$(echo "$out" | jq -r '.data.seal_verifying_key_b64 // .seal_verifying_key_b64')"
-  rp="$(echo "$out" | jq -r '.data.seal_recipient_pub_b64 // .seal_recipient_pub_b64')"
-  [[ -n "$vk" && "$vk" != null ]] || { red "no seal_verifying_key_b64 in init response"; return 1; }
-  [[ -n "$rp" && "$rp" != null ]] || { red "no seal_recipient_pub_b64 in init response"; return 1; }
+  vk="$(echo "$out" | jq -r '.seal_verifying_key_b64 // empty' 2>/dev/null)"
+  rp="$(echo "$out" | jq -r '.seal_recipient_pub_b64 // empty' 2>/dev/null)"
+  [[ -n "$vk" && "$vk" != null ]] || { red "no seal_verifying_key_b64 in provision response: $(echo "$out" | head -c 200)"; return 1; }
+  [[ -n "$rp" && "$rp" != null ]] || { red "no seal_recipient_pub_b64 in provision response"; return 1; }
   green "store readable, identity is stable: $store"
   echo
   echo "Paste this node block into the descriptor (set authority_endpoint to this node's tcp: address):"
@@ -102,19 +97,34 @@ cmd_node() {
   else info "DKMS_AUTHORITY_LISTEN is a unix path: $listen (use tcp: for a remote node)"; fi
 
   local store="${DKMS_AUTHORITY_KEY_STORE:-}"
-  [[ -n "$store" ]] && green "DKMS_AUTHORITY_KEY_STORE set: $store" || red "DKMS_AUTHORITY_KEY_STORE unset (init fails closed: no master store)"
+  [[ -n "$store" ]] && green "DKMS_AUTHORITY_KEY_STORE set: $store" || red "DKMS_AUTHORITY_KEY_STORE unset (startup fails closed: no master store)"
   if [[ -n "$store" && -e "$store" ]]; then
     local mode; mode="$(stat -f '%Lp' "$store" 2>/dev/null || stat -c '%a' "$store" 2>/dev/null)"
     [[ "$mode" == "600" ]] && green "master store mode is 0600" || red "master store mode is $mode (MUST be 0600 — it holds the node's master seed)"
   fi
 
+  # DKMS-8: caller policy is fail-closed and EXPLICIT. Detect the distinct modes the daemon itself
+  # now distinguishes at startup: an allow-list, explicit anonymous, or a misconfiguration that
+  # ABORTS startup (unset-without-opt-in, empty, or both set at once). This preflight only surfaces
+  # the intent; the daemon is the authority and refuses to bind on any misconfiguration.
   local allowed="${DKMS_AUTHORITY_ALLOWED_CALLERS:-}"
-  if [[ -z "$allowed" ]]; then red "DKMS_AUTHORITY_ALLOWED_CALLERS unset (node would serve ANY caller — production MUST allow-list the runtime)"
-  else
-    green "DKMS_AUTHORITY_ALLOWED_CALLERS set ($(awk -F, '{print NF}' <<<"$allowed") caller(s))"
-    if [[ -n "$expect_caller" ]]; then
-      [[ ",$allowed," == *",$expect_caller,"* ]] && green "expected runtime caller is allow-listed" || red "expected runtime caller VK is NOT in the allow-list"
+  local allow_anon="${DKMS_AUTHORITY_ALLOW_ANONYMOUS:-}"
+  local trimmed; trimmed="$(tr -d '[:space:],' <<<"$allowed")"
+  if [[ -n "$allowed" && "$allow_anon" == "1" ]]; then
+    red "DKMS_AUTHORITY_ALLOWED_CALLERS and DKMS_AUTHORITY_ALLOW_ANONYMOUS=1 are BOTH set (contradictory — the node fails closed on startup; choose one)"
+  elif [[ -n "$allowed" ]]; then
+    if [[ -z "$trimmed" ]]; then
+      red "DKMS_AUTHORITY_ALLOWED_CALLERS is set but EMPTY (the node fails closed on startup — a malformed allow-list never degrades to anonymous)"
+    else
+      green "DKMS_AUTHORITY_ALLOWED_CALLERS set ($(awk -F, '{c=0; for(i=1;i<=NF;i++) if($i ~ /[^[:space:]]/) c++; print c}' <<<"$allowed") caller(s))"
+      if [[ -n "$expect_caller" ]]; then
+        [[ ",$allowed," == *",$expect_caller,"* ]] && green "expected runtime caller is allow-listed" || red "expected runtime caller VK is NOT in the allow-list"
+      fi
     fi
+  elif [[ "$allow_anon" == "1" ]]; then
+    info "DKMS_AUTHORITY_ALLOW_ANONYMOUS=1 (EXPLICIT anonymous: node serves ANY well-formed caller — intended only for dev/open meshes, not an allow-listed production node)"
+  else
+    red "no caller policy configured (the node fails closed on startup — set DKMS_AUTHORITY_ALLOWED_CALLERS to the runtime VK, or DKMS_AUTHORITY_ALLOW_ANONYMOUS=1 to opt into anonymous)"
   fi
 
   local op="${DKMS_AUTHORITY_OPERATOR_VK:-}"

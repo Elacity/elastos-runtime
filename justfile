@@ -98,6 +98,14 @@ _verify-tail:
 verify-capsules:
     cd capsules/decrypt-provider && cargo test --features rail-stream,rail-mint,pdf-render,pq-envelope
     cd capsules/ddrm-envelope && cargo test --features access-grant,av-variants
+    # The dKMS EXTERNAL key-authority node: the full remediation regression suite (owner-only
+    # entitlement, RPC agreement, bounded replay, lifecycle-manifest v2, durable revocation,
+    # offline provisioning, allow-list posture). The elastos workspace does NOT include this crate,
+    # so without this line the whole dKMS regression suite (70+ tests) never runs in CI. Both the
+    # default (secure, legacy path fenced OUT) and the `dev-modes` lane (legacy-receipt-authz
+    # migration scaffold) are exercised so a ratchet under one config cannot silently rot the other.
+    cd capsules/dkms-authority && cargo test
+    cd capsules/dkms-authority && cargo test --features dev-modes
     cd scripts/dev/ddrm-media-authority && cargo test
     # AV forensic cross-language weld: the Python extractor's canonical codeword must match the Rust
     # serve selector byte-for-byte (golden vectors on both sides). Pure stdlib — no numpy/ffmpeg.

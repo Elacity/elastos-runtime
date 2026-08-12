@@ -1823,23 +1823,34 @@ impl PublishEscrow {
     }
 }
 
-/// Provision ONE secret-holding dKMS node: spawn it on its node-local master store, read back its
-/// PUBLISHED identity (vk + escrow recipient), and shut the provisioning child down (the long-lived
-/// daemon is started separately). The MASTER stays in `store_path` — the runtime created it via the
-/// node but NEVER reads it. Returns the node's `(verifying_key_b64, recipient_pub_b64)` pins.
+/// Provision ONE secret-holding dKMS node OFFLINE: run its `provision` subcommand against the
+/// node-local master store and read back its PUBLISHED identity (vk + escrow recipient). DKMS-7:
+/// identity is created/loaded from the operator-owned state root (env `DKMS_AUTHORITY_KEY_STORE`),
+/// NEVER over a wire `init` — a client cannot select the key-store path or trigger first creation.
+/// The MASTER stays in `store_path`; the runtime created it via the node but NEVER reads it. Returns
+/// the node's `(verifying_key_b64, recipient_pub_b64)` pins.
 fn provision_dkms_node(node_bin: &str, store_path: &str) -> Result<(String, String), String> {
-    let mut node = Capsule::spawn("dkms-authority(provision)", node_bin)?;
-    let init = ok_data(
-        &node.call(&json!({ "op": "init", "config": { "authority_key_store": store_path } }))?,
-        "dkms-authority init (provision)",
-    )?;
-    let vk = init["seal_verifying_key_b64"].as_str()
+    let out = Command::new(node_bin)
+        .arg("provision")
+        .env("DKMS_AUTHORITY_KEY_STORE", store_path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn dkms-authority(provision): {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "dkms-authority provision failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let identity: Value = serde_json::from_str(line.lines().next().unwrap_or("").trim())
+        .map_err(|e| format!("dkms-authority provision output is not JSON: {e}"))?;
+    let vk = identity["seal_verifying_key_b64"].as_str()
         .ok_or("dkms-authority node did not publish a verifying key")?
         .to_string();
-    let recipient = init["seal_recipient_pub_b64"].as_str()
+    let recipient = identity["seal_recipient_pub_b64"].as_str()
         .ok_or("dkms-authority node did not publish a recipient key")?
         .to_string();
-    node.shutdown();
     Ok((vk, recipient))
 }
 
@@ -2125,6 +2136,39 @@ fn probe_receipt(allowed: bool, content_id: &str, principal_id: &str, right: &st
         "expires_at": u64::MAX,
     })
 }
+
+// ============================================================================================
+// PENDING MIGRATION — live dkms-authority probe/lifecycle scenarios vs. the HARDENED node.
+//
+// STATUS (Stage 8): the main verify-mode RAIL is already migrated — it provisions each node's
+// identity OFFLINE via the `provision` subcommand (`provision_dkms_node`, writing the keystore and
+// returning `(vk, recipient)`) BEFORE `start_dkms_daemon` spawns a LOAD-ONLY daemon. The adversarial
+// probe + live-lifecycle scenarios BELOW have NOT been migrated and are RED against the hardened node
+// for two reasons:
+//   1. WIRE `op:init` IS REFUSED. The hardened node rejects `Request::Init` on every transport
+//      (DKMS-7: network clients cannot create/select a node identity). ~25 call sites here still send
+//      `{"op":"init"}` — some purely as a leftover round-trip against an already-provisioned running
+//      daemon (e.g. `dkms_node_adversarial_probe`, `dkms_malformed_frame_is_refused`,
+//      `dkms_tcp_channel_adversarial_gates`), others to READ the node's published `(vk, recipient)`
+//      from the init response (e.g. `dkms_threshold_probe`'s `recover_share`, the rotation/quorum/DKG
+//      scenarios). The former just delete the init call; the latter must take identity from
+//      `provision_dkms_node` instead.
+//   2. V1 LIFECYCLE AUTHS ARE REJECTED. The rotation/revocation, quorum-rotation, quorum-reconfigure,
+//      and DKG contribute/install/attest scenarios build v1 `reshare_aad`/`dkg_aad`-style
+//      authorizations; the hardened node verifies operator auth ONLY against the v2
+//      `ddrm_envelope::lifecycle` canonical manifest digest (DKMS-5). These must be re-encoded with
+//      the shared v2 lifecycle encoder.
+//   3. Several of these scenarios ALSO call `start_dkms_daemon` against a keystore path that was never
+//      provisioned (e.g. `dkms_threshold_probe`), so they now fail at daemon startup (load-only)
+//      BEFORE reaching the wire — each such spawn needs a preceding `provision_dkms_node`.
+//
+// This is a comprehensive rewrite of the live-lifecycle driver (~15 scenario functions), NOT a
+// mechanical edit, and it cannot be verified in isolation without the full offline orchestration
+// (node bin + decrypt-provider + content plane + key-provider) that `scripts/ddrm-consumer-smoke.sh`
+// drives. It is intentionally deferred and documented in `docs/dkms/DEV_SETUP.md`
+// ("ddrm-runtime-open live-lifecycle migration"). These scenarios are opt-in (verify mode + a `dkms`
+// backend + threshold config) and are NOT part of the `just verify-capsules` gate, which is green.
+// ============================================================================================
 
 /// Adversarial probe against the REAL dkms-authority node binary (verify mode only): prove, cross
 /// binary, that **(a)** a tampered/wrong NODE IDENTITY is rejected at the handshake — the node's

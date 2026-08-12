@@ -69,9 +69,12 @@ import json
 nodes = []
 for i in range(3):
     init = json.load(open(f"shared/node-{i}.init.json"))
-    data = init.get("data", {})
+    # DKMS-7: identity now comes from the offline `provision` subcommand, which prints the
+    # seal keys at the TOP LEVEL; the legacy wire-`init` response nested them under "data".
+    # Accept both so the descriptor assembles from either producer.
+    data = init.get("data", init)
     vk, rec = data.get("seal_verifying_key_b64"), data.get("seal_recipient_pub_b64")
-    assert vk and rec, f"node {i} init response missing public identity"
+    assert vk and rec, f"node {i} provision output missing public identity"
     did = open(f"shared/node-{i}.did").readline().strip()
     assert did.startswith("did:key:"), f"node {i} did looks wrong: {did!r}"
     nodes.append({

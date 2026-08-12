@@ -63,6 +63,39 @@ four checks in cost order: contract drift (`ddrm-drift-check.sh`), cross-impl pa
 expected counts (`ddrm-ladder-check.sh`), and the WASI smoke (`ddrm-chain-smoke.sh`, skips
 clean without `wasmtime`). Set `DDRM_VERIFY_FAST=1` to skip the two heavy gates.
 
+### 2.1 Known gap — `ddrm-runtime-open` live-lifecycle scenarios vs. the hardened node
+
+The `--backend dkms` smoke variants above drive the `ddrm-runtime-open` orchestrator. Its main
+verify-mode **rail** (the happy-path open) is already migrated to the hardened node: node identity is
+created **offline** by the `dkms-authority provision` subcommand (`provision_dkms_node`) *before* a
+**load-only** daemon is started — the daemon never creates or selects an identity over the wire
+(DKMS-7).
+
+Its **adversarial-probe and live-lifecycle scenarios are NOT yet migrated** and are RED against the
+hardened node. They are opt-in (verify mode + a `dkms` backend + a `--threshold`/`--nodes` config),
+and are **not** part of `just verify-capsules`, which is green. The remaining migration, per
+`scripts/dev/ddrm-runtime-open/src/main.rs` (the `PENDING MIGRATION` banner above
+`fn dkms_node_adversarial_probe`):
+
+1. **Wire `op:init` is refused** on every transport. ~25 call sites still send `{"op":"init"}`.
+   The ones that hit an already-provisioned running daemon (`dkms_node_adversarial_probe`,
+   `dkms_malformed_frame_is_refused`, `dkms_tcp_channel_adversarial_gates`) simply drop the init and
+   keep the `hello` round-trip. The ones that read `(vk, recipient)` from the init response
+   (`dkms_threshold_probe`, the rotation/quorum/DKG scenarios) must instead take identity from
+   `provision_dkms_node`.
+2. **Unprovisioned `start_dkms_daemon`.** Scenarios that spawn their own daemons (e.g.
+   `dkms_threshold_probe`) point at a keystore path that was never provisioned, so a load-only daemon
+   now fails at startup. Each such spawn needs a preceding `provision_dkms_node`.
+3. **v1 lifecycle auths are rejected.** The rotation/revocation, quorum-rotation,
+   quorum-reconfigure, and DKG contribute/install/attest scenarios build v1
+   `reshare_aad`/`dkg_aad`-style authorizations; the hardened node verifies operator auth only
+   against the v2 `ddrm_envelope::lifecycle` canonical manifest digest (DKMS-5). Re-encode with the
+   shared v2 encoder.
+
+This is a comprehensive rewrite of the live-lifecycle driver (~15 scenario functions) that can only
+be verified end-to-end under the full offline orchestration `scripts/ddrm-consumer-smoke.sh` drives.
+It is intentionally deferred; the security gate does not depend on it.
+
 ---
 
 ## 3. The full operator path: `run-creator-gateway.sh`
@@ -163,6 +196,16 @@ signature and reading `hasAccessByContentId` from Base. That is a faithful local
 the sovereign quorum, no mesh needed. In `dev` / `chain-mock` these stay unset and the
 enrolled-caller path is used instead (the browser MetaMask grant flow is only offered in
 chain mode; `prepare-grant` 400s otherwise).
+
+**Owner-only entitlement binding (DKMS-1).** The node binds the on-chain check to the wallet
+identity that actually signed the delegation: it normalizes and queries **exactly `owner_address`**
+(`covered_addresses = [owner]`, `MAX_COVERED_ADDRESSES = 1`). A wallet signature over a list is not
+proof the signer controls every listed address, so a **multi-address v1 grant fails closed** — it is
+not silently honored. The sidecar's grant builder already emits the safe owner-only default, so
+existing owner-only v1 grants stay valid; covering an additional distinct address would require a
+separately-versioned relation proof (not shipped). EOA and EIP-1271 owners follow the same rule, and
+both `hasAccessByContentId` and the EIP-1271 read fail closed on RPC disagreement or insufficient
+reachability (DKMS-2) rather than trusting a single endpoint.
 
 ### 3.4 AV forensic watermarking
 

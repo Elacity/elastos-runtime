@@ -64,21 +64,20 @@ fi
 mkdir -p "${QUORUM_DIR}"
 chmod 700 "${QUORUM_DIR}" 2>/dev/null || true
 
-# Provision one node: ensure a durable store, drive a one-shot `init` over stdio, and read back the
-# node's PUBLIC identity (verifying key + escrow recipient). The first init CREATES the master seed in
-# the store; later inits are deterministic from it — so this is idempotent (re-running keeps the same
-# identities the mint already sealed to). Echoes `vk<TAB>recipient<TAB>store<TAB>endpoint`.
+# Provision one node OFFLINE: ensure a durable store and read back the node's PUBLIC identity
+# (verifying key + escrow recipient) via the `provision` subcommand. DKMS-7: identity creation is
+# OFFLINE from the operator-owned state root — never a wire `init`, so a client cannot select the
+# key-store path or trigger first creation. First run CREATES the master seed; later runs are
+# deterministic from it (idempotent — re-running keeps the same identities the mint already sealed
+# to). Echoes `vk<TAB>recipient<TAB>store<TAB>endpoint`.
 provision_node() {
   local idx="$1"
   local store="${QUORUM_DIR}/node-${idx}.store.json"
   local endpoint="${QUORUM_DIR}/node-${idx}.sock"
   local resp
-  resp="$(printf '%s\n%s\n' \
-    "{\"op\":\"init\",\"config\":{\"authority_key_store\":\"${store}\"}}" \
-    '{"op":"shutdown"}' \
-    | "$NODE_BIN" 2>/dev/null | head -n 1)"
+  resp="$(DKMS_AUTHORITY_KEY_STORE="$store" "$NODE_BIN" provision 2>/dev/null | head -n 1)"
   if [[ -z "$resp" ]]; then
-    echo "FAIL: node ${idx} published no identity on init" >&2
+    echo "FAIL: node ${idx} published no identity on provision" >&2
     return 1
   fi
   python3 - "$resp" "$store" "$endpoint" <<'PY'
@@ -87,14 +86,11 @@ resp, store, endpoint = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     obj = json.loads(resp)
 except Exception as e:
-    sys.stderr.write(f"node init response is not JSON: {e}\n"); sys.exit(1)
-if obj.get("status") != "ok":
-    sys.stderr.write(f"node init failed: {resp}\n"); sys.exit(1)
-data = obj.get("data", {})
-vk = data.get("seal_verifying_key_b64")
-rec = data.get("seal_recipient_pub_b64")
+    sys.stderr.write(f"node provision response is not JSON: {e}\n"); sys.exit(1)
+vk = obj.get("seal_verifying_key_b64")
+rec = obj.get("seal_recipient_pub_b64")
 if not vk or not rec:
-    sys.stderr.write(f"node init missing public identity: {resp}\n"); sys.exit(1)
+    sys.stderr.write(f"node provision missing public identity: {resp}\n"); sys.exit(1)
 print("\t".join([vk, rec, store, endpoint]))
 PY
 }

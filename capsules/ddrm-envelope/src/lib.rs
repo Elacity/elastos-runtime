@@ -52,6 +52,13 @@ pub type MlKemEk = <MlKem768 as KemCore>::EncapsulationKey;
 #[cfg(feature = "access-grant")]
 pub mod access;
 
+/// Bounded, expiring, concurrency-safe TWO-PHASE replay state machine (DKMS-3): the node-held
+/// anti-replay + delegation-revocation store, with an RAII reservation so no lock is ever held
+/// across the on-chain access read and a failed/denied authorization never burns a nonce. Behind
+/// `access-grant` alongside the grant verifier it protects.
+#[cfg(feature = "access-grant")]
+pub mod replay;
+
 /// AV forensic-variant layer (AV Phase 5): the variant manifest schema
 /// (`elastos.ddrm.av-variants/v1`) and the **canonical, RNG-free** codeword derivation that the
 /// serve-time selector (Rust) and the offline forensic extractor (the Python reference under
@@ -495,7 +502,11 @@ pub fn combine_cek_xor(
         return Err("share length mismatch");
     }
     Ok(zeroize::Zeroizing::new(
-        share1.iter().zip(share2.iter()).map(|(a, b)| a ^ b).collect(),
+        share1
+            .iter()
+            .zip(share2.iter())
+            .map(|(a, b)| a ^ b)
+            .collect(),
     ))
 }
 
@@ -888,9 +899,7 @@ pub fn reshare_eval(share: &[u8], higher: &[&[u8]], y: u8) -> Result<Vec<u8>, &'
 ///
 /// Fails closed on an empty set, empty sub-shares, or a length mismatch. Result rides in
 /// `Zeroizing` (it is the node's secret share material).
-pub fn dkg_sum_subshares(
-    subshares: &[&[u8]],
-) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+pub fn dkg_sum_subshares(subshares: &[&[u8]]) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
     if subshares.is_empty() {
         return Err("need at least one dealer sub-share to assemble a DKG share");
     }
@@ -1233,7 +1242,8 @@ pub const DKMS_RECOVER_DOMAIN: &[u8] = b"elastos.dkms.authority/recover-proof/v1
 /// Length-prefixed concatenation of variable-length fields into one unambiguous signed preimage:
 /// each field is preceded by its u32(LE) length, so `("a","bc")` and `("ab","c")` never collide.
 fn lp_concat(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(domain.len() + fields.iter().map(|f| f.len() + 4).sum::<usize>());
+    let mut msg =
+        Vec::with_capacity(domain.len() + fields.iter().map(|f| f.len() + 4).sum::<usize>());
     msg.extend_from_slice(domain);
     for f in fields {
         msg.extend_from_slice(&(f.len() as u32).to_le_bytes());
@@ -1247,7 +1257,10 @@ fn lp_concat(domain: &[u8], fields: &[&[u8]]) -> Vec<u8> {
 /// the signature, and binding `caller_pub` ties the bearer token to the key the caller must later
 /// prove possession of.
 fn session_token_message(challenge: &[u8], caller_pub: &[u8], expires_at: u64) -> Vec<u8> {
-    lp_concat(DKMS_SESSION_DOMAIN, &[challenge, caller_pub, &expires_at.to_le_bytes()])
+    lp_concat(
+        DKMS_SESSION_DOMAIN,
+        &[challenge, caller_pub, &expires_at.to_le_bytes()],
+    )
 }
 
 /// The NODE side: mint a session token by signing `(challenge, caller_pub, expires_at)` with the
@@ -1273,7 +1286,10 @@ pub fn verify_session_token(
     expires_at: u64,
     sig: &[u8],
 ) -> bool {
-    verifier.verify(&session_token_message(challenge, caller_pub, expires_at), sig)
+    verifier.verify(
+        &session_token_message(challenge, caller_pub, expires_at),
+        sig,
+    )
 }
 
 /// Canonical signed preimage of a recover possession proof: the session `challenge`, the
@@ -1293,7 +1309,13 @@ pub fn recover_proof_message(
 ) -> Vec<u8> {
     lp_concat(
         DKMS_RECOVER_DOMAIN,
-        &[challenge, content_id, kid_hex, decrypt_session_pub, &recover_seq.to_le_bytes()],
+        &[
+            challenge,
+            content_id,
+            kid_hex,
+            decrypt_session_pub,
+            &recover_seq.to_le_bytes(),
+        ],
     )
 }
 
@@ -1308,7 +1330,13 @@ pub fn sign_recover_proof(
     decrypt_session_pub: &[u8],
     recover_seq: u64,
 ) -> Vec<u8> {
-    signer.sign(&recover_proof_message(challenge, content_id, kid_hex, decrypt_session_pub, recover_seq))
+    signer.sign(&recover_proof_message(
+        challenge,
+        content_id,
+        kid_hex,
+        decrypt_session_pub,
+        recover_seq,
+    ))
 }
 
 /// The NODE side: verify the caller's possession proof against the token-bound pubkey. `true` only
@@ -1326,7 +1354,13 @@ pub fn verify_recover_proof(
     sig: &[u8],
 ) -> bool {
     verifier.verify(
-        &recover_proof_message(challenge, content_id, kid_hex, decrypt_session_pub, recover_seq),
+        &recover_proof_message(
+            challenge,
+            content_id,
+            kid_hex,
+            decrypt_session_pub,
+            recover_seq,
+        ),
         sig,
     )
 }
@@ -1534,7 +1568,10 @@ pub fn verify_quorum_release_proof(
         valid += 1;
     }
     if valid < t as usize {
-        return Err(QuorumProofError::BelowQuorum { have: valid, need: t as usize });
+        return Err(QuorumProofError::BelowQuorum {
+            have: valid,
+            need: t as usize,
+        });
     }
     Ok(valid)
 }
@@ -1571,7 +1608,10 @@ pub fn verify_channel_key(
     channel_pub: &[u8],
     sig: &[u8],
 ) -> bool {
-    verifier.verify(&lp_concat(DKMS_CHANNEL_DOMAIN, &[challenge, channel_pub]), sig)
+    verifier.verify(
+        &lp_concat(DKMS_CHANNEL_DOMAIN, &[challenge, channel_pub]),
+        sig,
+    )
 }
 
 /// Domain label for the per-FRAME AAD of an established dKMS encrypted channel (Day 105–108).
@@ -1587,7 +1627,10 @@ pub const DKMS_CHANNEL_FRAME_DOMAIN: &[u8] = b"elastos.dkms.authority/channel-fr
 /// lp(seq_le)`. Defined ONCE here so the node + every client compute byte-identical AADs (a drifted
 /// encoder would fail every AEAD open, fail-closed).
 pub fn channel_frame_aad(channel_id: &[u8], direction: u8, seq: u64) -> Vec<u8> {
-    lp_concat(DKMS_CHANNEL_FRAME_DOMAIN, &[channel_id, &[direction], &seq.to_le_bytes()])
+    lp_concat(
+        DKMS_CHANNEL_FRAME_DOMAIN,
+        &[channel_id, &[direction], &seq.to_le_bytes()],
+    )
 }
 
 /// Domain label for a SHARE-WISE node-set ROTATION (Day 109–112): the operator instructs a
@@ -1611,7 +1654,10 @@ pub fn rotation_aad(
     source_recipient_pub: &[u8],
     successor_recipient_pub: &[u8],
 ) -> Vec<u8> {
-    lp_concat(DKMS_ROTATE_DOMAIN, &[kid_bytes16, source_recipient_pub, successor_recipient_pub])
+    lp_concat(
+        DKMS_ROTATE_DOMAIN,
+        &[kid_bytes16, source_recipient_pub, successor_recipient_pub],
+    )
 }
 
 /// Domain label for a quorum RECONFIGURATION (Day 121–125): the operator instructs a live k-of-m
@@ -1637,7 +1683,10 @@ pub fn reshare_aad(
     k: u8,
     m: u8,
 ) -> Vec<u8> {
-    lp_concat(DKMS_RESHARE_DOMAIN, &[kid_bytes16, old_node_set_id, new_node_set_id, &[k], &[m]])
+    lp_concat(
+        DKMS_RESHARE_DOMAIN,
+        &[kid_bytes16, old_node_set_id, new_node_set_id, &[k], &[m]],
+    )
 }
 
 /// Domain label for a single RECONFIGURATION SUB-SHARE — the sealed `q_i(y_j)` an OLD contributor
@@ -1678,14 +1727,11 @@ pub const DKMS_DKG_DOMAIN: &[u8] = b"elastos.dkms.authority/dkg/v1";
 /// for one ceremony cannot be replayed against another kid, redirected to a different node-set, or
 /// downgraded to a smaller t. `node_set_id` is the [`threshold_node_set_id_n`] hash pinning the m
 /// dealers + the threshold; `dkg_id` is a fresh per-ceremony nonce.
-pub fn dkg_aad(
-    kid_bytes16: &[u8; 16],
-    dkg_id: &[u8],
-    node_set_id: &[u8],
-    t: u8,
-    m: u8,
-) -> Vec<u8> {
-    lp_concat(DKMS_DKG_DOMAIN, &[kid_bytes16, dkg_id, node_set_id, &[t], &[m]])
+pub fn dkg_aad(kid_bytes16: &[u8; 16], dkg_id: &[u8], node_set_id: &[u8], t: u8, m: u8) -> Vec<u8> {
+    lp_concat(
+        DKMS_DKG_DOMAIN,
+        &[kid_bytes16, dkg_id, node_set_id, &[t], &[m]],
+    )
 }
 
 /// Domain label for a single DKG SUB-SHARE — the sealed `f_i(x_j)` a DEALER `i` routes to member `j`
@@ -1713,6 +1759,184 @@ pub fn dkg_subshare_aad(
     )
 }
 
+/// dKMS **lifecycle authorization v2** — canonical, phase-separated operation manifests (DKMS-5).
+///
+/// The v1 lifecycle AADs ([`reshare_aad`]/[`dkg_aad`]) UNDER-bind. They commit `(kid, set ids, k/t,
+/// m)` and lean on [`threshold_node_set_id_n`], whose derivation hashes ONLY the threshold and the
+/// ordered VERIFYING keys — it does NOT hash the member RECIPIENT (KEM) keys a dealer seals its
+/// sub-shares to, the EXECUTING node, the PHASE, `cek_len`, or the input material. A captured v1
+/// authorization could therefore be replayed with SUBSTITUTED recipient keys (the node deals its
+/// sub-shares straight to the attacker's escrow) or reused across the contribute → install phases
+/// (one token authorizing both).
+///
+/// v2 closes this by hashing a COMPLETE, domain- and phase-separated manifest of the semantic request
+/// into the authorization AAD. There is ONE encoder — this module — and BOTH the operator tooling
+/// (client, which seals the authorization) and the node (which re-derives the AAD from the request and
+/// fails closed on any mismatch) call it, so the two sides cannot drift. A divergence would silently
+/// reopen the finding, so the encoder is the single source of truth by construction.
+pub mod lifecycle {
+    use super::{lp_concat, Digest, Sha256};
+
+    /// The OPERATION and PHASE an authorization is minted for. Each maps to a DISTINCT AAD domain, so a
+    /// token minted for one operation/phase can NEVER open another's envelope — a contribute token
+    /// cannot authorize install, and DKG can never cross into re-share (nor rotate/recover, which use
+    /// their own domains entirely). This is invariant #1 (domain- and version-separation by operation
+    /// AND phase) enforced structurally.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum LifecycleOp {
+        ReshareContribute,
+        ReshareInstall,
+        DkgContribute,
+        DkgInstall,
+    }
+
+    impl LifecycleOp {
+        /// The domain-separation label welded into the authorization AAD (v2 — never a v1 label).
+        pub fn domain(self) -> &'static [u8] {
+            match self {
+                LifecycleOp::ReshareContribute => b"elastos.dkms.authority/reshare-contribute/v2",
+                LifecycleOp::ReshareInstall => b"elastos.dkms.authority/reshare-install/v2",
+                LifecycleOp::DkgContribute => b"elastos.dkms.authority/dkg-contribute/v2",
+                LifecycleOp::DkgInstall => b"elastos.dkms.authority/dkg-install/v2",
+            }
+        }
+
+        /// A stable 1-byte discriminator hashed INTO the manifest bytes (defence in depth alongside the
+        /// distinct AAD domain): even if two domains were ever confused, the discriminator differs.
+        pub fn discriminator(self) -> u8 {
+            match self {
+                LifecycleOp::ReshareContribute => 1,
+                LifecycleOp::ReshareInstall => 2,
+                LifecycleOp::DkgContribute => 3,
+                LifecycleOp::DkgInstall => 4,
+            }
+        }
+    }
+
+    /// One ORDERED member record: its coordinate and, as the phase supplies them, its verifying key
+    /// and/or its escrow RECIPIENT (KEM) key. Contribute phases carry the recipient keys the dealer
+    /// seals to (the field `threshold_node_set_id_n` does NOT cover — the DKMS-5 gap); either key may
+    /// be empty when a phase does not supply it (install phases bind material digests instead). Both
+    /// keys are length-framed in the encoding, so an empty key and a present key never collide.
+    #[derive(Clone, Debug, Default)]
+    pub struct MemberRecord {
+        pub coordinate: u8,
+        pub verifying_key: Vec<u8>,
+        pub recipient_key: Vec<u8>,
+    }
+
+    /// The canonical semantic request an operator authorizes. EVERY field an attacker could substitute
+    /// — operation, phase, `kid`, scheme, ceremony id, old/new set, threshold `k`/`t`, size `m`,
+    /// `cek_len`, executing node identity/coordinate, ordered members (coordinate + verifying +
+    /// recipient keys), and a digest of every input crypto object — is hashed in, so substituting ANY
+    /// of them changes the AAD and the authorization fails to open BEFORE secret material is touched
+    /// (invariants #2, #3, #4, #5, #6).
+    #[derive(Clone, Debug)]
+    pub struct LifecycleManifestV2 {
+        pub op: LifecycleOp,
+        pub kid: [u8; 16],
+        /// The escrow suite id (e.g. `SUITE_PQ_HYBRID`). Bound so a scheme swap invalidates the token.
+        pub scheme: Vec<u8>,
+        /// The per-ceremony nonce/id (`dkg_id` for DKG; empty for re-share, which is pinned by the
+        /// old/new set ids + kid). Stops cross-ceremony replay.
+        pub ceremony_id: Vec<u8>,
+        /// The SOURCE membership id (re-share only; empty otherwise).
+        pub old_set_id: Vec<u8>,
+        /// The TARGET membership id (`node_set_id` for DKG; the successor set for re-share).
+        pub new_set_id: Vec<u8>,
+        /// Threshold (`k` for re-share, `t` for DKG).
+        pub k: u8,
+        pub m: u8,
+        /// Agreed CEK byte length (DKG contribute; `0` where not applicable).
+        pub cek_len: u32,
+        /// The coordinate the EXECUTING node acts at (`dealer_x`/`target_x`; `0` when derived from
+        /// recovered material and thus not known pre-authorization — the executing vk still pins it).
+        pub executing_coordinate: u8,
+        /// The EXECUTING node's verifying key — the auth is sealed to its recipient AND names it here.
+        pub executing_vk: Vec<u8>,
+        /// Ordered member records (recipient keys for contribute phases; empty for install phases).
+        pub members: Vec<MemberRecord>,
+        /// Ordered digests of every input crypto object the operator authorizes: the source escrow +
+        /// producer vk (re-share contribute), or the ordered install contributions (both install
+        /// phases). Large sealed objects are bound by canonical length + SHA-256, never copied in.
+        pub material_digests: Vec<[u8; 32]>,
+    }
+
+    fn push_lp(out: &mut Vec<u8>, field: &[u8]) {
+        out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+        out.extend_from_slice(field);
+    }
+
+    /// The LENGTH-FRAMED canonical byte encoding (u32 **big-endian** length prefixes, matching
+    /// [`threshold_node_set_id_n`]). A version byte (`2`) + the operation discriminator lead, so the
+    /// encoding is self-describing and cannot be confused with a v1 preimage or another operation's
+    /// manifest. Pure and deterministic — the operator and node produce byte-identical output for the
+    /// same request, which is the whole point (a divergence reopens the finding).
+    pub fn canonical_bytes(m: &LifecycleManifestV2) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(2u8); // manifest version
+        out.push(m.op.discriminator());
+        push_lp(&mut out, &m.kid);
+        push_lp(&mut out, &m.scheme);
+        push_lp(&mut out, &m.ceremony_id);
+        push_lp(&mut out, &m.old_set_id);
+        push_lp(&mut out, &m.new_set_id);
+        out.push(m.k);
+        out.push(m.m);
+        out.extend_from_slice(&m.cek_len.to_be_bytes());
+        out.push(m.executing_coordinate);
+        push_lp(&mut out, &m.executing_vk);
+        out.extend_from_slice(&(m.members.len() as u32).to_be_bytes());
+        for member in &m.members {
+            out.push(member.coordinate);
+            push_lp(&mut out, &member.verifying_key);
+            push_lp(&mut out, &member.recipient_key);
+        }
+        out.extend_from_slice(&(m.material_digests.len() as u32).to_be_bytes());
+        for d in &m.material_digests {
+            out.extend_from_slice(d); // fixed 32 bytes — no length prefix needed
+        }
+        out
+    }
+
+    /// SHA-256 of the canonical bytes — the collision-resistant digest of the COMPLETE request.
+    pub fn digest(m: &LifecycleManifestV2) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(canonical_bytes(m));
+        let out = h.finalize();
+        let mut d = [0u8; 32];
+        d.copy_from_slice(&out[..32]);
+        d
+    }
+
+    /// The authorization AAD: the op/phase DOMAIN over the manifest digest. The operator seals its
+    /// authorization envelope AEAD-bound to this; the node RE-DERIVES it from the request and the
+    /// authorization opens iff every semantic field matches. Domain-separated per op/phase so a token
+    /// can only ever authorize the exact operation it was minted for.
+    pub fn authorization_aad(m: &LifecycleManifestV2) -> Vec<u8> {
+        lp_concat(m.op.domain(), &[&digest(m)])
+    }
+
+    /// Digest of ONE sealed contribution an install is authorized to consume: its declared coordinate,
+    /// its producer/dealer verifying key, and the canonical length + bytes of the sealed sub-share
+    /// envelope. The install manifest binds the ORDERED list of these, so a reordered, substituted, or
+    /// byte-mutated contribution changes the manifest and fails authorization BEFORE any share is
+    /// opened (the mutation-matrix "contribution order / contribution bytes" cases).
+    pub fn contribution_digest(coordinate: u8, verifying_key: &[u8], sealed: &[u8]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"elastos.dkms.authority/lifecycle-contribution/v2");
+        h.update([coordinate]);
+        h.update((verifying_key.len() as u32).to_be_bytes());
+        h.update(verifying_key);
+        h.update((sealed.len() as u32).to_be_bytes());
+        h.update(sealed);
+        let out = h.finalize();
+        let mut d = [0u8; 32];
+        d.copy_from_slice(&out[..32]);
+        d
+    }
+}
+
 /// Domain label for an OPERATOR-signed caller REVOCATION (Day 109–112): the node removes a caller
 /// from service at runtime — its next `hello` AND any `recover` under a still-live session token are
 /// refused (revocation outranks a live session). The runtime-core analogue of PC2 revoking a
@@ -1735,6 +1959,67 @@ pub fn verify_revocation(verifier: &impl CekSealVerifier, caller_pub: &[u8], sig
     verifier.verify(&lp_concat(DKMS_REVOKE_DOMAIN, &[caller_pub]), sig)
 }
 
+/// Domain label for an OPERATOR-signed DELEGATION revocation (DKMS-6): the node blocks a single
+/// wallet-delegated access grant — named by its delegation `nonce` (the grant's
+/// "revocation/replay handle", [`access::AccessDelegationV1::nonce_b64`]) — until `expires_at`, so a
+/// recover carrying that grant is refused BEFORE the replay reservation / on-chain read
+/// ([`replay::ReplayStore::begin`]). Separated from [`DKMS_REVOKE_DOMAIN`] (caller revocation) and
+/// every other signature domain so a caller-revocation signature can never be replayed as a
+/// delegation revocation, nor vice versa. The AUTHORITY is the pinned operator identity — the same
+/// trust root the node already uses for caller revocation and every lifecycle op; the node pins no
+/// wallet identity, so a wallet-owner cannot self-authorize a revocation at the node (the operator
+/// relays it). The signed payload binds the exact `(nonce, expires_at, issued_at)` triple, so a
+/// captured revocation cannot be re-aimed at another nonce nor have its window extended.
+pub const DKMS_REVOKE_DELEGATION_DOMAIN: &[u8] = b"elastos.dkms.authority/revoke-delegation/v1";
+
+/// The OPERATOR side: sign a revocation of the delegation named by `delegation_nonce`, effective
+/// until `expires_at` (unix seconds), issued at `issued_at`. All three fields are bound into the
+/// signature so neither the target nonce nor the revocation window can be tampered with.
+pub fn sign_delegation_revocation(
+    signer: &impl seal::CekSealSigner,
+    delegation_nonce: &[u8],
+    expires_at: u64,
+    issued_at: u64,
+) -> Vec<u8> {
+    signer.sign(&delegation_revocation_message(
+        delegation_nonce,
+        expires_at,
+        issued_at,
+    ))
+}
+
+/// The NODE side: verify a delegation revocation under the pinned operator identity. `true` only for
+/// a valid operator signature over the SAME `(nonce, expires_at, issued_at)` — a forged signature, a
+/// signature over a different nonce/window, or one lifted from another domain (caller revocation,
+/// hello attestation, session token) returns `false` and the revocation is refused.
+pub fn verify_delegation_revocation(
+    verifier: &impl CekSealVerifier,
+    delegation_nonce: &[u8],
+    expires_at: u64,
+    issued_at: u64,
+    sig: &[u8],
+) -> bool {
+    verifier.verify(
+        &delegation_revocation_message(delegation_nonce, expires_at, issued_at),
+        sig,
+    )
+}
+
+fn delegation_revocation_message(
+    delegation_nonce: &[u8],
+    expires_at: u64,
+    issued_at: u64,
+) -> Vec<u8> {
+    lp_concat(
+        DKMS_REVOKE_DELEGATION_DOMAIN,
+        &[
+            delegation_nonce,
+            &expires_at.to_le_bytes(),
+            &issued_at.to_le_bytes(),
+        ],
+    )
+}
+
 /// Length-prefixed message FRAMING for the dKMS node's socket transport (Day 93–94): every message
 /// is `[4-byte length (BE)][payload]`, so a reader recovers exact message boundaries instead of
 /// trusting a raw byte stream. The runtime-core analogue of PC2's Boson proxy framing —
@@ -1755,7 +2040,12 @@ pub mod frame {
         let len = u32::try_from(payload.len())
             .ok()
             .filter(|n| *n <= MAX_FRAME_BYTES)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame payload exceeds MAX_FRAME_BYTES"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame payload exceeds MAX_FRAME_BYTES",
+                )
+            })?;
         w.write_all(&len.to_be_bytes())?;
         w.write_all(payload)?;
         w.flush()
@@ -1770,23 +2060,35 @@ pub mod frame {
         match read_exact_or_eof(r, &mut header)? {
             ReadState::CleanEof => return Ok(None),
             ReadState::Torn => {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "torn frame header"))
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "torn frame header",
+                ))
             }
             ReadState::Full => {}
         }
         let len = u32::from_be_bytes(header);
         if len == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "zero-length frame"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zero-length frame",
+            ));
         }
         if len > MAX_FRAME_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame length exceeds MAX_FRAME_BYTES"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame length exceeds MAX_FRAME_BYTES",
+            ));
         }
         let mut payload = vec![0u8; len as usize];
         match read_exact_or_eof(r, &mut payload)? {
             ReadState::Full => Ok(Some(payload)),
             // A header that promised N bytes but the stream ended early is a torn frame, never a
             // short read we silently accept.
-            _ => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "torn frame payload")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "torn frame payload",
+            )),
         }
     }
 
@@ -1802,7 +2104,13 @@ pub mod frame {
         let mut filled = 0;
         while filled < buf.len() {
             match r.read(&mut buf[filled..]) {
-                Ok(0) => return Ok(if filled == 0 { ReadState::CleanEof } else { ReadState::Torn }),
+                Ok(0) => {
+                    return Ok(if filled == 0 {
+                        ReadState::CleanEof
+                    } else {
+                        ReadState::Torn
+                    })
+                }
                 Ok(n) => filled += n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
@@ -2033,8 +2341,8 @@ impl PqSealedEnvelope {
             .map_err(|_| PqEnvelopeError::UnsealFailed)?;
         let ct_len = read_u32(bytes, &mut off)?;
         let ct_bytes = read(bytes, &mut off, ct_len)?;
-        let kem_ct =
-            Ciphertext::<MlKem768>::try_from(ct_bytes).map_err(|_| PqEnvelopeError::UnsealFailed)?;
+        let kem_ct = Ciphertext::<MlKem768>::try_from(ct_bytes)
+            .map_err(|_| PqEnvelopeError::UnsealFailed)?;
         let nonce: [u8; 12] = read(bytes, &mut off, 12)?
             .try_into()
             .map_err(|_| PqEnvelopeError::UnsealFailed)?;
@@ -2277,7 +2585,8 @@ mod tests {
         let verifier = MlDsa65Verifier::from_encoded(&vk).expect("verifier");
         let aad = b"escrow:kid=abc";
         let env = seal_bound(&p1, &cek(), aad, &signer);
-        let recovered = hybrid_unwrap_bound(&s2, &env, aad, &verifier).expect("open with re-derived secret");
+        let recovered =
+            hybrid_unwrap_bound(&s2, &env, aad, &verifier).expect("open with re-derived secret");
         assert_eq!(recovered.as_slice(), cek().as_slice());
     }
 
@@ -2286,9 +2595,15 @@ mod tests {
         let master = [0x11u8; 32];
         assert_eq!(derive_seed(&master, b"seal"), derive_seed(&master, b"seal"));
         // Different labels → independent sub-seeds (can't be confused for one another).
-        assert_ne!(derive_seed(&master, b"seal"), derive_seed(&master, b"recipient"));
+        assert_ne!(
+            derive_seed(&master, b"seal"),
+            derive_seed(&master, b"recipient")
+        );
         // Different master → different sub-seed under the same label.
-        assert_ne!(derive_seed(&master, b"seal"), derive_seed(&[0x12u8; 32], b"seal"));
+        assert_ne!(
+            derive_seed(&master, b"seal"),
+            derive_seed(&[0x12u8; 32], b"seal")
+        );
     }
 
     #[test]
@@ -2406,21 +2721,36 @@ mod tests {
     #[test]
     fn transcript_segment_binding_is_additive_and_ordered() {
         let t = sample_transcript();
-        assert_eq!(t.to_aad(), t.to_aad_with_segments(None), "absent digests == plain to_aad");
+        assert_eq!(
+            t.to_aad(),
+            t.to_aad_with_segments(None),
+            "absent digests == plain to_aad"
+        );
 
         let seg_a = b"segment-zero-bytes".as_slice();
         let seg_b = b"segment-one-bytes-longer".as_slice();
         let d_ab = crate::segment_digests(&[seg_a, seg_b]);
         let bound = t.to_aad_with_segments(Some(&d_ab));
         assert_ne!(t.to_aad(), bound, "binding a segment list extends the AAD");
-        assert!(bound.starts_with(&t.to_aad()), "the binding strictly EXTENDS the single-segment AAD");
+        assert!(
+            bound.starts_with(&t.to_aad()),
+            "the binding strictly EXTENDS the single-segment AAD"
+        );
 
         // Reordering the segments changes the binding (order is welded in).
         let d_ba = crate::segment_digests(&[seg_b, seg_a]);
-        assert_ne!(bound, t.to_aad_with_segments(Some(&d_ba)), "segment ORDER is bound");
+        assert_ne!(
+            bound,
+            t.to_aad_with_segments(Some(&d_ba)),
+            "segment ORDER is bound"
+        );
         // Substituting a segment changes the binding.
         let d_ax = crate::segment_digests(&[seg_a, b"tampered".as_slice()]);
-        assert_ne!(bound, t.to_aad_with_segments(Some(&d_ax)), "segment CONTENT is bound");
+        assert_ne!(
+            bound,
+            t.to_aad_with_segments(Some(&d_ax)),
+            "segment CONTENT is bound"
+        );
     }
 
     /// The AV variant-set binding is strictly ADDITIVE (chunk 4): a `None` commitment leaves the
@@ -2441,7 +2771,10 @@ mod tests {
         let vsc = [9u8; 32];
         let bound = t.to_aad_with_all_bindings(Some(&segs), Some(&rights), Some(&vsc));
         assert_ne!(base, bound, "binding the variant set extends the AAD");
-        assert!(bound.starts_with(&base), "the variant set binding strictly EXTENDS the rights AAD");
+        assert!(
+            bound.starts_with(&base),
+            "the variant set binding strictly EXTENDS the rights AAD"
+        );
         let vsc2 = [10u8; 32];
         assert_ne!(
             bound,
@@ -2455,7 +2788,11 @@ mod tests {
     #[test]
     fn transcript_aad_is_deterministic_and_labelled() {
         let aad = sample_transcript().to_aad();
-        assert_eq!(aad, sample_transcript().to_aad(), "equal fields -> equal AAD");
+        assert_eq!(
+            aad,
+            sample_transcript().to_aad(),
+            "equal fields -> equal AAD"
+        );
         // First length-prefixed field is the domain label.
         let label = crate::transcript::DECRYPT_TRANSCRIPT_LABEL;
         assert_eq!(&aad[..4], &(label.len() as u32).to_be_bytes());
@@ -2494,15 +2831,27 @@ mod tests {
         // (no existing AAD changed), then the length-prefixed node-set id — so the two can
         // never be equal and a single-node seal can never open as a threshold one.
         assert_ne!(single, with_set, "binding a node-set must change the AAD");
-        assert_eq!(&with_set[..single.len()], single.as_slice(), "the single-node encoding is unchanged");
-        assert_eq!(with_set.len(), single.len() + 4 + id_a.len(), "exactly one length-prefixed field appended");
+        assert_eq!(
+            &with_set[..single.len()],
+            single.as_slice(),
+            "the single-node encoding is unchanged"
+        );
+        assert_eq!(
+            with_set.len(),
+            single.len() + 4 + id_a.len(),
+            "exactly one length-prefixed field appended"
+        );
 
         // A DIFFERENT node-set (one node swapped) yields a DIFFERENT AAD — the swapped-node
         // release fails the AEAD open at the boundary, not just at descriptor parse.
         let id_b = crate::threshold_node_set_id(2, b"vk-node-a", b"vk-node-ROGUE");
         let mut t = sample_transcript();
         t.node_set_id = Some(&id_b);
-        assert_ne!(with_set, t.to_aad(), "a swapped node-set must change the AAD");
+        assert_ne!(
+            with_set,
+            t.to_aad(),
+            "a swapped node-set must change the AAD"
+        );
     }
 
     /// The dKMS-node identity handshake: a node's attestation over a challenge verifies under its
@@ -2536,7 +2885,11 @@ mod tests {
         );
 
         // A malformed signature fails closed (no panic).
-        assert!(!crate::verify_attestation(&verifier, &challenge, b"not-a-signature"));
+        assert!(!crate::verify_attestation(
+            &verifier,
+            &challenge,
+            b"not-a-signature"
+        ));
     }
 
     /// The hello attestation is domain-separated from CEK seals — a seal signature can never be
@@ -2563,28 +2916,60 @@ mod tests {
         let caller_pub = [0x77u8; 48];
         let expires_at = 1_000_000u64;
         let token = crate::sign_session_token(&signer, &challenge, &caller_pub, expires_at);
-        assert!(crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at, &token));
+        assert!(crate::verify_session_token(
+            &verifier,
+            &challenge,
+            &caller_pub,
+            expires_at,
+            &token
+        ));
 
         // Tampering the expiry (e.g. extending the window) invalidates the signature.
-        assert!(!crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at + 1, &token));
+        assert!(!crate::verify_session_token(
+            &verifier,
+            &challenge,
+            &caller_pub,
+            expires_at + 1,
+            &token
+        ));
 
         // Tampering the challenge invalidates the signature.
         let mut other = challenge;
         other[0] ^= 1;
-        assert!(!crate::verify_session_token(&verifier, &other, &caller_pub, expires_at, &token));
+        assert!(!crate::verify_session_token(
+            &verifier,
+            &other,
+            &caller_pub,
+            expires_at,
+            &token
+        ));
 
         // Tampering the bound caller pubkey invalidates the signature (the token is caller-bound).
         let mut other_pub = caller_pub;
         other_pub[0] ^= 1;
-        assert!(!crate::verify_session_token(&verifier, &challenge, &other_pub, expires_at, &token));
+        assert!(!crate::verify_session_token(
+            &verifier, &challenge, &other_pub, expires_at, &token
+        ));
 
         // A token forged by a different (impersonator) key does not verify under this vk.
         let (impostor, _ivk) = crate::seal::mldsa_seal_keypair([0x5bu8; 32]);
         let forged = crate::sign_session_token(&impostor, &challenge, &caller_pub, expires_at);
-        assert!(!crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at, &forged));
+        assert!(!crate::verify_session_token(
+            &verifier,
+            &challenge,
+            &caller_pub,
+            expires_at,
+            &forged
+        ));
 
         // A malformed signature fails closed (no panic).
-        assert!(!crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at, b"nope"));
+        assert!(!crate::verify_session_token(
+            &verifier,
+            &challenge,
+            &caller_pub,
+            expires_at,
+            b"nope"
+        ));
     }
 
     /// The session token is domain-separated from the hello attestation — a hello attestation over
@@ -2598,7 +2983,13 @@ mod tests {
         let expires_at = 42u64;
         // A hello attestation must NOT verify as a session token over the same challenge.
         let hello = crate::attest_challenge(&signer, &challenge);
-        assert!(!crate::verify_session_token(&verifier, &challenge, &caller_pub, expires_at, &hello));
+        assert!(!crate::verify_session_token(
+            &verifier,
+            &challenge,
+            &caller_pub,
+            expires_at,
+            &hello
+        ));
         // …and a session token must NOT verify as a hello attestation.
         let token = crate::sign_session_token(&signer, &challenge, &caller_pub, expires_at);
         assert!(!crate::verify_attestation(&verifier, &challenge, &token));
@@ -2613,29 +3004,103 @@ mod tests {
         let (caller, caller_vk) = crate::seal::mldsa_seal_keypair([0x61u8; 32]);
         let caller_verifier = MlDsa65Verifier::from_encoded(&caller_vk).unwrap();
         let challenge = [0x12u8; 32];
-        let (content, kid, sess_pub) = (b"bafContent".as_slice(), b"c5c5".as_slice(), b"sessionpub".as_slice());
+        let (content, kid, sess_pub) = (
+            b"bafContent".as_slice(),
+            b"c5c5".as_slice(),
+            b"sessionpub".as_slice(),
+        );
         let seq = 1u64;
         let proof = crate::sign_recover_proof(&caller, &challenge, content, kid, sess_pub, seq);
-        assert!(crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, seq, &proof));
+        assert!(crate::verify_recover_proof(
+            &caller_verifier,
+            &challenge,
+            content,
+            kid,
+            sess_pub,
+            seq,
+            &proof
+        ));
 
         // A proof from a DIFFERENT key (a captured-token replayer without the private key) fails.
         let (other, _ovk) = crate::seal::mldsa_seal_keypair([0x62u8; 32]);
         let wrong = crate::sign_recover_proof(&other, &challenge, content, kid, sess_pub, seq);
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, seq, &wrong));
+        assert!(!crate::verify_recover_proof(
+            &caller_verifier,
+            &challenge,
+            content,
+            kid,
+            sess_pub,
+            seq,
+            &wrong
+        ));
 
         // A tampered binding (different content / kid / session pub / challenge / freshness seq) fails.
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, b"bafOTHER", kid, sess_pub, seq, &proof));
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, b"ffff", sess_pub, seq, &proof));
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, b"otherpub", seq, &proof));
-        assert!(!crate::verify_recover_proof(&caller_verifier, b"otherchal", content, kid, sess_pub, seq, &proof));
+        assert!(!crate::verify_recover_proof(
+            &caller_verifier,
+            &challenge,
+            b"bafOTHER",
+            kid,
+            sess_pub,
+            seq,
+            &proof
+        ));
+        assert!(!crate::verify_recover_proof(
+            &caller_verifier,
+            &challenge,
+            content,
+            b"ffff",
+            sess_pub,
+            seq,
+            &proof
+        ));
+        assert!(!crate::verify_recover_proof(
+            &caller_verifier,
+            &challenge,
+            content,
+            kid,
+            b"otherpub",
+            seq,
+            &proof
+        ));
+        assert!(!crate::verify_recover_proof(
+            &caller_verifier,
+            b"otherchal",
+            content,
+            kid,
+            sess_pub,
+            seq,
+            &proof
+        ));
         // A SWAPPED freshness counter invalidates the proof (the seq is authenticated, not free to alter).
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, seq + 1, &proof));
+        assert!(!crate::verify_recover_proof(
+            &caller_verifier,
+            &challenge,
+            content,
+            kid,
+            sess_pub,
+            seq + 1,
+            &proof
+        ));
 
         // The possession proof is domain-separated from the session token (different domain prefix).
-        assert!(!crate::verify_session_token(&caller_verifier, &challenge, content, 0, &proof));
+        assert!(!crate::verify_session_token(
+            &caller_verifier,
+            &challenge,
+            content,
+            0,
+            &proof
+        ));
 
         // A malformed signature fails closed.
-        assert!(!crate::verify_recover_proof(&caller_verifier, &challenge, content, kid, sess_pub, seq, b"nope"));
+        assert!(!crate::verify_recover_proof(
+            &caller_verifier,
+            &challenge,
+            content,
+            kid,
+            sess_pub,
+            seq,
+            b"nope"
+        ));
     }
 
     /// The socket framing round-trips messages, recovers exact boundaries from a concatenated
@@ -2648,9 +3113,18 @@ mod tests {
         write_frame(&mut buf, b"first").unwrap();
         write_frame(&mut buf, b"{\"op\":\"hello\"}").unwrap();
         let mut cur = std::io::Cursor::new(buf);
-        assert_eq!(read_frame(&mut cur).unwrap().as_deref(), Some(b"first".as_slice()));
-        assert_eq!(read_frame(&mut cur).unwrap().as_deref(), Some(b"{\"op\":\"hello\"}".as_slice()));
-        assert!(read_frame(&mut cur).unwrap().is_none(), "clean EOF at a frame boundary -> None");
+        assert_eq!(
+            read_frame(&mut cur).unwrap().as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(
+            read_frame(&mut cur).unwrap().as_deref(),
+            Some(b"{\"op\":\"hello\"}".as_slice())
+        );
+        assert!(
+            read_frame(&mut cur).unwrap().is_none(),
+            "clean EOF at a frame boundary -> None"
+        );
 
         // A header promising more bytes than follow is a TORN frame -> error (never a partial parse).
         let mut torn = Vec::new();
@@ -2681,25 +3155,36 @@ mod tests {
         // Distinct small sizes collapse onto the SAME bucket length (the metadata-hiding property).
         let a = pad(b"{\"op\":\"status\"}");
         let b = pad(b"{\"op\":\"hello\",\"x\":1}");
-        assert_eq!(a.len(), 256, "small control messages land in the 256B bucket");
-        assert_eq!(a.len(), b.len(), "two differently-sized small messages share a bucket");
+        assert_eq!(
+            a.len(),
+            256,
+            "small control messages land in the 256B bucket"
+        );
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "two differently-sized small messages share a bucket"
+        );
 
         // Round-trip across a range of sizes, including a payload that ends in 0x00 (the case the
         // mandatory 0x80 marker exists to disambiguate) and an exact-power-of-two boundary.
         for plaintext in [
             vec![],
             b"a".to_vec(),
-            vec![0u8; 255],         // +marker crosses into the 512 bucket
+            vec![0u8; 255], // +marker crosses into the 512 bucket
             vec![7u8; 256],
             {
                 let mut v = b"trailing-zeros".to_vec();
                 v.extend_from_slice(&[0u8; 5]);
                 v
             },
-            vec![0x42u8; 200_000],  // above TOP_BUCKET -> marker-only, still round-trips
+            vec![0x42u8; 200_000], // above TOP_BUCKET -> marker-only, still round-trips
         ] {
             let padded = pad(&plaintext);
-            assert!(padded.len() > plaintext.len(), "padding always grows by >= the marker");
+            assert!(
+                padded.len() > plaintext.len(),
+                "padding always grows by >= the marker"
+            );
             assert_eq!(unpad(&padded).as_deref(), Some(plaintext.as_slice()));
         }
 
@@ -2717,9 +3202,17 @@ mod tests {
         use crate::channel_pad::{pad, unpad_incoming};
         // A raw (un-padded) JSON frame from a legacy node round-trips untouched.
         let raw = br#"{"status":"released","share_b64":"AA=="}"#.to_vec();
-        assert_eq!(unpad_incoming(&raw), raw, "un-padded peer frame passes through unchanged");
+        assert_eq!(
+            unpad_incoming(&raw),
+            raw,
+            "un-padded peer frame passes through unchanged"
+        );
         // A padded frame from a padding-aware node is stripped back to the exact plaintext.
-        assert_eq!(unpad_incoming(&pad(&raw)), raw, "padded peer frame is stripped to plaintext");
+        assert_eq!(
+            unpad_incoming(&pad(&raw)),
+            raw,
+            "padded peer frame is stripped to plaintext"
+        );
         // Even a binary plaintext that itself ends in 0x80 strips correctly (marker is the last
         // non-zero byte), so the tolerance is unambiguous beyond JSON too.
         let ends_in_marker = vec![1u8, 2, 0x80];
@@ -2735,13 +3228,29 @@ mod tests {
 
         let (share1, share2) = crate::split_cek_xor(&cek, &mask).expect("split");
         // No single share equals (or reveals) the CEK.
-        assert_ne!(share1.as_slice(), cek.as_slice(), "share1 alone must not be the CEK");
-        assert_ne!(share2.as_slice(), cek.as_slice(), "share2 alone must not be the CEK");
-        assert_eq!(share1.as_slice(), mask.as_slice(), "share1 is the random mask");
+        assert_ne!(
+            share1.as_slice(),
+            cek.as_slice(),
+            "share1 alone must not be the CEK"
+        );
+        assert_ne!(
+            share2.as_slice(),
+            cek.as_slice(),
+            "share2 alone must not be the CEK"
+        );
+        assert_eq!(
+            share1.as_slice(),
+            mask.as_slice(),
+            "share1 is the random mask"
+        );
 
         // Combining the two shares reconstructs the CEK exactly.
         let recovered = crate::combine_cek_xor(&share1, &share2).expect("combine");
-        assert_eq!(recovered.as_slice(), cek.as_slice(), "share1 ^ share2 == CEK");
+        assert_eq!(
+            recovered.as_slice(),
+            cek.as_slice(),
+            "share1 ^ share2 == CEK"
+        );
 
         // Order does not matter (XOR is commutative).
         let recovered_swapped = crate::combine_cek_xor(&share2, &share1).expect("combine swapped");
@@ -2773,7 +3282,11 @@ mod tests {
             let a = &shares[(xa - 1) as usize];
             let b = &shares[(xb - 1) as usize];
             let rec = crate::combine_cek_shamir2(xa, a, xb, b).expect("combine");
-            assert_eq!(rec.as_slice(), cek.as_slice(), "pair ({xa},{xb}) must reconstruct the CEK");
+            assert_eq!(
+                rec.as_slice(),
+                cek.as_slice(),
+                "pair ({xa},{xb}) must reconstruct the CEK"
+            );
             // Order of the pair does not matter.
             let rec_swapped = crate::combine_cek_shamir2(xb, b, xa, a).expect("combine swapped");
             assert_eq!(rec_swapped.as_slice(), cek.as_slice());
@@ -2782,8 +3295,15 @@ mod tests {
         // No single share is the CEK, and a sub-quorum is structurally refused: combining a
         // share with ITSELF (duplicate x — one node's view twice) is not a quorum.
         for (i, share) in shares.iter().enumerate() {
-            assert_ne!(share.as_slice(), cek.as_slice(), "share {} alone must not be the CEK", i + 1);
-            assert!(crate::combine_cek_shamir2((i + 1) as u8, share, (i + 1) as u8, share).is_err());
+            assert_ne!(
+                share.as_slice(),
+                cek.as_slice(),
+                "share {} alone must not be the CEK",
+                i + 1
+            );
+            assert!(
+                crate::combine_cek_shamir2((i + 1) as u8, share, (i + 1) as u8, share).is_err()
+            );
         }
         // INFORMATION-THEORETIC uselessness: two different coefficient vectors produce splits
         // where the SAME x-1 share bytes are consistent with DIFFERENT CEKs — a single share
@@ -2795,12 +3315,16 @@ mod tests {
             .map(|(&c2, &s1)| c2 ^ s1) // k'·1 = k' = cek'[j] ⊕ share1[j]
             .collect();
         let shares2 = crate::split_cek_shamir2(&cek2, &coeff2).expect("split 2");
-        assert_eq!(shares2[0], shares[0], "the same share-1 bytes serve BOTH CEKs");
+        assert_eq!(
+            shares2[0], shares[0],
+            "the same share-1 bytes serve BOTH CEKs"
+        );
         assert_ne!(cek, cek2);
 
         // MIXED-SPLIT shares (x=2 of split 1 + x=3 of split 2 — two shares that never came
         // from one split) reconstruct GARBAGE, never either CEK.
-        let mixed = crate::combine_cek_shamir2(2, &shares[1], 3, &shares2[2]).expect("mixed combines");
+        let mixed =
+            crate::combine_cek_shamir2(2, &shares[1], 3, &shares2[2]).expect("mixed combines");
         assert_ne!(mixed.as_slice(), cek.as_slice());
         assert_ne!(mixed.as_slice(), cek2.as_slice());
 
@@ -2824,10 +3348,20 @@ mod tests {
                 s.iter().map(|&b| b ^ qx).collect()
             })
             .collect();
-        let rec = crate::combine_cek_shamir2(1, &refreshed[0], 3, &refreshed[2]).expect("refreshed");
-        assert_eq!(rec.as_slice(), cek.as_slice(), "a q(0)=0 refresh preserves the CEK");
-        let mixed_gen = crate::combine_cek_shamir2(1, &shares[0], 3, &refreshed[2]).expect("old+new");
-        assert_ne!(mixed_gen.as_slice(), cek.as_slice(), "old+refreshed shares must NOT reconstruct");
+        let rec =
+            crate::combine_cek_shamir2(1, &refreshed[0], 3, &refreshed[2]).expect("refreshed");
+        assert_eq!(
+            rec.as_slice(),
+            cek.as_slice(),
+            "a q(0)=0 refresh preserves the CEK"
+        );
+        let mixed_gen =
+            crate::combine_cek_shamir2(1, &shares[0], 3, &refreshed[2]).expect("old+new");
+        assert_ne!(
+            mixed_gen.as_slice(),
+            cek.as_slice(),
+            "old+refreshed shares must NOT reconstruct"
+        );
     }
 
     /// PRE-AUDIT FINDING #1 — CEK reconstruction integrity. The 3-share checked combine
@@ -2840,7 +3374,10 @@ mod tests {
         let coeff: Vec<u8> = (0u8..16).map(|b| b.wrapping_mul(7) ^ 0x3C).collect();
         let shares = crate::split_cek_shamir2(&cek, &coeff).expect("split");
         let pts = |s: &[Vec<u8>]| -> Vec<(u8, Vec<u8>)> {
-            s.iter().enumerate().map(|(i, v)| ((i + 1) as u8, v.clone())).collect()
+            s.iter()
+                .enumerate()
+                .map(|(i, v)| ((i + 1) as u8, v.clone()))
+                .collect()
         };
 
         // All three honest shares are consistent ⇒ the checked combine reconstructs the CEK.
@@ -2855,7 +3392,8 @@ mod tests {
             let mut tampered = shares.clone();
             tampered[bad][0] ^= 0x01; // flip one byte: still well-formed, wrong value
             let bad_pts = pts(&tampered);
-            let bad_refs: Vec<(u8, &[u8])> = bad_pts.iter().map(|(x, v)| (*x, v.as_slice())).collect();
+            let bad_refs: Vec<(u8, &[u8])> =
+                bad_pts.iter().map(|(x, v)| (*x, v.as_slice())).collect();
             assert!(
                 crate::combine_cek_shamir2_checked(&bad_refs).is_err(),
                 "a wrong-valued share at position {bad} must fail the checked combine closed"
@@ -2867,15 +3405,31 @@ mod tests {
         assert!(crate::combine_cek_shamir2_checked(&two).is_err());
 
         // The published commitment binds the CEK to the node-set and rejects a wrong CEK.
-        let node_set_id = crate::threshold_node_set_id_n(2, &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]]);
+        let node_set_id = crate::threshold_node_set_id_n(
+            2,
+            &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]],
+        );
         let commitment = crate::cek_commitment(&node_set_id, &cek);
-        assert!(crate::verify_cek_commitment(&node_set_id, &cek, &commitment));
+        assert!(crate::verify_cek_commitment(
+            &node_set_id,
+            &cek,
+            &commitment
+        ));
         let mut wrong = cek.clone();
         wrong[0] ^= 0x01;
-        assert!(!crate::verify_cek_commitment(&node_set_id, &wrong, &commitment), "commitment rejects a wrong CEK");
+        assert!(
+            !crate::verify_cek_commitment(&node_set_id, &wrong, &commitment),
+            "commitment rejects a wrong CEK"
+        );
         // A commitment is bound to its node-set: another quorum's commitment does not verify.
-        let other_set = crate::threshold_node_set_id_n(2, &[&[0x11u8; 40][..], &[0x22u8; 40][..], &[0x33u8; 40][..]]);
-        assert!(!crate::verify_cek_commitment(&other_set, &cek, &commitment), "commitment is node-set bound");
+        let other_set = crate::threshold_node_set_id_n(
+            2,
+            &[&[0x11u8; 40][..], &[0x22u8; 40][..], &[0x33u8; 40][..]],
+        );
+        assert!(
+            !crate::verify_cek_commitment(&other_set, &cek, &commitment),
+            "commitment is node-set bound"
+        );
     }
 
     /// GOLDEN VECTOR: the Shamir split/combine is pinned byte-for-byte (a refactor or a GF
@@ -2886,9 +3440,18 @@ mod tests {
         let coeff = [0x02u8, 0x80, 0xFF, 0x1B, 0x01, 0x00, 0xA5, 0x33];
         let shares = crate::split_cek_shamir2(&cek, &coeff).expect("split");
         // p(x) = cek ⊕ coeff·x over GF(2^8)/0x11B, evaluated at x = 1, 2, 3.
-        assert_eq!(shares[0], vec![0xC7, 0x81, 0x80, 0xE4, 0x01, 0xAB, 0xB5, 0x71]);
-        assert_eq!(shares[1], vec![0xC1, 0x1A, 0x9A, 0xC9, 0x02, 0xAB, 0x41, 0x24]);
-        assert_eq!(shares[2], vec![0xC3, 0x9A, 0x65, 0xD2, 0x03, 0xAB, 0xE4, 0x17]);
+        assert_eq!(
+            shares[0],
+            vec![0xC7, 0x81, 0x80, 0xE4, 0x01, 0xAB, 0xB5, 0x71]
+        );
+        assert_eq!(
+            shares[1],
+            vec![0xC1, 0x1A, 0x9A, 0xC9, 0x02, 0xAB, 0x41, 0x24]
+        );
+        assert_eq!(
+            shares[2],
+            vec![0xC3, 0x9A, 0x65, 0xD2, 0x03, 0xAB, 0xE4, 0x17]
+        );
         for (xa, xb) in [(1u8, 2u8), (1, 3), (2, 3)] {
             let rec = crate::combine_cek_shamir2(
                 xa,
@@ -2924,7 +3487,14 @@ mod tests {
                         (coords[k], shares[k].as_slice()),
                     ];
                     let rec = crate::lagrange_combine_at_zero(&pts).expect("combine triple");
-                    assert_eq!(rec.as_slice(), cek.as_slice(), "subset ({},{},{}) must reconstruct", coords[i], coords[j], coords[k]);
+                    assert_eq!(
+                        rec.as_slice(),
+                        cek.as_slice(),
+                        "subset ({},{},{}) must reconstruct",
+                        coords[i],
+                        coords[j],
+                        coords[k]
+                    );
                 }
             }
         }
@@ -2932,13 +3502,21 @@ mod tests {
         // BELOW THRESHOLD: 2 points cannot reconstruct a degree-2 secret — the result differs.
         let two: Vec<(u8, &[u8])> = vec![(1, shares[0].as_slice()), (2, shares[1].as_slice())];
         let under = crate::lagrange_combine_at_zero(&two).expect("combines but is wrong");
-        assert_ne!(under.as_slice(), cek.as_slice(), "t-1 shares must NOT reconstruct the secret");
+        assert_ne!(
+            under.as_slice(),
+            cek.as_slice(),
+            "t-1 shares must NOT reconstruct the secret"
+        );
 
         // CONSISTENCY: the general split with one coeff + n=3 equals the pinned 2-of-3 split.
         let coeff: Vec<u8> = (0u8..24).map(|b| b.wrapping_mul(7) ^ 0x3C).collect();
         let general = crate::split_cek_shamir(&cek, &[&coeff], 3).expect("general 2-of-3");
         let special = crate::split_cek_shamir2(&cek, &coeff).expect("special 2-of-3");
-        assert_eq!(general, special.to_vec(), "the generalization must match split_cek_shamir2 byte-for-byte");
+        assert_eq!(
+            general,
+            special.to_vec(),
+            "the generalization must match split_cek_shamir2 byte-for-byte"
+        );
 
         // FAIL-CLOSED shapes: empty cek, n=0, coeff length mismatch.
         assert!(crate::split_cek_shamir(&[], &[&c1], 5).is_err());
@@ -2975,25 +3553,37 @@ mod tests {
         let coeff = [0x9Au8, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78];
         let shares = crate::split_cek_shamir2(&cek, &coeff).expect("split");
         // Escrowed payloads are the INDEXED shares the nodes hold + rotate.
-        let indexed: Vec<Vec<u8>> =
-            (0..3).map(|i| crate::indexed_share((i + 1) as u8, &shares[i])).collect();
+        let indexed: Vec<Vec<u8>> = (0..3)
+            .map(|i| crate::indexed_share((i + 1) as u8, &shares[i]))
+            .collect();
 
         // ONE fresh refresh coefficient → per-node coordinate-bound deltas q(x_i).
         let refresh = [0x0Fu8, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78];
         let rotate = |payload: &[u8], x: u8| -> Vec<u8> {
             let delta = crate::shamir_refresh_delta(&refresh, x).expect("delta");
-            assert_eq!(delta.len(), payload.len(), "delta must match the indexed-share length");
+            assert_eq!(
+                delta.len(),
+                payload.len(),
+                "delta must match the indexed-share length"
+            );
             assert_eq!(delta[0], 0, "the index prefix byte must be untouched");
             // The node's UNCHANGED blind XOR.
-            payload.iter().zip(delta.iter()).map(|(a, b)| a ^ b).collect()
+            payload
+                .iter()
+                .zip(delta.iter())
+                .map(|(a, b)| a ^ b)
+                .collect()
         };
-        let refreshed: Vec<Vec<u8>> =
-            (0..3).map(|i| rotate(&indexed[i], (i + 1) as u8)).collect();
+        let refreshed: Vec<Vec<u8>> = (0..3).map(|i| rotate(&indexed[i], (i + 1) as u8)).collect();
 
         // The x prefix survived on every refreshed share, and the body changed.
         for i in 0..3 {
             let (x, body) = crate::parse_indexed_share(&refreshed[i]).expect("refreshed parse");
-            assert_eq!(x, (i + 1) as u8, "the coordinate is preserved across rotation");
+            assert_eq!(
+                x,
+                (i + 1) as u8,
+                "the coordinate is preserved across rotation"
+            );
             assert_ne!(body, shares[i].as_slice(), "the share body was refreshed");
         }
 
@@ -3001,28 +3591,68 @@ mod tests {
         let combine = |a: &[u8], b: &[u8]| -> Vec<u8> {
             let (xa, sa) = crate::parse_indexed_share(a).unwrap();
             let (xb, sb) = crate::parse_indexed_share(b).unwrap();
-            crate::combine_cek_shamir2(xa, sa, xb, sb).expect("combine").to_vec()
+            crate::combine_cek_shamir2(xa, sa, xb, sb)
+                .expect("combine")
+                .to_vec()
         };
-        assert_eq!(combine(&refreshed[0], &refreshed[1]), cek, "A'+B' reconstructs the CEK");
-        assert_eq!(combine(&refreshed[0], &refreshed[2]), cek, "A'+C' reconstructs the CEK");
-        assert_eq!(combine(&refreshed[1], &refreshed[2]), cek, "B'+C' reconstructs the CEK");
+        assert_eq!(
+            combine(&refreshed[0], &refreshed[1]),
+            cek,
+            "A'+B' reconstructs the CEK"
+        );
+        assert_eq!(
+            combine(&refreshed[0], &refreshed[2]),
+            cek,
+            "A'+C' reconstructs the CEK"
+        );
+        assert_eq!(
+            combine(&refreshed[1], &refreshed[2]),
+            cek,
+            "B'+C' reconstructs the CEK"
+        );
 
         // OLD MATERIAL DEAD: an OLD share next to a REFRESHED share no longer interpolates the CEK.
-        assert_ne!(combine(&indexed[0], &refreshed[1]), cek, "old A + refreshed B is garbage");
-        assert_ne!(combine(&indexed[1], &refreshed[2]), cek, "old B + refreshed C is garbage");
+        assert_ne!(
+            combine(&indexed[0], &refreshed[1]),
+            cek,
+            "old A + refreshed B is garbage"
+        );
+        assert_ne!(
+            combine(&indexed[1], &refreshed[2]),
+            cek,
+            "old B + refreshed C is garbage"
+        );
 
         // COORDINATE-BOUND: rotating node A (x=1) with node B's delta (q at x=2) puts A' on no
         // shared polynomial — the pair touching it reconstructs garbage, while B'+C' still works.
         let mis_a = {
             let wrong = crate::shamir_refresh_delta(&refresh, 2).expect("delta@2");
-            indexed[0].iter().zip(wrong.iter()).map(|(a, b)| a ^ b).collect::<Vec<u8>>()
+            indexed[0]
+                .iter()
+                .zip(wrong.iter())
+                .map(|(a, b)| a ^ b)
+                .collect::<Vec<u8>>()
         };
-        assert_ne!(combine(&mis_a, &refreshed[1]), cek, "a coordinate-mismatched delta breaks the pair");
-        assert_eq!(combine(&refreshed[1], &refreshed[2]), cek, "the correctly-refreshed pair is unaffected");
+        assert_ne!(
+            combine(&mis_a, &refreshed[1]),
+            cek,
+            "a coordinate-mismatched delta breaks the pair"
+        );
+        assert_eq!(
+            combine(&refreshed[1], &refreshed[2]),
+            cek,
+            "the correctly-refreshed pair is unaffected"
+        );
 
         // Fail-closed surface.
-        assert!(crate::shamir_refresh_delta(&refresh, 0).is_err(), "x=0 is the secret, never a node");
-        assert!(crate::shamir_refresh_delta(&[], 1).is_err(), "empty refresh_coeff is refused");
+        assert!(
+            crate::shamir_refresh_delta(&refresh, 0).is_err(),
+            "x=0 is the secret, never a node"
+        );
+        assert!(
+            crate::shamir_refresh_delta(&[], 1).is_err(),
+            "empty refresh_coeff is refused"
+        );
     }
 
     /// Quorum RECONFIGURATION (Day 121–125): a live 2-of-3 set is RE-SHARED into a 3-of-5 set that
@@ -3038,7 +3668,9 @@ mod tests {
         let old = crate::split_cek_shamir2(&cek, &coeff).expect("old split");
         // Sanity: any two old shares already reconstruct via the general combine.
         assert_eq!(
-            crate::lagrange_combine_at_zero(&[(1, &old[0]), (2, &old[1])]).expect("old combine").to_vec(),
+            crate::lagrange_combine_at_zero(&[(1, &old[0]), (2, &old[1])])
+                .expect("old combine")
+                .to_vec(),
             cek,
             "the general Lagrange combine reconstructs the old 2-of-3 secret"
         );
@@ -3070,7 +3702,10 @@ mod tests {
             .collect();
 
         // The new shares differ from the old shares at the same coordinate (a genuinely fresh poly).
-        assert_ne!(new_shares[0].1, old[0], "new share at x=1 is on a different polynomial");
+        assert_ne!(
+            new_shares[0].1, old[0],
+            "new share at x=1 is on a different polynomial"
+        );
 
         // INVARIANT: ANY THREE of the five new shares reconstruct the EXACT CEK.
         let combine3 = |a: usize, b: usize, c: usize| -> Vec<u8> {
@@ -3082,9 +3717,21 @@ mod tests {
             .expect("combine 3")
             .to_vec()
         };
-        assert_eq!(combine3(0, 1, 2), cek, "new shares {{1,2,3}} reconstruct the CEK");
-        assert_eq!(combine3(0, 2, 4), cek, "new shares {{1,3,5}} reconstruct the CEK");
-        assert_eq!(combine3(2, 3, 4), cek, "new shares {{3,4,5}} reconstruct the CEK");
+        assert_eq!(
+            combine3(0, 1, 2),
+            cek,
+            "new shares {{1,2,3}} reconstruct the CEK"
+        );
+        assert_eq!(
+            combine3(0, 2, 4),
+            cek,
+            "new shares {{1,3,5}} reconstruct the CEK"
+        );
+        assert_eq!(
+            combine3(2, 3, 4),
+            cek,
+            "new shares {{3,4,5}} reconstruct the CEK"
+        );
 
         // BELOW the NEW quorum: any TWO new shares do NOT reconstruct the CEK (degree-2 needs 3).
         let two = crate::lagrange_combine_at_zero(&[
@@ -3104,7 +3751,10 @@ mod tests {
         ])
         .expect("mixed combine")
         .to_vec();
-        assert_ne!(mixed, cek, "an old share inside a new-set reconstruction is garbage");
+        assert_ne!(
+            mixed, cek,
+            "an old share inside a new-set reconstruction is garbage"
+        );
 
         // The NEW node-set identity is distinct (different k AND different membership).
         let vks: Vec<Vec<u8>> = (0..5u8).map(|i| vec![0xC0 ^ i; 40]).collect();
@@ -3121,14 +3771,31 @@ mod tests {
         let old_id = crate::threshold_node_set_id_n(2, &vk_refs[..3]);
         let aad = crate::reshare_aad(&kid, &old_id, &new_set_id, 3, 5);
         assert_eq!(aad, crate::reshare_aad(&kid, &old_id, &new_set_id, 3, 5));
-        assert_ne!(aad, crate::reshare_aad(&kid, &old_id, &new_set_id, 2, 5), "k is bound");
-        assert_ne!(aad, crate::reshare_aad(&kid, &old_id, &new_set_id, 3, 4), "m is bound");
+        assert_ne!(
+            aad,
+            crate::reshare_aad(&kid, &old_id, &new_set_id, 2, 5),
+            "k is bound"
+        );
+        assert_ne!(
+            aad,
+            crate::reshare_aad(&kid, &old_id, &new_set_id, 3, 4),
+            "m is bound"
+        );
         assert!(aad.starts_with(crate::DKMS_RESHARE_DOMAIN));
 
         // Fail-closed surface.
-        assert!(crate::reshare_eval(&cek, &c1_higher, 0).is_err(), "y=0 is the secret, never a node");
-        assert!(crate::reshare_eval(&cek, &[], 1).is_err(), "k=1 (no higher coeffs) is degenerate");
-        assert!(crate::lagrange_combine_at_zero(&[]).is_err(), "empty point set is refused");
+        assert!(
+            crate::reshare_eval(&cek, &c1_higher, 0).is_err(),
+            "y=0 is the secret, never a node"
+        );
+        assert!(
+            crate::reshare_eval(&cek, &[], 1).is_err(),
+            "k=1 (no higher coeffs) is degenerate"
+        );
+        assert!(
+            crate::lagrange_combine_at_zero(&[]).is_err(),
+            "empty point set is refused"
+        );
         assert!(
             crate::lagrange_combine_at_zero(&[(1, &old[0]), (1, &old[1])]).is_err(),
             "duplicate coordinates are not a quorum"
@@ -3165,7 +3832,11 @@ mod tests {
         }
         // BORN DISTRIBUTED: no single dealer's contribution is the CEK.
         for c in &contrib {
-            assert_ne!(&c[..], &cek[..], "a single dealer contribution must not equal the CEK");
+            assert_ne!(
+                &c[..],
+                &cek[..],
+                "a single dealer contribution must not equal the CEK"
+            );
         }
 
         // Each dealer i evaluates f_i at the three member coordinates x = 1,2,3.
@@ -3195,42 +3866,98 @@ mod tests {
             .expect("dkg combine")
             .to_vec()
         };
-        assert_eq!(combine(0, 1), &cek[..], "members {{1,2}} reconstruct the DKG-born CEK");
-        assert_eq!(combine(0, 2), &cek[..], "members {{1,3}} reconstruct the DKG-born CEK");
-        assert_eq!(combine(1, 2), &cek[..], "members {{2,3}} reconstruct the DKG-born CEK");
+        assert_eq!(
+            combine(0, 1),
+            &cek[..],
+            "members {{1,2}} reconstruct the DKG-born CEK"
+        );
+        assert_eq!(
+            combine(0, 2),
+            &cek[..],
+            "members {{1,3}} reconstruct the DKG-born CEK"
+        );
+        assert_eq!(
+            combine(1, 2),
+            &cek[..],
+            "members {{2,3}} reconstruct the DKG-born CEK"
+        );
 
         // Below quorum: one share is just one point of F and reveals nothing of F(0).
-        assert_ne!(final_shares[0].1.as_slice(), &cek[..], "a single DKG share is not the CEK");
+        assert_ne!(
+            final_shares[0].1.as_slice(),
+            &cek[..],
+            "a single DKG share is not the CEK"
+        );
 
         // CEK BINDING: a public commitment the producer publishes (it learns the CEK transiently to
         // encrypt content). The boundary re-derives it from the reconstructed CEK; a wrong CEK fails.
         let dkg_id = [0x7Au8; 16];
-        let node_set = crate::threshold_node_set_id_n(2, &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]]);
+        let node_set = crate::threshold_node_set_id_n(
+            2,
+            &[&[0xA1u8; 40][..], &[0xB2u8; 40][..], &[0xC3u8; 40][..]],
+        );
         let binding = crate::dkg_cek_binding(&dkg_id, &node_set, &cek);
-        assert_eq!(binding, crate::dkg_cek_binding(&dkg_id, &node_set, &combine(0, 1)), "binding verifies for the reconstructed CEK");
+        assert_eq!(
+            binding,
+            crate::dkg_cek_binding(&dkg_id, &node_set, &combine(0, 1)),
+            "binding verifies for the reconstructed CEK"
+        );
         let mut wrong = cek;
         wrong[0] ^= 0x01;
-        assert_ne!(binding, crate::dkg_cek_binding(&dkg_id, &node_set, &wrong), "binding rejects a wrong CEK");
-        assert_ne!(binding, crate::dkg_cek_binding(&[0x00u8; 16], &node_set, &cek), "binding is ceremony-bound");
+        assert_ne!(
+            binding,
+            crate::dkg_cek_binding(&dkg_id, &node_set, &wrong),
+            "binding rejects a wrong CEK"
+        );
+        assert_ne!(
+            binding,
+            crate::dkg_cek_binding(&[0x00u8; 16], &node_set, &cek),
+            "binding is ceremony-bound"
+        );
 
         // The DKG AAD welds (kid, dkg_id, node_set, t, m): any field change diverges.
         let kid = [0x5Au8; 16];
         let aad = crate::dkg_aad(&kid, &dkg_id, &node_set, 2, 3);
         assert_eq!(aad, crate::dkg_aad(&kid, &dkg_id, &node_set, 2, 3));
-        assert_ne!(aad, crate::dkg_aad(&kid, &dkg_id, &node_set, 3, 3), "t is bound");
-        assert_ne!(aad, crate::dkg_aad(&kid, &dkg_id, &node_set, 2, 5), "m is bound");
+        assert_ne!(
+            aad,
+            crate::dkg_aad(&kid, &dkg_id, &node_set, 3, 3),
+            "t is bound"
+        );
+        assert_ne!(
+            aad,
+            crate::dkg_aad(&kid, &dkg_id, &node_set, 2, 5),
+            "m is bound"
+        );
         assert!(aad.starts_with(crate::DKMS_DKG_DOMAIN));
         // The sub-share AAD welds the dealer→target pair.
         let sub = crate::dkg_subshare_aad(&kid, &dkg_id, &node_set, 1, 2);
-        assert_ne!(sub, crate::dkg_subshare_aad(&kid, &dkg_id, &node_set, 2, 2), "dealer coordinate is bound");
-        assert_ne!(sub, crate::dkg_subshare_aad(&kid, &dkg_id, &node_set, 1, 3), "target coordinate is bound");
+        assert_ne!(
+            sub,
+            crate::dkg_subshare_aad(&kid, &dkg_id, &node_set, 2, 2),
+            "dealer coordinate is bound"
+        );
+        assert_ne!(
+            sub,
+            crate::dkg_subshare_aad(&kid, &dkg_id, &node_set, 1, 3),
+            "target coordinate is bound"
+        );
 
         // Fail-closed surface.
-        assert!(crate::dkg_sum_subshares(&[]).is_err(), "empty sub-share set is refused");
-        assert!(crate::dkg_sum_subshares(&[&[][..]]).is_err(), "empty sub-shares are refused");
+        assert!(
+            crate::dkg_sum_subshares(&[]).is_err(),
+            "empty sub-share set is refused"
+        );
+        assert!(
+            crate::dkg_sum_subshares(&[&[][..]]).is_err(),
+            "empty sub-shares are refused"
+        );
         let short: &[u8] = &[0u8; 4];
         let long: &[u8] = &[0u8; 8];
-        assert!(crate::dkg_sum_subshares(&[short, long]).is_err(), "length mismatch is refused");
+        assert!(
+            crate::dkg_sum_subshares(&[short, long]).is_err(),
+            "length mismatch is refused"
+        );
     }
 
     /// Day 131–135 — a genuine t-of-n quorum's co-signed release attestations aggregate into a proof
@@ -3256,7 +3983,16 @@ mod tests {
         let now = 1_000u64;
 
         let sign = |signer: &MlDsaSealSigner| {
-            sign_release_attestation(signer, content_id, principal_id, right, &node_set_id, &session_pub, &kid, expiry)
+            sign_release_attestation(
+                signer,
+                content_id,
+                principal_id,
+                right,
+                &node_set_id,
+                &session_pub,
+                &kid,
+                expiry,
+            )
         };
         let sig0 = sign(&s0);
         let sig1 = sign(&s1);
@@ -3264,7 +4000,19 @@ mod tests {
         // GENUINE: members {0,1} (a real quorum) → verifies offline, returns the distinct-signer count.
         let proof: Vec<(usize, &[u8])> = vec![(0, &sig0), (1, &sig1)];
         assert_eq!(
-            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &proof),
+            verify_quorum_release_proof(
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &proof
+            ),
             Ok(2),
             "a genuine quorum proof verifies offline"
         );
@@ -3272,33 +4020,93 @@ mod tests {
         // WRONG-PRINCIPAL: same signatures, but a relying party checking for a DIFFERENT principal —
         // the signatures were never over those bytes, so the first counted signer is named as bad.
         assert_eq!(
-            verify_quorum_release_proof(t, &members, &node_set_id, content_id, b"principal:mallory", right, &session_pub, &kid, expiry, now, &proof),
+            verify_quorum_release_proof(
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                b"principal:mallory",
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &proof
+            ),
             Err(QuorumProofError::BadSignature { member_index: 0 }),
             "a proof bound to alice does not authorize mallory"
         );
         // REPLAYED AGAINST ANOTHER OPEN: a different decrypt session → the freshness binding fails.
         let other_session = [0x88u8; 32];
         assert_eq!(
-            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &other_session, &kid, expiry, now, &proof),
+            verify_quorum_release_proof(
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &other_session,
+                &kid,
+                expiry,
+                now,
+                &proof
+            ),
             Err(QuorumProofError::BadSignature { member_index: 0 }),
             "an attestation cannot be replayed against a different open"
         );
 
         // UNDER-QUORUM: only one valid signature → not a real quorum.
         assert_eq!(
-            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(0, sig0.as_slice())]),
+            verify_quorum_release_proof(
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &[(0, sig0.as_slice())]
+            ),
             Err(QuorumProofError::BelowQuorum { have: 1, need: 2 }),
             "one signer is below quorum"
         );
         // DUPLICATE PADDING: one node cannot replay its own signature to fake a quorum.
         assert_eq!(
-            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(0, sig0.as_slice()), (0, sig0.as_slice())]),
+            verify_quorum_release_proof(
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &[(0, sig0.as_slice()), (0, sig0.as_slice())]
+            ),
             Err(QuorumProofError::DuplicateSigner { member_index: 0 }),
             "a duplicate signer cannot pad the count"
         );
         // EXPIRED: now past the attested expiry.
         assert_eq!(
-            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, expiry + 1, &proof),
+            verify_quorum_release_proof(
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                expiry + 1,
+                &proof
+            ),
             Err(QuorumProofError::Expired),
             "an aged-out proof is rejected"
         );
@@ -3306,14 +4114,38 @@ mod tests {
         let (imp, _impvk) = mldsa_seal_keypair([0xEEu8; 32]);
         let forged = sign(&imp);
         assert_eq!(
-            verify_quorum_release_proof(t, &members, &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(0, &sig0), (2, &forged)]),
+            verify_quorum_release_proof(
+                t,
+                &members,
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &[(0, &sig0), (2, &forged)]
+            ),
             Err(QuorumProofError::BadSignature { member_index: 2 }),
             "a forged member signature is rejected AND the member is named"
         );
         // WRONG NODE-SET: a proof claiming an id that does not match its (t, members) is rejected.
         let bogus_id = [0x00u8; 32];
         assert_eq!(
-            verify_quorum_release_proof(t, &members, &bogus_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &proof),
+            verify_quorum_release_proof(
+                t,
+                &members,
+                &bogus_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &proof
+            ),
             Err(QuorumProofError::NodeSetMismatch),
             "a proof cannot claim a node-set it is not"
         );
@@ -3324,30 +4156,82 @@ mod tests {
         let (s4, vk4) = mldsa_seal_keypair([0xE4u8; 32]);
         let big: Vec<&[u8]> = vec![&vk0, &vk1, &vk2, &vk3, &vk4];
         let big_id = threshold_node_set_id_n(3, &big);
-        assert_ne!(big_id, node_set_id, "the reconfigured set has a DISTINCT id");
+        assert_ne!(
+            big_id, node_set_id,
+            "the reconfigured set has a DISTINCT id"
+        );
         let bsign = |signer: &MlDsaSealSigner| {
-            sign_release_attestation(signer, content_id, principal_id, right, &big_id, &session_pub, &kid, expiry)
+            sign_release_attestation(
+                signer,
+                content_id,
+                principal_id,
+                right,
+                &big_id,
+                &session_pub,
+                &kid,
+                expiry,
+            )
         };
         let b1 = bsign(&s1);
         let b3 = bsign(&s3);
         let b4 = bsign(&s4);
         assert_eq!(
-            verify_quorum_release_proof(3, &big, &big_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &[(1, &b1), (3, &b3), (4, &b4)]),
+            verify_quorum_release_proof(
+                3,
+                &big,
+                &big_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &[(1, &b1), (3, &b3), (4, &b4)]
+            ),
             Ok(3),
             "a 3-of-5 proof on the reconfigured set verifies and names the current set"
         );
 
         // EMPTY: no members → nothing to verify against.
         assert_eq!(
-            verify_quorum_release_proof(t, &[], &node_set_id, content_id, principal_id, right, &session_pub, &kid, expiry, now, &proof),
+            verify_quorum_release_proof(
+                t,
+                &[],
+                &node_set_id,
+                content_id,
+                principal_id,
+                right,
+                &session_pub,
+                &kid,
+                expiry,
+                now,
+                &proof
+            ),
             Err(QuorumProofError::EmptyMembers),
         );
         // The preimage is domain-separated and field-bound.
-        let msg = release_attestation_message(content_id, principal_id, right, &node_set_id, &session_pub, &kid, expiry);
+        let msg = release_attestation_message(
+            content_id,
+            principal_id,
+            right,
+            &node_set_id,
+            &session_pub,
+            &kid,
+            expiry,
+        );
         assert!(msg.starts_with(DKMS_RELEASE_ATTEST_DOMAIN));
         assert_ne!(
             msg,
-            release_attestation_message(content_id, principal_id, b"download", &node_set_id, &session_pub, &kid, expiry),
+            release_attestation_message(
+                content_id,
+                principal_id,
+                b"download",
+                &node_set_id,
+                &session_pub,
+                &kid,
+                expiry
+            ),
             "the right is bound"
         );
     }
@@ -3365,9 +4249,21 @@ mod tests {
             "the 2-node id must be byte-identical through the n-node derivation"
         );
         let id3 = crate::threshold_node_set_id_n(2, &[&vk_a, &vk_b, &vk_c]);
-        assert_ne!(id3, crate::threshold_node_set_id_n(2, &[&vk_a, &vk_b]), "adding a member changes the id");
-        assert_ne!(id3, crate::threshold_node_set_id_n(2, &[&vk_a, &vk_c, &vk_b]), "order matters");
-        assert_ne!(id3, crate::threshold_node_set_id_n(3, &[&vk_a, &vk_b, &vk_c]), "t is bound");
+        assert_ne!(
+            id3,
+            crate::threshold_node_set_id_n(2, &[&vk_a, &vk_b]),
+            "adding a member changes the id"
+        );
+        assert_ne!(
+            id3,
+            crate::threshold_node_set_id_n(2, &[&vk_a, &vk_c, &vk_b]),
+            "order matters"
+        );
+        assert_ne!(
+            id3,
+            crate::threshold_node_set_id_n(3, &[&vk_a, &vk_b, &vk_c]),
+            "t is bound"
+        );
         let (_s, rogue) = crate::seal::mldsa_seal_keypair([0x99u8; 32]);
         assert_ne!(
             id3,
@@ -3407,6 +4303,195 @@ mod tests {
         );
     }
 
+    // ---- DKMS-5: lifecycle v2 canonical manifest encoder -------------------------------------
+    use crate::lifecycle::{
+        authorization_aad, canonical_bytes, contribution_digest, digest, LifecycleManifestV2,
+        LifecycleOp, MemberRecord,
+    };
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A fully-populated fixed manifest for golden vectors: every field is non-default so a regression
+    /// in ANY field's framing shifts the bytes.
+    fn golden_manifest() -> LifecycleManifestV2 {
+        LifecycleManifestV2 {
+            op: LifecycleOp::DkgContribute,
+            kid: [0xD7u8; 16],
+            scheme: b"elastos-pq-hybrid-threshold-v0".to_vec(),
+            ceremony_id: vec![0x33u8; 4],
+            old_set_id: Vec::new(),
+            new_set_id: vec![0xAB, 0xCD, 0xEF],
+            k: 2,
+            m: 3,
+            cek_len: 16,
+            executing_coordinate: 1,
+            executing_vk: vec![0x11u8; 5],
+            members: vec![
+                MemberRecord {
+                    coordinate: 1,
+                    verifying_key: vec![],
+                    recipient_key: vec![0x21u8; 4],
+                },
+                MemberRecord {
+                    coordinate: 2,
+                    verifying_key: vec![],
+                    recipient_key: vec![0x22u8; 4],
+                },
+            ],
+            material_digests: vec![[0x44u8; 32]],
+        }
+    }
+
+    /// GOLDEN VECTOR: the canonical byte encoding, digest, and authorization AAD of a fixed manifest
+    /// are pinned. Both the operator tooling and the node call THIS encoder; if either side (or a
+    /// refactor) shifts a single framing byte, this vector fails — the weld that keeps client and node
+    /// from drifting (a drift silently reopens DKMS-5).
+    #[test]
+    fn lifecycle_v2_canonical_encoding_golden_vectors() {
+        // Golden vectors (pinned). Single-line to avoid line-continuation whitespace ambiguity.
+        const CANONICAL: &str = "020300000010d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d70000001e656c6173746f732d70712d6879627269642d7468726573686f6c642d763000000004333333330000000000000003abcdef02030000001001000000051111111111000000020100000000000000042121212102000000000000000422222222000000014444444444444444444444444444444444444444444444444444444444444444";
+        const DIGEST: &str = "ff9d310c7c41e36616a3ae5df5bffaf597d23d2bc208a203d15f8c72c5a8b7bb";
+        const AAD: &str = "656c6173746f732e646b6d732e617574686f726974792f646b672d636f6e747269627574652f763220000000ff9d310c7c41e36616a3ae5df5bffaf597d23d2bc208a203d15f8c72c5a8b7bb";
+        let m = golden_manifest();
+        assert_eq!(
+            hex(&canonical_bytes(&m)),
+            CANONICAL,
+            "canonical bytes are byte-stable"
+        );
+        assert_eq!(hex(&digest(&m)), DIGEST, "manifest digest is pinned");
+        assert_eq!(
+            hex(&authorization_aad(&m)),
+            AAD,
+            "authorization AAD = domain ‖ lp(digest) is pinned"
+        );
+    }
+
+    /// The four operations use FOUR DISTINCT domains, so their authorization AADs differ even for an
+    /// otherwise-identical manifest — a token minted for one op/phase can never open another's.
+    #[test]
+    fn lifecycle_v2_domains_are_distinct_per_operation_and_phase() {
+        let ops = [
+            LifecycleOp::ReshareContribute,
+            LifecycleOp::ReshareInstall,
+            LifecycleOp::DkgContribute,
+            LifecycleOp::DkgInstall,
+        ];
+        let mut aads = std::collections::HashSet::new();
+        let mut domains = std::collections::HashSet::new();
+        for op in ops {
+            let mut m = golden_manifest();
+            m.op = op;
+            assert!(
+                domains.insert(op.domain().to_vec()),
+                "each op has a distinct domain"
+            );
+            assert!(
+                aads.insert(authorization_aad(&m)),
+                "each op yields a distinct authorization AAD"
+            );
+        }
+    }
+
+    /// EVERY semantic field is bound: mutating any one changes the digest (and hence the AAD).
+    #[test]
+    fn lifecycle_v2_every_field_changes_the_digest() {
+        let base = golden_manifest();
+        let base_d = digest(&base);
+        let mut mutations: Vec<LifecycleManifestV2> = Vec::new();
+
+        let mut m = base.clone();
+        m.op = LifecycleOp::DkgInstall;
+        mutations.push(m);
+        let mut m = base.clone();
+        m.kid[0] ^= 1;
+        mutations.push(m);
+        let mut m = base.clone();
+        m.scheme = b"other".to_vec();
+        mutations.push(m);
+        let mut m = base.clone();
+        m.ceremony_id = vec![0x34u8; 4];
+        mutations.push(m);
+        let mut m = base.clone();
+        m.old_set_id = vec![0x01];
+        mutations.push(m);
+        let mut m = base.clone();
+        m.new_set_id = vec![0xAB, 0xCD, 0xEE];
+        mutations.push(m);
+        let mut m = base.clone();
+        m.k = 3;
+        mutations.push(m);
+        let mut m = base.clone();
+        m.m = 4;
+        mutations.push(m);
+        let mut m = base.clone();
+        m.cek_len = 17;
+        mutations.push(m);
+        let mut m = base.clone();
+        m.executing_coordinate = 2;
+        mutations.push(m);
+        let mut m = base.clone();
+        m.executing_vk = vec![0x11u8; 6];
+        mutations.push(m);
+        let mut m = base.clone();
+        m.members[0].coordinate = 9;
+        mutations.push(m);
+        let mut m = base.clone();
+        m.members[0].recipient_key = vec![0x21u8; 5];
+        mutations.push(m);
+        let mut m = base.clone();
+        m.members[0].verifying_key = vec![0x01];
+        mutations.push(m);
+        let mut m = base.clone();
+        m.members.swap(0, 1);
+        mutations.push(m); // order
+        let mut m = base.clone();
+        m.members.truncate(1);
+        mutations.push(m);
+        let mut m = base.clone();
+        m.material_digests[0][0] ^= 1;
+        mutations.push(m);
+        let mut m = base.clone();
+        m.material_digests.clear();
+        mutations.push(m);
+
+        for m in &mutations {
+            assert_ne!(
+                digest(m),
+                base_d,
+                "a mutated field must change the manifest digest"
+            );
+        }
+    }
+
+    /// A contribution digest binds coordinate, verifying key, AND the sealed bytes: any change is
+    /// detectable, and a length-shift between the vk and the sealed field cannot collide.
+    #[test]
+    fn lifecycle_v2_contribution_digest_binds_all_parts() {
+        let base = contribution_digest(1, b"vk", b"sealed");
+        assert_ne!(
+            base,
+            contribution_digest(2, b"vk", b"sealed"),
+            "coordinate is bound"
+        );
+        assert_ne!(
+            base,
+            contribution_digest(1, b"VK", b"sealed"),
+            "vk is bound"
+        );
+        assert_ne!(
+            base,
+            contribution_digest(1, b"vk", b"SEALED"),
+            "sealed bytes are bound"
+        );
+        assert_ne!(
+            contribution_digest(1, b"vkX", b"sealed"),
+            contribution_digest(1, b"vk", b"Xsealed"),
+            "length framing prevents a boundary-shift collision",
+        );
+    }
+
     /// Day 105–108: the encrypted-channel KEY ATTESTATION pins both the handshake challenge AND the
     /// node's channel KEM key under the node identity — the property that defeats a MITM terminating
     /// the TCP connection (it can relay the genuine hello but cannot substitute its own KEM key).
@@ -3419,19 +4504,41 @@ mod tests {
         let sig = crate::attest_channel_key(&signer, &challenge, &channel_pub);
 
         // The genuine (challenge, channel_pub) verifies under the pinned identity.
-        assert!(crate::verify_channel_key(&verifier, &challenge, &channel_pub, &sig));
+        assert!(crate::verify_channel_key(
+            &verifier,
+            &challenge,
+            &channel_pub,
+            &sig
+        ));
         // A SUBSTITUTED channel key (the MITM's own KEM key) fails under the pinned identity.
         let mitm_pub = vec![0x43u8; 64];
-        assert!(!crate::verify_channel_key(&verifier, &challenge, &mitm_pub, &sig));
+        assert!(!crate::verify_channel_key(
+            &verifier, &challenge, &mitm_pub, &sig
+        ));
         // A different challenge (replayed attestation) fails.
-        assert!(!crate::verify_channel_key(&verifier, &[0x11u8; 32], &channel_pub, &sig));
+        assert!(!crate::verify_channel_key(
+            &verifier,
+            &[0x11u8; 32],
+            &channel_pub,
+            &sig
+        ));
         // A different node identity fails (the attestation is identity-pinned).
         let (_other, other_vk) = mldsa_seal_keypair([0x62u8; 32]);
         let other_verifier = MlDsa65Verifier::from_encoded(&other_vk).expect("vk decodes");
-        assert!(!crate::verify_channel_key(&other_verifier, &challenge, &channel_pub, &sig));
+        assert!(!crate::verify_channel_key(
+            &other_verifier,
+            &challenge,
+            &channel_pub,
+            &sig
+        ));
         // Domain separation: a hello attestation over the same challenge is NOT a channel attestation.
         let hello_sig = crate::attest_challenge(&signer, &challenge);
-        assert!(!crate::verify_channel_key(&verifier, &challenge, &channel_pub, &hello_sig));
+        assert!(!crate::verify_channel_key(
+            &verifier,
+            &challenge,
+            &channel_pub,
+            &hello_sig
+        ));
     }
 
     /// Day 105–108: the per-frame channel AAD separates channel, direction and sequence — a frame
@@ -3471,7 +4578,10 @@ mod tests {
         assert_ne!(aad, crate::rotation_aad(&kid, &source, &[0x34u8; 64]));
         // Domain-labelled, and NEVER the escrow AAD (a rotation delta is not an escrowed share).
         assert!(aad.starts_with(crate::DKMS_ROTATE_DOMAIN));
-        assert_ne!(aad, crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &successor));
+        assert_ne!(
+            aad,
+            crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &successor)
+        );
     }
 
     /// Day 109–112: a caller REVOCATION verifies only under the operator identity over the exact
@@ -3491,15 +4601,63 @@ mod tests {
         // A non-operator signer cannot revoke (the node pins the operator identity).
         let (impostor, impostor_vk) = mldsa_seal_keypair([0x70u8; 32]);
         let impostor_sig = crate::sign_revocation(&impostor, &caller_pub);
-        assert!(!crate::verify_revocation(&verifier, &caller_pub, &impostor_sig));
+        assert!(!crate::verify_revocation(
+            &verifier,
+            &caller_pub,
+            &impostor_sig
+        ));
         let impostor_verifier = MlDsa65Verifier::from_encoded(&impostor_vk).expect("vk decodes");
-        assert!(impostor_vk != operator_vk && crate::verify_revocation(&impostor_verifier, &caller_pub, &impostor_sig));
+        assert!(
+            impostor_vk != operator_vk
+                && crate::verify_revocation(&impostor_verifier, &caller_pub, &impostor_sig)
+        );
         // Domain separation: a hello attestation / channel attestation over the same bytes is NOT
         // a revocation — no signature from a sibling domain can stand in for one.
         let hello_sig = crate::attest_challenge(&operator, &caller_pub);
-        assert!(!crate::verify_revocation(&verifier, &caller_pub, &hello_sig));
+        assert!(!crate::verify_revocation(
+            &verifier,
+            &caller_pub,
+            &hello_sig
+        ));
         let channel_sig = crate::attest_channel_key(&operator, &caller_pub, &caller_pub);
-        assert!(!crate::verify_revocation(&verifier, &caller_pub, &channel_sig));
+        assert!(!crate::verify_revocation(
+            &verifier,
+            &caller_pub,
+            &channel_sig
+        ));
+    }
+
+    /// DKMS-6: a DELEGATION revocation verifies only under the operator identity over the EXACT
+    /// `(nonce, expires_at, issued_at)` — a forged signer, a different nonce, a shifted window, and a
+    /// caller-revocation signature over the same nonce bytes are all refused. Domain separation makes
+    /// a caller-revocation and a delegation-revocation non-interchangeable.
+    #[test]
+    fn delegation_revocation_signature_is_operator_nonce_and_window_bound() {
+        let (operator, operator_vk) = mldsa_seal_keypair([0x6Fu8; 32]);
+        let verifier = MlDsa65Verifier::from_encoded(&operator_vk).expect("vk decodes");
+        let nonce = [0x11u8; 16];
+        let (expires_at, issued_at) = (2_000u64, 1_000u64);
+        let sig = crate::sign_delegation_revocation(&operator, &nonce, expires_at, issued_at);
+
+        let verify = |n: &[u8], exp: u64, iss: u64, s: &[u8]| {
+            crate::verify_delegation_revocation(&verifier, n, exp, iss, s)
+        };
+        assert!(verify(&nonce, expires_at, issued_at, &sig));
+        // A DIFFERENT nonce is not covered.
+        assert!(!verify(&[0x22u8; 16], expires_at, issued_at, &sig));
+        // A shifted window / issue time invalidates the signature.
+        assert!(!verify(&nonce, expires_at + 1, issued_at, &sig));
+        assert!(!verify(&nonce, expires_at, issued_at + 1, &sig));
+        // A non-operator signer cannot revoke.
+        let (impostor, _impostor_vk) = mldsa_seal_keypair([0x70u8; 32]);
+        let impostor_sig =
+            crate::sign_delegation_revocation(&impostor, &nonce, expires_at, issued_at);
+        assert!(!verify(&nonce, expires_at, issued_at, &impostor_sig));
+        // Domain separation: a CALLER-revocation signature over the same nonce bytes is NOT a
+        // delegation revocation (and the reverse), so the two revocation kinds cannot be confused.
+        let caller_sig = crate::sign_revocation(&operator, &nonce);
+        assert!(!verify(&nonce, expires_at, issued_at, &caller_sig));
+        assert!(!crate::verify_revocation(&verifier, &nonce, &sig));
     }
 
     /// The escrow AAD both producer and authority bind is deterministic + labelled.
@@ -3508,7 +4666,10 @@ mod tests {
         let kid = [0x11u8; 16];
         let recip = [0x22u8; 64];
         let a = crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip);
-        assert_eq!(a, crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip));
+        assert_eq!(
+            a,
+            crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip)
+        );
         let label = crate::transcript::ESCROW_AAD_LABEL;
         assert_eq!(&a[..4], &(label.len() as u32).to_be_bytes());
         assert_eq!(&a[4..4 + label.len()], label);
@@ -3521,13 +4682,22 @@ mod tests {
         let kid = [0x11u8; 16];
         let recip = [0x22u8; 64];
         let base = crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip);
-        assert_ne!(base, crate::transcript::escrow_aad("other-suite", &kid, &recip));
+        assert_ne!(
+            base,
+            crate::transcript::escrow_aad("other-suite", &kid, &recip)
+        );
         let mut kid2 = kid;
         kid2[0] ^= 1;
-        assert_ne!(base, crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid2, &recip));
+        assert_ne!(
+            base,
+            crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid2, &recip)
+        );
         let mut recip2 = recip;
         recip2[0] ^= 1;
-        assert_ne!(base, crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip2));
+        assert_ne!(
+            base,
+            crate::transcript::escrow_aad(SUITE_PQ_HYBRID, &kid, &recip2)
+        );
     }
 
     /// The seal/unwrap path is welded to the shared transcript: a CEK sealed to one
@@ -3593,7 +4763,10 @@ mod tests {
             1_800_000_000,
             1_900_000_000,
         );
-        assert_ne!(base, changed, "a flipped status must change the receipt hash");
+        assert_ne!(
+            base, changed,
+            "a flipped status must change the receipt hash"
+        );
         let later_expiry = crate::transcript::release_receipt_hash(
             "elastos.release.receipt/v1",
             "key-release:1",
@@ -3606,6 +4779,9 @@ mod tests {
             1_800_000_000,
             1_900_000_001, // expiry +1
         );
-        assert_ne!(base, later_expiry, "a changed expiry must change the receipt hash");
+        assert_ne!(
+            base, later_expiry,
+            "a changed expiry must change the receipt hash"
+        );
     }
 }

@@ -38,7 +38,15 @@ if [ -f "$CAP/dkms-keygen/Cargo.toml" ]; then
   cargo build --quiet --manifest-path "$CAP/dkms-keygen/Cargo.toml" 2>/dev/null && \
   ALLOW="$("$CAP/dkms-keygen/target/debug/dkms-keygen" derive-vk --seed-b64 "$SEED_B64" 2>/dev/null | tr -d '\n')"
 fi
-echo "  allow-list caller vk: ${ALLOW:+set}${ALLOW:-<empty: serve-any for local wire check>}"
+echo "  allow-list caller vk: ${ALLOW:+set}${ALLOW:-<empty: explicit-anonymous for local wire check>}"
+
+# DKMS-8: caller policy is EXPLICIT — an empty allow-list is no longer a silent serve-any. When no
+# caller vk was derived, declare anonymous via the opt-in; otherwise enforce the derived allow-list.
+if [[ -n "$ALLOW" ]]; then
+  POLICY_ENV=(DKMS_AUTHORITY_ALLOWED_CALLERS="$ALLOW")
+else
+  POLICY_ENV=(DKMS_AUTHORITY_ALLOW_ANONYMOUS=1)
+fi
 
 echo "== start three local daemons (loopback TCP) =="
 PORTS=(19451 19452 19453)
@@ -47,7 +55,7 @@ for i in 0 1 2; do
   P="${PORTS[$i]}"
   DKMS_AUTHORITY_LISTEN="tcp:127.0.0.1:$P" \
   DKMS_AUTHORITY_KEY_STORE="$WORK/node$i.json" \
-  DKMS_AUTHORITY_ALLOWED_CALLERS="$ALLOW" \
+  env "${POLICY_ENV[@]}" \
   DKMS_AUTHORITY_OPERATOR_VK="" \
     "$NODE_BIN" >/dev/null 2>"$WORK/node$i.log" &
   PIDS+=("$!")

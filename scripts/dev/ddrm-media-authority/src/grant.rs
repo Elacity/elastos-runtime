@@ -162,9 +162,7 @@ pub fn run_grant_assemble() -> Result<(), String> {
 mod tests {
     use super::*;
     use ddrm_envelope::access::testkit::{personal_sign_canonical, test_wallet_address};
-    use ddrm_envelope::access::{
-        verify_access_grant, AccessGrantV1, AccessVerifyContext, ReplayGuard,
-    };
+    use ddrm_envelope::access::{verify_access_grant, AccessGrantV1, AccessVerifyContext};
 
     const CHAIN_ID: u64 = 8453;
     const WALLET_SEED: u8 = 0x21;
@@ -195,9 +193,7 @@ mod tests {
             expected_kid_hex: kid(),
             now: now_unix(),
         };
-        let mut guard = ReplayGuard::new();
-        verify_access_grant(&grant, &ctx, Some(&mut guard), None)
-            .expect("sidecar-built grant must verify at the node");
+        verify_access_grant(&grant, &ctx, None).expect("sidecar-built grant must verify at the node");
     }
 
     /// A wrong wallet signature (different seed) fails the node's recovery check — fail closed.
@@ -216,7 +212,7 @@ mod tests {
             expected_kid_hex: kid(),
             now: now_unix(),
         };
-        assert!(verify_access_grant(&grant, &ctx, None, None).is_err());
+        assert!(verify_access_grant(&grant, &ctx, None).is_err());
     }
 
     #[test]

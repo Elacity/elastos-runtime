@@ -165,6 +165,20 @@ On **each** node host:
    It prints `{verifying_key_b64, recipient_pub_b64, authority_endpoint:"tcp:REPLACE…"}`. Record
    that block for this node, and set `authority_endpoint` to this node's `tcp:10.66.0.X:9443`.
 
+> **Provisioning output contract (DKMS-7).** `dkms-preflight.sh identity` normalises the block
+> above from the raw `dkms-authority provision` output. That raw output is a **single flat JSON
+> object on stdout** (see `run_provision` in `capsules/dkms-authority/src/main.rs`):
+>
+> ```json
+> {"provider":"dkms-authority","protocol_version":"1.0","seal_verifying_key_b64":"…","seal_recipient_pub_b64":"…"}
+> ```
+>
+> The seal keys are at the **top level** — they are **not** wrapped in a `data` envelope (that was
+> the old wire-`init` response shape, which the hardened node no longer serves). Any tooling that
+> assembles a descriptor directly from `provision` must read `.seal_verifying_key_b64` /
+> `.seal_recipient_pub_b64` at the top level (the shipped `dkms-preflight.sh` and the dev
+> `scripts/dev/dkms-docker/up.sh` both do; the latter accepts either shape for back-compat).
+
 Repeat for nodes A, B, C → you now have three public identity blocks.
 
 ---
@@ -204,13 +218,16 @@ docs/dkms/deploy/bin/dkms-preflight.sh node \
 
 Healthy startup logs (from the binary):
 ```
-dkms-authority: enforcing a 1-entry caller allow-list
+dkms-authority: caller policy = ALLOW-LIST (1 entry enforced)
 dkms-authority: operator identity pinned (lifecycle ops enabled)
 dkms-authority: listening on tcp:10.66.0.X:9443
 ```
-All three lines **must** appear. "enforcing a … allow-list" and "operator identity pinned" confirm
-the node will refuse unknown callers and accept lifecycle authorization. No allow-list line = the
-node would serve anyone → stop and fix the env.
+All three lines **must** appear. "caller policy = ALLOW-LIST" and "operator identity pinned" confirm
+the node will refuse unknown callers and accept lifecycle authorization. DKMS-8: caller policy is now
+fail-closed — a misconfigured allow-list (empty, malformed, duplicate, or unset without an explicit
+anonymous opt-in) makes the daemon exit with `dkms-authority: cannot start — …` BEFORE it binds, so
+it can never silently "serve anyone". A deliberately anonymous node logs `caller policy = ANONYMOUS
+(explicit opt-in …)` — if you see that on a production node, stop and fix the env.
 
 ---
 
@@ -272,7 +289,55 @@ MITM-tampered frame dropped, wrong channel key refused).
 
 ---
 
-## 12. Rollback
+## 12. Upgrade to the hardened build (migration)
+
+The hardened `dkms-authority` build closes eight reviewed findings (DKMS-1..8). Three of those
+changes are **operator-visible migrations** — do them deliberately, in order, before you cut a
+production quorum over to the new binary. Upgrade **one non-production quorum first** (copied
+fixtures) and prove identity parity + revocation-restart + quorum-disagreement alerts before you
+touch production nodes.
+
+1. **Provision identity OFFLINE, before the listener starts.** The hardened node **refuses a wire
+   `init`** — a network/stdin client can no longer select the key-store path or trigger first
+   creation of a node identity. Identity creation happens via the offline `provision` subcommand
+   (RUNBOOK §6: `dkms-preflight.sh identity …`, which runs `dkms-authority provision`) against the
+   operator-owned state root, **before** `systemctl enable --now`. Verify each node's public
+   identity hash (the `provision` output) matches its pre-upgrade identity — a mismatch means the
+   store moved; stop and restore from the `master.seed` backup rather than minting a new identity.
+
+2. **Durable revocation state starts EMPTY — re-issue standing revocations.** The hardened node
+   keeps caller/delegation revocations in a **durable, operator-signed** store so they survive a
+   restart (DKMS-6). An existing node upgraded from the pre-hardened build has **no durable
+   revocation history**: after the upgrade its revocation state is empty. There is no authoritative
+   record to reconstruct it from, so **the operator MUST re-apply every known standing revocation**
+   into the new store (re-run the operator-signed `revoke_caller` / delegation revocation for each
+   caller/delegation that must stay revoked) **before** returning the node to service. Do **not**
+   assume a previously-revoked caller stays revoked across the upgrade. If you roll back to a binary
+   that cannot read the new revocation state, keep the node **out of service** until revocations are
+   re-established (see §13) — never run assuming revocations are still enforced.
+
+3. **Caller allow-list is fail-closed — opt into anonymous EXPLICITLY.** The hardened node no longer
+   treats an unset/empty allow-list as "anonymous" (DKMS-8). Production nodes set
+   `DKMS_AUTHORITY_ALLOWED_CALLERS` to the runtime caller VK (default, fail-closed). An open/dev mesh
+   that genuinely wants any well-formed caller must set `DKMS_AUTHORITY_ALLOW_ANONYMOUS=1`
+   **explicitly** (and leave `_ALLOWED_CALLERS` unset — setting both is a contradictory startup
+   error). A malformed/empty allow-list is a **hard startup error**, never a silent anonymous
+   fallback. `dkms-preflight.sh node` checks this posture; the launcher scripts
+   `scripts/dev/run-creator-gateway.sh` and `scripts/dev/ddrm-runtime-open/live-open-verify.sh`
+   already hard-code a non-empty caller VK, so they need no anonymous flag.
+
+4. **No mixed v1/v2 lifecycle ceremony.** DKG / re-share v2 is a **cutover boundary** (see
+   `DKG_CEREMONY.md`): the hardened node authorizes lifecycle ops against a versioned v2 manifest
+   digest and rejects the old loosely-bound v1 authorization. **Finish or abandon any in-flight v1
+   ceremony before the upgrade.** Do not attempt a ceremony that mixes a v1-authorized contribute
+   with a v2-authorized install — it fails closed.
+
+Preserve the old binary, keystore, configuration, and a **security-state backup** as rollback
+artifacts before you start.
+
+---
+
+## 13. Rollback
 
 Cutover is config-only, so rollback is fast and safe:
 
@@ -288,13 +353,16 @@ Cutover is config-only, so rollback is fast and safe:
 
 ---
 
-## 13. Go-live gate
+## 14. Go-live gate
 
 Proceed to production only when **all** are true:
 - [ ] descriptor validates `--require-tcp` (§7)
 - [ ] all three nodes' preflight `node` checks pass, all three startup-log lines present (§8)
 - [ ] runtime preflight reports every endpoint reachable (§9)
 - [ ] a live open succeeds, and survives one node down but fails closed below quorum (§10)
-- [ ] each node's `master.seed` is backed up offline (encrypted) (§12)
+- [ ] each node's `master.seed` is backed up offline (encrypted) (§13)
+- [ ] on upgrade: each node's `provision` identity hash matches its pre-upgrade identity (§12.1)
+- [ ] on upgrade: every known standing revocation has been re-issued into the new durable store (§12.2)
+- [ ] caller policy is explicit — allow-listed (default) or an explicit `ALLOW_ANONYMOUS=1` opt-in (§12.3)
 
 The remaining inputs are in [INTAKE.md](./INTAKE.md).
