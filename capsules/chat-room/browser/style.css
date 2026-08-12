@@ -122,7 +122,11 @@ p {
   height: 100%;
   min-height: 0;
   overflow: hidden;
-  background: var(--bg);
+  background: linear-gradient(
+    to right,
+    var(--sidebar-bg) 0 220px,
+    var(--bg) 220px 100%
+  );
 }
 
 .chat-sidebar {
@@ -131,7 +135,7 @@ p {
   min-height: 0;
   flex-direction: column;
   gap: 0.45rem;
-  padding: var(--window-chrome-safe-top, 52px) 10px 14px;
+  padding: 12px 10px 14px;
   overflow: auto;
   border-right: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
   background: var(--sidebar-bg);
@@ -244,12 +248,11 @@ p {
 
 .conversation-head {
   display: flex;
-  min-height: calc(var(--window-chrome-safe-top, 52px) + 0.35rem);
   flex: 0 0 auto;
   align-items: flex-end;
   justify-content: space-between;
   gap: 0.75rem;
-  padding: var(--window-chrome-safe-top, 52px) 0.85rem 0.45rem;
+  padding: 0.85rem 0.85rem 0.45rem;
   border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
   background: color-mix(in srgb, var(--el-surface-raised) 92%, transparent);
   backdrop-filter: blur(18px);
@@ -445,7 +448,7 @@ button.secondary {
   min-width: 0;
   flex-direction: column;
   gap: 0.65rem;
-  padding: var(--window-chrome-safe-top, 52px) 10px 14px;
+  padding: 10px 10px 14px;
   overflow-x: hidden;
   overflow-y: auto;
   border-left: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
@@ -593,11 +596,20 @@ button.secondary {
   background: color-mix(in srgb, var(--el-inset) 70%, transparent);
 }
 
+.node-row-head {
+  min-width: 0;
+}
+
 .browser-access-request-name,
 .node-row-name,
 .policy-row-name {
   font-size: 0.8rem;
   font-weight: 650;
+}
+
+.node-row-name,
+.node-row-detail {
+  overflow-wrap: anywhere;
 }
 
 .browser-access-request-time,
