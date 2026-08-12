@@ -1855,3 +1855,186 @@ fn newest_asset_created_in_logs_picks_matching_newest() {
         None
     );
 }
+
+// ESP-1: the TRADE-approval resolver `scan_asset_created_for_content_id` must FAIL CLOSED when
+// any candidate mint's calldata is unavailable — mirroring the buy resolver's MKT-1 hardening.
+// `decoded` is sorted newest-first and a re-mint reuses the KID, so silently skipping an
+// unavailable NEWEST candidate would fall through to an OLDER same-KID binder — a wrong
+// operative / wrong token-id trade-approval window.
+fn esp1_asset_created_log(
+    creator_topic: &str,
+    channel_topic: &str,
+    operative: &str,
+    token_id_word: &str,
+    tx_hash: &str,
+    block: u64,
+) -> Value {
+    let op_topic = format!("0x000000000000000000000000{}", &operative[2..]);
+    json!({
+        "topics": [ASSET_CREATED_TOPIC0, creator_topic, channel_topic, op_topic],
+        "data": token_id_word,
+        "blockNumber": format!("0x{block:x}"),
+        "logIndex": "0x0",
+        "transactionHash": tx_hash,
+    })
+}
+
+#[test]
+fn trade_resolver_fails_closed_when_newest_candidate_calldata_unavailable() {
+    let creator = "0x1111111111111111111111111111111111111111";
+    let channel = "0x2222222222222222222222222222222222222222";
+    let creator_topic = address_topic(creator).unwrap();
+    let channel_topic = address_topic(channel).unwrap();
+    let op_newer = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let op_older = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let tx_newer = format!("0x{}", "11".repeat(32));
+    let tx_older = format!("0x{}", "22".repeat(32));
+    let token = |n: u8| format!("0x{n:064x}");
+
+    // Same KID at two blocks. The OLDER tx binds the KID; the NEWER tx's calldata is unavailable.
+    let kid = "0x38691296765e76a331f5d5630bddf9f5";
+    let want = normalize_content_id_bytes16(kid).unwrap();
+    let older_binder = encode_mint_calldata(
+        "0xdeadbeef",
+        "ipfs://meta",
+        0,
+        &encode_op_raw_free(kid).unwrap(),
+        &[],
+    )
+    .unwrap();
+
+    let logs = json!([
+        esp1_asset_created_log(&creator_topic, &channel_topic, op_newer, &token(9), &tx_newer, 0x20),
+        esp1_asset_created_log(&creator_topic, &channel_topic, op_older, &token(7), &tx_older, 0x10),
+    ]);
+
+    // Scripted (buggy code walks all three; fixed code aborts after the newest `null`):
+    //   eth_getLogs -> both candidate logs
+    //   eth_getTransactionByHash(newest) -> null (calldata UNAVAILABLE)
+    //   eth_getTransactionByHash(older)  -> the KID binder (only reached by the buggy fallthrough)
+    let rpc_url = spawn_rpc_sequence_server(vec![
+        ("eth_getLogs", logs),
+        ("eth_getTransactionByHash", json!(null)),
+        ("eth_getTransactionByHash", json!({ "input": older_binder })),
+    ]);
+    let provider = provider_with_rpc(rpc_url);
+    let network = provider.evm_network("esc-local").unwrap().clone();
+
+    let result = provider.scan_asset_created_for_content_id(
+        &network,
+        &creator_topic,
+        &channel_topic,
+        &want,
+        0x0,
+        0x100,
+    );
+
+    match result {
+        Err(Response::Error { code, .. }) => assert_eq!(
+            code, "candidate_input_unavailable",
+            "unavailable newest calldata must fail closed, not fall back to the older binder"
+        ),
+        other => panic!("expected fail-closed candidate_input_unavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn trade_resolver_resolves_when_all_candidate_calldata_available() {
+    let creator = "0x1111111111111111111111111111111111111111";
+    let channel = "0x2222222222222222222222222222222222222222";
+    let creator_topic = address_topic(creator).unwrap();
+    let channel_topic = address_topic(channel).unwrap();
+    let op_newer = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let op_older = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let tx_newer = format!("0x{}", "11".repeat(32));
+    let tx_older = format!("0x{}", "22".repeat(32));
+    let token = |n: u8| format!("0x{n:064x}");
+
+    let kid = "0x38691296765e76a331f5d5630bddf9f5";
+    let want = normalize_content_id_bytes16(kid).unwrap();
+    // Newest binds the wanted KID; older binds a DIFFERENT KID — newest-first wins.
+    let newer_binder = encode_mint_calldata(
+        "0xdeadbeef",
+        "ipfs://meta",
+        0,
+        &encode_op_raw_free(kid).unwrap(),
+        &[],
+    )
+    .unwrap();
+    let older_other = encode_mint_calldata(
+        "0xdeadbeef",
+        "ipfs://meta",
+        0,
+        &encode_op_raw_free("0x00000000000000000000000000000001").unwrap(),
+        &[],
+    )
+    .unwrap();
+
+    let logs = json!([
+        esp1_asset_created_log(&creator_topic, &channel_topic, op_newer, &token(9), &tx_newer, 0x20),
+        esp1_asset_created_log(&creator_topic, &channel_topic, op_older, &token(7), &tx_older, 0x10),
+    ]);
+
+    // Every candidate's calldata is available → no false abort; the newest KID binder resolves.
+    let rpc_url = spawn_rpc_sequence_server(vec![
+        ("eth_getLogs", logs),
+        ("eth_getTransactionByHash", json!({ "input": newer_binder })),
+        ("eth_getTransactionByHash", json!({ "input": older_other })),
+    ]);
+    let provider = provider_with_rpc(rpc_url);
+    let network = provider.evm_network("esc-local").unwrap().clone();
+
+    let result = provider
+        .scan_asset_created_for_content_id(
+            &network,
+            &creator_topic,
+            &channel_topic,
+            &want,
+            0x0,
+            0x100,
+        )
+        .expect("a fully-available candidate set must resolve, not abort");
+    assert_eq!(
+        result,
+        Some((op_newer.to_string(), token(9))),
+        "newest KID binder wins when all candidate calldata is available"
+    );
+}
+
+#[test]
+fn trade_resolver_propagates_transport_error_on_candidate_fetch() {
+    let creator = "0x1111111111111111111111111111111111111111";
+    let channel = "0x2222222222222222222222222222222222222222";
+    let creator_topic = address_topic(creator).unwrap();
+    let channel_topic = address_topic(channel).unwrap();
+    let op_newer = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let tx_newer = format!("0x{}", "11".repeat(32));
+    let token = |n: u8| format!("0x{n:064x}");
+    let want = normalize_content_id_bytes16("0x38691296765e76a331f5d5630bddf9f5").unwrap();
+
+    let logs = json!([
+        esp1_asset_created_log(&creator_topic, &channel_topic, op_newer, &token(9), &tx_newer, 0x20),
+    ]);
+
+    // Only the getLogs call is served; the follow-up getTransactionByHash hits a closed socket.
+    // The transport error must PROPAGATE (via `?`), never be swallowed into Ok(None).
+    let rpc_url = spawn_rpc_sequence_server(vec![("eth_getLogs", logs)]);
+    let provider = provider_with_rpc(rpc_url);
+    let network = provider.evm_network("esc-local").unwrap().clone();
+
+    let result = provider.scan_asset_created_for_content_id(
+        &network,
+        &creator_topic,
+        &channel_topic,
+        &want,
+        0x0,
+        0x100,
+    );
+    match result {
+        Err(Response::Error { code, .. }) => assert_ne!(
+            code, "candidate_input_unavailable",
+            "a transport failure must surface as a transport error, not the fail-closed code"
+        ),
+        other => panic!("expected a propagated transport error, got {other:?}"),
+    }
+}

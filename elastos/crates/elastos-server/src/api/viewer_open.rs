@@ -318,21 +318,9 @@ pub async fn open_owned_in_viewer(
         .filter(|m| !m.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| owned.mime.clone());
-    let object_cid = capsule
-        .as_ref()
-        .and_then(|c| {
-            c.get("content_id")
-                .or_else(|| c.get("kid"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            owned
-                .content_cid
-                .clone()
-                .unwrap_or_else(|| format!("owned:{}", owned.name))
-        });
+    // Content id the live-chain rights gate reads back. Shared with `buy_owned_access` so a re-buy
+    // keys the SAME id this open later checks (see [`resolve_owned_content_id`]).
+    let object_cid = resolve_owned_content_id(&owned);
     let ext = extension_for(&owned.name, &render_mime);
 
     // Live-chain gate: the rights-provider capsule decides access (Anders' rule —
@@ -930,10 +918,12 @@ fn money_verb_refused(err: anyhow::Error) -> Response {
 /// POST /api/market/buy — buy an access token for an owned Library object, then report
 /// whether the rights gate will now allow the open.
 ///
-/// This resolves the object EXACTLY as `/api/viewers/open` does (same root-scoped read,
-/// same `content_id` derivation, same wallet `subject`), so the purchase is keyed on the
-/// identifier the rights gate reads back. The buy itself (assemble → sign → broadcast →
-/// await) lives in `buy_authority`; here we only authenticate, resolve, and report.
+/// This resolves the object EXACTLY as `/api/viewers/open` does: the legacy owned-root branch
+/// derives `content_id` through the SAME shared [`resolve_owned_content_id`] the open path calls
+/// (capsule `content_id`/`kid` first, then `content_cid`, then `owned:{name}`) and uses the same
+/// wallet `subject`, so the purchase is keyed on the identifier the rights gate reads back — even
+/// for a dKMS-capsule asset. The buy itself (assemble → sign → broadcast → await) lives in
+/// `buy_authority`; here we only authenticate, resolve, and report.
 pub async fn buy_owned_access(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -983,10 +973,10 @@ pub async fn buy_owned_access(
                     .into_response()
             }
         };
-        owned
-            .content_cid
-            .clone()
-            .unwrap_or_else(|| format!("owned:{}", owned.name))
+        // SAME derivation the open path uses (capsule `content_id`/`kid` first, then `content_cid`,
+        // then `owned:{name}`) — a dKMS-capsule re-buy MUST key on the capsule id the rights gate
+        // reads back, not `content_cid`/`owned:{name}` (which it never reads).
+        resolve_owned_content_id(&owned)
     };
     let subject = resolve_subject_address(&state, &principal_id).await;
     let now = now_unix();
@@ -1292,6 +1282,32 @@ fn dkms_capsule(bytes: &[u8]) -> Option<serde_json::Value> {
         .and_then(|s| s.as_str())
         .filter(|s| !s.is_empty())?;
     Some(v)
+}
+
+/// Single source of truth for the on-chain content id of an owned dDRM asset, shared by BOTH
+/// `/api/viewers/open` and the legacy owned-root re-buy branch of [`buy_owned_access`]. The open
+/// path is authoritative: its precedence is the capsule `content_id` (else `kid`) FIRST, then
+/// `owned.content_cid`, then `owned:{name}`. A minted dKMS asset is persisted AS its `.ddrm`
+/// capsule, so the id the live-chain rights gate reads back lives INSIDE the capsule — deriving it
+/// from `content_cid`/`owned:{name}` (as the old buy path did, never parsing the capsule) keyed a
+/// re-buy on an id the gate never reads, so money was spent and the open still denied. Routing both
+/// sites through here makes the buy/open derivations identical by construction.
+fn resolve_owned_content_id(owned: &crate::library::OwnedObjectForViewer) -> String {
+    dkms_capsule(&owned.bytes)
+        .as_ref()
+        .and_then(|c| {
+            c.get("content_id")
+                .or_else(|| c.get("kid"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            owned
+                .content_cid
+                .clone()
+                .unwrap_or_else(|| format!("owned:{}", owned.name))
+        })
 }
 
 /// The dKMS consumer-open: recover the minted asset's REAL CEK from the 2-of-3 quorum named by
@@ -1955,6 +1971,128 @@ mod tests {
         assert_eq!(grant_watermark_digest16_hex("  0x1234ABCD  "), GOLDEN);
         // 16 bytes => 32 hex chars.
         assert_eq!(grant_watermark_digest16_hex("anything").len(), 32);
+    }
+
+    // --- ESP-2: shared buy/open content-id resolver ------------------------------------------
+
+    /// A minimal but VALID `.ddrm` capsule (passes every `dkms_capsule` gate) pinning `content_id`.
+    fn capsule_bytes(content_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema": "elastos.ddrm.capsule/v1",
+            "content_id": content_id,
+            "mime": "image/png",
+            "ciphertext_b64": "QUJD",
+            "protections": [{
+                "scheme": "threshold-shamir-2of3",
+                "producer_verifying_key_b64": "cGs=",
+            }],
+        }))
+        .unwrap()
+    }
+
+    fn owned_for(
+        bytes: Vec<u8>,
+        content_cid: Option<&str>,
+        name: &str,
+    ) -> crate::library::OwnedObjectForViewer {
+        crate::library::OwnedObjectForViewer {
+            bytes,
+            mime: "application/octet-stream".to_string(),
+            content_cid: content_cid.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+
+    /// Byte-for-byte replica of the pre-refactor `/api/viewers/open` derivation (viewer_open.rs
+    /// ~321-335) — the source of truth. The shared resolver MUST equal this for every asset.
+    fn legacy_open_derivation(owned: &crate::library::OwnedObjectForViewer) -> String {
+        let capsule = dkms_capsule(&owned.bytes);
+        capsule
+            .as_ref()
+            .and_then(|c| {
+                c.get("content_id")
+                    .or_else(|| c.get("kid"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                owned
+                    .content_cid
+                    .clone()
+                    .unwrap_or_else(|| format!("owned:{}", owned.name))
+            })
+    }
+
+    /// REGRESSION (ESP-2): for a dKMS-capsule asset whose capsule `content_id` differs from its
+    /// `content_cid` AND its name, the shared resolver — used by BOTH open and the legacy re-buy
+    /// branch — MUST return the capsule `content_id` (the id the rights gate reads back), NOT the
+    /// `content_cid`/`owned:{name}` the old buy path keyed on. Fails on the pre-fix buy derivation.
+    #[test]
+    fn resolver_prefers_capsule_content_id_over_cid_and_name() {
+        let owned = owned_for(
+            capsule_bytes("0xabc123thekid"),
+            Some("ipfs://a-different-cid"),
+            "a-different-name.png",
+        );
+        assert_eq!(resolve_owned_content_id(&owned), "0xabc123thekid");
+        assert_ne!(resolve_owned_content_id(&owned), "ipfs://a-different-cid");
+        assert_ne!(
+            resolve_owned_content_id(&owned),
+            "owned:a-different-name.png"
+        );
+    }
+
+    /// The shared resolver is byte-identical to the open path's derivation for a capsule asset
+    /// (open is unchanged by the refactor).
+    #[test]
+    fn resolver_matches_open_derivation_for_capsule() {
+        let owned = owned_for(capsule_bytes("0xdeadbeef"), Some("ipfs://cid"), "n.png");
+        assert_eq!(
+            resolve_owned_content_id(&owned),
+            legacy_open_derivation(&owned)
+        );
+        assert_eq!(resolve_owned_content_id(&owned), "0xdeadbeef");
+    }
+
+    /// When the capsule omits `content_id` but carries `kid`, both open and buy use the `kid`.
+    #[test]
+    fn resolver_uses_kid_when_content_id_absent() {
+        let bytes = serde_json::to_vec(&json!({
+            "schema": "elastos.ddrm.capsule/v1",
+            "kid": "0xkidonly",
+            "ciphertext_b64": "QUJD",
+            "protections": [{ "scheme": "quorum", "producer_verifying_key_b64": "cGs=" }],
+        }))
+        .unwrap();
+        let owned = owned_for(bytes, Some("ipfs://cid"), "n.png");
+        assert_eq!(resolve_owned_content_id(&owned), "0xkidonly");
+        assert_eq!(
+            resolve_owned_content_id(&owned),
+            legacy_open_derivation(&owned)
+        );
+    }
+
+    /// Non-capsule / legacy assets are UNCHANGED: `content_cid` if present, else `owned:{name}`.
+    #[test]
+    fn resolver_non_capsule_falls_back_to_cid_then_name() {
+        let with_cid = owned_for(
+            b"not-a-capsule".to_vec(),
+            Some("ipfs://legacy-cid"),
+            "a.bin",
+        );
+        assert_eq!(resolve_owned_content_id(&with_cid), "ipfs://legacy-cid");
+        assert_eq!(
+            resolve_owned_content_id(&with_cid),
+            legacy_open_derivation(&with_cid)
+        );
+
+        let no_cid = owned_for(b"not-a-capsule".to_vec(), None, "a.bin");
+        assert_eq!(resolve_owned_content_id(&no_cid), "owned:a.bin");
+        assert_eq!(
+            resolve_owned_content_id(&no_cid),
+            legacy_open_derivation(&no_cid)
+        );
     }
 
     fn acct(id: &str, ns: &str, addr: &str, signable: bool) -> serde_json::Value {

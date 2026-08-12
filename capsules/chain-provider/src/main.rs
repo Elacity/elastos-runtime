@@ -2037,18 +2037,42 @@ impl ChainProvider {
             decoded.push((operative, token_id, block, log_index, tx_hash.to_string()));
         }
         decoded.sort_by(|a, b| (b.2, b.3).cmp(&(a.2, a.3)));
-        for (operative, token_id, _, _, tx_hash) in decoded {
-            let Some(input) = self.tx_input(network, &tx_hash)? else {
+        // Pre-fetch every candidate's mint calldata (live) BEFORE binding — the SAME MKT-1
+        // fail-closed-by-omission rule the buy resolver applies (ESP-1). `decoded` is newest-first
+        // and a re-mint reuses the KID, so silently skipping a candidate whose calldata is
+        // unavailable could fall through the newest mint to an OLDER same-KID binder — a wrong
+        // operative / wrong token-id trade-approval window. If ANY candidate's calldata cannot be
+        // fetched we abort the whole resolve rather than decide on a partial candidate set.
+        let mut inputs = std::collections::HashMap::new();
+        for (_, _, _, _, tx_hash) in &decoded {
+            if inputs.contains_key(tx_hash) {
                 continue;
-            };
-            // Precise decode for the canonical runtime mint; fall back to a content-bound
-            // substring match for RELAYED/forwarded mints whose OUTER ABI differs (the KID is
-            // still embedded in the calldata, just not at the canonical opRawData head offset).
-            let precise = decode_mint_content_id(&input)
+            }
+            match self.tx_input(network, tx_hash)? {
+                Some(input) => {
+                    inputs.insert(tx_hash.clone(), input);
+                }
+                None => {
+                    return Err(Response::error(
+                        "candidate_input_unavailable",
+                        &format!(
+                            "mint calldata for candidate tx {tx_hash} is unavailable; refusing to resolve on a partial candidate set (fail-closed)"
+                        ),
+                    ));
+                }
+            }
+        }
+        // Newest-first: the first candidate whose calldata binds the KID wins. Precise decode for
+        // the canonical runtime mint; fall back to a content-bound substring match for
+        // RELAYED/forwarded mints whose OUTER ABI differs (the KID is still embedded in the
+        // calldata, just not at the canonical opRawData head offset).
+        for (operative, token_id, _, _, tx_hash) in decoded {
+            let input = &inputs[&tx_hash];
+            let precise = decode_mint_content_id(input)
                 .and_then(|cid| normalize_content_id_bytes16(&cid))
                 .as_deref()
                 == Some(want_content_id);
-            if precise || mint_input_binds_content_id(&input, want_content_id) {
+            if precise || mint_input_binds_content_id(input, want_content_id) {
                 return Ok(Some((operative, token_id)));
             }
         }
