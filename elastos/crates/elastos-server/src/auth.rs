@@ -1,14 +1,12 @@
 //! Runtime-owned authentication state for proof-bound sessions.
 
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
-
-#[cfg(test)]
-use std::collections::HashMap;
 
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
@@ -72,6 +70,46 @@ const MAX_MIGRATION_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 static AUTH_STATE_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static AUDIT_CHAIN_ACTIVATION_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PRINCIPAL_ROOT_OBJECT_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static VERIFIED_AUTH_STATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, VerifiedAuthStateCacheEntry>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static VERIFY_AUDIT_CHAIN_CALLS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+static VERIFIED_AUTH_STATE_CACHE_FILL_HOOKS: OnceLock<
+    Mutex<HashMap<PathBuf, VerifiedAuthStateCacheBoundaryHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static VERIFIED_AUTH_STATE_CACHE_HIT_HOOKS: OnceLock<
+    Mutex<HashMap<PathBuf, VerifiedAuthStateCacheBoundaryHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+struct VerifiedAuthStateCacheBoundaryHook {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegularFileIdentity {
+    dev: u64,
+    ino: u64,
+    mtime_secs: i64,
+    mtime_nanos: i64,
+    ctime_secs: i64,
+    ctime_nanos: i64,
+    len: u64,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedAuthStateCacheEntry {
+    auth_state_identity: Option<RegularFileIdentity>,
+    activation_identity: Option<RegularFileIdentity>,
+    runtime_device_key_identity: Option<RegularFileIdentity>,
+    state: AuthState,
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +244,242 @@ fn audit_chain_activation_mutation_lock() -> &'static Mutex<()> {
 
 fn principal_root_object_mutation_lock() -> &'static Mutex<()> {
     PRINCIPAL_ROOT_OBJECT_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn verified_auth_state_cache() -> &'static Mutex<HashMap<PathBuf, VerifiedAuthStateCacheEntry>> {
+    VERIFIED_AUTH_STATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn auth_state_cache_key(data_dir: &Path) -> PathBuf {
+    std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf())
+}
+
+fn regular_file_identity_from_metadata(
+    metadata: &std::fs::Metadata,
+    label: &str,
+) -> anyhow::Result<RegularFileIdentity> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("{label} must be a regular non-symlink file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(RegularFileIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mtime_secs: metadata.mtime(),
+            mtime_nanos: metadata.mtime_nsec(),
+            ctime_secs: metadata.ctime(),
+            ctime_nanos: metadata.ctime_nsec(),
+            len: metadata.len(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        use std::time::{Duration, UNIX_EPOCH};
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let duration = modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0));
+        Ok(RegularFileIdentity {
+            dev: 0,
+            ino: 0,
+            mtime_secs: duration.as_secs() as i64,
+            mtime_nanos: duration.subsec_nanos() as i64,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+            len: metadata.len(),
+        })
+    }
+}
+
+fn observe_optional_regular_file_identity(
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {label} {path:?}"));
+        }
+    };
+    Ok(Some(regular_file_identity_from_metadata(&metadata, label)?))
+}
+
+fn observe_auth_state_file_identity(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    observe_optional_regular_file_identity(&auth_state_path(data_dir)?, "auth state")
+}
+
+fn observe_audit_chain_activation_file_identity(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    observe_optional_regular_file_identity(
+        &audit_chain_activation_path(data_dir)?,
+        "audit chain activation record",
+    )
+}
+
+fn observe_runtime_device_key_file_identity(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RegularFileIdentity>> {
+    observe_optional_regular_file_identity(
+        &elastos_identity::device_key_path(data_dir),
+        "runtime device key",
+    )
+}
+
+fn invalidate_verified_auth_state_cache(data_dir: &Path) {
+    let key = auth_state_cache_key(data_dir);
+    if let Ok(mut cache) = verified_auth_state_cache().lock() {
+        cache.remove(&key);
+    }
+}
+
+fn store_verified_auth_state_cache(
+    data_dir: &Path,
+    auth_state_identity: Option<RegularFileIdentity>,
+    activation_identity: Option<RegularFileIdentity>,
+    runtime_device_key_identity: Option<RegularFileIdentity>,
+    state: &AuthState,
+) {
+    let key = auth_state_cache_key(data_dir);
+    if let Ok(mut cache) = verified_auth_state_cache().lock() {
+        cache.insert(
+            key,
+            VerifiedAuthStateCacheEntry {
+                auth_state_identity,
+                activation_identity,
+                runtime_device_key_identity,
+                state: state.clone(),
+            },
+        );
+    }
+}
+
+fn take_verified_auth_state_cache_hit(
+    data_dir: &Path,
+    auth_state_identity: Option<RegularFileIdentity>,
+    activation_identity: Option<RegularFileIdentity>,
+    runtime_device_key_identity: Option<RegularFileIdentity>,
+) -> Option<AuthState> {
+    let key = auth_state_cache_key(data_dir);
+    let cache = verified_auth_state_cache().lock().ok()?;
+    let entry = cache.get(&key)?;
+    if entry.auth_state_identity == auth_state_identity
+        && entry.activation_identity == activation_identity
+        && entry.runtime_device_key_identity == runtime_device_key_identity
+    {
+        Some(entry.state.clone())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn verify_audit_chain_call_count(data_dir: &Path) -> usize {
+    let key = auth_state_cache_key(data_dir);
+    VERIFY_AUDIT_CHAIN_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|calls| calls.get(&key).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn record_verify_audit_chain_call(data_dir: &Path) {
+    let key = auth_state_cache_key(data_dir);
+    if let Ok(mut calls) = VERIFY_AUDIT_CHAIN_CALLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        *calls.entry(key).or_insert(0) += 1;
+    }
+}
+
+#[cfg(test)]
+fn install_verified_auth_state_cache_fill_hook(
+    data_dir: &Path,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let key = auth_state_cache_key(data_dir);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    VERIFIED_AUTH_STATE_CACHE_FILL_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("cache-fill hook lock")
+        .insert(
+            key,
+            VerifiedAuthStateCacheBoundaryHook {
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+    (reached_rx, resume_tx)
+}
+
+#[cfg(test)]
+fn run_verified_auth_state_cache_fill_hook(data_dir: &Path) -> anyhow::Result<()> {
+    let key = auth_state_cache_key(data_dir);
+    let hook = VERIFIED_AUTH_STATE_CACHE_FILL_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("cache-fill hook lock poisoned"))?
+        .remove(&key);
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    hook.reached
+        .send(())
+        .map_err(|_| anyhow!("cache-fill test observer closed"))?;
+    hook.resume
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| anyhow!("cache-fill test resume timed out"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn install_verified_auth_state_cache_hit_hook(
+    data_dir: &Path,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let key = auth_state_cache_key(data_dir);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    VERIFIED_AUTH_STATE_CACHE_HIT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("cache-hit hook lock")
+        .insert(
+            key,
+            VerifiedAuthStateCacheBoundaryHook {
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+    (reached_rx, resume_tx)
+}
+
+#[cfg(test)]
+fn run_verified_auth_state_cache_hit_hook(data_dir: &Path) -> anyhow::Result<()> {
+    let key = auth_state_cache_key(data_dir);
+    let hook = VERIFIED_AUTH_STATE_CACHE_HIT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| anyhow!("cache-hit hook lock poisoned"))?
+        .remove(&key);
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    hook.reached
+        .send(())
+        .map_err(|_| anyhow!("cache-hit test observer closed"))?;
+    hook.resume
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| anyhow!("cache-hit test resume timed out"))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,7 +738,7 @@ struct AuditChainCheckpointV1 {
     anchor_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct AuditChainActivationV2 {
     schema: String,
@@ -780,7 +1054,7 @@ fn persist_audit_chain_activation_unlocked(
     data_dir: &Path,
     activated_at: u64,
     checkpoint: &AuditChainCheckpointV1,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RegularFileIdentity> {
     let path = audit_chain_activation_path(data_dir)?;
     if let Some(parent) = path.parent() {
         ensure_regular_auth_parent(data_dir, parent)?;
@@ -798,7 +1072,18 @@ fn persist_audit_chain_activation_unlocked(
         signer_did,
         signature,
     };
-    write_secret_json_atomic(&path, &activation)
+    write_secret_json_atomic(&path, &activation)?;
+    let identity_before = observe_audit_chain_activation_file_identity(data_dir)?
+        .ok_or_else(|| anyhow!("audit chain activation disappeared after persistence"))?;
+    let persisted = load_audit_chain_activation_unlocked(data_dir)?
+        .ok_or_else(|| anyhow!("audit chain activation disappeared after persistence"))?;
+    let identity_after = observe_audit_chain_activation_file_identity(data_dir)?
+        .ok_or_else(|| anyhow!("audit chain activation disappeared after persistence"))?;
+    if identity_before != identity_after || persisted != activation {
+        anyhow::bail!("audit chain activation changed concurrently during persistence");
+    }
+    invalidate_verified_auth_state_cache(data_dir);
+    Ok(identity_after)
 }
 
 fn validate_checkpoint_progress(
@@ -876,51 +1161,111 @@ fn write_secret_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Resu
 
 pub fn load_auth_state(data_dir: &Path) -> anyhow::Result<AuthState> {
     with_audit_chain_activation_lock(data_dir, || {
-        let stored_state = load_auth_state_unverified(data_dir)?;
-        let state_was_present = stored_state.is_some();
-        let mut state = stored_state.unwrap_or_default();
-        let activation = load_audit_chain_activation_unlocked(data_dir)?;
-        match (state.audit_chain_state.as_ref(), activation.as_ref()) {
-            (Some(chain_state), Some(activation)) => {
-                verify_audit_chain(data_dir, &state)?;
-                if chain_state.activated_at != activation.activated_at {
-                    anyhow::bail!("audit chain state does not match its activation record");
-                }
-                let checkpoint = audit_chain_checkpoint(&state)?
-                    .expect("audit chain state must produce a checkpoint");
-                if validate_checkpoint_progress(&activation.checkpoint, &checkpoint)? {
-                    persist_audit_chain_activation_unlocked(
-                        data_dir,
-                        chain_state.activated_at,
-                        &checkpoint,
-                    )?;
-                }
+        for _ in 0..2 {
+            if let Some(state) = load_auth_state_locked_once(data_dir)? {
+                return Ok(state);
             }
-            (Some(chain_state), None) => {
-                verify_audit_chain(data_dir, &state)
-                    .context("cannot recover audit activation from invalid signed chain state")?;
-                let checkpoint = audit_chain_checkpoint(&state)?
-                    .expect("audit chain state must produce a checkpoint");
-                persist_audit_chain_activation_unlocked(
+        }
+        anyhow::bail!("auth state changed concurrently while it was being verified")
+    })
+}
+
+fn load_auth_state_locked_once(data_dir: &Path) -> anyhow::Result<Option<AuthState>> {
+    let initial_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+    let mut expected_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
+    let initial_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
+    if let Some(cached) = take_verified_auth_state_cache_hit(
+        data_dir,
+        initial_auth_state_identity,
+        expected_activation_identity,
+        initial_runtime_device_key_identity,
+    ) {
+        #[cfg(test)]
+        run_verified_auth_state_cache_hit_hook(data_dir)?;
+        let final_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+        let final_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
+        let final_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
+        if final_auth_state_identity != initial_auth_state_identity
+            || final_activation_identity != expected_activation_identity
+            || final_runtime_device_key_identity != initial_runtime_device_key_identity
+        {
+            invalidate_verified_auth_state_cache(data_dir);
+            return Ok(None);
+        }
+        let mut state = cached;
+        prune_auth_state(&mut state, now_ts());
+        return Ok(Some(state));
+    }
+
+    let stored_state = load_auth_state_unverified(data_dir)?;
+    let state_was_present = stored_state.is_some();
+    let mut state = stored_state.unwrap_or_default();
+    let activation = load_audit_chain_activation_unlocked(data_dir)?;
+    let mut verified_in_match = false;
+    match (state.audit_chain_state.as_ref(), activation.as_ref()) {
+        (Some(chain_state), Some(activation)) => {
+            verify_audit_chain(data_dir, &state)?;
+            verified_in_match = true;
+            if chain_state.activated_at != activation.activated_at {
+                anyhow::bail!("audit chain state does not match its activation record");
+            }
+            let checkpoint = audit_chain_checkpoint(&state)?
+                .expect("audit chain state must produce a checkpoint");
+            if validate_checkpoint_progress(&activation.checkpoint, &checkpoint)? {
+                expected_activation_identity = Some(persist_audit_chain_activation_unlocked(
                     data_dir,
                     chain_state.activated_at,
                     &checkpoint,
-                )?;
+                )?);
             }
-            (None, Some(_)) => {
-                anyhow::bail!("audit chain state is required after activation");
-            }
-            (None, None) if state_was_present && auth_state_requires_audit_chain(&state) => {
-                anyhow::bail!(
-                    "unchained auth state is unsupported; preserve and back up the existing data root, then use a fresh data root; no automatic migration or offline migration script is provided"
-                );
-            }
-            (None, None) => {}
         }
+        (Some(chain_state), None) => {
+            verify_audit_chain(data_dir, &state)
+                .context("cannot recover audit activation from invalid signed chain state")?;
+            verified_in_match = true;
+            let checkpoint = audit_chain_checkpoint(&state)?
+                .expect("audit chain state must produce a checkpoint");
+            expected_activation_identity = Some(persist_audit_chain_activation_unlocked(
+                data_dir,
+                chain_state.activated_at,
+                &checkpoint,
+            )?);
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("audit chain state is required after activation");
+        }
+        (None, None) if state_was_present && auth_state_requires_audit_chain(&state) => {
+            anyhow::bail!(
+                "unchained auth state is unsupported; preserve and back up the existing data root, then use a fresh data root; no automatic migration or offline migration script is provided"
+            );
+        }
+        (None, None) => {}
+    }
+    if !verified_in_match {
         verify_audit_chain(data_dir, &state)?;
-        prune_auth_state(&mut state, now_ts());
-        Ok(state)
-    })
+    }
+    #[cfg(test)]
+    run_verified_auth_state_cache_fill_hook(data_dir)?;
+
+    let final_auth_state_identity = observe_auth_state_file_identity(data_dir)?;
+    let final_activation_identity = observe_audit_chain_activation_file_identity(data_dir)?;
+    let final_runtime_device_key_identity = observe_runtime_device_key_file_identity(data_dir)?;
+    if final_auth_state_identity != initial_auth_state_identity
+        || final_activation_identity != expected_activation_identity
+        || final_runtime_device_key_identity != initial_runtime_device_key_identity
+    {
+        invalidate_verified_auth_state_cache(data_dir);
+        return Ok(None);
+    }
+    store_verified_auth_state_cache(
+        data_dir,
+        initial_auth_state_identity,
+        expected_activation_identity,
+        initial_runtime_device_key_identity,
+        &state,
+    );
+    prune_auth_state(&mut state, now_ts());
+    Ok(Some(state))
 }
 
 fn auth_state_requires_audit_chain(state: &AuthState) -> bool {
@@ -1005,6 +1350,7 @@ pub(crate) fn save_auth_state(data_dir: &Path, state: &AuthState) -> anyhow::Res
                 )?;
             }
         }
+        invalidate_verified_auth_state_cache(data_dir);
         Ok(())
     })
 }
@@ -2524,6 +2870,8 @@ fn require_runtime_audit_signer(
 }
 
 fn verify_audit_chain(data_dir: &Path, state: &AuthState) -> anyhow::Result<()> {
+    #[cfg(test)]
+    record_verify_audit_chain_call(data_dir);
     if state.audit.is_empty()
         && state.audit_chain.is_empty()
         && state.audit_chain_state.is_none()
@@ -4395,6 +4743,396 @@ pub(crate) fn store_test_principal_root_protection(
 mod tests {
     use super::*;
     use elastos_runtime::auth::PasskeyWebAuthnBinding;
+
+    #[test]
+    fn verified_auth_state_cache_returns_equivalent_state_on_unchanged_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+
+        let verifies_before_first = verify_audit_chain_call_count(data_dir.path());
+        let first = load_auth_state(data_dir.path()).unwrap();
+        let verifies_after_first = verify_audit_chain_call_count(data_dir.path());
+        assert!(
+            verifies_after_first > verifies_before_first,
+            "first load should verify the audit chain"
+        );
+
+        let second = load_auth_state(data_dir.path()).unwrap();
+        assert_eq!(
+            verify_audit_chain_call_count(data_dir.path()),
+            verifies_after_first,
+            "cache hit must not re-verify"
+        );
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        assert!(second.guest_registration_enabled);
+    }
+
+    #[test]
+    fn verified_auth_state_cache_invalidates_after_save_mutation() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let enabled = load_auth_state(data_dir.path()).unwrap();
+        assert!(enabled.guest_registration_enabled);
+
+        set_guest_registration_enabled(data_dir.path(), false, 30).unwrap();
+        let disabled = load_auth_state(data_dir.path()).unwrap();
+        assert!(!disabled.guest_registration_enabled);
+        assert_eq!(disabled.audit.len(), enabled.audit.len() + 1);
+    }
+
+    #[test]
+    fn verified_auth_state_cache_does_not_return_stale_after_external_rewrite() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let enabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let enabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+        let enabled = load_auth_state(data_dir.path()).unwrap();
+        assert!(enabled.guest_registration_enabled);
+
+        set_guest_registration_enabled(data_dir.path(), false, 30).unwrap();
+        let disabled = load_auth_state(data_dir.path()).unwrap();
+        assert!(!disabled.guest_registration_enabled);
+
+        // External rewrite restores prior auth-state + activation without save_auth_state.
+        // Changing only auth-state.json would trip activation rollback detection; both must move.
+        std::fs::write(&auth_path, &enabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &enabled_activation_bytes).unwrap();
+        let restored = load_auth_state(data_dir.path()).unwrap();
+        assert!(
+            restored.guest_registration_enabled,
+            "external rewrite must bypass the process-local cache"
+        );
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&enabled).unwrap()
+        );
+    }
+
+    #[test]
+    fn verified_auth_state_cache_retries_when_files_change_before_cache_fill() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let enabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let enabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+
+        set_guest_registration_enabled(data_dir.path(), false, 30).unwrap();
+        let disabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let disabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+
+        std::fs::write(&auth_path, &enabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &enabled_activation_bytes).unwrap();
+        invalidate_verified_auth_state_cache(data_dir.path());
+        let verifies_before = verify_audit_chain_call_count(data_dir.path());
+        let (verified, resume) = install_verified_auth_state_cache_fill_hook(data_dir.path());
+        let loader_data_dir = data_dir.path().to_path_buf();
+        let loader = std::thread::spawn(move || load_auth_state(&loader_data_dir));
+
+        verified
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load reached the cache-fill boundary");
+        std::fs::write(&auth_path, &disabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &disabled_activation_bytes).unwrap();
+        resume.send(()).unwrap();
+
+        let loaded = loader.join().unwrap().unwrap();
+        assert!(
+            !loaded.guest_registration_enabled,
+            "verified enabled state must not be cached under the disabled file identities"
+        );
+        let verifies_after_retry = verify_audit_chain_call_count(data_dir.path());
+        assert!(verifies_after_retry >= verifies_before + 2);
+
+        let cached = load_auth_state(data_dir.path()).unwrap();
+        assert!(!cached.guest_registration_enabled);
+        assert_eq!(
+            verify_audit_chain_call_count(data_dir.path()),
+            verifies_after_retry,
+            "the retry result should be cached only under its own file identities"
+        );
+    }
+
+    #[test]
+    fn verified_auth_state_cache_retries_when_files_change_before_cache_hit_return() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let activation_path = audit_chain_activation_path(data_dir.path()).unwrap();
+        let enabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let enabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+
+        set_guest_registration_enabled(data_dir.path(), false, 30).unwrap();
+        let disabled_auth_bytes = std::fs::read(&auth_path).unwrap();
+        let disabled_activation_bytes = std::fs::read(&activation_path).unwrap();
+
+        std::fs::write(&auth_path, &enabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &enabled_activation_bytes).unwrap();
+        invalidate_verified_auth_state_cache(data_dir.path());
+        assert!(
+            load_auth_state(data_dir.path())
+                .unwrap()
+                .guest_registration_enabled
+        );
+        let verifies_after_prime = verify_audit_chain_call_count(data_dir.path());
+        let (hit_observed, resume) = install_verified_auth_state_cache_hit_hook(data_dir.path());
+        let loader_data_dir = data_dir.path().to_path_buf();
+        let loader = std::thread::spawn(move || load_auth_state(&loader_data_dir));
+
+        hit_observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load reached the cache-hit return boundary");
+        std::fs::write(&auth_path, &disabled_auth_bytes).unwrap();
+        std::fs::write(&activation_path, &disabled_activation_bytes).unwrap();
+        resume.send(()).unwrap();
+
+        let loaded = loader.join().unwrap().unwrap();
+        assert!(
+            !loaded.guest_registration_enabled,
+            "cache hit must not return enabled state after both files changed to disabled"
+        );
+        let verifies_after_retry = verify_audit_chain_call_count(data_dir.path());
+        assert!(verifies_after_retry > verifies_after_prime);
+
+        let cached = load_auth_state(data_dir.path()).unwrap();
+        assert!(!cached.guest_registration_enabled);
+        assert_eq!(
+            verify_audit_chain_call_count(data_dir.path()),
+            verifies_after_retry,
+            "the changed state should be cached only after full verification"
+        );
+    }
+
+    #[test]
+    fn verified_auth_state_cache_retries_when_runtime_device_key_changes_before_cache_fill() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        invalidate_verified_auth_state_cache(data_dir.path());
+        let (verified, resume) = install_verified_auth_state_cache_fill_hook(data_dir.path());
+        let device_key_path = elastos_identity::device_key_path(data_dir.path());
+        let replacement = [7_u8; 32];
+        let loader_data_dir = data_dir.path().to_path_buf();
+        let loader = std::thread::spawn(move || load_auth_state(&loader_data_dir));
+
+        verified
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load reached the cache-fill boundary");
+        std::fs::write(&device_key_path, replacement).unwrap();
+        resume.send(()).unwrap();
+
+        let error = loader
+            .join()
+            .unwrap()
+            .expect_err("runtime device key replacement must fail closed");
+        assert!(!error.to_string().is_empty());
+        let repeat_error = load_auth_state(data_dir.path())
+            .expect_err("changed runtime device key must not retain a cached verified state");
+        assert!(!repeat_error.to_string().is_empty());
+    }
+
+    #[test]
+    fn verified_auth_state_cache_retries_when_runtime_device_key_changes_before_cache_hit_return() {
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        invalidate_verified_auth_state_cache(data_dir.path());
+        assert!(
+            load_auth_state(data_dir.path())
+                .unwrap()
+                .guest_registration_enabled
+        );
+        let (hit_observed, resume) = install_verified_auth_state_cache_hit_hook(data_dir.path());
+        let device_key_path = elastos_identity::device_key_path(data_dir.path());
+        let replacement = [9_u8; 32];
+        let loader_data_dir = data_dir.path().to_path_buf();
+        let loader = std::thread::spawn(move || load_auth_state(&loader_data_dir));
+
+        hit_observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load reached the cache-hit return boundary");
+        std::fs::write(&device_key_path, replacement).unwrap();
+        resume.send(()).unwrap();
+
+        let error = loader
+            .join()
+            .unwrap()
+            .expect_err("runtime device key replacement must fail closed");
+        assert!(!error.to_string().is_empty());
+        let repeat_error = load_auth_state(data_dir.path())
+            .expect_err("cache hit must be invalidated after runtime device key replacement");
+        assert!(!repeat_error.to_string().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_auth_state_cache_detects_same_size_rewrite_with_restored_mtime() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let original = std::fs::read(&auth_path).unwrap();
+        let original_metadata = std::fs::metadata(&auth_path).unwrap();
+        let original_identity =
+            regular_file_identity_from_metadata(&original_metadata, "auth state").unwrap();
+
+        let verifies_before_prime = verify_audit_chain_call_count(data_dir.path());
+        assert!(
+            load_auth_state(data_dir.path())
+                .unwrap()
+                .guest_registration_enabled
+        );
+        let verifies_after_prime = verify_audit_chain_call_count(data_dir.path());
+        assert!(verifies_after_prime > verifies_before_prime);
+
+        let mut tampered = original.clone();
+        let marker = b"\"signature\":";
+        let marker_start = tampered
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("stored AuthState has a signed audit entry");
+        let signature_start = tampered[marker_start + marker.len()..]
+            .iter()
+            .position(|byte| *byte == b'\"')
+            .map(|offset| marker_start + marker.len() + offset + 1)
+            .expect("signature value is a JSON string");
+        tampered[signature_start] = if tampered[signature_start] == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        assert_eq!(tampered.len(), original.len());
+
+        let mut file = OpenOptions::new().write(true).open(&auth_path).unwrap();
+        file.write_all(&tampered).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let path = CString::new(auth_path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: original_identity.mtime_secs as libc::time_t,
+                tv_nsec: original_identity.mtime_nanos as libc::c_long,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+
+        let rewritten_identity = regular_file_identity_from_metadata(
+            &std::fs::metadata(&auth_path).unwrap(),
+            "auth state",
+        )
+        .unwrap();
+        assert_eq!(rewritten_identity.dev, original_identity.dev);
+        assert_eq!(rewritten_identity.ino, original_identity.ino);
+        assert_eq!(rewritten_identity.len, original_identity.len);
+        assert_eq!(
+            (
+                rewritten_identity.mtime_secs,
+                rewritten_identity.mtime_nanos
+            ),
+            (original_identity.mtime_secs, original_identity.mtime_nanos)
+        );
+        assert_ne!(
+            (
+                rewritten_identity.ctime_secs,
+                rewritten_identity.ctime_nanos
+            ),
+            (original_identity.ctime_secs, original_identity.ctime_nanos)
+        );
+
+        let error = load_auth_state(data_dir.path())
+            .expect_err("ctime change must prevent returning the cached verified state");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_auth_state_cache_detects_same_size_runtime_device_key_replacement_with_restored_mtime(
+    ) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        set_guest_registration_enabled(data_dir.path(), true, 20).unwrap();
+        let device_key_path = elastos_identity::device_key_path(data_dir.path());
+        let original = std::fs::read(&device_key_path).unwrap();
+        let original_metadata = std::fs::metadata(&device_key_path).unwrap();
+        let original_identity =
+            regular_file_identity_from_metadata(&original_metadata, "runtime device key").unwrap();
+
+        let verifies_before_prime = verify_audit_chain_call_count(data_dir.path());
+        assert!(
+            load_auth_state(data_dir.path())
+                .unwrap()
+                .guest_registration_enabled
+        );
+        let verifies_after_prime = verify_audit_chain_call_count(data_dir.path());
+        assert!(verifies_after_prime > verifies_before_prime);
+
+        let replacement = vec![original[0].wrapping_add(1); original.len()];
+        assert_eq!(replacement.len(), original.len());
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&device_key_path)
+            .unwrap();
+        file.write_all(&replacement).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let path = CString::new(device_key_path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: original_identity.mtime_secs as libc::time_t,
+                tv_nsec: original_identity.mtime_nanos as libc::c_long,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+
+        let rewritten_identity = regular_file_identity_from_metadata(
+            &std::fs::metadata(&device_key_path).unwrap(),
+            "runtime device key",
+        )
+        .unwrap();
+        assert_eq!(rewritten_identity.dev, original_identity.dev);
+        assert_eq!(rewritten_identity.ino, original_identity.ino);
+        assert_eq!(rewritten_identity.len, original_identity.len);
+        assert_eq!(
+            (
+                rewritten_identity.mtime_secs,
+                rewritten_identity.mtime_nanos
+            ),
+            (original_identity.mtime_secs, original_identity.mtime_nanos)
+        );
+        assert_ne!(
+            (
+                rewritten_identity.ctime_secs,
+                rewritten_identity.ctime_nanos
+            ),
+            (original_identity.ctime_secs, original_identity.ctime_nanos)
+        );
+
+        let error = load_auth_state(data_dir.path())
+            .expect_err("ctime change on runtime device key must prevent returning cached state");
+        assert!(!error.to_string().is_empty());
+    }
 
     fn test_audit_event(index: u64) -> RuntimeAuditEventV1 {
         RuntimeAuditEventV1 {
