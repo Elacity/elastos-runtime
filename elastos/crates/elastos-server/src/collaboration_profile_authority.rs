@@ -349,6 +349,7 @@ pub(crate) fn update_profile_authority(
     if bytes.len() > MAX_PROFILE_AUTHORITY_BUNDLE_BYTES {
         anyhow::bail!("profile authority bundle is too large");
     }
+    prepare_profile_authority_parent_for_write(data_dir, &path)?;
     crate::auth::write_protected_principal_root_object(
         data_dir,
         principal_id,
@@ -504,6 +505,12 @@ pub(crate) fn restore_profile_authority_bundle_for_recovery(
         anyhow::bail!("recovered profile signing seed does not control the recovered Profile DID");
     }
     let path = profile_authority_path(data_dir, localhost_root)?;
+    if crate::auth::load_principal_root_protection(data_dir, principal_id, localhost_root)?
+        .is_none()
+    {
+        anyhow::bail!("protected principal root is required for profile authority");
+    }
+    prepare_profile_authority_parent_for_write(data_dir, &path)?;
     crate::auth::write_protected_principal_root_object(
         data_dir,
         principal_id,
@@ -513,6 +520,13 @@ pub(crate) fn restore_profile_authority_bundle_for_recovery(
         &bytes,
     )?;
     Ok(verified)
+}
+
+fn prepare_profile_authority_parent_for_write(data_dir: &Path, path: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("profile authority path has no parent"))?;
+    crate::auth::create_owner_only_dir_all(data_dir, parent)
 }
 
 /// The exact signed chain segment to announce, oldest first, ending at the head.
@@ -1275,6 +1289,221 @@ mod tests {
         assert!(!path.exists());
         assert!(!path.parent().unwrap().exists());
         assert!(!dir.path().join("identity").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_mutation_bootstraps_owner_only_parent_chain_before_first_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = owner_only_tempdir();
+        let principal_id = "person:local:profile-parent-bootstrap";
+        let localhost_root = crate::auth::principal_localhost_root(principal_id);
+        write_device_key(dir.path(), 31);
+        let proof_binding_id = store_passkey_principal(
+            dir.path(),
+            principal_id,
+            "credential-parent-bootstrap",
+            None,
+        );
+        crate::auth::store_test_principal_root_protection(dir.path(), principal_id);
+        let path = profile_authority_path(dir.path(), &localhost_root).unwrap();
+        assert!(!path.parent().unwrap().exists());
+
+        update_profile_authority(
+            dir.path(),
+            principal_id,
+            &localhost_root,
+            &proof_binding_id,
+            "Profile Bootstrap",
+            None,
+            1_787_000_000,
+        )
+        .unwrap();
+
+        let relative_parent = path.parent().unwrap().strip_prefix(dir.path()).unwrap();
+        let mut current = dir.path().to_path_buf();
+        for component in relative_parent.components() {
+            current.push(component.as_os_str());
+            assert_eq!(
+                std::fs::symlink_metadata(&current)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "{} is not owner-only",
+                current.display()
+            );
+        }
+        assert!(path.is_file());
+        assert_eq!(
+            load_profile_authority(dir.path(), principal_id, &localhost_root)
+                .unwrap()
+                .unwrap()
+                .document()
+                .display_name,
+            "Profile Bootstrap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_mutation_narrows_legacy_public_card_parent_without_changing_card() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = owner_only_tempdir();
+        let principal_id = "person:local:legacy-profile-card";
+        let localhost_root = crate::auth::principal_localhost_root(principal_id);
+        write_device_key(dir.path(), 32);
+        let proof_binding_id = store_passkey_principal(
+            dir.path(),
+            principal_id,
+            "credential-legacy-profile-card",
+            None,
+        );
+        crate::auth::store_test_principal_root_protection(dir.path(), principal_id);
+        let path = profile_authority_path(dir.path(), &localhost_root).unwrap();
+        let profile_dir = path.parent().unwrap();
+        crate::auth::create_owner_only_dir_all(dir.path(), profile_dir.parent().unwrap()).unwrap();
+        std::fs::create_dir(profile_dir).unwrap();
+        std::fs::set_permissions(profile_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let public_card = profile_dir.join("profile-card.json");
+        let public_card_bytes = br#"{"schema":"elastos.profile-card/v1","display_name":"Legacy"}"#;
+        std::fs::write(&public_card, public_card_bytes).unwrap();
+        std::fs::set_permissions(&public_card, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        update_profile_authority(
+            dir.path(),
+            principal_id,
+            &localhost_root,
+            &proof_binding_id,
+            "Migrated Profile",
+            None,
+            1_787_000_001,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::symlink_metadata(profile_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(std::fs::read(&public_card).unwrap(), public_card_bytes);
+        assert_eq!(
+            std::fs::symlink_metadata(&public_card)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_load_does_not_create_or_narrow_legacy_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = owner_only_tempdir();
+        let principal_id = "person:local:read-only-legacy-profile";
+        let localhost_root = crate::auth::principal_localhost_root(principal_id);
+        let path = profile_authority_path(dir.path(), &localhost_root).unwrap();
+        let profile_dir = path.parent().unwrap();
+        crate::auth::create_owner_only_dir_all(dir.path(), profile_dir.parent().unwrap()).unwrap();
+        std::fs::create_dir(profile_dir).unwrap();
+        std::fs::set_permissions(profile_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let public_card = profile_dir.join("profile-card.json");
+        let public_card_bytes = b"public profile card";
+        std::fs::write(&public_card, public_card_bytes).unwrap();
+        std::fs::set_permissions(&public_card, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            load_profile_authority(dir.path(), principal_id, &localhost_root)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::symlink_metadata(profile_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read(&public_card).unwrap(), public_card_bytes);
+        assert_eq!(
+            std::fs::symlink_metadata(&public_card)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_mutation_rejects_symlink_and_non_directory_parents_without_writing() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for parent_kind in ["symlink", "non-directory"] {
+            let dir = owner_only_tempdir();
+            let principal_id = format!("person:local:profile-parent-{parent_kind}");
+            let localhost_root = crate::auth::principal_localhost_root(&principal_id);
+            write_device_key(dir.path(), 33);
+            let proof_binding_id = store_passkey_principal(
+                dir.path(),
+                &principal_id,
+                &format!("credential-profile-parent-{parent_kind}"),
+                None,
+            );
+            crate::auth::store_test_principal_root_protection(dir.path(), &principal_id);
+            let path = profile_authority_path(dir.path(), &localhost_root).unwrap();
+            let profile_dir = path.parent().unwrap();
+            crate::auth::create_owner_only_dir_all(dir.path(), profile_dir.parent().unwrap())
+                .unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let sentinel = b"must remain unchanged";
+            if parent_kind == "symlink" {
+                symlink(outside.path(), profile_dir).unwrap();
+            } else {
+                std::fs::write(profile_dir, sentinel).unwrap();
+                std::fs::set_permissions(profile_dir, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+
+            let error = update_profile_authority(
+                dir.path(),
+                &principal_id,
+                &localhost_root,
+                &proof_binding_id,
+                "Rejected Profile",
+                None,
+                1_787_000_002,
+            )
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("owner-only directory")
+                    || error
+                        .to_string()
+                        .contains("protected principal-root parent")
+                    || error.to_string().contains("failed to inspect"),
+                "unexpected {parent_kind} rejection: {error:#}"
+            );
+            assert!(!path.is_file());
+            assert!(!outside.path().join("profile-authority.json").exists());
+            if parent_kind == "non-directory" {
+                assert_eq!(std::fs::read(profile_dir).unwrap(), sentinel);
+            }
+        }
     }
 
     #[test]

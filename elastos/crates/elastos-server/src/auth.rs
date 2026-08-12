@@ -4165,6 +4165,18 @@ fn ensure_protected_principal_root_object_parent(
     Ok(())
 }
 
+#[cfg(unix)]
+fn auth_owner_only_directory_matches_uid(
+    metadata: &std::fs::Metadata,
+    expected_uid: libc::uid_t,
+) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    metadata.is_dir()
+        && metadata.uid() == expected_uid
+        && metadata.permissions().mode() & 0o077 == 0
+}
+
 /// Ensures an auth-owned parent directory is an owner-only real directory.
 ///
 /// Protected principal-root objects contain secrets, so this intentionally
@@ -4203,7 +4215,7 @@ fn ensure_auth_owner_only_directory(path: &Path) -> anyhow::Result<()> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         let mut options = OpenOptions::new();
         options
@@ -4215,10 +4227,7 @@ fn ensure_auth_owner_only_directory(path: &Path) -> anyhow::Result<()> {
         let metadata = directory
             .metadata()
             .with_context(|| format!("failed to inspect opened protected parent {path:?}"))?;
-        if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
+        if !auth_owner_only_directory_matches_uid(&metadata, unsafe { libc::geteuid() }) {
             anyhow::bail!("protected principal-root parent must be owner-only: {path:?}")
         }
     }
@@ -5287,6 +5296,24 @@ mod tests {
             .unwrap(),
             b"# Secret\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_directory_policy_rejects_foreign_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = std::fs::symlink_metadata(directory.path()).unwrap();
+        let owner_uid = metadata.uid();
+        let foreign_uid = owner_uid ^ 1;
+
+        assert!(auth_owner_only_directory_matches_uid(&metadata, owner_uid));
+        assert!(!auth_owner_only_directory_matches_uid(
+            &metadata,
+            foreign_uid
+        ));
     }
 
     #[cfg(unix)]
