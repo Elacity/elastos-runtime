@@ -6135,11 +6135,15 @@ async fn recv_loop(
 ///
 /// Peer-DID and connect-ticket routes use the long-lived Carrier endpoint, so
 /// every invocation keeps one Runtime endpoint identity and its discovery
-/// context. An invoker built without that endpoint has no verified remote
-/// route and fails before a provider effect.
+/// context. A Peer-DID naming that same endpoint loops through Carrier's
+/// authenticated provider admission without opening a network connection.
+/// The registry is weak so the registry-owned invoker cannot form an ownership
+/// cycle. An invoker without the required endpoint or registry fails before a
+/// provider effect.
 #[derive(Default)]
 pub struct CarrierProviderInvoker {
     peer_endpoint: Option<Endpoint>,
+    provider_registry: Weak<ProviderRegistry>,
 }
 
 #[derive(Debug, Clone)]
@@ -6165,15 +6169,65 @@ impl CarrierProviderInvoker {
     pub fn new() -> Self {
         Self {
             peer_endpoint: None,
+            provider_registry: Weak::new(),
         }
     }
 
     /// Binds the invoker to the long-lived Carrier endpoint that owns peer
-    /// discovery. Only this form can resolve a peer-DID route.
+    /// discovery. This form can resolve foreign peer-DID routes but deliberately
+    /// has no same-endpoint dispatcher.
     pub fn with_carrier_endpoint(endpoint: Endpoint) -> Self {
         Self {
             peer_endpoint: Some(endpoint),
+            provider_registry: Weak::new(),
         }
+    }
+
+    /// Binds the Carrier endpoint and its non-owning local provider dispatcher.
+    /// Production uses this form so a same-endpoint route enters the exact same
+    /// Carrier provider admission path as a remotely received invocation.
+    pub fn with_carrier_endpoint_and_registry(
+        endpoint: Endpoint,
+        provider_registry: Weak<ProviderRegistry>,
+    ) -> Self {
+        Self {
+            peer_endpoint: Some(endpoint),
+            provider_registry,
+        }
+    }
+
+    async fn invoke_loopback_provider(
+        &self,
+        peer_endpoint: &Endpoint,
+        invocation: &ProviderInvocation,
+        request: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, ProviderError> {
+        let registry = self.provider_registry.upgrade().ok_or_else(|| {
+            ProviderError::Unavailable(
+                "Carrier loopback provider registry is unavailable".to_string(),
+            )
+        })?;
+        let message: CarrierMessage = serde_json::from_value(carrier_provider_invoke_message(
+            invocation, request,
+        ))
+        .map_err(|err| {
+            ProviderError::Provider(format!(
+                "Carrier loopback invocation encoding failed: {err}"
+            ))
+        })?;
+        let response =
+            carrier_provider_invoke_registry(&registry, &message.data, &peer_endpoint.id())
+                .await
+                .map_err(|err| {
+                    ProviderError::Provider(format!(
+                        "Carrier loopback provider invocation failed: {err}"
+                    ))
+                })?;
+        carrier_provider_invoke_result(response).map_err(|err| {
+            ProviderError::Provider(format!(
+                "Carrier loopback provider invocation failed: {err}"
+            ))
+        })
     }
 }
 
@@ -6211,6 +6265,14 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                     return Err(ProviderError::Provider(
                         "Carrier provider invocation connect_ticket has no endpoints".to_string(),
                     ));
+                }
+                if endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.id == peer_endpoint.id())
+                {
+                    return self
+                        .invoke_loopback_provider(peer_endpoint, invocation, request)
+                        .await;
                 }
 
                 let mut errors = Vec::new();
@@ -6253,6 +6315,11 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                         "Carrier peer routing is not available on this Runtime".to_string(),
                     )
                 })?;
+                if public_key == peer_endpoint.id() {
+                    return self
+                        .invoke_loopback_provider(peer_endpoint, invocation, request)
+                        .await;
+                }
                 let client =
                     CarrierClient::connect_resolved_peer(peer_endpoint, public_key, timeout_secs)
                         .await
@@ -6338,6 +6405,42 @@ fn carrier_endpoint_matches_peer(endpoint: &iroh::EndpointAddr, peer_did: &str) 
 pub struct CarrierClient {
     conn: iroh::endpoint::Connection,
     _endpoint: Endpoint,
+}
+
+fn carrier_provider_invoke_message(
+    invocation: &ProviderInvocation,
+    request: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "op": "provider_invoke",
+        "source": invocation.source.as_str(),
+        "target": invocation.target.as_str(),
+        "operation": invocation.op.as_str(),
+        "transfer": invocation.transfer.as_str(),
+        "range": invocation.range.map(|range| serde_json::json!({
+            "start": range.start,
+            "end": range.end,
+        })),
+        "progress": invocation.progress.as_ref().map(|progress| serde_json::json!({
+            "request_id": progress.request_id.as_str(),
+            "expected_bytes": progress.expected_bytes,
+        })),
+        "request": request,
+    })
+}
+
+fn carrier_provider_invoke_result(response: serde_json::Value) -> Result<serde_json::Value> {
+    if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
+        return Ok(response
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null));
+    }
+    let message = response
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Carrier provider invocation failed");
+    anyhow::bail!(message.to_string())
 }
 
 impl CarrierClient {
@@ -6509,22 +6612,7 @@ impl CarrierClient {
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let (mut send, recv) = self.conn.open_bi().await?;
-        let msg = serde_json::json!({
-            "op": "provider_invoke",
-            "source": invocation.source.as_str(),
-            "target": invocation.target.as_str(),
-            "operation": invocation.op.as_str(),
-            "transfer": invocation.transfer.as_str(),
-            "range": invocation.range.map(|range| serde_json::json!({
-                "start": range.start,
-                "end": range.end,
-            })),
-            "progress": invocation.progress.as_ref().map(|progress| serde_json::json!({
-                "request_id": progress.request_id.as_str(),
-                "expected_bytes": progress.expected_bytes,
-            })),
-            "request": request,
-        });
+        let msg = carrier_provider_invoke_message(invocation, request);
         let mut bytes = serde_json::to_vec(&msg)?;
         bytes.push(b'\n');
         send.write_all(&bytes).await?;
@@ -6534,17 +6622,7 @@ impl CarrierClient {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         let response: serde_json::Value = serde_json::from_str(line.trim())?;
-        if response.get("ok").and_then(|value| value.as_bool()) == Some(true) {
-            return Ok(response
-                .get("result")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null));
-        }
-        let message = response
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Carrier provider invocation failed");
-        anyhow::bail!("{message}");
+        carrier_provider_invoke_result(response)
     }
 
     pub async fn open_browser_exit_stream(
@@ -8309,9 +8387,12 @@ mod tests {
         .await
         .unwrap();
         local_registry
-            .set_carrier_invoker(Arc::new(CarrierProviderInvoker::with_carrier_endpoint(
-                local_node.endpoint.clone(),
-            )))
+            .set_carrier_invoker(Arc::new(
+                CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    local_node.endpoint.clone(),
+                    Arc::downgrade(&local_registry),
+                ),
+            ))
             .await;
 
         let remote_requests = Arc::new(StdMutex::new(Vec::new()));
@@ -8432,6 +8513,193 @@ mod tests {
 
         shutdown_test_carrier_node(fixture.remote_node).await;
         shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_self_route_uses_carrier_admission_without_network_connect() {
+        let fixture = peer_did_route_fixture(90, 91).await;
+        let local_did = public_key_to_did(&fixture.local_node.endpoint.id());
+
+        let local_requests = Arc::new(StdMutex::new(Vec::new()));
+        fixture
+            .local_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: local_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Close both Carrier nodes before invoking. A socket/dial path can no
+        // longer succeed, while the in-process Carrier admission path remains
+        // available through the registry and endpoint identity held by the
+        // invoker.
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+
+        let response = fixture
+            .local_registry
+            .invoke_provider(peer_did_invocation(&local_did))
+            .await
+            .expect("same-endpoint PeerDid must loop through Carrier admission");
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(
+            response["data"]["runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert!(
+            fixture.remote_requests.lock().unwrap().is_empty(),
+            "self PeerDid must not dial the remote Carrier peer"
+        );
+        let requests = local_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            local_did
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_self_route_uses_carrier_admission_without_network_connect() {
+        let fixture = peer_did_route_fixture(93, 94).await;
+        let local_did = public_key_to_did(&fixture.local_node.endpoint.id());
+        let mut local_watch = fixture.local_node.endpoint.watch_addr();
+        let local_addr = local_watch.get();
+        let local_requests = Arc::new(StdMutex::new(Vec::new()));
+        fixture
+            .local_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: local_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+
+        let response = fixture
+            .local_registry
+            .invoke_provider(connect_ticket_invocation(local_addr, &local_did))
+            .await
+            .expect("same-endpoint ticket must loop through Carrier admission");
+
+        assert_eq!(response["status"], "ok");
+        assert!(fixture.remote_requests.lock().unwrap().is_empty());
+        let requests = local_requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["transport"],
+            "carrier-provider-plane"
+        );
+        assert_eq!(
+            requests[0]["_runtime_invocation"]["carrier"]["source_endpoint_did"],
+            local_did
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_ticket_self_route_rejects_mismatched_peer_before_provider_effect() {
+        let fixture = peer_did_route_fixture(95, 96).await;
+        let mut local_watch = fixture.local_node.endpoint.watch_addr();
+        let local_addr = local_watch.get();
+        let local_requests = Arc::new(StdMutex::new(Vec::new()));
+        fixture
+            .local_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: local_requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let error = fixture
+            .local_registry
+            .invoke_provider(connect_ticket_invocation(local_addr, &fixture.remote_did))
+            .await
+            .expect_err("mismatched peer_did and ticket must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("peer_did does not match connect_ticket"));
+        assert!(local_requests.lock().unwrap().is_empty());
+        assert!(fixture.remote_requests.lock().unwrap().is_empty());
+
+        shutdown_test_carrier_node(fixture.remote_node).await;
+        shutdown_test_carrier_node(fixture.local_node).await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_did_self_route_requires_a_live_loopback_registry_before_provider_effect() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let (local_sk, local_did) = elastos_identity::derive_did(&[92; 32]);
+        let node = start_carrier_node(&local_sk, &local_did, local_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+
+        let absent_registry = Arc::new(ProviderRegistry::new());
+        absent_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        absent_registry
+            .set_carrier_invoker(Arc::new(CarrierProviderInvoker::with_carrier_endpoint(
+                node.endpoint.clone(),
+            )))
+            .await;
+        let error = absent_registry
+            .invoke_provider(peer_did_invocation(&local_did))
+            .await
+            .expect_err("self route without a loopback registry must fail closed");
+        assert!(error.to_string().contains("registry is unavailable"));
+        assert!(requests.lock().unwrap().is_empty());
+
+        let closed_target = Arc::new(ProviderRegistry::new());
+        let closed_weak = Arc::downgrade(&closed_target);
+        drop(closed_target);
+        let closed_registry = Arc::new(ProviderRegistry::new());
+        closed_registry
+            .register_sub_provider(
+                "content",
+                Arc::new(RecordingCarrierContentProvider {
+                    requests: requests.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        closed_registry
+            .set_carrier_invoker(Arc::new(
+                CarrierProviderInvoker::with_carrier_endpoint_and_registry(
+                    node.endpoint.clone(),
+                    closed_weak,
+                ),
+            ))
+            .await;
+        let error = closed_registry
+            .invoke_provider(peer_did_invocation(&local_did))
+            .await
+            .expect_err("self route with a closed loopback registry must fail closed");
+        assert!(error.to_string().contains("registry is unavailable"));
+        assert!(requests.lock().unwrap().is_empty());
+
+        shutdown_test_carrier_node(node).await;
     }
 
     #[tokio::test]

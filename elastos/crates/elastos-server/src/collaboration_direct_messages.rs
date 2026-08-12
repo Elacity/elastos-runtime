@@ -1400,7 +1400,11 @@ impl CollaborationDirectMessageService {
                 // but a swallowed error made the cold-path stall undiagnosable:
                 // a measured idle pair stayed in "Sending" past six minutes on
                 // the 5s dial budget and past two minutes on a 30s one, so the
-                // dial is failing outright, not running out of time. Say why.
+                // dial is failing outright, not running out of time. A
+                // same-endpoint PeerDid stays on the Carrier provider plane but
+                // Carrier loops it through authenticated admission without a
+                // network dial, so a remaining failure here is an admission or
+                // foreign route problem.
                 tracing::debug!(
                     peer_did = %recipient_endpoint_did,
                     error = %err,

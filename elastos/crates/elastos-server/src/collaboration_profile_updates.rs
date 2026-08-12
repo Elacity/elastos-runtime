@@ -1112,6 +1112,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn profile_update_between_same_runtime_profiles_uses_strict_carrier_loopback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut pair =
+            crate::collaboration_discovery_runtime::tests::same_runtime_profile_pair(temp.path())
+                .await;
+        let now = crate::auth::now_ts();
+        let endpoint_did = encode_did_key(&pair.endpoint_key.verifying_key());
+        let previous = crate::collaboration_discovery_runtime::tests::profile_hash(&pair.profile_b);
+        let head_b = signed_profile_document_for_test(
+            &pair.profile_key_b,
+            "Bob Same Runtime",
+            Some("bob"),
+            2,
+            Some(&previous),
+            now + 1,
+            vec![endpoint_did.clone()],
+        )
+        .unwrap();
+        let updates = pair.service.profile_update_service();
+        updates
+            .register_verified_context_for_test(pair.store_b.clone(), head_b.clone())
+            .unwrap();
+        let envelope = prepare_profile_update(
+            &pair.endpoint_key,
+            &pair.service.network_profile(),
+            &head_b,
+            &pair.conversation_id,
+            &pair.profile_a.document().profile_did,
+            &[head_b.signed_envelope().clone()],
+            now + 2,
+        )
+        .unwrap();
+
+        // A closed Carrier endpoint makes any socket path impossible. The
+        // update must still pass collaboration-profile's strict Carrier-plane
+        // validator and authenticate this Runtime endpoint as its source.
+        pair.node
+            .take()
+            .expect("fixture Carrier node")
+            .shutdown()
+            .await;
+        updates
+            .deliver(&envelope, &endpoint_did, now + 2)
+            .await
+            .unwrap();
+
+        let alice_view = pair.store_a.snapshot().unwrap();
+        assert_eq!(alice_view.contacts().len(), 1);
+        assert_eq!(
+            alice_view.contacts()[0].remote_profile_did(),
+            pair.profile_b.document().profile_did
+        );
+        assert_eq!(
+            alice_view.contacts()[0].remote_display_name(),
+            "Bob Same Runtime"
+        );
+        assert_eq!(
+            alice_view.contacts()[0].remote_presence_device_did(),
+            endpoint_did
+        );
+    }
+
     #[test]
     fn profile_update_envelope_round_trips_and_stays_runtime_internal() {
         let network = network();

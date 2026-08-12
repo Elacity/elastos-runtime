@@ -2855,6 +2855,35 @@ assert(
   "Profile updates travel their own Runtime provider, resolve by Profile DID, apply through the store's chain rules, and need no durable outbox: announcement is a pure function of the local head",
 );
 assert(
+  sourceBlock(
+    discoveryRuntime,
+    "async fn invoke_bootstrap(",
+    "Collaboration Discovery bootstrap",
+  ).includes("ProviderInvocationTransport::Carrier") &&
+    sourceBlock(
+      discoveryRuntime,
+      "async fn invoke_bootstrap(",
+      "Collaboration Discovery bootstrap",
+    ).includes("ProviderCarrierRoute::ConnectTicket") &&
+    !sourceBlock(
+      discoveryRuntime,
+      "async fn invoke_bootstrap(",
+      "Collaboration Discovery bootstrap",
+    ).includes("ProviderInvocationTransport::Local") &&
+    !sourceBlock(
+      discoveryRuntime,
+      "async fn invoke_bootstrap(",
+      "Collaboration Discovery bootstrap",
+    ).includes('send_raw("peer"') &&
+    !discoveryRuntime.includes("local_carrier_endpoint_node_id") &&
+    !discoveryRuntime.includes("bootstrap_transport_for_peer") &&
+    discoveryRuntime.includes(
+      "invoke_bootstrap_self_peer_uses_carrier_loopback_without_network_connect",
+    ) &&
+    discoveryRuntime.includes("invoke_bootstrap_rejects_local_node_id_with_foreign_ticket"),
+  "Collaboration Discovery always emits its signed bootstrap request over the normal Carrier ConnectTicket route; Carrier alone may loop the authenticated endpoint locally",
+);
+assert(
   gatewayApi.includes(".AppData/ElastOS/Home/services-peer-contacts.json") &&
     gatewayApi.includes(
       'HOME_SERVICES_PEER_CONTACTS_SCHEMA: &str = "elastos.services.peer-contacts-state/v1"',
@@ -6369,6 +6398,11 @@ assert(
     ) &&
     carrierRuntime.includes("CarrierProviderInvoker") &&
     carrierRuntime.includes("ProviderCarrierInvoker for CarrierProviderInvoker") &&
+    carrierRuntime.includes("with_carrier_endpoint_and_registry") &&
+    carrierRuntime.includes("provider_registry: Weak<ProviderRegistry>") &&
+    carrierRuntime.includes("invoke_loopback_provider") &&
+    !carrierRuntime.includes("peer_did_is_local") &&
+    !discoveryRuntime.includes("ProviderInvocationTransport::Local") &&
     carrierRuntime.includes("invoke_provider(") &&
     carrierRuntime.includes("carrier_endpoint_matches_peer") &&
     carrierRuntime.includes('assert!(!response.to_string().contains("\\\"connect_ticket\\\":"));') &&
@@ -6376,6 +6410,18 @@ assert(
     carrierRuntime.includes("test_carrier_provider_invoke_accepts_stream_contract_metadata") &&
     carrierRuntime.includes("test_carrier_provider_invoke_rejects_stream_without_contract_metadata") &&
     carrierRuntime.includes("test_carrier_provider_invoke_rejects_raw_backend_target") &&
+    carrierRuntime.includes(
+      "test_peer_did_self_route_uses_carrier_admission_without_network_connect",
+    ) &&
+    carrierRuntime.includes(
+      "test_peer_did_self_route_requires_a_live_loopback_registry_before_provider_effect",
+    ) &&
+    carrierRuntime.includes(
+      "test_connect_ticket_self_route_uses_carrier_admission_without_network_connect",
+    ) &&
+    carrierRuntime.includes(
+      "test_connect_ticket_self_route_rejects_mismatched_peer_before_provider_effect",
+    ) &&
     carrierRuntime.includes("test_carrier_availability_fetch_uses_provider_invocation_transport") &&
     carrierRuntime.includes("test_carrier_replication_proof_uses_remote_content_provider_invocation") &&
     carrierRuntime.includes("test_carrier_replication_falls_back_to_exact_import_when_remote_pin_fails") &&
@@ -6401,7 +6447,9 @@ assert(
     carrierRuntime.includes("ProviderError::Unavailable") &&
     serverInfra.includes("set_carrier_invoker") &&
     serverInfra.includes("CarrierAvailabilityProvider::with_provider_registry") &&
-    serverInfra.includes("CarrierProviderInvoker::with_carrier_endpoint(") &&
+    serverInfra.includes(
+      "CarrierProviderInvoker::with_carrier_endpoint_and_registry(",
+    ) &&
     serverInfra.includes("maybe_spawn_content_repair_scheduler") &&
     serverInfra.includes("ELASTOS_CONTENT_REPAIR_SCHEDULER") &&
     serverInfra.includes("invoke_content_repair_worker(") &&

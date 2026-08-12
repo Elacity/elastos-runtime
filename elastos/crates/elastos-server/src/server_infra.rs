@@ -966,8 +966,9 @@ async fn setup_server_infrastructure_impl(
             Ok(carrier_node) => {
                 provider_registry
                     .set_carrier_invoker(Arc::new(
-                        elastos_server::carrier::CarrierProviderInvoker::with_carrier_endpoint(
+                        elastos_server::carrier::CarrierProviderInvoker::with_carrier_endpoint_and_registry(
                             carrier_node.endpoint.clone(),
+                            Arc::downgrade(&provider_registry),
                         ),
                     ))
                     .await;
