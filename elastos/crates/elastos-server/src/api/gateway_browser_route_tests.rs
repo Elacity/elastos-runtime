@@ -3187,13 +3187,29 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
         "the second read waited for the first provider result"
     );
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !late_result_observed.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::task::yield_now().await;
+    // Let the discarded late provider result resolve in the background, proving
+    // the timeout only discarded (not cancelled) the first provider's work. The
+    // callers run this under a paused virtual clock (`start_paused`), which makes
+    // the 100ms read timeout deterministically beat the 250ms delayed provider
+    // for the assertions above -- no real-clock race between the second read
+    // completing and the delayed task firing. The flip side is that the delayed
+    // provider's 250ms timer only fires once virtual time is advanced past it; a
+    // bare yield loop would keep the runtime busy and deny the paused clock that
+    // advance, so drive it explicitly and then settle under a bounded cap that
+    // fails loudly if the discarded result never lands.
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    let mut late_observed = false;
+    for _ in 0..1_000_000 {
+        if late_result_observed.load(std::sync::atomic::Ordering::SeqCst) {
+            late_observed = true;
+            break;
         }
-    })
-    .await
-    .unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        late_observed,
+        "the discarded late provider result must still resolve in the background"
+    );
 
     let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
     let events = auth_state
@@ -3213,12 +3229,12 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
     assert_ne!(events[0].challenge_id, events[2].challenge_id);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_browser_wallet_read_timeout_does_not_poison_wallet_refresh() {
     verify_browser_wallet_read_timeout_boundary(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_browser_wallet_read_timeout_does_not_poison_chain_dispatch() {
     verify_browser_wallet_read_timeout_boundary(false).await;
 }
