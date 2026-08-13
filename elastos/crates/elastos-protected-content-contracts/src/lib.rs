@@ -6,6 +6,7 @@
 
 mod canonical;
 mod identity;
+mod node_contribution;
 mod node_decision;
 mod node_set;
 mod release_request;
@@ -23,6 +24,11 @@ pub use identity::{
     RuntimeSessionBindingV1, ThresholdV1, WalletAddress, MAX_ENCRYPTED_CONTENT_BYTES,
     MAX_KEY_ENVELOPE_BYTES, MAX_RECIPIENT_ENCRYPTION_SUITE_ID_BYTES, MAX_RIGHTS_POLICY_BYTES,
     MAX_THRESHOLD_NODES,
+};
+pub use node_contribution::{
+    NodeContributionStatementV1, RecipientSealedContributionV1, SignedNodeContributionV1,
+    VerifiedNodeContributionV1, MAX_NODE_CONTRIBUTION_LIFETIME_SECS,
+    MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES,
 };
 pub use node_decision::{
     NodeRightsDecisionStatementV1, SignedNodeRightsDecisionV1, VerifiedNodeRightsDecisionV1,
