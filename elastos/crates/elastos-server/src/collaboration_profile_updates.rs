@@ -38,7 +38,7 @@ use crate::collaboration_protocol::{
     validate_id, validate_payload_type, verify_collaboration_acceptance_receipt,
     verify_collaboration_message,
 };
-use crate::crypto::{domain_separated_sign, encode_did_key};
+use crate::crypto::domain_separated_sign;
 
 pub(crate) const PROFILE_UPDATE_PROVIDER_SCHEME: &str = "collaboration-profile";
 pub(crate) const PROFILE_UPDATE_PROVIDER_OP: &str = "announce";
@@ -686,7 +686,7 @@ pub(crate) fn prepare_profile_update(
     validate_id(conversation_id, "profile update conversation_id")?;
     crate::crypto::decode_did_key(recipient_profile_did)
         .context("invalid profile update recipient Profile DID")?;
-    let signer_did = encode_did_key(&signing_key.verifying_key());
+    let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
     if !sender_profile.authorizes_signer(
         &signer_did,
         PROFILE_UPDATE_SENDER_SERVICE,
@@ -832,7 +832,7 @@ mod tests {
                 revision,
                 previous.as_deref(),
                 1_785_900_000 + revision,
-                vec![encode_did_key(&device.verifying_key())],
+                vec![crate::crypto::encode_signing_key_did(&device)],
             )
             .unwrap();
             let signed = verified.signed_envelope().clone();
@@ -892,10 +892,10 @@ mod tests {
             std::fs::set_permissions(&b2_root, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let (b2_device_key, _) = elastos_identity::load_or_create_did(&b2_root).unwrap();
-        let b2_device_did = encode_did_key(&b2_device_key.verifying_key());
+        let b2_device_did = crate::crypto::encode_signing_key_did(&b2_device_key);
         assert_ne!(
             b2_device_did,
-            encode_did_key(&pair.identity_b.device_key.verifying_key())
+            crate::crypto::encode_signing_key_did(&pair.identity_b.device_key)
         );
         crate::auth::store_test_principal_root_protection(&b2_root, &pair.identity_b.principal_id);
         let binding = elastos_runtime::auth::ProofBinding::passkey_webauthn(
@@ -1119,7 +1119,7 @@ mod tests {
             crate::collaboration_discovery_runtime::tests::same_runtime_profile_pair(temp.path())
                 .await;
         let now = crate::auth::now_ts();
-        let endpoint_did = encode_did_key(&pair.endpoint_key.verifying_key());
+        let endpoint_did = crate::crypto::encode_signing_key_did(&pair.endpoint_key);
         let previous = crate::collaboration_discovery_runtime::tests::profile_hash(&pair.profile_b);
         let head_b = signed_profile_document_for_test(
             &pair.profile_key_b,
@@ -1194,7 +1194,7 @@ mod tests {
             &network,
             &sender_profile,
             "direct:sha256:aa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899",
-            &encode_did_key(&recipient_device.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&recipient_device),
             &segment,
             now,
         )
@@ -1227,8 +1227,8 @@ mod tests {
         let (endpoint_key, _) = generate_keypair();
         let (message_key, _) = generate_keypair();
         let (recipient_key, _) = generate_keypair();
-        let endpoint_did = encode_did_key(&endpoint_key.verifying_key());
-        let message_signer_did = encode_did_key(&message_key.verifying_key());
+        let endpoint_did = crate::crypto::encode_signing_key_did(&endpoint_key);
+        let message_signer_did = crate::crypto::encode_signing_key_did(&message_key);
         let sender_profile = crate::collaboration_profile_authority::
             signed_profile_document_with_authority_for_test(
                 &profile_key,
@@ -1250,7 +1250,7 @@ mod tests {
             &network,
             &sender_profile,
             "direct:sha256:aa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899",
-            &encode_did_key(&recipient_key.verifying_key()),
+            &crate::crypto::encode_signing_key_did(&recipient_key),
             &segment,
             now,
         )
@@ -1264,7 +1264,7 @@ mod tests {
 
     #[test]
     fn profile_update_provider_requires_authenticated_carrier_source() {
-        let source_endpoint_did = encode_did_key(&generate_keypair().0.verifying_key());
+        let source_endpoint_did = crate::crypto::encode_signing_key_did(&generate_keypair().0);
         let valid = serde_json::json!({
             "schema": "elastos.provider.invocation/v1",
             "source": PROFILE_UPDATE_PROVIDER_SCHEME,
@@ -1297,7 +1297,7 @@ mod tests {
         let network = network();
         let (sender_device, _) = generate_keypair();
         let (profile_signer, _) = generate_keypair();
-        let recipient = encode_did_key(&generate_keypair().0.verifying_key());
+        let recipient = crate::crypto::encode_signing_key_did(&generate_keypair().0);
         let sender_segment = chain(&profile_signer, &sender_device, 1);
         let sender_profile =
             crate::collaboration_profile_authority::verify_signed_profile_document(

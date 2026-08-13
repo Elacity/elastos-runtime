@@ -394,7 +394,7 @@ mod tests {
             1,
             None,
             1,
-            vec![crate::crypto::encode_did_key(&device_key.verifying_key())],
+            vec![crate::crypto::encode_signing_key_did(&device_key)],
         )
         .unwrap()
     }
@@ -493,7 +493,7 @@ mod tests {
         signing_key: &SigningKey,
         network_id: &str,
     ) -> crate::collaboration_network::VerifiedCollaborationNetworkProfile {
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let payload = crate::collaboration_network::CollaborationNetworkProfile {
             schema: crate::collaboration_network::COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),

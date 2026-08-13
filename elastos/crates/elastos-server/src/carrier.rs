@@ -51,6 +51,9 @@ use elastos_common::localhost::{
     publisher_artifacts_path, publisher_install_script_path, publisher_publish_state_path,
     publisher_release_head_path, publisher_release_manifest_path,
 };
+use elastos_identity::{
+    decode_did_key, encode_did_key, validate_canonical_ed25519_verifying_key_bytes,
+};
 use elastos_runtime::provider::{
     Provider, ProviderCarrierInvoker, ProviderCarrierRoute, ProviderError, ProviderInvocation,
     ProviderInvocationTransport, ProviderRegistry, ProviderTransfer, ResourceRequest,
@@ -563,25 +566,16 @@ async fn connect_ticket_endpoints(
     connected
 }
 
-/// Parse a `did:key:z6Mk...` string into an iroh PublicKey.
-///
-/// DID encodes Ed25519 public key bytes (multicodec 0xed01 + base58).
-/// iroh PublicKey is the same Ed25519 bytes, different encoding.
 pub fn did_to_public_key(did: &str) -> Option<iroh::PublicKey> {
-    let multibase = did.strip_prefix("did:key:z")?;
-    let bytes = bs58::decode(multibase).into_vec().ok()?;
-    if bytes.len() != 34 || bytes[0] != 0xed || bytes[1] != 0x01 {
-        return None;
-    }
-    let key_bytes: [u8; 32] = bytes[2..34].try_into().ok()?;
-    iroh::PublicKey::from_bytes(&key_bytes).ok()
+    let verifying_key = decode_did_key(did).ok()?;
+    iroh::PublicKey::from_bytes(verifying_key.as_bytes()).ok()
 }
 
-fn public_key_to_did(public_key: &iroh::PublicKey) -> String {
-    let mut bytes = Vec::with_capacity(34);
-    bytes.extend_from_slice(&[0xed, 0x01]);
-    bytes.extend_from_slice(public_key.as_bytes());
-    format!("did:key:z{}", bs58::encode(bytes).into_string())
+fn public_key_to_did(public_key: &iroh::PublicKey) -> anyhow::Result<String> {
+    let verifying_key = validate_canonical_ed25519_verifying_key_bytes(*public_key.as_bytes())
+        .context("iroh public keys must be canonical Ed25519 verifying keys")?;
+    encode_did_key(&verifying_key)
+        .context("iroh public keys must encode as one canonical Ed25519 did:key")
 }
 
 pub fn decode_ticket_endpoints(ticket: &str) -> Vec<iroh::EndpointAddr> {
@@ -790,24 +784,33 @@ pub fn source_carrier_addrs(source: &TrustedSource) -> Vec<String> {
     addrs
 }
 
-fn source_node_id(source: &TrustedSource) -> Option<String> {
+fn source_transport_endpoint_id(source: &TrustedSource) -> Result<Option<String>> {
     if !source.publisher_node_id.is_empty() {
-        if source.publisher_node_id.starts_with("did:key:") {
-            return did_to_public_key(&source.publisher_node_id).map(|pk| pk.to_string());
+        let public_key: iroh::PublicKey = source
+            .publisher_node_id
+            .parse()
+            .context("trusted source publisher_node_id must be one raw Iroh endpoint ID")?;
+        let canonical = public_key.to_string();
+        if canonical != source.publisher_node_id {
+            anyhow::bail!(
+                "trusted source publisher_node_id must be one canonical raw Iroh endpoint ID"
+            );
         }
-        return Some(source.publisher_node_id.clone());
+        return Ok(Some(canonical));
     }
 
-    decode_ticket_endpoints(&source.connect_ticket)
+    Ok(decode_ticket_endpoints(&source.connect_ticket)
         .into_iter()
         .next()
-        .map(|endpoint| endpoint.id.to_string())
+        .map(|endpoint| endpoint.id.to_string()))
 }
 
 /// Start the Carrier node (endpoint + gossip + file serving).
 ///
 /// Accepts an Ed25519 `SigningKey` (from DID derivation). The iroh `SecretKey`
-/// is derived directly from the signing key bytes — so the node ID IS the DID.
+/// is derived directly from the same signing-key bytes. The canonical
+/// Profile/Runtime DID text and the raw Iroh transport endpoint ID stay
+/// distinct and are validated at their own boundaries.
 pub async fn start_carrier_node(
     signing_key: &ed25519_dalek::SigningKey,
     did: &str,
@@ -822,6 +825,12 @@ pub async fn start_carrier_node_with_registry(
     data_dir: PathBuf,
     provider_registry: Option<Weak<ProviderRegistry>>,
 ) -> Result<CarrierNode> {
+    let expected_did = crate::crypto::encode_signing_key_did(signing_key);
+    let decoded_did =
+        decode_did_key(did).context("Carrier DID must be one canonical Ed25519 did:key")?;
+    if decoded_did.to_bytes() != signing_key.verifying_key().to_bytes() || did != expected_did {
+        anyhow::bail!("Carrier DID does not match the supplied signing key");
+    }
     let secret_key = SecretKey::from_bytes(&signing_key.to_bytes());
 
     // Build an endpoint with Iroh's N0 DNS and relay services unless a custom
@@ -1635,7 +1644,8 @@ async fn carrier_provider_invoke_registry(
     runtime.insert(
         "carrier".to_string(),
         serde_json::json!({
-            "source_endpoint_did": public_key_to_did(source_endpoint_id),
+            "source_endpoint_did": public_key_to_did(source_endpoint_id)
+                .context("Carrier source endpoint DID encoding failed")?,
         }),
     );
 
@@ -6396,10 +6406,7 @@ fn carrier_route_timeout_secs(route: &ProviderCarrierRoute) -> u64 {
 }
 
 fn carrier_endpoint_matches_peer(endpoint: &iroh::EndpointAddr, peer_did: &str) -> bool {
-    if let Some(public_key) = did_to_public_key(peer_did) {
-        return endpoint.id == public_key;
-    }
-    endpoint.id.to_string() == peer_did
+    did_to_public_key(peer_did).is_some_and(|public_key| endpoint.id == public_key)
 }
 
 pub struct CarrierClient {
@@ -6538,6 +6545,7 @@ impl CarrierClient {
     }
 
     pub async fn connect_trusted_source(source: &TrustedSource, timeout_secs: u64) -> Result<Self> {
+        let node_id = source_transport_endpoint_id(source)?;
         let ticket_endpoints = decode_ticket_endpoints(&source.connect_ticket);
         let mut ticket_errors = Vec::new();
         for endpoint in ticket_endpoints {
@@ -6547,7 +6555,7 @@ impl CarrierClient {
             }
         }
 
-        let node_id = source_node_id(source)
+        let node_id = node_id
             .ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
         let addrs = source_carrier_addrs(source);
         match Self::connect(&node_id, &addrs, timeout_secs).await {
@@ -6761,6 +6769,7 @@ pub async fn fetch_file_from_trusted_source(
     connect_timeout_secs: u64,
     fetch_timeout_secs: u64,
 ) -> Result<Vec<u8>> {
+    let node_id = source_transport_endpoint_id(source)?;
     let mut errors = Vec::new();
     let ticket_endpoints = decode_ticket_endpoints(&source.connect_ticket);
     for (index, endpoint) in ticket_endpoints.into_iter().enumerate() {
@@ -6784,8 +6793,8 @@ pub async fn fetch_file_from_trusted_source(
         }
     }
 
-    let node_id = source_node_id(source)
-        .ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
+    let node_id =
+        node_id.ok_or_else(|| anyhow::anyhow!("trusted source has no usable Carrier node id"))?;
     let addrs = source_carrier_addrs(source);
     match CarrierClient::connect(&node_id, &addrs, connect_timeout_secs).await {
         Ok(client) => match fetch_file_with_timeout(&client, path, fetch_timeout_secs).await {
@@ -6825,8 +6834,14 @@ mod tests {
     use super::*;
     use std::sync::{Mutex as StdMutex, OnceLock};
 
+    const NONCANONICAL_ALIAS_DID: &str = "did:key:z2DQYePVrytqCLfdq5VSDGtksAZC9NAt75iCed5WwSKKVXt";
+
     fn authenticated_test_source_endpoint() -> iroh::PublicKey {
         iroh::SecretKey::from_bytes(&[42u8; 32]).public()
+    }
+
+    fn overlong_did(did: &str) -> String {
+        format!("{did}1")
     }
 
     fn test_topic_buffer(
@@ -8350,7 +8365,7 @@ mod tests {
         );
         assert_eq!(
             response["result"]["data"]["runtime_invocation"]["carrier"]["source_endpoint_did"],
-            public_key_to_did(&source_endpoint)
+            public_key_to_did(&source_endpoint).expect("test source endpoint must encode as DID")
         );
         assert!(!response.to_string().contains("\"connect_ticket\":"));
     }
@@ -8503,6 +8518,7 @@ mod tests {
         assert_eq!(
             requests[0]["_runtime_invocation"]["carrier"]["source_endpoint_did"],
             public_key_to_did(&fixture.local_node.endpoint.id())
+                .expect("test endpoint must encode as DID")
         );
         assert_eq!(
             requests[0]["_runtime_invocation"]["source"],
@@ -8518,7 +8534,8 @@ mod tests {
     #[tokio::test]
     async fn test_peer_did_self_route_uses_carrier_admission_without_network_connect() {
         let fixture = peer_did_route_fixture(90, 91).await;
-        let local_did = public_key_to_did(&fixture.local_node.endpoint.id());
+        let local_did = public_key_to_did(&fixture.local_node.endpoint.id())
+            .expect("test endpoint must encode as DID");
 
         let local_requests = Arc::new(StdMutex::new(Vec::new()));
         fixture
@@ -8569,7 +8586,8 @@ mod tests {
     #[tokio::test]
     async fn test_connect_ticket_self_route_uses_carrier_admission_without_network_connect() {
         let fixture = peer_did_route_fixture(93, 94).await;
-        let local_did = public_key_to_did(&fixture.local_node.endpoint.id());
+        let local_did = public_key_to_did(&fixture.local_node.endpoint.id())
+            .expect("test endpoint must encode as DID");
         let mut local_watch = fixture.local_node.endpoint.watch_addr();
         let local_addr = local_watch.get();
         let local_requests = Arc::new(StdMutex::new(Vec::new()));
@@ -8722,6 +8740,7 @@ mod tests {
                 fixture.remote_requests.lock().unwrap()[expected - 1]["_runtime_invocation"]
                     ["carrier"]["source_endpoint_did"],
                 public_key_to_did(&fixture.local_node.endpoint.id())
+                    .expect("test endpoint must encode as DID")
             );
             assert!(!fixture.local_node.endpoint.is_closed());
         }
@@ -9038,6 +9057,7 @@ mod tests {
         assert_eq!(
             response["result"]["data"]["runtime_invocation"]["carrier"]["source_endpoint_did"],
             public_key_to_did(&authenticated_test_source_endpoint())
+                .expect("authenticated test source must encode as DID")
         );
         assert!(!response.to_string().contains("\"connect_ticket\":"));
     }
@@ -10830,16 +10850,179 @@ mod tests {
 
     #[test]
     fn test_did_to_public_key_roundtrip() {
-        // Derive a DID, convert back to PublicKey, verify it matches the signing key
-        let (sk, did) = elastos_identity::derive_did(&[99u8; 32]);
+        let public_key = iroh::SecretKey::from_bytes(&[99u8; 32]).public();
+        let did = public_key_to_did(&public_key).expect("generated public key must encode as DID");
         let pk = did_to_public_key(&did).expect("DID should parse to PublicKey");
 
-        // iroh PublicKey bytes should equal ed25519 verifying key bytes
-        let sk_iroh = iroh::SecretKey::from_bytes(&sk.to_bytes());
         assert_eq!(
-            *pk,
-            *sk_iroh.public(),
-            "DID-derived PublicKey must match iroh SecretKey-derived PublicKey"
+            *pk, *public_key,
+            "shared DID codec must round-trip generated iroh public keys"
+        );
+    }
+
+    #[test]
+    fn test_did_to_public_key_rejects_noncanonical_alias_did() {
+        assert!(
+            did_to_public_key(NONCANONICAL_ALIAS_DID).is_none(),
+            "noncanonical alias DID must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_did_to_public_key_rejects_overlong_did() {
+        let public_key = iroh::SecretKey::from_bytes(&[100u8; 32]).public();
+        let did = overlong_did(
+            &public_key_to_did(&public_key).expect("generated public key must encode as DID"),
+        );
+        assert!(
+            did_to_public_key(&did).is_none(),
+            "overlong DID must fail closed"
+        );
+    }
+
+    #[test]
+    fn test_carrier_endpoint_matches_peer_accepts_canonical_did() {
+        let public_key = iroh::SecretKey::from_bytes(&[101u8; 32]).public();
+        let endpoint = iroh::EndpointAddr::from(public_key);
+        let did = public_key_to_did(&public_key).expect("generated public key must encode as DID");
+
+        assert!(
+            carrier_endpoint_matches_peer(&endpoint, &did),
+            "endpoint matching must accept the canonical shared-codec DID"
+        );
+    }
+
+    #[test]
+    fn test_carrier_endpoint_matches_peer_rejects_noncanonical_and_nonmatching_inputs() {
+        let public_key = iroh::SecretKey::from_bytes(&[102u8; 32]).public();
+        let endpoint = iroh::EndpointAddr::from(public_key);
+        let other_public_key = iroh::SecretKey::from_bytes(&[103u8; 32]).public();
+        let other_did =
+            public_key_to_did(&other_public_key).expect("generated public key must encode as DID");
+        let canonical_did =
+            public_key_to_did(&public_key).expect("generated public key must encode as DID");
+        let raw_endpoint_id = endpoint.id.to_string();
+        let malformed_did = "did:key:not-base58";
+        let overlong = overlong_did(&canonical_did);
+
+        assert!(
+            !carrier_endpoint_matches_peer(&endpoint, &raw_endpoint_id),
+            "raw endpoint IDs must not satisfy peer DID matching"
+        );
+        assert!(
+            !carrier_endpoint_matches_peer(&endpoint, malformed_did),
+            "malformed DIDs must fail closed"
+        );
+        assert!(
+            !carrier_endpoint_matches_peer(&endpoint, NONCANONICAL_ALIAS_DID),
+            "noncanonical alias DIDs must fail closed"
+        );
+        assert!(
+            !carrier_endpoint_matches_peer(&endpoint, &overlong),
+            "overlong DIDs must fail closed"
+        );
+        assert!(
+            !carrier_endpoint_matches_peer(&endpoint, &other_did),
+            "a canonical DID for another key must not match this endpoint"
+        );
+    }
+
+    #[test]
+    fn test_source_transport_endpoint_id_uses_one_raw_transport_representation() {
+        let endpoint = iroh::SecretKey::from_bytes(&[104u8; 32]).public();
+        let source = TrustedSource {
+            name: "seed".to_string(),
+            publisher_dids: Vec::new(),
+            channel: "stable".to_string(),
+            discovery_uri: String::new(),
+            connect_ticket: String::new(),
+            gateways: Vec::new(),
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: endpoint.to_string(),
+            ipns_name: String::new(),
+        };
+
+        assert_eq!(
+            source_transport_endpoint_id(&source).unwrap(),
+            Some(endpoint.to_string()),
+            "trusted sources must expose the raw Iroh endpoint ID unchanged"
+        );
+    }
+
+    #[test]
+    fn test_source_transport_endpoint_id_rejects_did_form_configured_transport_id() {
+        let endpoint = iroh::SecretKey::from_bytes(&[105u8; 32]).public();
+        let did = public_key_to_did(&endpoint).expect("generated public key must encode as DID");
+        let source = TrustedSource {
+            name: "seed".to_string(),
+            publisher_dids: Vec::new(),
+            channel: "stable".to_string(),
+            discovery_uri: String::new(),
+            connect_ticket: "ticket-would-not-be-used".to_string(),
+            gateways: Vec::new(),
+            install_path: String::new(),
+            installed_version: String::new(),
+            head_cid: String::new(),
+            publisher_node_id: did,
+            ipns_name: String::new(),
+        };
+
+        let err = source_transport_endpoint_id(&source)
+            .expect_err("configured DID-form transport ID must fail closed");
+        assert!(
+            err.to_string()
+                .contains("trusted source publisher_node_id must be one raw Iroh endpoint ID"),
+            "unexpected configured transport-id error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_carrier_node_with_registry_rejects_malformed_did_before_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[106u8; 32]);
+        let err = match start_carrier_node_with_registry(
+            &signing_key,
+            "did:key:not-base58",
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("malformed Carrier DID must fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("Carrier DID must be one canonical Ed25519 did:key"),
+            "unexpected malformed DID error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_carrier_node_with_registry_rejects_signing_key_mismatch_before_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[107u8; 32]);
+        let foreign_signing_key = ed25519_dalek::SigningKey::from_bytes(&[108u8; 32]);
+        let foreign_did = crate::crypto::encode_signing_key_did(&foreign_signing_key);
+        let err = match start_carrier_node_with_registry(
+            &signing_key,
+            &foreign_did,
+            dir.path().to_path_buf(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("mismatched Carrier DID must fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("Carrier DID does not match the supplied signing key"),
+            "unexpected mismatch error: {err}"
         );
     }
 

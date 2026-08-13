@@ -60,7 +60,7 @@ pub struct TrustedSource {
     pub installed_version: String,
     #[serde(default)]
     pub head_cid: String,
-    /// Stable Iroh node ID (derived from publisher's device key) for durable P2P connections.
+    /// Stable raw Iroh endpoint ID string for durable P2P transport connections.
     #[serde(default)]
     pub publisher_node_id: String,
     /// IPNS name for mutable release head pointer (Kubo peer ID or key name).
@@ -451,7 +451,7 @@ pub enum SourceCommand {
         /// Known HEAD CID for this source
         #[arg(long)]
         head_cid: Option<String>,
-        /// Publisher's stable Iroh node ID for durable P2P connections
+        /// Publisher's stable raw Iroh endpoint ID for durable P2P transport connections
         #[arg(long)]
         publisher_node_id: Option<String>,
         /// IPNS name for mutable release head pointer

@@ -745,7 +745,7 @@ mod tests {
             1,
             None,
             NOW,
-            vec![crate::crypto::encode_did_key(&endpoint_key.verifying_key())],
+            vec![crate::crypto::encode_signing_key_did(&endpoint_key)],
         )
         .unwrap()
     }
@@ -845,7 +845,7 @@ mod tests {
             .unwrap()
         });
         let (signer, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&signer.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signer);
         let payload = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: NETWORK.to_string(),
@@ -1040,7 +1040,7 @@ mod tests {
         let mut bad_trust = config_file(&material);
         let (other_signer, _) = generate_keypair();
         bad_trust.trusted_profile_signer_dids =
-            vec![crate::crypto::encode_did_key(&other_signer.verifying_key())];
+            vec![crate::crypto::encode_signing_key_did(&other_signer)];
         rejected(canonical_startup_config_bytes(&bad_trust).unwrap());
 
         let mut bad_profile = config_file(&material);

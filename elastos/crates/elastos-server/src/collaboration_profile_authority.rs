@@ -10,7 +10,7 @@ use sha2::Digest;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use crate::crypto::{decode_did_key, encode_did_key};
+use crate::crypto::decode_did_key;
 
 pub(crate) const COLLABORATION_PROFILE_AUTHORITY_BUNDLE_SCHEMA_V1: &str =
     "elastos.profile-authority-bundle/v1";
@@ -279,7 +279,7 @@ pub(crate) fn update_profile_authority(
     let profile_did = existing
         .as_ref()
         .map(|state| state.verified.document().profile_did.clone())
-        .unwrap_or_else(|| encode_did_key(&signing_key.verifying_key()));
+        .unwrap_or_else(|| crate::crypto::encode_signing_key_did(&signing_key));
     let revision = existing
         .as_ref()
         .map(|state| {
@@ -414,7 +414,7 @@ fn decode_profile_authority_bundle(
     }
     let seed = decode_profile_signing_seed(&bundle.profile_signing_seed_hex)?;
     let signing_key = SigningKey::from_bytes(&seed);
-    let expected_signer_did = encode_did_key(&signing_key.verifying_key());
+    let expected_signer_did = crate::crypto::encode_signing_key_did(&signing_key);
     if bundle.signed_profile.signer_did != expected_signer_did {
         anyhow::bail!("profile authority signer DID mismatch");
     }
@@ -501,7 +501,7 @@ pub(crate) fn restore_profile_authority_bundle_for_recovery(
     let seed_key = SigningKey::from_bytes(&decode_profile_signing_seed(
         &bundle.profile_signing_seed_hex,
     )?);
-    if encode_did_key(&seed_key.verifying_key()) != verified.document().profile_did {
+    if crate::crypto::encode_signing_key_did(&seed_key) != verified.document().profile_did {
         anyhow::bail!("recovered profile signing seed does not control the recovered Profile DID");
     }
     let path = profile_authority_path(data_dir, localhost_root)?;
@@ -911,7 +911,7 @@ pub(crate) fn signed_profile_document_with_authority_for_test(
     )?;
     let document = CollaborationProfileDocument {
         schema: COLLABORATION_PROFILE_DOCUMENT_SCHEMA_V1.to_string(),
-        profile_did: encode_did_key(&signing_key.verifying_key()),
+        profile_did: crate::crypto::encode_signing_key_did(&signing_key),
         collaboration_endpoint,
         collaboration_signers,
         display_name: clean_profile_display_name(display_name)?,
@@ -1151,9 +1151,9 @@ mod tests {
         let endpoint_key = SigningKey::from_bytes(&[42u8; 32]);
         let signer_key = SigningKey::from_bytes(&[43u8; 32]);
         let other_key = SigningKey::from_bytes(&[44u8; 32]);
-        let endpoint_did = encode_did_key(&endpoint_key.verifying_key());
-        let signer_did = encode_did_key(&signer_key.verifying_key());
-        let other_did = encode_did_key(&other_key.verifying_key());
+        let endpoint_did = crate::crypto::encode_signing_key_did(&endpoint_key);
+        let signer_did = crate::crypto::encode_signing_key_did(&signer_key);
+        let other_did = crate::crypto::encode_signing_key_did(&other_key);
         let profile = signed_profile_document_with_authority_for_test(
             &profile_key,
             "Alice",
@@ -1214,8 +1214,10 @@ mod tests {
     #[test]
     fn profile_authority_rotation_and_revocation_require_new_generations() {
         let profile_key = SigningKey::from_bytes(&[51u8; 32]);
-        let first_endpoint = encode_did_key(&SigningKey::from_bytes(&[52u8; 32]).verifying_key());
-        let second_endpoint = encode_did_key(&SigningKey::from_bytes(&[53u8; 32]).verifying_key());
+        let first_endpoint =
+            crate::crypto::encode_signing_key_did(&SigningKey::from_bytes(&[52u8; 32]));
+        let second_endpoint =
+            crate::crypto::encode_signing_key_did(&SigningKey::from_bytes(&[53u8; 32]));
         let first = signed_profile_document_for_test(
             &profile_key,
             "Alice",
@@ -1543,7 +1545,10 @@ mod tests {
             .unwrap()
             .expect("existing device key should load");
         assert_eq!(loaded.1, expected_did);
-        assert_eq!(encode_did_key(&loaded.0.verifying_key()), expected_did);
+        assert_eq!(
+            crate::crypto::encode_signing_key_did(&loaded.0),
+            expected_did
+        );
         assert_eq!(loaded.0.to_bytes(), expected_key.to_bytes());
     }
 

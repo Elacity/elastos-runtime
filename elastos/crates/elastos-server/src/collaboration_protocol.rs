@@ -17,8 +17,8 @@ use elastos_common::collaboration_protocol::{
 use elastos_runtime::signature::SigningKey;
 
 use crate::crypto::{
-    decode_did_key, domain_separated_sign, encode_did_key, verify_domain_separated_signature,
-    verify_signed_json_envelope_against_dids,
+    decode_did_key, domain_separated_sign, encode_signing_key_did,
+    verify_domain_separated_signature, verify_signed_json_envelope_against_dids,
 };
 
 pub(crate) const COLLABORATION_TRANSPORT_FRAME_SCHEMA_V1: &str =
@@ -121,7 +121,7 @@ pub(crate) fn sign_collaboration_transport_frame(
     validate_transport_envelope_bytes(envelope_bytes)?;
     let payload = CollaborationTransportFramePayload {
         schema: COLLABORATION_TRANSPORT_FRAME_SCHEMA_V1.to_string(),
-        source_endpoint_did: encode_did_key(&signing_key.verifying_key()),
+        source_endpoint_did: encode_signing_key_did(signing_key),
         envelope: std::str::from_utf8(envelope_bytes)
             .context("collaboration transport frame envelope is not UTF-8")?
             .to_string(),
@@ -489,11 +489,9 @@ pub(crate) fn validate_payload_type(value: &str) -> anyhow::Result<()> {
 }
 
 fn validate_canonical_did(value: &str, field: &str) -> anyhow::Result<()> {
-    let key = decode_did_key(value).with_context(|| format!("invalid {field}"))?;
-    if encode_did_key(&key) != value {
-        anyhow::bail!("{field} is not canonical");
-    }
-    Ok(())
+    decode_did_key(value)
+        .with_context(|| format!("invalid {field}"))
+        .map(|_| ())
 }
 
 fn validate_signature_shape(signature: &str) -> anyhow::Result<()> {
@@ -547,7 +545,7 @@ mod tests {
     const SERVICE: &str = "chat";
 
     fn did(signing_key: &SigningKey) -> String {
-        encode_did_key(&signing_key.verifying_key())
+        encode_signing_key_did(signing_key)
     }
 
     fn verified_network_profile(network_id: &str) -> VerifiedCollaborationNetworkProfile {

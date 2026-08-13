@@ -99,7 +99,7 @@ impl DefaultConversationDeviceAuthority {
             .checked_add(ttl_secs)
             .context("collaboration message TTL overflows its timestamp")?;
 
-        let signer_did = crate::crypto::encode_did_key(&self.signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&self.signing_key);
         if !sender_profile.authorizes_endpoint(&signer_did)
             || !sender_profile.authorizes_signer(&signer_did, runtime_service, payload_type)
         {
@@ -259,7 +259,7 @@ impl DefaultConversationDeviceAuthority {
     }
 
     pub(crate) fn local_device_did(&self) -> String {
-        crate::crypto::encode_did_key(&self.signing_key.verifying_key())
+        crate::crypto::encode_signing_key_did(&self.signing_key)
     }
 
     pub(crate) fn profile(&self) -> &VerifiedCollaborationNetworkProfile {
@@ -330,7 +330,7 @@ mod tests {
         previous: Option<&VerifiedCollaborationNetworkProfile>,
         grant_cid: Option<String>,
     ) -> VerifiedCollaborationNetworkProfile {
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let payload = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),
@@ -369,7 +369,7 @@ mod tests {
 
     fn authority(network_id: &str) -> (DefaultConversationDeviceAuthority, String, String) {
         let (profile_signer, _) = generate_keypair();
-        let profile_signer_did = crate::crypto::encode_did_key(&profile_signer.verifying_key());
+        let profile_signer_did = crate::crypto::encode_signing_key_did(&profile_signer);
         let grant_bytes = canonical_default_conversation_grant_bytes(&grant(network_id)).unwrap();
         let profile = verified_profile(
             &profile_signer,
@@ -380,7 +380,7 @@ mod tests {
         );
         let verified_grant = verify_default_conversation_grant(&profile, &grant_bytes).unwrap();
         let (device_key, _) = generate_keypair();
-        let device_did = crate::crypto::encode_did_key(&device_key.verifying_key());
+        let device_did = crate::crypto::encode_signing_key_did(&device_key);
         (
             DefaultConversationDeviceAuthority::new(device_key, profile, verified_grant).unwrap(),
             profile_signer_did,
@@ -404,7 +404,7 @@ mod tests {
                 1,
                 None,
                 NOW,
-                vec![crate::crypto::encode_did_key(&sender.verifying_key())],
+                vec![crate::crypto::encode_signing_key_did(&sender)],
             )
             .unwrap();
         CollaborationMessage {
@@ -590,13 +590,13 @@ mod tests {
         let authorized = authority
             .authorize_incoming(
                 &exact,
-                &crate::crypto::encode_did_key(&remote_key.verifying_key()),
+                &crate::crypto::encode_signing_key_did(&remote_key),
                 NOW,
             )
             .unwrap();
         assert_eq!(
             authorized.message().envelope().signer_did,
-            crate::crypto::encode_did_key(&remote_key.verifying_key())
+            crate::crypto::encode_signing_key_did(&remote_key)
         );
 
         let wrong_network = sign_message(
@@ -648,7 +648,7 @@ mod tests {
                 SERVICE,
                 CollaborationRecipient {
                     kind: CollaborationRecipientKind::Profile,
-                    id: crate::crypto::encode_did_key(&remote_key.verifying_key()),
+                    id: crate::crypto::encode_signing_key_did(&remote_key),
                 },
             ),
         );
@@ -673,7 +673,7 @@ mod tests {
             assert!(authority
                 .authorize_incoming(
                     &invalid,
-                    &crate::crypto::encode_did_key(&remote_key.verifying_key()),
+                    &crate::crypto::encode_signing_key_did(&remote_key),
                     NOW,
                 )
                 .is_err());
@@ -684,7 +684,7 @@ mod tests {
         assert!(authority
             .authorize_incoming(
                 &canonical_signed_collaboration_message_bytes(&tampered).unwrap(),
-                &crate::crypto::encode_did_key(&remote_key.verifying_key()),
+                &crate::crypto::encode_signing_key_did(&remote_key),
                 NOW,
             )
             .is_err());
@@ -693,14 +693,14 @@ mod tests {
         assert!(authority
             .authorize_incoming(
                 &noncanonical,
-                &crate::crypto::encode_did_key(&remote_key.verifying_key()),
+                &crate::crypto::encode_signing_key_did(&remote_key),
                 NOW,
             )
             .is_err());
         assert!(authority
             .authorize_incoming(
                 &vec![0; MAX_COLLABORATION_ENVELOPE_BYTES + 1],
-                &crate::crypto::encode_did_key(&remote_key.verifying_key()),
+                &crate::crypto::encode_signing_key_did(&remote_key),
                 NOW,
             )
             .is_err());
@@ -709,7 +709,7 @@ mod tests {
         assert!(authority
             .authorize_incoming(
                 &exact,
-                &crate::crypto::encode_did_key(&substituted_endpoint.verifying_key()),
+                &crate::crypto::encode_signing_key_did(&substituted_endpoint),
                 NOW,
             )
             .is_err());

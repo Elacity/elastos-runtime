@@ -1819,7 +1819,7 @@ mod tests {
         network_id: &str,
         grant_cid: String,
     ) -> VerifiedCollaborationNetworkProfile {
-        let signer_did = crate::crypto::encode_did_key(&signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&signing_key);
         let payload = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),

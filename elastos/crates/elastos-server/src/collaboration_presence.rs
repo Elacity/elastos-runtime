@@ -772,7 +772,7 @@ mod tests {
         )
         .to_string();
         let (profile_signer, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&profile_signer.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&profile_signer);
         let payload = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: NETWORK.to_string(),
@@ -811,7 +811,7 @@ mod tests {
         };
         let grant = verify_default_conversation_grant(&profile, &grant_bytes).unwrap();
         let (device_key, _) = generate_keypair();
-        let device_did = crate::crypto::encode_did_key(&device_key.verifying_key());
+        let device_did = crate::crypto::encode_signing_key_did(&device_key);
         let (person_key, _) = generate_keypair();
         let person_profile =
             crate::collaboration_profile_authority::signed_profile_document_for_test(
@@ -857,7 +857,7 @@ mod tests {
         crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
     ) {
         let (key, _) = generate_keypair();
-        let device_did = crate::crypto::encode_did_key(&key.verifying_key());
+        let device_did = crate::crypto::encode_signing_key_did(&key);
         let (person_key, _) = generate_keypair();
         let person_profile =
             crate::collaboration_profile_authority::signed_profile_document_for_test(
@@ -962,9 +962,7 @@ mod tests {
                 1,
                 None,
                 NOW,
-                vec![crate::crypto::encode_did_key(
-                    &fixture.device_key.verifying_key(),
-                )],
+                vec![crate::crypto::encode_signing_key_did(&fixture.device_key)],
             )
             .unwrap();
         assert!(fixture

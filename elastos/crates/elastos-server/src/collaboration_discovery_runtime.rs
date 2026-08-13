@@ -48,7 +48,7 @@ use crate::collaboration_network::{
 };
 use crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument;
 use crate::collaboration_protocol::validate_id;
-use crate::crypto::{domain_separated_sign, encode_did_key};
+use crate::crypto::domain_separated_sign;
 
 const COLLABORATION_DISCOVERY_PROVIDER_SCHEME: &str = "collaboration";
 const MAX_DISCOVERY_CLIENT_STATES: usize = 32;
@@ -2043,7 +2043,7 @@ impl CollaborationDiscoveryAuthority {
     }
 
     fn local_device_did(&self) -> String {
-        encode_did_key(&self.signing_key.verifying_key())
+        crate::crypto::encode_signing_key_did(&self.signing_key)
     }
 }
 
@@ -3175,7 +3175,7 @@ pub(crate) mod tests {
         trusted_signing_key: &SigningKey,
         bootstrap_peers: Vec<CollaborationBootstrapPeer>,
     ) -> VerifiedCollaborationNetworkProfile {
-        let signer_did = encode_did_key(&trusted_signing_key.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&trusted_signing_key);
         let profile = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),
@@ -3204,7 +3204,7 @@ pub(crate) mod tests {
                 .unwrap(),
             ),
             network_id,
-            &[encode_did_key(&trusted_signing_key.verifying_key())],
+            &[crate::crypto::encode_signing_key_did(&trusted_signing_key)],
             None,
         )
         .unwrap()
@@ -3238,7 +3238,7 @@ pub(crate) mod tests {
     ) {
         std::fs::create_dir_all(root).unwrap();
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let did = encode_did_key(&device_signing_key.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&device_signing_key);
         let principal_id = format!("person:local:{}", &did[8..16]);
         let protection = crate::auth::store_test_principal_root_protection(root, &principal_id);
         let local_profile =
@@ -3276,7 +3276,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let profile = signed_profile(NETWORK, trusted_signing_key, bootstrap_peers);
         let registry = Arc::new(ProviderRegistry::new());
-        let did = encode_did_key(&device_signing_key.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&device_signing_key);
         let node = start_carrier_node_with_registry(
             device_signing_key,
             &did,
@@ -3482,7 +3482,7 @@ pub(crate) mod tests {
         let endpoint_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let profile_key_a = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let profile_key_b = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
-        let endpoint_did = encode_did_key(&endpoint_key.verifying_key());
+        let endpoint_did = crate::crypto::encode_signing_key_did(&endpoint_key);
         let now = current_timestamp();
         let profile_a = signed_profile_document_for_test(
             &profile_key_a,
@@ -3665,7 +3665,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(root).unwrap();
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (device_key, _) = elastos_identity::load_or_create_did(root).unwrap();
-        let did = encode_did_key(&device_key.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&device_key);
         let principal_id = format!("person:local:{}", &did[8..16]);
         let protection = crate::auth::store_test_principal_root_protection(root, &principal_id);
         let binding = elastos_runtime::auth::ProofBinding::passkey_webauthn(
@@ -3917,7 +3917,7 @@ pub(crate) mod tests {
         let remote_profile = service_profile(&remote_service, "Remote Person", Some("remote"));
         let network = remote_service.network_profile();
         let registry = Arc::new(ProviderRegistry::new());
-        let local_did = encode_did_key(&local_key.verifying_key());
+        let local_did = crate::crypto::encode_signing_key_did(&local_key);
         let local_node = start_carrier_node_with_registry(
             local_key,
             &local_did,
@@ -4087,7 +4087,7 @@ pub(crate) mod tests {
             revision,
             previous_profile_sha256,
             updated_at,
-            vec![encode_did_key(&device_signing_key.verifying_key())],
+            vec![crate::crypto::encode_signing_key_did(&device_signing_key)],
         )
         .unwrap()
     }
@@ -4320,7 +4320,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -4460,7 +4460,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -4876,7 +4876,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5035,7 +5035,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5199,7 +5199,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5387,7 +5387,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5534,7 +5534,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -5745,7 +5745,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -6069,7 +6069,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -6159,7 +6159,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -6303,7 +6303,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -6406,7 +6406,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,
@@ -6487,7 +6487,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let registry = Arc::new(ProviderRegistry::new());
-        let did = encode_did_key(&device_key.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&device_key);
         let node = start_carrier_node_with_registry(
             &device_key,
             &did,
@@ -6572,7 +6572,7 @@ pub(crate) mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let registry = Arc::new(ProviderRegistry::new());
-        let did = encode_did_key(&device_key.verifying_key());
+        let did = crate::crypto::encode_signing_key_did(&device_key);
         let node = start_carrier_node_with_registry(
             &device_key,
             &did,
@@ -6631,7 +6631,7 @@ pub(crate) mod tests {
         let foreign_root = temp.path().join("foreign");
         std::fs::create_dir_all(&foreign_root).unwrap();
         std::fs::set_permissions(&foreign_root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let foreign_did = encode_did_key(&foreign_key.verifying_key());
+        let foreign_did = crate::crypto::encode_signing_key_did(&foreign_key);
         let foreign_registry = Arc::new(ProviderRegistry::new());
         let foreign_node = start_carrier_node_with_registry(
             &foreign_key,
@@ -8244,8 +8244,8 @@ pub(crate) mod tests {
             None,
             10,
             vec![
-                encode_did_key(&device_a.verifying_key()),
-                encode_did_key(&device_b.verifying_key()),
+                crate::crypto::encode_signing_key_did(&device_a),
+                crate::crypto::encode_signing_key_did(&device_b),
             ],
         )
         .unwrap();
@@ -8535,7 +8535,7 @@ pub(crate) mod tests {
         let trusted = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_key = SigningKey::from_bytes(&generate_keypair().0.to_bytes());
         let seed_registry = Arc::new(ProviderRegistry::new());
-        let seed_did = encode_did_key(&seed_key.verifying_key());
+        let seed_did = crate::crypto::encode_signing_key_did(&seed_key);
         let seed_node = start_carrier_node_with_registry(
             &seed_key,
             &seed_did,

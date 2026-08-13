@@ -6,6 +6,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -49,14 +50,79 @@ pub struct IdentityStore {
 }
 
 /// Multicodec prefix for Ed25519 public keys.
-pub const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+const MULTICODEC_ED25519_PUB: [u8; 2] = [0xed, 0x01];
+const DID_KEY_PREFIX: &str = "did:key:z";
+const DID_KEY_ED25519_PREFIX: &str = "did:key:z6Mk";
+const DID_KEY_ED25519_LEN: usize = 56;
+const DID_KEY_DECODED_BYTES: usize = 34;
 
-/// Encode an Ed25519 verifying key as `did:key:z6Mk...` (multicodec + base58).
-pub fn encode_did_key(verifying_key: &ed25519_dalek::VerifyingKey) -> String {
-    let mut bytes = Vec::with_capacity(34);
-    bytes.extend_from_slice(&MULTICODEC_ED25519_PUB);
-    bytes.extend_from_slice(verifying_key.as_bytes());
-    format!("did:key:z{}", bs58::encode(&bytes).into_string())
+fn encode_canonical_did_key_bytes(key_bytes: [u8; 32]) -> String {
+    let mut encoded = Vec::with_capacity(34);
+    encoded.extend_from_slice(&MULTICODEC_ED25519_PUB);
+    encoded.extend_from_slice(&key_bytes);
+    format!("did:key:z{}", bs58::encode(&encoded).into_string())
+}
+
+/// Encode a signing-key-derived Ed25519 public key as `did:key:z6Mk...`.
+pub fn encode_signing_key_did(signing_key: &ed25519_dalek::SigningKey) -> String {
+    encode_canonical_did_key_bytes(signing_key.verifying_key().to_bytes())
+}
+
+/// Encode one canonical Ed25519 verifying key as `did:key:z6Mk...`.
+pub fn encode_did_key(verifying_key: &ed25519_dalek::VerifyingKey) -> anyhow::Result<String> {
+    let bytes = verifying_key.to_bytes();
+    validate_canonical_ed25519_verifying_key_bytes(bytes)?;
+    Ok(encode_canonical_did_key_bytes(bytes))
+}
+
+/// Accept only one canonical Ed25519 public-key encoding for authority use.
+pub fn validate_canonical_ed25519_verifying_key_bytes(
+    bytes: [u8; 32],
+) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+    let compressed = CompressedEdwardsY(bytes);
+    let point = compressed
+        .decompress()
+        .ok_or_else(|| anyhow::anyhow!("Ed25519 key must decompress"))?;
+    if point.compress().to_bytes() != bytes {
+        anyhow::bail!("Ed25519 key is not canonically compressed");
+    }
+    if point.is_small_order() {
+        anyhow::bail!("Ed25519 key must not be small order");
+    }
+    if !point.is_torsion_free() {
+        anyhow::bail!("Ed25519 key must be torsion free");
+    }
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid Ed25519 verifying key: {error}"))
+}
+
+/// Decode the one canonical Ed25519 `did:key` representation.
+///
+/// The round-trip check rejects alternate base58 spellings and any future
+/// multicodec variant. Callers that need a Profile identity should retain the
+/// returned key bytes as authority and treat the DID text as a projection.
+pub fn decode_did_key(did: &str) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+    if did.len() != DID_KEY_ED25519_LEN || !did.starts_with(DID_KEY_ED25519_PREFIX) {
+        anyhow::bail!("DID must be one canonical Ed25519 did:key");
+    }
+    let multibase = did
+        .strip_prefix(DID_KEY_PREFIX)
+        .ok_or_else(|| anyhow::anyhow!("DID must start with did:key:z"))?;
+    let mut bytes = [0u8; DID_KEY_DECODED_BYTES];
+    let decoded = bs58::decode(multibase)
+        .onto(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("invalid base58 in DID: {error}"))?;
+    if decoded != DID_KEY_DECODED_BYTES || bytes[..2] != MULTICODEC_ED25519_PUB {
+        anyhow::bail!("DID must contain one Ed25519 public key");
+    }
+    let key_bytes: [u8; 32] = bytes[2..]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("DID must contain one Ed25519 public key"))?;
+    let verifying_key = validate_canonical_ed25519_verifying_key_bytes(key_bytes)?;
+    if encode_canonical_did_key_bytes(verifying_key.to_bytes()) != did {
+        anyhow::bail!("DID is not canonical");
+    }
+    Ok(verifying_key)
 }
 
 /// Load the device key and derive a stable DID identity from it.
@@ -155,7 +221,7 @@ pub fn derive_did(secret: &[u8; 32]) -> (ed25519_dalek::SigningKey, String) {
     hasher.update(secret);
     let derived: [u8; 32] = hasher.finalize().into();
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&derived);
-    let did = encode_did_key(&signing_key.verifying_key());
+    let did = encode_signing_key_did(&signing_key);
     (signing_key, did)
 }
 
@@ -378,7 +444,42 @@ fn generate_user_id(credential_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use curve25519_dalek::{constants, edwards::CompressedEdwardsY};
+
     use super::*;
+
+    fn alias_pair() -> ([u8; 32], [u8; 32]) {
+        let canonical = [
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let noncanonical = [
+            0xf0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ];
+        (canonical, noncanonical)
+    }
+
+    fn weak_public_key_bytes() -> [u8; 32] {
+        [
+            236, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 127,
+        ]
+    }
+
+    fn non_torsion_free_public_key_bytes() -> [u8; 32] {
+        (constants::ED25519_BASEPOINT_POINT + constants::EIGHT_TORSION[1])
+            .compress()
+            .to_bytes()
+    }
+
+    fn did_for_key_bytes(bytes: [u8; 32]) -> String {
+        let mut encoded = MULTICODEC_ED25519_PUB.to_vec();
+        encoded.extend_from_slice(&bytes);
+        format!("did:key:z{}", bs58::encode(encoded).into_string())
+    }
 
     #[test]
     fn test_store_roundtrip() {
@@ -497,12 +598,90 @@ mod tests {
     #[test]
     fn test_did_format() {
         let dir = tempfile::tempdir().unwrap();
-        let (_sk, did) = load_or_create_did(dir.path()).unwrap();
+        let (sk, did) = load_or_create_did(dir.path()).unwrap();
         assert!(
             did.starts_with("did:key:z6Mk"),
             "DID must start with did:key:z6Mk, got: {}",
             did
         );
+        assert_eq!(decode_did_key(&did).unwrap(), sk.verifying_key());
+    }
+
+    #[test]
+    fn did_decode_rejects_invalid_and_noncanonical_profile_text() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let did = encode_signing_key_did(&key);
+        assert!(decode_did_key("did:example:alice").is_err());
+        assert!(decode_did_key(&did.to_ascii_uppercase()).is_err());
+        assert!(decode_did_key(&(did.clone() + "x")).is_err());
+        assert!(decode_did_key(&did[..did.len() - 1]).is_err());
+
+        let mut wrong_codec = vec![0xec, 0x01];
+        wrong_codec.extend_from_slice(key.verifying_key().as_bytes());
+        let wrong_codec = format!("did:key:z{}", bs58::encode(wrong_codec).into_string());
+        assert!(decode_did_key(&wrong_codec).is_err());
+
+        let (canonical_alias, noncanonical_alias) = alias_pair();
+        assert!(decode_did_key(&did_for_key_bytes(canonical_alias)).is_err());
+        assert!(decode_did_key(&did_for_key_bytes(noncanonical_alias)).is_err());
+        assert!(decode_did_key(&did_for_key_bytes(weak_public_key_bytes())).is_err());
+        assert!(decode_did_key(&did_for_key_bytes(non_torsion_free_public_key_bytes())).is_err());
+    }
+
+    #[test]
+    fn canonical_ed25519_validator_accepts_generated_keys_and_rejects_aliases() {
+        let generated = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+        assert_eq!(
+            validate_canonical_ed25519_verifying_key_bytes(generated.to_bytes()).unwrap(),
+            generated
+        );
+
+        let (canonical_alias, noncanonical_alias) = alias_pair();
+        let canonical_point = CompressedEdwardsY(canonical_alias).decompress().unwrap();
+        let alias_point = CompressedEdwardsY(noncanonical_alias).decompress().unwrap();
+        assert_eq!(canonical_point, alias_point);
+        assert_eq!(canonical_point.compress().to_bytes(), canonical_alias);
+        assert!(validate_canonical_ed25519_verifying_key_bytes(canonical_alias).is_err());
+        assert!(validate_canonical_ed25519_verifying_key_bytes(noncanonical_alias).is_err());
+    }
+
+    #[test]
+    fn canonical_ed25519_validator_rejects_weak_and_non_torsion_free_points() {
+        let weak = CompressedEdwardsY(weak_public_key_bytes())
+            .decompress()
+            .unwrap();
+        assert!(weak.is_small_order());
+        assert!(!weak.is_torsion_free());
+        assert!(validate_canonical_ed25519_verifying_key_bytes(weak_public_key_bytes()).is_err());
+
+        let non_torsion_free = CompressedEdwardsY(non_torsion_free_public_key_bytes())
+            .decompress()
+            .unwrap();
+        assert!(!non_torsion_free.is_small_order());
+        assert!(!non_torsion_free.is_torsion_free());
+        assert!(
+            validate_canonical_ed25519_verifying_key_bytes(non_torsion_free_public_key_bytes())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn encode_did_key_rejects_noncanonical_and_weak_reconstructed_verifying_keys() {
+        let (canonical_alias, noncanonical_alias) = alias_pair();
+        let canonical_alias_key = ed25519_dalek::VerifyingKey::from_bytes(&canonical_alias)
+            .expect("dalek accepts alias bytes as a verifying key");
+        let noncanonical_alias_key = ed25519_dalek::VerifyingKey::from_bytes(&noncanonical_alias)
+            .expect("dalek accepts alias bytes as a verifying key");
+        let weak_key = ed25519_dalek::VerifyingKey::from_bytes(&weak_public_key_bytes())
+            .expect("dalek accepts weak-order bytes as a verifying key");
+        let non_torsion_free_key =
+            ed25519_dalek::VerifyingKey::from_bytes(&non_torsion_free_public_key_bytes())
+                .expect("dalek accepts non-torsion-free bytes as a verifying key");
+
+        assert!(encode_did_key(&canonical_alias_key).is_err());
+        assert!(encode_did_key(&noncanonical_alias_key).is_err());
+        assert!(encode_did_key(&weak_key).is_err());
+        assert!(encode_did_key(&non_torsion_free_key).is_err());
     }
 
     #[test]

@@ -1759,7 +1759,7 @@ mod tests {
     fn upsert_peer_merges_existing_route_and_allowlist() {
         let dir = tempfile::tempdir().unwrap();
         let (sk, _) = generate_keypair();
-        let did = elastos_identity::encode_did_key(&sk.verifying_key());
+        let did = elastos_identity::encode_signing_key_did(&sk);
 
         upsert_peer(
             dir.path(),
@@ -1794,7 +1794,7 @@ mod tests {
     fn remove_peer_deletes_existing_entry() {
         let dir = tempfile::tempdir().unwrap();
         let (sk, _) = generate_keypair();
-        let did = elastos_identity::encode_did_key(&sk.verifying_key());
+        let did = elastos_identity::encode_signing_key_did(&sk);
 
         upsert_peer(
             dir.path(),
@@ -1815,7 +1815,7 @@ mod tests {
     #[test]
     fn signed_operator_response_round_trip_verifies_target_did() {
         let (sk, _) = generate_keypair();
-        let target_did = elastos_identity::encode_did_key(&sk.verifying_key());
+        let target_did = elastos_identity::encode_signing_key_did(&sk);
         let payload = OperatorResponsePayload {
             version: 1,
             request_id: "req-1".to_string(),

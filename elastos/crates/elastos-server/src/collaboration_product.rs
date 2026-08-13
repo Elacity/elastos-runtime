@@ -314,7 +314,7 @@ pub(crate) fn test_chat_product_port(
     )
     .to_string();
     let (profile_signer, _) = elastos_runtime::signature::generate_keypair();
-    let signer_did = crate::crypto::encode_did_key(&profile_signer.verifying_key());
+    let signer_did = crate::crypto::encode_signing_key_did(&profile_signer);
     let profile_payload = CollaborationNetworkProfile {
         schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
         network_id: network_id.to_string(),
@@ -573,7 +573,7 @@ mod tests {
         let multihash = cid::multihash::Multihash::<64>::wrap(0x12, digest.as_slice()).unwrap();
         let grant_cid = cid::Cid::new_v1(0x55, multihash).to_string();
         let (profile_signer, _) = generate_keypair();
-        let signer_did = crate::crypto::encode_did_key(&profile_signer.verifying_key());
+        let signer_did = crate::crypto::encode_signing_key_did(&profile_signer);
         let profile_payload = CollaborationNetworkProfile {
             schema: COLLABORATION_NETWORK_PROFILE_SCHEMA.to_string(),
             network_id: network_id.to_string(),
@@ -612,7 +612,7 @@ mod tests {
         };
         let grant = verify_default_conversation_grant(&profile, &grant_bytes).unwrap();
         let (device_key, _) = generate_keypair();
-        let device_did = crate::crypto::encode_did_key(&device_key.verifying_key());
+        let device_did = crate::crypto::encode_signing_key_did(&device_key);
         let (person_key, _) = generate_keypair();
         let person_profile =
             crate::collaboration_profile_authority::signed_profile_document_for_test(
@@ -665,7 +665,7 @@ mod tests {
         crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument,
     ) {
         let (remote_key, _) = generate_keypair();
-        let remote_did = crate::crypto::encode_did_key(&remote_key.verifying_key());
+        let remote_did = crate::crypto::encode_signing_key_did(&remote_key);
         let (person_key, _) = generate_keypair();
         let person_profile =
             crate::collaboration_profile_authority::signed_profile_document_for_test(

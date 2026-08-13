@@ -957,7 +957,7 @@ async fn durable_pending_restarts_with_the_exact_envelope_and_settles_once() {
         .unwrap();
     let restarted_b = crate::carrier::start_carrier_node_with_registry(
         &pair.key_b,
-        &encode_did_key(&pair.key_b.verifying_key()),
+        &crate::crypto::encode_signing_key_did(&pair.key_b),
         temp.path().join("b-restarted"),
         Some(Arc::downgrade(&pair.registry_b)),
     )
@@ -1044,7 +1044,7 @@ async fn retry_filters_invalid_and_removed_records_before_its_bounded_budget() {
 
     let removed_key =
         SigningKey::from_bytes(&elastos_runtime::signature::generate_keypair().0.to_bytes());
-    let removed_did = encode_did_key(&removed_key.verifying_key());
+    let removed_did = crate::crypto::encode_signing_key_did(&removed_key);
     for index in 0..4 {
         let removed = test_message(
             &pair,
@@ -1235,11 +1235,8 @@ async fn persistence_rejects_invalid_messages_receipts_and_state_without_mutatio
         .persist_message(&valid, false, now)
         .unwrap();
     let receiver_before_substitution = protected_store_bytes(&context_b.message_store);
-    let foreign_endpoint = encode_did_key(
-        &elastos_runtime::signature::generate_keypair()
-            .0
-            .verifying_key(),
-    );
+    let foreign_endpoint =
+        crate::crypto::encode_signing_key_did(&elastos_runtime::signature::generate_keypair().0);
     assert!(direct_b.receive(&valid, &foreign_endpoint, now).is_err());
     assert_eq!(
         protected_store_bytes(&context_b.message_store),
@@ -1253,7 +1250,7 @@ async fn persistence_rejects_invalid_messages_receipts_and_state_without_mutatio
 
     let other_key =
         SigningKey::from_bytes(&elastos_runtime::signature::generate_keypair().0.to_bytes());
-    let other_did = encode_did_key(&other_key.verifying_key());
+    let other_did = crate::crypto::encode_signing_key_did(&other_key);
     let wrong_network = resign_message(&valid, &pair.key_a, |message| {
         message.network_id = "other-network".to_string();
     });
@@ -1641,7 +1638,7 @@ async fn direct_delivery_leaves_on_the_peer_did_route_without_bootstrap_transpor
         .is_empty());
 
     let invoker = std::sync::Arc::new(RecordingDirectCarrierInvoker {
-        source_endpoint_did: encode_did_key(&pair.key_a.verifying_key()),
+        source_endpoint_did: crate::crypto::encode_signing_key_did(&pair.key_a),
         remote: pair.service_b.direct_message_service(),
         calls: tokio::sync::Mutex::new(Vec::new()),
     });
@@ -1756,7 +1753,7 @@ async fn same_runtime_profiles_settle_through_authenticated_carrier_loopback_wit
     let temp = tempfile::tempdir().unwrap();
     let mut pair =
         crate::collaboration_discovery_runtime::tests::same_runtime_profile_pair(temp.path()).await;
-    let endpoint_did = encode_did_key(&pair.endpoint_key.verifying_key());
+    let endpoint_did = crate::crypto::encode_signing_key_did(&pair.endpoint_key);
     pair.node
         .take()
         .expect("fixture Carrier node")
@@ -1814,7 +1811,7 @@ async fn same_runtime_carrier_loopback_rejects_wrong_authority_and_recipient_bin
     let temp = tempfile::tempdir().unwrap();
     let mut pair =
         crate::collaboration_discovery_runtime::tests::same_runtime_profile_pair(temp.path()).await;
-    let endpoint_did = encode_did_key(&pair.endpoint_key.verifying_key());
+    let endpoint_did = crate::crypto::encode_signing_key_did(&pair.endpoint_key);
     pair.node
         .take()
         .expect("fixture Carrier node")
@@ -1894,11 +1891,8 @@ async fn same_runtime_carrier_loopback_rejects_wrong_authority_and_recipient_bin
         ))
         .await
         .is_err());
-    let unregistered_profile = encode_did_key(
-        &elastos_runtime::signature::generate_keypair()
-            .0
-            .verifying_key(),
-    );
+    let unregistered_profile =
+        crate::crypto::encode_signing_key_did(&elastos_runtime::signature::generate_keypair().0);
     let unregistered_recipient = resign_message(&valid, &pair.endpoint_key, |message| {
         message.recipient.id = unregistered_profile;
     });
@@ -1951,11 +1945,8 @@ async fn non_recipient_runtime_cannot_admit_another_profiles_direct_message() {
 
 #[test]
 fn direct_provider_runtime_metadata_is_exact() {
-    let source_endpoint_did = encode_did_key(
-        &elastos_runtime::signature::generate_keypair()
-            .0
-            .verifying_key(),
-    );
+    let source_endpoint_did =
+        crate::crypto::encode_signing_key_did(&elastos_runtime::signature::generate_keypair().0);
     let valid = serde_json::json!({
         "schema":"elastos.provider.invocation/v1",
         "source":DIRECT_MESSAGE_PROVIDER_SCHEME,
@@ -2000,8 +1991,8 @@ fn direct_message_signer_and_carrier_endpoint_are_independent_profile_roles() {
     let message_key = SigningKey::from_bytes(&[73u8; 32]);
     let recipient_profile_key = SigningKey::from_bytes(&[74u8; 32]);
     let recipient_endpoint_key = SigningKey::from_bytes(&[75u8; 32]);
-    let endpoint_did = encode_did_key(&endpoint_key.verifying_key());
-    let message_signer_did = encode_did_key(&message_key.verifying_key());
+    let endpoint_did = crate::crypto::encode_signing_key_did(&endpoint_key);
+    let message_signer_did = crate::crypto::encode_signing_key_did(&message_key);
     let sender_profile =
         crate::collaboration_profile_authority::signed_profile_document_with_authority_for_test(
             &profile_key,
@@ -2024,7 +2015,9 @@ fn direct_message_signer_and_carrier_endpoint_are_independent_profile_roles() {
             1,
             None,
             1_800_000_000,
-            vec![encode_did_key(&recipient_endpoint_key.verifying_key())],
+            vec![crate::crypto::encode_signing_key_did(
+                &recipient_endpoint_key,
+            )],
         )
         .unwrap();
     let trusted = SigningKey::from_bytes(&[76u8; 32]);

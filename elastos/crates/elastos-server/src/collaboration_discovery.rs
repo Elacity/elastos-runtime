@@ -16,7 +16,7 @@ use crate::collaboration_profile_authority::{
 use crate::collaboration_protocol::{
     verify_collaboration_message, verify_stored_collaboration_message, VerifiedCollaborationMessage,
 };
-use crate::crypto::{decode_did_key, encode_did_key, verify_signed_json_envelope_against_dids};
+use crate::crypto::{decode_did_key, verify_signed_json_envelope_against_dids};
 
 pub const COLLABORATION_DISCOVERY_SERVICE: &str = "people";
 pub const COLLABORATION_DISCOVERY_DIRECTORY_ID: &str = "elastos.people.discovery.directory";
@@ -835,11 +835,9 @@ fn sha256_label(bytes: &[u8]) -> String {
 }
 
 fn validate_canonical_did(value: &str, field: &str) -> anyhow::Result<()> {
-    let key = decode_did_key(value).with_context(|| format!("invalid {field}"))?;
-    if encode_did_key(&key) != value {
-        anyhow::bail!("{field} is not canonical");
-    }
-    Ok(())
+    decode_did_key(value)
+        .with_context(|| format!("invalid {field}"))
+        .map(|_| ())
 }
 
 fn validate_signature_shape(signature: &str) -> anyhow::Result<()> {
@@ -991,7 +989,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     fn device_did(signing_key: &SigningKey) -> String {
-        crate::crypto::encode_did_key(&signing_key.verifying_key())
+        crate::crypto::encode_signing_key_did(signing_key)
     }
 
     fn verified_profile(signing_key: &SigningKey) -> VerifiedCollaborationNetworkProfile {

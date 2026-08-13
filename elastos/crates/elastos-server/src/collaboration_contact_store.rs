@@ -39,7 +39,7 @@ use crate::collaboration_profile_authority::{
     VerifiedCollaborationProfileDocument, MAX_RETAINED_PROFILE_REVISIONS,
 };
 use crate::collaboration_protocol::validate_id;
-use crate::crypto::{decode_did_key, encode_did_key};
+use crate::crypto::decode_did_key;
 
 const CONTACT_STORE_SCHEMA: &str = "elastos.people.contact-store/v1";
 /// Removed relationships stay visible and keep their retained head, so they
@@ -2660,11 +2660,9 @@ fn ordered_pair<'a>(left: &'a str, right: &'a str) -> (&'a str, &'a str) {
 }
 
 fn validate_canonical_did(value: &str, field: &str) -> anyhow::Result<()> {
-    let key = decode_did_key(value).with_context(|| format!("invalid {field}"))?;
-    if encode_did_key(&key) != value {
-        anyhow::bail!("{field} is not canonical");
-    }
-    Ok(())
+    decode_did_key(value)
+        .with_context(|| format!("invalid {field}"))
+        .map(|_| ())
 }
 
 fn sha256_label_bytes(bytes: &[u8]) -> String {
@@ -2789,7 +2787,7 @@ mod tests {
     }
 
     fn device_did(signing_key: &SigningKey) -> String {
-        crate::crypto::encode_did_key(&signing_key.verifying_key())
+        crate::crypto::encode_signing_key_did(signing_key)
     }
 
     fn profile_hash(profile: &VerifiedCollaborationProfileDocument) -> String {
