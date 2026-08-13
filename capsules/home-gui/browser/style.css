@@ -3482,13 +3482,13 @@ body.dock-autohide::after {
    Dark mode → dark-dock (lighter cells). Light mode → light-dock (darker cells). */
 .taskbar-icon-launcher {
   background:
-    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20260812a")
+    url("./icons/apps-launcher/dark-dock/icon-64.png?v=home-20260813a")
       center / contain no-repeat;
 }
 
 :root[data-el-theme="light"] .taskbar-icon-launcher {
   background-image:
-    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20260812a");
+    url("./icons/apps-launcher/light-dock/icon-64.png?v=home-20260813a");
 }
 
 .taskbar-icon-launcher::before {

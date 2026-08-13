@@ -1688,7 +1688,7 @@ const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-p
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
-const homeGuiAssetVersion = "home-20260812a";
+const homeGuiAssetVersion = "home-20260813a";
 const homeShellHostAssetVersion = "home-20260802a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
@@ -1726,16 +1726,41 @@ assert(
   "Home readiness state must not preserve shell naming",
 );
 assert(
-  homeGuiTemplateHtml.includes('data-action="minimize"'),
-  "Window minimize action must remain explicit",
+  /<div class="window-head">\s*<div class="window-traffic-lights">\s*<button class="window-action-btn" data-action="close"[\s\S]*?<button class="window-action-btn" data-action="minimize"[\s\S]*?<button class="window-action-btn" data-action="maximize"[\s\S]*?<\/div>\s*<div class="window-head-draggable">[\s\S]*?<\/div>\s*<div class="window-head-balance" aria-hidden="true"><\/div>\s*<\/div>/.test(
+    homeGuiTemplateHtml,
+  ),
+  "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
 );
 assert(
-  homeGuiTemplateHtml.includes('data-action="maximize"'),
-  "Window maximize action must remain explicit",
+  /<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>\s*<div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">\s*<div class="launcher-header">[\s\S]*?<p class="launcher-browse-label">Apps<\/p>[\s\S]*?<button\s+id="launcher-view-toggle"[\s\S]*?<\/button>\s*<\/div>\s*<div class="launcher-scroll hide-scrollbar">[\s\S]*?<h1 class="launcher-heading visually-hidden">Apps<\/h1>[\s\S]*?<div id="launcher-grid" class="launcher-sections"><\/div>[\s\S]*?<\/div>\s*<\/div>\s*<\/aside>/.test(
+    homeGuiTemplateHtml,
+  ) &&
+    !homeGuiTemplateHtml.includes('id="close-launcher"') &&
+    !homeGuiTemplateHtml.includes('placeholder="Search Home"') &&
+    fileExists("capsules/home-gui/browser/icons/apps-launcher/dark-dock/icon-64.png") &&
+    fileExists("capsules/home-gui/browser/icons/apps-launcher/light-dock/icon-64.png") &&
+    fileExists("capsules/home-gui/browser/icons/apps-launcher/icon-64.png"),
+  "Home launcher must keep one complete launcher generation with its raster icon set",
 );
 assert(
-  homeGuiTemplateHtml.includes('data-action="close"'),
-  "Window close action must remain explicit",
+  /people:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
+    /inbox:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
+    /chat:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
+    /"chat-room":\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&
+    homeGuiCore.includes("browser: WINDOW_CHROME_UNIFIED_TOOLBAR"),
+  "People, Chat, and Inbox must keep the canonical unified-sidebar Home chrome while Browser keeps its toolbar chrome",
+);
+assert(
+  peopleStyle.includes("padding: var(--window-chrome-safe-top, 52px) 12px 16px;") &&
+    !chatRoomStyle.includes("window-chrome-safe-top") &&
+    !inboxStyle.includes("window-chrome-safe-top"),
+  "People must reserve the Home safe-top inset in unified-sidebar mode while Chat and Inbox keep capsule-local top padding only",
+);
+assert(
+  !/window-action-btn|window-traffic-lights|data-action="(?:minimize|maximize|close)"/.test(
+    [peopleStyle, chatRoomStyle, inboxStyle].join("\n"),
+  ),
+  "People, Chat, and Inbox capsules must not define duplicate outer window chrome",
 );
 assert(
   !/fetch\(/.test(shellQuickLook) &&
@@ -1834,8 +1859,13 @@ assert(
   "Home PWA metadata must include mobile-web-app-capable",
 );
 assert(
-  homeGuiTemplateHtml.includes('id="toolbar-fullscreen"'),
-  "Home must expose a fullscreen control in the top toolbar",
+  homeGuiTemplateHtml.includes('id="toolbar-system"') &&
+    homeGuiTemplateHtml.includes('id="toolbar-active-title"') &&
+    homeGuiTemplateHtml.includes('id="toolbar-menubar"') &&
+    homeGuiTemplateHtml.includes('id="toolbar-control-centre"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-fullscreen"') &&
+    !homeGuiTemplateHtml.includes('id="toolbar-fullscreen"'),
+  "Home must expose fullscreen through the canonical system bar and control centre, not the obsolete naked toolbar button",
 );
 assert(
   shellManifest.name === "ElastOS Home",
@@ -7400,7 +7430,7 @@ assert(
   "Home passkey flow must not flicker from checking copy before the final unlock card",
 );
 assert(
-  homeGuiTemplateHtml.includes("toolbar-sign-out") &&
+  homeGuiTemplateHtml.includes("identity-menu-sign-out") &&
     shellAuth.includes("/api/auth/sessions/sign-out") &&
     homeGuiAuthority.includes("summary?.authority?.signed_in === true") &&
     homeGuiShell.includes("projectHomeGuiAuthority(document.body, summary);") &&
@@ -7413,15 +7443,15 @@ assert(
     homeGuiSignOutOpaqueServer.includes("proof:click-sign-out") &&
     homeShellBridgeSmoke.includes("an unauthorized frame or substituted token reached Runtime sign-out") &&
     homeShellBridgeSmoke.includes("trusted Home GUI sign-out did not make exactly one Runtime revocation request"),
-  "Home must expose an explicit sign-out path that clears the browser session through Runtime",
+  "Home must expose an explicit sign-out path through the system menu and clear the browser session through Runtime",
 );
 assert(
-  homeGuiTemplateHtml.includes('id="toolbar-sign-out"') &&
+  homeGuiTemplateHtml.includes('id="identity-menu-sign-out"') &&
     homeGuiTemplateHtml.includes(
       "<path d=\"M6.5 3.5H4.2A1.7 1.7 0 0 0 2.5 5.2v5.6A1.7 1.7 0 0 0 4.2 12.5h2.3M7 8h6.5M11.2 5.5 13.5 8l-2.3 2.5\"",
     ) &&
     !shellStyle.includes('.sign-out-btn .toolbar-identity-item-icon {\n  background-image: url("data:image/svg+xml'),
-  "Home sign-out toolbar icon must use the inline SVG glyph without a duplicate CSS background image",
+  "Home sign-out menu icon must use the inline SVG glyph without a duplicate CSS background image",
 );
 assert(
   !shellStyle.includes(".sign-out-btn::before") &&

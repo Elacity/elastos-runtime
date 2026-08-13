@@ -19,7 +19,7 @@ import {
   saveShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260812a";
+} from "./shell-core.js?v=home-20260813a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260812a";
+} from "./shell-window-geometry.js?v=home-20260813a";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -47,7 +47,7 @@ import {
   setActiveStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260812a";
+} from "./shell-stages.js?v=home-20260813a";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
