@@ -2178,6 +2178,161 @@ fn ensure_audit_chain_state(data_dir: &Path, state: &mut AuthState) -> anyhow::R
     Ok(())
 }
 
+/// Summary of an offline audit-chain migration. Counts and the backup path only —
+/// never any secret material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationReport {
+    /// True when this invocation actually rewrote the auth state (a fresh chain was activated).
+    pub migrated: bool,
+    /// True when the root was already chained and nothing was done (idempotent no-op).
+    pub already_migrated: bool,
+    /// True when `--dry-run` was requested; no writes were performed.
+    pub dry_run: bool,
+    /// Preserved identity counts.
+    pub principals_kept: usize,
+    pub sessions_kept: usize,
+    pub challenges_kept: usize,
+    pub root_protections_kept: usize,
+    /// Number of unchained audit entries discarded (0 when nothing was migrated).
+    pub audit_entries_discarded: usize,
+    /// Path of the pre-migration backup, when one was (or would be) written.
+    pub backup_path: Option<PathBuf>,
+}
+
+/// Offline, operator-invoked migration for a data root created BEFORE the audit-chain
+/// hardening. A lossless migration is impossible by design: the pre-hardening `audit`
+/// entries were never chained, and retro-signing them would forge tamper-evidence. This
+/// PRESERVES identity (principals, sessions, challenges, principal_root_protections) and
+/// DISCARDS the unchained audit history, then activates a fresh chain so the boot guard in
+/// `load_auth_state` passes again. The runtime guard is left intact; this is the explicit
+/// escape hatch.
+///
+/// Intended to run with the gateway stopped. To be robustly safe even if a daemon is live,
+/// the whole mutate+persist is bracketed by BOTH auth-state locks in the SAME order the
+/// runtime uses in `mutate_auth_state`: the auth-state file lock (outer) then the audit-chain
+/// activation lock (inner). Runtime writers take the auth-state file lock first and only then
+/// acquire the activation lock (nested inside `load_auth_state`/`save_auth_state`), so matching
+/// that order makes the migration mutually exclusive with a concurrent `save_auth_state`
+/// without any lock-ordering inversion.
+pub fn migrate_audit_chain(data_dir: &Path, dry_run: bool) -> anyhow::Result<MigrationReport> {
+    // Outer lock: the auth-state file lock, same as `mutate_auth_state`/`save_auth_state`.
+    let _guard = auth_state_mutation_lock()
+        .lock()
+        .map_err(|_| anyhow!("auth state mutation lock poisoned"))?;
+    let lock_file = open_auth_state_lock(data_dir)?;
+    lock_auth_state_file(&lock_file)?;
+    // Inner lock: the activation lock, acquired inside the file lock exactly as the runtime does.
+    let result = with_audit_chain_activation_lock(data_dir, || {
+        migrate_audit_chain_locked(data_dir, dry_run)
+    });
+    let unlock = unlock_auth_state_file(&lock_file);
+    match (result, unlock) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
+}
+
+fn migrate_audit_chain_locked(data_dir: &Path, dry_run: bool) -> anyhow::Result<MigrationReport> {
+    let Some(mut state) = load_auth_state_unverified(data_dir)? else {
+        // Nothing to migrate: no auth state on this root.
+        return Ok(MigrationReport {
+            migrated: false,
+            already_migrated: false,
+            dry_run,
+            principals_kept: 0,
+            sessions_kept: 0,
+            challenges_kept: 0,
+            root_protections_kept: 0,
+            audit_entries_discarded: 0,
+            backup_path: None,
+        });
+    };
+
+    let principals_kept = state.principals.len();
+    let sessions_kept = state.sessions.len();
+    let challenges_kept = state.challenges.len();
+    let root_protections_kept = state.principal_root_protections.len();
+
+    // Idempotent: an already-chained root needs no migration, no backup, no write.
+    if state.audit_chain_state.is_some() {
+        return Ok(MigrationReport {
+            migrated: false,
+            already_migrated: true,
+            dry_run,
+            principals_kept,
+            sessions_kept,
+            challenges_kept,
+            root_protections_kept,
+            audit_entries_discarded: 0,
+            backup_path: None,
+        });
+    }
+
+    let audit_entries_discarded = state.audit.len();
+    let auth_path = auth_state_path(data_dir)?;
+    let unix_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let backup_path =
+        auth_path.with_file_name(format!("{AUTH_STATE_FILE}.pre-audit-migrate-{unix_ts}.bak"));
+
+    if dry_run {
+        return Ok(MigrationReport {
+            migrated: false,
+            already_migrated: false,
+            dry_run: true,
+            principals_kept,
+            sessions_kept,
+            challenges_kept,
+            root_protections_kept,
+            audit_entries_discarded,
+            backup_path: Some(backup_path),
+        });
+    }
+
+    // Back up the raw on-disk auth state BEFORE any write, as a private secret file.
+    let raw = std::fs::read(&auth_path)
+        .with_context(|| format!("failed to read auth state for backup {auth_path:?}"))?;
+    {
+        let mut backup = open_new_secret_file(&backup_path)?;
+        backup.write_all(&raw)?;
+        backup.sync_all()?;
+    }
+    set_secret_file_permissions(&backup_path)?;
+
+    // Preserve identity; discard only the unchained audit history.
+    state.audit.clear();
+    state.audit_chain.clear();
+    state.audit_chain_anchor = None;
+
+    // Now that the audit history is empty, activate a fresh chain.
+    ensure_audit_chain_state(data_dir, &mut state)?;
+
+    // Persist the migrated state and its activation record under the lock we already hold.
+    write_secret_json_atomic(&auth_path, &state)?;
+    let chain_state = state
+        .audit_chain_state
+        .as_ref()
+        .expect("ensure_audit_chain_state sets audit_chain_state");
+    let checkpoint = audit_chain_checkpoint(&state)?
+        .expect("an active audit chain state must produce a checkpoint");
+    persist_audit_chain_activation_unlocked(data_dir, chain_state.activated_at, &checkpoint)?;
+
+    Ok(MigrationReport {
+        migrated: true,
+        already_migrated: false,
+        dry_run: false,
+        principals_kept,
+        sessions_kept,
+        challenges_kept,
+        root_protections_kept,
+        audit_entries_discarded,
+        backup_path: Some(backup_path),
+    })
+}
+
 fn retain_audit_tail(data_dir: &Path, state: &mut AuthState, limit: usize) -> anyhow::Result<()> {
     if state.audit.len() <= limit {
         return Ok(());
@@ -4729,6 +4884,183 @@ mod tests {
         assert!(err.contains("unchained auth state is unsupported"));
         assert!(err.contains("fresh data root"));
         assert!(err.contains("no automatic migration"));
+    }
+
+    fn write_pre_hardening_auth_state(data_dir: &Path) -> AuthState {
+        let now = now_ts();
+        // Mint a valid root protection via the test helper (it persists a chained
+        // state as a side effect), then overwrite with a raw *pre-hardening* auth
+        // state and remove the stray activation marker so the fixture is genuinely
+        // unchained.
+        let protection = store_test_principal_root_protection(data_dir, "person:local:test");
+
+        let mut state = AuthState::default();
+        state.principals.push(PrincipalRecord {
+            principal_id: "person:local:test".to_string(),
+            proof_binding_id: "proof:passkey:test".to_string(),
+            proof_binding: passkey_binding(1, now, now),
+            display_name: String::new(),
+            role: RuntimePrincipalRole::Admin,
+            localhost_root: String::new(),
+            created_at: now,
+            updated_at: now,
+        });
+        state.sessions.push(StoredAuthSession {
+            grant: AuthSessionGrantV1 {
+                schema: AuthSessionGrantV1::SCHEMA.to_string(),
+                grant_id: "grant:test".to_string(),
+                session_id: "auth:test".to_string(),
+                principal_id: "person:local:test".to_string(),
+                proof_binding_id: "proof:passkey:test".to_string(),
+                issued_at: now,
+                expires_at: now + 100_000,
+                apps: vec!["home".to_string()],
+            },
+            revoked_at: None,
+        });
+        state.challenges.push(StoredAuthChallenge {
+            challenge: AuthChallengeV1 {
+                schema: AuthChallengeV1::SCHEMA.to_string(),
+                challenge_id: "challenge:test".to_string(),
+                domain: "localhost".to_string(),
+                uri: "http://localhost/apps/home/".to_string(),
+                statement: "Sign in to ElastOS Runtime.".to_string(),
+                address: "0x1111111111111111111111111111111111111111".to_string(),
+                chain_id: 20,
+                nonce: "migrate-test".to_string(),
+                issued_at: now,
+                expires_at: now + 100_000,
+                resources: vec!["elastos://auth/challenge/migrate-test".to_string()],
+            },
+            consumed_at: None,
+        });
+        state.principal_root_protections.push(protection);
+        state.audit.push(test_audit_event(1));
+        state.audit.push(test_audit_event(2));
+
+        let path = auth_state_path(data_dir).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        // Drop the activation marker left by the helper so the root looks pre-hardening.
+        let marker = audit_chain_activation_path(data_dir).unwrap();
+        let _ = std::fs::remove_file(marker);
+        state
+    }
+
+    fn migration_backups(data_dir: &Path) -> Vec<PathBuf> {
+        let dir = auth_state_path(data_dir).unwrap();
+        let dir = dir.parent().unwrap().to_path_buf();
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("auth-state.json.pre-audit-migrate-") && name.ends_with(".bak") {
+                found.push(entry.path());
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn migrate_activates_chain_and_preserves_identities() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_pre_hardening_auth_state(data_dir.path());
+
+        // Sanity: the boot guard (specifically) rejects the pre-hardening root before migration.
+        let boot_err = load_auth_state(data_dir.path()).unwrap_err().to_string();
+        assert!(boot_err.contains("unchained auth state is unsupported"));
+
+        let report = migrate_audit_chain(data_dir.path(), false).unwrap();
+        assert!(report.migrated);
+        assert!(!report.already_migrated);
+        assert_eq!(report.principals_kept, 1);
+        assert_eq!(report.sessions_kept, 1);
+        assert_eq!(report.challenges_kept, 1);
+        assert_eq!(report.root_protections_kept, 1);
+        assert_eq!(report.audit_entries_discarded, 2);
+        assert!(report.backup_path.is_some());
+
+        let migrated = load_auth_state_unverified(data_dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.principals.len(), 1);
+        assert_eq!(migrated.sessions.len(), 1);
+        assert_eq!(migrated.principal_root_protections.len(), 1);
+        assert!(migrated.audit.is_empty());
+        assert!(migrated.audit_chain.is_empty());
+        assert!(migrated.audit_chain_anchor.is_none());
+        assert!(migrated.audit_chain_state.is_some());
+
+        // CRUCIAL end-to-end proof: the boot guard now passes.
+        let booted = load_auth_state(data_dir.path()).unwrap();
+        assert_eq!(booted.principals.len(), 1);
+        assert_eq!(booted.sessions.len(), 1);
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_pre_hardening_auth_state(data_dir.path());
+
+        let first = migrate_audit_chain(data_dir.path(), false).unwrap();
+        assert!(first.migrated);
+
+        let second = migrate_audit_chain(data_dir.path(), false).unwrap();
+        assert!(!second.migrated);
+        assert!(second.already_migrated);
+        assert!(second.backup_path.is_none());
+        // Only the first run created a backup.
+        assert_eq!(migration_backups(data_dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn migrate_backs_up_before_writing() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_pre_hardening_auth_state(data_dir.path());
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let original_bytes = std::fs::read(&auth_path).unwrap();
+
+        let report = migrate_audit_chain(data_dir.path(), false).unwrap();
+        let backup_path = report.backup_path.unwrap();
+        assert!(backup_path.exists());
+        let backup_bytes = std::fs::read(&backup_path).unwrap();
+        assert_eq!(backup_bytes, original_bytes);
+        // The live auth state was actually rewritten (no longer equal to the backup).
+        assert_ne!(std::fs::read(&auth_path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn migrate_dry_run_makes_no_changes() {
+        let data_dir = tempfile::tempdir().unwrap();
+        write_pre_hardening_auth_state(data_dir.path());
+        let auth_path = auth_state_path(data_dir.path()).unwrap();
+        let before = std::fs::read(&auth_path).unwrap();
+
+        let report = migrate_audit_chain(data_dir.path(), true).unwrap();
+        assert!(!report.migrated);
+        assert_eq!(report.principals_kept, 1);
+        assert_eq!(report.sessions_kept, 1);
+        assert_eq!(report.challenges_kept, 1);
+        assert_eq!(report.root_protections_kept, 1);
+        assert_eq!(report.audit_entries_discarded, 2);
+
+        assert_eq!(std::fs::read(&auth_path).unwrap(), before);
+        assert!(migration_backups(data_dir.path()).is_empty());
+    }
+
+    #[test]
+    fn migrate_noop_on_fresh_root() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let report = migrate_audit_chain(data_dir.path(), false).unwrap();
+        assert!(!report.migrated);
+        assert!(!report.already_migrated);
+        assert_eq!(report.principals_kept, 0);
+        assert_eq!(report.audit_entries_discarded, 0);
+        assert!(report.backup_path.is_none());
+        // No auth state file was created.
+        assert!(!auth_state_path(data_dir.path()).unwrap().exists());
+        assert!(migration_backups(data_dir.path()).is_empty());
     }
 
     #[cfg(unix)]

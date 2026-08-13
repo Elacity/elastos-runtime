@@ -454,6 +454,18 @@ enum Commands {
         backup_dir: PathBuf,
     },
 
+    /// Migrate a pre-hardening data root so the gateway can boot: discard the unchained audit
+    /// history and activate a fresh audit chain, preserving identities/passkeys. Run offline.
+    #[command(name = "migrate-audit-chain")]
+    MigrateAuditChain {
+        /// Runtime data root (defaults to the standard data directory)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Show what would happen without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Upgrade every configured protected root from canonical declared plaintext while offline
     #[command(name = "principal-root-upgrade", hide = true)]
     PrincipalRootUpgrade {
@@ -1484,6 +1496,43 @@ async fn main() -> anyhow::Result<()> {
                 &backup_dir,
             )?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+
+        Commands::MigrateAuditChain { data_dir, dry_run } => {
+            let data_dir = data_dir.unwrap_or_else(sources::default_data_dir);
+            let report = elastos_server::auth::migrate_audit_chain(&data_dir, dry_run)?;
+            if report.already_migrated {
+                println!("already migrated (audit chain active)");
+            } else if !report.migrated && !report.dry_run {
+                println!("nothing to migrate (no auth state)");
+            } else {
+                if report.dry_run {
+                    println!("dry run: no changes written");
+                    println!(
+                        "would discard {} unchained audit entries and activate a fresh audit chain",
+                        report.audit_entries_discarded
+                    );
+                    if let Some(path) = report.backup_path.as_ref() {
+                        println!("would back up auth state to {}", path.display());
+                    }
+                } else {
+                    println!("audit chain activated");
+                    println!(
+                        "discarded {} unchained audit entries",
+                        report.audit_entries_discarded
+                    );
+                    if let Some(path) = report.backup_path.as_ref() {
+                        println!("backed up auth state to {}", path.display());
+                    }
+                }
+                println!(
+                    "kept {} principals / {} sessions / {} challenges / {} root protections",
+                    report.principals_kept,
+                    report.sessions_kept,
+                    report.challenges_kept,
+                    report.root_protections_kept,
+                );
+            }
         }
 
         Commands::PrincipalRootUpgrade {
