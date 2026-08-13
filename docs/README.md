@@ -12,6 +12,7 @@ Each top-level ledger has one job:
 
 - [Repository README](../README.md): quick install, source build, and system model
 - [Getting started](GETTING_STARTED.md): user installation and source development
+- [Local source Home setup](HOME_LOCAL_SETUP.md): source-home browser Home on one machine
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
 - [Glossary](GLOSSARY.md): canonical terminology
 
