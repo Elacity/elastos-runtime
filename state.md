@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-11 UTC
+Last updated: 2026-08-13 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Historical
@@ -11,14 +11,36 @@ the public repository.
 ## Release Posture
 
 - `main` at `d358dedb` is the released 0.6.0 line.
-- `codex/post-0.6-consolidation` is the sole active local integration line for
-  the unpublished collaboration and UI work described below. It has no upstream
-  and is not installed or published product truth.
-- The branch adds Runtime-backed People/Chat collaboration and selected shell UI
-  work. The source boundary is complete for review: Profile authority, Runtime
-  lifecycle, Carrier routing, People/Chat projections, and the strict
-  fixture-owned two-Runtime acceptance all pass. Normal localhost and public
-  seed installation remain separate product gates.
+- The published collaboration review stack is
+  `origin/review/collaboration-foundation` ->
+  `origin/review/collaboration-product-integration` ->
+  `origin/review/collaboration-candidate`. Each review branch depends on its
+  parent; installed and live claims remain separate target evidence, not branch
+  truth.
+- `codex/post-0.6-consolidation` remains an unpublished local integration line
+  for additional collaboration and UI work. It has no upstream and is not
+  installed or published product truth.
+- `feat/protected-content-contracts` is an unpublished source-only contract
+  branch stacked on `origin/review/collaboration-candidate`. It adds the
+  canonical `elastos-protected-content-contracts` crate, the related
+  documentation, and the shared strict DID/Carrier codec correction required by
+  that contract surface. It does not integrate Runtime orchestration, provider
+  replacement, custody, threshold reconstruction, recipient encryption proof,
+  decryption, playback, installation, or deployment.
+- Released 0.6 and the parent collaboration source retain the older
+  provisional `elastos_common::protected_content` DTOs plus fail-closed
+  `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
+  capsules. That surface does not consume or prove the new v1 contract.
+  Installed-target truth requires separate target evidence.
+- An independent branch-local source/contract review of
+  `feat/protected-content-contracts` completed with no code findings after the
+  strict DID codec and Carrier codec consolidation. This is not an external
+  cryptographic audit or production security approval.
+- The collaboration review stack adds Runtime-backed People/Chat collaboration
+  and selected shell UI work. The source boundary is complete for review:
+  Profile authority, Runtime lifecycle, Carrier routing, People/Chat
+  projections, and the strict fixture-owned two-Runtime acceptance all pass.
+  Normal localhost and public seed installation remain separate product gates.
 - The first normal cross-Runtime Chat send on the installed candidate aborted
   inside the old Iroh 0.96.1 `iroh-quinn` transport. The source candidate now
   uses one coordinated Carrier generation: Iroh 1.0.2, iroh-gossip 0.101.0,

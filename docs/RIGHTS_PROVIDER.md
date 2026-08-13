@@ -5,6 +5,12 @@ questions for the DRM open path:
 
 `capsule -> runtime capability -> elastos://rights/* -> rights-provider -> policy backend`
 
+This page describes the older provisional provider surface. It does not
+describe or prove the canonical source-only v1 contract in
+[`PROTECTED_CONTENT_CONTRACTS_V1.md`](PROTECTED_CONTENT_CONTRACTS_V1.md). Future
+integration must replace the provisional surface atomically, with no parallel
+decoder, fallback, or migration path.
+
 Capsules do not receive contract SDK objects, chain RPC, wallet RPC,
 key-backend SDKs, raw CEKs, or provider credentials. The provider validates the
 question and fails closed until a reviewed dDRM/chain policy backend is

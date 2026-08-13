@@ -145,14 +145,30 @@ the result. Each dependency has a typed contract and fails closed. Viewers
 receive scoped output or a scoped session, not content keys, chain RPC, wallet
 authority, storage APIs, or provider credentials.
 
+The dependency order for this work is strict:
+
+1. review the canonical v1 contract as source only;
+2. review custody, recipient-encryption, replay, and policy design;
+3. replace the provisional DTO/provider surface atomically and wire
+   Runtime/Wallet/provider integration to the reviewed contract; and
+4. prove the installed end-to-end open/decrypt/render path.
+
+Carrier remains transport only throughout that sequence. It carries
+Runtime-selected traffic, but it does not define rights authority, custody
+policy, or capsule-visible contract meaning.
+
 New protected objects should carry encrypted payload identity, rights policy,
 algorithm metadata, key envelopes, provenance, availability receipts, and a
 declared viewer interface. Cryptographic upgrades use versioned envelopes and
 migration rules. A permissioned key service can precede a public network, but
 production claims require independent review and operational evidence.
 
-See [Protected content](docs/PROTECTED_CONTENT.md) and the provider-specific
-contracts for rights, key release, and decryption.
+The repository now has a canonical source-only v1 review candidate in
+[Protected-content v1 contracts](docs/PROTECTED_CONTENT_CONTRACTS_V1.md). The
+current installed/provider path still uses the older provisional
+`elastos_common::protected_content` DTOs plus fail-closed provider stubs, so
+see [Protected content](docs/PROTECTED_CONTENT.md) and the provider-specific
+contracts as the current integration surface, not as proof that v1 is wired.
 
 ### 4. Add wallet, DID, and node proofs behind Runtime authority
 

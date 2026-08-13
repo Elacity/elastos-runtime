@@ -8,6 +8,12 @@ The contract is:
 
 `capsule -> runtime capability -> elastos://decrypt/* -> decrypt-provider -> decrypt/render backend`
 
+This page describes the older provisional provider surface. It does not
+describe or prove the canonical source-only v1 contract in
+[`PROTECTED_CONTENT_CONTRACTS_V1.md`](PROTECTED_CONTENT_CONTRACTS_V1.md). Future
+integration must replace the provisional surface atomically, with no parallel
+decoder, fallback, or migration path.
+
 Apps and viewers must not receive raw CEKs, broad plaintext authority,
 filesystem authority, key-backend SDKs, KMS credentials, chain RPC, wallet RPC,
 or provider credentials. They receive scoped rendered output, streams, or
@@ -23,7 +29,8 @@ Unsupported operations fail closed and do not create broad provider wildcards.
 
 ## Request Shape
 
-`DecryptSessionRequestV1` binds:
+The current provisional `elastos_common::protected_content::DecryptSessionRequestV1`
+binds:
 
 - request ID
 - principal ID
@@ -42,8 +49,9 @@ outputs: `rendered`, `stream`, and `working_copy`.
 
 ## Key Material Rail
 
-`ReleaseReceiptV1` is an authorization receipt, not key material. It proves that
-the key-provider accepted the rights-bound release request for the same
+The current provisional `elastos_common::protected_content::ReleaseReceiptV1`
+is an authorization receipt, not key material. It proves that the key-provider
+accepted the rights-bound release request for the same
 principal/session/object/action, but it does not contain a CEK.
 
 When the real decrypt backend is wired, the recommended normal path is:
