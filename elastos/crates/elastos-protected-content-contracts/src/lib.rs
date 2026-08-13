@@ -13,7 +13,10 @@ mod release_request;
 mod replay;
 mod rights;
 mod rights_receipt;
+mod terminal_receipt;
 
+#[cfg(test)]
+mod authority_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -48,4 +51,8 @@ pub use rights::{
 pub use rights_receipt::{
     RightsReceiptIssuerKey, RightsReceiptStatementV1, SignedRightsReceiptV1,
     MAX_RIGHTS_RECEIPT_LIFETIME_SECS,
+};
+pub use terminal_receipt::{
+    KeyReleaseOutcomeV1, NodeContributionRefV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
+    TerminalReceiptStatementV1, MAX_TERMINAL_RECEIPT_LIFETIME_SECS,
 };

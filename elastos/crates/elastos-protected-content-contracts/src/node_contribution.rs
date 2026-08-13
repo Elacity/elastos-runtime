@@ -254,6 +254,8 @@ impl SignedNodeContributionV1 {
             decision_hash: decision.decision_hash(),
             contribution_hash: self.canonical_hash()?,
             contribution_commitment: statement.recipient_sealed_contribution.commitment(),
+            issued_at: statement.issued_at,
+            expires_at: statement.expires_at,
         })
     }
 }
@@ -290,6 +292,8 @@ pub struct VerifiedNodeContributionV1 {
     decision_hash: Digest32,
     contribution_hash: Digest32,
     contribution_commitment: Digest32,
+    issued_at: u64,
+    expires_at: u64,
 }
 
 impl VerifiedNodeContributionV1 {
@@ -315,6 +319,14 @@ impl VerifiedNodeContributionV1 {
 
     pub const fn contribution_commitment(&self) -> Digest32 {
         self.contribution_commitment
+    }
+
+    pub(crate) const fn issued_at(&self) -> u64 {
+        self.issued_at
+    }
+
+    pub(crate) const fn expires_at(&self) -> u64 {
+        self.expires_at
     }
 }
 
