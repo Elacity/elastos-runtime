@@ -6247,17 +6247,6 @@ mod tests {
         )
     }
 
-    /// Seal an operator authorization to `recipient_b64`, bound to `aad`.
-    fn seal_operator_auth(
-        recipient_b64: &str,
-        aad: &[u8],
-        signer: &ddrm_envelope::seal::MlDsaSealSigner,
-    ) -> String {
-        let bytes = b64().decode(recipient_b64).unwrap();
-        let public = ddrm_envelope::session_public_from_bytes(&bytes).unwrap();
-        b64().encode(ddrm_envelope::seal::seal_bound(&public, b"dkg", aad, signer).to_bytes())
-    }
-
     // ---- DKMS-5: operator-side v2 manifest builders --------------------------------------------
     // These mirror EXACTLY the manifests the node re-derives from the request. Both sides call the
     // ONE encoder in `ddrm-envelope`; the happy-path round-trips passing is what proves they match.
