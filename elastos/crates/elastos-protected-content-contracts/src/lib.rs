@@ -7,6 +7,12 @@
 mod canonical;
 mod identity;
 mod node_set;
+mod replay;
+mod rights;
+mod rights_receipt;
+
+#[cfg(test)]
+mod test_support;
 
 pub use canonical::{CanonicalContract, ContractError};
 pub use identity::{
@@ -17,3 +23,13 @@ pub use identity::{
     MAX_THRESHOLD_NODES,
 };
 pub use node_set::{NodePublicKey, NodeSetV1};
+pub use replay::{AtomicReplayClaimer, ReplayClaimError, ReplayClaimKeyV1};
+pub use rights::{
+    ReplayNonce16, RightsActionV1, RightsDecisionV1, RightsError, RightsRequestV1,
+    RightsVerificationContextV1, VerifiedRightsRequestV1, WalletSignedRightsRequestV1,
+    MAX_RIGHTS_REQUEST_LIFETIME_SECS, RIGHTS_CLOCK_SKEW_SECS,
+};
+pub use rights_receipt::{
+    RightsReceiptIssuerKey, RightsReceiptStatementV1, SignedRightsReceiptV1,
+    MAX_RIGHTS_RECEIPT_LIFETIME_SECS,
+};

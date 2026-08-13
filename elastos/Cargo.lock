@@ -1624,9 +1624,13 @@ name = "elastos-protected-content-contracts"
 version = "0.6.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
+ "elastos-auth",
  "elastos-identity",
+ "hex",
+ "k256",
  "serde",
  "sha2 0.10.9",
+ "sha3",
  "thiserror 1.0.69",
 ]
 
