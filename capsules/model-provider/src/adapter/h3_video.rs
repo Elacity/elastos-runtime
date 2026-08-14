@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /* No wall-clock ceiling: a run ends on completion, caller cancel (Stop), or genuine
-   upstream failure — the caller owns the compute. */
+upstream failure — the caller owns the compute. */
 const READ_CHUNK: usize = 256 * 1024;
 
 fn multipart_body(fields: &[(&str, String)]) -> (Vec<u8>, String) {
@@ -41,7 +41,12 @@ fn multipart_body(fields: &[(&str, String)]) -> (Vec<u8>, String) {
     (body, boundary)
 }
 
-pub fn run_video(run: Arc<Mutex<Run>>, upstream_url: String, output_dir: PathBuf, params: VideoParams) {
+pub fn run_video(
+    run: Arc<Mutex<Run>>,
+    upstream_url: String,
+    output_dir: PathBuf,
+    params: VideoParams,
+) {
     let (run_id, cancel) = {
         let guard = run.lock().unwrap();
         (

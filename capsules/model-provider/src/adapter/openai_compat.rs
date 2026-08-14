@@ -14,8 +14,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 /* Sovereign runtime: no policy ceiling on a chat run. The run ends when the model
-   finishes, the caller cancels (Stop), or the upstream connection genuinely fails —
-   never on a wall-clock timeout. The caller owns the compute. */
+finishes, the caller cancels (Stop), or the upstream connection genuinely fails —
+never on a wall-clock timeout. The caller owns the compute. */
 
 fn extract_delta(chunk: &serde_json::Value) -> (String, String) {
     let delta = &chunk["choices"][0]["delta"];
@@ -58,12 +58,7 @@ fn message_text(chunk: &serde_json::Value) -> String {
     String::new()
 }
 
-pub fn run_chat(
-    run: Arc<Mutex<Run>>,
-    upstream_url: String,
-    model: String,
-    params: ChatParams,
-) {
+pub fn run_chat(run: Arc<Mutex<Run>>, upstream_url: String, model: String, params: ChatParams) {
     let cancel = Arc::clone(&run.lock().unwrap().cancel);
     let push = |event: RunEvent| run.lock().unwrap().push(event);
     let fail = |code: &str, message: &str| {
@@ -90,17 +85,16 @@ pub fn run_chat(
         payload["temperature"] = temperature.into();
     }
 
-    let response = match ureq::post(&format!("{}/chat/completions", upstream_url))
-        .send_json(payload)
-    {
-        Ok(response) => response,
-        Err(err) => {
-            // ureq errors on non-2xx too: the upstream may be reachable and
-            // rejecting the request — say "error", not "unreachable".
-            fail("upstream_error", &err.to_string());
-            return;
-        }
-    };
+    let response =
+        match ureq::post(&format!("{}/chat/completions", upstream_url)).send_json(payload) {
+            Ok(response) => response,
+            Err(err) => {
+                // ureq errors on non-2xx too: the upstream may be reachable and
+                // rejecting the request — say "error", not "unreachable".
+                fail("upstream_error", &err.to_string());
+                return;
+            }
+        };
 
     let mut saw_text = false;
     let mut lines = BufReader::new(response.into_reader()).lines();

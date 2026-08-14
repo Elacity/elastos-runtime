@@ -8,7 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Terminal runs stay readable for this long, then are evicted on the next
+/// create — the registry is a run surface, not a retention store (offer
+/// policy declares data_retention_seconds: 0; this TTL exists only so
+/// clients can fetch final events/artifacts after completion).
+const TERMINAL_RUN_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,19 +29,37 @@ pub enum RunState {
 
 impl RunState {
     pub fn is_terminal(self) -> bool {
-        matches!(self, RunState::Succeeded | RunState::Failed | RunState::Cancelled)
+        matches!(
+            self,
+            RunState::Succeeded | RunState::Failed | RunState::Cancelled
+        )
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunEvent {
-    State { state: RunState },
-    Text { delta: String },
-    Thinking { delta: String },
-    Progress { completed: u64, total: u64, phase: String },
-    Result { objects: Vec<ObjectDescriptor> },
-    Error { code: String, message: String },
+    State {
+        state: RunState,
+    },
+    Text {
+        delta: String,
+    },
+    Thinking {
+        delta: String,
+    },
+    Progress {
+        completed: u64,
+        total: u64,
+        phase: String,
+    },
+    Result {
+        objects: Vec<ObjectDescriptor>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,12 +78,16 @@ pub struct Run {
     pub events: Vec<RunEvent>,
     pub cancel: Arc<AtomicBool>,
     pub created_at: SystemTime,
+    pub terminal_at: Option<SystemTime>,
 }
 
 impl Run {
     pub fn push(&mut self, event: RunEvent) {
         if let RunEvent::State { state } = event {
             self.state = state;
+            if state.is_terminal() && self.terminal_at.is_none() {
+                self.terminal_at = Some(SystemTime::now());
+            }
         }
         self.events.push(event);
     }
@@ -93,21 +121,40 @@ impl Registry {
     }
 
     pub fn create(&mut self, offer_id: &str, operation: &str) -> Arc<Mutex<Run>> {
+        self.evict_expired();
         let run = Arc::new(Mutex::new(Run {
             run_id: new_run_id(),
             offer_id: offer_id.to_string(),
             operation: operation.to_string(),
             state: RunState::Queued,
-            events: vec![RunEvent::State { state: RunState::Queued }],
+            events: vec![RunEvent::State {
+                state: RunState::Queued,
+            }],
             cancel: Arc::new(AtomicBool::new(false)),
             created_at: SystemTime::now(),
+            terminal_at: None,
         }));
-        self.runs.insert(run.lock().unwrap().run_id.clone(), Arc::clone(&run));
+        self.runs
+            .insert(run.lock().unwrap().run_id.clone(), Arc::clone(&run));
         run
     }
 
     pub fn get(&self, run_id: &str) -> Option<Arc<Mutex<Run>>> {
         self.runs.get(run_id).cloned()
+    }
+
+    fn evict_expired(&mut self) {
+        let now = SystemTime::now();
+        self.runs.retain(|_, run| {
+            let run = run.lock().unwrap();
+            match run.terminal_at {
+                Some(at) => now
+                    .duration_since(at)
+                    .map(|age| age < TERMINAL_RUN_TTL)
+                    .unwrap_or(false),
+                None => true,
+            }
+        });
     }
 }
 
@@ -154,7 +201,10 @@ pub fn validate_chat_inputs(inputs: &serde_json::Value) -> Result<ChatParams, Re
     if let Some(object) = inputs.as_object() {
         for key in object.keys() {
             if !known.contains(&key.as_str()) {
-                return Err(("invalid_inputs", "unknown parameter (additionalProperties false)"));
+                return Err((
+                    "invalid_inputs",
+                    "unknown parameter (additionalProperties false)",
+                ));
             }
         }
     }
@@ -218,11 +268,21 @@ pub fn validate_video_inputs(inputs: &serde_json::Value) -> Result<VideoParams, 
             ));
         }
     }
-    let known = ["prompt", "duration_seconds", "resolution", "aspect_ratio", "scale", "reference"];
+    let known = [
+        "prompt",
+        "duration_seconds",
+        "resolution",
+        "aspect_ratio",
+        "scale",
+        "reference",
+    ];
     if let Some(object) = inputs.as_object() {
         for key in object.keys() {
             if !known.contains(&key.as_str()) {
-                return Err(("invalid_inputs", "unknown parameter (additionalProperties false)"));
+                return Err((
+                    "invalid_inputs",
+                    "unknown parameter (additionalProperties false)",
+                ));
             }
         }
     }
@@ -239,3 +299,45 @@ pub struct VideoParams {
 
 /// (code, message) — converted to a Response at the call site.
 pub type Response2 = (&'static str, &'static str);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_run_evicted_after_ttl_on_next_create() {
+        let mut registry = Registry::default();
+        let run = registry.create("offer:chat", "generate");
+        let run_id = run.lock().unwrap().run_id.clone();
+        {
+            let mut guard = run.lock().unwrap();
+            guard.push(RunEvent::State {
+                state: RunState::Succeeded,
+            });
+            guard.terminal_at = Some(SystemTime::now() - TERMINAL_RUN_TTL - Duration::from_secs(1));
+        }
+        registry.create("offer:chat", "generate");
+        assert!(registry.get(&run_id).is_none());
+    }
+
+    #[test]
+    fn terminal_run_within_ttl_survives() {
+        let mut registry = Registry::default();
+        let run = registry.create("offer:chat", "generate");
+        let run_id = run.lock().unwrap().run_id.clone();
+        run.lock().unwrap().push(RunEvent::State {
+            state: RunState::Succeeded,
+        });
+        registry.create("offer:chat", "generate");
+        assert!(registry.get(&run_id).is_some());
+    }
+
+    #[test]
+    fn active_run_is_never_evicted() {
+        let mut registry = Registry::default();
+        let run = registry.create("offer:chat", "generate");
+        let run_id = run.lock().unwrap().run_id.clone();
+        registry.create("offer:chat", "generate");
+        assert!(registry.get(&run_id).is_some());
+    }
+}

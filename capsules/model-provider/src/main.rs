@@ -119,10 +119,7 @@ impl ModelProvider {
         match offer_id {
             "offer:flash-chat:pair-a" => {
                 let Some(upstream) = self.config.flash_url.clone().filter(|u| !u.is_empty()) else {
-                    return Response::error(
-                        "offer_not_found",
-                        "chat backend is not configured",
-                    );
+                    return Response::error("offer_not_found", "chat backend is not configured");
                 };
                 let params = match run::validate_chat_inputs(&inputs) {
                     Ok(params) => params,
@@ -211,8 +208,7 @@ impl ModelProvider {
         if run.state.is_terminal() {
             return Response::error("not_cancellable", "run is already in a terminal state");
         }
-        run.cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         Response::ok(serde_json::json!({
             "run_id": run.run_id,
             "state": "cancelling",
