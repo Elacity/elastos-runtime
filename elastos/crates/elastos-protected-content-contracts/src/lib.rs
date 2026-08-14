@@ -10,6 +10,8 @@ mod identity;
 mod node_contribution;
 mod node_decision;
 mod node_set;
+mod policy;
+mod recipient_authorization;
 mod release_request;
 mod replay;
 mod rights;
@@ -45,6 +47,17 @@ pub use node_decision::{
     MAX_NODE_DECISION_LIFETIME_SECS,
 };
 pub use node_set::{NodePublicKey, NodeSetV1};
+pub use policy::{
+    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
+    RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1, RightsObservationFinalityV1,
+    RightsPolicyBodyV1, RightsSubjectSourceV1,
+};
+pub use recipient_authorization::{
+    RecipientAuthorizationError, RecipientKeyAuthorizationContextV1,
+    RecipientKeyAuthorizationStatementV1, RecipientPublicKeyBytesV1,
+    RuntimeOperationIssuerKeyV1, SignedRecipientKeyAuthorizationV1,
+    VerifiedRecipientKeyAuthorizationV1, MAX_RECIPIENT_KEY_AUTHORIZATION_LIFETIME_SECS,
+};
 pub use release_request::{
     KeyReleaseError, KeyReleaseRequestV1, VerifiedKeyReleaseRequestV1,
     MAX_RELEASE_REQUEST_LIFETIME_SECS,

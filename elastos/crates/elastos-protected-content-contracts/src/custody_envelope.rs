@@ -533,7 +533,7 @@ fn has_duplicate_custody_keys(nodes: &[CustodyNodeIdentityV1]) -> bool {
     false
 }
 
-fn validate_canonical_x25519_public_key(
+pub(crate) fn validate_canonical_x25519_public_key(
     bytes: [u8; 32],
     field: &'static str,
 ) -> Result<(), ContractError> {
