@@ -15,6 +15,7 @@ Each top-level ledger has one job:
 - [Local source Home setup](HOME_LOCAL_SETUP.md): source-home browser Home on one machine
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
 - [Glossary](GLOSSARY.md): canonical terminology
+- [ElastOS picture](picture/README.md): living map for people and agents (read order, tree, glossary, gates)
 
 ## Architecture and core model
 
