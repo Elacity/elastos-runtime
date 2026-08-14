@@ -7,7 +7,7 @@ use crate::rights::{validate_active, validate_time_window};
 use crate::{
     CanonicalContract, Digest32, KeyReleaseError, NodePublicKey, NodeSetV1,
     ProtectedContentBindingV1, RecipientKeyIdentityV1, RightsDecisionV1,
-    SignedNodeRightsDecisionV1, VerifiedKeyReleaseRequestV1,
+    SignedNodeRightsDecisionV1, VerifiedKeyReleaseRequestV1, VerifiedNodeRightsDecisionV1,
 };
 
 pub const MAX_NODE_CONTRIBUTION_LIFETIME_SECS: u64 = 60;
@@ -139,6 +139,23 @@ impl NodeContributionStatementV1 {
     }
 }
 
+pub fn validate_node_contribution_active_window(
+    issued_at: u64,
+    expires_at: u64,
+    request: &VerifiedKeyReleaseRequestV1,
+    decision: &VerifiedNodeRightsDecisionV1,
+    now: u64,
+) -> Result<(), KeyReleaseError> {
+    if issued_at < request.issued_at() || expires_at > request.expires_at() {
+        return Err(KeyReleaseError::BindingMismatch("node_contribution_window"));
+    }
+    validate_active(issued_at, expires_at, now)?;
+    if issued_at < decision.issued_at() || expires_at > decision.expires_at() {
+        return Err(KeyReleaseError::BindingMismatch("node_decision_window"));
+    }
+    Ok(())
+}
+
 impl CanonicalBody for NodeContributionStatementV1 {
     const DOMAIN: &'static str = "elastos.protected-content.node-contribution/v1";
 
@@ -222,23 +239,19 @@ impl SignedNodeContributionV1 {
         if statement.recipient_sealed_contribution.recipient() != request.recipient() {
             return Err(KeyReleaseError::BindingMismatch("recipient_key_identity"));
         }
-        if statement.issued_at < request.issued_at() || statement.expires_at > request.expires_at()
-        {
-            return Err(KeyReleaseError::BindingMismatch("node_contribution_window"));
-        }
-        validate_active(statement.issued_at, statement.expires_at, now)?;
-
         let decision = statement
             .signed_rights_decision
             .verify(request, node_set, now)?;
         if decision.decision() != RightsDecisionV1::Allowed {
             return Err(KeyReleaseError::RightsDenied);
         }
-        if statement.issued_at < decision.issued_at()
-            || statement.expires_at > decision.expires_at()
-        {
-            return Err(KeyReleaseError::BindingMismatch("node_decision_window"));
-        }
+        validate_node_contribution_active_window(
+            statement.issued_at,
+            statement.expires_at,
+            request,
+            &decision,
+            now,
+        )?;
 
         let key =
             validate_ed25519_public_key(*decision.node_public_key().as_bytes(), "node_public_key")

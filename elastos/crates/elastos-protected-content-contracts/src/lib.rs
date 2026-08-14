@@ -35,9 +35,9 @@ pub use identity::{
     MAX_THRESHOLD_NODES,
 };
 pub use node_contribution::{
-    NodeContributionStatementV1, RecipientSealedContributionV1, SignedNodeContributionV1,
-    VerifiedNodeContributionV1, MAX_NODE_CONTRIBUTION_LIFETIME_SECS,
-    MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES,
+    validate_node_contribution_active_window, NodeContributionStatementV1,
+    RecipientSealedContributionV1, SignedNodeContributionV1, VerifiedNodeContributionV1,
+    MAX_NODE_CONTRIBUTION_LIFETIME_SECS, MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES,
 };
 pub use node_decision::{
     NodeRightsDecisionStatementV1, SignedNodeRightsDecisionV1, VerifiedNodeRightsDecisionV1,

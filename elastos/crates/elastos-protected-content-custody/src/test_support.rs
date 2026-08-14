@@ -1,0 +1,269 @@
+use ed25519_dalek::{Signer as _, SigningKey};
+use k256::ecdsa::SigningKey as WalletSigningKey;
+use rand09::{rngs::StdRng as HpkeStdRng, SeedableRng as _};
+use rand10::{rngs::StdRng as ShamirStdRng, SeedableRng as _};
+use sha2::Digest as _;
+use sha3::Keccak256;
+
+use elastos_auth::ethereum_signed_message_hash;
+use elastos_protected_content_contracts::{
+    AtomicReplayClaimer, CanonicalContract, CustodyEnvelopeV1, Digest32,
+    EncryptedContentIdentityV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey,
+    ProtectedContentBindingV1, RecipientKeyIdentityV1, ReplayClaimError, ReplayClaimKeyV1,
+    ReplayNonce16, RightsActionV1, RightsDecisionV1, RightsRequestV1, RightsVerificationContextV1,
+    RuntimeSessionBindingV1, SignedNodeRightsDecisionV1, ThresholdV1, VerifiedKeyReleaseRequestV1,
+    VerifiedRightsRequestV1, WalletAddress, WalletSignedRightsRequestV1, CUSTODY_HPKE_SUITE_ID_V1,
+};
+
+use crate::{
+    provision::provision_custody_envelope_with_rng, ContentEncryptionKeyV1, NodeCustodySecretKeyV1,
+    RecipientPublicKeyV1, RecipientSecretKeyV1,
+};
+
+pub(crate) const NOW: u64 = 2_000_000_000;
+
+#[derive(Debug, Default)]
+struct TestReplayClaims(std::collections::HashMap<ReplayClaimKeyV1, u64>);
+
+impl AtomicReplayClaimer for TestReplayClaims {
+    fn claim(
+        &mut self,
+        key: ReplayClaimKeyV1,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<(), ReplayClaimError> {
+        self.0.retain(|_, expiry| *expiry > now);
+        if self.0.contains_key(&key) {
+            return Err(ReplayClaimError::AlreadyClaimed);
+        }
+        self.0.insert(key, expires_at);
+        Ok(())
+    }
+}
+
+pub(crate) fn digest(byte: u8) -> Digest32 {
+    Digest32::new([byte; 32])
+}
+
+pub(crate) fn node_signing_key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+pub(crate) fn node_public_key(seed: u8) -> NodePublicKey {
+    NodePublicKey::new(node_signing_key(seed).verifying_key().to_bytes()).unwrap()
+}
+
+pub(crate) fn node_custody_secret(seed: u8) -> NodeCustodySecretKeyV1 {
+    NodeCustodySecretKeyV1::from_test_bytes([seed; 32])
+}
+
+pub(crate) fn recipient_secret(seed: u8) -> RecipientSecretKeyV1 {
+    RecipientSecretKeyV1::from_test_bytes([seed; 32])
+}
+
+pub(crate) fn recipient_public_key(seed: u8) -> RecipientPublicKeyV1 {
+    recipient_secret(seed).public_key().unwrap()
+}
+
+fn recipient_identity_with_suite(seed: u8, suite: &str) -> RecipientKeyIdentityV1 {
+    let key = recipient_public_key(seed);
+    RecipientKeyIdentityV1::new(suite, digest_key(key.as_bytes())).unwrap()
+}
+
+fn digest_key(bytes: &[u8; 32]) -> Digest32 {
+    Digest32::new(sha2::Sha256::digest(bytes).into())
+}
+
+pub(crate) fn content_key() -> ContentEncryptionKeyV1 {
+    ContentEncryptionKeyV1::from_test_bytes([0x22; 32])
+}
+
+pub(crate) fn custody_nodes() -> Vec<(NodePublicKey, NodeCustodyPublicKeyV1)> {
+    vec![
+        (
+            node_public_key(1),
+            node_custody_secret(1).public_key().unwrap(),
+        ),
+        (
+            node_public_key(2),
+            node_custody_secret(2).public_key().unwrap(),
+        ),
+        (
+            node_public_key(3),
+            node_custody_secret(3).public_key().unwrap(),
+        ),
+    ]
+}
+
+fn wallet(seed: u8) -> WalletAddress {
+    let key = WalletSigningKey::from_slice(&[seed; 32]).unwrap();
+    let encoded = key.verifying_key().to_encoded_point(false);
+    let digest = Keccak256::digest(&encoded.as_bytes()[1..]);
+    WalletAddress::new(digest[12..].try_into().unwrap())
+}
+
+fn binding_for_wallet_with_envelope(
+    wallet: WalletAddress,
+    envelope: &CustodyEnvelopeV1,
+) -> ProtectedContentBindingV1 {
+    let content = EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap();
+    ProtectedContentBindingV1::new(
+        content.clone(),
+        envelope.key_envelope_identity().unwrap(),
+        elastos_protected_content_contracts::RightsPolicyIdentityV1::new(digest(0x44), 384)
+            .unwrap(),
+        elastos_protected_content_contracts::ProfileIdentityV1::from_public_key_bytes(
+            SigningKey::from_bytes(&[0x26; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap(),
+        wallet,
+        RuntimeSessionBindingV1::new(digest(0x66)).unwrap(),
+    )
+    .unwrap()
+}
+
+fn binding_for_wallet(wallet: WalletAddress) -> ProtectedContentBindingV1 {
+    binding_for_wallet_with_envelope(wallet, &provisioned_envelope())
+}
+
+fn signed_rights_request_with_suite(suite: &str) -> WalletSignedRightsRequestV1 {
+    let wallet = wallet(7);
+    let request = RightsRequestV1::new(
+        binding_for_wallet(wallet),
+        RightsActionV1::View,
+        recipient_identity_with_suite(0x30, suite),
+        NOW,
+        NOW + 180,
+        ReplayNonce16::new([0x55; 16]),
+    )
+    .unwrap();
+    let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
+    let (signature, recovery_id) = key
+        .sign_prehash_recoverable(&ethereum_signed_message_hash(
+            &request.canonical_bytes().unwrap(),
+        ))
+        .unwrap();
+    let mut signature_bytes = signature.to_bytes().to_vec();
+    signature_bytes.push(recovery_id.to_byte());
+    WalletSignedRightsRequestV1::new(request, signature_bytes).unwrap()
+}
+
+fn verified_rights_request_with_suite(suite: &str) -> VerifiedRightsRequestV1 {
+    let signed = signed_rights_request_with_suite(suite);
+    let context = RightsVerificationContextV1::new(
+        signed.request().binding().clone(),
+        signed.request().action(),
+        signed.request().recipient().clone(),
+        NOW + 1,
+    );
+    signed
+        .verify(&context, &mut TestReplayClaims::default())
+        .unwrap()
+}
+
+pub(crate) fn verified_release_request() -> VerifiedKeyReleaseRequestV1 {
+    verified_release_request_with_suite(CUSTODY_HPKE_SUITE_ID_V1)
+}
+
+pub(crate) fn verified_release_request_with_suite(suite: &str) -> VerifiedKeyReleaseRequestV1 {
+    verified_release_request_for_envelope_with_suite(&provisioned_envelope(), suite)
+}
+
+pub(crate) fn verified_release_request_for_envelope(
+    envelope: &CustodyEnvelopeV1,
+) -> VerifiedKeyReleaseRequestV1 {
+    verified_release_request_for_envelope_with_suite(envelope, CUSTODY_HPKE_SUITE_ID_V1)
+}
+
+fn verified_release_request_for_envelope_with_suite(
+    envelope: &CustodyEnvelopeV1,
+    suite: &str,
+) -> VerifiedKeyReleaseRequestV1 {
+    let rights = {
+        let signed = signed_rights_request_with_suite_for_envelope(suite, envelope);
+        let context = RightsVerificationContextV1::new(
+            signed.request().binding().clone(),
+            signed.request().action(),
+            signed.request().recipient().clone(),
+            NOW + 1,
+        );
+        signed
+            .verify(&context, &mut TestReplayClaims::default())
+            .unwrap()
+    };
+    KeyReleaseRequestV1::new(
+        rights.binding().clone(),
+        rights.request_hash(),
+        rights.action(),
+        rights.recipient().clone(),
+        NOW + 2,
+        NOW + 60,
+        ReplayNonce16::new([0x66; 16]),
+    )
+    .unwrap()
+    .verify(&rights, NOW + 3, &mut TestReplayClaims::default())
+    .unwrap()
+}
+
+fn signed_rights_request_with_suite_for_envelope(
+    suite: &str,
+    envelope: &CustodyEnvelopeV1,
+) -> WalletSignedRightsRequestV1 {
+    let wallet = wallet(7);
+    let request = RightsRequestV1::new(
+        binding_for_wallet_with_envelope(wallet, envelope),
+        RightsActionV1::View,
+        recipient_identity_with_suite(0x30, suite),
+        NOW,
+        NOW + 180,
+        ReplayNonce16::new([0x55; 16]),
+    )
+    .unwrap();
+    let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
+    let (signature, recovery_id) = key
+        .sign_prehash_recoverable(&ethereum_signed_message_hash(
+            &request.canonical_bytes().unwrap(),
+        ))
+        .unwrap();
+    let mut signature_bytes = signature.to_bytes().to_vec();
+    signature_bytes.push(recovery_id.to_byte());
+    WalletSignedRightsRequestV1::new(request, signature_bytes).unwrap()
+}
+
+pub(crate) fn signed_node_decision(
+    request: &VerifiedKeyReleaseRequestV1,
+    node_seed: u8,
+    decision: RightsDecisionV1,
+) -> SignedNodeRightsDecisionV1 {
+    let statement = elastos_protected_content_contracts::NodeRightsDecisionStatementV1::new(
+        request.request_hash(),
+        request.rights_request_hash(),
+        request.binding().clone(),
+        request.action(),
+        node_public_key(node_seed),
+        decision,
+        digest(0x80 + node_seed),
+        NOW + 4,
+        NOW + 50,
+    )
+    .unwrap();
+    let signature = node_signing_key(node_seed)
+        .sign(&statement.canonical_bytes().unwrap())
+        .to_bytes()
+        .to_vec();
+    SignedNodeRightsDecisionV1::new(statement, signature).unwrap()
+}
+
+pub(crate) fn provisioned_envelope() -> CustodyEnvelopeV1 {
+    provision_custody_envelope_with_rng(
+        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+        &content_key(),
+        ThresholdV1::new(2, 3).unwrap(),
+        custody_nodes(),
+        &mut HpkeStdRng::from_seed([0x41; 32]),
+        &mut ShamirStdRng::from_seed([0x42; 32]),
+    )
+    .unwrap()
+}

@@ -1,0 +1,472 @@
+use ed25519_dalek::{Signer as _, SigningKey};
+use hpke::rand_core::{CryptoRng as HpkeCryptoRng, RngCore as HpkeRngCore};
+use rand09::{rngs::StdRng, SeedableRng as _};
+
+use elastos_protected_content_contracts::{
+    validate_node_contribution_active_window, CanonicalContract, CustodyEnvelopeV1,
+    NodeContributionStatementV1, NodePublicKey, RecipientSealedContributionV1, RightsDecisionV1,
+    SignedNodeContributionV1, SignedNodeRightsDecisionV1, VerifiedKeyReleaseRequestV1,
+};
+
+use crate::{
+    hpke_helpers::seal_share,
+    secrets::{NodeCustodySecretKeyV1, RecipientPublicKeyV1},
+    CustodyError,
+};
+
+#[allow(clippy::too_many_arguments)]
+pub fn produce_node_contribution(
+    request: &VerifiedKeyReleaseRequestV1,
+    signed_rights_decision: &SignedNodeRightsDecisionV1,
+    envelope: &CustodyEnvelopeV1,
+    node_signing_key: &SigningKey,
+    node_custody_secret: &NodeCustodySecretKeyV1,
+    recipient_public_key: &RecipientPublicKeyV1,
+    issued_at: u64,
+    expires_at: u64,
+    now: u64,
+) -> Result<SignedNodeContributionV1, CustodyError> {
+    let mut hpke_rng =
+        StdRng::try_from_os_rng().map_err(|_| CustodyError::RandomnessUnavailable)?;
+    produce_node_contribution_with_rng(
+        request,
+        signed_rights_decision,
+        envelope,
+        node_signing_key,
+        node_custody_secret,
+        recipient_public_key,
+        issued_at,
+        expires_at,
+        now,
+        &mut hpke_rng,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn produce_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>(
+    request: &VerifiedKeyReleaseRequestV1,
+    signed_rights_decision: &SignedNodeRightsDecisionV1,
+    envelope: &CustodyEnvelopeV1,
+    node_signing_key: &SigningKey,
+    node_custody_secret: &NodeCustodySecretKeyV1,
+    recipient_public_key: &RecipientPublicKeyV1,
+    issued_at: u64,
+    expires_at: u64,
+    now: u64,
+    hpke_rng: &mut R,
+) -> Result<SignedNodeContributionV1, CustodyError> {
+    if !envelope.matches_key_envelope_identity(request.binding().key_envelope())? {
+        return Err(CustodyError::BindingMismatch("key_envelope"));
+    }
+    if request.recipient().encryption_suite_id()
+        != elastos_protected_content_contracts::CUSTODY_HPKE_SUITE_ID_V1
+    {
+        return Err(CustodyError::BindingMismatch(
+            "recipient_encryption_suite_id",
+        ));
+    }
+    if recipient_public_key.identity()? != *request.recipient() {
+        return Err(CustodyError::BindingMismatch("recipient_key_identity"));
+    }
+
+    let node_set = envelope.manifest().node_set()?;
+    let decision = signed_rights_decision.verify(request, &node_set, now)?;
+    if decision.decision() != RightsDecisionV1::Allowed {
+        return Err(CustodyError::Release(
+            elastos_protected_content_contracts::KeyReleaseError::RightsDenied,
+        ));
+    }
+    validate_node_contribution_active_window(issued_at, expires_at, request, &decision, now)?;
+    let node_public_key = NodePublicKey::new(node_signing_key.verifying_key().to_bytes())?;
+    if node_public_key != decision.node_public_key() {
+        return Err(CustodyError::BindingMismatch("node_public_key"));
+    }
+
+    let node_entry = envelope
+        .manifest()
+        .node(node_public_key)
+        .ok_or(CustodyError::BindingMismatch("custody_node"))?;
+    node_custody_secret.matches_node_entry(
+        node_public_key,
+        node_entry.custody_public_key(),
+        node_signing_key,
+    )?;
+
+    let stored_share = envelope
+        .stored_share_for_node(node_public_key)
+        .ok_or(CustodyError::BindingMismatch("stored_share"))?;
+    let stored_aad = envelope
+        .manifest()
+        .stored_share_aad_bytes_for_node(node_public_key)?;
+    let plaintext_share = crate::hpke_helpers::open_share(
+        stored_share,
+        node_custody_secret.secret_bytes(),
+        elastos_protected_content_contracts::STORED_SHARE_HPKE_INFO_V1,
+        &stored_aad,
+    )?;
+    let released_aad = node_entry.released_share_aad_bytes(
+        request.request_hash(),
+        request.binding(),
+        decision.decision_hash(),
+        request.recipient(),
+    )?;
+    let released_ciphertext = seal_share(
+        recipient_public_key.as_bytes(),
+        elastos_protected_content_contracts::RELEASED_SHARE_HPKE_INFO_V1,
+        &released_aad,
+        &plaintext_share,
+        hpke_rng,
+    )?;
+    let recipient_sealed_contribution = RecipientSealedContributionV1::new(
+        request.recipient().clone(),
+        released_ciphertext.canonical_bytes()?,
+    )?;
+    let statement = NodeContributionStatementV1::new(
+        request.request_hash(),
+        request.binding().clone(),
+        signed_rights_decision.clone(),
+        recipient_sealed_contribution,
+        issued_at,
+        expires_at,
+    )?;
+    let signature = node_signing_key
+        .sign(&statement.canonical_bytes()?)
+        .to_bytes()
+        .to_vec();
+    let signed = SignedNodeContributionV1::new(statement, signature)?;
+    signed.verify(request, &node_set, now)?;
+    Ok(signed)
+}
+
+#[cfg(test)]
+mod tests {
+    use rand09::{rngs::StdRng, SeedableRng as _};
+
+    use super::*;
+    use crate::test_support::{
+        node_custody_secret, node_signing_key, provisioned_envelope, recipient_public_key,
+        signed_node_decision, verified_release_request, verified_release_request_for_envelope,
+        verified_release_request_with_suite,
+    };
+    use elastos_protected_content_contracts::{
+        KeyReleaseError, RightsError, RIGHTS_CLOCK_SKEW_SECS,
+    };
+
+    fn node_share_index(envelope: &CustodyEnvelopeV1, seed: u8) -> usize {
+        let node_public_key = elastos_protected_content_contracts::NodePublicKey::new(
+            node_signing_key(seed).verifying_key().to_bytes(),
+        )
+        .unwrap();
+        envelope.manifest().node_index(node_public_key).unwrap()
+    }
+
+    #[test]
+    fn release_produces_a_verified_node_contribution() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let signed = produce_node_contribution(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &envelope,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap();
+        let verified = signed
+            .verify(
+                &request,
+                &envelope.manifest().node_set().unwrap(),
+                crate::test_support::NOW + 6,
+            )
+            .unwrap();
+        assert_eq!(
+            verified.node_public_key(),
+            elastos_protected_content_contracts::NodePublicKey::new(
+                node_signing_key(1).verifying_key().to_bytes()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn release_rejects_wrong_signing_key() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let err = produce_node_contribution(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &envelope,
+            &node_signing_key(2),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("node_public_key")
+        ));
+    }
+
+    #[test]
+    fn release_rejects_wrong_custody_secret() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let err = produce_node_contribution(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &envelope,
+            &node_signing_key(1),
+            &node_custody_secret(2),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("node_custody_public_key")
+        ));
+    }
+
+    #[test]
+    fn release_rejects_wrong_recipient_suite_or_public_key() {
+        let wrong_suite_request =
+            verified_release_request_with_suite("x25519-hkdf-sha256-aes256gcm/v1");
+        let envelope = provisioned_envelope();
+        let err = produce_node_contribution(
+            &wrong_suite_request,
+            &signed_node_decision(&wrong_suite_request, 1, RightsDecisionV1::Allowed),
+            &envelope,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("recipient_encryption_suite_id")
+        ));
+
+        let request = verified_release_request();
+        let err = produce_node_contribution(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &envelope,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x31),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("recipient_key_identity")
+        ));
+    }
+
+    #[test]
+    fn release_rejects_denied_decision() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let err = produce_node_contribution(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Denied),
+            &envelope,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::Release(
+                elastos_protected_content_contracts::KeyReleaseError::RightsDenied
+            )
+        ));
+    }
+
+    #[test]
+    fn release_rejects_post_binding_envelope_mutation_before_decrypt() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let mut stored_shares = envelope.stored_shares().to_vec();
+        let index = node_share_index(&envelope, 1);
+        let mut ciphertext = *stored_shares[index].ciphertext();
+        ciphertext[0] ^= 0x55;
+        stored_shares[index] = elastos_protected_content_contracts::HpkeCiphertextV1::new(
+            *stored_shares[index].encapped_key(),
+            ciphertext,
+        )
+        .unwrap();
+        let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
+        let err = produce_node_contribution_with_rng(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &tampered,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+            &mut StdRng::from_seed([0x71; 32]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CustodyError::BindingMismatch("key_envelope")));
+    }
+
+    #[test]
+    fn release_reaches_hpke_failure_for_request_bound_to_invalid_ciphertext() {
+        let envelope = provisioned_envelope();
+        let mut stored_shares = envelope.stored_shares().to_vec();
+        let index = node_share_index(&envelope, 1);
+        let mut ciphertext = *stored_shares[index].ciphertext();
+        ciphertext[0] ^= 0x55;
+        stored_shares[index] = elastos_protected_content_contracts::HpkeCiphertextV1::new(
+            *stored_shares[index].encapped_key(),
+            ciphertext,
+        )
+        .unwrap();
+        let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
+        let request = verified_release_request_for_envelope(&tampered);
+        let err = produce_node_contribution_with_rng(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &tampered,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+            &mut StdRng::from_seed([0x71; 32]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CustodyError::Hpke(_)));
+    }
+
+    #[test]
+    fn release_checks_active_window_before_opening_bound_invalid_ciphertext() {
+        let envelope = provisioned_envelope();
+        let mut stored_shares = envelope.stored_shares().to_vec();
+        let index = node_share_index(&envelope, 1);
+        let mut ciphertext = *stored_shares[index].ciphertext();
+        ciphertext[0] ^= 0x55;
+        stored_shares[index] = elastos_protected_content_contracts::HpkeCiphertextV1::new(
+            *stored_shares[index].encapped_key(),
+            ciphertext,
+        )
+        .unwrap();
+        let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
+        let request = verified_release_request_for_envelope(&tampered);
+        let err = produce_node_contribution_with_rng(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &tampered,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 6,
+            crate::test_support::NOW + 6,
+            &mut StdRng::from_seed([0x71; 32]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::Rights(RightsError::Expired))
+        ));
+    }
+
+    #[test]
+    fn release_rejects_noncanonical_encapped_key_before_hpke_open() {
+        let envelope = provisioned_envelope();
+        let mut stored_shares = envelope.stored_shares().to_vec();
+        let index = node_share_index(&envelope, 1);
+        let noncanonical = [
+            0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ];
+        stored_shares[index] = elastos_protected_content_contracts::HpkeCiphertextV1::new(
+            noncanonical,
+            *stored_shares[index].ciphertext(),
+        )
+        .unwrap();
+        let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
+        let request = verified_release_request_for_envelope(&tampered);
+        let err = produce_node_contribution_with_rng(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &tampered,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+            &mut StdRng::from_seed([0x71; 32]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::MalformedShare("hpke_encapped_key")
+        ));
+    }
+
+    #[test]
+    fn release_accepts_the_contract_clock_skew_boundary() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        produce_node_contribution(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &envelope,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 6 + RIGHTS_CLOCK_SKEW_SECS,
+            crate::test_support::NOW + 40,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn release_rejects_expires_at_equal_to_now() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let err = produce_node_contribution(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &envelope,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 6,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::Release(KeyReleaseError::Rights(RightsError::Expired))
+        ));
+    }
+}
