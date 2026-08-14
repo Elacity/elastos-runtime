@@ -153,7 +153,10 @@ A. review the canonical v1 source-only contract and operational contract
    epochs, and the authenticated replay-pending Runtime-to-release-node
    envelope;
 B. build source-only custody-node operations and durable node state on top of
-   that contract, including replay, issuer lifecycle, and operational review;
+   that contract. The current local child line covers the node-local durable
+   replay-claim boundary and claim-gated release transition; remaining work is
+   issuer lifecycle, node admission or rotation or recovery, operational
+   review, and durable post-claim operation recovery;
 C. replace the provisional DTO/provider surface atomically and wire
    Runtime/Wallet/provider integration to the reviewed contract, with one
    source allow flow and one source deny flow; and

@@ -709,17 +709,26 @@ and review items pass.
 
 ### Trusted content and access rights
 
-The source-only protected-content stack now has three review layers in order:
-published canonical contracts, published custody helpers, and the local
-operational-contract child line. Remaining work must stay in this order. Carrier
-remains transport only throughout every stage below.
+The source-only protected-content stack now has four review layers in order:
+published canonical contracts, published custody helpers, the accepted local
+operational-contract child line, and the current local custody-operations child
+line. Remaining work must stay in this order. Carrier remains transport only
+throughout every stage below.
 
-The local operational-contract line now defines the reviewed source-only EVM
-`has_access_by_content_id` policy/evidence contract, including the exact
+The accepted local operational-contract line defines the reviewed source-only
+EVM `has_access_by_content_id` policy/evidence contract, including the exact
 contract right string mapped from one product action, Profile-signed
 recipient-key authorization, signed immutable custody epoch, and authenticated
-replay-pending Runtime release-operation envelope. Remaining tasks start after
-that boundary; they do not reopen it as ambient provider configuration.
+replay-pending Runtime release-operation envelope. The current local
+custody-operations line adds the node-local durable dual-key replay-claim store
+and the private claim-gated transition from authenticated replay-pending
+Runtime evidence to node-actionable release authority. Remaining tasks start
+after those boundaries; they do not reopen them as ambient provider
+configuration. Runtime owns its own orchestration replay. Each custody node
+owns only its exact local dual-key claim. A crash after a successful local
+claim but before contribution settlement is fail closed and currently requires
+a fresh Runtime release operation; there is no durable operation-resume
+journal yet.
 
 #### A. Source-only review gate
 
@@ -759,19 +768,21 @@ that boundary; they do not reopen it as ambient provider configuration.
   revocation, audit retention, issuer-key lifecycle, and recovery operations.
   The source-only `elastos-protected-content-custody` crate now implements new
   content share provisioning, recipient-sealed node release, and recipient-side
-  threshold reconstruction, but it does not prove operational custody safety,
-  durable storage, or product integration. Its manifest-bound CEK commitment
+  threshold reconstruction, but it does not yet prove full operational custody
+  safety, complete node-state durability, or product integration. Its
+  manifest-bound CEK commitment
   detects a wrong reconstructed key; it does not identify the malicious node or
   add verifiable secret sharing.
-- [ ] Implement durable per-node replay claim stores and operational node state
-  around the reviewed contracts. Claims must use the contract's exact
-  authority-scope hash plus nonce, survive restarts until expiry, and prove
-  insert-if-absent behavior under concurrency and storage failure.
-- [ ] Add the atomic custody-node transition from the authenticated
-  replay-pending Runtime release operation to claimed actionable release
-  authority. The node must claim the exact Wallet and release replay keys
-  durably before it opens any stored share. Stage A's replay-pending contract
-  value must remain non-actionable.
+- [ ] Extend the reviewed node-local replay-claim and claim-gated release
+  transition into full operational node state: retained claim pruning policy,
+  multi-process operational audit retention, node admission and issuer-key
+  lifecycle, recovery tooling, and storage review for production hosts. The
+  current local child line already proves one owner-only durable dual-key
+  claim-many store, atomic no-partial-claim updates, restart survival, and the
+  private claim-before-open transition from authenticated replay-pending
+  Runtime evidence to node-actionable release authority. It does not yet add a
+  durable operation-resume journal after claim success, so a post-claim crash
+  still requires a fresh Runtime release operation.
 
 #### C. Atomic Runtime/provider cutover plus source allow/deny proof
 

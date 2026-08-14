@@ -16,8 +16,10 @@ product integration.
    the protected-content binding. It does not prove that the right exists;
    each release node evaluates the bound policy. Wallet does not replace
    Profile identity.
-3. Runtime derives authority, selects providers, owns lifecycle, performs the
-   mandatory atomic replay claim, chooses terminal-receipt issuers, and audits.
+3. Runtime derives authority, selects providers, owns lifecycle, owns its
+   orchestration replay, chooses terminal-receipt issuers, and audits. Each
+   custody node owns the exact local atomic dual-key replay claim before it
+   can act.
 4. Provider contracts define local and remote rights and custody operations.
 5. Carrier transports traffic only to endpoints selected by Runtime. It grants
    no authority and is absent from these types.
@@ -234,11 +236,16 @@ binds:
 Verification proves those bindings and requires the Profile-signed
 recipient-key authorization to authorize the Runtime issuer. Carrier endpoint
 authentication remains transport evidence only. This source-only contract does
-not implement durable replay state or provider routing. Verification returns an
-authenticated replay-pending surface only: it proves signatures and exact
-bindings, exposes the nested request hashes and replay-claim keys, and does not
-expose actionable `VerifiedRightsRequestV1` or `VerifiedKeyReleaseRequestV1`
-values. Runtime and custody-node durable replay claims remain later work.
+not implement provider routing or Runtime durable replay state. Verification
+returns an authenticated replay-pending surface only: it proves signatures and
+exact bindings, exposes the nested request hashes and replay-claim keys, and
+does not expose actionable `VerifiedRightsRequestV1` or
+`VerifiedKeyReleaseRequestV1` values. The companion source-only custody helper
+now uses those exact claim keys for one local dual-key atomic claim transition,
+but Runtime durable replay and orchestration remain later work. A crash or
+storage failure after that node-local claim succeeds but before contribution
+settlement is fail closed and currently requires a fresh Runtime release
+operation; there is no durable operation-resume journal yet.
 
 ## Node decision and contribution
 
@@ -250,9 +257,9 @@ window.
 `KeyReleaseRequestV1` is not a Runtime signature or a bearer grant. A remote
 node must receive the canonical Wallet request and release request through the
 typed `SignedRuntimeReleaseOperationV1` envelope. The node must still verify
-the nested requests and claim replay in its own durable store before it acts.
-Carrier endpoint authentication alone does not prove who authored the
-application request.
+the nested requests and claim both replay keys atomically in its own durable
+store before it acts. Carrier endpoint authentication alone does not prove who
+authored the application request.
 
 Each node creates `SignedNodeRightsDecisionV1` after independently evaluating
 the exact rights-policy identity. The signed statement binds the release and
@@ -308,8 +315,10 @@ canonical input, noncanonical Wallet/Profile encodings, and noncanonical or
 low-order X25519 contract key encodings.
 
 These contracts plus the source-only `elastos-protected-content-custody` helper
-do not solve malicious custody nodes, rights-policy correctness, durable replay
-storage, issuer-key lifecycle, recipient key-possession proof, node
+provide one bounded node-local owner-only dual-key replay-claim store, but
+they do not solve malicious custody nodes, rights-policy correctness, Runtime
+durable replay storage, full operational custody state, durable post-claim
+resume/settlement, issuer-key lifecycle, recipient key-possession proof, node
 admission/rotation/recovery, availability, decryption, rendering, or product
 workflow safety. The custody helper uses `hpke` 0.13, whose upstream
 documentation says it has not been formally audited. These source-only crates

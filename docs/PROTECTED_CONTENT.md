@@ -13,11 +13,13 @@ The source tree currently has two protected-content layers:
   stack now defines canonical authority bindings, typed rights-policy and
   evidence contracts, Profile-signed recipient-key authorization, signed
   immutable custody epochs, a typed Runtime-to-release-node operation
-  envelope, and source-only custody helpers for custody-envelope
-  provisioning, recipient-sealed node release, and recipient-side threshold
-  reconstruction for new content. It is not yet wired into Runtime
-  orchestration, provider integration, durable replay storage, recipient
-  key-possession proof, decryption, playback, installation, or deployment.
+  envelope, a local durable dual-key replay-claim store for custody nodes,
+  a claim-gated node release path, and source-only custody helpers for
+  custody-envelope provisioning, recipient-sealed node release, and
+  recipient-side threshold reconstruction for new content. It is not yet wired
+  into Runtime orchestration, provider integration, Runtime-owned replay
+  storage, recipient key-possession proof, decryption, playback, installation,
+  or deployment.
 - The current installed/provider surface is the older provisional
   `elastos_common::protected_content` DTO set plus the fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -143,8 +145,13 @@ protected content:
 - It returns only opaque, redacted secret wrappers; it does not expose a
   capsule-visible raw-key API.
 - It is source-only. There are no running custody nodes, Runtime/provider
-  routes, durable replay stores, recipient key-possession proof, decrypt/render
-  product flow, installation, or deployment in this branch.
+  routes, Runtime-owned replay orchestration, recipient key-possession proof,
+  decrypt/render product flow, installation, or deployment in this branch. The
+  current local child line adds one node-local durable dual-key replay-claim
+  store and the private claim-gated release transition only. That store adds a
+  domain-separated integrity digest to detect same-length corruption or torn
+  local state, but it does not defend against a malicious same-UID rewrite
+  that can recompute the digest.
 
 This helper does not make a PQ claim. PQ-hybrid custody, dKMS node lifecycle,
 and product wiring remain future work. The current HPKE dependency is `hpke`
@@ -179,13 +186,16 @@ contract layer that later Runtime and custody-node integrations must consume:
   authorization, exact policy and evidence request, exact custody epoch, exact
   Runtime issuer, one audit id, and one bounded window. Verification returns an
   authenticated replay-pending value only. It exposes exact request hashes and
-  replay claim keys for a later atomic durable claim step, but it does not
-  expose actionable verified requests.
+  replay claim keys for the node-local atomic durable claim step, but it does
+  not expose actionable verified requests before that claim succeeds. A crash
+  or storage failure after the node-local claim succeeds but before
+  contribution settlement is fail closed and currently requires a fresh
+  Runtime release operation; there is no durable operation-resume journal yet.
 
 This operational layer is still source-only. There is no provider registry
-cutover, durable replay store, recipient key-possession proof, node lifecycle
-service, installed product flow, or production confidentiality claim in this
-branch.
+cutover, Runtime-owned replay store, recipient key-possession proof, node
+lifecycle service, installed product flow, or production confidentiality claim
+in this branch.
 
 ## Provider Boundary
 
@@ -214,9 +224,12 @@ The provider plane should expose typed questions instead:
 A. Finish the source-only review gate: professional external cryptographic and
    contract review, plus any additional grounded HPKE wrapper known-answer
    coverage that a reviewed upstream vector path can support.
-B. Build source-only custody-node operations and durable node state around the
-   reviewed contracts: node admission/rotation/revocation/recovery, durable
-   replay claims, issuer-key lifecycle, and operational audit retention.
+B. Continue the source-only custody-node operations and durable node-state
+   layer around the reviewed contracts. The current local child line adds the
+   durable dual-key replay-claim boundary and the claim-gated node-release
+   transition. Remaining work is node admission/rotation/revocation/recovery,
+   issuer-key lifecycle, operational audit retention, and durable
+   post-claim operation recovery.
 C. Replace the provisional `elastos_common::protected_content` DTO/provider
    surface atomically with Runtime-owned orchestration over the reviewed v1
    contract: Wallet integration, recipient key generation and possession proof,
