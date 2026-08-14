@@ -100,7 +100,11 @@ impl ModelProvider {
             return Response::error("invalid_operation", "only the generate operation exists");
         }
         let configured = offer::configured_offers(&self.config);
-        let Some(offer) = configured.iter().find(|offer| offer.offer_id == offer_id) else {
+        let Some(offer) = configured
+            .iter()
+            .map(|service| &service.descriptor)
+            .find(|descriptor| descriptor.offer_id == offer_id)
+        else {
             return Response::error("offer_not_found", "offer unknown or backend not configured");
         };
 
@@ -114,13 +118,18 @@ impl ModelProvider {
 
         match offer_id {
             "offer:flash-chat:pair-a" => {
+                let Some(upstream) = self.config.flash_url.clone().filter(|u| !u.is_empty()) else {
+                    return Response::error(
+                        "offer_not_found",
+                        "chat backend is not configured",
+                    );
+                };
                 let params = match run::validate_chat_inputs(&inputs) {
                     Ok(params) => params,
                     Err((code, message)) => return Response::error(code, message),
                 };
                 let run = self.registry.create(offer_id, operation);
                 let run_id = run.lock().unwrap().run_id.clone();
-                let upstream = self.config.flash_url.clone().unwrap_or_default();
                 let model = offer.model.id.clone();
                 let worker = std::sync::Arc::clone(&run);
                 std::thread::spawn(move || {

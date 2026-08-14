@@ -12,9 +12,10 @@ use crate::run::{ChatParams, Run, RunEvent, RunState};
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-const RUN_CEILING: Duration = Duration::from_secs(120);
+/* Sovereign runtime: no policy ceiling on a chat run. The run ends when the model
+   finishes, the caller cancels (Stop), or the upstream connection genuinely fails —
+   never on a wall-clock timeout. The caller owns the compute. */
 
 fn extract_delta(chunk: &serde_json::Value) -> (String, String) {
     let delta = &chunk["choices"][0]["delta"];
@@ -63,7 +64,6 @@ pub fn run_chat(
     model: String,
     params: ChatParams,
 ) {
-    let started = Instant::now();
     let cancel = Arc::clone(&run.lock().unwrap().cancel);
     let push = |event: RunEvent| run.lock().unwrap().push(event);
     let fail = |code: &str, message: &str| {
@@ -91,7 +91,6 @@ pub fn run_chat(
     }
 
     let response = match ureq::post(&format!("{}/chat/completions", upstream_url))
-        .timeout(RUN_CEILING + Duration::from_secs(5))
         .send_json(payload)
     {
         Ok(response) => response,
@@ -108,10 +107,6 @@ pub fn run_chat(
     loop {
         if cancel.load(Ordering::Relaxed) {
             push(RunState::Cancelled.into());
-            return;
-        }
-        if started.elapsed() > RUN_CEILING {
-            fail("timeout", "run exceeded 120s policy ceiling");
             return;
         }
         let line = match lines.next() {

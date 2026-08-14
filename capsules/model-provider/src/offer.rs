@@ -1,20 +1,37 @@
-//! `elastos.model.offer/v1` — model capability descriptor.
+//! Model capability descriptor, wrapped in an `elastos.service.offer/v1`
+//! service record with `service_kind: "model"` (Anders' publish contract).
 //!
-//! Served by `offers.list`. The descriptor carries capability metadata only:
-//! no upstream URLs, ports, or credentials ever appear in an offer (SSRF-closed,
-//! SP-CRYPTO). Wrapping into `elastos.service.offer/v1` for DID/Carrier
-//! discovery happens at publish time, not here.
+//! The outer record is the discovery/identity envelope; the typed model
+//! descriptor rides inside it. Carries capability metadata only: no upstream
+//! URLs, ports, or credentials ever appear (SSRF-closed, SP-CRYPTO). No
+//! self-asserted identity: signing / provider identity is injected by the
+//! Runtime at publish time (collaboration branch), so the descriptor holds
+//! no placeholder DIDs.
 
 use serde::Serialize;
 
-pub const MODEL_OFFER_SCHEMA: &str = "elastos.model.offer/v1";
+pub const SERVICE_OFFER_SCHEMA: &str = "elastos.service.offer/v1";
+pub const SERVICE_KIND_MODEL: &str = "model";
+pub const MODEL_DESCRIPTOR_SCHEMA: &str = "elastos.model.descriptor/v1";
 
+/// Outer service record — the envelope the Runtime signs and Carrier discovers.
+/// Identity is NOT self-asserted: `provider` stays empty until the Runtime
+/// binds the service instance's own identity at publish time.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceOffer {
+    pub schema: &'static str,
+    pub service_kind: &'static str,
+    pub service_uri: String,
+    /// Runtime-injected service-instance identity. Empty until published.
+    pub provider: String,
+    pub descriptor: ModelOffer,
+}
+
+/// Typed model descriptor (nested inside the service record).
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelOffer {
     pub schema: &'static str,
     pub offer_id: String,
-    pub provider_profile_did: String,
-    pub service_offer_id: String,
     pub model: ModelInfo,
     pub operations: Vec<Operation>,
     pub policy: Policy,
@@ -75,7 +92,6 @@ pub struct ProviderConfig {
     pub h3_url: Option<String>,
     pub flash_digest: Option<String>,
     pub h3_digest: Option<String>,
-    pub provider_profile_did: Option<String>,
     /// Directory for durable run artifacts. `extra.h3_output_dir` wins;
     /// falls back to `<base_path>/creative/jobs` (the dogfood library
     /// convention), then `./creative/jobs`.
@@ -115,29 +131,20 @@ impl ProviderConfig {
             h3_url: get("h3_url"),
             flash_digest: get("flash_digest"),
             h3_digest: get("h3_digest"),
-            provider_profile_did: get("provider_profile_did"),
             base_path,
             h3_output_dir: get("h3_output_dir"),
         }
     }
 }
 
-pub fn flash_chat_offer(config: &ProviderConfig) -> ModelOffer {
-    ModelOffer {
-        schema: MODEL_OFFER_SCHEMA,
+pub fn flash_chat_offer(config: &ProviderConfig) -> ServiceOffer {
+    let descriptor = ModelOffer {
+        schema: MODEL_DESCRIPTOR_SCHEMA,
         offer_id: "offer:flash-chat:pair-a".to_string(),
-        provider_profile_did: config
-            .provider_profile_did
-            .clone()
-            .unwrap_or_else(|| "did:key:sparks-flash".to_string()),
-        service_offer_id: "service:model:chat".to_string(),
         model: ModelInfo {
             id: "deepseek-v4-flash".to_string(),
             revision: "2026-08-10".to_string(),
-            digest: config
-                .flash_digest
-                .clone()
-                .unwrap_or_else(|| "sha256:<model-digest>".to_string()),
+            digest: config.flash_digest.clone().unwrap_or_default(),
             name: "DeepSeek V4 Flash (Sparks pair A)".to_string(),
         },
         operations: vec![Operation {
@@ -165,7 +172,7 @@ pub fn flash_chat_offer(config: &ProviderConfig) -> ModelOffer {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "max_tokens": { "type": "integer", "minimum": 1, "maximum": 8192 },
+                    "max_tokens": { "type": "integer", "minimum": 1 },
                     "temperature": { "type": "number", "minimum": 0, "maximum": 2 }
                 }
             }),
@@ -173,30 +180,31 @@ pub fn flash_chat_offer(config: &ProviderConfig) -> ModelOffer {
         policy: Policy {
             maximum_concurrent_runs: 8,
             maximum_input_bytes: 1_048_576,
-            maximum_run_seconds: 120,
+            // 0 = no wall-clock ceiling: the caller owns the compute; a run ends on
+            // completion, caller cancel (Stop), or genuine upstream failure only.
+            maximum_run_seconds: 0,
             data_retention_seconds: 0,
             training_use: false,
         },
         terms_ref: "elastos://services/terms/sparks-flash".to_string(),
+    };
+    ServiceOffer {
+        schema: SERVICE_OFFER_SCHEMA,
+        service_kind: SERVICE_KIND_MODEL,
+        service_uri: "elastos://model/offer:flash-chat:pair-a".to_string(),
+        provider: String::new(),
+        descriptor,
     }
 }
 
-pub fn h3_video_offer(config: &ProviderConfig) -> ModelOffer {
-    ModelOffer {
-        schema: MODEL_OFFER_SCHEMA,
+pub fn h3_video_offer(config: &ProviderConfig) -> ServiceOffer {
+    let descriptor = ModelOffer {
+        schema: MODEL_DESCRIPTOR_SCHEMA,
         offer_id: "offer:h3-video:2x".to_string(),
-        provider_profile_did: config
-            .provider_profile_did
-            .clone()
-            .unwrap_or_else(|| "did:key:sparks-h3".to_string()),
-        service_offer_id: "service:model:video".to_string(),
         model: ModelInfo {
             id: "minimax-h3-fl2va".to_string(),
             revision: "2026-08-09".to_string(),
-            digest: config
-                .h3_digest
-                .clone()
-                .unwrap_or_else(|| "sha256:<model-digest>".to_string()),
+            digest: config.h3_digest.clone().unwrap_or_default(),
             name: "MiniMax H3 FL2VA (Sparks 2×)".to_string(),
         },
         operations: vec![Operation {
@@ -236,7 +244,7 @@ pub fn h3_video_offer(config: &ProviderConfig) -> ModelOffer {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "duration_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+                    "duration_seconds": { "type": "integer", "minimum": 1 },
                     "resolution": { "enum": ["720p", "1080p"] },
                     "aspect_ratio": { "enum": ["16:9", "9:16", "1:1"] },
                     "scale": { "enum": [1, 2, 4], "default": 2 }
@@ -246,27 +254,32 @@ pub fn h3_video_offer(config: &ProviderConfig) -> ModelOffer {
         policy: Policy {
             maximum_concurrent_runs: 1,
             maximum_input_bytes: 104_857_600,
-            maximum_run_seconds: 3000,
+            // 0 = no wall-clock ceiling: the caller owns the compute.
+            maximum_run_seconds: 0,
             data_retention_seconds: 0,
             training_use: false,
         },
         terms_ref: "elastos://services/terms/h3-video".to_string(),
+    };
+    ServiceOffer {
+        schema: SERVICE_OFFER_SCHEMA,
+        service_kind: SERVICE_KIND_MODEL,
+        service_uri: "elastos://model/offer:h3-video:2x".to_string(),
+        provider: String::new(),
+        descriptor,
     }
 }
 
 /// All offers configured on this provider. An offer is only advertised when
 /// its backend is configured — honesty about readiness (never advertise what
 /// we cannot serve).
-pub fn configured_offers(config: &ProviderConfig) -> Vec<ModelOffer> {
+pub fn configured_offers(config: &ProviderConfig) -> Vec<ServiceOffer> {
     let mut offers = Vec::new();
     if config.flash_url.is_some() {
         offers.push(flash_chat_offer(config));
     }
     if config.h3_url.is_some() {
         offers.push(h3_video_offer(config));
-    }
-    if offers.is_empty() {
-        offers.push(flash_chat_offer(config));
     }
     offers
 }

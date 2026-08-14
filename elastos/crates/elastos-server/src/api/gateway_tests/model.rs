@@ -27,6 +27,10 @@ impl Provider for MockModelProvider {
                 "status": "ok",
                 "data": { "provider": "model-provider", "version": "0.1.0-dev" }
             })),
+            Some("runs_create") => Ok(json!({
+                "status": "ok",
+                "data": { "run_id": "run:test", "state": "queued" }
+            })),
             _ => Err(ProviderError::Provider("unsupported op".into())),
         }
     }
@@ -136,4 +140,41 @@ async fn model_provider_requires_token() {
         .await
         .unwrap();
     assert!(response.status().is_client_error());
+}
+
+// Interim (pre Runtime grant enforcement): runs_create is gated by the app
+// allowlist alone, same as every other provider today. A request from the
+// allowed Home GUI shell dispatches to the provider; per-principal grants land
+// with the Runtime collaboration branch (Anders: "let Runtime derive the caller
+// and enforce grants").
+#[tokio::test]
+async fn model_runs_create_dispatches_via_app_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(model_test_state(dir.path()).await);
+    let token = issue_home_launch_token(dir.path(), HOME_GUI_SHELL_ID).unwrap();
+    let offer = "offer:chat";
+    let body = serde_json::json!({ "offer_id": offer, "input": { "prompt": "hi" } }).to_string();
+
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/provider/model/runs_create")
+                .header("x-elastos-home-token", &token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["run_id"], "run:test");
 }

@@ -40,6 +40,7 @@ pub enum RunEvent {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ObjectDescriptor {
+    pub id: String,
     pub media_type: String,
     pub sha256: String,
     pub size: u64,
@@ -130,9 +131,10 @@ pub fn validate_chat_inputs(inputs: &serde_json::Value) -> Result<ChatParams, Re
             let n = value
                 .as_u64()
                 .ok_or_else(|| ("invalid_inputs", "max_tokens must be an integer"))?;
-            if !(1..=8192).contains(&n) {
-                return Err(("invalid_inputs", "max_tokens out of range 1..=8192"));
+            if n == 0 {
+                return Err(("invalid_inputs", "max_tokens must be at least 1"));
             }
+            // No upper cap: the caller owns the compute and may request any budget.
             Some(n)
         }
     };
@@ -191,9 +193,10 @@ pub fn validate_video_inputs(inputs: &serde_json::Value) -> Result<VideoParams, 
             let d = value
                 .as_u64()
                 .ok_or_else(|| ("invalid_inputs", "duration_seconds must be an integer"))?;
-            if !(1..=30).contains(&d) {
-                return Err(("invalid_inputs", "duration_seconds out of range 1..=30"));
+            if d == 0 {
+                return Err(("invalid_inputs", "duration_seconds must be at least 1"));
             }
+            // No upper cap: the caller owns the compute and may request any duration.
             d
         }
     };

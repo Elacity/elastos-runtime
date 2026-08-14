@@ -1373,6 +1373,11 @@ pub(super) async fn gateway_provider_proxy(
         },
         _ => return (StatusCode::NOT_FOUND, "Gateway provider not found").into_response(),
     };
+
+    // Per-principal grant enforcement for model/runs_create is owned by the
+    // Runtime (Anders' collaboration branch: "let Runtime derive the caller and
+    // enforce grants"). No provider-side grant store here.
+
     let context =
         match require_home_launch_token_for_any_context(&state.data_dir, &headers, allowed_apps) {
             Ok(context) => context,
