@@ -6,12 +6,16 @@ authority.
 
 The source tree currently has two protected-content layers:
 
-- The canonical v1 review candidate is the source-only
-  `elastos-protected-content-contracts` crate, documented in
-  [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md). It is
-  not yet wired into Runtime orchestration, provider integration, custody,
-  threshold reconstruction, recipient encryption proof, decryption, playback,
-  installation, or deployment.
+- The canonical v1 source-only review stack is the
+  `elastos-protected-content-contracts` crate plus the companion
+  `elastos-protected-content-custody` crate, documented in
+  [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md). That
+  stack defines canonical authority bindings plus source-only custody helpers
+  for custody-envelope provisioning, recipient-sealed node release, and
+  recipient-side threshold reconstruction for new content. It is not yet wired
+  into Runtime orchestration, provider integration, durable replay storage,
+  recipient key-possession proof, decryption, playback, installation, or
+  deployment.
 - The current installed/provider surface is the older provisional
   `elastos_common::protected_content` DTO set plus the fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -51,9 +55,9 @@ production DRM:
   `sealed.json`, payload, rights policy, availability receipt, provenance, and
   approved key-envelope algorithms are required
 
-This is intentional. The first safe steps are to make the authority boundary
-unambiguous in the canonical v1 contract and keep the current provider chain
-fail closed until the reviewed integration slice exists.
+This is intentional. The first safe steps are to make the authority and
+custody boundaries unambiguous in the source-only v1 crates and keep the
+current provider chain fail closed until the reviewed integration slice exists.
 
 PC2's dDRM contracts and WASM decrypt/render/media crates are useful
 implementation references. They should enter Runtime only as provider-internal
@@ -76,7 +80,8 @@ sealed-material rail:
 - `decrypt-provider` creates a per-session one-time public key for the decrypt
   sandbox.
 - `key-provider` or the dKMS release backend seals the CEK to that one-time
-  decrypt-session public key, using the approved PQ-hybrid envelope profile.
+  decrypt-session public key, using a separately reviewed decrypt-handoff
+  suite.
 - The decrypt step receives sealed material in the decrypt-session request,
   unwraps it inside the sandbox, decrypts/renders, zeroizes the live CEK, and
   returns only scoped output.
@@ -85,11 +90,10 @@ sealed-material rail:
   authority surface.
 
 This keeps the rights/key/decrypt separation while avoiding an outbound
-authority grant to the highest-risk boundary. It also explains the current
-schema gap: `ReleaseReceiptV1` proves authorization, but it intentionally carries
-no key material; the next contract addition should add a sealed decrypt material
-envelope to the key/decrypt handoff instead of sending a raw CEK or letting
-decrypt fetch one.
+authority grant to the highest-risk boundary. The current source-only custody
+crate already defines canonical custody envelopes plus stored-share and
+released-share sealing for new content, but the Runtime/provider handoff to a
+decrypt boundary is still future integration work.
 
 Other options were considered and rejected as the normal Runtime path:
 
@@ -111,68 +115,25 @@ current `ddrm-decrypt` WASM pattern proves the containment invariant, but its
 P-256 and Lit/Chipotle details are implementation references rather than
 Runtime product truth.
 
-## Protected Object Shape
+## Current source-only custody helper
 
-New protected objects should publish as sealed SmartWeb objects:
+The `elastos-protected-content-custody` crate is a source-only helper for new
+protected content:
 
-```json
-{
-  "schema": "elastos.sealed.object/v1",
-  "payload_cid": "bafy...",
-  "rights_policy_cid": "bafy...",
-  "availability_receipt_cid": "bafy...",
-  "key_envelope": {
-    "scheme": "elastos-pq-hybrid-threshold-v0",
-    "kid": "...",
-    "wrapped_cek": "...",
-    "policy_hash": "sha256:...",
-    "algorithms": {
-      "cipher": "aes-256-gcm",
-      "signature": ["ed25519", "ml-dsa-65"],
-      "kem": ["x25519", "ml-kem-768"],
-      "share_scheme": "shamir-t-of-n"
-    }
-  },
-  "viewer": {
-    "required_interface": "elastos.viewer/document@1"
-  }
-}
-```
+- It provisions canonical custody envelopes from the reviewed v1 contract.
+- It uses one pinned recipient-sealing suite for stored and released shares:
+  RFC 9180 base mode X25519 + HKDF-SHA256 + AES-256-GCM.
+- It uses GF256 Shamir splitting through `vsss-rs` for new content only.
+- It returns only opaque, redacted secret wrappers; it does not expose a
+  capsule-visible raw-key API.
+- It is source-only. There are no running custody nodes, Runtime/provider
+  routes, durable replay stores, recipient key-possession proof, decrypt/render
+  product flow, installation, or deployment in this branch.
 
-`payload_cid` can be publicly reachable because protected payload bytes must be
-encrypted before replication. Access is enforced by rights checks and key release,
-not by hiding CIDs.
-
-## Crypto Agility And dKMS Direction
-
-FROST is a threshold Schnorr protocol, so it is classical ECC security, not a
-post-quantum root. ElastOS may use FROST for short/medium-term receipt or cohort
-signing, but new dKMS content must not depend on FROST as the long-term key
-security foundation.
-
-New protected content should use algorithm-agile sealed objects:
-
-- Encrypt payload bytes with AES-256-GCM or ChaCha20-Poly1305.
-- Split the AES-256 CEK into `t-of-n` shares.
-- Wrap each share to an approved dKMS node with hybrid X25519 + ML-KEM-768.
-- Sign release receipts with classical + PQ signatures where practical, starting
-  with Ed25519 plus ML-DSA; use SLH-DSA for conservative hash-based signatures
-  where size and speed are acceptable.
-- Reconstruct the CEK only inside the key/decrypt provider boundary, then return
-  scoped render/decrypt output to the viewer instead of raw CEKs.
-- When the decrypt engine is wired, prefer dKMS-direct sealing to the decrypt
-  session key. If an intermediate key-provider re-seal is used during migration,
-  it must remain provider-internal, signed, auditable, and short-lived.
-
-Current EVM/BTC/ELA wallet proofs and dDRM chain state are still classical. They
-are useful authorization inputs today, but they should not be the only permanent
-identity or access root for long-lived encrypted assets.
-
-References: [NIST PQC standards announcement](https://www.nist.gov/news-events/news/2024/08/nist-releases-first-3-finalized-post-quantum-encryption-standards),
-[FIPS 203 ML-KEM](https://csrc.nist.gov/pubs/fips/203/final),
-[FIPS 204 ML-DSA](https://csrc.nist.gov/pubs/fips/204/final),
-[FIPS 205 SLH-DSA](https://csrc.nist.gov/pubs/fips/205/final),
-and [RFC 9591 FROST](https://www.rfc-editor.org/rfc/rfc9591).
+This helper does not make a PQ claim. PQ-hybrid custody, dKMS node lifecycle,
+and product wiring remain future work. The current HPKE dependency is `hpke`
+0.13, whose upstream documentation says it has not been formally audited. This
+branch therefore makes no external cryptographic audit claim.
 
 ## Provider Boundary
 
@@ -198,8 +159,9 @@ The provider plane should expose typed questions instead:
 
 ## Remaining sequence
 
-1. Finish independent review of the source-only canonical v1 contract and the
-   related custody, encryption, replay, recipient-key, and policy decisions.
+1. Finish independent review of the source-only canonical v1 contract and
+   source-only custody helper, then close the remaining custody, replay,
+   recipient-key, and policy design decisions.
 2. Replace the provisional `elastos_common::protected_content` DTO/provider
    surface atomically with Runtime-owned orchestration over the reviewed v1
    contract: content status/fetch, typed rights checks, rights-bound key
@@ -210,7 +172,9 @@ The provider plane should expose typed questions instead:
 4. Wire real protected-content producers to the existing sealed-object publish
    contract after payload encryption, rights policy, availability receipt,
    provenance, key-envelope, and viewer-interface generation exist.
-5. Add a permissioned ElastOS PQ-hybrid dKMS v0 for new content only.
+5. Add a reviewed custody-node lifecycle and, only after that, decide whether
+   a permissioned ElastOS PQ-hybrid dKMS layer should replace the pinned
+   source-only helper for new content.
 
 Visible protected-content UI may ship only as a disabled/read-only readiness
 rail until fail-closed provider tests and capability-resource checks cover the

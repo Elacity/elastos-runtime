@@ -1,8 +1,10 @@
 # Protected-content v1 contracts
 
-Status: source-only contract foundation. The normative implementation is the
-`elastos-protected-content-contracts` crate. This document describes that
-review candidate; it does not claim running rights providers, key custody,
+Status: source-only authority and canonical-wire foundation. The normative
+authority types are in the `elastos-protected-content-contracts` crate, and the
+companion source-only custody helper lives in
+`elastos-protected-content-custody`. This document describes the reviewed
+contract layer; it does not claim running rights providers, custody nodes,
 content availability, decryption, playback, or product integration.
 
 ## Authority boundaries
@@ -151,11 +153,13 @@ node, wrong node set, wrong threshold, or escaped child window fails.
 The contribution payload is provider-private
 `RecipientSealedContributionV1`: exact recipient key identity plus bounded
 opaque bytes. The contract requires that recipient to equal the signed release
-recipient and authenticates the bytes and commitment. It does not implement
-encryption and cannot prove those bytes were cryptographically sealed. That
-proof belongs to the deferred custody implementation and external
-cryptographic review. No production confidentiality claim follows from this
-source-only type.
+recipient and authenticates the bytes and commitment. The contract type itself
+does not implement encryption. The companion source-only
+`elastos-protected-content-custody` crate implements a pinned HPKE + GF256
+Shamir helper for new-content share release and threshold reconstruction, but
+that helper is not yet wired into Runtime/provider/product flows and has not
+received an external cryptographic audit. No production confidentiality claim
+follows from this contract type alone.
 
 ## Terminal result
 
@@ -182,12 +186,14 @@ a denied or cross-node decision, cross-request contribution reuse, duplicate
 node/decision/contribution/commitment evidence, insufficient threshold,
 malformed canonical input, and noncanonical Wallet/Profile encodings.
 
-These contracts do not solve malicious custody nodes, rights-policy correctness,
-key-share generation/storage/rotation, contribution encryption, durable replay
-storage, issuer-key lifecycle, revocation, availability, decryption, rendering,
-or product workflow safety. They provide bounded statements for those systems
-to implement and audit. Remaining custody and product work is tracked in
-`TASKS.md`.
+These contracts plus the source-only `elastos-protected-content-custody` helper
+do not solve malicious custody nodes, rights-policy correctness, durable replay
+storage, issuer-key lifecycle, recipient key-possession proof, node
+admission/rotation/recovery, availability, decryption, rendering, or product
+workflow safety. The custody helper uses `hpke` 0.13, whose upstream
+documentation says it has not been formally audited. These source-only crates
+provide bounded statements and helper operations for later systems to audit and
+integrate. Remaining custody and product work is tracked in `TASKS.md`.
 
 The parent branch's provisional `elastos_common::protected_content` DTOs are
 not this canonical contract. Integration must replace that surface atomically

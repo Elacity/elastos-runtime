@@ -12,7 +12,7 @@ use elastos_protected_content_contracts::{
     ProtectedContentBindingV1, RecipientKeyIdentityV1, ReplayClaimError, ReplayClaimKeyV1,
     ReplayNonce16, RightsActionV1, RightsDecisionV1, RightsRequestV1, RightsVerificationContextV1,
     RuntimeSessionBindingV1, SignedNodeRightsDecisionV1, ThresholdV1, VerifiedKeyReleaseRequestV1,
-    VerifiedRightsRequestV1, WalletAddress, WalletSignedRightsRequestV1, CUSTODY_HPKE_SUITE_ID_V1,
+    WalletAddress, WalletSignedRightsRequestV1, CUSTODY_HPKE_SUITE_ID_V1,
 };
 
 use crate::{
@@ -124,65 +124,50 @@ fn binding_for_wallet_with_envelope(
     .unwrap()
 }
 
-fn binding_for_wallet(wallet: WalletAddress) -> ProtectedContentBindingV1 {
-    binding_for_wallet_with_envelope(wallet, &provisioned_envelope())
-}
-
-fn signed_rights_request_with_suite(suite: &str) -> WalletSignedRightsRequestV1 {
-    let wallet = wallet(7);
-    let request = RightsRequestV1::new(
-        binding_for_wallet(wallet),
-        RightsActionV1::View,
-        recipient_identity_with_suite(0x30, suite),
-        NOW,
-        NOW + 180,
-        ReplayNonce16::new([0x55; 16]),
-    )
-    .unwrap();
-    let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
-    let (signature, recovery_id) = key
-        .sign_prehash_recoverable(&ethereum_signed_message_hash(
-            &request.canonical_bytes().unwrap(),
-        ))
-        .unwrap();
-    let mut signature_bytes = signature.to_bytes().to_vec();
-    signature_bytes.push(recovery_id.to_byte());
-    WalletSignedRightsRequestV1::new(request, signature_bytes).unwrap()
-}
-
-fn verified_rights_request_with_suite(suite: &str) -> VerifiedRightsRequestV1 {
-    let signed = signed_rights_request_with_suite(suite);
-    let context = RightsVerificationContextV1::new(
-        signed.request().binding().clone(),
-        signed.request().action(),
-        signed.request().recipient().clone(),
-        NOW + 1,
-    );
-    signed
-        .verify(&context, &mut TestReplayClaims::default())
-        .unwrap()
-}
-
 pub(crate) fn verified_release_request() -> VerifiedKeyReleaseRequestV1 {
-    verified_release_request_with_suite(CUSTODY_HPKE_SUITE_ID_V1)
+    verified_release_request_for_envelope_with_suite_and_recipient_seed(
+        &provisioned_envelope(),
+        CUSTODY_HPKE_SUITE_ID_V1,
+        0x30,
+    )
 }
 
 pub(crate) fn verified_release_request_with_suite(suite: &str) -> VerifiedKeyReleaseRequestV1 {
-    verified_release_request_for_envelope_with_suite(&provisioned_envelope(), suite)
+    verified_release_request_for_envelope_with_suite_and_recipient_seed(
+        &provisioned_envelope(),
+        suite,
+        0x30,
+    )
 }
 
 pub(crate) fn verified_release_request_for_envelope(
     envelope: &CustodyEnvelopeV1,
 ) -> VerifiedKeyReleaseRequestV1 {
-    verified_release_request_for_envelope_with_suite(envelope, CUSTODY_HPKE_SUITE_ID_V1)
+    verified_release_request_for_envelope_with_suite_and_recipient_seed(
+        envelope,
+        CUSTODY_HPKE_SUITE_ID_V1,
+        0x30,
+    )
 }
 
-fn verified_release_request_for_envelope_with_suite(
+pub(crate) fn verified_release_request_for_envelope_and_recipient_seed(
+    envelope: &CustodyEnvelopeV1,
+    recipient_seed: u8,
+) -> VerifiedKeyReleaseRequestV1 {
+    verified_release_request_for_envelope_with_suite_and_recipient_seed(
+        envelope,
+        CUSTODY_HPKE_SUITE_ID_V1,
+        recipient_seed,
+    )
+}
+
+fn verified_release_request_for_envelope_with_suite_and_recipient_seed(
     envelope: &CustodyEnvelopeV1,
     suite: &str,
+    recipient_seed: u8,
 ) -> VerifiedKeyReleaseRequestV1 {
     let rights = {
-        let signed = signed_rights_request_with_suite_for_envelope(suite, envelope);
+        let signed = signed_rights_request_with_suite_for_envelope(suite, envelope, recipient_seed);
         let context = RightsVerificationContextV1::new(
             signed.request().binding().clone(),
             signed.request().action(),
@@ -210,12 +195,13 @@ fn verified_release_request_for_envelope_with_suite(
 fn signed_rights_request_with_suite_for_envelope(
     suite: &str,
     envelope: &CustodyEnvelopeV1,
+    recipient_seed: u8,
 ) -> WalletSignedRightsRequestV1 {
     let wallet = wallet(7);
     let request = RightsRequestV1::new(
         binding_for_wallet_with_envelope(wallet, envelope),
         RightsActionV1::View,
-        recipient_identity_with_suite(0x30, suite),
+        recipient_identity_with_suite(recipient_seed, suite),
         NOW,
         NOW + 180,
         ReplayNonce16::new([0x55; 16]),

@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-13 UTC
+Last updated: 2026-08-14 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Historical
@@ -20,22 +20,29 @@ the public repository.
 - `codex/post-0.6-consolidation` remains an unpublished local integration line
   for additional collaboration and UI work. It has no upstream and is not
   installed or published product truth.
-- `feat/protected-content-contracts` is an unpublished source-only contract
-  branch stacked on `origin/review/collaboration-candidate`. It adds the
-  canonical `elastos-protected-content-contracts` crate, the related
-  documentation, and the shared strict DID/Carrier codec correction required by
-  that contract surface. It does not integrate Runtime orchestration, provider
-  replacement, custody, threshold reconstruction, recipient encryption proof,
+- `origin/feat/protected-content-contracts` is the published source-only
+  protected-content contract branch stacked on
+  `origin/review/collaboration-candidate`. It adds the canonical
+  `elastos-protected-content-contracts` crate, the related documentation, and
+  the shared strict DID/Carrier codec correction required by that contract
+  surface. It does not integrate Runtime orchestration, provider replacement,
   decryption, playback, installation, or deployment.
-- Released 0.6 and the parent collaboration source retain the older
+- `feat/protected-content-custody` is an unpublished local child branch stacked
+  on `origin/feat/protected-content-contracts`. It adds the source-only
+  `elastos-protected-content-custody` crate plus custody-envelope provisioning,
+  recipient-sealed node release, and recipient-side threshold reconstruction
+  for new content. It does not integrate Runtime/provider/Carrier
+  orchestration, durable replay storage, recipient key-possession proof,
+  decrypt/render product flows, installation, or deployment.
+- Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
   capsules. That surface does not consume or prove the new v1 contract.
   Installed-target truth requires separate target evidence.
-- An independent branch-local source/contract review of
-  `feat/protected-content-contracts` completed with no code findings after the
-  strict DID codec and Carrier codec consolidation. This is not an external
-  cryptographic audit or production security approval.
+- An independent branch-local source/contract review of the published
+  `origin/feat/protected-content-contracts` branch completed with no code
+  findings after the strict DID codec and Carrier codec consolidation. This is
+  not an external cryptographic audit or production security approval.
 - The collaboration review stack adds Runtime-backed People/Chat collaboration
   and selected shell UI work. The source boundary is complete for review:
   Profile authority, Runtime lifecycle, Carrier routing, People/Chat

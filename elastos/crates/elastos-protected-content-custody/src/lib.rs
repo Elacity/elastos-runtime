@@ -2,6 +2,7 @@
 
 mod hpke_helpers;
 mod provision;
+mod reconstruct;
 mod release;
 mod secrets;
 
@@ -11,6 +12,7 @@ mod test_support;
 use thiserror::Error;
 
 pub use provision::provision_custody_envelope;
+pub use reconstruct::reconstruct_content_key;
 pub use release::produce_node_contribution;
 pub use secrets::{
     ContentEncryptionKeyV1, NodeCustodySecretKeyV1, RecipientPublicKeyV1, RecipientSecretKeyV1,

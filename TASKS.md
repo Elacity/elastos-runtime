@@ -709,8 +709,9 @@ and review items pass.
 
 ### Trusted content and access rights
 - [ ] Obtain external cryptographic, custody, and contract review of
-  `docs/PROTECTED_CONTENT_CONTRACTS_V1.md` and the source-only
-  `elastos-protected-content-contracts` crate before any provider or product
+  `docs/PROTECTED_CONTENT_CONTRACTS_V1.md`, the source-only
+  `elastos-protected-content-contracts` crate, and the source-only
+  `elastos-protected-content-custody` crate before any provider or product
   integration. The branch-local source review already closed with no code
   findings after the shared strict DID codec and Carrier codec consolidation;
   that was not an external cryptographic audit or production security
@@ -720,19 +721,23 @@ and review items pass.
   atomic replay keys, node decisions, terminal issuer signatures, nested
   authority windows including contribution-to-terminal settlement, shared
   canonical Ed25519 validation (including noncanonical-encoding rejection),
-  unique contribution commitments at threshold settlement, and golden vectors.
+  custody-envelope AAD domains, pinned HPKE share sealing, GF256 Shamir share
+  handling, threshold reconstruction zeroization, unique contribution
+  commitments at threshold settlement, and golden vectors.
 - [ ] Add a typed protected-content Wallet operation that verifies an
   externally completed signature, canonicalizes a `27/28` recovery byte to
   `0/1` after signer verification and before `WalletSignedRightsRequestV1`
   construction, and covers managed, MetaMask, and WalletConnect paths with
   exact tests. The v1 contract itself continues to accept only canonical
   `0/1`.
-- [ ] Decide and review the custody architecture, node admission and rotation,
-  threshold algorithm, recipient encryption suite, contribution protection,
-  durable per-node replay claims, revocation, audit retention, issuer-key
-  lifecycle, and recovery operations. The v1 contract binds recipient-labeled
-  bytes but does not implement or prove encryption, custody, or threshold
-  reconstruction.
+- [ ] Complete the remaining custody review and operational design: node
+  admission and rotation, review or replacement of the pinned threshold and
+  recipient-encryption suites, durable per-node replay claims, revocation,
+  audit retention, issuer-key lifecycle, and recovery operations. The
+  source-only `elastos-protected-content-custody` crate now implements new
+  content share provisioning, recipient-sealed node release, and recipient-side
+  threshold reconstruction, but it does not prove operational custody safety,
+  durable storage/replay, provider wiring, or product integration.
 - [ ] Define how Runtime derives the recipient public key from the authenticated
   Profile and session, proves key possession, and selects an approved encryption
   suite. The caller must not provide endpoint, device, route, or Carrier
