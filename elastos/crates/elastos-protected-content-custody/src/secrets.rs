@@ -168,4 +168,36 @@ mod tests {
         assert!(!node_debug.contains("22"));
         assert!(!recipient_debug.contains("33"));
     }
+
+    #[test]
+    fn recipient_public_key_rejects_invalid_x25519_bytes() {
+        let low_order = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 1;
+            bytes
+        };
+        let mut high_bit_alias = RecipientSecretKeyV1::from_test_bytes([0x41; 32])
+            .public_key()
+            .unwrap()
+            .0;
+        high_bit_alias[31] |= 0x80;
+        let valid = RecipientSecretKeyV1::from_test_bytes([0x42; 32])
+            .public_key()
+            .unwrap()
+            .0;
+
+        assert!(matches!(
+            RecipientPublicKeyV1::new([0; 32]),
+            Err(CustodyError::BindingMismatch("recipient_public_key"))
+        ));
+        assert!(matches!(
+            RecipientPublicKeyV1::new(low_order),
+            Err(CustodyError::BindingMismatch("recipient_public_key"))
+        ));
+        assert!(matches!(
+            RecipientPublicKeyV1::new(high_bit_alias),
+            Err(CustodyError::BindingMismatch("recipient_public_key"))
+        ));
+        assert!(RecipientPublicKeyV1::new(valid).is_ok());
+    }
 }

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Canonical source-only protected-content v1 contracts"
 
 [dependencies]
+curve25519-dalek = { version = "5.0", default-features = false }
 ed25519-dalek = "2.1"
 elastos-auth = { path = "../elastos-auth" }
 elastos-identity = { path = "../elastos-identity" }

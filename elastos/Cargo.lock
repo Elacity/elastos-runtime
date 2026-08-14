@@ -1646,6 +1646,7 @@ dependencies = [
 name = "elastos-protected-content-contracts"
 version = "0.6.0"
 dependencies = [
+ "curve25519-dalek 5.0.0",
  "ed25519-dalek 2.2.0",
  "elastos-auth",
  "elastos-identity",

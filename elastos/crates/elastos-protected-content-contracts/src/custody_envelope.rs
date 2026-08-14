@@ -1,3 +1,5 @@
+use curve25519_dalek::{constants::X25519_LOW_ORDER_POINTS, montgomery::MontgomeryPoint};
+
 use crate::canonical::{CanonicalBody, ContractError, Decoder, Encoder};
 use crate::{
     CanonicalContract, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, NodePublicKey,
@@ -306,6 +308,7 @@ impl CanonicalBody for HpkeCiphertextV1 {
     const DOMAIN: &'static str = "elastos.protected-content.hpke-ciphertext/v1";
 
     fn validate(&self) -> Result<(), ContractError> {
+        validate_canonical_x25519_public_key(self.encapped_key, "hpke_encapped_key")?;
         Ok(())
     }
 
@@ -523,7 +526,11 @@ fn validate_canonical_x25519_public_key(
     bytes: [u8; 32],
     field: &'static str,
 ) -> Result<(), ContractError> {
-    if bytes == [0; 32] || bytes[31] & 0x80 != 0 || le_bytes_ge(bytes, X25519_MODULUS) {
+    if bytes[31] & 0x80 != 0 || le_bytes_ge(bytes, X25519_MODULUS) {
+        return Err(ContractError::InvalidField(field));
+    }
+    let point = MontgomeryPoint(bytes);
+    if X25519_LOW_ORDER_POINTS.iter().any(|low_order| point == *low_order) {
         return Err(ContractError::InvalidField(field));
     }
     Ok(())
@@ -540,8 +547,12 @@ fn le_bytes_ge(lhs: [u8; 32], rhs: [u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use curve25519_dalek::{
+        constants::X25519_LOW_ORDER_POINTS,
+        montgomery::MontgomeryPoint,
+    };
     use ed25519_dalek::SigningKey;
-    use hex::decode;
+    use hex::encode;
 
     use super::*;
 
@@ -555,9 +566,7 @@ mod tests {
     }
 
     fn custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeCustodyPublicKeyV1::new(bytes).unwrap()
+        NodeCustodyPublicKeyV1::new(valid_x25519_public_key_bytes(seed)).unwrap()
     }
 
     fn node(seed: u8, coordinate: u8) -> CustodyNodeIdentityV1 {
@@ -583,11 +592,14 @@ mod tests {
     }
 
     fn stored_share(seed: u8) -> HpkeCiphertextV1 {
-        let mut encapped_key = [0u8; HPKE_ENCAPPED_KEY_BYTES];
-        encapped_key.fill(seed);
+        let encapped_key = valid_x25519_public_key_bytes(seed.wrapping_add(0x40));
         let mut ciphertext = [0u8; HPKE_SEALED_SHARE_BYTES];
         ciphertext.fill(seed.wrapping_add(0x40));
         HpkeCiphertextV1::new(encapped_key, ciphertext).unwrap()
+    }
+
+    fn valid_x25519_public_key_bytes(seed: u8) -> [u8; 32] {
+        MontgomeryPoint::mul_base_clamped([seed; 32]).to_bytes()
     }
 
     fn recipient(seed: u8) -> RecipientKeyIdentityV1 {
@@ -628,11 +640,9 @@ mod tests {
         let decoded = CustodyEnvelopeV1::from_canonical_bytes(&canonical).unwrap();
         assert_eq!(decoded, envelope);
 
-        let expected_hash =
-            decode("0248dd5145d55696c6c8502f142fe614db027445d0d72887474d4a26dcd7a0b7").unwrap();
         assert_eq!(
-            envelope.canonical_hash().unwrap().as_bytes(),
-            expected_hash.as_slice()
+            encode(envelope.canonical_hash().unwrap().as_bytes()),
+            "059072cd112a899827770607fe96268a8338d700db49fda12661364429d8a590"
         );
 
         let key_envelope = envelope.key_envelope_identity().unwrap();
@@ -688,21 +698,34 @@ mod tests {
     }
 
     #[test]
-    fn custody_public_key_rejects_zero_and_noncanonical_alias_bytes() {
-        assert_eq!(
-            NodeCustodyPublicKeyV1::new([0; 32]),
-            Err(ContractError::InvalidField("node_custody_public_key"))
-        );
+    fn custody_public_key_rejects_low_order_noncanonical_and_high_bit_alias_bytes() {
+        for low_order in X25519_LOW_ORDER_POINTS.iter() {
+            assert_eq!(
+                NodeCustodyPublicKeyV1::new(low_order.to_bytes()),
+                Err(ContractError::InvalidField("node_custody_public_key"))
+            );
+        }
         assert_eq!(
             NodeCustodyPublicKeyV1::new(X25519_MODULUS),
             Err(ContractError::InvalidField("node_custody_public_key"))
         );
-        let mut aliased = X25519_MODULUS;
-        aliased[0] = aliased[0].wrapping_add(1);
+        let mut p_plus_one = X25519_MODULUS;
+        p_plus_one[0] = p_plus_one[0].wrapping_add(1);
         assert_eq!(
-            NodeCustodyPublicKeyV1::new(aliased),
+            NodeCustodyPublicKeyV1::new(p_plus_one),
             Err(ContractError::InvalidField("node_custody_public_key"))
         );
+        let mut high_bit_alias = valid_x25519_public_key_bytes(0x51);
+        high_bit_alias[31] |= 0x80;
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(high_bit_alias),
+            Err(ContractError::InvalidField("node_custody_public_key"))
+        );
+    }
+
+    #[test]
+    fn custody_public_key_accepts_generated_valid_bytes() {
+        assert!(NodeCustodyPublicKeyV1::new(valid_x25519_public_key_bytes(0x41)).is_ok());
     }
 
     #[test]
@@ -717,6 +740,35 @@ mod tests {
         assert_eq!(
             HpkeCiphertextV1::from_canonical_bytes(&canonical[..canonical.len() - 1]),
             Err(ContractError::UnexpectedEnd)
+        );
+    }
+
+    #[test]
+    fn hpke_ciphertext_rejects_invalid_encapped_keys_at_constructor_and_decode() {
+        let ciphertext = [0x55; HPKE_SEALED_SHARE_BYTES];
+        assert_eq!(
+            HpkeCiphertextV1::new([0; HPKE_ENCAPPED_KEY_BYTES], ciphertext),
+            Err(ContractError::InvalidField("hpke_encapped_key"))
+        );
+        assert_eq!(
+            HpkeCiphertextV1::new(X25519_MODULUS, ciphertext),
+            Err(ContractError::InvalidField("hpke_encapped_key"))
+        );
+        let mut high_bit_alias = valid_x25519_public_key_bytes(0x61);
+        high_bit_alias[31] |= 0x80;
+        assert_eq!(
+            HpkeCiphertextV1::new(high_bit_alias, ciphertext),
+            Err(ContractError::InvalidField("hpke_encapped_key"))
+        );
+
+        let valid = HpkeCiphertextV1::new(valid_x25519_public_key_bytes(0x62), ciphertext).unwrap();
+        let mut canonical = valid.canonical_bytes().unwrap();
+        let offset = <HpkeCiphertextV1 as CanonicalBody>::DOMAIN.len() + 1;
+        canonical[offset..offset + HPKE_ENCAPPED_KEY_BYTES]
+            .copy_from_slice(X25519_LOW_ORDER_POINTS[2].as_bytes());
+        assert_eq!(
+            HpkeCiphertextV1::from_canonical_bytes(&canonical),
+            Err(ContractError::InvalidField("hpke_encapped_key"))
         );
     }
 

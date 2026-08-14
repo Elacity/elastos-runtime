@@ -149,7 +149,7 @@ mod tests {
         verified_release_request_with_suite,
     };
     use elastos_protected_content_contracts::{
-        KeyReleaseError, RightsError, RIGHTS_CLOCK_SKEW_SECS,
+        ContractError, KeyReleaseError, RightsError, RIGHTS_CLOCK_SKEW_SECS,
     };
 
     fn node_share_index(envelope: &CustodyEnvelopeV1, seed: u8) -> usize {
@@ -395,39 +395,20 @@ mod tests {
     }
 
     #[test]
-    fn release_rejects_noncanonical_encapped_key_before_hpke_open() {
+    fn release_contract_rejects_noncanonical_encapped_key_before_hpke_open() {
         let envelope = provisioned_envelope();
-        let mut stored_shares = envelope.stored_shares().to_vec();
         let index = node_share_index(&envelope, 1);
         let noncanonical = [
             0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0x7f,
         ];
-        stored_shares[index] = elastos_protected_content_contracts::HpkeCiphertextV1::new(
+        let err = elastos_protected_content_contracts::HpkeCiphertextV1::new(
             noncanonical,
-            *stored_shares[index].ciphertext(),
-        )
-        .unwrap();
-        let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
-        let request = verified_release_request_for_envelope(&tampered);
-        let err = produce_node_contribution_with_rng(
-            &request,
-            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
-            &tampered,
-            &node_signing_key(1),
-            &node_custody_secret(1),
-            &recipient_public_key(0x30),
-            crate::test_support::NOW + 5,
-            crate::test_support::NOW + 45,
-            crate::test_support::NOW + 6,
-            &mut StdRng::from_seed([0x71; 32]),
+            *envelope.stored_shares()[index].ciphertext(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            CustodyError::MalformedShare("hpke_encapped_key")
-        ));
+        assert_eq!(err, ContractError::InvalidField("hpke_encapped_key"));
     }
 
     #[test]

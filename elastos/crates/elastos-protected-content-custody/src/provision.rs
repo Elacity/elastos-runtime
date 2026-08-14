@@ -190,23 +190,16 @@ mod tests {
     }
 
     #[test]
-    fn provision_rejects_low_order_node_custody_public_key_at_hpke_boundary() {
-        let low_order = {
-            let mut bytes = [0u8; 32];
-            bytes[0] = 1;
-            NodeCustodyPublicKeyV1::new(bytes).unwrap()
-        };
-        let err = provision_custody_envelope(
-            EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
-            &content_key(),
-            ThresholdV1::new(2, 3).unwrap(),
-            vec![
-                (crate::test_support::node_public_key(1), low_order),
-                custody_nodes()[1],
-                custody_nodes()[2],
-            ],
-        )
-        .unwrap_err();
-        assert!(matches!(err, CustodyError::Hpke(_)));
+    fn contract_rejects_low_order_node_custody_public_key_before_provision() {
+        let mut low_order = [0u8; 32];
+        low_order[0] = 1;
+        assert_eq!(
+            NodeCustodyPublicKeyV1::new(low_order),
+            Err(
+                elastos_protected_content_contracts::ContractError::InvalidField(
+                    "node_custody_public_key"
+                )
+            )
+        );
     }
 }
