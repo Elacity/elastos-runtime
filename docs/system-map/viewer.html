@@ -1,0 +1,967 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="elastos-c4-sha256" content="77d2d16e61d67eec56c91f66c80fc9006b371acc068131492449949c31763b86">
+  <title>ElastOS C4 model</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: light-dark(#eef2f7, #0b0e14);
+      --panel: light-dark(#ffffff, #121722);
+      --panel-2: light-dark(#f7f9fc, #171d29);
+      --canvas: light-dark(#f8fafc, #0e131d);
+      --text: light-dark(#172033, #eef3ff);
+      --muted: light-dark(#5d687b, #aab4c8);
+      --line: light-dark(#d7deea, #2b3547);
+      --line-strong: light-dark(#aeb9ca, #53617a);
+      --accent: light-dark(#245ec7, #70a7ff);
+      --accent-soft: light-dark(#e8f0ff, #172a4a);
+      --system: light-dark(#265fae, #3977c9);
+      --container: light-dark(#3973b7, #4986cf);
+      --component: light-dark(#6d87a9, #536b8c);
+      --external: light-dark(#687386, #4a5569);
+      --person: light-dark(#116a69, #187f7d);
+      --data: light-dark(#6751a2, #7258b1);
+      --code: light-dark(#8a5a22, #92632e);
+      --target: light-dark(#6f4ca4, #7855ad);
+      --shadow: 0 16px 45px light-dark(#17203318, #0000004d);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--page); color: var(--text); }
+    button, a { font: inherit; }
+    button { color: inherit; }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 270px minmax(0, 1fr);
+    }
+
+    .rail {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+      padding: 22px 16px 28px;
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+    }
+
+    .brand { padding: 0 8px 20px; }
+    .brand-mark {
+      width: 36px;
+      height: 36px;
+      display: grid;
+      place-items: center;
+      border-radius: 10px;
+      background: var(--accent);
+      color: white;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      box-shadow: var(--shadow);
+    }
+    .brand h1 { margin: 12px 0 4px; font-size: 18px; letter-spacing: -0.02em; }
+    .brand p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+
+    .nav-group { margin-top: 18px; }
+    .nav-group h2 {
+      margin: 0 8px 7px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    .nav-item {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      padding: 9px 10px;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+    .nav-item:hover { background: var(--panel-2); }
+    .nav-item[aria-current="true"] { background: var(--accent-soft); color: var(--accent); }
+    .nav-index {
+      color: var(--muted);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+    .nav-item[aria-current="true"] .nav-index { color: var(--accent); }
+    .nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 620; }
+
+    .rail-foot {
+      margin: 24px 8px 0;
+      padding-top: 16px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+    .rail-foot a { color: var(--accent); text-decoration: none; }
+    .rail-foot a:hover { text-decoration: underline; }
+
+    .main { min-width: 0; padding: 28px; }
+    .toolbar {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 18px;
+    }
+    .eyebrow { margin: 0 0 7px; color: var(--accent); font-size: 11px; font-weight: 780; letter-spacing: 0.1em; text-transform: uppercase; }
+    .title { margin: 0; font-size: clamp(25px, 3vw, 38px); letter-spacing: -0.035em; line-height: 1.08; }
+    .question { max-width: 780px; margin: 9px 0 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .view-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+    .action {
+      min-width: 38px;
+      min-height: 36px;
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--panel);
+      cursor: pointer;
+    }
+    .action:hover { border-color: var(--line-strong); background: var(--panel-2); }
+    .action:focus-visible, .nav-item:focus-visible, .node:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 40%, transparent); outline-offset: 2px; }
+
+    .stage {
+      position: relative;
+      min-height: 650px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background-color: var(--canvas);
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 28px 28px;
+      box-shadow: var(--shadow);
+      touch-action: none;
+    }
+    .stage.dragging { cursor: grabbing; }
+    .stage svg { width: 100%; height: 650px; display: block; user-select: none; }
+
+    .stage-note {
+      position: absolute;
+      left: 14px;
+      bottom: 14px;
+      max-width: min(720px, calc(100% - 28px));
+      padding: 8px 11px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+      backdrop-filter: blur(10px);
+    }
+
+    .detail {
+      min-height: 58px;
+      margin-top: 12px;
+      padding: 13px 15px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .detail strong { color: var(--text); }
+    .detail-type {
+      flex: 0 0 auto;
+      padding: 3px 7px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      color: var(--text);
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 13px; margin: 14px 2px 0; color: var(--muted); font-size: 11px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .swatch { width: 10px; height: 10px; border-radius: 3px; }
+
+    .group-box { fill: color-mix(in srgb, var(--panel-2) 72%, transparent); stroke: var(--line-strong); stroke-width: 1.2; stroke-dasharray: 7 5; }
+    .group-label { fill: var(--muted); font-size: 12px; font-weight: 750; letter-spacing: 0.04em; }
+    .edge { fill: none; stroke: var(--line-strong); stroke-width: 1.7; marker-end: url(#arrow); }
+    .edge.target { stroke-dasharray: 7 5; }
+    .edge-label-bg { fill: var(--canvas); stroke: var(--line); stroke-width: 0.8; opacity: 0.97; }
+    .edge-label { fill: var(--muted); font-size: 11px; text-anchor: middle; }
+    .node { cursor: pointer; }
+    .node rect { stroke: color-mix(in srgb, white 28%, transparent); stroke-width: 1.1; filter: drop-shadow(0 5px 9px color-mix(in srgb, black 20%, transparent)); }
+    .node:hover rect, .node:focus rect { stroke: white; stroke-width: 2; }
+    .node-title { fill: white; font-size: 13px; font-weight: 760; text-anchor: middle; }
+    .node-meta { fill: color-mix(in srgb, white 78%, transparent); font-size: 10px; text-anchor: middle; }
+    .node-desc { fill: color-mix(in srgb, white 90%, transparent); font-size: 10.5px; text-anchor: middle; }
+    .status-chip { fill: color-mix(in srgb, black 28%, transparent); }
+    .status-text { fill: white; font-size: 8.5px; font-weight: 800; text-anchor: middle; text-transform: uppercase; }
+    .lifeline { stroke: var(--line-strong); stroke-width: 1.1; stroke-dasharray: 5 6; }
+    .message { stroke: var(--accent); stroke-width: 1.7; marker-end: url(#arrowAccent); }
+    .message.return { stroke: var(--line-strong); stroke-dasharray: 5 4; marker-end: url(#arrow); }
+    .message-label { fill: var(--text); font-size: 10.5px; text-anchor: middle; }
+    .phase-box { fill: color-mix(in srgb, var(--accent-soft) 65%, transparent); stroke: var(--accent); stroke-width: 1; stroke-dasharray: 6 4; }
+    .phase-label { fill: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; }
+
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 1fr; }
+      .rail { position: static; width: 100%; height: auto; padding: 14px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .brand { display: grid; grid-template-columns: 40px 1fr; column-gap: 10px; align-items: center; padding-bottom: 10px; }
+      .brand-mark { grid-row: 1 / 3; }
+      .brand h1, .brand p { margin: 0; }
+      #view-nav { display: flex; gap: 14px; overflow-x: auto; padding-bottom: 5px; }
+      .nav-group { flex: 0 0 auto; margin-top: 9px; }
+      .nav-list { display: flex; gap: 5px; overflow-x: auto; padding-bottom: 3px; }
+      .nav-item { min-width: max-content; grid-template-columns: auto auto; }
+      .rail-foot { display: none; }
+      .main { padding: 18px 12px; }
+      .toolbar { align-items: flex-end; }
+      .view-actions .action:first-child, .view-actions .action:nth-child(2) { display: none; }
+      .stage { min-height: 560px; height: 560px; overflow: auto; }
+      .stage svg { width: 900px; min-width: 900px; min-height: 560px; height: 560px; }
+    }
+
+    @media (max-width: 560px) {
+      .toolbar { display: block; }
+      .view-actions { justify-content: flex-start; margin-top: 14px; }
+      .question { font-size: 13px; }
+      .detail { align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app" id="c4-viewer">
+    <aside class="rail" aria-label="C4 views">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">C4</div>
+        <h1>ElastOS system map</h1>
+        <p>One question and one architecture layer at a time.</p>
+      </div>
+      <nav id="view-nav"></nav>
+      <div class="rail-foot">
+        This is a hash-bound projection of
+        <a href="c4.md">the canonical C4 document</a>. If they disagree, the
+        Markdown is correct and this viewer is wrong. Current product proof
+        remains in <a href="../../state.md">state.md</a>.
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="toolbar">
+        <div>
+          <p class="eyebrow" id="view-level"></p>
+          <h2 class="title" id="view-title"></h2>
+          <p class="question" id="view-question"></p>
+        </div>
+        <div class="view-actions" aria-label="Diagram controls">
+          <button class="action" id="previous-view" type="button" title="Previous view" aria-label="Previous view">←</button>
+          <button class="action" id="next-view" type="button" title="Next view" aria-label="Next view">→</button>
+          <button class="action" id="zoom-out" type="button" title="Zoom out" aria-label="Zoom out">−</button>
+          <button class="action" id="fit-view" type="button" title="Fit view">Fit</button>
+          <button class="action" id="zoom-in" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+          <button class="action" id="fullscreen" type="button" title="Fullscreen" aria-label="Fullscreen">⛶</button>
+        </div>
+      </header>
+
+      <section class="stage" id="diagram-stage" aria-label="Architecture diagram">
+        <svg id="diagram" viewBox="0 0 1200 720" role="img" aria-labelledby="svg-title svg-desc">
+          <title id="svg-title"></title>
+          <desc id="svg-desc"></desc>
+        </svg>
+        <div class="stage-note" id="view-note"></div>
+      </section>
+
+      <div class="detail" id="selection-detail" aria-live="polite">
+        Select a node to see its responsibility. Drag the canvas to pan; use the controls to zoom.
+      </div>
+
+      <div class="legend" aria-label="Diagram legend">
+        <span class="legend-item"><span class="swatch" style="background:var(--system)"></span>System</span>
+        <span class="legend-item"><span class="swatch" style="background:var(--container)"></span>Container</span>
+        <span class="legend-item"><span class="swatch" style="background:var(--component)"></span>Component</span>
+        <span class="legend-item"><span class="swatch" style="background:var(--person)"></span>Person</span>
+        <span class="legend-item"><span class="swatch" style="background:var(--external)"></span>External</span>
+        <span class="legend-item"><span class="swatch" style="background:var(--data)"></span>Data</span>
+        <span class="legend-item"><span class="swatch" style="background:var(--target)"></span>Target</span>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const N = (id, x, y, title, type, meta, desc, status, w = 190, h = 100) => ({
+        id, x, y, title, type, meta, desc, status, w, h
+      });
+      const E = (from, to, label, options = {}) => ({ from, to, label, ...options });
+      const G = (x, y, w, h, label) => ({ x, y, w, h, label });
+      const P = (id, label, desc) => ({ id, label, desc });
+      const M = (from, to, label, options = {}) => ({ from, to, label, ...options });
+
+      const views = [
+        {
+          id: "context", group: "Level 1", number: "01", level: "C4 · Level 1",
+          title: "System context", question: "Who uses an ElastOS node, and which external systems can it reach?",
+          note: "Carrier is peer transport. Exit is typed egress. A remote Exit may use Carrier, but they remain separate responsibilities.",
+          nodes: [
+            N("person", 45, 125, "Person", "person", "Person", "Authenticates to Home, launches Apps, and approves effects."),
+            N("operator", 45, 465, "Operator", "person", "Person", "Installs, configures, and inspects the node."),
+            N("node", 430, 270, "ElastOS node", "system", "Software System", "Home, Runtime, capsules, providers, state, and audit.", null, 270, 130),
+            N("publisher", 440, 55, "Trusted publisher", "external", "External system", "Supplies signed manifests and artifacts."),
+            N("peers", 920, 40, "Peer ElastOS nodes", "external", "External systems", "Endpoint-authenticated transport peers for private services, messages, and content."),
+            N("web", 920, 165, "Public web + edge", "external", "External systems", "Destinations behind Runtime Net and Exit policy."),
+            N("chains", 920, 290, "Chain + DID networks", "external", "External systems", "Typed identity, provenance, and transaction services."),
+            N("content", 920, 415, "Content backends", "external", "External systems", "Encrypted objects, sealed key material, bounded receipts, and availability. Never a live CEK."),
+            N("wallets", 920, 540, "External wallets", "external", "External systems", "Exact connector-owned proof or approval."),
+            N("ai", 445, 545, "AI inference backends", "external", "External systems", "Provider-routed local or configured model inference.")
+          ],
+          edges: [
+            E("person", "node", "uses Home", { ly: 245 }), E("operator", "node", "operates", { ly: 500 }),
+            E("publisher", "node", "signed releases", { lx: 570, ly: 205 }), E("node", "peers", "Carrier", { ly: 115 }),
+            E("node", "web", "Net / Exit", { ly: 210 }), E("node", "chains", "typed providers", { ly: 310 }),
+            E("node", "content", "content providers", { ly: 410 }), E("node", "wallets", "connector handoff", { ly: 520 }),
+            E("node", "ai", "AI provider", { lx: 575, ly: 495 })
+          ]
+        },
+        {
+          id: "containers", group: "Level 2", number: "02", level: "C4 · Level 2",
+          title: "Containers", question: "What runs inside one ElastOS node, and which container owns each responsibility?",
+          note: "Provider capsules are containers beside the host, not components inside it. Container families may use different processes or substrates.",
+          groups: [G(180, 25, 830, 650, "ElastOS node · Software System")],
+          nodes: [
+            N("person", 15, 290, "Person", "person", "Person", "Uses Home."),
+            N("home", 225, 80, "Home front door", "container", "HTML / JavaScript", "Sign-in and shell lifecycle."),
+            N("projection", 225, 270, "Shell + App projections", "container", "Container family", "Product facts and typed intents."),
+            N("host", 505, 245, "elastos host", "container", "Rust / Tokio / Axum", "Authority, routing, lifecycle, and audit.", null, 210, 120),
+            N("exec", 225, 500, "Executable instances", "container", "Component or microVM", "Bounded admitted capsule code."),
+            N("provider", 770, 90, "Provider processes", "container", "Process or microVM", "Typed protocol and backend implementations."),
+            N("adapter", 770, 315, "Host + engine adapters", "container", "Native processes", "Browser, stream, VM, and edge helpers."),
+            N("data", 505, 520, "Runtime data home", "data", "Data store", "Principal roots, state, receipts, and audit."),
+            N("backend", 1040, 175, "External backends", "external", "External systems", "Web, chain, content, wallets, and AI.", null, 150, 110),
+            N("peer", 1040, 500, "Peer ElastOS node", "external", "External system", "Remote Runtime and providers.", null, 150, 100)
+          ],
+          edges: [
+            E("person", "home", "uses"), E("home", "projection", "mounts"), E("home", "host", "auth + launch"),
+            E("projection", "host", "narrow routes"), E("host", "exec", "launches"), E("exec", "host", "Bus / adapter", { curve: -45 }),
+            E("host", "provider", "typed invoke"), E("host", "adapter", "private control"), E("host", "data", "owns"),
+            E("provider", "backend", "provider protocol"), E("adapter", "backend", "selected target"), E("host", "peer", "Carrier")
+          ]
+        },
+        {
+          id: "runtime", group: "Level 3", number: "03", level: "C4 · Level 3",
+          title: "Runtime host", question: "How does the trusted host authorize an operation and choose a local or off-box route?",
+          note: "The switchboard owns the host path, backend, peer, and transport. POST /api/provider/:scheme/:op is a live host adapter, not the capsule contract.",
+          groups: [G(155, 25, 850, 665, "elastos host · Container")],
+          nodes: [
+            N("caller", 5, 285, "Home / App / executable", "container", "External containers", "Submits one exact typed request.", null, 130, 110),
+            N("ingress", 195, 75, "Runtime ingress", "component", "Component", "Validates route, origin, token, and shape."),
+            N("identity", 445, 75, "Identity + sessions", "component", "Component", "Binds principal, proof, expiry, and revocation."),
+            N("authority", 695, 75, "Capability authority", "component", "Component", "Checks caller, resource, action, and constraints."),
+            N("lifecycle", 195, 285, "Capsule lifecycle", "component", "Component", "Admission, instance ownership, and cleanup."),
+            N("namespace", 445, 285, "Namespace + storage", "component", "Component", "Principal roots, objects, CIDs, and WebSpaces."),
+            N("router", 695, 285, "Provider switchboard", "component", "Component", "Selects namespace owner and authorized placement."),
+            N("effects", 320, 505, "Durable effects + audit", "component", "Component", "Records intent, denial, result, receipt, and cleanup."),
+            N("local", 575, 505, "Local dispatcher", "component", "Component", "In-process, stdio, IPC, or vsock."),
+            N("carrier", 815, 505, "Carrier adapter", "component", "Component", "Endpoint-authenticated peer transport and local admission loopback."),
+            N("provider", 1030, 330, "Local provider", "container", "External container", "Owns service semantics and credentials.", null, 150, 105),
+            N("peerIngress", 1015, 485, "Peer Runtime admission", "external", "External component", "Checks source, service, operation, signatures, delegation, freshness, and replay.", null, 170, 115),
+            N("peerProvider", 1015, 620, "Peer provider", "container", "External container", "Owns destination operation semantics.", null, 170, 85),
+            N("store", 1030, 90, "Runtime data", "data", "Data store", "Authoritative durable state.", null, 150, 95)
+          ],
+          edges: [
+            E("caller", "ingress", "typed request"), E("ingress", "identity", "validate"), E("identity", "authority", "bind context"),
+            E("authority", "lifecycle", "launch / stop", { curve: 40 }), E("authority", "namespace", "core operation"), E("authority", "router", "provider request"),
+            E("router", "local", "same-node"), E("local", "provider", "typed invoke"), E("router", "carrier", "explicit peer"),
+            E("carrier", "peerIngress", "endpoint-auth transport"), E("peerIngress", "peerProvider", "admitted operation"),
+            E("lifecycle", "effects", "lifecycle facts"), E("namespace", "effects", "object facts"),
+            E("router", "effects", "route + result", { curve: 30 }), E("effects", "store", "persist", { curve: -45 })
+          ]
+        },
+        {
+          id: "home", group: "Level 3", number: "04", level: "C4 · Level 3",
+          title: "Home front door", question: "What does Home own before an intent reaches Runtime?",
+          note: "Home presents facts and intent. It cannot mint capabilities or pass ambient Home authority to a child frame.",
+          groups: [G(230, 45, 690, 580, "Home front door · Container")],
+          nodes: [
+            N("person", 20, 270, "Person", "person", "Person", "Uses passkey and visible product controls."),
+            N("auth", 280, 100, "Authentication UI", "component", "Component", "Runs Home-origin passkey ceremonies."),
+            N("shell", 510, 100, "Shell manager", "component", "Component", "Mounts and retires one active shell."),
+            N("children", 740, 100, "Child registry", "component", "Component", "Binds source window, target, generation, and token."),
+            N("launch", 355, 385, "Launch bridge", "component", "Component", "Requests an exact shell or App route."),
+            N("edges", 650, 385, "Closed edge adapters", "component", "Component", "Clipboard and wallet connector schemas."),
+            N("frames", 980, 110, "Shell + App frames", "container", "External containers", "Opaque sandboxed projections.", null, 180, 110),
+            N("runtime", 980, 450, "elastos host", "container", "External container", "Mints tokens and enforces authority.", null, 180, 110)
+          ],
+          edges: [
+            E("person", "auth", "passkey"), E("auth", "shell", "unlocked context"), E("shell", "frames", "mounts"),
+            E("frames", "children", "typed intent", { curve: -25 }), E("children", "launch", "validated child"), E("launch", "runtime", "launch request"),
+            E("frames", "edges", "allowlisted edge effect"), E("edges", "runtime", "exact request"), E("auth", "runtime", "ceremony result", { curve: 55 })
+          ]
+        },
+        {
+          id: "collaboration", group: "Level 3", number: "05", level: "C4 · Level 3 · Candidate",
+          title: "Collaboration", question: "How do People, Inbox, and Chat share Profile and delivery authority without seeing Carrier topology?",
+          note: "Profile DID represents the person in collaboration; Device DID identifies a delivery endpoint. Same-endpoint direct delivery now uses authenticated Carrier loopback with the signed envelope and signed receipt.",
+          groups: [G(250, 25, 720, 670, "elastos host · Collaboration candidate")],
+          nodes: [
+            N("people", 15, 80, "People", "container", "External projection", "Profile, discovery, and contacts."),
+            N("inbox", 15, 290, "Inbox", "container", "External projection", "Owns contact approval."),
+            N("chat", 15, 500, "Chat", "container", "External projection", "Direct and configured conversations."),
+            N("routes", 300, 70, "Product routes", "component", "Component", "Typed People, Inbox, and Chat ports.", "candidate"),
+            N("profile", 550, 70, "ProfileAuthority", "component", "Component", "Protected key and signed Profile head.", "candidate"),
+            N("discovery", 780, 70, "Discovery + presence", "component", "Component", "Bounded signed advertisements.", "candidate"),
+            N("contacts", 300, 300, "Contacts + direct messages", "component", "Component", "Relationship, approval, and delivery state.", "candidate"),
+            N("conversation", 550, 300, "Conversation core", "component", "Component", "Signed messages, receipts, and outbox.", "candidate"),
+            N("delivery", 780, 300, "Delivery workers", "component", "Component", "Bounded retry and settlement.", "candidate"),
+            N("carrier", 550, 525, "Carrier integration", "component", "Component", "Gossip and provider invocation."),
+            N("roots", 790, 525, "Principal roots", "data", "Data store", "Protected Profile and collaboration state."),
+            N("peer", 1010, 300, "Peer Runtime", "external", "External system", "Peer collaboration service.", null, 170, 110)
+          ],
+          edges: [
+            E("people", "routes", "typed routes"), E("inbox", "routes", "approval routes"), E("chat", "routes", "Chat routes"),
+            E("routes", "profile", "Profile work"), E("routes", "discovery", "presence"), E("routes", "contacts", "contacts"), E("routes", "conversation", "messages"),
+            E("profile", "roots", "protected state", { curve: 50 }), E("contacts", "roots", "relationship state"), E("conversation", "roots", "message state"),
+            E("profile", "delivery", "Profile updates"), E("contacts", "delivery", "direct artifacts"), E("conversation", "delivery", "outbox"),
+            E("discovery", "carrier", "signed discovery", { curve: 35 }), E("delivery", "carrier", "opaque envelopes"), E("carrier", "peer", "off-box only")
+          ]
+        },
+        {
+          id: "agent", group: "Level 3", number: "06", level: "C4 · Level 3 · Target",
+          title: "Agent Host", question: "Where would an agent harness live without creating a second authority system?",
+          note: "The Agent Host, public agent identity, private persona, durable recovery, and mandate path are target architecture. They are not shipped claims.",
+          groups: [G(245, 35, 650, 650, "Agent Host capsule instance · Target container")],
+          nodes: [
+            N("person", 15, 90, "Person", "person", "Person", "Starts, resumes, cancels, and approves."),
+            N("home", 15, 330, "Home / Inbox", "container", "External container", "Presents sessions and approvals."),
+            N("session", 290, 90, "Task-session supervisor", "target", "Target component", "Durable task IDs, resume, cancel, and terminal lifecycle."),
+            N("context", 540, 90, "Context + memory", "target", "Target component", "Builds principal-owned task context."),
+            N("modelclient", 720, 280, "Model client", "target", "Target component", "Submits typed inference requests."),
+            N("planner", 450, 300, "Planner + tool interpreter", "target", "Target component", "Produces proposals, never grants."),
+            N("proposer", 290, 515, "Effect proposer", "target", "Target component", "Submits exact typed Runtime operations."),
+            N("journal", 670, 515, "Task journal", "target", "Target component", "Tracks conversation, progress, and results."),
+            N("runtime", 945, 90, "Runtime authority", "container", "External container", "Binds principal, session, grants, lifecycle, and audit.", null, 220, 120),
+            N("model", 960, 330, "Model provider", "container", "External container", "Owns selection, credentials, streams, and terminal outcomes.", null, 190, 105),
+            N("effects", 960, 545, "Effect providers", "container", "External containers", "Content, messaging, Browser, wallet, chain, and storage.", null, 190, 105),
+            N("roots", 510, 590, "UsersAI roots", "data", "Data store", "Agent task and memory state.", null, 150, 80)
+          ],
+          edges: [
+            E("person", "home", "uses"), E("home", "runtime", "start / approve", { curve: -45 }), E("runtime", "session", "launches", { curve: 55 }),
+            E("session", "context", "loads"), E("context", "modelclient", "prompt context"), E("modelclient", "runtime", "inference request"),
+            E("runtime", "model", "typed provider call"), E("model", "planner", "output / proposal", { curve: 50 }), E("planner", "proposer", "exact proposal"),
+            E("proposer", "runtime", "capability check"), E("runtime", "effects", "approved operation"), E("effects", "proposer", "audited result", { curve: 50 }),
+            E("session", "journal", "records", { curve: 40 }), E("context", "roots", "reads"), E("journal", "roots", "writes")
+          ]
+        },
+        {
+          id: "code", group: "Supporting", number: "07", level: "Supporting view",
+          title: "Trusted host code ownership", question: "Which Rust crates and code areas implement the Runtime host responsibilities?",
+          note: "This supporting path map stops at crate granularity; it is not a C4 Level 4 diagram. Cargo manifests define the exact dependency graph.",
+          groups: [G(60, 25, 1080, 660, "Rust workspace · Code boundary")],
+          nodes: [
+            N("server", 450, 65, "elastos-server", "code", "Application crate", "Gateway, Carrier, collaboration, orchestration, and supervisors.", null, 250, 110),
+            N("runtime", 450, 260, "elastos-runtime", "code", "Library crate", "Capabilities, sessions, capsules, invoke, providers, and audit.", null, 250, 110),
+            N("identity", 100, 95, "elastos-identity", "code", "Library crate", "Passkey and local identity support."),
+            N("auth", 100, 265, "elastos-auth", "code", "Library crate", "Proof-bound authorization contracts."),
+            N("namespace", 100, 455, "namespace + storage", "code", "Library crates", "Rooted names and persistence."),
+            N("compute", 450, 475, "elastos-compute", "code", "Library crate", "Execution-substrate abstraction."),
+            N("crosvm", 820, 90, "elastos-crosvm", "code", "Adapter crate", "Linux crosvm/KVM execution adapter."),
+            N("vz", 820, 255, "elastos-vz", "code", "Adapter crate", "macOS Virtualization.framework adapter."),
+            N("wallet", 820, 430, "wallet-contract", "code", "Schema crate", "Transport-independent Wallet Bus types."),
+            N("common", 450, 595, "common + guest", "code", "Supporting crates", "Shared contracts and guest Bus SDK.", null, 250, 75)
+          ],
+          edges: [
+            E("server", "runtime", "composes"), E("server", "identity", "uses"), E("runtime", "auth", "uses"), E("runtime", "namespace", "uses"),
+            E("runtime", "compute", "uses"), E("server", "crosvm", "composes"), E("crosvm", "compute", "implements"), E("vz", "compute", "implements"),
+            E("server", "wallet", "uses schema"), E("runtime", "common", "uses"), E("compute", "common", "guest model")
+          ]
+        },
+        {
+          id: "trust", group: "Supporting", number: "08", level: "Supporting view",
+          title: "Trust boundaries", question: "Which boundary changes an untrusted intent into an admitted effect?",
+          note: "A model, UI, approval card, discovery record, or provider may propose or carry work. Runtime remains the enforcement point.",
+          groups: [G(35, 80, 300, 550, "Presentation boundary"), G(380, 80, 460, 550, "Trusted Runtime boundary"), G(890, 80, 265, 550, "Typed service boundary")],
+          nodes: [
+            N("human", 90, 140, "Human action", "person", "Input", "Visible product intent."),
+            N("agent", 90, 310, "Agent proposal", "target", "Target input", "Model or harness proposal without authority."),
+            N("surface", 90, 485, "Surface adapter", "container", "Home / shell / App", "Carries intent without ambient authority."),
+            N("edge", 430, 130, "Ingress validation", "component", "Runtime", "Origin, route, shape, and token."),
+            N("gate", 620, 260, "Authority gate", "component", "Runtime", "Identity, session, capability, and grant."),
+            N("route", 430, 440, "Runtime route", "component", "Runtime", "Core operation or typed provider call."),
+            N("audit", 620, 510, "Durable audit", "data", "Runtime state", "Intent, decision, result, and obligations."),
+            N("provider", 925, 180, "Provider", "container", "Service boundary", "Protocol semantics and credentials."),
+            N("world", 925, 455, "External world", "external", "Backend", "Host, peer, chain, content, wallet, web, or model.")
+          ],
+          edges: [
+            E("human", "surface", "intent"), E("agent", "surface", "proposal"), E("surface", "edge", "typed request"),
+            E("edge", "gate", "validated input"), E("gate", "route", "admitted operation"), E("route", "provider", "typed invoke"),
+            E("route", "audit", "decision"), E("provider", "world", "provider protocol"), E("provider", "audit", "validated result", { curve: 40 })
+          ]
+        },
+        {
+          id: "identity", group: "Supporting", number: "09", level: "Supporting view",
+          title: "Identity overlay", question: "Which identifiers name authority subjects, people, endpoints, software, and bytes?",
+          note: "The human actor, local principal, signed Profile, and Device DID are separate. A CID names immutable bytes. PrivateNetwork has separate policy authority.",
+          nodes: [
+            N("passkey", 50, 80, "Passkey", "person", "Human proof", "Unlocks a local principal session."),
+            N("principal", 330, 80, "Principal", "system", "Authority subject", "Local Runtime authorization subject."),
+            N("session", 640, 80, "Session", "component", "Runtime-owned context", "Binds accepted proof, principal, actors, and grants."),
+            N("profileauth", 50, 300, "ProfileAuthority", "component", "Protected authority", "Owns the Profile signing key."),
+            N("profile", 330, 300, "Profile DID", "system", "Person identity", "Stable person and contact identity."),
+            N("device", 640, 300, "Device DID", "external", "Endpoint identity", "Runtime and Carrier delivery endpoint."),
+            N("package", 50, 530, "Capsule package", "container", "Software identity", "Publisher plus admitted manifest."),
+            N("artifact", 330, 530, "Artifact hash / CID", "data", "Immutable bytes", "Exact admitted package revision."),
+            N("object", 640, 530, "Mutable object", "data", "Live state", "May have content-addressed revisions."),
+            N("cid", 935, 530, "CID", "data", "Immutable revision", "Exact content bytes."),
+            N("objectdid", 935, 300, "Optional object DID", "target", "Target only", "Explicitly minted mutable object identity."),
+            N("network", 935, 80, "PrivateNetwork", "target", "Target signed object", "Separate policy authority signs membership and named services.")
+          ],
+          edges: [
+            E("passkey", "session", "accepted proof"), E("principal", "session", "bound by Runtime"), E("profileauth", "profile", "signs"),
+            E("profile", "device", "authorizes binding"), E("package", "artifact", "binds bytes"), E("object", "cid", "revision"),
+            E("objectdid", "cid", "signed head", { target: true }), E("profile", "network", "may name invitee", { target: true }),
+            E("network", "device", "admits endpoint", { target: true, curve: 35 })
+          ]
+        },
+        {
+          id: "launch", group: "Dynamics", number: "10", level: "Dynamic view",
+          title: "Launch", question: "How does launch cross the same authority path for a projection, Component, or microVM?",
+          note: "The substrate changes how a target runs, not who grants authority. First-party UI Apps remain web projections in this tree.",
+          kind: "sequence",
+          participants: [
+            P("person", "Person", "Chooses an installed target."), P("home", "Home", "Collects exact visible intent."),
+            P("ingress", "Runtime ingress", "Validates request and origin."), P("identity", "Identity", "Binds principal and session."),
+            P("authority", "Launch authority", "Checks target and grant."), P("lifecycle", "Lifecycle", "Admits and owns the instance."),
+            P("target", "Target", "Projection, Component, or microVM.")
+          ],
+          messages: [
+            M("person", "home", "Open installed target"), M("home", "ingress", "Exact launch intent"),
+            M("ingress", "identity", "Validate origin, proof, principal, session"), M("identity", "ingress", "Bound identity context", { return: true }),
+            M("ingress", "authority", "Check target, actors, resource, grant"), M("authority", "lifecycle", "Admit exact package"),
+            M("lifecycle", "home", "Web: scoped route + launch token", { phase: "web projection", return: true }),
+            M("home", "target", "Mount opaque frame", { phase: "web projection" }),
+            M("lifecycle", "target", "Component / VM: start bounded instance", { phase: "isolated executable" }),
+            M("lifecycle", "home", "Return projection or session facts", { phase: "isolated executable", return: true })
+          ]
+        },
+        {
+          id: "effect", group: "Dynamics", number: "11", level: "Dynamic view",
+          title: "Typed effect", question: "Where is the local-versus-Carrier decision made?",
+          note: "There is no Caller → Carrier edge. Same-node and explicit peer routes are alternatives owned by Runtime.",
+          kind: "sequence",
+          participants: [
+            P("caller", "Caller", "Projection or capsule."), P("runtime", "Runtime", "Authority and result boundary."),
+            P("router", "Switchboard", "Chooses authorized placement."), P("local", "Local provider", "Same-node implementation."),
+            P("carrier", "Carrier", "Endpoint-authenticated peer transport."), P("peerAuth", "Peer admission", "Destination Runtime policy boundary."),
+            P("peerProvider", "Peer provider", "Destination operation semantics."),
+            P("audit", "Audit", "Durable effect facts.")
+          ],
+          messages: [
+            M("caller", "runtime", "Typed resource + operation + input"), M("runtime", "runtime", "Bind principal, session, capability"),
+            M("runtime", "router", "Authorized provider request"), M("router", "local", "Same-node typed invocation", { phase: "local alternative" }),
+            M("local", "router", "Validated result", { phase: "local alternative", return: true }),
+            M("router", "carrier", "Opaque provider envelope", { phase: "off-box alternative" }),
+            M("carrier", "peerAuth", "Endpoint-authenticated transport", { phase: "off-box alternative" }),
+            M("peerAuth", "peerAuth", "Admit source, service, operation, signatures, freshness, replay", { phase: "off-box alternative" }),
+            M("peerAuth", "peerProvider", "Admitted typed invocation", { phase: "off-box alternative" }),
+            M("peerProvider", "peerAuth", "Validated result", { phase: "off-box alternative", return: true }),
+            M("peerAuth", "carrier", "Typed result", { phase: "off-box alternative", return: true }),
+            M("carrier", "router", "Typed result", { phase: "off-box alternative", return: true }),
+            M("runtime", "audit", "Record intent, route, result, obligations"), M("runtime", "caller", "Bounded result", { return: true })
+          ]
+        },
+        {
+          id: "conversation", group: "Dynamics", number: "12", level: "Dynamic view · Candidate",
+          title: "Conversation send", question: "How does Chat send one configured-conversation message without seeing Carrier details?",
+          note: "This view shows the shared-conversation local-only buffer. Direct same-endpoint delivery separately uses authenticated Carrier loopback and a signed acceptance receipt.",
+          kind: "sequence",
+          participants: [
+            P("person", "Person", "Writes a message."), P("chat", "Chat", "Scoped product projection."),
+            P("port", "Runtime port", "Typed Chat product boundary."), P("core", "Durable core", "Signs and stores message state."),
+            P("worker", "Worker", "Runs bounded delivery."), P("carrier", "Carrier", "Local buffer or Iroh transport."),
+            P("peer", "Peer Runtime", "Verifies and accepts remote work.")
+          ],
+          messages: [
+            M("person", "chat", "Send message"), M("chat", "port", "Typed Chat request"),
+            M("port", "core", "Prepare signed Profile envelope"), M("core", "port", "Durable outgoing record", { return: true }),
+            M("worker", "core", "Read bounded pending batch"), M("core", "worker", "Opaque signed frame", { return: true }),
+            M("worker", "carrier", "Exact verified collaboration network"),
+            M("carrier", "worker", "No peer: local-only buffered", { phase: "local, no network", return: true }),
+            M("carrier", "peer", "Remote: Iroh gossip", { phase: "remote peer" }),
+            M("peer", "carrier", "Signed acceptance receipt", { phase: "remote peer", return: true }),
+            M("worker", "core", "Verify, settle, or retain for retry")
+          ]
+        },
+        {
+          id: "wallet", group: "Dynamics", number: "13", level: "Dynamic view",
+          title: "Wallet transaction", question: "Who coordinates prepare, sign, broadcast, and reconciliation?",
+          note: "Wallet Provider never calls Chain Provider directly. Runtime owns the durable transaction effect and coordinates both contracts.",
+          kind: "sequence",
+          participants: [
+            P("app", "Requesting App", "Wallet, Inbox, Browser, or another App."), P("runtime", "Runtime", "Transaction-effect coordinator."),
+            P("audit", "Effect store", "Durable state before dispatch."), P("chain", "Chain Provider", "Prepares and broadcasts."),
+            P("wallet", "Wallet Provider", "Approves and signs exact intent.")
+          ],
+          messages: [
+            M("app", "runtime", "Exact transaction intent"), M("runtime", "audit", "Create durable effect"),
+            M("runtime", "chain", "Prepare chain-specific transaction"), M("chain", "runtime", "Canonical prepared intent", { return: true }),
+            M("runtime", "wallet", "Approve + sign exact prepared intent"), M("wallet", "runtime", "Signature / signed transaction", { return: true }),
+            M("runtime", "chain", "Broadcast exact signed transaction"), M("chain", "runtime", "Outcome or uncertain status", { return: true }),
+            M("runtime", "wallet", "Attach validated chain outcome"), M("runtime", "audit", "Settle or retain reconciliation"),
+            M("runtime", "app", "Terminal or pending result", { return: true })
+          ]
+        },
+        {
+          id: "deployment", group: "Deployment", number: "14", level: "C4 · Deployment",
+          title: "One node and one peer", question: "Where do the Level 2 containers run on a local installation?",
+          note: "This is generic, not the public seed topology. Verified 2026-08-16: the seed has no /dev/kvm and is not Home or a local crosvm/KVM Browser target.",
+          groups: [G(15, 25, 215, 670, "Person device · Deployment node"), G(250, 25, 720, 670, "ElastOS host machine · Deployment node")],
+          nodes: [
+            N("browser", 35, 90, "Browser / installed PWA", "external", "Execution environment", "Loads Home. Browser projection still chooses display_mode; Runtime selection is the target.", null, 175, 125),
+            N("home", 35, 285, "Home front door", "container", "Container instance", "Sign-in and shell lifecycle.", null, 175, 95),
+            N("projections", 35, 490, "Shell + App projections", "container", "Container instances", "Product facts and narrow Runtime intents.", null, 175, 105),
+            N("host", 300, 90, "elastos process", "container", "Container instance", "Gateway, Runtime, Carrier, and collaboration.", null, 220, 115),
+            N("providers", 670, 90, "Provider processes", "container", "Container instances", "Typed service implementations."),
+            N("native", 670, 300, "Native helpers", "container", "Container instances", "Supervisor, stream, engine, and edge adapters."),
+            N("component", 300, 330, "Component instance", "container", "Execution environment", "Wasmtime Component Model path."),
+            N("vm", 300, 535, "Capsule / Browser VM", "target", "Execution environment", "crosvm/KVM or Apple VZ when proven."),
+            N("data", 670, 535, "Stable data home", "data", "Data store", "Identity, roots, capsules, provider config, and audit."),
+            N("external", 1010, 150, "External backend", "external", "Deployment node", "Selected provider or engine target.", null, 170, 105),
+            N("peer", 1010, 500, "Peer ElastOS host", "external", "Deployment node", "Runtime plus Carrier endpoint.", null, 170, 105)
+          ],
+          edges: [
+            E("browser", "home", "loads"), E("home", "projections", "mounts"), E("home", "host", "HTTPS / loopback"),
+            E("projections", "host", "narrow Runtime routes"), E("host", "providers", "private typed IPC"), E("host", "native", "private control"),
+            E("host", "component", "hostcalls / Bus"), E("host", "vm", "vsock / adapter"), E("host", "data", "owns"),
+            E("providers", "external", "provider protocol"), E("native", "external", "engine / edge path"), E("host", "peer", "Carrier")
+          ]
+        }
+      ];
+
+      const root = document.getElementById("c4-viewer");
+      const nav = document.getElementById("view-nav");
+      const svg = document.getElementById("diagram");
+      const stage = document.getElementById("diagram-stage");
+      const detail = document.getElementById("selection-detail");
+      const level = document.getElementById("view-level");
+      const title = document.getElementById("view-title");
+      const question = document.getElementById("view-question");
+      const note = document.getElementById("view-note");
+      const palette = {
+        person: "var(--person)", system: "var(--system)", container: "var(--container)",
+        component: "var(--component)", external: "var(--external)", data: "var(--data)",
+        code: "var(--code)", target: "var(--target)"
+      };
+      const camera = { scale: 1, x: 0, y: 0 };
+      let activeIndex = 0;
+      let drag = null;
+
+      const esc = (value) => String(value ?? "").replace(/[&<>\"]/g, (char) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;"
+      })[char]);
+
+      const wrap = (text, max = 27) => {
+        const words = String(text || "").split(/\s+/);
+        const lines = [];
+        let line = "";
+        for (const word of words) {
+          const next = line ? `${line} ${word}` : word;
+          if (next.length > max && line) {
+            lines.push(line);
+            line = word;
+          } else {
+            line = next;
+          }
+        }
+        if (line) lines.push(line);
+        return lines.slice(0, 3);
+      };
+
+      const textLines = (lines, x, y, className, lineHeight) => lines.map((line, index) =>
+        `<text class="${className}" x="${x}" y="${y + index * lineHeight}">${esc(line)}</text>`
+      ).join("");
+
+      const defs = () => `
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line-strong)"></path>
+          </marker>
+          <marker id="arrowAccent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"></path>
+          </marker>
+        </defs>`;
+
+      const endpoint = (a, b) => {
+        const acx = a.x + a.w / 2;
+        const acy = a.y + a.h / 2;
+        const bcx = b.x + b.w / 2;
+        const bcy = b.y + b.h / 2;
+        const dx = bcx - acx;
+        const dy = bcy - acy;
+        if (Math.abs(dx) >= Math.abs(dy)) {
+          return dx >= 0
+            ? { sx: a.x + a.w, sy: acy, tx: b.x, ty: bcy }
+            : { sx: a.x, sy: acy, tx: b.x + b.w, ty: bcy };
+        }
+        return dy >= 0
+          ? { sx: acx, sy: a.y + a.h, tx: bcx, ty: b.y }
+          : { sx: acx, sy: a.y, tx: bcx, ty: b.y + b.h };
+      };
+
+      const edgeMarkup = (edge, nodeMap) => {
+        const from = nodeMap.get(edge.from);
+        const to = nodeMap.get(edge.to);
+        if (!from || !to) return "";
+        const { sx, sy, tx, ty } = endpoint(from, to);
+        let path;
+        if (edge.curve) {
+          const mx = (sx + tx) / 2;
+          const my = (sy + ty) / 2;
+          const dx = tx - sx;
+          const dy = ty - sy;
+          const length = Math.max(1, Math.hypot(dx, dy));
+          const cx = mx - (dy / length) * edge.curve;
+          const cy = my + (dx / length) * edge.curve;
+          path = `M ${sx} ${sy} Q ${cx} ${cy} ${tx} ${ty}`;
+        } else if (Math.abs(tx - sx) > Math.abs(ty - sy) * 1.4 || Math.abs(ty - sy) > Math.abs(tx - sx) * 1.4) {
+          path = `M ${sx} ${sy} L ${tx} ${ty}`;
+        } else {
+          const mx = (sx + tx) / 2;
+          path = `M ${sx} ${sy} L ${mx} ${sy} L ${mx} ${ty} L ${tx} ${ty}`;
+        }
+        const lx = edge.lx ?? (sx + tx) / 2;
+        const ly = edge.ly ?? (sy + ty) / 2 - 8;
+        const lines = wrap(edge.label, 26);
+        const width = Math.max(54, Math.min(220, Math.max(...lines.map((line) => line.length), 1) * 6.1 + 16));
+        const height = lines.length * 13 + 8;
+        return `<g>
+          <path class="edge${edge.target ? " target" : ""}" d="${path}"></path>
+          <rect class="edge-label-bg" x="${lx - width / 2}" y="${ly - 12}" width="${width}" height="${height}" rx="6"></rect>
+          ${textLines(lines, lx, ly, "edge-label", 13)}
+        </g>`;
+      };
+
+      const nodeMarkup = (node) => {
+        const color = palette[node.type] || palette.component;
+        const titleLines = wrap(
+          node.title,
+          Math.max(12, Math.floor((node.w - 18) / 7)),
+        );
+        const descLines = wrap(
+          node.desc,
+          Math.max(16, Math.floor((node.w - 18) / 6.3)),
+        );
+        const titleY = node.y + 27;
+        const metaY = titleY + titleLines.length * 15 + 3;
+        const descY = metaY + 20;
+        const chip = node.status ? `
+          <rect class="status-chip" x="${node.x + node.w - 59}" y="${node.y + 7}" width="51" height="16" rx="8"></rect>
+          <text class="status-text" x="${node.x + node.w - 33.5}" y="${node.y + 18}">${esc(node.status)}</text>` : "";
+        return `<g class="node" data-node-id="${esc(node.id)}" tabindex="0" role="button" aria-label="${esc(node.title)}">
+          <rect x="${node.x}" y="${node.y}" width="${node.w}" height="${node.h}" rx="${node.type === "person" ? 28 : 11}" fill="${color}"></rect>
+          ${chip}
+          ${textLines(titleLines, node.x + node.w / 2, titleY, "node-title", 15)}
+          <text class="node-meta" x="${node.x + node.w / 2}" y="${metaY}">${esc(node.meta)}</text>
+          ${textLines(descLines, node.x + node.w / 2, descY, "node-desc", 13)}
+        </g>`;
+      };
+
+      const renderGraph = (view) => {
+        const nodeMap = new Map(view.nodes.map((node) => [node.id, node]));
+        const groups = (view.groups || []).map((group) => `
+          <g>
+            <rect class="group-box" x="${group.x}" y="${group.y}" width="${group.w}" height="${group.h}" rx="16"></rect>
+            <text class="group-label" x="${group.x + 14}" y="${group.y + 22}">${esc(group.label)}</text>
+          </g>`).join("");
+        return `${defs()}<g id="scene">${groups}${view.edges.map((edge) => edgeMarkup(edge, nodeMap)).join("")}${view.nodes.map(nodeMarkup).join("")}</g>`;
+      };
+
+      const renderSequence = (view) => {
+        const width = 1200;
+        const margin = 65;
+        const lane = (width - margin * 2) / Math.max(1, view.participants.length - 1);
+        const participantMap = new Map(view.participants.map((participant, index) => [participant.id, {
+          ...participant, x: margin + index * lane, y: 38, w: Math.min(145, lane - 12), h: 66,
+          title: participant.label, type: "component", meta: "Participant"
+        }]));
+        const header = [...participantMap.values()].map((participant) => {
+          const x = participant.x - participant.w / 2;
+          const lines = wrap(participant.label, 18);
+          return `<g class="node" data-node-id="${esc(participant.id)}" tabindex="0" role="button" aria-label="${esc(participant.label)}">
+            <rect x="${x}" y="${participant.y}" width="${participant.w}" height="${participant.h}" rx="9" fill="var(--container)"></rect>
+            ${textLines(lines, participant.x, participant.y + 28, "node-title", 15)}
+            <line class="lifeline" x1="${participant.x}" y1="${participant.y + participant.h}" x2="${participant.x}" y2="680"></line>
+          </g>`;
+        }).join("");
+
+        let y = 145;
+        let currentPhase = null;
+        const messages = view.messages.map((message) => {
+          const from = participantMap.get(message.from);
+          const to = participantMap.get(message.to);
+          if (!from || !to) return "";
+          let phase = "";
+          if (message.phase && message.phase !== currentPhase) {
+            currentPhase = message.phase;
+            phase = `<rect class="phase-box" x="36" y="${y - 18}" width="1128" height="34" rx="8"></rect>
+              <text class="phase-label" x="49" y="${y + 3}">${esc(message.phase)}</text>`;
+            y += 42;
+          }
+          const labelLines = wrap(message.label, 36);
+          const labelY = y - 8 - (labelLines.length - 1) * 12;
+          let line;
+          if (from.id === to.id) {
+            const loopX = from.x + Math.min(54, lane / 3);
+            line = `<path class="message${message.return ? " return" : ""}" d="M ${from.x} ${y} H ${loopX} V ${y + 22} H ${from.x}"></path>`;
+          } else {
+            line = `<line class="message${message.return ? " return" : ""}" x1="${from.x}" y1="${y}" x2="${to.x}" y2="${y}"></line>`;
+          }
+          const labelX = from.id === to.id ? from.x + 58 : (from.x + to.x) / 2;
+          const markup = `${phase}<g>${line}${textLines(labelLines, labelX, labelY, "message-label", 12)}</g>`;
+          y += 46 + (labelLines.length - 1) * 10;
+          return markup;
+        }).join("");
+        return `${defs()}<g id="scene">${header}${messages}</g>`;
+      };
+
+      const updateCamera = () => {
+        const scene = svg.querySelector("#scene");
+        if (scene) scene.setAttribute("transform", `translate(${camera.x} ${camera.y}) scale(${camera.scale})`);
+      };
+
+      const selectItem = (item) => {
+        if (!item) return;
+        detail.innerHTML = `<span class="detail-type">${esc(item.meta || item.type || "Element")}</span><span><strong>${esc(item.title || item.label)}</strong>: ${esc(item.desc)}</span>`;
+      };
+
+      const bindNodes = (view) => {
+        const source = view.kind === "sequence" ? view.participants : view.nodes;
+        const sourceMap = new Map(source.map((item) => [item.id, item]));
+        svg.querySelectorAll("[data-node-id]").forEach((element) => {
+          const activate = () => selectItem(sourceMap.get(element.dataset.nodeId));
+          element.addEventListener("click", activate);
+          element.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              activate();
+            }
+          });
+        });
+      };
+
+      const render = () => {
+        const view = views[activeIndex];
+        level.textContent = view.level;
+        title.textContent = view.title;
+        question.textContent = view.question;
+        note.textContent = view.note;
+        const drawing = view.kind === "sequence" ? renderSequence(view) : renderGraph(view);
+        svg.innerHTML = `<title id="svg-title">${esc(`${view.level}: ${view.title}`)}</title><desc id="svg-desc">${esc(view.question)}</desc>${drawing}`;
+        camera.scale = 1;
+        camera.x = 0;
+        camera.y = 0;
+        updateCamera();
+        detail.textContent = view.kind === "sequence"
+          ? "Select a participant to see its responsibility. Use ← and → to move between views."
+          : "Select a node to see its responsibility. Drag the canvas to pan; use the controls to zoom.";
+        bindNodes(view);
+        let activeButton = null;
+        nav.querySelectorAll(".nav-item").forEach((button) => {
+          const active = button.dataset.viewId === view.id;
+          button.setAttribute("aria-current", active ? "true" : "false");
+          if (active) activeButton = button;
+        });
+        if (activeButton && nav.scrollWidth > nav.clientWidth) {
+          nav.scrollLeft = activeButton.offsetLeft - nav.clientWidth / 2 + activeButton.clientWidth / 2;
+        }
+        history.replaceState(null, "", `#${view.id}`);
+      };
+
+      const setView = (index) => {
+        activeIndex = (index + views.length) % views.length;
+        render();
+      };
+
+      const buildNav = () => {
+        const groups = new Map();
+        views.forEach((view, index) => {
+          if (!groups.has(view.group)) groups.set(view.group, []);
+          groups.get(view.group).push({ view, index });
+        });
+        nav.innerHTML = [...groups.entries()].map(([groupName, entries]) => `
+          <section class="nav-group">
+            <h2>${esc(groupName)}</h2>
+            <div class="nav-list">
+              ${entries.map(({ view, index }) => `<button class="nav-item" type="button" data-view-id="${esc(view.id)}" data-view-index="${index}">
+                <span class="nav-index">${esc(view.number)}</span><span class="nav-label">${esc(view.title)}</span>
+              </button>`).join("")}
+            </div>
+          </section>`).join("");
+        nav.querySelectorAll(".nav-item").forEach((button) => {
+          button.addEventListener("click", () => setView(Number(button.dataset.viewIndex)));
+        });
+      };
+
+      document.getElementById("previous-view").addEventListener("click", () => setView(activeIndex - 1));
+      document.getElementById("next-view").addEventListener("click", () => setView(activeIndex + 1));
+      document.getElementById("zoom-in").addEventListener("click", () => { camera.scale = Math.min(2.1, camera.scale + 0.15); updateCamera(); });
+      document.getElementById("zoom-out").addEventListener("click", () => { camera.scale = Math.max(0.65, camera.scale - 0.15); updateCamera(); });
+      document.getElementById("fit-view").addEventListener("click", () => { camera.scale = 1; camera.x = 0; camera.y = 0; updateCamera(); });
+      document.getElementById("fullscreen").addEventListener("click", () => {
+        if (document.fullscreenElement) document.exitFullscreen();
+        else root.requestFullscreen();
+      });
+
+      stage.addEventListener("pointerdown", (event) => {
+        if (event.target.closest(".node")) return;
+        drag = { x: event.clientX, y: event.clientY, cameraX: camera.x, cameraY: camera.y };
+        stage.setPointerCapture(event.pointerId);
+        stage.classList.add("dragging");
+      });
+      stage.addEventListener("pointermove", (event) => {
+        if (!drag) return;
+        const rect = svg.getBoundingClientRect();
+        camera.x = drag.cameraX + (event.clientX - drag.x) * 1200 / rect.width;
+        camera.y = drag.cameraY + (event.clientY - drag.y) * 720 / rect.height;
+        updateCamera();
+      });
+      stage.addEventListener("pointerup", () => { drag = null; stage.classList.remove("dragging"); });
+      stage.addEventListener("pointercancel", () => { drag = null; stage.classList.remove("dragging"); });
+      stage.addEventListener("wheel", (event) => {
+        if (!event.ctrlKey && !event.metaKey) return;
+        event.preventDefault();
+        camera.scale = Math.max(0.65, Math.min(2.1, camera.scale + (event.deltaY < 0 ? 0.1 : -0.1)));
+        updateCamera();
+      }, { passive: false });
+
+      window.addEventListener("keydown", (event) => {
+        if (event.target.closest("button, a")) return;
+        if (event.key === "ArrowLeft") setView(activeIndex - 1);
+        if (event.key === "ArrowRight") setView(activeIndex + 1);
+      });
+
+      buildNav();
+      const requested = location.hash.slice(1);
+      const requestedIndex = views.findIndex((view) => view.id === requested);
+      activeIndex = requestedIndex >= 0 ? requestedIndex : 0;
+      render();
+    })();
+  </script>
+</body>
+</html>

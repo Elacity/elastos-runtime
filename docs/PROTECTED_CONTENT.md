@@ -1,4 +1,4 @@
-# Protected Content Provider
+# Protected content provider
 
 Protected content is Runtime-mediated. App, viewer, and content capsules ask to
 open an object; they do not receive raw wallet, chain, IPFS, Elacity, or key
@@ -8,7 +8,7 @@ The contract is:
 
 `capsule -> runtime capability -> elastos://drm/open -> drm-provider -> rights/key/decrypt providers`
 
-## Current Slice
+## Current implementation
 
 The repo now has the contract and fail-closed boundary, not production DRM:
 
@@ -44,7 +44,7 @@ backends behind `rights-provider`, `key-provider`, and `decrypt-provider`; they
 must not give app or viewer capsules raw CEK, wallet, chain, IPFS, or Elacity
 authority.
 
-## dDRM Decrypt Rail Options And Recommendation
+## dDRM decrypt rail
 
 The v0.4.0 provider chain intentionally proves the fail-closed sockets:
 
@@ -94,7 +94,7 @@ current `ddrm-decrypt` WASM pattern proves the containment invariant, but its
 P-256 and Lit/Chipotle details are implementation references rather than
 Runtime product truth.
 
-## Protected Object Shape
+## Protected object shape
 
 New protected objects should publish as sealed SmartWeb objects:
 
@@ -126,7 +126,7 @@ New protected objects should publish as sealed SmartWeb objects:
 encrypted before replication. Access is enforced by rights checks and key release,
 not by hiding CIDs.
 
-## Crypto Agility And dKMS Direction
+## Crypto agility and dKMS direction
 
 FROST is a threshold Schnorr protocol, so it is classical ECC security, not a
 post-quantum root. ElastOS may use FROST for short/medium-term receipt or cohort
@@ -147,6 +147,27 @@ New protected content should use algorithm-agile sealed objects:
   session key. If an intermediate key-provider re-seal is used during migration,
   it must remain provider-internal, signed, auditable, and short-lived.
 
+### dKMS placement and transport
+
+The typed key-release contract does not change with placement. Runtime selects
+the route after authorization; the caller does not name a peer, host path,
+backend, or transport. The selected provider may use an internal compatibility
+backend, but that backend does not become part of the capsule contract:
+
+- same-node key or dKMS implementations use a private Runtime-owned adapter;
+- a first-party production dKMS hop that crosses an ElastOS machine boundary
+  uses Carrier as the canonical off-box transport;
+- vendor or compatibility transports remain provider-internal and must not
+  create a second capsule contract;
+- Carrier endpoint authentication identifies the transport peer but does not
+  authorize key release, so the dKMS protocol still verifies node authority,
+  rights binding, encryption, signatures, freshness, replay, and threshold
+  policy end to end;
+- raw CEKs never enter Runtime, Carrier, an ordinary app, or a viewer. Prefer
+  direct sealing to a one-time decrypt-session key; and
+- an all-on-one-machine quorum is a development or contract-test topology, not
+  proof of independent operators, failure domains, or distributed custody.
+
 Current EVM/BTC/ELA wallet proofs and dDRM chain state are still classical. They
 are useful authorization inputs today, but they should not be the only permanent
 identity or access root for long-lived encrypted assets.
@@ -157,7 +178,7 @@ References: [NIST PQC standards announcement](https://www.nist.gov/news-events/n
 [FIPS 205 SLH-DSA](https://csrc.nist.gov/pubs/fips/205/final),
 and [RFC 9591 FROST](https://www.rfc-editor.org/rfc/rfc9591).
 
-## Provider Boundary
+## Provider boundary
 
 Normal capsules must not see:
 
@@ -179,19 +200,10 @@ The provider plane should expose typed questions instead:
 - `elastos://decrypt/session/open`
 - `elastos://decrypt/render`
 
-## Remaining Sequence
+## Product readiness
 
-1. Wire real `elastos://drm/open` orchestration behind the declared sequence:
-   content status/fetch, typed rights checks, rights-bound key release,
-   release-receipt-bound decrypt/render sessions, sealed decrypt material, and
-   signed release receipts.
-2. Wire `key-provider` to an ElastOS PQ-hybrid threshold release backend.
-3. Wire `decrypt-provider` to a real decrypt/render backend that keeps CEKs
-   inside the provider boundary.
-4. Wire real protected-content producers to the existing sealed-object publish
-   contract after payload encryption, rights policy, availability receipt,
-   provenance, key-envelope, and viewer-interface generation exist.
-5. Add a permissioned ElastOS PQ-hybrid dKMS v0 for new content only.
+Open implementation work and sequencing stay in [`TASKS.md`](../TASKS.md) and
+[`ROADMAP.md`](../ROADMAP.md).
 
 Visible protected-content UI may ship only as a disabled/read-only readiness
 rail until fail-closed provider tests and capability-resource checks cover the
@@ -200,11 +212,11 @@ receipts and a disabled `Encrypted recipients` option, but it must not claim
 production encrypted-recipient sharing, dDRM completion, or generic decrypt/
 render readiness.
 
-## Executable Proof
+## Executable proof
 
 Run `scripts/protected-content-provider-contract-smoke.sh` after changing
 protected-content provider capsules. It exercises the real provider binaries
-over their JSON line protocol and verifies the current journey contract:
+over their JSON line protocol and verifies the current provider path:
 
 - status exposes blocked raw authority
 - valid requests fail closed until backends are configured

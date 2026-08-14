@@ -18,7 +18,7 @@ authority, or availability.
 [CAPSULE_MODEL.md](CAPSULE_MODEL.md) supplements this document with capsule
 layers and lifecycle.
 
-## ElastOS Four Quadrants
+## ElastOS four quadrants
 
 The four quadrants divide responsibility within the ElastOS World Computer
 model. Together they describe one product with one trusted-core boundary. The
@@ -57,8 +57,10 @@ bootstrap peers and authenticates the content-addressed default-conversation
 grant. The Runtime collaboration service, durable core, and transport driver own
 that authority and give Carrier only opaque signed envelopes. Configured Chat
 text receives typed projections from the Runtime-owned product port and never
-receives tickets, endpoints, raw sockets, or Carrier topics. The route-owned Room
-gossip exception is gone; People/discovery migration remains separate open work.
+receives tickets, endpoints, raw sockets, or Carrier topics. The collaboration
+candidate's bounded People discovery uses the same Runtime-owned path. Wider
+discovery rendezvous and the old Services remote-Exit social/contact path remain
+separate work.
 
 Sequencing and incomplete work belong in [ROADMAP.md](../ROADMAP.md) and
 [TASKS.md](../TASKS.md). This document defines the following authority
@@ -191,6 +193,8 @@ identity, lifecycle, and intent contract.
 
 Interaction equality is part of the same rule: a visible human action and an
 agent request must reach the same capability-scoped Runtime operation.
+[Human and agent architecture](AGENT_ARCHITECTURE.md) defines the corresponding
+principal, profile, session, capsule, and delegation model.
 
 Home shell browser state may persist safe window and route descriptors for
 restoration, but not Browser VM Chromium profile disks, launch tokens,
@@ -245,6 +249,12 @@ Launch policy follows:
 
 Executable capsules express intent, and Runtime decides how to fulfill it.
 
+A private network follows the same rule. Signed membership admits devices to a
+network, while named service access still requires source and destination
+Runtime authorization. Optional TUN, Exit, and LAN Gateway functions are
+compatibility providers behind that policy, not a second capsule network ABI.
+See [PRIVATE_NETWORK.md](PRIVATE_NETWORK.md).
+
 ## WebSpace addressing
 
 [NAMESPACES.md](NAMESPACES.md) defines accepted schemes, current roots, and URI
@@ -262,6 +272,17 @@ operation to its owning provider. Ordinary capsules receive neither raw keys
 nor provider credentials. [PROTECTED_CONTENT.md](PROTECTED_CONTENT.md) owns the
 access sequence and failure rules; [CONTENT_AVAILABILITY.md](CONTENT_AVAILABILITY.md)
 owns publication and retrieval.
+
+The protected-content and dKMS capsule contract is placement-neutral. A
+same-node key or dKMS implementation uses a private Runtime-owned adapter. A
+first-party production dKMS hop that crosses an ElastOS machine boundary uses
+Carrier as its canonical transport, while the dKMS protocol keeps its own
+end-to-end node authorization, encryption, signing, freshness, replay defense,
+and rights binding above Carrier. Carrier authenticates endpoints; it does not
+authorize key release. Raw CEKs never enter Runtime, Carrier, or an ordinary
+App. Runtime selects placement and transport; the caller does not name a dKMS
+peer, host path, backend, or pipe. A quorum placed on one machine is development
+evidence rather than proof of distributed custody.
 
 ## Capability system
 
@@ -339,6 +360,11 @@ Provider namespaces and operations belong in their contract documents, not in
 a universal CRUD interface or hand-maintained architecture table. New provider
 families must define a typed contract before becoming visible in Home. The
 [documentation index](README.md) lists the current provider contracts.
+
+For model inference, the provider owns backend credentials, selection,
+streaming, cancellation, and error translation. Runtime authorizes the caller
+and selection policy. Model output can propose another typed effect but cannot
+authorize it. See [MODEL_PROVIDER.md](MODEL_PROVIDER.md).
 
 ## Orchestration and Runtime communication
 
