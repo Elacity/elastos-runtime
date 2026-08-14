@@ -37,6 +37,9 @@ pub fn reconstruct_content_key(
             KeyReleaseError::InsufficientContributions,
         ));
     }
+    if contributions.len() != required {
+        return Err(CustodyError::BindingMismatch("release_threshold"));
+    }
 
     let node_set = envelope.manifest().node_set()?;
     let mut seen_nodes = HashSet::with_capacity(contributions.len());
@@ -98,7 +101,11 @@ pub fn reconstruct_content_key(
 
     let mut content_key = Zeroizing::new([0u8; CONTENT_KEY_BYTES]);
     content_key.copy_from_slice(&reconstructed[..]);
-    Ok(ContentEncryptionKeyV1::from_guarded_bytes(content_key))
+    let content_key = ContentEncryptionKeyV1::from_guarded_bytes(content_key);
+    if !content_key.matches_commitment(envelope.manifest().content_key_commitment()) {
+        return Err(CustodyError::ContentKeyCommitmentMismatch);
+    }
+    Ok(content_key)
 }
 
 fn open_released_share(
@@ -144,6 +151,7 @@ mod tests {
     };
 
     use crate::{
+        hpke_helpers::{open_share, seal_share},
         provision::provision_custody_envelope_with_rng,
         release::produce_node_contribution_with_rng,
         test_support::{
@@ -265,6 +273,78 @@ mod tests {
         SignedNodeContributionV1::new(statement, signature).unwrap()
     }
 
+    fn malicious_wrong_share_contribution(
+        request: &VerifiedKeyReleaseRequestV1,
+        envelope: &CustodyEnvelopeV1,
+        node_seed: u8,
+        recipient_seed: u8,
+        hpke_seed: u8,
+    ) -> SignedNodeContributionV1 {
+        let valid = released_contribution(request, envelope, node_seed, recipient_seed, hpke_seed);
+        let verified = valid
+            .verify(request, &envelope.manifest().node_set().unwrap(), NOW + 7)
+            .unwrap();
+        let node_entry = envelope
+            .manifest()
+            .node(verified.node_public_key())
+            .unwrap()
+            .clone();
+        let released_aad = node_entry
+            .released_share_aad_bytes(
+                request.request_hash(),
+                request.binding(),
+                verified.decision_hash(),
+                request.recipient(),
+            )
+            .unwrap();
+        let original = decode_ciphertext_bytes(
+            valid
+                .statement()
+                .recipient_sealed_contribution()
+                .sealed_bytes(),
+        )
+        .unwrap();
+        let mut plaintext = open_share(
+            &original,
+            recipient_secret(recipient_seed).secret_bytes(),
+            elastos_protected_content_contracts::RELEASED_SHARE_HPKE_INFO_V1,
+            &released_aad,
+        )
+        .unwrap();
+        plaintext[0] ^= 0x01;
+        let resealed = seal_share(
+            recipient_public_key(recipient_seed).as_bytes(),
+            elastos_protected_content_contracts::RELEASED_SHARE_HPKE_INFO_V1,
+            &released_aad,
+            &plaintext,
+            &mut StdRng::from_seed([hpke_seed.wrapping_add(0x30); 32]),
+        )
+        .unwrap();
+        let sealed = RecipientSealedContributionV1::new(
+            request.recipient().clone(),
+            resealed.canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let statement = NodeContributionStatementV1::new(
+            request.request_hash(),
+            request.binding().clone(),
+            signed_node_decision(
+                request,
+                node_seed,
+                elastos_protected_content_contracts::RightsDecisionV1::Allowed,
+            ),
+            sealed,
+            NOW + 5,
+            NOW + 45,
+        )
+        .unwrap();
+        let signature = node_signing_key(node_seed)
+            .sign(&statement.canonical_bytes().unwrap())
+            .to_bytes()
+            .to_vec();
+        SignedNodeContributionV1::new(statement, signature).unwrap()
+    }
+
     fn alternate_envelope() -> CustodyEnvelopeV1 {
         provision_custody_envelope_with_rng(
             EncryptedContentIdentityV1::new(digest(0x99), 4096).unwrap(),
@@ -332,6 +412,40 @@ mod tests {
         assert!(matches!(
             err,
             CustodyError::Release(KeyReleaseError::InsufficientContributions)
+        ));
+    }
+
+    #[test]
+    fn required_plus_one_shares_fail_before_open() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            released_contribution(&request, &envelope, 2, 0x30, 0x72),
+            released_contribution(&request, &envelope, 3, 0x30, 0x73),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions[..2],
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("release_threshold")
         ));
     }
 
@@ -455,6 +569,36 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, CustodyError::Hpke(_)));
+    }
+
+    #[test]
+    fn malicious_signed_wrong_share_is_rejected_by_content_key_commitment() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let contributions = vec![
+            released_contribution(&request, &envelope, 1, 0x30, 0x71),
+            malicious_wrong_share_contribution(&request, &envelope, 2, 0x30, 0x72),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            &envelope,
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+
+        let err = reconstruct_content_key(
+            &request,
+            &envelope,
+            &contributions,
+            &terminal,
+            terminal.statement().issuer(),
+            &recipient_secret(0x30),
+            NOW + 8,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, CustodyError::ContentKeyCommitmentMismatch));
     }
 
     #[test]

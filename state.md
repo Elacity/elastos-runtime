@@ -27,13 +27,17 @@ the public repository.
   the shared strict DID/Carrier codec correction required by that contract
   surface. It does not integrate Runtime orchestration, provider replacement,
   decryption, playback, installation, or deployment.
-- `feat/protected-content-custody` is an unpublished local child branch stacked
-  on `origin/feat/protected-content-contracts`. It adds the source-only
-  `elastos-protected-content-custody` crate plus custody-envelope provisioning,
-  recipient-sealed node release, and recipient-side threshold reconstruction
-  for new content. It does not integrate Runtime/provider/Carrier
-  orchestration, durable replay storage, recipient key-possession proof,
-  decrypt/render product flows, installation, or deployment.
+- `feat/protected-content-custody` is the source-only child review line
+  stacked on `origin/feat/protected-content-contracts`. It adds the
+  `elastos-protected-content-custody` crate plus custody-envelope
+  provisioning, recipient-sealed node release, and recipient-side threshold
+  reconstruction for new content. Its current reviewed behavior rejects
+  invalid X25519 contract key bytes before HPKE use, requires exactly the
+  bound released threshold, and checks a manifest-bound CEK commitment after
+  reconstruction to detect a wrong reconstructed key. It does not integrate
+  Runtime/provider/Carrier orchestration, durable replay storage, recipient
+  key-possession proof, decrypt/render product flows, installation, or
+  deployment.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -43,6 +47,10 @@ the public repository.
   `origin/feat/protected-content-contracts` branch completed with no code
   findings after the strict DID codec and Carrier codec consolidation. This is
   not an external cryptographic audit or production security approval.
+- An independent AI/model review found the invalid-X25519 acceptance,
+  released-threshold mismatch, and missing reconstructed-key commitment check
+  now corrected on the custody review line. That review is useful source
+  review evidence, not a professional external cryptographic audit.
 - The collaboration review stack adds Runtime-backed People/Chat collaboration
   and selected shell UI work. The source boundary is complete for review:
   Profile authority, Runtime lifecycle, Carrier routing, People/Chat

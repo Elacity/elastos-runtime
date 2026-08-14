@@ -50,6 +50,7 @@ where
     let manifest = CustodyEnvelopeManifestV1::new(
         encrypted_content,
         threshold,
+        content_key.commitment(),
         node_keys
             .into_iter()
             .enumerate()

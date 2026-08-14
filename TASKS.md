@@ -715,15 +715,21 @@ and review items pass.
   integration. The branch-local source review already closed with no code
   findings after the shared strict DID codec and Carrier codec consolidation;
   that was not an external cryptographic audit or production security
-  approval. Review the canonical codec, domain tags, field bounds, EIP-191
-  recovery (`0/1` only), canonical Profile `did:key`, policy identity,
-  owner-Wallet recovery, Runtime-selected and Wallet-signed recipient binding,
-  atomic replay keys, node decisions, terminal issuer signatures, nested
-  authority windows including contribution-to-terminal settlement, shared
-  canonical Ed25519 validation (including noncanonical-encoding rejection),
-  custody-envelope AAD domains, pinned HPKE share sealing, GF256 Shamir share
-  handling, threshold reconstruction zeroization, unique contribution
-  commitments at threshold settlement, and golden vectors.
+  approval. An independent AI/model review later found and prompted the local
+  custody remediation for invalid X25519 contract bytes, exact released
+  threshold settlement, and post-reconstruction CEK commitment checking; that
+  review is also not a professional external audit. Review the canonical
+  codec, domain tags, field bounds, EIP-191 recovery (`0/1` only), canonical
+  Profile `did:key`, policy identity, owner-Wallet recovery, Runtime-selected
+  and Wallet-signed recipient binding, atomic replay keys, node decisions,
+  terminal issuer signatures, nested authority windows including
+  contribution-to-terminal settlement, shared canonical Ed25519 validation
+  (including noncanonical-encoding rejection), the stricter local canonical
+  X25519 contract-key rule, custody-envelope AAD domains, pinned HPKE share
+  sealing, GF256 Shamir share handling, exact-threshold release settlement,
+  threshold reconstruction zeroization, manifest-bound reconstructed-key
+  commitment checking, unique contribution commitments at threshold settlement,
+  and golden vectors.
 - [ ] Add a typed protected-content Wallet operation that verifies an
   externally completed signature, canonicalizes a `27/28` recovery byte to
   `0/1` after signer verification and before `WalletSignedRightsRequestV1`
@@ -737,7 +743,14 @@ and review items pass.
   source-only `elastos-protected-content-custody` crate now implements new
   content share provisioning, recipient-sealed node release, and recipient-side
   threshold reconstruction, but it does not prove operational custody safety,
-  durable storage/replay, provider wiring, or product integration.
+  durable storage/replay, provider wiring, or product integration. Its
+  manifest-bound CEK commitment detects a wrong reconstructed key; it does not
+  identify the malicious node or add verifiable secret sharing.
+- [ ] Add professionally reviewed wrapper-level known-answer coverage for the
+  pinned HPKE share framing if a grounded upstream vector path becomes
+  available. The current source keeps tamper and binding tests, but the pinned
+  upstream `hpke` 0.13 vector set does not cover our exact fixed 32-byte share
+  wrapper framing.
 - [ ] Define how Runtime derives the recipient public key from the authenticated
   Profile and session, proves key possession, and selects an approved encryption
   suite. The caller must not provide endpoint, device, route, or Carrier

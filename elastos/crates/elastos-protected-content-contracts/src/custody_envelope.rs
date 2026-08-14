@@ -7,6 +7,8 @@ use crate::{
 };
 
 pub const CUSTODY_HPKE_SUITE_ID_V1: &str = "hpke-rfc9180-base-x25519-hkdf-sha256-aes256gcm/v1";
+pub const CONTENT_KEY_COMMITMENT_DOMAIN_V1: &[u8] =
+    b"elastos.protected-content.content-key-commitment/v1";
 pub const STORED_SHARE_HPKE_INFO_V1: &[u8] = b"elastos.protected-content.stored-share/v1";
 pub const RELEASED_SHARE_HPKE_INFO_V1: &[u8] = b"elastos.protected-content.released-share/v1";
 pub const HPKE_ENCAPPED_KEY_BYTES: usize = 32;
@@ -140,6 +142,7 @@ impl CanonicalBody for CustodyNodeIdentityV1 {
 pub struct CustodyEnvelopeManifestV1 {
     encrypted_content: EncryptedContentIdentityV1,
     threshold: ThresholdV1,
+    content_key_commitment: Digest32,
     nodes: Vec<CustodyNodeIdentityV1>,
 }
 
@@ -147,6 +150,7 @@ impl CustodyEnvelopeManifestV1 {
     pub fn new(
         encrypted_content: EncryptedContentIdentityV1,
         threshold: ThresholdV1,
+        content_key_commitment: Digest32,
         mut nodes: Vec<CustodyNodeIdentityV1>,
     ) -> Result<Self, ContractError> {
         nodes.sort_unstable_by_key(|node| node.node_public_key());
@@ -159,6 +163,7 @@ impl CustodyEnvelopeManifestV1 {
         let value = Self {
             encrypted_content,
             threshold,
+            content_key_commitment,
             nodes,
         };
         value.validate()?;
@@ -171,6 +176,10 @@ impl CustodyEnvelopeManifestV1 {
 
     pub const fn threshold(&self) -> ThresholdV1 {
         self.threshold
+    }
+
+    pub const fn content_key_commitment(&self) -> Digest32 {
+        self.content_key_commitment
     }
 
     pub fn nodes(&self) -> &[CustodyNodeIdentityV1] {
@@ -247,6 +256,7 @@ impl CanonicalBody for CustodyEnvelopeManifestV1 {
     fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
         encoder.nested(&self.encrypted_content)?;
         self.threshold.encode(encoder);
+        encoder.fixed(self.content_key_commitment.as_bytes());
         encoder.u8(self.nodes.len() as u8);
         for node in &self.nodes {
             encoder.nested(node)?;
@@ -257,12 +267,13 @@ impl CanonicalBody for CustodyEnvelopeManifestV1 {
     fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
         let encrypted_content = decoder.nested("encrypted_content")?;
         let threshold = ThresholdV1::decode(decoder)?;
+        let content_key_commitment = Digest32::new(decoder.fixed()?);
         let count = usize::from(decoder.u8()?);
         let mut nodes = Vec::with_capacity(count);
         for _ in 0..count {
             nodes.push(decoder.nested("custody_node")?);
         }
-        Self::new(encrypted_content, threshold, nodes)
+        Self::new(encrypted_content, threshold, content_key_commitment, nodes)
     }
 }
 
@@ -526,11 +537,15 @@ fn validate_canonical_x25519_public_key(
     bytes: [u8; 32],
     field: &'static str,
 ) -> Result<(), ContractError> {
+    // RFC 7748 X25519 accepts non-canonical u-coordinate encodings at the
+    // primitive boundary. This contract intentionally applies a stricter local
+    // canonical-identity rule for stored public keys and HPKE encapped keys:
+    // exact canonical bytes only, plus low-order rejection before HPKE use.
     if bytes[31] & 0x80 != 0 || le_bytes_ge(bytes, X25519_MODULUS) {
         return Err(ContractError::InvalidField(field));
     }
     let point = MontgomeryPoint(bytes);
-    if X25519_LOW_ORDER_POINTS.iter().any(|low_order| point == *low_order) {
+    if X25519_LOW_ORDER_POINTS.contains(&point) {
         return Err(ContractError::InvalidField(field));
     }
     Ok(())
@@ -547,10 +562,7 @@ fn le_bytes_ge(lhs: [u8; 32], rhs: [u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use curve25519_dalek::{
-        constants::X25519_LOW_ORDER_POINTS,
-        montgomery::MontgomeryPoint,
-    };
+    use curve25519_dalek::{constants::X25519_LOW_ORDER_POINTS, montgomery::MontgomeryPoint};
     use ed25519_dalek::SigningKey;
     use hex::encode;
 
@@ -582,10 +594,15 @@ mod tests {
         EncryptedContentIdentityV1::new(digest(byte), 4096).unwrap()
     }
 
+    fn content_key_commitment(seed: u8) -> Digest32 {
+        digest(seed)
+    }
+
     fn manifest() -> CustodyEnvelopeManifestV1 {
         CustodyEnvelopeManifestV1::new(
             encrypted_content(0x11),
             ThresholdV1::new(2, 3).unwrap(),
+            content_key_commitment(0x19),
             vec![node(3, 3), node(1, 1), node(2, 2)],
         )
         .unwrap()
@@ -642,7 +659,7 @@ mod tests {
 
         assert_eq!(
             encode(envelope.canonical_hash().unwrap().as_bytes()),
-            "059072cd112a899827770607fe96268a8338d700db49fda12661364429d8a590"
+            "158bbfdde78acc999faffc5c668f3dc674f08fe07e6f04c414aa9722f6b447ea"
         );
 
         let key_envelope = envelope.key_envelope_identity().unwrap();
@@ -673,6 +690,7 @@ mod tests {
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
                 threshold,
+                content_key_commitment(0x19),
                 vec![
                     node(1, 1),
                     CustodyNodeIdentityV1::new(
@@ -691,6 +709,7 @@ mod tests {
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
                 threshold,
+                content_key_commitment(0x19),
                 vec![node(1, 1), node(2, 2)],
             ),
             Err(ContractError::InvalidField("custody_manifest.nodes"))
@@ -783,6 +802,7 @@ mod tests {
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x12),
                 ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x19),
                 vec![node(1, 1), node(2, 2), node(3, 3)],
             )
             .unwrap(),
@@ -793,6 +813,7 @@ mod tests {
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
                 ThresholdV1::new(3, 3).unwrap(),
+                content_key_commitment(0x19),
                 vec![node(1, 1), node(2, 2), node(3, 3)],
             )
             .unwrap(),
@@ -804,10 +825,22 @@ mod tests {
             vec![stored_share(1), stored_share(2), stored_share(4)],
         )
         .unwrap();
+        let changed_commitment = CustodyEnvelopeV1::new(
+            CustodyEnvelopeManifestV1::new(
+                encrypted_content(0x11),
+                ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x1a),
+                vec![node(1, 1), node(2, 2), node(3, 3)],
+            )
+            .unwrap(),
+            vec![stored_share(1), stored_share(2), stored_share(3)],
+        )
+        .unwrap();
         let changed_custody_key = CustodyEnvelopeV1::new(
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
                 ThresholdV1::new(2, 3).unwrap(),
+                content_key_commitment(0x19),
                 vec![
                     node(1, 1),
                     CustodyNodeIdentityV1::new(
@@ -841,6 +874,13 @@ mod tests {
         assert_ne!(
             envelope.key_envelope_identity().unwrap().envelope_sha256(),
             changed_stored_share
+                .key_envelope_identity()
+                .unwrap()
+                .envelope_sha256()
+        );
+        assert_ne!(
+            envelope.key_envelope_identity().unwrap().envelope_sha256(),
+            changed_commitment
                 .key_envelope_identity()
                 .unwrap()
                 .envelope_sha256()

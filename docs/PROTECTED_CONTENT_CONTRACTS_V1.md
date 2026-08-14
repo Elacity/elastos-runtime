@@ -55,6 +55,12 @@ methods, alternate spellings, noncanonical Edwards encodings, and weak
 Ed25519 public keys fail. Node and receipt-issuer authority uses that same
 shared validator at construction.
 
+The custody helper also applies a stricter local canonical-identity rule for
+X25519 contract bytes than RFC 7748 requires at the primitive boundary.
+Contract node custody keys, recipient public keys, and HPKE encapped keys must
+use one exact canonical byte encoding and must reject low-order points before
+HPKE runs.
+
 ## Canonical wire form
 
 JSON serialization is an inspection projection and is never signed or hashed.
@@ -156,10 +162,12 @@ opaque bytes. The contract requires that recipient to equal the signed release
 recipient and authenticates the bytes and commitment. The contract type itself
 does not implement encryption. The companion source-only
 `elastos-protected-content-custody` crate implements a pinned HPKE + GF256
-Shamir helper for new-content share release and threshold reconstruction, but
-that helper is not yet wired into Runtime/provider/product flows and has not
-received an external cryptographic audit. No production confidentiality claim
-follows from this contract type alone.
+Shamir helper for new-content share release and threshold reconstruction,
+including a manifest-bound reconstructed-key commitment check that detects a
+wrong reconstructed key. It does not identify the malicious node, it is not
+verifiable secret sharing, it is not yet wired into Runtime/provider/product
+flows, and it has not received an external cryptographic audit. No production
+confidentiality claim follows from this contract type alone.
 
 ## Terminal result
 
@@ -172,9 +180,11 @@ The statement names an Ed25519 issuer and is signed. Verification requires the
 Runtime-selected expected issuer, the verified release request, and the exact
 set of verified contribution references. Every verified contribution must
 retain and match the exact release-request hash and recipient. A successful
-result requires the bound threshold. Contributions from another request or
-recipient cannot be reused. The receipt is audit/result evidence, not a
-portable grant that can authorize another release.
+result requires exactly the bound threshold. Required-plus-one released
+contributions are rejected, not treated as extra success evidence.
+Contributions from another request or recipient cannot be reused. The receipt
+is audit/result evidence, not a portable grant that can authorize another
+release.
 
 ## Threat model and fail-closed rules
 
@@ -184,7 +194,9 @@ recipient, expiry, replay, and post-signature mutation. They also reject a
 forged allow receipt, nonce reuse after changing fields, child lifetime escape,
 a denied or cross-node decision, cross-request contribution reuse, duplicate
 node/decision/contribution/commitment evidence, insufficient threshold,
-malformed canonical input, and noncanonical Wallet/Profile encodings.
+required-plus-one released evidence, malformed canonical input, noncanonical
+Wallet/Profile encodings, and noncanonical/low-order X25519 contract key
+encodings.
 
 These contracts plus the source-only `elastos-protected-content-custody` helper
 do not solve malicious custody nodes, rights-policy correctness, durable replay

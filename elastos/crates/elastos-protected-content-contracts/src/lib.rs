@@ -24,8 +24,9 @@ mod test_support;
 pub use canonical::{CanonicalContract, ContractError};
 pub use custody_envelope::{
     CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyNodeIdentityV1, HpkeCiphertextV1,
-    NodeCustodyPublicKeyV1, ShareCoordinateV1, CUSTODY_HPKE_SUITE_ID_V1, HPKE_ENCAPPED_KEY_BYTES,
-    HPKE_SEALED_SHARE_BYTES, RELEASED_SHARE_HPKE_INFO_V1, STORED_SHARE_HPKE_INFO_V1,
+    NodeCustodyPublicKeyV1, ShareCoordinateV1, CONTENT_KEY_COMMITMENT_DOMAIN_V1,
+    CUSTODY_HPKE_SUITE_ID_V1, HPKE_ENCAPPED_KEY_BYTES, HPKE_SEALED_SHARE_BYTES,
+    RELEASED_SHARE_HPKE_INFO_V1, STORED_SHARE_HPKE_INFO_V1,
 };
 pub use identity::{
     Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, ProfileIdentityV1,

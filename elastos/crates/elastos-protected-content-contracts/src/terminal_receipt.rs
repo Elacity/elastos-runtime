@@ -171,7 +171,7 @@ impl CanonicalBody for TerminalReceiptStatementV1 {
             }
             KeyReleaseOutcomeV1::Released
                 if self.contribution_refs.len()
-                    < usize::from(self.binding.key_envelope().threshold().required()) =>
+                    != usize::from(self.binding.key_envelope().threshold().required()) =>
             {
                 Err(ContractError::InvalidField("release_threshold"))
             }
@@ -304,11 +304,14 @@ impl SignedTerminalReceiptV1 {
         if expected_refs != statement.contribution_refs {
             return Err(KeyReleaseError::BindingMismatch("node_contribution_refs"));
         }
-        if statement.outcome == KeyReleaseOutcomeV1::Released
-            && expected_refs.len()
-                < usize::from(request.binding().key_envelope().threshold().required())
-        {
-            return Err(KeyReleaseError::InsufficientContributions);
+        if statement.outcome == KeyReleaseOutcomeV1::Released {
+            let required = usize::from(request.binding().key_envelope().threshold().required());
+            if expected_refs.len() < required {
+                return Err(KeyReleaseError::InsufficientContributions);
+            }
+            if expected_refs.len() != required {
+                return Err(KeyReleaseError::BindingMismatch("release_threshold"));
+            }
         }
         let key =
             validate_ed25519_public_key(*statement.issuer.as_bytes(), "terminal_receipt_issuer")
@@ -393,6 +396,21 @@ mod tests {
     fn terminal_receipt_requires_threshold_for_released_outcome() {
         let err = statement_with_refs(
             vec![reference(1, 0x31, 0x41, 0x51)],
+            KeyReleaseOutcomeV1::Released,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ContractError::InvalidField("release_threshold"));
+    }
+
+    #[test]
+    fn terminal_receipt_rejects_more_than_required_refs_for_released_outcome() {
+        let err = statement_with_refs(
+            vec![
+                reference(1, 0x31, 0x41, 0x51),
+                reference(2, 0x32, 0x42, 0x52),
+                reference(3, 0x33, 0x43, 0x53),
+            ],
             KeyReleaseOutcomeV1::Released,
         )
         .unwrap_err();

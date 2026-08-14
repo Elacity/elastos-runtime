@@ -2,11 +2,12 @@ use ed25519_dalek::SigningKey;
 use hpke::{kem::Kem as KemTrait, Deserializable, Serializable};
 use rand09::{rngs::StdRng, RngCore as _, SeedableRng as _};
 use sha2::{Digest as _, Sha256};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use elastos_protected_content_contracts::{
     Digest32, NodeCustodyPublicKeyV1, NodePublicKey, RecipientKeyIdentityV1,
-    CUSTODY_HPKE_SUITE_ID_V1,
+    CONTENT_KEY_COMMITMENT_DOMAIN_V1, CUSTODY_HPKE_SUITE_ID_V1,
 };
 
 use crate::{hpke_helpers::HpkeKem, CustodyError, CONTENT_KEY_BYTES};
@@ -24,6 +25,17 @@ impl ContentEncryptionKeyV1 {
 
     pub(crate) fn from_guarded_bytes(bytes: Zeroizing<[u8; CONTENT_KEY_BYTES]>) -> Self {
         Self(bytes)
+    }
+
+    pub(crate) fn commitment(&self) -> Digest32 {
+        self.with_bytes(content_key_commitment)
+    }
+
+    pub(crate) fn matches_commitment(&self, expected: Digest32) -> bool {
+        self.commitment()
+            .as_bytes()
+            .ct_eq(expected.as_bytes())
+            .into()
     }
 
     #[cfg(test)]
@@ -137,6 +149,14 @@ impl std::fmt::Debug for RecipientSecretKeyV1 {
 fn public_key_bytes_from_secret(secret_bytes: &[u8; 32]) -> Result<[u8; 32], CustodyError> {
     let secret = <HpkeKem as KemTrait>::PrivateKey::from_bytes(secret_bytes)?;
     Ok(<HpkeKem as KemTrait>::sk_to_pk(&secret).to_bytes().into())
+}
+
+fn content_key_commitment(bytes: &[u8; CONTENT_KEY_BYTES]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(CONTENT_KEY_COMMITMENT_DOMAIN_V1);
+    hasher.update([0u8]);
+    hasher.update(bytes);
+    Digest32::new(hasher.finalize().into())
 }
 
 fn random_bytes<const N: usize>() -> Result<Zeroizing<[u8; N]>, CustodyError> {

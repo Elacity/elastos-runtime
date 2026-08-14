@@ -143,6 +143,7 @@ mod tests {
     use rand09::{rngs::StdRng, SeedableRng as _};
 
     use super::*;
+    use crate::hpke_helpers::{open_share, seal_share};
     use crate::test_support::{
         node_custody_secret, node_signing_key, provisioned_envelope, recipient_public_key,
         signed_node_decision, verified_release_request, verified_release_request_for_envelope,
@@ -345,6 +346,66 @@ mod tests {
         .unwrap();
         let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
         let request = verified_release_request_for_envelope(&tampered);
+        let err = produce_node_contribution_with_rng(
+            &request,
+            &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
+            &tampered,
+            &node_signing_key(1),
+            &node_custody_secret(1),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+            &mut StdRng::from_seed([0x71; 32]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CustodyError::Hpke(_)));
+    }
+
+    #[test]
+    fn release_reaches_hpke_failure_for_request_bound_to_wrong_node_aad_stored_share() {
+        let envelope = provisioned_envelope();
+        let node_public_key = elastos_protected_content_contracts::NodePublicKey::new(
+            node_signing_key(1).verifying_key().to_bytes(),
+        )
+        .unwrap();
+        let stored_share = envelope.stored_share_for_node(node_public_key).unwrap();
+        let correct_aad = envelope
+            .manifest()
+            .stored_share_aad_bytes_for_node(node_public_key)
+            .unwrap();
+        let wrong_aad = envelope
+            .manifest()
+            .stored_share_aad_bytes_for_node(
+                elastos_protected_content_contracts::NodePublicKey::new(
+                    node_signing_key(2).verifying_key().to_bytes(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let plaintext = open_share(
+            stored_share,
+            node_custody_secret(1).secret_bytes(),
+            elastos_protected_content_contracts::STORED_SHARE_HPKE_INFO_V1,
+            &correct_aad,
+        )
+        .unwrap();
+
+        let mut stored_shares = envelope.stored_shares().to_vec();
+        let index = node_share_index(&envelope, 1);
+        stored_shares[index] = seal_share(
+            envelope.manifest().nodes()[index]
+                .custody_public_key()
+                .as_bytes(),
+            elastos_protected_content_contracts::STORED_SHARE_HPKE_INFO_V1,
+            &wrong_aad,
+            &plaintext,
+            &mut StdRng::from_seed([0x74; 32]),
+        )
+        .unwrap();
+        let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
+        let request = verified_release_request_for_envelope(&tampered);
+
         let err = produce_node_contribution_with_rng(
             &request,
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),

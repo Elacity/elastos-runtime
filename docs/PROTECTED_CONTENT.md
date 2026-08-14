@@ -121,9 +121,17 @@ The `elastos-protected-content-custody` crate is a source-only helper for new
 protected content:
 
 - It provisions canonical custody envelopes from the reviewed v1 contract.
+- It binds each custody manifest to a domain-separated CEK commitment, then
+  checks that commitment after threshold reconstruction before returning an
+  opaque content-key wrapper.
 - It uses one pinned recipient-sealing suite for stored and released shares:
   RFC 9180 base mode X25519 + HKDF-SHA256 + AES-256-GCM.
+- It rejects noncanonical and low-order X25519 contract key bytes as a stricter
+  local canonical-identity rule before HPKE use. This is stronger than the RFC
+  7748 primitive requirement; it is not claimed as an RFC mandate.
 - It uses GF256 Shamir splitting through `vsss-rs` for new content only.
+- Released terminal settlement and recipient reconstruction require exactly the
+  bound threshold count. Required-plus-one contributions are rejected.
 - It returns only opaque, redacted secret wrappers; it does not expose a
   capsule-visible raw-key API.
 - It is source-only. There are no running custody nodes, Runtime/provider
@@ -133,7 +141,9 @@ protected content:
 This helper does not make a PQ claim. PQ-hybrid custody, dKMS node lifecycle,
 and product wiring remain future work. The current HPKE dependency is `hpke`
 0.13, whose upstream documentation says it has not been formally audited. This
-branch therefore makes no external cryptographic audit claim.
+branch therefore makes no external cryptographic audit claim. The manifest
+commitment only detects that threshold reconstruction produced the wrong key; it
+does not identify the malicious node and it is not verifiable secret sharing.
 
 ## Provider Boundary
 

@@ -37,6 +37,8 @@ pub enum CustodyError {
     BindingMismatch(&'static str),
     #[error("malformed custody share: {0}")]
     MalformedShare(&'static str),
+    #[error("reconstructed content key does not match the envelope commitment")]
+    ContentKeyCommitmentMismatch,
     #[error("required cryptographic randomness is unavailable")]
     RandomnessUnavailable,
 }

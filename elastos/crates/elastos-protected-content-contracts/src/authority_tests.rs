@@ -572,6 +572,28 @@ fn terminal_receipt_carries_only_authenticated_hash_references() {
 }
 
 #[test]
+fn terminal_receipt_preserves_exact_reference_verification_when_extra_contributions_are_passed() {
+    let request = verified_release();
+    let contributions = vec![
+        verified_contribution(&request, 1),
+        verified_contribution(&request, 2),
+    ];
+    let extra = verified_contribution(&request, 3);
+    let receipt = terminal_receipt(&request, &contributions, 21);
+    let issuer = receipt.statement().issuer();
+
+    assert_eq!(
+        receipt.verify(
+            &request,
+            &[contributions[0].clone(), contributions[1].clone(), extra],
+            issuer,
+            NOW + 8,
+        ),
+        Err(KeyReleaseError::BindingMismatch("node_contribution_refs"))
+    );
+}
+
+#[test]
 fn duplicate_contribution_commitment_cannot_count_toward_threshold() {
     let request = verified_release();
     let shared_bytes = vec![0xab; 48];
