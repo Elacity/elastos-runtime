@@ -349,6 +349,7 @@ mod tests {
         provision_custody_envelope_with_rng(
             EncryptedContentIdentityV1::new(digest(0x99), 4096).unwrap(),
             &content_key(),
+            crate::test_support::custody_epoch_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             custody_nodes(),
             &mut StdRng::from_seed([0x51; 32]),

@@ -4,7 +4,8 @@ use k256::ecdsa::SigningKey as WalletSigningKey;
 use elastos_auth::ethereum_signed_message_hash;
 
 use crate::test_support::{
-    binding_for_wallet, digest, node_key, node_public_key, node_set, wallet, TestReplayClaims, NOW,
+    binding_for_wallet, custody_epoch_identity, digest, node_key, node_public_key, node_set,
+    wallet, TestReplayClaims, NOW,
 };
 use crate::*;
 
@@ -277,6 +278,7 @@ fn wrong_content_policy_threshold_and_session_are_authority_mismatches() {
                 original.key_envelope().envelope_bytes(),
                 original.key_envelope().node_set_id(),
                 original.key_envelope().threshold(),
+                original.key_envelope().custody_epoch(),
             )
             .unwrap(),
             original.rights_policy().clone(),
@@ -302,6 +304,7 @@ fn wrong_content_policy_threshold_and_session_are_authority_mismatches() {
                 original.key_envelope().envelope_bytes(),
                 digest(0xee),
                 ThresholdV1::new(3, 3).unwrap(),
+                custody_epoch_identity(),
             )
             .unwrap(),
             original.rights_policy().clone(),
@@ -754,19 +757,19 @@ fn canonical_signature_golden_vectors() {
     );
     assert_eq!(
         hex::encode(rights.wallet_signature()),
-        "8192a42519dbdb47240a91ecbe13f8c8d326fb72c9cb694e21a6dc8bdd2f11650f023fd39f60b5a5fa53e6d57e646e13f805fe72fc0a98ddac33b607c34f0f5000"
+        "cda3a5d61aca1bb33e1d4df4bcca941800dab7f7739018a0c190a6d1f1faaa2e53f098e4bd6b1bc53ebc4205162cd7a283763602c48d287582adb944a86e50bb01"
     );
     assert_eq!(
         hex::encode(decision.node_signature()),
-        "0c0fc8fd7e1ab1cf4e8e5589cde8b8180c7e11ba2a4384d3967e213f843d3dd9e509c7c117d705500b2ab15a81d38aeff430b2d17e350b10bd3d2e17669ed404"
+        "40a27f3b03e1f72754b9a26cc8fc62d980922982d82edfb127c6f45123b7d9d1aeb8b68ce2dac78ff12328eef24b2dd807039c176ad1b442558767b353518105"
     );
     assert_eq!(
         hex::encode(contribution.node_signature()),
-        "0faed8e4cfd2d507133cc6ddc06b8f170212e40c7aa79ec58a21757be0b54a9c5862cf378a1e9f2d53b003785e90d90bdbf24eabcaf93dab5e109a9caeecd50a"
+        "23c25cfe287f73dbebb1fd7ee44c790f9966419041ed38fe9a4c3858cdc0a304f85c4e3054ae586e6bfa7c0d77105c4507209e578df802231716460ad7254109"
     );
     assert_eq!(
         hex::encode(terminal.issuer_signature()),
-        "d3ca9cb0396b266511ad0aaac0ec19a09833b3fb84d9bcf60a6c05a3bab8bbfd7763f1e127caa5c56f68a939d95ba6d448c62f08a719b7914b272f4498004e0d"
+        "a3ac53c9c1f7f949a959371b31351b089ba6f84ecbd827c6550a306a5d4226991246fe52a060ff866a82a565623d523287833bbf1c3ae9dd49184440986a4306"
     );
 
     assert_eq!(
@@ -777,10 +780,10 @@ fn canonical_signature_golden_vectors() {
             hex::encode(terminal.canonical_hash().unwrap().as_bytes()),
         ],
         [
-            "0791264458234aaba89f3d024ba5d127da503a72544b5cac10e455a845ebfa75",
-            "059628dcbe86397748e5775fd8211d3608c99291cc538911c94911072a73f2ad",
-            "2212266f5c6d1860a17d6b86995d99dfe8b19ad9e6c9d9dbe7a3c1809929a4a0",
-            "30e01ca0836e1913f5d72e6781b49bf3d3d90a0ed536365fc7bea013be4d5b31",
+            "61660286259d645be3551a50320dab0317901b61623e72b84ecb22830df2ef9d",
+            "6d55a220fb555f50f96500f0a6cf28ec933b15fefc9ac8925220a3520e3958c8",
+            "1a2900de201ab561469ea632ac6e06938b2ee4a2e7c007922a1543fca9c321f0",
+            "6be094d54f410df6423d8e2872ba8f54f1d1ad6d68d05277e5acc52a421766c8",
         ]
         .map(str::to_string)
     );

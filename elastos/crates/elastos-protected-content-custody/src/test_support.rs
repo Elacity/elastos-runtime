@@ -7,7 +7,7 @@ use sha3::Keccak256;
 
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
-    AtomicReplayClaimer, CanonicalContract, CustodyEnvelopeV1, Digest32,
+    AtomicReplayClaimer, CanonicalContract, CustodyEnvelopeV1, CustodyEpochIdentityV1, Digest32,
     EncryptedContentIdentityV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey,
     ProtectedContentBindingV1, RecipientKeyIdentityV1, ReplayClaimError, ReplayClaimKeyV1,
     ReplayNonce16, RightsActionV1, RightsDecisionV1, RightsRequestV1, RightsVerificationContextV1,
@@ -93,6 +93,10 @@ pub(crate) fn custody_nodes() -> Vec<(NodePublicKey, NodeCustodyPublicKeyV1)> {
             node_custody_secret(3).public_key().unwrap(),
         ),
     ]
+}
+
+pub(crate) fn custody_epoch_identity() -> CustodyEpochIdentityV1 {
+    CustodyEpochIdentityV1::new(digest(0x33), 512).unwrap()
 }
 
 fn wallet(seed: u8) -> WalletAddress {
@@ -246,6 +250,7 @@ pub(crate) fn provisioned_envelope() -> CustodyEnvelopeV1 {
     provision_custody_envelope_with_rng(
         EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
         &content_key(),
+        custody_epoch_identity(),
         ThresholdV1::new(2, 3).unwrap(),
         custody_nodes(),
         &mut HpkeStdRng::from_seed([0x41; 32]),

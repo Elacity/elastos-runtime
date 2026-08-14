@@ -156,6 +156,16 @@ impl KeyReleaseRequestV1 {
         now: u64,
         replay: &mut impl AtomicReplayClaimer,
     ) -> Result<VerifiedKeyReleaseRequestV1, KeyReleaseError> {
+        let verified = self.verify_unclaimed(rights, now)?;
+        replay.claim(self.replay_claim_key()?, self.expires_at, now)?;
+        Ok(verified)
+    }
+
+    pub(crate) fn verify_unclaimed(
+        &self,
+        rights: &VerifiedRightsRequestV1,
+        now: u64,
+    ) -> Result<VerifiedKeyReleaseRequestV1, KeyReleaseError> {
         self.canonical_bytes()?;
         if self.binding != *rights.binding() {
             return Err(KeyReleaseError::BindingMismatch(
@@ -175,7 +185,6 @@ impl KeyReleaseRequestV1 {
             return Err(KeyReleaseError::BindingMismatch("rights_request_window"));
         }
         validate_active(self.issued_at, self.expires_at, now)?;
-        replay.claim(self.replay_claim_key()?, self.expires_at, now)?;
         Ok(VerifiedKeyReleaseRequestV1 {
             request_hash: self.request_hash()?,
             binding: self.binding.clone(),

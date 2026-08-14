@@ -1,5 +1,5 @@
 use elastos_protected_content_contracts::{
-    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyNodeIdentityV1,
+    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyNodeIdentityV1,
     EncryptedContentIdentityV1, NodeCustodyPublicKeyV1, NodePublicKey, ShareCoordinateV1,
     ThresholdV1,
 };
@@ -18,6 +18,7 @@ use crate::{
 pub fn provision_custody_envelope(
     encrypted_content: EncryptedContentIdentityV1,
     content_key: &ContentEncryptionKeyV1,
+    custody_epoch: CustodyEpochIdentityV1,
     threshold: ThresholdV1,
     node_keys: Vec<(NodePublicKey, NodeCustodyPublicKeyV1)>,
 ) -> Result<CustodyEnvelopeV1, CustodyError> {
@@ -28,6 +29,7 @@ pub fn provision_custody_envelope(
     provision_custody_envelope_with_rng(
         encrypted_content,
         content_key,
+        custody_epoch,
         threshold,
         node_keys,
         &mut hpke_rng,
@@ -38,6 +40,7 @@ pub fn provision_custody_envelope(
 pub(crate) fn provision_custody_envelope_with_rng<RHpke, RShamir>(
     encrypted_content: EncryptedContentIdentityV1,
     content_key: &ContentEncryptionKeyV1,
+    custody_epoch: CustodyEpochIdentityV1,
     threshold: ThresholdV1,
     node_keys: Vec<(NodePublicKey, NodeCustodyPublicKeyV1)>,
     hpke_rng: &mut RHpke,
@@ -49,6 +52,7 @@ where
 {
     let manifest = CustodyEnvelopeManifestV1::new(
         encrypted_content,
+        custody_epoch,
         threshold,
         content_key.commitment(),
         node_keys
@@ -134,7 +138,7 @@ mod tests {
     use rand10::{rngs::StdRng as ShamirStdRng, SeedableRng as _};
 
     use super::*;
-    use crate::test_support::{content_key, custody_nodes, digest};
+    use crate::test_support::{content_key, custody_epoch_identity, custody_nodes, digest};
 
     #[test]
     fn provision_is_deterministic_under_test_rng_and_binds_identity() {
@@ -145,6 +149,7 @@ mod tests {
         let envelope_a = provision_custody_envelope_with_rng(
             EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
             &content_key(),
+            custody_epoch_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             custody_nodes(),
             &mut hpke_rng_a,
@@ -154,6 +159,7 @@ mod tests {
         let envelope_b = provision_custody_envelope_with_rng(
             EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
             &content_key(),
+            custody_epoch_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             custody_nodes(),
             &mut hpke_rng_b,
@@ -176,6 +182,7 @@ mod tests {
         let err = provision_custody_envelope(
             EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
             &content_key(),
+            custody_epoch_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             nodes,
         )

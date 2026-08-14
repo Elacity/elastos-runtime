@@ -6,6 +6,7 @@
 
 mod canonical;
 mod custody_envelope;
+mod custody_epoch;
 mod identity;
 mod node_contribution;
 mod node_decision;
@@ -16,6 +17,7 @@ mod release_request;
 mod replay;
 mod rights;
 mod rights_receipt;
+mod runtime_release_operation;
 mod terminal_receipt;
 
 #[cfg(test)]
@@ -29,6 +31,10 @@ pub use custody_envelope::{
     NodeCustodyPublicKeyV1, ShareCoordinateV1, CONTENT_KEY_COMMITMENT_DOMAIN_V1,
     CUSTODY_HPKE_SUITE_ID_V1, HPKE_ENCAPPED_KEY_BYTES, HPKE_SEALED_SHARE_BYTES,
     RELEASED_SHARE_HPKE_INFO_V1, STORED_SHARE_HPKE_INFO_V1,
+};
+pub use custody_epoch::{
+    CustodyApprovedSuitesV1, CustodyEpochError, CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1,
+    CustodyEpochStatementV1, SignedCustodyEpochV1, VerifiedCustodyEpochV1,
 };
 pub use identity::{
     Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, ProfileIdentityV1,
@@ -54,9 +60,9 @@ pub use policy::{
 };
 pub use recipient_authorization::{
     RecipientAuthorizationError, RecipientKeyAuthorizationContextV1,
-    RecipientKeyAuthorizationStatementV1, RecipientPublicKeyBytesV1,
-    RuntimeOperationIssuerKeyV1, SignedRecipientKeyAuthorizationV1,
-    VerifiedRecipientKeyAuthorizationV1, MAX_RECIPIENT_KEY_AUTHORIZATION_LIFETIME_SECS,
+    RecipientKeyAuthorizationStatementV1, RecipientPublicKeyBytesV1, RuntimeOperationIssuerKeyV1,
+    SignedRecipientKeyAuthorizationV1, VerifiedRecipientKeyAuthorizationV1,
+    MAX_RECIPIENT_KEY_AUTHORIZATION_LIFETIME_SECS,
 };
 pub use release_request::{
     KeyReleaseError, KeyReleaseRequestV1, VerifiedKeyReleaseRequestV1,
@@ -71,6 +77,11 @@ pub use rights::{
 pub use rights_receipt::{
     RightsReceiptIssuerKey, RightsReceiptStatementV1, SignedRightsReceiptV1,
     MAX_RIGHTS_RECEIPT_LIFETIME_SECS,
+};
+pub use runtime_release_operation::{
+    AuthenticatedRuntimeReleaseOperationV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationError,
+    RuntimeReleaseOperationStatementV1, SignedRuntimeReleaseOperationV1,
+    MAX_RUNTIME_RELEASE_OPERATION_LIFETIME_SECS,
 };
 pub use terminal_receipt::{
     KeyReleaseOutcomeV1, NodeContributionRefV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,

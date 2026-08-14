@@ -1,9 +1,11 @@
 use curve25519_dalek::{constants::X25519_LOW_ORDER_POINTS, montgomery::MontgomeryPoint};
 
 use crate::canonical::{CanonicalBody, ContractError, Decoder, Encoder};
+use crate::custody_epoch::validate_custody_node_set;
 use crate::{
-    CanonicalContract, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, NodePublicKey,
-    NodeSetV1, ProtectedContentBindingV1, RecipientKeyIdentityV1, ThresholdV1, MAX_THRESHOLD_NODES,
+    CanonicalContract, CustodyEpochIdentityV1, Digest32, EncryptedContentIdentityV1,
+    KeyEnvelopeIdentityV1, NodePublicKey, NodeSetV1, ProtectedContentBindingV1,
+    RecipientKeyIdentityV1, ThresholdV1,
 };
 
 pub const CUSTODY_HPKE_SUITE_ID_V1: &str = "hpke-rfc9180-base-x25519-hkdf-sha256-aes256gcm/v1";
@@ -57,7 +59,7 @@ impl ShareCoordinateV1 {
 pub struct CustodyNodeIdentityV1 {
     node_public_key: NodePublicKey,
     custody_public_key: NodeCustodyPublicKeyV1,
-    share_coordinate: ShareCoordinateV1,
+    pub(crate) share_coordinate: ShareCoordinateV1,
 }
 
 impl CustodyNodeIdentityV1 {
@@ -141,6 +143,7 @@ impl CanonicalBody for CustodyNodeIdentityV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustodyEnvelopeManifestV1 {
     encrypted_content: EncryptedContentIdentityV1,
+    custody_epoch: CustodyEpochIdentityV1,
     threshold: ThresholdV1,
     content_key_commitment: Digest32,
     nodes: Vec<CustodyNodeIdentityV1>,
@@ -149,6 +152,7 @@ pub struct CustodyEnvelopeManifestV1 {
 impl CustodyEnvelopeManifestV1 {
     pub fn new(
         encrypted_content: EncryptedContentIdentityV1,
+        custody_epoch: CustodyEpochIdentityV1,
         threshold: ThresholdV1,
         content_key_commitment: Digest32,
         mut nodes: Vec<CustodyNodeIdentityV1>,
@@ -162,6 +166,7 @@ impl CustodyEnvelopeManifestV1 {
         }
         let value = Self {
             encrypted_content,
+            custody_epoch,
             threshold,
             content_key_commitment,
             nodes,
@@ -176,6 +181,10 @@ impl CustodyEnvelopeManifestV1 {
 
     pub const fn threshold(&self) -> ThresholdV1 {
         self.threshold
+    }
+
+    pub const fn custody_epoch(&self) -> CustodyEpochIdentityV1 {
+        self.custody_epoch
     }
 
     pub const fn content_key_commitment(&self) -> Digest32 {
@@ -227,34 +236,13 @@ impl CanonicalBody for CustodyEnvelopeManifestV1 {
 
     fn validate(&self) -> Result<(), ContractError> {
         self.encrypted_content.validate()?;
-        self.threshold.validate()?;
-        if self.nodes.len() != usize::from(self.threshold.total())
-            || self.nodes.len() > usize::from(MAX_THRESHOLD_NODES)
-            || self
-                .nodes
-                .windows(2)
-                .any(|window| window[0].node_public_key() >= window[1].node_public_key())
-        {
-            return Err(ContractError::InvalidField("custody_manifest.nodes"));
-        }
-        for (index, node) in self.nodes.iter().enumerate() {
-            node.canonical_bytes()?;
-            let expected_coordinate = ShareCoordinateV1::new(
-                u8::try_from(index + 1)
-                    .map_err(|_| ContractError::InvalidField("share_coordinate"))?,
-            )?;
-            if node.share_coordinate() != expected_coordinate {
-                return Err(ContractError::InvalidField("share_coordinate"));
-            }
-        }
-        if has_duplicate_custody_keys(&self.nodes) {
-            return Err(ContractError::InvalidField("node_custody_public_key"));
-        }
-        Ok(())
+        self.custody_epoch.validate()?;
+        validate_custody_node_set(&self.nodes, self.threshold, "custody_manifest.nodes")
     }
 
     fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
         encoder.nested(&self.encrypted_content)?;
+        encoder.nested(&self.custody_epoch)?;
         self.threshold.encode(encoder);
         encoder.fixed(self.content_key_commitment.as_bytes());
         encoder.u8(self.nodes.len() as u8);
@@ -266,6 +254,7 @@ impl CanonicalBody for CustodyEnvelopeManifestV1 {
 
     fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
         let encrypted_content = decoder.nested("encrypted_content")?;
+        let custody_epoch = decoder.nested("custody_epoch")?;
         let threshold = ThresholdV1::decode(decoder)?;
         let content_key_commitment = Digest32::new(decoder.fixed()?);
         let count = usize::from(decoder.u8()?);
@@ -273,7 +262,13 @@ impl CanonicalBody for CustodyEnvelopeManifestV1 {
         for _ in 0..count {
             nodes.push(decoder.nested("custody_node")?);
         }
-        Self::new(encrypted_content, threshold, content_key_commitment, nodes)
+        Self::new(
+            encrypted_content,
+            custody_epoch,
+            threshold,
+            content_key_commitment,
+            nodes,
+        )
     }
 }
 
@@ -378,6 +373,7 @@ impl CustodyEnvelopeV1 {
                 .map_err(|_| ContractError::FieldTooLong("custody_envelope"))?,
             self.manifest.node_set()?.node_set_id()?,
             self.manifest.threshold,
+            self.manifest.custody_epoch,
         )
     }
 
@@ -521,18 +517,6 @@ impl CanonicalBody for ReleasedShareAadV1 {
     }
 }
 
-fn has_duplicate_custody_keys(nodes: &[CustodyNodeIdentityV1]) -> bool {
-    for (index, node) in nodes.iter().enumerate() {
-        if nodes[index + 1..]
-            .iter()
-            .any(|other| node.custody_public_key() == other.custody_public_key())
-        {
-            return true;
-        }
-    }
-    false
-}
-
 pub(crate) fn validate_canonical_x25519_public_key(
     bytes: [u8; 32],
     field: &'static str,
@@ -598,9 +582,14 @@ mod tests {
         digest(seed)
     }
 
+    fn custody_epoch_identity() -> CustodyEpochIdentityV1 {
+        CustodyEpochIdentityV1::new(digest(0x33), 512).unwrap()
+    }
+
     fn manifest() -> CustodyEnvelopeManifestV1 {
         CustodyEnvelopeManifestV1::new(
             encrypted_content(0x11),
+            custody_epoch_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             content_key_commitment(0x19),
             vec![node(3, 3), node(1, 1), node(2, 2)],
@@ -659,7 +648,7 @@ mod tests {
 
         assert_eq!(
             encode(envelope.canonical_hash().unwrap().as_bytes()),
-            "158bbfdde78acc999faffc5c668f3dc674f08fe07e6f04c414aa9722f6b447ea"
+            "746aa446eb641e3ab818dccc536a30053d64711233a116b17929709f543a5cd3"
         );
 
         let key_envelope = envelope.key_envelope_identity().unwrap();
@@ -689,6 +678,7 @@ mod tests {
         assert_eq!(
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
+                custody_epoch_identity(),
                 threshold,
                 content_key_commitment(0x19),
                 vec![
@@ -708,6 +698,7 @@ mod tests {
         assert_eq!(
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
+                custody_epoch_identity(),
                 threshold,
                 content_key_commitment(0x19),
                 vec![node(1, 1), node(2, 2)],
@@ -801,6 +792,7 @@ mod tests {
         let changed_content = CustodyEnvelopeV1::new(
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x12),
+                custody_epoch_identity(),
                 ThresholdV1::new(2, 3).unwrap(),
                 content_key_commitment(0x19),
                 vec![node(1, 1), node(2, 2), node(3, 3)],
@@ -812,6 +804,7 @@ mod tests {
         let changed_threshold = CustodyEnvelopeV1::new(
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
+                custody_epoch_identity(),
                 ThresholdV1::new(3, 3).unwrap(),
                 content_key_commitment(0x19),
                 vec![node(1, 1), node(2, 2), node(3, 3)],
@@ -828,6 +821,7 @@ mod tests {
         let changed_commitment = CustodyEnvelopeV1::new(
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
+                custody_epoch_identity(),
                 ThresholdV1::new(2, 3).unwrap(),
                 content_key_commitment(0x1a),
                 vec![node(1, 1), node(2, 2), node(3, 3)],
@@ -839,6 +833,7 @@ mod tests {
         let changed_custody_key = CustodyEnvelopeV1::new(
             CustodyEnvelopeManifestV1::new(
                 encrypted_content(0x11),
+                custody_epoch_identity(),
                 ThresholdV1::new(2, 3).unwrap(),
                 content_key_commitment(0x19),
                 vec![

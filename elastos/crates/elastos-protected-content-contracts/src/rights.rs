@@ -259,6 +259,19 @@ impl WalletSignedRightsRequestV1 {
         context: &RightsVerificationContextV1,
         replay: &mut impl AtomicReplayClaimer,
     ) -> Result<VerifiedRightsRequestV1, RightsError> {
+        let verified = self.verify_unclaimed(context)?;
+        replay.claim(
+            self.request.replay_claim_key()?,
+            self.request.expires_at,
+            context.now,
+        )?;
+        Ok(verified)
+    }
+
+    pub(crate) fn verify_unclaimed(
+        &self,
+        context: &RightsVerificationContextV1,
+    ) -> Result<VerifiedRightsRequestV1, RightsError> {
         self.canonical_bytes()?;
         let request = &self.request;
         if request.binding != context.expected_binding {
@@ -277,7 +290,6 @@ impl WalletSignedRightsRequestV1 {
             return Err(RightsError::WalletMismatch);
         }
 
-        replay.claim(request.replay_claim_key()?, request.expires_at, context.now)?;
         Ok(VerifiedRightsRequestV1 {
             request_hash: request.request_hash()?,
             binding: request.binding.clone(),
