@@ -524,6 +524,10 @@ APP_CAPSULES=(
     # Library falls back to Properties instead of opening the viewer.
     ddrm-viewer
     elacity-player
+    # The Create portal (mint dDRM assets). Ported in with the dkms capsules but only
+    # registered here + components.json later: without both, provisioning never installs
+    # it and the Home launcher silently drops it (list_launchable_browser_capsules).
+    creator
 )
 
 APP_CAPSULES_JSON="$(printf '%s\n' "${APP_CAPSULES[@]}" | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"

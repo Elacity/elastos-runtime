@@ -33,9 +33,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::gateway::{
-    consume_passkey_step_up_token, issue_home_launch_token_with_context,
-    require_home_token_launch, require_owned_open_token_context, GatewayState,
-    HomeLaunchTokenContext,
+    consume_passkey_step_up_token, issue_home_launch_token_with_context, require_home_token_launch,
+    require_owned_open_token_context, GatewayState, HomeLaunchTokenContext,
 };
 use super::media_authority::{
     resolve_decrypt_bin, resolve_helper_bin, resolve_key_bin, MediaAuthorityProc,

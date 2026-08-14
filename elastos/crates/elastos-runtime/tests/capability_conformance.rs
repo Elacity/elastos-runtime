@@ -204,8 +204,13 @@ async fn token_denies_after_use_limit() {
 /// gap once described. The residual best-effort emission of non-custody events stays in `KNOWN_GAPS`.
 #[tokio::test]
 async fn denial_is_audited() {
-    let path = std::env::temp_dir().join("elastos-capconf-denial-audit.log");
-    let _ = std::fs::remove_file(&path);
+    // A per-run tempdir, NOT a fixed path under std::env::temp_dir(): the audit log is
+    // single-opener (flock on `<log>.lock`) and fail-closed against its persisted sidecars
+    // (`.head-anchor` is a lower bound on record count), so a fixed path poisons every later
+    // run — a stale anchor over a freshly-deleted log reads as tail-truncation and appends
+    // are refused, and a concurrent holder of the lock reads as WouldBlock.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("denial-audit.log");
     let audit = AuditLog::with_file(&path).expect("open audit file");
     let m = manager_with(audit);
 
@@ -229,7 +234,6 @@ async fn denial_is_audited() {
     assert!(matches!(r, Err(ValidationError::WrongCapsule { .. })));
 
     let logged = std::fs::read_to_string(&path).unwrap_or_default();
-    let _ = std::fs::remove_file(&path);
     assert!(
         !logged.trim().is_empty(),
         "a capability denial must produce an audit record (got empty log)"

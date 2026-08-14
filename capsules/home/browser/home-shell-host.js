@@ -116,7 +116,7 @@ const MONEY_VERB_ROUTES = Object.freeze({
 const MONEY_VERB_REQUEST_TYPE = "elastos.home.money-verb.request/v1";
 // Only frames with a REAL caller today. `creator` is deliberately absent: the Create portal
 // reaches chain through the capability bus (encrypt-provider -> publish-provider -> wallet
-// approval), so nothing in `capsules/creator/creator.js` posts `/api/create/mint`. Listing it
+// approval), so nothing in `capsules/creator/browser/creator.js` posts `/api/create/mint`. Listing it
 // would enlarge the set of frames that can make Home raise a confirmation prompt and start a
 // step-up ceremony — a prompt-fatigue and social-engineering surface — for no capability today.
 // Re-adding it is this one line when the Create portal ships a caller.

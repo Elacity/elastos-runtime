@@ -112,9 +112,8 @@ pub(super) use gateway_home_token::{
     require_home_projection_launch_token_context, require_home_runtime_wallet_authority,
     require_home_token, require_home_token_context, require_home_token_launch,
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
-    require_owned_open_token_context,
-    require_runtime_wallet_authority, runtime_wallet_authority, HomeLaunchContext,
-    HomeLaunchTokenContext, RequiredHomeLaunchToken, RuntimeWalletAuthority,
+    require_owned_open_token_context, require_runtime_wallet_authority, runtime_wallet_authority,
+    HomeLaunchContext, HomeLaunchTokenContext, RequiredHomeLaunchToken, RuntimeWalletAuthority,
 };
 #[cfg(test)]
 pub(crate) use gateway_home_token::{

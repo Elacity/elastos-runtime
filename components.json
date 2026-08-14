@@ -1034,6 +1034,20 @@
         }
       }
     },
+    "creator": {
+      "install_path": "capsules/creator",
+      "description": "Create portal: mints a dDRM asset on PQ custody via the capability bus",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "creator.tar.gz",
+          "extract_path": "creator",
+          "install_path": "capsules/creator"
+        }
+      }
+    },
     "ddrm-viewer": {
       "install_path": "capsules/ddrm-viewer",
       "description": "Protected dDRM viewer for owned non-media assets opened from Library",

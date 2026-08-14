@@ -140,6 +140,62 @@ fn dkms_capsules_load_into_the_active_catalog_inventory() {
     }
 }
 
+/// Shell-launchability pin: `list_launchable_browser_capsules` (the function
+/// behind the Home launcher) silently drops any capsule that
+/// `load_browser_capsule` cannot resolve. For non-`data` capsule types,
+/// resolution requires `browser/index.html` inside the installed capsule dir —
+/// the exact seam that dropped `creator` from the shell when its manifest moved
+/// to `type: wasm` while its entrypoint stayed at the capsule root. Catalog
+/// presence (the tests above) does NOT imply launchability, so pin it here.
+#[test]
+fn dkms_browser_capsules_stay_shell_launchable() {
+    let data_dir = tempfile::tempdir().unwrap();
+    install_all_dkms_capsules(data_dir.path());
+
+    let launchable: std::collections::BTreeSet<String> =
+        crate::api::browser_capsules::list_launchable_browser_capsules(data_dir.path())
+            .into_iter()
+            .map(|capsule| capsule.name)
+            .collect();
+
+    for name in ["creator", "elacity-player", "ddrm-viewer"] {
+        assert!(
+            launchable.contains(name),
+            "{name} dropped from the shell launcher; launchable={launchable:?}"
+        );
+    }
+}
+
+/// Provisioning-registry pin: a capsule that exists in `capsules/` but has no entry in the
+/// repo-root `components.json` is never installed into the data dir by
+/// `scripts/setup-source-home.sh`, so it can pass every manifest/launchability test above
+/// and still be absent from the Home desktop (that is exactly how `creator` went missing
+/// after the ESP port). Every browser-facing dkms capsule must be registered for install.
+#[test]
+fn dkms_browser_capsules_are_registered_for_provisioning() {
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../components.json"
+    ))
+    .expect("repo-root components.json must be readable");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&raw).expect("components.json must parse");
+    let external = manifest["external"]
+        .as_object()
+        .expect("components.json must carry an external component map");
+
+    for name in ["creator", "elacity-player", "ddrm-viewer"] {
+        let entry = external.get(name).unwrap_or_else(|| {
+            panic!("{name} missing from components.json external map — provisioning will never install it and the Home desktop will not show it")
+        });
+        assert_eq!(
+            entry["install_path"].as_str(),
+            Some(format!("capsules/{name}").as_str()),
+            "{name} components.json entry must install into capsules/{name}"
+        );
+    }
+}
+
 /// Same install, exercised through the actual catalog read model
 /// (`gateway_capsule_catalog::capsule_catalog_summary`, the function behind
 /// `/api/capsules/catalog`) rather than the lower-level inventory list, so a
