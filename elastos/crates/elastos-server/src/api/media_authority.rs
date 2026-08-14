@@ -32,7 +32,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::gateway::{
-    issue_home_launch_token_with_context, require_home_token_context, GatewayState,
+    issue_home_launch_token_with_context, require_owned_open_token_context, GatewayState,
 };
 use super::viewer_media::{
     media_play_route, put_media_session, MediaSession, MEDIA_VIEWER_CAPSULE,
@@ -382,7 +382,7 @@ impl Drop for MediaAuthorityProc {
 /// POST /api/viewers/elacity-player/media/open — stand up an owned-media play
 /// session through a gateway-spawned local key-authority and return a play URL.
 pub async fn open_demo_media(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
+    let context = match require_owned_open_token_context(&state.data_dir, &headers) {
         Ok(context) => context,
         Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
     };

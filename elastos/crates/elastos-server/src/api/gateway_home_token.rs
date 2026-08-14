@@ -376,6 +376,54 @@ pub(crate) fn require_home_launch_token_for_any_app_context(
         .map(|required| (required.launch_context.executable_actor, required.context))
 }
 
+/// Authorize an owned-asset OPEN driven by a Home SHELL, not the top-level Home app.
+///
+/// The owned-open endpoints (`/api/viewers/open`, `/api/viewers/prepare-grant`,
+/// `/api/viewers/ddrm-viewer/object/open`, `/api/viewers/elacity-player/media/open`) are invoked by
+/// the graphical shell's `shell-windows.js` with the SHELL's launch token — `executable_actor` is
+/// `home-gui` (or `home-cli`), never `home`. The plain [`require_home_token_context`] admits only
+/// the `home` app AND reads the `HOME_SESSION_COOKIE`, so a shell-driven open fails twice over:
+/// the actor is not allow-listed, and the shell's header token conflicts with the still-present Home
+/// session cookie. This gate mirrors the shell-state gate (`require_home_shell_state_token_context`):
+/// it admits the trusted Home surfaces — the graphical/CLI shells plus the Home app — and reads ONLY
+/// the `x-elastos-home-token` header (no cookie, hence no conflict). It proves the caller is a
+/// trusted, signed-in Home surface acting for its principal; ownership, the on-chain rights gate, and
+/// the dKMS quorum recover still independently gate the actual plaintext downstream.
+pub(crate) fn require_owned_open_token_context(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    let result = require_home_launch_token_for_any_context(
+        data_dir,
+        headers,
+        &[HOME_CAPSULE_ID, HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID],
+    );
+    if let Err(err) = &result {
+        // TEMP DIAGNOSTIC (owned-open 403 trace): decode the presented header token to reveal its
+        // actor + delivery shape, so the exact rejection is visible in the gateway log.
+        let header_actor = home_launch_token_header(headers)
+            .and_then(|tok| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(tok.trim())
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<HomeLaunchTokenEnvelope>(&bytes).ok())
+            .map(|env| env.payload.launch_context.executable_actor)
+            .unwrap_or_else(|| "<undecodable/none>".to_string());
+        let origin = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<none>");
+        let has_cookie = headers.get(axum::http::header::COOKIE).is_some();
+        let has_header = headers.get("x-elastos-home-token").is_some();
+        tracing::warn!(
+            "OWNED-OPEN GATE DENY: err={err} | token_actor={header_actor} | origin={origin} | \
+             has_home_token_header={has_header} | has_cookie={has_cookie}"
+        );
+    }
+    result
+}
+
 pub(crate) fn require_home_projection_launch_token_context(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
@@ -1445,6 +1493,57 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing same-origin provenance"));
+    }
+
+    #[test]
+    fn owned_open_gate_admits_the_home_gui_shell_token_the_home_only_gate_rejects() {
+        // Regression: the owned-asset open endpoints (/api/viewers/open, /prepare-grant,
+        // /ddrm-viewer/object/open, /elacity-player/media/open) are driven by the graphical Home
+        // SHELL's `shell-windows.js`, which sends the shell's `home-gui`-actor launch token over the
+        // capsule iframe (opaque origin, `x-elastos-home-token` header, NO Home session cookie).
+        // The home-only `require_home_token_context` rejects that token — the actor is not `home` —
+        // which surfaced as a 403 the shell mapped to `requestHomeUnlock()`, rebooting Home in an
+        // endless sign-in loop. `require_owned_open_token_context` admits the trusted shell surfaces.
+        let data_dir = tempfile::tempdir().unwrap();
+        elastos_identity::load_or_create_did(data_dir.path()).unwrap();
+
+        // The two Home shells drive owned opens over the capsule iframe (opaque origin, header-only).
+        for actor in [HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID] {
+            let token = issue_home_launch_token_with_context(
+                data_dir.path(),
+                actor,
+                &local_home_launch_token_context(data_dir.path()).unwrap(),
+            )
+            .unwrap();
+            require_owned_open_token_context(data_dir.path(), &capsule_headers(&token))
+                .unwrap_or_else(|err| panic!("owned-open gate must admit {actor}: {err}"));
+        }
+
+        // The Home app itself keeps working too — it uses the exact-home-origin regime.
+        let home_token = issue_home_launch_token_with_context(
+            data_dir.path(),
+            HOME_CAPSULE_ID,
+            &local_home_launch_token_context(data_dir.path()).unwrap(),
+        )
+        .unwrap();
+        let mut home = HeaderMap::new();
+        home.insert("x-elastos-home-token", home_token.parse().unwrap());
+        home.insert("host", "localhost:45542".parse().unwrap());
+        home.insert("origin", "http://localhost:45542".parse().unwrap());
+        home.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        require_owned_open_token_context(data_dir.path(), &home).unwrap();
+
+        // The shell token is still rejected by the home-only gate — the exact pre-fix failure.
+        let shell_token = issue_home_launch_token_with_context(
+            data_dir.path(),
+            HOME_GUI_SHELL_ID,
+            &local_home_launch_token_context(data_dir.path()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            require_home_token_context(data_dir.path(), &capsule_headers(&shell_token)).is_err(),
+            "home-only gate must still reject the shell token (proves the widening is necessary)"
+        );
     }
 
     #[test]

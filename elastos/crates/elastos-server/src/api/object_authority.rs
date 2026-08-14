@@ -29,7 +29,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use super::gateway::{
-    issue_home_launch_token_with_context, require_home_token_context, GatewayState,
+    issue_home_launch_token_with_context, require_owned_open_token_context, GatewayState,
 };
 use super::viewer_object::{
     object_view_route, put_object_session, ObjectSession, OBJECT_VIEWER_CAPSULE,
@@ -347,7 +347,7 @@ impl Drop for ObjectAuthorityProc {
 /// POST /api/viewers/ddrm-viewer/object/open — stand up an owned non-media view
 /// session through a gateway-spawned local key-authority and return a view URL.
 pub async fn open_owned_object(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
+    let context = match require_owned_open_token_context(&state.data_dir, &headers) {
         Ok(context) => context,
         Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
     };

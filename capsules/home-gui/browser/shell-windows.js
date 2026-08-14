@@ -1070,7 +1070,12 @@ export function openTarget(targetId, options = {}) {
     launch()
       .catch((error) => {
         const status = Number(error && error.status);
-        if (status === 401 || status === 403) {
+        // A 401 means "not signed in" — re-authenticating can actually resolve it, so prompt a Home
+        // unlock. A 403 is an authorization REFUSAL (token scope, ownership, or rights) that signing
+        // in again cannot fix; funnelling it into requestHomeUnlock() reboots Home and drops the
+        // pending open, which the user experiences as an endless sign-in loop. Surface the server's
+        // reason as an explicit, actionable error instead of looping.
+        if (status === 401) {
           closeWindow(loading.id);
           requireWindowHooks().requestHomeUnlock?.();
           return;

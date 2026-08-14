@@ -10,7 +10,7 @@
   "execution": "web-projection",
   "projections": ["web", "facts", "affordances", "gates"],
   "author": "elastos",
-  "entrypoint": "index.html",
+  "entrypoint": "browser/index.html",
   "interfaces": [
     {
       "id": "elastos.viewer.document",

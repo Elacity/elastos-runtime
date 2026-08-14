@@ -34,7 +34,8 @@ use serde_json::json;
 
 use super::gateway::{
     consume_passkey_step_up_token, issue_home_launch_token_with_context,
-    require_home_token_context, require_home_token_launch, GatewayState, HomeLaunchTokenContext,
+    require_home_token_launch, require_owned_open_token_context, GatewayState,
+    HomeLaunchTokenContext,
 };
 use super::media_authority::{
     resolve_decrypt_bin, resolve_helper_bin, resolve_key_bin, MediaAuthorityProc,
@@ -265,7 +266,7 @@ pub async fn open_owned_in_viewer(
     headers: HeaderMap,
     Json(req): Json<OpenOwnedRequest>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
+    let context = match require_owned_open_token_context(&state.data_dir, &headers) {
         Ok(context) => context,
         Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
     };
@@ -684,7 +685,7 @@ pub async fn prepare_owned_grant(
     headers: HeaderMap,
     Json(req): Json<PrepareGrantRequest>,
 ) -> Response {
-    let context = match require_home_token_context(&state.data_dir, &headers) {
+    let context = match require_owned_open_token_context(&state.data_dir, &headers) {
         Ok(context) => context,
         Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
     };
