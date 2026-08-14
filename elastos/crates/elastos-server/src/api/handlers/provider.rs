@@ -486,4 +486,80 @@ mod tests {
         assert_eq!(err.0, StatusCode::FORBIDDEN);
         assert!(err.1.contains("Capability denied"));
     }
+
+    #[tokio::test]
+    async fn provider_proxy_enforces_model_capability_on_session_path() {
+        let audit_log = Arc::new(AuditLog::new());
+        let capability_manager = Arc::new(CapabilityManager::new(
+            Arc::new(CapabilityStore::new()),
+            audit_log.clone(),
+            Arc::new(MetricsManager::new()),
+        ));
+        let state = ProviderProxyState {
+            registry: Arc::new(ProviderRegistry::new()),
+            capability_manager: Some(capability_manager.clone()),
+        };
+        let session = Session::new(SessionType::Shell, None);
+
+        // The resource + action the proxy derives for model/runs_create.
+        let request = serde_json::json!({"offer_id": "offer:chat", "op": "runs_create"});
+        let resource = build_capability_resource("model", "runs_create", &request).unwrap();
+        assert_eq!(resource, "elastos://model/offer:chat/runs_create");
+        let required_action = provider_operation_action("model", "runs_create").unwrap();
+        assert_eq!(required_action, Action::Execute);
+
+        // Delegated capsule call without a token: denied, no ambient authority.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Elastos-Capsule-Id",
+            HeaderValue::from_static("component-test"),
+        );
+        let err = enforce_capability(&state, &session, &headers, &resource, required_action)
+            .await
+            .expect_err("model runs_create without a token must be denied");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // Read-scoped token must not authorize an Execute operation.
+        let read_token = capability_manager.grant(
+            session.id.as_str(),
+            ResourceId::new(&resource),
+            Action::Read,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Elastos-Capsule-Id",
+            HeaderValue::from_static("component-test"),
+        );
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&read_token.to_base64().unwrap()).unwrap(),
+        );
+        let err = enforce_capability(&state, &session, &headers, &resource, required_action)
+            .await
+            .expect_err("read token must not authorize model runs_create");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // Execute token on the derived resource validates.
+        let execute_token = capability_manager.grant(
+            session.id.as_str(),
+            ResourceId::new(&resource),
+            Action::Execute,
+            TokenConstraints::default(),
+            None,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Elastos-Capsule-Id",
+            HeaderValue::from_static("component-test"),
+        );
+        headers.insert(
+            "X-Capability-Token",
+            HeaderValue::from_str(&execute_token.to_base64().unwrap()).unwrap(),
+        );
+        enforce_capability(&state, &session, &headers, &resource, required_action)
+            .await
+            .expect("execute token should authorize model runs_create");
+    }
 }

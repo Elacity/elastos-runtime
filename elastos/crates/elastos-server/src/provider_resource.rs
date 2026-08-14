@@ -39,6 +39,28 @@ pub fn build_capability_resource(
                 None => Ok(format!("elastos://ai/meta/{op}")),
             }
         }
+        "model" => {
+            ensure_supported_operation(
+                "model",
+                op,
+                &[
+                    "offers_list",
+                    "runs_create",
+                    "runs_get",
+                    "runs_events",
+                    "runs_cancel",
+                    "ping",
+                ],
+            )?;
+            let offer = request.get("offer_id").and_then(|value| value.as_str());
+            match offer {
+                Some(offer) => {
+                    validate_offer_id(offer)?;
+                    Ok(format!("elastos://model/{offer}/{op}"))
+                }
+                None => Ok(format!("elastos://model/meta/{op}")),
+            }
+        }
         "availability" => simple_elastos_resource("availability", op, &["ensure", "status"]),
         "block-graph" => simple_elastos_resource(
             "block-graph",
@@ -141,6 +163,11 @@ pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
     match scheme {
         "localhost" | "webspace" => localhost_op_required_action(op),
         "ai" | "llama" | "did" => execute_op_required_action(op),
+        "model" => match op {
+            "runs_create" | "runs_cancel" => Some(Action::Execute),
+            "offers_list" | "runs_get" | "runs_events" | "ping" => Some(Action::Read),
+            _ => None,
+        },
         "availability" => match op {
             "status" => Some(Action::Read),
             "ensure" => Some(Action::Write),
@@ -311,6 +338,20 @@ fn validate_segment(value: &str, label: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!("Invalid {label}: {value}"))
+}
+
+/// Offer ids are URN-ish (`offer:flash-chat:pair-a`): alphanumerics, `-`,
+/// `_`, and `:` only — no `/`, no `..`, so no path or scheme confusion in the
+/// capability URI we construct.
+fn validate_offer_id(value: &str) -> Result<(), String> {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ':')
+    {
+        return Ok(());
+    }
+    Err(format!("Invalid offer id: {value}"))
 }
 
 fn validate_chain_network(network: &str) -> Result<(), String> {
@@ -575,6 +616,37 @@ mod tests {
         let request = serde_json::json!({"backend": "bad/name", "op": "chat_completions"});
         let err = build_capability_resource("ai", "chat_completions", &request).unwrap_err();
         assert!(err.contains("Invalid backend name"));
+    }
+
+    #[test]
+    fn model_resource_with_offer() {
+        let request =
+            serde_json::json!({"offer_id": "offer:flash-chat:pair-a", "op": "runs_create"});
+        assert_eq!(
+            build_capability_resource("model", "runs_create", &request).unwrap(),
+            "elastos://model/offer:flash-chat:pair-a/runs_create"
+        );
+    }
+
+    #[test]
+    fn model_resource_without_offer() {
+        let request = serde_json::json!({"op": "offers_list"});
+        assert_eq!(
+            build_capability_resource("model", "offers_list", &request).unwrap(),
+            "elastos://model/meta/offers_list"
+        );
+    }
+
+    #[test]
+    fn model_resource_invalid_offer_fails_closed() {
+        let request = serde_json::json!({"offer_id": "bad/offer", "op": "runs_create"});
+        assert!(build_capability_resource("model", "runs_create", &request).is_err());
+    }
+
+    #[test]
+    fn model_resource_unknown_op_fails_closed() {
+        let request = serde_json::json!({"op": "runs_destroy"});
+        assert!(build_capability_resource("model", "runs_destroy", &request).is_err());
     }
 
     #[test]
