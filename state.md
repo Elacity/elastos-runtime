@@ -38,6 +38,17 @@ the public repository.
   Runtime/provider/Carrier orchestration, durable replay storage, recipient
   key-possession proof, decrypt/render product flows, installation, or
   deployment.
+- `feat/protected-content-operational-contracts` is the current local
+  dependent source-only child line stacked on
+  `origin/feat/protected-content-custody`. It adds the narrow typed v1 EVM
+  rights-policy body plus exact evidence request/result contracts, including
+  the exact EVM right string mapped from one product action, the
+  Profile-signed recipient-key authorization, the signed immutable custody
+  epoch, and the authenticated replay-pending Runtime-to-release-node
+  operation envelope. It does not prove X25519 secret-key possession, add
+  durable replay or custody-node state, expose actionable claimed requests,
+  wire Runtime/provider/product flows, or make an installed confidentiality
+  claim.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`

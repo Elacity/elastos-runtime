@@ -147,11 +147,17 @@ authority, storage APIs, or provider credentials.
 
 The dependency order for this work is strict:
 
-1. review the canonical v1 contract as source only;
-2. review custody, recipient-encryption, replay, and policy design;
-3. replace the provisional DTO/provider surface atomically and wire
-   Runtime/Wallet/provider integration to the reviewed contract; and
-4. prove the installed end-to-end open/decrypt/render path.
+A. review the canonical v1 source-only contract and operational contract
+   surface, including the exact EVM `has_access_by_content_id`
+   policy/evidence contract, recipient-key authorization, immutable custody
+   epochs, and the authenticated replay-pending Runtime-to-release-node
+   envelope;
+B. build source-only custody-node operations and durable node state on top of
+   that contract, including replay, issuer lifecycle, and operational review;
+C. replace the provisional DTO/provider surface atomically and wire
+   Runtime/Wallet/provider integration to the reviewed contract, with one
+   source allow flow and one source deny flow; and
+D. prove the installed end-to-end open/decrypt/render path.
 
 Carrier remains transport only throughout that sequence. It carries
 Runtime-selected traffic, but it does not define rights authority, custody

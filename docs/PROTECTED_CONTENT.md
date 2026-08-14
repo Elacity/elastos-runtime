@@ -10,12 +10,14 @@ The source tree currently has two protected-content layers:
   `elastos-protected-content-contracts` crate plus the companion
   `elastos-protected-content-custody` crate, documented in
   [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md). That
-  stack defines canonical authority bindings plus source-only custody helpers
-  for custody-envelope provisioning, recipient-sealed node release, and
-  recipient-side threshold reconstruction for new content. It is not yet wired
-  into Runtime orchestration, provider integration, durable replay storage,
-  recipient key-possession proof, decryption, playback, installation, or
-  deployment.
+  stack now defines canonical authority bindings, typed rights-policy and
+  evidence contracts, Profile-signed recipient-key authorization, signed
+  immutable custody epochs, a typed Runtime-to-release-node operation
+  envelope, and source-only custody helpers for custody-envelope
+  provisioning, recipient-sealed node release, and recipient-side threshold
+  reconstruction for new content. It is not yet wired into Runtime
+  orchestration, provider integration, durable replay storage, recipient
+  key-possession proof, decryption, playback, installation, or deployment.
 - The current installed/provider surface is the older provisional
   `elastos_common::protected_content` DTO set plus the fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -95,6 +97,12 @@ crate already defines canonical custody envelopes plus stored-share and
 released-share sealing for new content, but the Runtime/provider handoff to a
 decrypt boundary is still future integration work.
 
+The new Profile-signed recipient-key authorization in the v1 contract is an
+authorization object only. It binds one exact recipient public key and one
+exact Runtime operation issuer for one binding/action/session/time window. It
+does not prove X25519 secret-key possession. Actual holder-only possession
+remains a later Runtime-owned invariant.
+
 Other options were considered and rejected as the normal Runtime path:
 
 | Option | Shape | Assessment |
@@ -145,6 +153,40 @@ branch therefore makes no external cryptographic audit claim. The manifest
 commitment only detects that threshold reconstruction produced the wrong key; it
 does not identify the malicious node and it is not verifiable secret sharing.
 
+## Current source-only operational contracts
+
+The reviewed v1 contract stack now also defines the source-only operational
+contract layer that later Runtime and custody-node integrations must consume:
+
+- `RightsPolicyBodyV1`, `RightsEvaluationEvidenceRequestV1`, and
+  `RightsEvaluationEvidenceV1` provide one narrow typed EVM policy/evidence
+  shape grounded in the current `chain-provider`
+  `has_access_by_content_id` method only: exact Wallet-derived subject,
+  `chain_id`, contract bytes, selector, ABI identity, `content_id`, one exact
+  contract right string, the product action that policy maps to that right,
+  one bounded confirmation rule, and exact observed block/result evidence.
+  They do not carry RPC URLs, provider labels, or routes.
+- `SignedRecipientKeyAuthorizationV1` lets the authenticated Profile authorize
+  one exact recipient public key and one exact Runtime application-operation
+  issuer for one protected-content binding, action, session, and time window.
+- `SignedCustodyEpochV1` signs one immutable custody epoch over the exact node
+  signing keys, node custody keys, deterministic coordinates, threshold,
+  approved suites, and issuer key. Existing envelopes cannot silently inherit a
+  new epoch.
+- `SignedRuntimeReleaseOperationV1` is the typed application-authenticated
+  Runtime-to-release-node envelope above Carrier transport evidence. It binds
+  the exact Wallet request, exact release request, exact recipient bytes and
+  authorization, exact policy and evidence request, exact custody epoch, exact
+  Runtime issuer, one audit id, and one bounded window. Verification returns an
+  authenticated replay-pending value only. It exposes exact request hashes and
+  replay claim keys for a later atomic durable claim step, but it does not
+  expose actionable verified requests.
+
+This operational layer is still source-only. There is no provider registry
+cutover, durable replay store, recipient key-possession proof, node lifecycle
+service, installed product flow, or production confidentiality claim in this
+branch.
+
 ## Provider Boundary
 
 Normal capsules must not see:
@@ -169,22 +211,24 @@ The provider plane should expose typed questions instead:
 
 ## Remaining sequence
 
-1. Finish independent review of the source-only canonical v1 contract and
-   source-only custody helper, then close the remaining custody, replay,
-   recipient-key, and policy design decisions.
-2. Replace the provisional `elastos_common::protected_content` DTO/provider
+A. Finish the source-only review gate: professional external cryptographic and
+   contract review, plus any additional grounded HPKE wrapper known-answer
+   coverage that a reviewed upstream vector path can support.
+B. Build source-only custody-node operations and durable node state around the
+   reviewed contracts: node admission/rotation/revocation/recovery, durable
+   replay claims, issuer-key lifecycle, and operational audit retention.
+C. Replace the provisional `elastos_common::protected_content` DTO/provider
    surface atomically with Runtime-owned orchestration over the reviewed v1
-   contract: content status/fetch, typed rights checks, rights-bound key
-   release, release-receipt-bound decrypt/render sessions, sealed decrypt
-   material, and signed terminal receipts.
-3. Wire `rights-provider`, `key-provider`, and `decrypt-provider` to reviewed
-   policy, custody, and decrypt/render backends behind that one contract.
-4. Wire real protected-content producers to the existing sealed-object publish
-   contract after payload encryption, rights policy, availability receipt,
-   provenance, key-envelope, and viewer-interface generation exist.
-5. Add a reviewed custody-node lifecycle and, only after that, decide whether
-   a permissioned ElastOS PQ-hybrid dKMS layer should replace the pinned
-   source-only helper for new content.
+   contract: Wallet integration, recipient key generation and possession proof,
+   typed rights checks, rights-bound key release, release-receipt-bound
+   decrypt/render sessions, sealed decrypt material, and one source allow/deny
+   proof with no fallback path.
+D. Prove the installed end-to-end path: real protected-content producers,
+   installed provider/runtime flow, decrypt/render handoff, and final product
+   evidence.
+
+Only after A-D should ElastOS decide whether a permissioned PQ-hybrid dKMS
+layer should replace the pinned source-only helper for new content.
 
 Visible protected-content UI may ship only as a disabled/read-only readiness
 rail until fail-closed provider tests and capability-resource checks cover the

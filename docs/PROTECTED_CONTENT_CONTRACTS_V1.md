@@ -1,11 +1,12 @@
 # Protected-content v1 contracts
 
-Status: source-only authority and canonical-wire foundation. The normative
-authority types are in the `elastos-protected-content-contracts` crate, and the
-companion source-only custody helper lives in
-`elastos-protected-content-custody`. This document describes the reviewed
-contract layer; it does not claim running rights providers, custody nodes,
-content availability, decryption, playback, or product integration.
+Status: source-only authority, operational-contract, and canonical-wire
+foundation. The normative authority types are in the
+`elastos-protected-content-contracts` crate, and the companion source-only
+custody helper lives in `elastos-protected-content-custody`. This document
+describes the reviewed contract layer; it does not claim running rights
+providers, custody nodes, content availability, decryption, playback, or
+product integration.
 
 ## Authority boundaries
 
@@ -37,7 +38,7 @@ It binds all of the following:
 - canonical Profile Ed25519 public key;
 - recovered Wallet address;
 - non-secret, opaque 32-byte Runtime session binding;
-- node-set identity and threshold.
+- node-set identity, threshold, and custody-epoch identity.
 
 `RightsPolicyIdentityV1` identifies the exact immutable policy each node must
 evaluate. The policy body belongs to the rights provider. Its identity contains
@@ -131,6 +132,114 @@ authentic `Allowed` receipt is not key-release authority. The release verifier
 does not accept this receipt type. A forged or unsigned allow therefore has no
 path into release verification.
 
+## Typed policy and recipient-key authorization
+
+`RightsPolicyBodyV1` is the v1 immutable policy body. It is intentionally
+narrow and grounded in the current reviewed rights-provider surface:
+
+- one exact `content_id`;
+- one exact required `RightsActionV1`;
+- one exact EVM right argument string sent as the third
+  `has_access_by_content_id(content_id, subject, right)` ABI argument;
+- one exact subject source: the Wallet address from
+  `ProtectedContentBindingV1`;
+- one exact EVM `chain_id`;
+- one exact 20-byte EVM contract address;
+- one exact 4-byte function selector;
+- one exact ABI identity:
+  `HasAccessByContentIdStringAddressString`;
+- one exact bounded observation/finality rule:
+  `RightsObservationFinalityV1::min_confirmations`.
+
+This is not a generic policy language, opaque byte blob, or arbitrary map.
+It is the smallest reviewed source-only policy shape that matches the current
+typed `chain-provider` `has_access_by_content_id` path. The signed policy now
+explicitly maps one product `RightsActionV1` to one exact contract right string,
+so two nodes cannot claim the same policy identity while sending different ABI
+right arguments. Production-approved chain ids, contract addresses, selectors,
+ABI fixtures, and right strings remain open review inputs, but they are
+required typed policy fields now, not ambient provider configuration.
+
+`RightsEvaluationEvidenceRequestV1` is the matching typed evidence request. It
+pins the exact `ProtectedContentBindingV1` and `RightsPolicyIdentityV1`. A node
+cannot claim to evaluate a different policy or a different Wallet/content/
+session binding than the one named in the request.
+
+`RightsEvaluationEvidenceV1` is the matching typed evaluation result. It binds
+the same exact binding and policy identity plus:
+
+- the exact Wallet subject address derived from the binding;
+- the exact observed chain id;
+- the exact observed block number and block hash;
+- the exact head block number used for the finality rule; and
+- the exact `has_access` result.
+
+Verification rejects a different Wallet subject, different chain, or
+insufficient confirmation depth before any provider integration exists. RPC
+URLs, provider labels, transport routes, and endpoint identity remain outside
+the contract. Because the evidence binds the exact `RightsPolicyIdentityV1`, it
+indirectly pins the full reviewed policy body: contract, selector, ABI, exact
+right argument, content id, and finality rule.
+
+`SignedRecipientKeyAuthorizationV1` is a Profile-signed recipient-key
+authorization. It binds all of the following:
+
+- the exact `ProtectedContentBindingV1`;
+- the exact requested action;
+- the exact recipient X25519 public-key bytes;
+- the exact `RecipientKeyIdentityV1`;
+- the exact Runtime application-operation issuer key;
+- the shared opaque Runtime session binding;
+- one bounded issue/expiry window.
+
+Verification compares the recipient bytes to `RecipientKeyIdentityV1`, the
+Profile signer to the binding Profile, the Runtime issuer to the signed issuer,
+and the window to the parent binding/action/session context. This object proves
+authorization only. It does not prove that the recipient holds the X25519
+secret key. Actual recipient-key possession remains a later Runtime-owned
+invariant.
+
+## Custody epoch and Runtime release operation
+
+`SignedCustodyEpochV1` is the immutable signed custody epoch. Its statement
+binds:
+
+- the exact epoch issuer key;
+- the exact approved recipient/stored-share/released-share suite ids;
+- the exact threshold;
+- the exact ordered node list of:
+  - Ed25519 node signing key,
+  - X25519 node custody public key,
+  - deterministic share coordinate.
+
+The node list is canonicalized by node signing key, and the coordinates are
+reassigned deterministically from that order. `KeyEnvelopeIdentityV1` now pins
+the resulting `CustodyEpochIdentityV1`, so the epoch signature is not
+self-authorizing and an existing envelope cannot silently inherit a different
+issuer, node set, threshold, or suite.
+
+`SignedRuntimeReleaseOperationV1` is the typed application-authenticated
+Runtime-to-release-node envelope above Carrier transport authentication. It
+binds:
+
+- the exact canonical Wallet-signed rights request bytes and derived hash;
+- the exact canonical key-release request bytes and derived hash;
+- the exact recipient public-key bytes;
+- the exact signed recipient-key authorization;
+- the exact typed policy body, policy identity, and evidence request;
+- the exact signed custody epoch and bound key-envelope identity;
+- the exact Runtime application-operation issuer;
+- one bounded audit request id and issue/expiry window.
+
+Verification proves those bindings and requires the Profile-signed
+recipient-key authorization to authorize the Runtime issuer. Carrier endpoint
+authentication remains transport evidence only. This source-only contract does
+not implement durable replay state or provider routing. Verification returns an
+authenticated replay-pending surface only: it proves signatures and exact
+bindings, exposes the nested request hashes and replay-claim keys, and does not
+expose actionable `VerifiedRightsRequestV1` or `VerifiedKeyReleaseRequestV1`
+values. Runtime and custody-node durable replay claims remain later work.
+
 ## Node decision and contribution
 
 `KeyReleaseRequestV1` binds the same protected-content identity, original
@@ -139,12 +248,11 @@ separately claimed release nonce. It stays inside the verified Wallet request
 window.
 
 `KeyReleaseRequestV1` is not a Runtime signature or a bearer grant. A remote
-node must receive the canonical Wallet request and release request through a
-typed, application-authenticated Runtime-to-provider operation. The node must
-verify both requests and claim replay in its own durable store before it acts.
+node must receive the canonical Wallet request and release request through the
+typed `SignedRuntimeReleaseOperationV1` envelope. The node must still verify
+the nested requests and claim replay in its own durable store before it acts.
 Carrier endpoint authentication alone does not prove who authored the
-application request. That operation envelope is integration work and is not
-defined by this source-only crate.
+application request.
 
 Each node creates `SignedNodeRightsDecisionV1` after independently evaluating
 the exact rights-policy identity. The signed statement binds the release and
@@ -189,14 +297,15 @@ release.
 ## Threat model and fail-closed rules
 
 Tests reject wrong Wallet, attacker-signed victim address, wrong content,
-policy, node set, threshold, Profile, session, action, request hash, issuer,
-recipient, expiry, replay, and post-signature mutation. They also reject a
-forged allow receipt, nonce reuse after changing fields, child lifetime escape,
-a denied or cross-node decision, cross-request contribution reuse, duplicate
-node/decision/contribution/commitment evidence, insufficient threshold,
-required-plus-one released evidence, malformed canonical input, noncanonical
-Wallet/Profile encodings, and noncanonical/low-order X25519 contract key
-encodings.
+policy, evidence request, node set, threshold, Profile, session, action,
+request hash, issuer, recipient, recipient-key identity, Runtime issuer,
+custody epoch, approved suite, expiry, replay, and post-signature mutation.
+They also reject a forged allow receipt, nonce reuse after changing fields,
+child lifetime escape, a denied or cross-node decision, cross-request
+contribution reuse, duplicate node/decision/contribution/commitment evidence,
+insufficient threshold, required-plus-one released evidence, malformed
+canonical input, noncanonical Wallet/Profile encodings, and noncanonical or
+low-order X25519 contract key encodings.
 
 These contracts plus the source-only `elastos-protected-content-custody` helper
 do not solve malicious custody nodes, rights-policy correctness, durable replay
