@@ -1688,7 +1688,7 @@ const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-p
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
 const homeAssetVersion = "home-20260805a";
 const homeClipboardAssetVersion = "home-20260726a";
-const homeGuiAssetVersion = "home-20260813a";
+const homeGuiAssetVersion = "home-20260814a";
 const homeShellHostAssetVersion = "home-20260802a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
@@ -1786,11 +1786,14 @@ assert(
   "The shortcuts overlay documents only surfaces that exist: no Wallet row until the wallet rail lands",
 );
 assert(
-  !/agent|harness/i.test(shellStages) &&
-    !/agent|harness/i.test(shellExpose) &&
-    !shellWindows.includes("AgentWorkspace") &&
-    !homeGuiTemplateHtml.includes("agent"),
-  "Stages and Mission Control migrate without the agent harness: no Agent Space, no shelf morph, no workspace snapshot hook",
+  shellStages.includes("export function agentStageId()") &&
+    shellStages.includes("export function isAgentSpace(") &&
+    shellWindows.includes("bindAgentWorkspaceSnapshot") &&
+    shellWindows.includes("scheduleAgentWorkspacePersist") &&
+    homeGuiTemplateHtml.includes('id="agent-harness"') &&
+    homeGuiTemplateHtml.includes('id="viewer-rail"') &&
+    homeGuiTemplateHtml.includes('id="shelf-morph-stage"'),
+  "Agent harness is wired: Agent Space, workspace snapshot hook, harness + viewer + shelf markup",
 );
 assert(
   !/fetch\(/.test(shellStages) &&

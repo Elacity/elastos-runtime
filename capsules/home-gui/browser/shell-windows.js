@@ -19,7 +19,7 @@ import {
   saveShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20260814a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -30,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260813a";
+} from "./shell-window-geometry.js?v=home-20260814a";
 import {
   applyFullscreenStageFromPlacement,
   bindStageWindowHooks,
@@ -47,7 +47,7 @@ import {
   setActiveStage,
   toggleFullscreenStage,
   windowVisibleOnActiveSpace,
-} from "./shell-stages.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20260814a";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -222,6 +222,35 @@ function currentRootShellSessionId() {
   return HOME_GUI_SHELL_ID;
 }
 
+let agentWorkspaceSnapshotFn = null;
+let agentWorkspacePersistTimer = 0;
+
+/** Agent harness registers a snapshotter so chat/projects ride the host session. */
+export function bindAgentWorkspaceSnapshot(getSnapshot) {
+  agentWorkspaceSnapshotFn = typeof getSnapshot === "function" ? getSnapshot : null;
+}
+
+function agentWorkspaceForPersist() {
+  try {
+    const snap = agentWorkspaceSnapshotFn?.();
+    return snap && typeof snap === "object" ? snap : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Debounced persist after pin / project / chat edits (host session blob). */
+export function scheduleAgentWorkspacePersist() {
+  if (shellState.restoringSession) {
+    return;
+  }
+  window.clearTimeout(agentWorkspacePersistTimer);
+  agentWorkspacePersistTimer = window.setTimeout(() => {
+    agentWorkspacePersistTimer = 0;
+    persistBrowserSession();
+  }, 200);
+}
+
 function persistBrowserSession() {
   if (shellState.restoringSession) {
     return;
@@ -230,6 +259,7 @@ function persistBrowserSession() {
 }
 
 export function snapshotBrowserSession() {
+  const agent = agentWorkspaceForPersist();
   return {
     root_shell: currentRootShellSessionId(),
     windows: persistedBrowserSessionEntries(),
@@ -237,6 +267,7 @@ export function snapshotBrowserSession() {
     active_stage: stableSpaceKeyForId(getActiveStageId()),
     space_order: (Array.isArray(shellState.spaceOrder) ? shellState.spaceOrder : [])
       .map((id) => stableSpaceKeyForId(id)),
+    ...(agent ? { agent } : {}),
   };
 }
 

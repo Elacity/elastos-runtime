@@ -289,20 +289,977 @@
   </section>
 </main>
 
-<footer class="taskbar" aria-label="Home taskbar" data-home-gui-hidden-by-host="hidden" inert hidden>
-  <div class="taskbar-inner">
-    <div class="taskbar-primary">
+<!-- Viewer rail: slide-over hosting an artifact's capsule (document / video /
+     web / table) beside the Agent chat. Same sandboxed-iframe + authority-
+     carrying launch as the wallet rail; dynamic target, single slot. -->
+<aside
+  id="viewer-rail"
+  class="wallet-rail viewer-rail"
+  role="complementary"
+  aria-label="Viewer"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="wallet-rail-head">
+    <span id="viewer-rail-icon" class="viewer-rail-icon" aria-hidden="true"></span>
+    <h2 id="viewer-rail-title" class="wallet-rail-title">Viewer</h2>
+    <div class="wallet-rail-head-actions">
       <button
-        id="launcher-toggle"
-        class="taskbar-item taskbar-item-launcher"
+        id="viewer-rail-open-window"
+        class="wallet-rail-head-btn wallet-rail-text-btn"
         type="button"
-        aria-label="Open launcher"
-        aria-controls="launcher"
+        aria-label="Open as a window"
+        title="Open as a window"
+      >
+        Open
+      </button>
+      <button
+        id="viewer-rail-close"
+        class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"
+        type="button"
+        aria-label="Close viewer"
+      >
+        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+      </button>
+    </div>
+  </div>
+  <div id="viewer-rail-media" class="viewer-rail-media" hidden></div>
+  <iframe id="viewer-rail-frame" class="wallet-rail-frame" title="Viewer" hidden></iframe>
+  <div id="viewer-rail-error" class="wallet-rail-error" hidden>
+    <h3 class="wallet-rail-error-title">Could not open viewer</h3>
+    <p class="wallet-rail-error-copy">
+      Home asked the runtime to open this, but the launch did not complete. It may be
+      momentary — trying again is safe.
+    </p>
+    <p id="viewer-rail-error-detail" class="wallet-rail-error-detail"></p>
+    <button id="viewer-rail-retry" class="window-error-retry" type="button">Try Again</button>
+  </div>
+</aside>
+
+<canvas
+  id="agent-home-drop-canvas"
+  class="agent-home-drop-canvas"
+  hidden
+  aria-hidden="true"
+></canvas>
+<section
+  id="agent-harness"
+  class="agent-harness"
+  hidden
+  aria-hidden="true"
+  aria-label="Agent"
+>
+  <button
+    type="button"
+    id="agent-harness-scrim"
+    class="agent-harness-scrim"
+    hidden
+    aria-hidden="true"
+    tabindex="-1"
+    aria-label="Close sessions"
+  ></button>
+  <aside id="agent-harness-sidebar" class="agent-harness-sidebar" aria-label="Agent sessions">
+    <div class="agent-harness-sidebar-head">
+      <div class="agent-harness-brand">
+        <span class="agent-harness-brand-name">Agent</span>
+        <span class="agent-harness-brand-sub">On this Home</span>
+      </div>
+      <div class="agent-harness-sidebar-actions">
+        <button
+          id="agent-harness-panel-toggle"
+          class="agent-harness-icon-btn agent-harness-panel-toggle"
+          type="button"
+          aria-label="Close sidebar"
+          title="Close sidebar"
+        >
+          <span class="agent-harness-icon-panel" aria-hidden="true"></span>
+        </button>
+        <button
+          id="agent-harness-search-open"
+          class="agent-harness-icon-btn agent-harness-search-open"
+          type="button"
+          aria-label="Search chats"
+          title="Search chats"
+          aria-haspopup="dialog"
+          aria-controls="agent-session-search"
+        >
+          <span class="agent-harness-icon-search" aria-hidden="true"></span>
+        </button>
+      </div>
+    </div>
+    <div class="agent-harness-segment" role="group" aria-label="Session mode">
+      <button
+        class="agent-harness-segment-btn is-active"
+        type="button"
+        data-segment="chat"
+        aria-pressed="true"
+        title="Chat — answers and grant asks; tools start at zero"
+      >
+        Chat
+      </button>
+      <button
+        class="agent-harness-segment-btn"
+        type="button"
+        data-segment="build"
+        aria-pressed="false"
+        title="Build — plan/outputs theatre; no write authority until ADE sandbox"
+      >
+        Build
+      </button>
+    </div>
+    <div class="agent-harness-nav-cluster">
+      <button id="agent-harness-new-chat" class="agent-harness-new-chat" type="button" title="Start a new chat">
+        <span aria-hidden="true">+</span>
+        <span>New chat</span>
+      </button>
+      <button
+        id="agent-harness-home"
+        class="agent-harness-home"
+        type="button"
+        title="Return to Home OS (Esc)"
+      >
+        <span class="agent-harness-home-mark" aria-hidden="true"></span>
+        <span>Home</span>
+      </button>
+      <nav class="agent-harness-nav" aria-label="Agent destinations">
+        <button type="button" class="agent-harness-nav-row" data-sidebar-nav="studio">
+          <span class="agent-harness-nav-mark" data-nav-icon="studio" aria-hidden="true"></span>
+          <span>Studio</span>
+        </button>
+        <button type="button" class="agent-harness-nav-row" data-sidebar-nav="configure">
+          <span class="agent-harness-nav-mark" data-nav-icon="configure" aria-hidden="true"></span>
+          <span>Settings</span>
+        </button>
+        <button type="button" class="agent-harness-nav-row" data-sidebar-nav="usage">
+          <span class="agent-harness-nav-mark" data-nav-icon="usage" aria-hidden="true"></span>
+          <span>Usage</span>
+        </button>
+      </nav>
+    </div>
+    <div class="agent-projects-block" data-agent-projects>
+      <div class="agent-projects-head">
+        <span class="agent-projects-label">Projects</span>
+        <button
+          type="button"
+          class="agent-projects-add"
+          data-project-add
+          aria-label="New project"
+          title="Group chats around a project"
+        >
+          +
+        </button>
+      </div>
+      <form
+        class="agent-projects-create"
+        data-project-create
+        hidden
+        method="post"
+        action="#"
+        onsubmit="return false;"
+      >
+        <input
+          class="agent-projects-create-input"
+          data-project-create-input
+          type="text"
+          maxlength="48"
+          placeholder="Project name"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Project name — Enter to add, Esc to cancel"
+        />
+        <!-- Hidden submit so Enter can submit; onsubmit=return false blocks navigation. -->
+        <button type="submit" class="agent-projects-create-submit" tabindex="-1" aria-hidden="true">
+          Add
+        </button>
+        <button type="button" class="agent-projects-create-cancel" data-project-create-cancel aria-label="Cancel">
+          ×
+        </button>
+      </form>
+      <div class="agent-projects-list" data-projects-list></div>
+    </div>
+    <div class="agent-harness-sessions" id="agent-harness-session-list"></div>
+  </aside>
+  <div
+    id="agent-session-search"
+    class="agent-session-search"
+    hidden
+    inert
+    aria-hidden="true"
+  >
+    <div
+      class="agent-session-search-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Search chats"
+    >
+      <div class="agent-session-search-bar">
+        <span class="agent-session-search-glyph" aria-hidden="true"></span>
+        <input
+          id="agent-session-search-input"
+          class="agent-session-search-input"
+          type="search"
+          placeholder="Search chats"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button
+          id="agent-session-search-close"
+          class="agent-session-search-close"
+          type="button"
+          aria-label="Close search"
+        >
+          <span aria-hidden="true">×</span>
+        </button>
+      </div>
+      <div
+        id="agent-session-search-results"
+        class="agent-session-search-results"
+        role="listbox"
+        aria-label="Chat results"
+      ></div>
+    </div>
+  </div>
+  <div class="agent-harness-main">
+    <div class="agent-harness-mobile-bar">
+      <button
+        id="agent-harness-drawer-open"
+        class="agent-harness-drawer-toggle"
+        type="button"
+        aria-label="Open sessions"
+        aria-expanded="false"
+        aria-controls="agent-harness-sidebar"
+        title="Sessions"
+      >
+        <span class="agent-harness-icon-panel" aria-hidden="true"></span>
+      </button>
+      <h2 id="agent-harness-title" class="agent-harness-title">New chat</h2>
+      <button
+        id="agent-harness-search-open-main"
+        class="agent-harness-icon-btn agent-harness-search-open"
+        type="button"
+        aria-label="Search chats"
+        title="Search chats"
+        aria-haspopup="dialog"
+        aria-controls="agent-session-search"
+      >
+        <span class="agent-harness-icon-search" aria-hidden="true"></span>
+      </button>
+      <button
+        type="button"
+        class="agent-harness-icon-btn agent-workbench-open-btn"
+        data-workbench-open
+        aria-label="Open workbench"
+        title="Workbench — outputs, plan, library"
+        aria-controls="agent-workbench-rail"
         aria-expanded="false"
       >
-        <span class="taskbar-icon taskbar-icon-launcher"></span>
+        <span class="agent-harness-icon-workbench" aria-hidden="true"></span>
       </button>
-      <div id="taskbar-targets" class="taskbar-sortable" aria-label="Taskbar items"></div>
+    </div>
+    <div class="agent-harness-stream-viewport">
+      <p
+        class="agent-inference-status"
+        data-agent-inference-status
+        data-state="preview"
+        role="status"
+      >
+        Preview · not live inference — mock replies until a local model is wired
+      </p>
+      <p
+        class="agent-stream-status"
+        data-agent-stream-status
+        data-tone="idle"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        hidden
+      ></p>
+      <div
+        id="agent-harness-stream"
+        class="agent-harness-stream"
+        role="log"
+        aria-live="off"
+        aria-relevant="additions"
+      >
+        <div class="agent-harness-stream-column" id="agent-harness-stream-column"></div>
+        <button
+          type="button"
+          class="agent-jump-latest"
+          data-agent-jump-latest
+          hidden
+        >
+          Jump to latest
+        </button>
+      </div>
+    </div>
+    <section
+      class="agent-harness-page"
+      data-harness-page
+      role="region"
+      aria-label="Agent page"
+      tabindex="-1"
+      hidden
+    >
+      <div class="agent-harness-page-column">
+        <header class="agent-harness-page-head">
+          <div class="agent-harness-page-heading">
+            <h2 class="agent-harness-page-title" data-page-title>Settings</h2>
+            <p class="agent-harness-page-sub" data-page-sub hidden></p>
+          </div>
+          <button
+            type="button"
+            class="agent-harness-page-close"
+            data-page-close
+            aria-label="Back to chat"
+            title="Back to chat (Esc)"
+          ></button>
+        </header>
+
+        <div class="agent-harness-page-section" data-page-section="configure" hidden>
+          <nav class="agent-configure-sections" aria-label="Settings sections">
+            <button type="button" class="agent-configure-chip is-active" data-configure-section="overview">
+              Overview
+            </button>
+            <button type="button" class="agent-configure-chip" data-configure-section="machine">
+              Machine
+            </button>
+            <button type="button" class="agent-configure-chip" data-configure-section="models">
+              Models
+            </button>
+            <button type="button" class="agent-configure-chip" data-configure-section="prompt">
+              Prompt
+            </button>
+            <button type="button" class="agent-configure-chip" data-configure-section="tools">
+              Tools
+            </button>
+            <button type="button" class="agent-configure-chip" data-configure-section="runtime">
+              Runtime
+            </button>
+            <button type="button" class="agent-configure-chip" data-configure-section="permissions">
+              Permissions
+            </button>
+          </nav>
+
+          <div data-configure-panel="overview">
+            <div class="agent-configure-overview" data-configure-overview></div>
+            <p class="agent-harness-page-foot">
+              Automatic by default — this machine is detected. Remotes come later.
+            </p>
+          </div>
+
+          <div data-configure-panel="machine" hidden>
+            <div class="agent-machine-card" data-machine-card></div>
+            <p class="agent-harness-page-foot">
+              Profile is literacy for Picks — not an agent grant (UI ≠ authority).
+            </p>
+          </div>
+
+          <div data-configure-panel="models" hidden>
+            <p class="agent-harness-page-caption" data-models-device hidden></p>
+            <div class="agent-model-hero" data-models-hero hidden></div>
+            <p class="agent-models-section-title">Mine</p>
+            <div
+              class="agent-model-menu-list"
+              data-models-installed
+              role="listbox"
+              aria-label="Preview models on this device"
+            ></div>
+            <div data-models-picks></div>
+            <p class="agent-models-section-title">Get</p>
+            <div
+              class="agent-model-menu-list"
+              data-models-discover
+              role="list"
+              aria-label="Preview models to add"
+            ></div>
+            <p class="agent-harness-page-foot">
+              Get is preview only — in-session stub, not a real weight download until runtime grants exist.
+            </p>
+          </div>
+
+          <div data-configure-panel="prompt" hidden>
+            <div class="agent-prompt-panel" data-prompt-panel>
+              <label class="agent-prompt-label" for="agent-system-prompt">System prompt</label>
+              <textarea
+                id="agent-system-prompt"
+                class="agent-prompt-textarea"
+                data-system-prompt
+                rows="8"
+                maxlength="8000"
+                spellcheck="true"
+                placeholder="Principles-safe default — knowledge only, no tools."
+              ></textarea>
+              <div class="agent-prompt-actions">
+                <button type="button" class="agent-prompt-reset" data-system-prompt-reset>
+                  Reset to default
+                </button>
+                <span class="agent-prompt-count" data-system-prompt-count></span>
+              </div>
+              <label class="agent-prompt-label" for="agent-home-notes">Notes on this Home</label>
+              <textarea
+                id="agent-home-notes"
+                class="agent-prompt-textarea"
+                data-agent-notes
+                rows="4"
+                maxlength="4000"
+                spellcheck="true"
+                placeholder="Sticky facts for Live turns — host-persisted on this Home only. Not cloud memory."
+              ></textarea>
+              <p class="agent-harness-page-foot">
+                Notes append to the system prompt for Live · never leave this Home · UI ≠ authority
+              </p>
+              <div class="agent-prompt-params">
+                <label class="agent-prompt-param">
+                  <span>Temperature</span>
+                  <input
+                    type="number"
+                    min="0"
+                    max="2"
+                    step="0.05"
+                    data-agent-temperature
+                    inputmode="decimal"
+                  />
+                </label>
+                <label class="agent-prompt-param">
+                  <span>Max tokens</span>
+                  <input
+                    type="number"
+                    min="16"
+                    max="8192"
+                    step="16"
+                    data-agent-max-tokens
+                    inputmode="numeric"
+                  />
+                </label>
+              </div>
+              <div class="agent-backends-panel" data-offers-panel>
+                <p class="agent-prompt-label">Model offers on this Home</p>
+                <ul class="agent-offers-list" data-offers-list></ul>
+                <div class="agent-prompt-actions">
+                  <span class="agent-prompt-count" data-offers-status>Gateway-mediated</span>
+                </div>
+              </div>
+              <p class="agent-harness-page-foot">
+                Host-persisted prefs · offers are operator-configured · UI ≠ authority
+              </p>
+            </div>
+          </div>
+
+          <div data-configure-panel="tools" hidden>
+            <ul class="agent-tools-list agent-tools-list-manage" data-page-tools></ul>
+            <button type="button" class="agent-tools-demo" data-tools-demo-grant>
+              Demo Library grant card
+            </button>
+            <p class="agent-harness-page-foot">Preview · Inbox grammar · UI ≠ authority</p>
+          </div>
+
+          <div data-configure-panel="runtime" hidden>
+            <div class="agent-runtime-badges" data-runtime-badges></div>
+            <p class="agent-runtime-offers" data-runtime-offers></p>
+            <dl class="agent-status-dl agent-status-dl-page" data-page-status></dl>
+            <p class="agent-runtime-note" data-runtime-note></p>
+            <p class="agent-harness-page-foot">UI ≠ authority · preview literacy</p>
+          </div>
+
+          <div data-configure-panel="permissions" hidden>
+            <p class="agent-harness-page-caption">
+              This agent's session grants — what this assistant may touch, right now.
+              Revoke removes the grant at the runtime, not just this view.
+            </p>
+            <div class="agent-permissions-list" data-permissions-list></div>
+            <p class="agent-harness-page-foot">
+              Agent-scoped only · machine-wide app access lives in System → Security
+            </p>
+          </div>
+        </div>
+
+        <div class="agent-harness-page-section" data-page-section="usage" hidden>
+          <div class="agent-usage" data-usage-page></div>
+        </div>
+
+        <div class="agent-harness-page-section" data-page-section="studio" hidden>
+          <div class="agent-studio" data-studio-page>
+            <p class="agent-studio-profile" data-studio-profile data-state="offline">
+              Checking creative backend…
+            </p>
+            <form class="agent-studio-form" data-studio-form method="post" action="#" onsubmit="return false;">
+              <div class="agent-studio-row">
+                <label class="agent-prompt-param">
+                  <span>Skill</span>
+                  <select data-studio-mode aria-label="Studio skill">
+                    <option value="generate" selected>Generate</option>
+                    <option value="storyboard">Storyboard</option>
+                    <option value="character">Character / Ref2VA</option>
+                  </select>
+                </label>
+                <label class="agent-prompt-param">
+                  <span>GPUs</span>
+                  <select data-studio-scale aria-label="GPU scale">
+                    <option value="1">1× · learn</option>
+                    <option value="2" selected>2× · everyday</option>
+                    <option value="4">4× · max</option>
+                  </select>
+                </label>
+                <label class="agent-prompt-param">
+                  <span data-studio-duration-label>Duration</span>
+                  <select data-studio-duration aria-label="Clip duration">
+                    <option value="2">2s</option>
+                    <option value="3">3s</option>
+                    <option value="5">5s</option>
+                    <option value="10" selected>10s</option>
+                    <option value="15">15s</option>
+                    <option value="30">30s</option>
+                  </select>
+                </label>
+              </div>
+              <!-- Occam: no always-on scale explainer line; status/Generate carry honesty. -->
+              <div class="agent-studio-storyboard" data-studio-storyboard hidden>
+                <label class="agent-prompt-label" for="agent-studio-shots">Shots (one per line)</label>
+                <textarea
+                  id="agent-studio-shots"
+                  class="agent-prompt-textarea"
+                  data-studio-shots
+                  rows="6"
+                  maxlength="10000"
+                  spellcheck="true"
+                  placeholder="Wide showroom, avocado carpet, camera zooms to velvet pedestal&#10;Pitchman rips gold cloth — ordinary grey rock on pedestal&#10;Hero macros of the rock under studio lights, stereo funk bed&#10;Salesman leans into camera: buy one, buy five"
+                ></textarea>
+                <p class="agent-studio-ref-note" data-studio-storyboard-note>
+                  One Generate per shot, then ffmpeg stitch on this Home (2–8 lines)
+                </p>
+                <p class="agent-studio-ref-note agent-studio-storyboard-total" data-studio-storyboard-total hidden></p>
+              </div>
+              <label class="agent-prompt-label" for="agent-studio-prompt" data-studio-prompt-label>Prompt</label>
+              <textarea
+                id="agent-studio-prompt"
+                class="agent-prompt-textarea"
+                data-studio-prompt
+                rows="5"
+                maxlength="12000"
+                spellcheck="true"
+                placeholder="A quiet alley after rain — neon reflections, soft footsteps, stereo ambience"
+              ></textarea>
+              <div class="agent-studio-refs" data-studio-refs hidden>
+                <label class="agent-prompt-label" for="agent-studio-ref-files">Face / identity stills (up to 6)</label>
+                <input
+                  id="agent-studio-ref-files"
+                  class="agent-studio-ref-files"
+                  data-studio-ref-files
+                  type="file"
+                  accept="image/*"
+                  multiple
+                />
+                <p class="agent-studio-ref-note" data-studio-ref-note>No face stills selected</p>
+                <label class="agent-prompt-param">
+                  <span>Identity lock</span>
+                  <select data-studio-ref-size aria-label="Identity lock strength">
+                    <option value="match" selected>Match — faster</option>
+                    <option value="max">Max — stronger lock</option>
+                  </select>
+                </label>
+                <label class="agent-prompt-label" for="agent-studio-voice-file">Voice clip (optional)</label>
+                <input
+                  id="agent-studio-voice-file"
+                  class="agent-studio-ref-files"
+                  data-studio-voice-file
+                  type="file"
+                  accept="audio/*"
+                />
+                <!-- Occam: one helper line; per-field note elements removed from markup. -->
+                <p class="agent-studio-ref-note" data-studio-ref-note>Face stills + optional voice clip lock the person.</p>
+                <span data-studio-voice-note hidden></span>
+              </div>
+              <div class="agent-studio-row agent-studio-row--submit">
+                <button type="submit" class="agent-studio-submit" data-studio-submit>
+                  Generate
+                </button>
+              </div>
+            </form>
+            <p class="agent-studio-status" data-studio-status data-tone="idle" role="status" hidden></p>
+            <div class="agent-studio-progress" data-studio-progress hidden>
+              <div class="agent-studio-progress-track">
+                <div class="agent-studio-progress-bar" data-studio-progress-bar></div>
+              </div>
+              <p class="agent-studio-progress-label" data-studio-progress-label></p>
+            </div>
+            <video
+              class="agent-studio-video"
+              data-studio-video
+              controls
+              playsinline
+              preload="auto"
+              hidden
+            ></video>
+            <a
+              class="agent-studio-download"
+              data-studio-download
+              download
+              hidden
+              >Save clip</a
+            >
+            <section class="agent-studio-library" data-studio-library aria-label="Clips on this Home">
+              <div class="agent-studio-library-head">
+                <h3 class="agent-studio-library-title">Clips on this Home</h3>
+                <button
+                  type="button"
+                  class="agent-studio-library-refresh"
+                  data-studio-library-refresh
+                  title="Refresh"
+                  aria-label="Refresh clips"
+                >
+                  <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.61-3.89M13.5 1.75v3h-3"/></svg>
+                </button>
+              </div>
+              <ul class="agent-studio-library-list" data-studio-library-list></ul>
+              <p class="agent-studio-library-empty" data-studio-library-empty hidden>
+                No clips yet — Generate one above.
+              </p>
+            </section>
+            <!-- Footer removed: Studio status + allocator line already says prepare/busy. -->
+
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <!-- Collapsed-by-default session rail (ChatGPT/Claude-like). Status/Tools live in Settings. -->
+  <button
+    type="button"
+    class="agent-workbench-fab"
+    data-workbench-open
+    aria-label="Open workbench"
+    title="Workbench — outputs, plan, library"
+    aria-controls="agent-workbench-rail"
+    aria-expanded="false"
+  >
+    <span class="agent-harness-icon-workbench" aria-hidden="true"></span>
+  </button>
+  <aside
+    id="agent-workbench-rail"
+    class="agent-harness-outputs"
+    aria-label="Workbench"
+    data-workbench-rail
+    hidden
+  >
+    <div class="agent-harness-outputs-head">
+      <span data-workbench-title>Workbench</span>
+      <div class="agent-harness-outputs-head-actions">
+        <span class="agent-harness-outputs-preview">preview</span>
+        <button
+          type="button"
+          class="agent-workbench-close"
+          data-workbench-close
+          aria-label="Close workbench"
+          title="Close workbench"
+        >
+          ×
+        </button>
+      </div>
+    </div>
+    <div class="agent-workbench-tabs" role="tablist" aria-label="Workbench panels">
+      <button type="button" class="agent-workbench-tab is-active" role="tab" data-workbench-tab="outputs" aria-selected="true">Outputs</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="plan" aria-selected="false">Plan</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="library" aria-selected="false">Library</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="diff" aria-selected="false" data-build-only hidden>Diff</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="browser" aria-selected="false">Browser</button>
+      <button type="button" class="agent-workbench-tab" role="tab" data-workbench-tab="terminal" aria-selected="false">Term</button>
+    </div>
+    <div class="agent-workbench-panels">
+      <div class="agent-workbench-panel is-active" data-workbench-panel="outputs" role="tabpanel">
+        <ul class="agent-harness-outputs-list" data-outputs-list>
+          <li><button type="button" class="agent-harness-output-chip" data-output-id="plan.md" title="Preview artifact">plan.md</button></li>
+          <li><button type="button" class="agent-harness-output-chip" data-output-id="notes.txt" title="Preview artifact">notes.txt</button></li>
+        </ul>
+        <p class="agent-workbench-hint">Mock artifacts · not written to disk</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="plan" role="tabpanel" hidden>
+        <div class="agent-plan-editor" data-plan-root>
+          <label class="visually-hidden" for="agent-plan-markdown">Shared plan</label>
+          <textarea
+            id="agent-plan-markdown"
+            class="agent-plan-markdown"
+            data-plan-markdown
+            spellcheck="false"
+          >### To-dos
+- [ ] Clarify what to build
+- [/] Sketch capsule surface
+- [ ] Declare capabilities
+- [ ] Local install (later)</textarea>
+        </div>
+        <p class="agent-workbench-hint">Shared checklist · human + mock agent</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="library" role="tabpanel" hidden>
+        <div class="agent-library-chips" data-library-chips>
+          <p class="agent-library-empty" data-library-empty>
+            Desktop objects appear here. Attach from the composer — content extract needs a
+            library.read grant (Inbox; UI ≠ authority).
+          </p>
+        </div>
+        <p class="agent-workbench-hint">Rooted nouns only · no host filesystem</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="diff" role="tabpanel" hidden>
+        <div class="agent-diff-card">
+          <p class="agent-diff-path">capsule.json</p>
+          <pre class="agent-diff-body">+ "name": "weekend-notes"
++ "capabilities": ["library.read"]</pre>
+          <div class="agent-diff-actions">
+            <button type="button" class="agent-diff-btn" disabled title="Needs ADE sandbox grant">Apply</button>
+            <button type="button" class="agent-diff-btn" disabled title="Needs ADE sandbox grant">Reject</button>
+          </div>
+        </div>
+        <p class="agent-workbench-hint">Needs ADE grant · Apply/Reject stay disabled</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="browser" role="tabpanel" hidden>
+        <p class="agent-workbench-empty">Needs ADE · Browser grant — no Open Terminal clone</p>
+      </div>
+      <div class="agent-workbench-panel" data-workbench-panel="terminal" role="tabpanel" hidden>
+        <p class="agent-workbench-empty">Needs ADE · Term grant — not ambient, no Pyodide identity</p>
+      </div>
+    </div>
+  </aside>
+</section>
+
+<footer
+  class="taskbar"
+  aria-label="Shelf"
+  data-agent-preview="1"
+  data-home-gui-hidden-by-host="hidden"
+  inert
+  hidden
+>
+  <div class="taskbar-inner">
+    <div id="space-pager" class="space-pager" hidden aria-hidden="true"></div>
+    <div class="shelf-morph-stage" id="shelf-morph-stage">
+      <!-- Apps face — dock stays centered; this face fades out in place -->
+      <div class="shelf-face shelf-face-apps" data-shelf-face="apps">
+        <div class="taskbar-primary">
+          <div class="taskbar-system" aria-label="Agent and Apps">
+            <button
+              id="agent-shelf-toggle"
+              class="taskbar-item taskbar-item-agent shelf-morph-exit"
+              data-morph-exit="0"
+              type="button"
+              aria-label="Agent — morph Shelf to chat"
+              aria-pressed="false"
+              data-label="Agent"
+              title="Agent morphs the Shelf — talk privately on this machine"
+            >
+              <span class="taskbar-icon taskbar-icon-agent" aria-hidden="true"></span>
+            </button>
+            <button
+              id="launcher-toggle"
+              class="taskbar-item taskbar-item-launcher shelf-morph-exit"
+              data-morph-exit="1"
+              type="button"
+              aria-label="Open Apps"
+              aria-controls="launcher"
+              aria-expanded="false"
+              data-label="Apps"
+            >
+              <span class="taskbar-icon taskbar-icon-launcher" aria-hidden="true"></span>
+            </button>
+          </div>
+          <div class="taskbar-separator shelf-morph-exit" data-morph-exit="2" aria-hidden="true"></div>
+          <div
+            id="taskbar-targets"
+            class="taskbar-sortable shelf-morph-exit"
+            data-morph-exit="3"
+            aria-label="Shelf items"
+          ></div>
+        </div>
+      </div>
+      <!-- Launcher face — Apps panel; morphs from idle dock (same FLIP as Agent) -->
+      <div
+        id="launcher"
+        class="shelf-face shelf-face-launcher launcher"
+        data-shelf-face="launcher"
+        data-open="false"
+        data-view="grid"
+        aria-hidden="true"
+        inert
+        hidden
+      >
+        <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
+          <div class="launcher-header shelf-morph-enter" data-morph-enter="0">
+            <div class="launcher-search-wrap" hidden>
+              <input
+                id="launcher-search"
+                class="launcher-search-field"
+                type="search"
+                autocomplete="off"
+                placeholder="Search"
+                spellcheck="false"
+                tabindex="-1"
+                aria-hidden="true"
+              />
+            </div>
+            <p class="launcher-browse-label">Apps</p>
+            <button
+              id="launcher-view-toggle"
+              class="launcher-header-btn"
+              type="button"
+              aria-label="Switch to list view"
+              aria-pressed="false"
+            ></button>
+          </div>
+          <div class="launcher-scroll hide-scrollbar shelf-morph-enter" data-morph-enter="1">
+            <h1 class="launcher-heading visually-hidden">Apps</h1>
+            <div id="launcher-grid" class="launcher-sections"></div>
+            <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+          </div>
+        </div>
+      </div>
+      <!-- Agent face — composer only; Send opens Agent Harness above (dock stays) -->
+      <div class="shelf-face shelf-face-agent" data-shelf-face="agent" aria-hidden="true">
+        <!-- Follow-ups while a turn is busy — ChatGPT-style bumps above the composer. -->
+        <div
+          class="agent-queue"
+          data-agent-queue
+          hidden
+          aria-label="Queued follow-up prompts"
+        ></div>
+        <div class="agent-composer" role="form" aria-label="Agent composer">
+          <label class="agent-composer-field shelf-morph-enter" data-morph-enter="0">
+            <span class="visually-hidden">Message</span>
+            <textarea
+              id="agent-composer-input"
+              class="agent-composer-input"
+              rows="1"
+              placeholder="Ask on this machine"
+              autocomplete="off"
+              spellcheck="true"
+            ></textarea>
+          </label>
+          <div
+            class="agent-composer-attachments shelf-morph-enter"
+            data-morph-enter="0"
+            data-agent-attachments
+            hidden
+          ></div>
+          <input
+            id="agent-attach-input"
+            class="visually-hidden"
+            type="file"
+            multiple
+            tabindex="-1"
+            aria-hidden="true"
+          />
+          <div class="agent-attach-menu" data-agent-attach-menu hidden>
+            <p class="agent-attach-menu-label">Attach</p>
+            <div class="agent-attach-menu-list" data-attach-desktop-list></div>
+            <button type="button" class="agent-attach-menu-item" data-attach-device-files>
+              Choose files on this device…
+            </button>
+            <p class="agent-attach-menu-foot">
+              Text extracts size-capped · Desktop needs library.read · images vision-unsupported
+            </p>
+          </div>
+          <div class="agent-composer-toolbar shelf-morph-enter" data-morph-enter="1">
+            <!-- ChatGPT-like: left = Home + attach + tool intent; right = model + mic + send -->
+            <div class="agent-composer-tools-left">
+              <button
+                id="agent-shelf-flip-back"
+                class="agent-flip-back"
+                type="button"
+                aria-label="Back to Home"
+                title="Back to Home (Esc)"
+              >
+                Home
+              </button>
+              <button
+                id="agent-attach-btn"
+                class="agent-tool-btn"
+                type="button"
+                aria-label="Attach"
+                title="Attach Desktop object or local file (UI ≠ authority)"
+              >
+                <span aria-hidden="true">+</span>
+              </button>
+              <div class="agent-approve-wrap">
+                <button
+                  id="agent-approve-btn"
+                  class="agent-approve-btn"
+                  type="button"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                  aria-controls="agent-approve-menu"
+                  aria-label="How should Agent actions be approved?"
+                  title="Tool intent — UI ≠ authority. Never mints Carrier grants."
+                >
+                  <span class="agent-approve-mark" aria-hidden="true" data-approve-mark data-icon="read"></span>
+                  <span data-approve-label>Read only</span>
+                  <span class="agent-approve-chevron" aria-hidden="true"></span>
+                </button>
+              </div>
+              <button
+                type="button"
+                class="agent-think-btn"
+                data-truth-thinking-toggle
+                aria-pressed="true"
+                aria-label="Show model thinking"
+                title="Show model thinking blocks"
+              >
+                Think
+              </button>
+              <button
+                type="button"
+                class="agent-think-btn agent-effort-btn"
+                data-reasoning-effort="medium"
+                data-effective-effort="model-default"
+                disabled
+                aria-disabled="true"
+                aria-label="Reasoning Medium — Flash uses model-default; effort levels wait on the offer"
+                title="Requested Medium · Effective model-default · Provider Flash · High/Low are not offered yet"
+              >
+                Med
+              </button>
+            </div>
+            <div class="agent-composer-tools-right">
+              <div class="agent-model-wrap">
+                <button
+                  id="agent-model-picker"
+                  class="agent-model-btn"
+                  type="button"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                  aria-controls="agent-model-menu"
+                  title="Local model (preview) — select or see recommended downloads"
+                >
+                  <span class="agent-model-name">Local preview</span>
+                  <span class="agent-model-tier" hidden></span>
+                  <span class="agent-model-chevron" aria-hidden="true"></span>
+                </button>
+              </div>
+              <button
+                id="agent-composer-mic"
+                class="agent-tool-btn agent-mic-btn"
+                type="button"
+                disabled
+                aria-disabled="true"
+                aria-pressed="false"
+                aria-label="Voice dictation"
+                title="Dictate into the composer. You can edit before Send."
+                data-dictation-state="idle"
+              >
+                <span class="agent-mic-mark" aria-hidden="true"></span>
+              </button>
+              <button
+                id="agent-composer-send"
+                class="agent-send-btn"
+                type="button"
+                aria-label="Send"
+                title="Enter a message to send"
+                data-mode="send"
+                disabled
+              >
+                <span class="agent-send-mark" aria-hidden="true"></span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </footer>
@@ -338,6 +1295,95 @@
     </div>
   </div>
 </aside>
+
+<!-- Agent composer menus live on body so dock transform/overflow cannot clip them. -->
+<div
+  id="agent-approve-menu"
+  class="agent-approve-menu"
+  role="dialog"
+  aria-label="How should Agent actions be approved?"
+  tabindex="-1"
+  hidden
+>
+  <div class="agent-approve-menu-head">
+    <p class="agent-approve-menu-title">How should Agent actions be approved?</p>
+    <p class="agent-approve-menu-learn">Preview</p>
+  </div>
+  <div class="agent-approve-menu-list" role="listbox" aria-label="Approval modes">
+    <button
+      type="button"
+      class="agent-approve-option"
+      role="option"
+      data-tool-mode="ask"
+      aria-selected="false"
+    >
+      <span class="agent-approve-option-icon" data-icon="ask" aria-hidden="true"></span>
+      <span class="agent-approve-option-copy">
+        <span class="agent-approve-option-title">Ask for approval</span>
+        <span class="agent-approve-option-desc"
+          >Always ask via Inbox-style cards before any tool</span
+        >
+      </span>
+      <span class="agent-approve-option-check" aria-hidden="true"></span>
+    </button>
+    <button
+      type="button"
+      class="agent-approve-option"
+      role="option"
+      data-tool-mode="read"
+      aria-selected="true"
+    >
+      <span class="agent-approve-option-icon" data-icon="read" aria-hidden="true"></span>
+      <span class="agent-approve-option-copy">
+        <span class="agent-approve-option-title">Read only</span>
+        <span class="agent-approve-option-desc"
+          >Answers only — tools stay at zero on this device</span
+        >
+      </span>
+      <span class="agent-approve-option-check" aria-hidden="true"></span>
+    </button>
+    <button
+      type="button"
+      class="agent-approve-option agent-approve-option-danger"
+      role="option"
+      data-tool-mode="full"
+      aria-selected="false"
+    >
+      <span class="agent-approve-option-icon" data-icon="full" aria-hidden="true"></span>
+      <span class="agent-approve-option-copy">
+        <span class="agent-approve-option-title">Full access</span>
+        <span class="agent-approve-option-desc"
+          >Broader tool requests — still fail-closed; never ambient</span
+        >
+      </span>
+      <span class="agent-approve-option-check" aria-hidden="true"></span>
+    </button>
+  </div>
+</div>
+
+<div
+  id="agent-model-menu"
+  class="agent-model-menu"
+  role="dialog"
+  aria-label="Choose a local model"
+  tabindex="-1"
+  hidden
+>
+  <div class="agent-model-menu-list" data-model-menu-list role="listbox" aria-label="Models"></div>
+  <button type="button" class="agent-model-menu-add" data-model-add>Add models</button>
+</div>
+
+<div
+  id="agent-session-actions"
+  class="agent-session-actions"
+  role="menu"
+  aria-label="Chat actions"
+  tabindex="-1"
+  hidden
+>
+  <div class="agent-session-actions-list" data-session-actions-list></div>
+</div>
+
 
 <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
 

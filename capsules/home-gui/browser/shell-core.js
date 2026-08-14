@@ -60,9 +60,14 @@ export const WINDOW_TOP_INSET = 8;
 export const WINDOW_BOTTOM_INSET = 72;
 export const CONTEXT_MENU_IGNORE_OUTSIDE_MS = 220;
 const HOME_GUI_TEMPLATE_ID = "home-gui-template";
-const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260813a", import.meta.url).href;
+const HOME_GUI_TEMPLATE_URL = new URL("./home-gui-template.html?v=home-20260814a", import.meta.url).href;
 const HOME_GUI_STYLESHEET_ID = "home-gui-stylesheet";
-const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260813a", import.meta.url).href;
+const HOME_GUI_STYLESHEET_URL = new URL("./style.css?v=home-20260814a", import.meta.url).href;
+const HOME_GUI_AGENT_STYLESHEET_ID = "home-gui-agent-stylesheet";
+const HOME_GUI_AGENT_STYLESHEET_URL = new URL(
+  "./agent-harness.css?v=home-20260814a",
+  import.meta.url,
+).href;
 let homeGuiTemplateHtmlPromise = null;
 let homeGuiLaunchToken = "";
 
@@ -72,6 +77,31 @@ export function setHomeGuiLaunchToken(token) {
     throw new Error("Home GUI launch token is required");
   }
   homeGuiLaunchToken = normalized;
+}
+
+export function getHomeGuiLaunchToken() {
+  if (homeGuiLaunchToken) {
+    return homeGuiLaunchToken;
+  }
+  try {
+    const fromGlobal = globalThis.__elastosHomeGuiLaunchToken;
+    if (typeof fromGlobal === "string" && fromGlobal.trim()) {
+      homeGuiLaunchToken = fromGlobal.trim();
+      return homeGuiLaunchToken;
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const fromSession = sessionStorage.getItem("elastos.home-gui.launch-token");
+    if (typeof fromSession === "string" && fromSession.trim()) {
+      homeGuiLaunchToken = fromSession.trim();
+      return homeGuiLaunchToken;
+    }
+  } catch {
+    /* ignore */
+  }
+  return "";
 }
 
 export const shellState = {
@@ -238,15 +268,21 @@ export async function ensureHomeGuiDom() {
 }
 
 function ensureHomeGuiStylesheet() {
-  if (document.querySelector(`#${HOME_GUI_STYLESHEET_ID}`)) {
-    return;
-  }
-  const link = document.createElement("link");
-  link.id = HOME_GUI_STYLESHEET_ID;
-  link.rel = "stylesheet";
-  link.href = HOME_GUI_STYLESHEET_URL;
   const head = document.head || document.querySelector("head");
-  head?.appendChild?.(link);
+  if (!document.querySelector(`#${HOME_GUI_STYLESHEET_ID}`)) {
+    const link = document.createElement("link");
+    link.id = HOME_GUI_STYLESHEET_ID;
+    link.rel = "stylesheet";
+    link.href = HOME_GUI_STYLESHEET_URL;
+    head?.appendChild?.(link);
+  }
+  if (!document.querySelector(`#${HOME_GUI_AGENT_STYLESHEET_ID}`)) {
+    const agentLink = document.createElement("link");
+    agentLink.id = HOME_GUI_AGENT_STYLESHEET_ID;
+    agentLink.rel = "stylesheet";
+    agentLink.href = HOME_GUI_AGENT_STYLESHEET_URL;
+    head?.appendChild?.(agentLink);
+  }
 }
 
 export function beginShellInteraction() {

@@ -24,13 +24,13 @@ import {
   shellInteractionActive,
   shouldIgnoreDesktopKeydown,
   targetById,
-} from "./shell-core.js?v=home-20260813a";
+} from "./shell-core.js?v=home-20260814a";
 import {
   bindIdentityMenu,
   clearIdentitySurface,
   syncIdentity,
   updateClock,
-} from "./shell-chrome.js?v=home-20260813a";
+} from "./shell-chrome.js?v=home-20260814a";
 import {
   beginDesktopMarquee,
   bindShellSurfaceDom,
@@ -57,7 +57,9 @@ import {
   toggleLauncher,
   updateDesktopMarquee,
   updateTaskbarState,
-} from "./shell-surface.js?v=home-20260813a";
+} from "./shell-surface.js?v=home-20260814a";
+import { bindAgentShelf } from "./agent-shelf.js?v=home-20260814a";
+import { bindAgentHarness } from "./agent-harness.js?v=home-20260814a";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -70,46 +72,46 @@ import {
   restoreShellSession,
   showDesktopHome,
   supportsMenuNewWindow,
-} from "./shell-windows.js?v=home-20260813a";
+} from "./shell-windows.js?v=home-20260814a";
 import {
   bindShellKeyboard,
   handleDesktopArrowKey,
   retireKeyboardSurfaces,
   toggleShortcutsOverlay,
-} from "./shell-keyboard.js?v=home-20260813a";
+} from "./shell-keyboard.js?v=home-20260814a";
 import {
   bindSpotlight,
   hideSpotlight,
   showSpotlight,
-} from "./shell-spotlight.js?v=home-20260813a";
+} from "./shell-spotlight.js?v=home-20260814a";
 import {
   bindNotificationCenter,
   hideNotificationCenter,
   recordNotifications,
-} from "./shell-notifications.js?v=home-20260813a";
+} from "./shell-notifications.js?v=home-20260814a";
 import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
   syncMenubar,
-} from "./shell-menubar.js?v=home-20260813a";
+} from "./shell-menubar.js?v=home-20260814a";
 import {
   bindQuickLook,
   hideQuickLook,
   toggleQuickLook,
-} from "./shell-quicklook.js?v=home-20260813a";
-import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260813a";
+} from "./shell-quicklook.js?v=home-20260814a";
+import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260814a";
 import {
   bindSpaceEdgePeek,
   bindSpacePager,
   toggleActiveFullscreenStage,
-} from "./shell-stages.js?v=home-20260813a";
-import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260813a";
+} from "./shell-stages.js?v=home-20260814a";
+import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260814a";
 import {
   bindControlCentre,
   hideControlCentre,
   syncControlCentre,
-} from "./shell-control-centre.js?v=home-20260813a";
+} from "./shell-control-centre.js?v=home-20260814a";
 import {
   bindWalletRail,
   retireWalletRail,
@@ -118,7 +120,7 @@ import {
   walletRailFrame,
   walletRailOpen,
   walletRailSessionMounted,
-} from "./shell-wallet-rail.js?v=home-20260813a";
+} from "./shell-wallet-rail.js?v=home-20260814a";
 import {
   bindInboxRail,
   retireInboxRail,
@@ -127,7 +129,13 @@ import {
   inboxRailFrame,
   inboxRailOpen,
   inboxRailSessionMounted,
-} from "./shell-inbox-rail.js?v=home-20260813a";
+} from "./shell-inbox-rail.js?v=home-20260814a";
+import {
+  bindViewerRail,
+  viewerRailOpen,
+  viewerRailFrame,
+  viewerRailTarget,
+} from "./shell-viewer-rail.js?v=home-20260814a";
 import {
   bindConnectorSheet,
   connectorSheetFrame,
@@ -136,7 +144,7 @@ import {
   noteConnectorSheetSummaryRefresh,
   retireConnectorSheet,
   showConnectorSheet,
-} from "./shell-connector-sheet.js?v=home-20260813a";
+} from "./shell-connector-sheet.js?v=home-20260814a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -144,6 +152,8 @@ const OPAQUE_FRAME_TARGET = "*";
 await ensureHomeGuiDom();
 bindIdentityMenu();
 bindShellSurfaceDom();
+bindAgentShelf();
+bindAgentHarness();
 bindSpotlight();
 bindNotificationCenter();
 bindQuickLook();
@@ -155,6 +165,7 @@ bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow 
 bindControlCentre();
 bindWalletRail();
 bindInboxRail();
+bindViewerRail();
 bindConnectorSheet();
 window.addEventListener("elastos:ui-preference-changed", (event) => {
   const detail = event?.detail;
@@ -177,6 +188,8 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#control-centre",
   "#wallet-rail",
   "#inbox-rail",
+  "#viewer-rail",
+  "#agent-harness",
   "#connector-sheet",
   "#spotlight",
   "#window-switcher",
@@ -423,6 +436,13 @@ export function deliverMessageToHomeGuiTargetFrame(target, payload, options = nu
       return true;
     }
   }
+  if (viewerRailOpen() && viewerRailTarget() === target) {
+    const railFrame = viewerRailFrame();
+    if (railFrame?.contentWindow) {
+      railFrame.contentWindow.postMessage(payload, OPAQUE_FRAME_TARGET);
+      return true;
+    }
+  }
   const entries = [...shellState.windows.values()]
     .filter((entry) => entry.kind === "browser" && entry.targetId === target)
     .sort((left, right) => Number(right.serial || 0) - Number(left.serial || 0));
@@ -510,6 +530,11 @@ function broadcastHomeGuiUiPreferences(preferences) {
   }
   try {
     inboxRailFrame()?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
+  } catch (_error) {
+    // Rail not mounted.
+  }
+  try {
+    viewerRailFrame()?.contentWindow?.postMessage(message, OPAQUE_FRAME_TARGET);
   } catch (_error) {
     // Rail not mounted.
   }

@@ -2,7 +2,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 
-const moduleVersion = "home-20260813a";
+const moduleVersion = "home-20260814a";
 const savedStatePatches = [];
 const requests = [];
 const windowEventListeners = new Map();

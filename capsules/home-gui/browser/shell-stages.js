@@ -10,13 +10,14 @@
  * UI ≠ authority: Space switches never mint Capsule/Carrier grants.
  */
 
-import { shellState } from "./shell-core.js?v=home-20260813a";
+import { shellState } from "./shell-core.js?v=home-20260814a";
 import {
   rememberWindowRestoreBounds,
   restoreWindowFromSpecialState,
-} from "./shell-window-geometry.js?v=home-20260813a";
+} from "./shell-window-geometry.js?v=home-20260814a";
 
 const DESKTOP_STAGE = "desktop";
+const AGENT_STAGE = "agent";
 let liveRegion = null;
 let stageRecency = [];
 let focusWindowFn = null;
@@ -75,6 +76,14 @@ export function announceStage(message) {
 
 export function desktopStageId() {
   return DESKTOP_STAGE;
+}
+
+export function agentStageId() {
+  return AGENT_STAGE;
+}
+
+export function isAgentSpace(spaceId) {
+  return spaceId === AGENT_STAGE;
 }
 
 export function getExtraDesktops() {
@@ -212,8 +221,22 @@ function bindEdgeReveal() {
   });
 }
 
+/** Agent harness reuses fullscreen menubar edge-reveal (dock stays put). */
+export function enableHarnessMenubarReveal() {
+  document.body.classList.remove("stage-menubar-reveal");
+  ensureEdgeSensors();
+  bindEdgeReveal();
+}
+
+export function clearHarnessMenubarReveal() {
+  document.body.classList.remove("stage-menubar-reveal");
+}
+
 export function windowVisibleOnActiveSpace(entry, active = getActiveStageId()) {
   if (!entry) {
+    return false;
+  }
+  if (isAgentSpace(active)) {
     return false;
   }
   if (isDesktopSpace(active)) {
@@ -462,27 +485,37 @@ export function setActiveStage(stageId, { announce = true, focus = true, animate
   let next = DESKTOP_STAGE;
   if (isDesktopSpace(stageId)) {
     next = stageId;
+  } else if (isAgentSpace(stageId)) {
+    next = AGENT_STAGE;
   } else if (stageEntry(stageId)?.fullscreenStage) {
     next = stageId;
   }
   const prev = getActiveStageId();
-  if (animate && prev !== next && playSpaceSlide(prev, next, { announce, focus })) {
+  const canSlide =
+    animate &&
+    prev !== next &&
+    !isAgentSpace(prev) &&
+    !isAgentSpace(next) &&
+    playSpaceSlide(prev, next, { announce, focus });
+  if (canSlide) {
     return next;
   }
   shellState.activeStageId = next;
-  if (!isDesktopSpace(next)) {
+  if (!isDesktopSpace(next) && !isAgentSpace(next)) {
     touchRecency(next);
   }
   syncStagePresentation();
   if (announce) {
-    if (isDesktopSpace(next)) {
+    if (isAgentSpace(next)) {
+      announceStage("Agent");
+    } else if (isDesktopSpace(next)) {
       announceStage(next === DESKTOP_STAGE ? "Desktop" : spaceLabelForDesktop(next));
     } else {
       const entry = stageEntry(next);
       announceStage(`${entry?.title || "App"}, fullscreen`);
     }
   }
-  if (focus && !isDesktopSpace(next)) {
+  if (focus && !isDesktopSpace(next) && !isAgentSpace(next)) {
     focusWindowFn?.(next);
   }
   persist();
@@ -506,6 +539,9 @@ export function desktopSpaceLabel(spaceId) {
 function spaceLabelForPager(spaceId) {
   if (isDesktopSpace(spaceId)) {
     return spaceLabelForDesktop(spaceId);
+  }
+  if (isAgentSpace(spaceId)) {
+    return "Agent";
   }
   const entry = stageEntry(spaceId);
   return entry?.title || entry?.targetId || "App";
@@ -673,7 +709,7 @@ function defaultStageRing() {
     const br = bi === -1 ? 999 : bi;
     return ar - br;
   });
-  return [DESKTOP_STAGE, ...getExtraDesktops(), ...staged.map((entry) => entry.id)];
+  return [DESKTOP_STAGE, ...getExtraDesktops(), AGENT_STAGE, ...staged.map((entry) => entry.id)];
 }
 
 export function buildStageRing() {
