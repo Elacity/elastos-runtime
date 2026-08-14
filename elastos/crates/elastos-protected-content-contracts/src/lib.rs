@@ -68,7 +68,7 @@ pub use release_request::{
     KeyReleaseError, KeyReleaseRequestV1, VerifiedKeyReleaseRequestV1,
     MAX_RELEASE_REQUEST_LIFETIME_SECS,
 };
-pub use replay::{AtomicReplayClaimer, ReplayClaimError, ReplayClaimKeyV1};
+pub use replay::{AtomicReplayClaimer, ReplayClaimEntryV1, ReplayClaimError, ReplayClaimKeyV1};
 pub use rights::{
     ReplayNonce16, RightsActionV1, RightsDecisionV1, RightsError, RightsRequestV1,
     RightsVerificationContextV1, VerifiedRightsRequestV1, WalletSignedRightsRequestV1,

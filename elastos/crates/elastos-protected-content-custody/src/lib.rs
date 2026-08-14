@@ -4,6 +4,7 @@ mod hpke_helpers;
 mod provision;
 mod reconstruct;
 mod release;
+mod replay_store;
 mod secrets;
 
 #[cfg(test)]
@@ -14,11 +15,14 @@ use thiserror::Error;
 pub use provision::provision_custody_envelope;
 pub use reconstruct::reconstruct_content_key;
 pub use release::produce_node_contribution;
+pub use replay_store::{ClaimedNodeReleaseOperationV1, DurableReplayClaimStoreV1};
 pub use secrets::{
     ContentEncryptionKeyV1, NodeCustodySecretKeyV1, RecipientPublicKeyV1, RecipientSecretKeyV1,
 };
 
-use elastos_protected_content_contracts::{ContractError, KeyReleaseError};
+use elastos_protected_content_contracts::{
+    ContractError, KeyReleaseError, ReplayClaimError, RuntimeReleaseOperationError,
+};
 
 pub(crate) const CONTENT_KEY_BYTES: usize = 32;
 pub(crate) const RELEASED_SHARE_TAG_BYTES: usize = 16;
@@ -29,6 +33,10 @@ pub enum CustodyError {
     Contract(#[from] ContractError),
     #[error(transparent)]
     Release(#[from] KeyReleaseError),
+    #[error(transparent)]
+    RuntimeReleaseOperation(#[from] RuntimeReleaseOperationError),
+    #[error(transparent)]
+    Replay(#[from] ReplayClaimError),
     #[error("hpke operation failed")]
     Hpke(#[from] hpke::HpkeError),
     #[error("shamir operation failed: {0}")]

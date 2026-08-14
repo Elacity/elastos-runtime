@@ -3,15 +3,15 @@ use hpke::rand_core::{CryptoRng as HpkeCryptoRng, RngCore as HpkeRngCore};
 use rand09::{rngs::StdRng, SeedableRng as _};
 
 use elastos_protected_content_contracts::{
-    validate_node_contribution_active_window, CanonicalContract, CustodyEnvelopeV1,
-    NodeContributionStatementV1, NodePublicKey, RecipientSealedContributionV1, RightsDecisionV1,
-    SignedNodeContributionV1, SignedNodeRightsDecisionV1, VerifiedKeyReleaseRequestV1,
+    CanonicalContract, CustodyEnvelopeV1, NodeContributionStatementV1, NodePublicKey,
+    RecipientSealedContributionV1, RightsDecisionV1, SignedNodeContributionV1,
+    SignedNodeRightsDecisionV1,
 };
 
 use crate::{
     hpke_helpers::seal_share,
     secrets::{NodeCustodySecretKeyV1, RecipientPublicKeyV1},
-    CustodyError,
+    ClaimedNodeReleaseOperationV1, CustodyError,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -33,7 +33,7 @@ use crate::{
 ///     recipient_public_key: RecipientPublicKeyV1,
 /// ) {
 ///     let _ = produce_node_contribution(
-///         operation.statement().release_request(),
+///         operation,
 ///         &signed_rights_decision,
 ///         &envelope,
 ///         &node_signing_key,
@@ -46,7 +46,7 @@ use crate::{
 /// }
 /// ```
 pub fn produce_node_contribution(
-    request: &VerifiedKeyReleaseRequestV1,
+    operation: ClaimedNodeReleaseOperationV1,
     signed_rights_decision: &SignedNodeRightsDecisionV1,
     envelope: &CustodyEnvelopeV1,
     node_signing_key: &SigningKey,
@@ -59,7 +59,7 @@ pub fn produce_node_contribution(
     let mut hpke_rng =
         StdRng::try_from_os_rng().map_err(|_| CustodyError::RandomnessUnavailable)?;
     produce_node_contribution_with_rng(
-        request,
+        &operation,
         signed_rights_decision,
         envelope,
         node_signing_key,
@@ -74,7 +74,7 @@ pub fn produce_node_contribution(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn produce_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>(
-    request: &VerifiedKeyReleaseRequestV1,
+    operation: &ClaimedNodeReleaseOperationV1,
     signed_rights_decision: &SignedNodeRightsDecisionV1,
     envelope: &CustodyEnvelopeV1,
     node_signing_key: &SigningKey,
@@ -85,31 +85,34 @@ pub(crate) fn produce_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>
     now: u64,
     hpke_rng: &mut R,
 ) -> Result<SignedNodeContributionV1, CustodyError> {
-    if !envelope.matches_key_envelope_identity(request.binding().key_envelope())? {
+    if !envelope.matches_key_envelope_identity(operation.binding().key_envelope())? {
         return Err(CustodyError::BindingMismatch("key_envelope"));
     }
-    if request.recipient().encryption_suite_id()
+    if operation.recipient().encryption_suite_id()
         != elastos_protected_content_contracts::CUSTODY_HPKE_SUITE_ID_V1
     {
         return Err(CustodyError::BindingMismatch(
             "recipient_encryption_suite_id",
         ));
     }
-    if recipient_public_key.identity()? != *request.recipient() {
+    if recipient_public_key.identity()? != *operation.recipient() {
         return Err(CustodyError::BindingMismatch("recipient_key_identity"));
     }
 
     let node_set = envelope.manifest().node_set()?;
-    let decision = signed_rights_decision.verify(request, &node_set, now)?;
+    let decision = operation.verify_node_rights_decision(signed_rights_decision, &node_set, now)?;
     if decision.decision() != RightsDecisionV1::Allowed {
         return Err(CustodyError::Release(
             elastos_protected_content_contracts::KeyReleaseError::RightsDenied,
         ));
     }
-    validate_node_contribution_active_window(issued_at, expires_at, request, &decision, now)?;
+    operation.validate_node_contribution_active_window(issued_at, expires_at, &decision, now)?;
     let node_public_key = NodePublicKey::new(node_signing_key.verifying_key().to_bytes())?;
     if node_public_key != decision.node_public_key() {
         return Err(CustodyError::BindingMismatch("node_public_key"));
+    }
+    if node_public_key != operation.selected_node_public_key() {
+        return Err(CustodyError::BindingMismatch("claimed_node_public_key"));
     }
 
     let node_entry = envelope
@@ -135,10 +138,10 @@ pub(crate) fn produce_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>
         &stored_aad,
     )?;
     let released_aad = node_entry.released_share_aad_bytes(
-        request.request_hash(),
-        request.binding(),
+        operation.release_request_hash(),
+        operation.binding(),
         decision.decision_hash(),
-        request.recipient(),
+        operation.recipient(),
     )?;
     let released_ciphertext = seal_share(
         recipient_public_key.as_bytes(),
@@ -148,12 +151,12 @@ pub(crate) fn produce_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>
         hpke_rng,
     )?;
     let recipient_sealed_contribution = RecipientSealedContributionV1::new(
-        request.recipient().clone(),
+        operation.recipient().clone(),
         released_ciphertext.canonical_bytes()?,
     )?;
     let statement = NodeContributionStatementV1::new(
-        request.request_hash(),
-        request.binding().clone(),
+        operation.release_request_hash(),
+        operation.binding().clone(),
         signed_rights_decision.clone(),
         recipient_sealed_contribution,
         issued_at,
@@ -164,7 +167,7 @@ pub(crate) fn produce_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>
         .to_bytes()
         .to_vec();
     let signed = SignedNodeContributionV1::new(statement, signature)?;
-    signed.verify(request, &node_set, now)?;
+    operation.verify_node_contribution(&signed, &node_set, now)?;
     Ok(signed)
 }
 
@@ -175,9 +178,9 @@ mod tests {
     use super::*;
     use crate::hpke_helpers::{open_share, seal_share};
     use crate::test_support::{
-        node_custody_secret, node_signing_key, provisioned_envelope, recipient_public_key,
-        signed_node_decision, verified_release_request, verified_release_request_for_envelope,
-        verified_release_request_with_suite,
+        claimed_runtime_release_operation_for_envelope_and_node_seed, node_custody_secret,
+        node_signing_key, provisioned_envelope, recipient_public_key, signed_node_decision,
+        verified_release_request, verified_release_request_for_envelope,
     };
     use elastos_protected_content_contracts::{
         ContractError, KeyReleaseError, RightsError, RIGHTS_CLOCK_SKEW_SECS,
@@ -191,12 +194,19 @@ mod tests {
         envelope.manifest().node_index(node_public_key).unwrap()
     }
 
+    fn claimed_operation(
+        envelope: &CustodyEnvelopeV1,
+        node_seed: u8,
+    ) -> ClaimedNodeReleaseOperationV1 {
+        claimed_runtime_release_operation_for_envelope_and_node_seed(envelope, node_seed, 0x30)
+    }
+
     #[test]
     fn release_produces_a_verified_node_contribution() {
         let request = verified_release_request();
         let envelope = provisioned_envelope();
         let signed = produce_node_contribution(
-            &request,
+            claimed_operation(&envelope, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &envelope,
             &node_signing_key(1),
@@ -228,7 +238,7 @@ mod tests {
         let request = verified_release_request();
         let envelope = provisioned_envelope();
         let err = produce_node_contribution(
-            &request,
+            claimed_operation(&envelope, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &envelope,
             &node_signing_key(2),
@@ -246,11 +256,33 @@ mod tests {
     }
 
     #[test]
+    fn release_rejects_claimed_operation_for_a_different_node() {
+        let request = verified_release_request();
+        let envelope = provisioned_envelope();
+        let err = produce_node_contribution(
+            claimed_operation(&envelope, 1),
+            &signed_node_decision(&request, 2, RightsDecisionV1::Allowed),
+            &envelope,
+            &node_signing_key(2),
+            &node_custody_secret(2),
+            &recipient_public_key(0x30),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::BindingMismatch("claimed_node_public_key")
+        ));
+    }
+
+    #[test]
     fn release_rejects_wrong_custody_secret() {
         let request = verified_release_request();
         let envelope = provisioned_envelope();
         let err = produce_node_contribution(
-            &request,
+            claimed_operation(&envelope, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &envelope,
             &node_signing_key(1),
@@ -268,30 +300,11 @@ mod tests {
     }
 
     #[test]
-    fn release_rejects_wrong_recipient_suite_or_public_key() {
-        let wrong_suite_request =
-            verified_release_request_with_suite("x25519-hkdf-sha256-aes256gcm/v1");
+    fn release_rejects_wrong_recipient_public_key() {
         let envelope = provisioned_envelope();
-        let err = produce_node_contribution(
-            &wrong_suite_request,
-            &signed_node_decision(&wrong_suite_request, 1, RightsDecisionV1::Allowed),
-            &envelope,
-            &node_signing_key(1),
-            &node_custody_secret(1),
-            &recipient_public_key(0x30),
-            crate::test_support::NOW + 5,
-            crate::test_support::NOW + 45,
-            crate::test_support::NOW + 6,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            CustodyError::BindingMismatch("recipient_encryption_suite_id")
-        ));
-
         let request = verified_release_request();
         let err = produce_node_contribution(
-            &request,
+            claimed_operation(&envelope, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &envelope,
             &node_signing_key(1),
@@ -313,7 +326,7 @@ mod tests {
         let request = verified_release_request();
         let envelope = provisioned_envelope();
         let err = produce_node_contribution(
-            &request,
+            claimed_operation(&envelope, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Denied),
             &envelope,
             &node_signing_key(1),
@@ -347,7 +360,7 @@ mod tests {
         .unwrap();
         let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
         let err = produce_node_contribution_with_rng(
-            &request,
+            &claimed_operation(&envelope, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &tampered,
             &node_signing_key(1),
@@ -377,7 +390,7 @@ mod tests {
         let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
         let request = verified_release_request_for_envelope(&tampered);
         let err = produce_node_contribution_with_rng(
-            &request,
+            &claimed_operation(&tampered, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &tampered,
             &node_signing_key(1),
@@ -437,7 +450,7 @@ mod tests {
         let request = verified_release_request_for_envelope(&tampered);
 
         let err = produce_node_contribution_with_rng(
-            &request,
+            &claimed_operation(&tampered, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &tampered,
             &node_signing_key(1),
@@ -467,7 +480,7 @@ mod tests {
         let tampered = CustodyEnvelopeV1::new(envelope.manifest().clone(), stored_shares).unwrap();
         let request = verified_release_request_for_envelope(&tampered);
         let err = produce_node_contribution_with_rng(
-            &request,
+            &claimed_operation(&tampered, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &tampered,
             &node_signing_key(1),
@@ -507,7 +520,7 @@ mod tests {
         let request = verified_release_request();
         let envelope = provisioned_envelope();
         produce_node_contribution(
-            &request,
+            claimed_operation(&envelope, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &envelope,
             &node_signing_key(1),
@@ -525,7 +538,7 @@ mod tests {
         let request = verified_release_request();
         let envelope = provisioned_envelope();
         let err = produce_node_contribution(
-            &request,
+            claimed_operation(&envelope, 1),
             &signed_node_decision(&request, 1, RightsDecisionV1::Allowed),
             &envelope,
             &node_signing_key(1),

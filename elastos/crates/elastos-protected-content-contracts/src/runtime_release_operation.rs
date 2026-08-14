@@ -5,11 +5,13 @@ use thiserror::Error;
 use crate::canonical::{CanonicalBody, ContractError, Decoder, Encoder};
 use crate::rights::{validate_active, validate_time_window, RightsError};
 use crate::{
-    CanonicalContract, CustodyEpochError, CustodyEpochIdentityV1, Digest32, KeyReleaseError,
-    KeyReleaseRequestV1, RecipientAuthorizationError, RecipientKeyAuthorizationContextV1,
-    RecipientPublicKeyBytesV1, ReplayClaimKeyV1, RightsEvaluationEvidenceRequestV1,
-    RightsPolicyBodyV1, RuntimeOperationIssuerKeyV1, SignedCustodyEpochV1,
-    SignedRecipientKeyAuthorizationV1, WalletSignedRightsRequestV1,
+    CanonicalContract, CustodyEnvelopeV1, CustodyEpochError, CustodyEpochIdentityV1, Digest32,
+    KeyReleaseError, KeyReleaseRequestV1, NodePublicKey, NodeSetV1, RecipientAuthorizationError,
+    RecipientKeyAuthorizationContextV1, RecipientPublicKeyBytesV1, ReplayClaimKeyV1,
+    RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RuntimeOperationIssuerKeyV1,
+    SignedCustodyEpochV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
+    SignedRecipientKeyAuthorizationV1, VerifiedKeyReleaseRequestV1, VerifiedNodeContributionV1,
+    VerifiedNodeRightsDecisionV1, WalletSignedRightsRequestV1,
 };
 
 pub const MAX_RUNTIME_RELEASE_OPERATION_LIFETIME_SECS: u64 = 60;
@@ -337,70 +339,24 @@ impl SignedRuntimeReleaseOperationV1 {
         runtime_key
             .verify(&self.statement.canonical_bytes()?, &signature)
             .map_err(|_| RuntimeReleaseOperationError::InvalidRuntimeSignature)?;
-
-        let rights_context = crate::RightsVerificationContextV1::new(
-            self.statement.rights_request.request().binding().clone(),
-            self.statement.rights_request.request().action(),
-            self.statement.rights_request.request().recipient().clone(),
-            now,
-        );
-        let verified_rights = self
-            .statement
-            .rights_request
-            .verify_unclaimed(&rights_context)?;
-        let verified_release = self
-            .statement
-            .release_request
-            .verify_unclaimed(&verified_rights, now)?;
-        let recipient_context = RecipientKeyAuthorizationContextV1::new(
-            verified_release.binding().clone(),
-            verified_release.action(),
-            self.statement.recipient_public_key,
-            self.statement.runtime_operation_issuer,
-            now,
-        );
-        let verified_authorization = self
-            .statement
-            .recipient_authorization
-            .verify(&recipient_context)?;
-        let verified_epoch = self
-            .statement
-            .custody_epoch
-            .verify_against_key_envelope(verified_release.binding().key_envelope())?;
-        if verified_epoch
-            .approved_suites()
-            .recipient_encryption_suite_id()
-            != verified_authorization
-                .recipient_identity()
-                .encryption_suite_id()
-        {
-            return Err(RuntimeReleaseOperationError::BindingMismatch(
-                "recipient_encryption_suite_id",
-            ));
-        }
-        if self.statement.recipient_public_key.key_identity(
-            verified_epoch
-                .approved_suites()
-                .recipient_encryption_suite_id(),
-        )? != *verified_authorization.recipient_identity()
-        {
-            return Err(RuntimeReleaseOperationError::BindingMismatch(
-                "recipient_public_key",
-            ));
-        }
+        let verified = verify_release_operation_statement(&self.statement, now)?;
         Ok(AuthenticatedRuntimeReleaseOperationV1 {
             statement: self.statement.clone(),
             operation_hash: self.statement.canonical_hash()?,
-            rights_request_hash: verified_rights.request_hash(),
+            rights_request_hash: self.statement.rights_request.request().request_hash()?,
             rights_request_replay_claim_key: self
                 .statement
                 .rights_request
                 .request()
                 .replay_claim_key()?,
-            release_request_hash: verified_release.request_hash(),
+            release_request_hash: verified.release.request_hash(),
             release_request_replay_claim_key: self.statement.release_request.replay_claim_key()?,
-            recipient_authorization_hash: verified_authorization.statement_hash(),
-            custody_epoch_identity: verified_epoch.epoch_identity(),
+            recipient_authorization_hash: self
+                .statement
+                .recipient_authorization
+                .statement()
+                .canonical_hash()?,
+            custody_epoch_identity: verified.epoch.epoch_identity(),
         })
     }
 }
@@ -479,6 +435,84 @@ impl AuthenticatedRuntimeReleaseOperationV1 {
     pub const fn custody_epoch_identity(&self) -> CustodyEpochIdentityV1 {
         self.custody_epoch_identity
     }
+
+    pub fn binding(&self) -> &crate::ProtectedContentBindingV1 {
+        self.statement.release_request().binding()
+    }
+
+    pub fn action(&self) -> crate::RightsActionV1 {
+        self.statement.release_request().action()
+    }
+
+    pub fn recipient(&self) -> &crate::RecipientKeyIdentityV1 {
+        self.statement.release_request().recipient()
+    }
+
+    pub fn validate_node_release_claim_context(
+        &self,
+        envelope: &CustodyEnvelopeV1,
+        node_public_key: NodePublicKey,
+        now: u64,
+    ) -> Result<(), RuntimeReleaseOperationError> {
+        map_active(self.statement.issued_at, self.statement.expires_at, now)?;
+        let verified = verify_release_operation_statement(&self.statement, now)?;
+        if !envelope.matches_key_envelope_identity(verified.release.binding().key_envelope())? {
+            return Err(RuntimeReleaseOperationError::BindingMismatch(
+                "key_envelope",
+            ));
+        }
+        if envelope.manifest().custody_epoch() != verified.epoch.epoch_identity() {
+            return Err(RuntimeReleaseOperationError::BindingMismatch(
+                "custody_epoch",
+            ));
+        }
+        if envelope.manifest().node(node_public_key).is_none() {
+            return Err(RuntimeReleaseOperationError::BindingMismatch(
+                "custody_node",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn verify_node_rights_decision(
+        &self,
+        decision: &SignedNodeRightsDecisionV1,
+        node_set: &NodeSetV1,
+        now: u64,
+    ) -> Result<VerifiedNodeRightsDecisionV1, KeyReleaseError> {
+        let verified = verify_release_operation_statement(&self.statement, now)
+            .map_err(map_runtime_release_key_release_error)?;
+        decision.verify(&verified.release, node_set, now)
+    }
+
+    pub fn validate_node_contribution_active_window(
+        &self,
+        issued_at: u64,
+        expires_at: u64,
+        decision: &VerifiedNodeRightsDecisionV1,
+        now: u64,
+    ) -> Result<(), KeyReleaseError> {
+        let verified = verify_release_operation_statement(&self.statement, now)
+            .map_err(map_runtime_release_key_release_error)?;
+        crate::validate_node_contribution_active_window(
+            issued_at,
+            expires_at,
+            &verified.release,
+            decision,
+            now,
+        )
+    }
+
+    pub fn verify_node_contribution(
+        &self,
+        contribution: &SignedNodeContributionV1,
+        node_set: &NodeSetV1,
+        now: u64,
+    ) -> Result<VerifiedNodeContributionV1, KeyReleaseError> {
+        let verified = verify_release_operation_statement(&self.statement, now)
+            .map_err(map_runtime_release_key_release_error)?;
+        contribution.verify(&verified.release, node_set, now)
+    }
 }
 
 fn map_active(
@@ -492,6 +526,89 @@ fn map_active(
         Err(RightsError::Expired) => Err(RuntimeReleaseOperationError::Expired),
         Err(RightsError::Contract(error)) => Err(RuntimeReleaseOperationError::Contract(error)),
         Err(other) => Err(RuntimeReleaseOperationError::Rights(other)),
+    }
+}
+
+struct VerifiedReleaseOperationStatementV1 {
+    release: VerifiedKeyReleaseRequestV1,
+    epoch: crate::VerifiedCustodyEpochV1,
+}
+
+fn verify_release_operation_statement(
+    statement: &RuntimeReleaseOperationStatementV1,
+    now: u64,
+) -> Result<VerifiedReleaseOperationStatementV1, RuntimeReleaseOperationError> {
+    let rights_context = crate::RightsVerificationContextV1::new(
+        statement.rights_request.request().binding().clone(),
+        statement.rights_request.request().action(),
+        statement.rights_request.request().recipient().clone(),
+        now,
+    );
+    let verified_rights = statement.rights_request.verify_unclaimed(&rights_context)?;
+    let verified_release = statement
+        .release_request
+        .verify_unclaimed(&verified_rights, now)?;
+    let recipient_context = RecipientKeyAuthorizationContextV1::new(
+        verified_release.binding().clone(),
+        verified_release.action(),
+        statement.recipient_public_key,
+        statement.runtime_operation_issuer,
+        now,
+    );
+    let verified_authorization = statement
+        .recipient_authorization
+        .verify(&recipient_context)?;
+    let verified_epoch = statement
+        .custody_epoch
+        .verify_against_key_envelope(verified_release.binding().key_envelope())?;
+    if verified_epoch
+        .approved_suites()
+        .recipient_encryption_suite_id()
+        != verified_authorization
+            .recipient_identity()
+            .encryption_suite_id()
+    {
+        return Err(RuntimeReleaseOperationError::BindingMismatch(
+            "recipient_encryption_suite_id",
+        ));
+    }
+    if statement.recipient_public_key.key_identity(
+        verified_epoch
+            .approved_suites()
+            .recipient_encryption_suite_id(),
+    )? != *verified_authorization.recipient_identity()
+    {
+        return Err(RuntimeReleaseOperationError::BindingMismatch(
+            "recipient_public_key",
+        ));
+    }
+    Ok(VerifiedReleaseOperationStatementV1 {
+        release: verified_release,
+        epoch: verified_epoch,
+    })
+}
+
+fn map_runtime_release_key_release_error(error: RuntimeReleaseOperationError) -> KeyReleaseError {
+    match error {
+        RuntimeReleaseOperationError::Contract(error) => KeyReleaseError::Contract(error),
+        RuntimeReleaseOperationError::Rights(error) => KeyReleaseError::Rights(error),
+        RuntimeReleaseOperationError::KeyRelease(error) => error,
+        RuntimeReleaseOperationError::RecipientAuthorization(_) => {
+            KeyReleaseError::BindingMismatch("recipient_authorization")
+        }
+        RuntimeReleaseOperationError::CustodyEpoch(_) => {
+            KeyReleaseError::BindingMismatch("custody_epoch")
+        }
+        RuntimeReleaseOperationError::BindingMismatch(field) => {
+            KeyReleaseError::BindingMismatch(field)
+        }
+        RuntimeReleaseOperationError::InvalidRuntimeSignature => {
+            KeyReleaseError::BindingMismatch("runtime_signature")
+        }
+        RuntimeReleaseOperationError::NotYetValid => {
+            KeyReleaseError::Rights(RightsError::NotYetValid)
+        }
+        RuntimeReleaseOperationError::Expired => KeyReleaseError::Rights(RightsError::Expired),
     }
 }
 
@@ -510,10 +627,9 @@ mod tests {
     use crate::{
         CustodyApprovedSuitesV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
         CustodyNodeIdentityV1, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
-        KeyEnvelopeIdentityV1, NodeCustodyPublicKeyV1, NodePublicKey, ProfileIdentityV1,
-        ProtectedContentBindingV1, ReplayNonce16, RightsActionV1, RightsObservationFinalityV1,
-        RightsSubjectSourceV1, RuntimeSessionBindingV1, ShareCoordinateV1, ThresholdV1,
-        WalletAddress,
+        NodeCustodyPublicKeyV1, NodePublicKey, ProfileIdentityV1, ProtectedContentBindingV1,
+        ReplayNonce16, RightsActionV1, RightsObservationFinalityV1, RightsSubjectSourceV1,
+        RuntimeSessionBindingV1, ShareCoordinateV1, ThresholdV1, WalletAddress,
     };
 
     fn wallet(seed: u8) -> WalletAddress {
@@ -576,6 +692,46 @@ mod tests {
         .unwrap()
     }
 
+    fn envelope_for_epoch(custody_epoch: CustodyEpochIdentityV1) -> CustodyEnvelopeV1 {
+        let manifest = crate::CustodyEnvelopeManifestV1::new(
+            crate::EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+            custody_epoch,
+            ThresholdV1::new(2, 3).unwrap(),
+            digest(0x19),
+            vec![
+                CustodyNodeIdentityV1::new(
+                    node_public_key(1),
+                    custody_public_key(1),
+                    ShareCoordinateV1::new(1).unwrap(),
+                )
+                .unwrap(),
+                CustodyNodeIdentityV1::new(
+                    node_public_key(2),
+                    custody_public_key(2),
+                    ShareCoordinateV1::new(2).unwrap(),
+                )
+                .unwrap(),
+                CustodyNodeIdentityV1::new(
+                    node_public_key(3),
+                    custody_public_key(3),
+                    ShareCoordinateV1::new(3).unwrap(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let stored_share = crate::HpkeCiphertextV1::new([0x31; 32], [0x41; 48]).unwrap();
+        CustodyEnvelopeV1::new(
+            manifest,
+            vec![
+                stored_share.clone(),
+                stored_share.clone(),
+                stored_share.clone(),
+            ],
+        )
+        .unwrap()
+    }
+
     fn policy_body() -> RightsPolicyBodyV1 {
         RightsPolicyBodyV1::new(
             "content:alpha",
@@ -593,16 +749,9 @@ mod tests {
 
     fn binding() -> ProtectedContentBindingV1 {
         let encrypted_content = crate::EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap();
-        let epoch = signed_epoch();
-        let envelope = KeyEnvelopeIdentityV1::new(
-            encrypted_content.clone(),
-            digest(0x22),
-            512,
-            epoch.statement().node_set().unwrap().node_set_id().unwrap(),
-            epoch.statement().threshold(),
-            epoch.epoch_identity().unwrap(),
-        )
-        .unwrap();
+        let envelope = envelope_for_epoch(signed_epoch().epoch_identity().unwrap())
+            .key_envelope_identity()
+            .unwrap();
         let profile = SigningKey::from_bytes(&[0x26; 32]);
         let policy_body = policy_body();
         ProtectedContentBindingV1::new(
@@ -702,7 +851,7 @@ mod tests {
         let authenticated = operation.verify(NOW + 3).unwrap();
         assert_eq!(
             encode(authenticated.operation_hash().as_bytes()),
-            "787f4f626efb5a95122fc9c6cdc3205a1715a094037817d4ce78308cb8318e44"
+            "f37a1060048335ddaf05fc2c1b767b9983bc6a16af936113b1742af679089058"
         );
         assert_eq!(
             authenticated.rights_request_hash(),
@@ -730,6 +879,58 @@ mod tests {
                 .replay_claim_key()
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn runtime_release_operation_exposes_exact_replay_keys_but_stays_non_actionable() {
+        let operation = signed_operation();
+        let authenticated = operation.verify(NOW + 3).unwrap();
+        assert_eq!(
+            authenticated.release_request_hash(),
+            operation
+                .statement()
+                .release_request()
+                .request_hash()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_release_operation_claim_context_rejects_wrong_epoch_and_unknown_node() {
+        let wrong_epoch = signed_operation()
+            .verify(NOW + 3)
+            .unwrap()
+            .validate_node_release_claim_context(
+                &envelope_for_epoch(CustodyEpochIdentityV1::new(digest(0xee), 512).unwrap()),
+                node_public_key(1),
+                NOW + 3,
+            );
+        assert!(matches!(
+            wrong_epoch,
+            Err(RuntimeReleaseOperationError::BindingMismatch(
+                "key_envelope"
+            ))
+        ));
+
+        let unknown_node = signed_operation()
+            .verify(NOW + 3)
+            .unwrap()
+            .validate_node_release_claim_context(
+                &envelope_for_epoch(signed_epoch().epoch_identity().unwrap()),
+                NodePublicKey::new(
+                    SigningKey::from_bytes(&[0x66; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                )
+                .unwrap(),
+                NOW + 3,
+            );
+        assert!(matches!(
+            unknown_node,
+            Err(RuntimeReleaseOperationError::BindingMismatch(
+                "custody_node"
+            ))
+        ));
     }
 
     #[test]

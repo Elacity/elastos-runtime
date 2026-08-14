@@ -30,6 +30,27 @@ impl ReplayClaimKeyV1 {
     }
 }
 
+/// A replay claim and the authority lifetime it must hold through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayClaimEntryV1 {
+    key: ReplayClaimKeyV1,
+    expires_at: u64,
+}
+
+impl ReplayClaimEntryV1 {
+    pub const fn new(key: ReplayClaimKeyV1, expires_at: u64) -> Self {
+        Self { key, expires_at }
+    }
+
+    pub const fn key(&self) -> ReplayClaimKeyV1 {
+        self.key
+    }
+
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ReplayClaimError {
     #[error("authority nonce was already claimed")]

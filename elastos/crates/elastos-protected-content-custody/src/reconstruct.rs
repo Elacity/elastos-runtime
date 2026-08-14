@@ -155,9 +155,10 @@ mod tests {
         provision::provision_custody_envelope_with_rng,
         release::produce_node_contribution_with_rng,
         test_support::{
-            content_key, custody_nodes, digest, node_custody_secret, node_signing_key,
-            provisioned_envelope, recipient_public_key, recipient_secret, signed_node_decision,
-            verified_release_request, verified_release_request_for_envelope,
+            claimed_runtime_release_operation_for_envelope_and_node_seed, content_key,
+            custody_nodes, digest, node_custody_secret, node_signing_key, provisioned_envelope,
+            recipient_public_key, recipient_secret, signed_node_decision, verified_release_request,
+            verified_release_request_for_envelope,
             verified_release_request_for_envelope_and_recipient_seed, NOW,
         },
     };
@@ -172,7 +173,11 @@ mod tests {
         hpke_seed: u8,
     ) -> SignedNodeContributionV1 {
         produce_node_contribution_with_rng(
-            request,
+            &claimed_runtime_release_operation_for_envelope_and_node_seed(
+                envelope,
+                node_seed,
+                recipient_seed,
+            ),
             &signed_node_decision(
                 request,
                 node_seed,
