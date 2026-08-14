@@ -5,6 +5,7 @@
 //! content keys, or expose capsule workflows.
 
 mod canonical;
+mod custody_envelope;
 mod identity;
 mod node_contribution;
 mod node_decision;
@@ -21,6 +22,11 @@ mod authority_tests;
 mod test_support;
 
 pub use canonical::{CanonicalContract, ContractError};
+pub use custody_envelope::{
+    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyNodeIdentityV1, HpkeCiphertextV1,
+    NodeCustodyPublicKeyV1, ShareCoordinateV1, CUSTODY_HPKE_SUITE_ID_V1, HPKE_ENCAPPED_KEY_BYTES,
+    HPKE_SEALED_SHARE_BYTES, RELEASED_SHARE_HPKE_INFO_V1, STORED_SHARE_HPKE_INFO_V1,
+};
 pub use identity::{
     Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, ProfileIdentityV1,
     ProtectedContentBindingV1, RecipientKeyIdentityV1, RightsPolicyIdentityV1,
