@@ -17,7 +17,8 @@ provisional retirement surface:
   envelope, a local durable dual-key replay-claim store for custody nodes,
   a claim-gated node release path, and source-only custody helpers for
   custody-envelope provisioning, recipient-sealed node release, and
-  recipient-side threshold reconstruction for new content. It is not yet wired
+  recipient-scoped threshold reconstruction inside the decrypt boundary for new
+  content. It is not yet wired
   into Runtime orchestration, provider integration, Runtime-owned replay
   storage, recipient key-possession proof, decryption, playback, installation,
   or deployment.
