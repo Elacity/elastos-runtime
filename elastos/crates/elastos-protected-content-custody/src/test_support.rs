@@ -23,7 +23,7 @@ use elastos_protected_content_contracts::{
 };
 
 use crate::{
-    provision::provision_custody_envelope_with_rng, ClaimedNodeReleaseOperationV1,
+    provision::provision_custody_envelope_with_rng, replay_store::ClaimedNodeReleaseOperationV1,
     ContentEncryptionKeyV1, DurableReplayClaimStoreV1, NodeCustodySecretKeyV1,
     RecipientPublicKeyV1, RecipientSecretKeyV1,
 };

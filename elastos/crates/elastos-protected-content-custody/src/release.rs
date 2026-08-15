@@ -1,5 +1,6 @@
 use ed25519_dalek::{Signer as _, SigningKey};
 use hpke::rand_core::{CryptoRng as HpkeCryptoRng, RngCore as HpkeRngCore};
+#[cfg(test)]
 use rand09::{rngs::StdRng, SeedableRng as _};
 
 use elastos_protected_content_contracts::{
@@ -10,42 +11,14 @@ use elastos_protected_content_contracts::{
 
 use crate::{
     hpke_helpers::seal_share,
+    replay_store::ClaimedNodeReleaseOperationV1,
     secrets::{NodeCustodySecretKeyV1, RecipientPublicKeyV1},
-    ClaimedNodeReleaseOperationV1, CustodyError,
+    CustodyError,
 };
 
 #[allow(clippy::too_many_arguments)]
-/// ```compile_fail
-/// use ed25519_dalek::SigningKey;
-/// use elastos_protected_content_contracts::{
-///     AuthenticatedRuntimeReleaseOperationV1, CustodyEnvelopeV1, SignedNodeRightsDecisionV1,
-/// };
-/// use elastos_protected_content_custody::{
-///     produce_node_contribution, NodeCustodySecretKeyV1, RecipientPublicKeyV1,
-/// };
-///
-/// fn replay_pending_runtime_operations_are_not_actionable(
-///     operation: AuthenticatedRuntimeReleaseOperationV1,
-///     signed_rights_decision: SignedNodeRightsDecisionV1,
-///     envelope: CustodyEnvelopeV1,
-///     node_signing_key: SigningKey,
-///     node_custody_secret: NodeCustodySecretKeyV1,
-///     recipient_public_key: RecipientPublicKeyV1,
-/// ) {
-///     let _ = produce_node_contribution(
-///         operation,
-///         &signed_rights_decision,
-///         &envelope,
-///         &node_signing_key,
-///         &node_custody_secret,
-///         &recipient_public_key,
-///         1,
-///         2,
-///         1,
-///     );
-/// }
-/// ```
-pub fn produce_node_contribution(
+#[cfg(test)]
+pub(crate) fn produce_node_contribution(
     operation: ClaimedNodeReleaseOperationV1,
     signed_rights_decision: &SignedNodeRightsDecisionV1,
     envelope: &CustodyEnvelopeV1,

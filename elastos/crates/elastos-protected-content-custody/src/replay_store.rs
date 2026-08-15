@@ -2,69 +2,54 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::SigningKey;
+use hpke::rand_core::{CryptoRng as HpkeCryptoRng, RngCore as HpkeRngCore};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::geteuid;
+use rand09::SeedableRng as _;
 use sha2::{Digest as _, Sha256};
 
 use elastos_protected_content_contracts::{
-    AuthenticatedRuntimeReleaseOperationV1, CustodyEnvelopeV1, Digest32, NodePublicKey, NodeSetV1,
-    ReplayClaimEntryV1, ReplayClaimError, ReplayClaimKeyV1, ReplayNonce16,
-    SignedNodeContributionV1, SignedNodeRightsDecisionV1, VerifiedNodeContributionV1,
-    VerifiedNodeRightsDecisionV1,
+    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, CustodyEnvelopeV1, Digest32,
+    NodePublicKey, NodeSetV1, ReplayClaimEntryV1, ReplayClaimError, ReplayClaimKeyV1,
+    ReplayNonce16, RightsDecisionV1, RuntimeReleaseAuditIdV1, SignedNodeContributionV1,
+    SignedNodeRightsDecisionV1, VerifiedNodeContributionV1, VerifiedNodeRightsDecisionV1,
+    CUSTODY_HPKE_SUITE_ID_V1, MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES,
 };
 
-use crate::CustodyError;
+use crate::{
+    release::produce_node_contribution_with_rng, secrets::NodeCustodySecretKeyV1, CustodyError,
+    RecipientPublicKeyV1,
+};
 
 const STATE_MAGIC: &[u8; 8] = b"epc-rcl1";
 const STATE_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/node-replay-claims/state/v1";
 const STATE_HEADER_BYTES: usize = 44;
-const STATE_ENTRY_BYTES: usize = 56;
+const REPLAY_CLAIM_KEY_BYTES: usize = 48;
+const STORED_RESULT_STATE_CLAIM_ONLY: u8 = 0;
+const STORED_RESULT_STATE_PRESENT: u8 = 1;
+const MAX_STORED_CONTRIBUTION_BYTES: usize = MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES + (4 * 1024);
+const STATE_RECORD_FIXED_BYTES: usize = (REPLAY_CLAIM_KEY_BYTES + 8) * 2 + 32 + 32 + 1 + 2;
 const STATE_DIGEST_BYTES: usize = 32;
 const MAX_REPLAY_CLAIMS: usize = 4096;
-const MAX_STATE_PAYLOAD_BYTES: usize = STATE_HEADER_BYTES + (MAX_REPLAY_CLAIMS * STATE_ENTRY_BYTES);
-const MAX_STATE_BYTES: usize = MAX_STATE_PAYLOAD_BYTES + STATE_DIGEST_BYTES;
+const MAX_NODE_RELEASE_RECORDS: usize = MAX_REPLAY_CLAIMS / 2;
+const MAX_STATE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STATE_PAYLOAD_BYTES: usize = MAX_STATE_BYTES - STATE_DIGEST_BYTES;
 
 /// Atomically claimed node-release authority for one custody node.
 ///
 /// This token is non-serializable and has no public constructor. Only the
 /// concrete owner-only durable replay store can return it after the exact
 /// dual-key claim succeeds.
-///
-/// ```compile_fail
-/// use elastos_protected_content_contracts::{AuthenticatedRuntimeReleaseOperationV1, NodePublicKey};
-/// use elastos_protected_content_custody::ClaimedNodeReleaseOperationV1;
-///
-/// fn cannot_fabricate(
-///     operation: AuthenticatedRuntimeReleaseOperationV1,
-///     node: NodePublicKey,
-/// ) {
-///     let _ = ClaimedNodeReleaseOperationV1 {
-///         authenticated_operation: operation,
-///         selected_node_public_key: node,
-///     };
-/// }
-/// ```
 #[derive(Debug)]
-pub struct ClaimedNodeReleaseOperationV1 {
+pub(crate) struct ClaimedNodeReleaseOperationV1 {
     authenticated_operation: AuthenticatedRuntimeReleaseOperationV1,
     selected_node_public_key: NodePublicKey,
 }
 
 impl ClaimedNodeReleaseOperationV1 {
-    pub const fn operation_hash(&self) -> Digest32 {
-        self.authenticated_operation.operation_hash()
-    }
-
-    pub const fn rights_request_hash(&self) -> Digest32 {
-        self.authenticated_operation.rights_request_hash()
-    }
-
     pub const fn release_request_hash(&self) -> Digest32 {
         self.authenticated_operation.release_request_hash()
-    }
-
-    pub const fn recipient_authorization_hash(&self) -> Digest32 {
-        self.authenticated_operation.recipient_authorization_hash()
     }
 
     pub const fn selected_node_public_key(&self) -> NodePublicKey {
@@ -73,10 +58,6 @@ impl ClaimedNodeReleaseOperationV1 {
 
     pub fn binding(&self) -> &elastos_protected_content_contracts::ProtectedContentBindingV1 {
         self.authenticated_operation.binding()
-    }
-
-    pub fn action(&self) -> elastos_protected_content_contracts::RightsActionV1 {
-        self.authenticated_operation.action()
     }
 
     pub fn recipient(&self) -> &elastos_protected_content_contracts::RecipientKeyIdentityV1 {
@@ -118,6 +99,83 @@ impl ClaimedNodeReleaseOperationV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredNodeReleaseRecordV1 {
+    rights_request_replay_claim_key: ReplayClaimKeyV1,
+    rights_request_expires_at: u64,
+    release_request_replay_claim_key: ReplayClaimKeyV1,
+    release_request_expires_at: u64,
+    audit_request_id: RuntimeReleaseAuditIdV1,
+    operation_hash: Digest32,
+    contribution_bytes: Option<Vec<u8>>,
+}
+
+impl StoredNodeReleaseRecordV1 {
+    fn claim_only(
+        rights_claim: ReplayClaimEntryV1,
+        release_claim: ReplayClaimEntryV1,
+        audit_request_id: RuntimeReleaseAuditIdV1,
+        operation_hash: Digest32,
+    ) -> Self {
+        Self {
+            rights_request_replay_claim_key: rights_claim.key(),
+            rights_request_expires_at: rights_claim.expires_at(),
+            release_request_replay_claim_key: release_claim.key(),
+            release_request_expires_at: release_claim.expires_at(),
+            audit_request_id,
+            operation_hash,
+            contribution_bytes: None,
+        }
+    }
+
+    const fn rights_request_replay_claim_key(&self) -> ReplayClaimKeyV1 {
+        self.rights_request_replay_claim_key
+    }
+
+    const fn release_request_replay_claim_key(&self) -> ReplayClaimKeyV1 {
+        self.release_request_replay_claim_key
+    }
+
+    const fn audit_request_id(&self) -> RuntimeReleaseAuditIdV1 {
+        self.audit_request_id
+    }
+
+    const fn operation_hash(&self) -> Digest32 {
+        self.operation_hash
+    }
+
+    const fn rights_active(&self, now: u64) -> bool {
+        self.rights_request_expires_at > now
+    }
+
+    const fn release_active(&self, now: u64) -> bool {
+        self.release_request_expires_at > now
+    }
+
+    const fn any_active(&self, now: u64) -> bool {
+        self.rights_active(now) || self.release_active(now)
+    }
+
+    fn contribution_bytes(&self) -> Option<&[u8]> {
+        self.contribution_bytes.as_deref()
+    }
+
+    fn set_contribution_bytes(&mut self, contribution_bytes: Vec<u8>) {
+        self.contribution_bytes = Some(contribution_bytes);
+    }
+
+    fn sort_key(&self) -> [u8; REPLAY_CLAIM_KEY_BYTES * 2] {
+        let mut bytes = [0u8; REPLAY_CLAIM_KEY_BYTES * 2];
+        bytes[..REPLAY_CLAIM_KEY_BYTES].copy_from_slice(&replay_claim_sort_key(
+            self.release_request_replay_claim_key(),
+        ));
+        bytes[REPLAY_CLAIM_KEY_BYTES..].copy_from_slice(&replay_claim_sort_key(
+            self.rights_request_replay_claim_key(),
+        ));
+        bytes
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DurableReplayClaimStoreV1 {
     node_public_key: NodePublicKey,
@@ -143,7 +201,8 @@ impl DurableReplayClaimStoreV1 {
         self.node_public_key
     }
 
-    pub fn claim_node_release_operation(
+    #[cfg(test)]
+    pub(crate) fn claim_node_release_operation(
         &mut self,
         operation: AuthenticatedRuntimeReleaseOperationV1,
         envelope: &CustodyEnvelopeV1,
@@ -154,21 +213,25 @@ impl DurableReplayClaimStoreV1 {
             return Err(CustodyError::BindingMismatch("store_node_public_key"));
         }
         operation.validate_node_release_claim_context(envelope, selected_node_public_key, now)?;
-        self.claim_pair_inner(
-            [
-                ReplayClaimEntryV1::new(
-                    operation.rights_request_replay_claim_key(),
-                    operation
-                        .statement()
-                        .rights_request()
-                        .request()
-                        .expires_at(),
-                ),
-                ReplayClaimEntryV1::new(
-                    operation.release_request_replay_claim_key(),
-                    operation.statement().release_request().expires_at(),
-                ),
-            ],
+        let rights_claim = ReplayClaimEntryV1::new(
+            operation.rights_request_replay_claim_key(),
+            operation
+                .statement()
+                .rights_request()
+                .request()
+                .expires_at(),
+        );
+        let release_claim = ReplayClaimEntryV1::new(
+            operation.release_request_replay_claim_key(),
+            operation.statement().release_request().expires_at(),
+        );
+        self.claim_claim_only_record(
+            StoredNodeReleaseRecordV1::claim_only(
+                rights_claim,
+                release_claim,
+                operation.statement().audit_request_id(),
+                operation.operation_hash(),
+            ),
             now,
         )?;
         Ok(ClaimedNodeReleaseOperationV1 {
@@ -177,36 +240,228 @@ impl DurableReplayClaimStoreV1 {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_or_replay_node_contribution(
+        &mut self,
+        operation: AuthenticatedRuntimeReleaseOperationV1,
+        signed_rights_decision: &SignedNodeRightsDecisionV1,
+        envelope: &CustodyEnvelopeV1,
+        node_signing_key: &SigningKey,
+        node_custody_secret: &NodeCustodySecretKeyV1,
+        recipient_public_key: &RecipientPublicKeyV1,
+        issued_at: u64,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<SignedNodeContributionV1, CustodyError> {
+        let mut hpke_rng = rand09::rngs::StdRng::try_from_os_rng()
+            .map_err(|_| CustodyError::RandomnessUnavailable)?;
+        self.claim_or_replay_node_contribution_with_rng(
+            operation,
+            signed_rights_decision,
+            envelope,
+            node_signing_key,
+            node_custody_secret,
+            recipient_public_key,
+            issued_at,
+            expires_at,
+            now,
+            &mut hpke_rng,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn claim_or_replay_node_contribution_with_rng<R: HpkeCryptoRng + HpkeRngCore>(
+        &mut self,
+        operation: AuthenticatedRuntimeReleaseOperationV1,
+        signed_rights_decision: &SignedNodeRightsDecisionV1,
+        envelope: &CustodyEnvelopeV1,
+        node_signing_key: &SigningKey,
+        node_custody_secret: &NodeCustodySecretKeyV1,
+        recipient_public_key: &RecipientPublicKeyV1,
+        issued_at: u64,
+        expires_at: u64,
+        now: u64,
+        hpke_rng: &mut R,
+    ) -> Result<SignedNodeContributionV1, CustodyError> {
+        let selected_node_public_key =
+            NodePublicKey::new(node_signing_key.verifying_key().to_bytes())?;
+        if selected_node_public_key != self.node_public_key {
+            return Err(CustodyError::BindingMismatch("store_node_public_key"));
+        }
+        operation.validate_node_release_claim_context(envelope, selected_node_public_key, now)?;
+        if operation.recipient().encryption_suite_id() != CUSTODY_HPKE_SUITE_ID_V1 {
+            return Err(CustodyError::BindingMismatch(
+                "recipient_encryption_suite_id",
+            ));
+        }
+        if recipient_public_key.identity()? != *operation.recipient() {
+            return Err(CustodyError::BindingMismatch("recipient_key_identity"));
+        }
+        let node_set = envelope.manifest().node_set()?;
+        let decision =
+            operation.verify_node_rights_decision(signed_rights_decision, &node_set, now)?;
+        if decision.decision() != RightsDecisionV1::Allowed {
+            return Err(CustodyError::Release(
+                elastos_protected_content_contracts::KeyReleaseError::RightsDenied,
+            ));
+        }
+        operation
+            .validate_node_contribution_active_window(issued_at, expires_at, &decision, now)?;
+        let node_entry = envelope
+            .manifest()
+            .node(selected_node_public_key)
+            .ok_or(CustodyError::BindingMismatch("custody_node"))?;
+        node_custody_secret.matches_node_entry(
+            selected_node_public_key,
+            node_entry.custody_public_key(),
+            node_signing_key,
+        )?;
+
+        let rights_claim = ReplayClaimEntryV1::new(
+            operation.rights_request_replay_claim_key(),
+            operation
+                .statement()
+                .rights_request()
+                .request()
+                .expires_at(),
+        );
+        let release_claim = ReplayClaimEntryV1::new(
+            operation.release_request_replay_claim_key(),
+            operation.statement().release_request().expires_at(),
+        );
+        let audit_request_id = operation.statement().audit_request_id();
+        let operation_hash = operation.operation_hash();
+        let decision_bytes = signed_rights_decision.canonical_bytes()?;
+
+        self.ensure_state_dir()?;
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.cleanup_stale_temp()?;
+
+        let mut records = self.read_state()?;
+        records.retain(|record| record.any_active(now));
+
+        match find_exact_record_index(
+            &records,
+            rights_claim.key(),
+            release_claim.key(),
+            audit_request_id,
+            operation_hash,
+            now,
+        )? {
+            Some(index) => {
+                return replay_exact_contribution(
+                    &records[index],
+                    &decision_bytes,
+                    &operation,
+                    &node_set,
+                    now,
+                );
+            }
+            None => {
+                if has_conflicting_active_record(
+                    &records,
+                    rights_claim.key(),
+                    release_claim.key(),
+                    audit_request_id,
+                    now,
+                ) {
+                    return Err(CustodyError::Replay(ReplayClaimError::Unavailable));
+                }
+            }
+        }
+
+        let claim_only = StoredNodeReleaseRecordV1::claim_only(
+            rights_claim,
+            release_claim,
+            audit_request_id,
+            operation_hash,
+        );
+        records.push(claim_only);
+        records.sort_unstable_by_key(StoredNodeReleaseRecordV1::sort_key);
+        if records.len() > MAX_NODE_RELEASE_RECORDS {
+            return Err(CustodyError::Replay(ReplayClaimError::Unavailable));
+        }
+        self.write_state(&records)?;
+
+        let claimed = ClaimedNodeReleaseOperationV1 {
+            authenticated_operation: operation,
+            selected_node_public_key,
+        };
+        let contribution = produce_node_contribution_with_rng(
+            &claimed,
+            signed_rights_decision,
+            envelope,
+            node_signing_key,
+            node_custody_secret,
+            recipient_public_key,
+            issued_at,
+            expires_at,
+            now,
+            hpke_rng,
+        )?;
+        let contribution_bytes = contribution.canonical_bytes()?;
+
+        let Some(record) = records.iter_mut().find(|record| {
+            record.rights_request_replay_claim_key() == rights_claim.key()
+                && record.release_request_replay_claim_key() == release_claim.key()
+                && record.audit_request_id() == audit_request_id
+                && record.operation_hash() == operation_hash
+        }) else {
+            return Err(CustodyError::Replay(ReplayClaimError::Unavailable));
+        };
+        record.set_contribution_bytes(contribution_bytes);
+        self.write_state(&records)?;
+        Ok(contribution)
+    }
+
+    #[cfg(test)]
     fn claim_pair_inner(
         &self,
         mut claims: [ReplayClaimEntryV1; 2],
+        now: u64,
+    ) -> Result<(), ReplayClaimError> {
+        sort_claims(&mut claims);
+        if claims[0].key() == claims[1].key() {
+            return Err(ReplayClaimError::Unavailable);
+        }
+        self.claim_claim_only_record(
+            StoredNodeReleaseRecordV1::claim_only(
+                claims[0],
+                claims[1],
+                synthetic_runtime_release_audit_id(&claims),
+                synthetic_operation_hash(&claims),
+            ),
+            now,
+        )
+    }
+
+    #[cfg(test)]
+    fn claim_claim_only_record(
+        &self,
+        record: StoredNodeReleaseRecordV1,
         now: u64,
     ) -> Result<(), ReplayClaimError> {
         self.ensure_state_dir()?;
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.cleanup_stale_temp()?;
 
-        let mut entries = self.read_state()?;
-        entries.retain(|entry| entry.expires_at() > now);
-
-        sort_claims(&mut claims);
-        if claims[0].key() == claims[1].key() {
-            return Err(ReplayClaimError::Unavailable);
-        }
-        if claims
-            .iter()
-            .any(|claim| entries.iter().any(|entry| entry.key() == claim.key()))
-        {
+        let mut records = self.read_state()?;
+        records.retain(|existing| existing.any_active(now));
+        if has_conflicting_active_record(
+            &records,
+            record.rights_request_replay_claim_key(),
+            record.release_request_replay_claim_key(),
+            record.audit_request_id(),
+            now,
+        ) {
             return Err(ReplayClaimError::AlreadyClaimed);
         }
-
-        entries.extend(claims);
-        entries.sort_unstable_by_key(|entry| replay_claim_sort_key(entry.key()));
-        if entries.len() > MAX_REPLAY_CLAIMS {
+        records.push(record);
+        records.sort_unstable_by_key(StoredNodeReleaseRecordV1::sort_key);
+        if records.len() > MAX_NODE_RELEASE_RECORDS {
             return Err(ReplayClaimError::Unavailable);
         }
-
-        self.write_state(&entries)
+        self.write_state(&records)
     }
 
     fn ensure_state_dir(&self) -> Result<(), ReplayClaimError> {
@@ -238,7 +493,7 @@ impl DurableReplayClaimStoreV1 {
         }
     }
 
-    fn read_state(&self) -> Result<Vec<ReplayClaimEntryV1>, ReplayClaimError> {
+    fn read_state(&self) -> Result<Vec<StoredNodeReleaseRecordV1>, ReplayClaimError> {
         let metadata = match fs::symlink_metadata(&self.state_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -262,14 +517,14 @@ impl DurableReplayClaimStoreV1 {
         decode_state(&bytes, self.node_public_key)
     }
 
-    fn write_state(&self, entries: &[ReplayClaimEntryV1]) -> Result<(), ReplayClaimError> {
+    fn write_state(&self, records: &[StoredNodeReleaseRecordV1]) -> Result<(), ReplayClaimError> {
         match fs::symlink_metadata(&self.state_path) {
             Ok(metadata) => validate_owner_only_regular_file_metadata(&self.state_path, &metadata)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(ReplayClaimError::Unavailable),
         }
         let mut file = open_owner_only_temp_file_for_write(&self.temp_path)?;
-        let bytes = encode_state(self.node_public_key, entries)?;
+        let bytes = encode_state(self.node_public_key, records)?;
         file.write_all(&bytes)
             .map_err(|_| ReplayClaimError::Unavailable)?;
         file.sync_all().map_err(|_| ReplayClaimError::Unavailable)?;
@@ -445,6 +700,7 @@ fn validate_owner_and_mode(
     Ok(())
 }
 
+#[cfg(test)]
 fn sort_claims(claims: &mut [ReplayClaimEntryV1; 2]) {
     if replay_claim_sort_key(claims[1].key()) < replay_claim_sort_key(claims[0].key()) {
         claims.swap(0, 1);
@@ -460,30 +716,87 @@ fn replay_claim_sort_key(key: ReplayClaimKeyV1) -> [u8; 48] {
 
 fn encode_state(
     node_public_key: NodePublicKey,
-    entries: &[ReplayClaimEntryV1],
+    records: &[StoredNodeReleaseRecordV1],
 ) -> Result<Vec<u8>, ReplayClaimError> {
-    if entries.len() > MAX_REPLAY_CLAIMS {
+    if records.len() > MAX_NODE_RELEASE_RECORDS {
         return Err(ReplayClaimError::Unavailable);
     }
-    let mut payload = Vec::with_capacity(STATE_HEADER_BYTES + entries.len() * STATE_ENTRY_BYTES);
+    let total_contribution_bytes = records
+        .iter()
+        .map(|record| record.contribution_bytes().map_or(0, <[u8]>::len))
+        .sum::<usize>();
+    let mut payload = Vec::with_capacity(
+        STATE_HEADER_BYTES + (records.len() * STATE_RECORD_FIXED_BYTES) + total_contribution_bytes,
+    );
     payload.extend_from_slice(STATE_MAGIC);
     payload.extend_from_slice(node_public_key.as_bytes());
-    payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
-    for entry in entries {
-        payload.extend_from_slice(entry.key().authority_scope_hash().as_bytes());
-        payload.extend_from_slice(entry.key().nonce().as_bytes());
-        payload.extend_from_slice(&entry.expires_at().to_be_bytes());
+    payload.extend_from_slice(&(records.len() as u32).to_be_bytes());
+    let mut previous = None;
+    for record in records {
+        let sort_key = record.sort_key();
+        if previous.is_some_and(|prior| prior >= sort_key) {
+            return Err(ReplayClaimError::Unavailable);
+        }
+        previous = Some(sort_key);
+
+        payload.extend_from_slice(
+            record
+                .rights_request_replay_claim_key()
+                .authority_scope_hash()
+                .as_bytes(),
+        );
+        payload.extend_from_slice(record.rights_request_replay_claim_key().nonce().as_bytes());
+        payload.extend_from_slice(&record.rights_request_expires_at.to_be_bytes());
+
+        payload.extend_from_slice(
+            record
+                .release_request_replay_claim_key()
+                .authority_scope_hash()
+                .as_bytes(),
+        );
+        payload.extend_from_slice(record.release_request_replay_claim_key().nonce().as_bytes());
+        payload.extend_from_slice(&record.release_request_expires_at.to_be_bytes());
+
+        payload.extend_from_slice(record.audit_request_id().digest().as_bytes());
+        payload.extend_from_slice(record.operation_hash().as_bytes());
+
+        match record.contribution_bytes() {
+            Some(contribution_bytes) => {
+                if contribution_bytes.is_empty()
+                    || contribution_bytes.len() > MAX_STORED_CONTRIBUTION_BYTES
+                {
+                    return Err(ReplayClaimError::Unavailable);
+                }
+                payload.push(STORED_RESULT_STATE_PRESENT);
+                payload.extend_from_slice(
+                    &u16::try_from(contribution_bytes.len())
+                        .map_err(|_| ReplayClaimError::Unavailable)?
+                        .to_be_bytes(),
+                );
+                payload.extend_from_slice(contribution_bytes);
+            }
+            None => {
+                payload.push(STORED_RESULT_STATE_CLAIM_ONLY);
+                payload.extend_from_slice(&0u16.to_be_bytes());
+            }
+        }
+    }
+    if payload.len() > MAX_STATE_PAYLOAD_BYTES {
+        return Err(ReplayClaimError::Unavailable);
     }
     let digest = state_integrity_digest(&payload);
     let mut bytes = payload;
     bytes.extend_from_slice(&digest);
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(ReplayClaimError::Unavailable);
+    }
     Ok(bytes)
 }
 
 fn decode_state(
     bytes: &[u8],
     expected_node_public_key: NodePublicKey,
-) -> Result<Vec<ReplayClaimEntryV1>, ReplayClaimError> {
+) -> Result<Vec<StoredNodeReleaseRecordV1>, ReplayClaimError> {
     if bytes.len() < STATE_HEADER_BYTES + STATE_DIGEST_BYTES {
         return Err(ReplayClaimError::Unavailable);
     }
@@ -502,44 +815,204 @@ fn decode_state(
             .try_into()
             .map_err(|_| ReplayClaimError::Unavailable)?,
     ) as usize;
-    if count > MAX_REPLAY_CLAIMS {
-        return Err(ReplayClaimError::Unavailable);
-    }
-    if payload.len() != STATE_HEADER_BYTES + (count * STATE_ENTRY_BYTES) {
+    if count > MAX_NODE_RELEASE_RECORDS {
         return Err(ReplayClaimError::Unavailable);
     }
 
-    let mut entries = Vec::with_capacity(count);
+    let mut records = Vec::with_capacity(count);
     let mut previous = None;
     let mut offset = STATE_HEADER_BYTES;
     for _ in 0..count {
-        let mut authority_scope_hash = [0u8; 32];
-        authority_scope_hash.copy_from_slice(&payload[offset..offset + 32]);
+        if payload.len() < offset + STATE_RECORD_FIXED_BYTES {
+            return Err(ReplayClaimError::Unavailable);
+        }
+
+        let mut rights_authority_scope_hash = [0u8; 32];
+        rights_authority_scope_hash.copy_from_slice(&payload[offset..offset + 32]);
         offset += 32;
-        let mut nonce = [0u8; 16];
-        nonce.copy_from_slice(&payload[offset..offset + 16]);
+        let mut rights_nonce = [0u8; 16];
+        rights_nonce.copy_from_slice(&payload[offset..offset + 16]);
         offset += 16;
-        let expires_at = u64::from_be_bytes(
+        let rights_request_expires_at = u64::from_be_bytes(
             payload[offset..offset + 8]
                 .try_into()
                 .map_err(|_| ReplayClaimError::Unavailable)?,
         );
         offset += 8;
-        let entry = ReplayClaimEntryV1::new(
-            ReplayClaimKeyV1::new(
-                Digest32::new(authority_scope_hash),
-                ReplayNonce16::new(nonce),
-            ),
-            expires_at,
+
+        let mut release_authority_scope_hash = [0u8; 32];
+        release_authority_scope_hash.copy_from_slice(&payload[offset..offset + 32]);
+        offset += 32;
+        let mut release_nonce = [0u8; 16];
+        release_nonce.copy_from_slice(&payload[offset..offset + 16]);
+        offset += 16;
+        let release_request_expires_at = u64::from_be_bytes(
+            payload[offset..offset + 8]
+                .try_into()
+                .map_err(|_| ReplayClaimError::Unavailable)?,
         );
-        let sort_key = replay_claim_sort_key(entry.key());
+        offset += 8;
+
+        let mut audit_request_id = [0u8; 32];
+        audit_request_id.copy_from_slice(&payload[offset..offset + 32]);
+        offset += 32;
+
+        let mut operation_hash = [0u8; 32];
+        operation_hash.copy_from_slice(&payload[offset..offset + 32]);
+        offset += 32;
+
+        let contribution_state = payload[offset];
+        offset += 1;
+        let contribution_len = u16::from_be_bytes(
+            payload[offset..offset + 2]
+                .try_into()
+                .map_err(|_| ReplayClaimError::Unavailable)?,
+        ) as usize;
+        offset += 2;
+        if payload.len() < offset + contribution_len {
+            return Err(ReplayClaimError::Unavailable);
+        }
+
+        let contribution_bytes = match contribution_state {
+            STORED_RESULT_STATE_CLAIM_ONLY => {
+                if contribution_len != 0 {
+                    return Err(ReplayClaimError::Unavailable);
+                }
+                None
+            }
+            STORED_RESULT_STATE_PRESENT => {
+                if contribution_len == 0 || contribution_len > MAX_STORED_CONTRIBUTION_BYTES {
+                    return Err(ReplayClaimError::Unavailable);
+                }
+                let contribution = payload[offset..offset + contribution_len].to_vec();
+                offset += contribution_len;
+                Some(contribution)
+            }
+            _ => return Err(ReplayClaimError::Unavailable),
+        };
+
+        let record = StoredNodeReleaseRecordV1 {
+            rights_request_replay_claim_key: ReplayClaimKeyV1::new(
+                Digest32::new(rights_authority_scope_hash),
+                ReplayNonce16::new(rights_nonce),
+            ),
+            rights_request_expires_at,
+            release_request_replay_claim_key: ReplayClaimKeyV1::new(
+                Digest32::new(release_authority_scope_hash),
+                ReplayNonce16::new(release_nonce),
+            ),
+            release_request_expires_at,
+            audit_request_id: RuntimeReleaseAuditIdV1::new(Digest32::new(audit_request_id))
+                .map_err(|_| ReplayClaimError::Unavailable)?,
+            operation_hash: Digest32::new(operation_hash),
+            contribution_bytes,
+        };
+
+        let sort_key = record.sort_key();
         if previous.is_some_and(|prior| prior >= sort_key) {
             return Err(ReplayClaimError::Unavailable);
         }
         previous = Some(sort_key);
-        entries.push(entry);
+        records.push(record);
     }
-    Ok(entries)
+    if offset != payload.len() {
+        return Err(ReplayClaimError::Unavailable);
+    }
+    Ok(records)
+}
+
+fn has_conflicting_active_record(
+    records: &[StoredNodeReleaseRecordV1],
+    rights_request_replay_claim_key: ReplayClaimKeyV1,
+    release_request_replay_claim_key: ReplayClaimKeyV1,
+    audit_request_id: RuntimeReleaseAuditIdV1,
+    now: u64,
+) -> bool {
+    records.iter().any(|record| {
+        let matches_rights_key = record.rights_request_replay_claim_key()
+            == rights_request_replay_claim_key
+            || record.release_request_replay_claim_key() == rights_request_replay_claim_key;
+        let matches_release_key = record.rights_request_replay_claim_key()
+            == release_request_replay_claim_key
+            || record.release_request_replay_claim_key() == release_request_replay_claim_key;
+        record.any_active(now)
+            && (matches_rights_key
+                || matches_release_key
+                || record.audit_request_id() == audit_request_id)
+    })
+}
+
+fn find_exact_record_index(
+    records: &[StoredNodeReleaseRecordV1],
+    rights_request_replay_claim_key: ReplayClaimKeyV1,
+    release_request_replay_claim_key: ReplayClaimKeyV1,
+    audit_request_id: RuntimeReleaseAuditIdV1,
+    operation_hash: Digest32,
+    now: u64,
+) -> Result<Option<usize>, ReplayClaimError> {
+    let mut exact = None;
+    for (index, record) in records.iter().enumerate() {
+        if !record.any_active(now) {
+            continue;
+        }
+        let same_claims = record.rights_request_replay_claim_key()
+            == rights_request_replay_claim_key
+            && record.release_request_replay_claim_key() == release_request_replay_claim_key;
+        if same_claims && record.audit_request_id() == audit_request_id {
+            if record.operation_hash() != operation_hash {
+                return Err(ReplayClaimError::Unavailable);
+            }
+            exact = Some(index);
+        }
+    }
+    Ok(exact)
+}
+
+fn replay_exact_contribution(
+    record: &StoredNodeReleaseRecordV1,
+    decision_bytes: &[u8],
+    operation: &AuthenticatedRuntimeReleaseOperationV1,
+    node_set: &NodeSetV1,
+    now: u64,
+) -> Result<SignedNodeContributionV1, CustodyError> {
+    let contribution_bytes = record
+        .contribution_bytes()
+        .ok_or(CustodyError::Replay(ReplayClaimError::Unavailable))?;
+    let contribution = SignedNodeContributionV1::from_canonical_bytes(contribution_bytes)?;
+    if contribution
+        .statement()
+        .signed_rights_decision()
+        .canonical_bytes()?
+        != decision_bytes
+    {
+        return Err(CustodyError::BindingMismatch("node_rights_decision"));
+    }
+    operation.verify_node_contribution(&contribution, node_set, now)?;
+    Ok(contribution)
+}
+
+#[cfg(test)]
+fn synthetic_runtime_release_audit_id(claims: &[ReplayClaimEntryV1; 2]) -> RuntimeReleaseAuditIdV1 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"elastos/protected-content/node-replay-claims/test-audit-id/v1");
+    for claim in claims {
+        hasher.update(claim.key().authority_scope_hash().as_bytes());
+        hasher.update(claim.key().nonce().as_bytes());
+        hasher.update(claim.expires_at().to_be_bytes());
+    }
+    RuntimeReleaseAuditIdV1::new(Digest32::new(hasher.finalize().into())).unwrap()
+}
+
+#[cfg(test)]
+fn synthetic_operation_hash(claims: &[ReplayClaimEntryV1; 2]) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"elastos/protected-content/node-replay-claims/test-operation-hash/v1");
+    for claim in claims {
+        hasher.update(claim.key().authority_scope_hash().as_bytes());
+        hasher.update(claim.key().nonce().as_bytes());
+        hasher.update(claim.expires_at().to_be_bytes());
+    }
+    Digest32::new(hasher.finalize().into())
 }
 
 fn state_integrity_digest(payload: &[u8]) -> [u8; STATE_DIGEST_BYTES] {
@@ -601,12 +1074,35 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use ed25519_dalek::SigningKey;
+    use hpke::rand_core::{CryptoRng, RngCore};
+    use rand09::{rngs::StdRng, SeedableRng as _};
 
     use super::*;
     use crate::test_support::{
-        authenticated_runtime_release_operation_for_envelope_and_recipient_seed, node_public_key,
-        provisioned_envelope, NOW,
+        authenticated_runtime_release_operation_for_envelope_and_recipient_seed,
+        node_custody_secret, node_public_key, node_signing_key, provisioned_envelope,
+        recipient_public_key, signed_node_decision,
+        verified_release_request_for_envelope_and_recipient_seed, NOW,
     };
+
+    #[derive(Debug)]
+    struct PanicRng;
+
+    impl CryptoRng for PanicRng {}
+
+    impl RngCore for PanicRng {
+        fn next_u32(&mut self) -> u32 {
+            panic!("replay path must not consume randomness")
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            panic!("replay path must not consume randomness")
+        }
+
+        fn fill_bytes(&mut self, _dest: &mut [u8]) {
+            panic!("replay path must not consume randomness")
+        }
+    }
 
     fn claim(seed: u8, expiry: u64) -> ReplayClaimEntryV1 {
         ReplayClaimEntryV1::new(
@@ -640,6 +1136,116 @@ mod tests {
 
     fn durable_store(seed: u8, temp: &tempfile::TempDir) -> DurableReplayClaimStoreV1 {
         DurableReplayClaimStoreV1::new(store_node(seed), store_dir(temp))
+    }
+
+    fn derived_max_signed_node_contribution_bytes() -> usize {
+        const DIGEST_BYTES: usize = 32;
+        const U64_BYTES: usize = 8;
+        const U32_BYTES: usize = 4;
+        const U16_BYTES: usize = 2;
+        const U8_BYTES: usize = 1;
+        const WALLET_ADDRESS_BYTES: usize = 20;
+        const ED25519_SIGNATURE_BYTES: usize = 64;
+
+        let max_encrypted_content_identity_bytes =
+            "elastos.protected-content.encrypted-content/v1".len() + 1 + DIGEST_BYTES + U64_BYTES;
+        let max_rights_policy_identity_bytes = "elastos.protected-content.rights-policy-identity/v1"
+            .len()
+            + 1
+            + DIGEST_BYTES + U32_BYTES;
+        let max_profile_identity_bytes =
+            "elastos.protected-content.profile-identity/v1".len() + 1 + DIGEST_BYTES;
+        let max_custody_epoch_identity_bytes = "elastos.protected-content.custody-epoch-identity/v1"
+            .len()
+            + 1
+            + DIGEST_BYTES
+            + DIGEST_BYTES
+            + U8_BYTES
+            + U8_BYTES + U32_BYTES;
+        let max_key_envelope_identity_bytes = "elastos.protected-content.key-envelope/v1".len()
+            + 1
+            + U16_BYTES
+            + max_encrypted_content_identity_bytes
+            + DIGEST_BYTES
+            + U32_BYTES
+            + DIGEST_BYTES
+            + U8_BYTES
+            + U8_BYTES
+            + U16_BYTES
+            + max_custody_epoch_identity_bytes;
+        let max_protected_content_binding_bytes = "elastos.protected-content.binding/v1".len()
+            + 1
+            + U16_BYTES
+            + max_encrypted_content_identity_bytes
+            + U16_BYTES
+            + max_key_envelope_identity_bytes
+            + U16_BYTES
+            + max_rights_policy_identity_bytes
+            + U16_BYTES
+            + max_profile_identity_bytes
+            + WALLET_ADDRESS_BYTES
+            + DIGEST_BYTES;
+        let max_recipient_key_identity_bytes = "elastos.protected-content.recipient-key-identity/v1"
+            .len()
+            + 1
+            + U16_BYTES
+            + elastos_protected_content_contracts::MAX_RECIPIENT_ENCRYPTION_SUITE_ID_BYTES
+            + DIGEST_BYTES;
+        let max_recipient_sealed_contribution_bytes =
+            "elastos.protected-content.recipient-sealed-contribution/v1".len()
+                + 1
+                + U16_BYTES
+                + max_recipient_key_identity_bytes
+                + U16_BYTES
+                + elastos_protected_content_contracts::MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES;
+        let max_signed_node_rights_decision_bytes =
+            "elastos.protected-content.signed-node-rights-decision/v1".len()
+                + 1
+                + U16_BYTES
+                + ("elastos.protected-content.node-rights-decision/v1".len()
+                    + 1
+                    + DIGEST_BYTES
+                    + DIGEST_BYTES
+                    + U16_BYTES
+                    + max_protected_content_binding_bytes
+                    + U8_BYTES
+                    + DIGEST_BYTES
+                    + U8_BYTES
+                    + DIGEST_BYTES
+                    + U64_BYTES
+                    + U64_BYTES)
+                + U16_BYTES
+                + ED25519_SIGNATURE_BYTES;
+        "elastos.protected-content.signed-node-contribution/v1".len()
+            + 1
+            + U16_BYTES
+            + ("elastos.protected-content.node-contribution/v1".len()
+                + 1
+                + DIGEST_BYTES
+                + U16_BYTES
+                + max_protected_content_binding_bytes
+                + U16_BYTES
+                + max_signed_node_rights_decision_bytes
+                + U16_BYTES
+                + max_recipient_sealed_contribution_bytes
+                + U64_BYTES
+                + U64_BYTES)
+            + U16_BYTES
+            + ED25519_SIGNATURE_BYTES
+    }
+
+    fn allowed_decision_for(
+        envelope: &CustodyEnvelopeV1,
+        recipient_seed: u8,
+    ) -> SignedNodeRightsDecisionV1 {
+        let request =
+            verified_release_request_for_envelope_and_recipient_seed(envelope, recipient_seed);
+        signed_node_decision(&request, 1, RightsDecisionV1::Allowed)
+    }
+
+    #[test]
+    fn durable_store_cap_admits_every_current_valid_signed_contribution_shape() {
+        assert!(derived_max_signed_node_contribution_bytes() <= MAX_STORED_CONTRIBUTION_BYTES);
     }
 
     #[test]
@@ -683,6 +1289,208 @@ mod tests {
         store
             .claim_pair_inner([claim(1, 40), claim(2, 40)], 21)
             .unwrap();
+    }
+
+    #[test]
+    fn durable_store_replays_exact_contribution_after_restart_without_new_effects() {
+        let temp = owner_only_tempdir();
+        let envelope = provisioned_envelope();
+        let decision = allowed_decision_for(&envelope, 0x30);
+        let mut store = durable_store(1, &temp);
+        let first_operation =
+            authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+                &envelope, 0x30,
+            );
+        let mut first_rng = StdRng::from_seed([0x51; 32]);
+        let first = store
+            .claim_or_replay_node_contribution_with_rng(
+                first_operation,
+                &decision,
+                &envelope,
+                &node_signing_key(1),
+                &node_custody_secret(1),
+                &recipient_public_key(0x30),
+                NOW + 5,
+                NOW + 45,
+                NOW + 6,
+                &mut first_rng,
+            )
+            .unwrap();
+        let first_bytes = first.canonical_bytes().unwrap();
+
+        let mut reopened = durable_store(1, &temp);
+        let replayed = reopened
+            .claim_or_replay_node_contribution_with_rng(
+                authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+                    &envelope, 0x30,
+                ),
+                &decision,
+                &envelope,
+                &node_signing_key(1),
+                &node_custody_secret(1),
+                &recipient_public_key(0x30),
+                NOW + 5,
+                NOW + 45,
+                NOW + 6,
+                &mut PanicRng,
+            )
+            .unwrap();
+        assert_eq!(replayed.canonical_bytes().unwrap(), first_bytes);
+    }
+
+    #[test]
+    fn durable_store_claim_without_result_fails_closed() {
+        let temp = owner_only_tempdir();
+        let envelope = provisioned_envelope();
+        let mut store = durable_store(1, &temp);
+        let operation = authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+            &envelope, 0x30,
+        );
+        store
+            .claim_node_release_operation(operation, &envelope, node_public_key(1), NOW + 3)
+            .unwrap();
+
+        let decision = allowed_decision_for(&envelope, 0x30);
+        let err = store
+            .claim_or_replay_node_contribution_with_rng(
+                authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+                    &envelope, 0x30,
+                ),
+                &decision,
+                &envelope,
+                &node_signing_key(1),
+                &node_custody_secret(1),
+                &recipient_public_key(0x30),
+                NOW + 5,
+                NOW + 45,
+                NOW + 6,
+                &mut PanicRng,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::Replay(ReplayClaimError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn durable_store_rejects_mismatched_retry_without_mutating_stored_result() {
+        let temp = owner_only_tempdir();
+        let envelope = provisioned_envelope();
+        let mut store = durable_store(1, &temp);
+        let decision = allowed_decision_for(&envelope, 0x30);
+        let mut first_rng = StdRng::from_seed([0x52; 32]);
+        let first = store
+            .claim_or_replay_node_contribution_with_rng(
+                authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+                    &envelope, 0x30,
+                ),
+                &decision,
+                &envelope,
+                &node_signing_key(1),
+                &node_custody_secret(1),
+                &recipient_public_key(0x30),
+                NOW + 5,
+                NOW + 45,
+                NOW + 6,
+                &mut first_rng,
+            )
+            .unwrap();
+        let first_bytes = first.canonical_bytes().unwrap();
+
+        let mismatched_decision = allowed_decision_for(&envelope, 0x31);
+        let err = store
+            .claim_or_replay_node_contribution_with_rng(
+                authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+                    &envelope, 0x31,
+                ),
+                &mismatched_decision,
+                &envelope,
+                &node_signing_key(1),
+                &node_custody_secret(1),
+                &recipient_public_key(0x31),
+                NOW + 5,
+                NOW + 45,
+                NOW + 6,
+                &mut PanicRng,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::Replay(ReplayClaimError::Unavailable)
+        ));
+
+        let replayed = store
+            .claim_or_replay_node_contribution_with_rng(
+                authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+                    &envelope, 0x30,
+                ),
+                &decision,
+                &envelope,
+                &node_signing_key(1),
+                &node_custody_secret(1),
+                &recipient_public_key(0x30),
+                NOW + 5,
+                NOW + 45,
+                NOW + 6,
+                &mut PanicRng,
+            )
+            .unwrap();
+        assert_eq!(replayed.canonical_bytes().unwrap(), first_bytes);
+    }
+
+    #[test]
+    fn durable_store_rejects_corrupt_stored_result_without_mutation() {
+        let temp = owner_only_tempdir();
+        let envelope = provisioned_envelope();
+        let decision = allowed_decision_for(&envelope, 0x30);
+        let mut store = durable_store(1, &temp);
+        let mut first_rng = StdRng::from_seed([0x53; 32]);
+        store
+            .claim_or_replay_node_contribution_with_rng(
+                authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+                    &envelope, 0x30,
+                ),
+                &decision,
+                &envelope,
+                &node_signing_key(1),
+                &node_custody_secret(1),
+                &recipient_public_key(0x30),
+                NOW + 5,
+                NOW + 45,
+                NOW + 6,
+                &mut first_rng,
+            )
+            .unwrap();
+
+        let mut records = store.read_state().unwrap();
+        let contribution = records[0].contribution_bytes.as_mut().unwrap();
+        let last = contribution.len() - 1;
+        contribution[last] ^= 0x5a;
+        let expected = records.clone();
+        store.write_state(&records).unwrap();
+
+        let err = store
+            .claim_or_replay_node_contribution_with_rng(
+                authenticated_runtime_release_operation_for_envelope_and_recipient_seed(
+                    &envelope, 0x30,
+                ),
+                &decision,
+                &envelope,
+                &node_signing_key(1),
+                &node_custody_secret(1),
+                &recipient_public_key(0x30),
+                NOW + 5,
+                NOW + 45,
+                NOW + 6,
+                &mut PanicRng,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyError::Contract(_) | CustodyError::Release(_) | CustodyError::BindingMismatch(_)
+        ));
+        assert_eq!(store.read_state().unwrap(), expected);
     }
 
     #[test]

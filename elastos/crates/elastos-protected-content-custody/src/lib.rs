@@ -14,8 +14,7 @@ use thiserror::Error;
 
 pub use provision::provision_custody_envelope;
 pub use reconstruct::reconstruct_content_key;
-pub use release::produce_node_contribution;
-pub use replay_store::{ClaimedNodeReleaseOperationV1, DurableReplayClaimStoreV1};
+pub use replay_store::DurableReplayClaimStoreV1;
 pub use secrets::{
     ContentEncryptionKeyV1, NodeCustodySecretKeyV1, RecipientPublicKeyV1, RecipientSecretKeyV1,
 };
