@@ -230,7 +230,13 @@ pub(super) fn managed_signed_result(
 pub(super) fn external_signature_message(
     request: &WalletApprovalRequest,
 ) -> Result<String, String> {
-    if request.intent == "browser_personal_sign" {
+    // `ddrm_delegation_sign` (the connector-brokered dDRM delegation signature, minted by
+    // `viewer_grant_sign::create_delegation_sign_request`) shares the EXACT same connector
+    // `personal_sign` shape as `browser_personal_sign` — a `payload.message` string the connector
+    // EIP-191 signs verbatim — so it must be extracted and hashed identically, not fall through to
+    // the generic `ElastOS Wallet Approval...` canned message below (which would never match what
+    // the wallet actually signed).
+    if request.intent == "browser_personal_sign" || request.intent == "ddrm_delegation_sign" {
         return request
             .payload
             .get("message")

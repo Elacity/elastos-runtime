@@ -1562,6 +1562,20 @@ function canOpenTargetFromHomeMessage(context, target) {
   if (context.kind === "home") {
     return true;
   }
+  // ESP connector-signed delegation (dDRM): the home-gui shell auto-routes to the principal's
+  // default wallet connector capsule so a pending `personal_sign` approval surfaces there —
+  // mirrors the `wallet` app-frame's existing ability to open these same two targets (below).
+  // Wallet connector capsules are deliberately excluded from `summary.targets`
+  // (`is_home_visible_target` server-side), so the generic "visible-target" policy below would
+  // always deny them; this is a narrow, id-scoped exception for the shell frame itself only —
+  // not a widening of what any other target/source may open.
+  if (
+    context.kind === "shell-frame" &&
+    context.targetId === HOME_GUI_SHELL_ID &&
+    WALLET_CONNECTOR_TARGETS.has(target)
+  ) {
+    return true;
+  }
   const policy = SHELL_MESSAGE_OPEN_TARGET_SOURCES[context.targetId];
   if (!policy) {
     return false;

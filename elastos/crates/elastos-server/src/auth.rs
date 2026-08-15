@@ -23,7 +23,8 @@ use elastos_common::localhost::rooted_localhost_fs_path;
 use elastos_runtime::auth::{
     validate_principal_root_protection, AuthChallengeV1, AuthSessionGrantV1,
     PrincipalRootProtectionV1, PrincipalRootProtectorKind, PrincipalRootRecoveryArchiveV1,
-    ProofBinding, RecoveryKitV1, RuntimeAuditEventV1, DEFAULT_PRINCIPAL_ROOT_CIPHER,
+    ProofBinding, ProofBindingKind, RecoveryKitV1, RuntimeAuditEventV1,
+    DEFAULT_PRINCIPAL_ROOT_CIPHER,
 };
 use hkdf::Hkdf;
 use rand::RngCore;
@@ -1739,6 +1740,30 @@ pub fn load_principal_for_proof_binding(
         .into_iter()
         .find(|principal| principal.proof_binding_id == proof_binding_id)
         .ok_or_else(|| anyhow!("proof binding not found"))
+}
+
+/// The signed-in principal's OWN verified EVM wallet address, if one is linked.
+///
+/// When a user binds a wallet through the wallet app, the runtime persists it on their principal as
+/// an `EvmAccount` proof binding (`proof:wallet:eip155:<chain>:<address>`, the address held in
+/// `ProofBinding::subject`). That already-verified linkage IS the principal's DRM subject: it is
+/// resolved per-principal from persisted state, with NO operator-chosen pin — unlike the
+/// `ELASTOS_DDRM_SUBJECT` dev override, which aims every principal's rights check at one wallet.
+///
+/// When a principal has bound more than one EVM wallet, prefer the most-recently-verified one (the
+/// freshest linkage — typically the wallet the user most recently connected with). Returns `None`
+/// when the principal has linked no EVM wallet, which every caller treats as "no bound wallet"
+/// (i.e. no rights) — never as "rights granted".
+pub fn linked_evm_subject_for_principal(data_dir: &Path, principal_id: &str) -> Option<String> {
+    let state = load_auth_state(data_dir).ok()?;
+    state
+        .principals
+        .into_iter()
+        .filter(|record| record.principal_id == principal_id)
+        .filter(|record| record.proof_binding.kind == ProofBindingKind::EvmAccount)
+        .filter(|record| !record.proof_binding.subject.trim().is_empty())
+        .max_by_key(|record| record.proof_binding.verified_at)
+        .map(|record| record.proof_binding.subject)
 }
 
 pub fn ensure_proof_binding_not_revoked(record: &PrincipalRecord) -> anyhow::Result<()> {
@@ -4414,6 +4439,43 @@ mod tests {
         assert_eq!(passkey.sign_count, 2);
         assert_eq!(second.role, RuntimePrincipalRole::Guest);
         assert!(second.localhost_root.starts_with("localhost://Users/"));
+    }
+
+    #[test]
+    fn linked_evm_subject_resolves_the_principals_own_verified_wallet() {
+        // The DRM subject is the signed-in principal's OWN linked EVM wallet, resolved per-principal
+        // from the verified proof binding the wallet app persists — never an operator-pinned wallet.
+        let data_dir = tempfile::tempdir().unwrap();
+        let now = 100;
+
+        // A passkey-only principal has linked no EVM wallet yet -> no subject (fail-closed empty).
+        let principal =
+            upsert_principal_for_binding(data_dir.path(), passkey_binding(1, now, now), now)
+                .unwrap();
+        assert_eq!(
+            linked_evm_subject_for_principal(data_dir.path(), &principal.principal_id),
+            None,
+        );
+
+        // Binding a wallet through the wallet app records an EvmAccount proof binding on the SAME
+        // principal; resolution then returns exactly that verified address.
+        upsert_principal_for_binding_as(
+            data_dir.path(),
+            ProofBinding::evm_account(8453, "0xab5028bdbb0826ad6f1885478e421db677b0001a", now + 1),
+            principal.principal_id.clone(),
+            now + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            linked_evm_subject_for_principal(data_dir.path(), &principal.principal_id).as_deref(),
+            Some("0xab5028bdbb0826ad6f1885478e421db677b0001a"),
+        );
+
+        // A DIFFERENT principal with no wallet still resolves to nothing (per-principal isolation).
+        assert_eq!(
+            linked_evm_subject_for_principal(data_dir.path(), "person:local:someone-else"),
+            None,
+        );
     }
 
     #[test]

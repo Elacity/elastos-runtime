@@ -315,6 +315,7 @@ function walletIntentLabel(intent) {
     case "auth_challenge": return "Sign in";
     case "browser_personal_sign": return "Sign message";
     case "browser_typed_data_sign": return "Sign typed data";
+    case "ddrm_delegation_sign": return "Authorize protected content";
     case "capability_grant": return "Grant access";
     case "credential": return "Issue credential";
     case "publish_envelope": return "Publish";

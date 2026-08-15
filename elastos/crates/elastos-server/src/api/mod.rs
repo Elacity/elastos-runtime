@@ -31,6 +31,7 @@ pub(crate) mod session_bounds;
 pub(crate) mod session_lifecycle;
 pub mod trade_authority;
 pub mod viewer_gateway;
+pub mod viewer_grant_sign;
 pub mod viewer_media;
 pub mod viewer_object;
 pub mod viewer_open;

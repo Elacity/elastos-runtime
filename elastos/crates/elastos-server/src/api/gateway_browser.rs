@@ -32,6 +32,18 @@ pub(in crate::api::gateway) use gateway_browser_stream::*;
 pub(in crate::api::gateway) use gateway_browser_transport::*;
 pub(in crate::api::gateway) use gateway_browser_validation::*;
 pub(in crate::api::gateway) use gateway_browser_wallet::*;
+// See `gateway_browser_wallet.rs`: `default_evm_connector_id` and
+// `validate_connector_and_resolve_account` need to reach `viewer_open::prepare_owned_grant` /
+// `viewer_grant_sign`, siblings of `gateway` — re-export them at `pub(in crate::api)`.
+// `create_connector_personal_sign_approval` / `ConnectorPersonalSignApprovalInput` are the shared
+// connector `personal_sign` approval mint core `viewer_grant_sign` calls directly (same width, same
+// reason). `evm_account_for_connector` itself stays at its `pub(in crate::api)` definition width
+// (gateway_browser_wallet_bridge.rs) but is NOT re-exported this far — only
+// `validate_connector_and_resolve_account`, which wraps it, is consumed outside `gateway`.
+pub(in crate::api) use gateway_browser_wallet::{
+    create_connector_personal_sign_approval, default_evm_connector_id,
+    validate_connector_and_resolve_account, ConnectorPersonalSignApprovalInput,
+};
 
 const BROWSER_PROFILE_STORAGE: &str = "principal_owned_profile_disk";
 const BROWSER_PROFILE_STORAGE_POSTURE: &str = "principal_owned_reset_scoped_unprotected";

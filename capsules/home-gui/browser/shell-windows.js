@@ -1419,7 +1419,7 @@ async function openOwnedRequest(uri, loading = null) {
     // Secure-view session: the wallet already signed a delegation for this asset earlier in the
     // window — open with just { uri } and the gateway assembles a fresh grant (no MetaMask popup).
   } else if (prepared && typeof prepared.delegation_canonical === "string" && prepared.grant_handle) {
-    const sig = await walletPersonalSign(prepared.delegation_canonical, prepared.owner_address);
+    const sig = await signDelegationViaConnector(uri, prepared);
     if (sig) {
       body.grant_handle = prepared.grant_handle;
       body.delegation_sig_hex = sig;
@@ -1434,56 +1434,104 @@ async function openOwnedRequest(uri, loading = null) {
   });
 }
 
-// Ask the user's injected EVM wallet (MetaMask, etc.) to EIP-191 `personal_sign` the canonical
-// delegation. Ensures the signing account matches the delegation owner the gateway bound. Returns
-// the 0x-hex signature, or null if no wallet / declined (the caller then falls back to legacy).
+// Obtain the wallet's EIP-191 `personal_sign` over `delegation_canonical` through the user's
+// DEFAULT wallet CONNECTOR capsule (`wallet-metamask` / `wallet-unisat` — whichever holds the
+// injected wallet) instead of `window.ethereum`, which this shell frame cannot use: it is an
+// opaque-origin frame with no injected provider of its own. Mints a connector `personal_sign`
+// approval via Task 3's `POST /api/viewers/prepare-grant/sign`, auto-routes the shell to that
+// connector capsule's own window so its approval UI surfaces, then polls
+// `GET .../prepare-grant/sign/:request_id` for the result. Returns the 0x-hex signature, or null
+// on no-default-connector / rejection / timeout (the caller then falls back to the enrolled-caller
+// path, which surfaces its own clean error).
 //
-// KNOWN TENSION (deliberate deferral, dkms-inherited): this touches `window.ethereum` directly,
-// which is at odds with the wallet-authority isolation Home enforces via
-// `home/browser/home-wallet-connector-host.js` — there, every provider call is reached through a
-// `home:wallet-connector-effect` message and Home performs it on the frame's behalf. Routing this
-// through that host was considered and rejected as a *widening*, not a narrowing:
-//   * The host admits only `context.kind === "app-frame"` whose `targetId` is one of the two
-//     connector capsules (`wallet-metamask`, `wallet-unisat`). This is a shell frame, so the
-//     source check would have to grow to admit the GUI shell.
-//   * Its only two actions, `link` and `approve`, are *runtime-issued*: the message to be signed
-//     comes from a gateway challenge/handoff and the signature goes straight back to the gateway,
-//     bound by `payload_hash`. A delegation canonical is caller-supplied, so it would need a new
-//     "sign this string, hand me the hex" action — precisely the raw signing oracle the
-//     challenge/`payload_hash` shape exists to prevent.
-// Net: the safe unification is to move the delegation challenge server-side (gateway issues the
-// canonical + a handoff, connector `approve` signs it, gateway returns the grant) — a gateway
-// change out of scope here. Until then this stays a direct provider call, whose blast radius is
-// bounded: it signs only a gateway-issued `delegation_canonical`, refuses any signer that is not
-// the `owner_address` the gateway bound, and its failure mode is a null signature.
-async function walletPersonalSign(canonical, ownerAddress) {
-  const eth = typeof window !== "undefined" ? window.ethereum : null;
-  if (!eth || typeof eth.request !== "function") {
+// CRITICAL: both the mint and the poll go through THIS module's `fetchJson` (from
+// `shell-core.js`), which always attaches the home-gui shell's OWN launch token
+// (`x-elastos-home-token`). The gateway's status read is scoped to the EXACT actor that minted
+// the request (`viewer_grant_sign.rs::delegation_sign_status_from_approvals` requires
+// `requested_by_actor == actor`) — routing either call through a different frame/token would mint
+// under one actor and poll under another, and the status GET would never find its own request.
+const DELEGATION_SIGN_POLL_INTERVAL_MS = 1000;
+const DELEGATION_SIGN_POLL_DEADLINE_MS = 120_000;
+
+async function signDelegationViaConnector(uri, prepared) {
+  const connectorId = typeof prepared?.default_connector_id === "string"
+    ? prepared.default_connector_id.trim()
+    : "";
+  if (!connectorId) {
+    // No default connector on file: fall through to the enrolled-caller path (existing clean
+    // error) rather than guessing at one.
     return null;
   }
+  let minted;
   try {
-    const accounts = await eth.request({ method: "eth_requestAccounts" });
-    const want = String(ownerAddress || "").toLowerCase();
-    let from = Array.isArray(accounts) && accounts.length ? String(accounts[0]) : "";
-    if (want) {
-      const match = (accounts || []).find((a) => String(a).toLowerCase() === want);
-      if (match) {
-        from = match;
-      } else {
-        throw new Error(
-          "the connected wallet (" + from + ") is not the account linked to this content (" + ownerAddress + ")",
-        );
-      }
-    }
-    const sig = await eth.request({ method: "personal_sign", params: [canonical, from] });
-    return typeof sig === "string" && sig ? sig : null;
+    minted = await fetchJson("/api/viewers/prepare-grant/sign", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        uri,
+        delegation_canonical: prepared.delegation_canonical,
+        owner_address: prepared.owner_address,
+        kid: prepared.kid,
+        connector_id: connectorId,
+      }),
+    });
   } catch (error) {
-    if (error && /not the account linked/.test(String(error.message || ""))) {
-      throw error;
-    }
-    console.warn("wallet personal_sign unavailable or declined:", error);
+    console.warn("delegation-sign request could not be minted", error);
     return null;
   }
+  const requestId = typeof minted?.request_id === "string" ? minted.request_id.trim() : "";
+  if (!requestId) {
+    return null;
+  }
+  // Auto-route using the connector id the GATEWAY echoed back (it validated `connectorId` against
+  // the principal's actual default before minting), and only ever open a target from the known
+  // wallet-connector set — never an arbitrary server-supplied string.
+  const routedConnectorId = typeof minted?.connector_id === "string" ? minted.connector_id.trim() : "";
+  if (WALLET_CONNECTOR_TARGETS.has(routedConnectorId)) {
+    routeToDefaultConnector(routedConnectorId);
+  }
+  return pollDelegationSignRequest(requestId);
+}
+
+// Surface the pending approval by bringing the connector capsule's own window to the front,
+// launching it fresh if it is not already open. This is the SAME `openTarget` path taskbar clicks
+// use (`handleTaskbarTargetClick` below). Wallet connector capsules are deliberately excluded from
+// the Home summary's visible-target list (server-side `is_home_visible_target`), so the generic
+// "visible-target" policy `canOpenTargetFromHomeMessage` applies to this shell frame would deny
+// them; `home-shell-host.js` carries a narrow, id-scoped exception (home-gui shell frame + known
+// `WALLET_CONNECTOR_TARGETS` only) that admits exactly this call.
+function routeToDefaultConnector(connectorId) {
+  const existing = topBrowserWindowEntryForTarget(connectorId);
+  if (existing) {
+    focusWindow(existing.id);
+    return;
+  }
+  openTarget(connectorId, {});
+}
+
+async function pollDelegationSignRequest(requestId) {
+  const deadline = Date.now() + DELEGATION_SIGN_POLL_DEADLINE_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, DELEGATION_SIGN_POLL_INTERVAL_MS));
+    let status;
+    try {
+      status = await fetchJson(`/api/viewers/prepare-grant/sign/${encodeURIComponent(requestId)}`);
+    } catch (error) {
+      console.warn("delegation-sign status poll failed", error);
+      return null;
+    }
+    if (status?.status === "completed") {
+      return typeof status.delegation_sig_hex === "string" && status.delegation_sig_hex
+        ? status.delegation_sig_hex
+        : null;
+    }
+    if (status?.status === "rejected") {
+      return null;
+    }
+    // "pending" (or anything unrecognized) -> keep polling until the deadline.
+  }
+  console.warn("delegation-sign request timed out waiting for the connector");
+  return null;
 }
 
 // A 403 whose body is the rights-provider's denial (no access token yet) — distinct from an

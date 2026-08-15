@@ -82,6 +82,10 @@ mod gateway_wallet;
 mod gateway_wallet_adapter;
 #[cfg(test)]
 use gateway_browser::browser_runtime_stream_socket_path;
+pub(super) use gateway_browser::{
+    create_connector_personal_sign_approval, default_evm_connector_id,
+    validate_connector_and_resolve_account, ConnectorPersonalSignApprovalInput,
+};
 use gateway_capsule_catalog::*;
 use gateway_esp::*;
 pub(crate) use gateway_home_runtime::is_wallet_connector_capsule_id;
@@ -112,8 +116,9 @@ pub(super) use gateway_home_token::{
     require_home_projection_launch_token_context, require_home_runtime_wallet_authority,
     require_home_token, require_home_token_context, require_home_token_launch,
     require_home_viewer_launch_token_context, require_internal_shell_launch_grant_for_any_context,
-    require_owned_open_token_context, require_runtime_wallet_authority, runtime_wallet_authority,
-    HomeLaunchContext, HomeLaunchTokenContext, RequiredHomeLaunchToken, RuntimeWalletAuthority,
+    require_owned_open_token_context, require_owned_open_token_launch,
+    require_runtime_wallet_authority, runtime_wallet_authority, HomeLaunchContext,
+    HomeLaunchTokenContext, RequiredHomeLaunchToken, RuntimeWalletAuthority,
 };
 #[cfg(test)]
 pub(crate) use gateway_home_token::{
@@ -143,6 +148,8 @@ use gateway_site::*;
 pub(super) use gateway_site::{content_type, validate_file_path};
 use gateway_transaction_effects::*;
 pub(crate) use gateway_wallet::ensure_wallet_connector_configured;
+pub(super) use gateway_wallet::runtime_wallet_data;
+pub(super) use gateway_wallet::system_wallet_accounts_summary;
 use gateway_wallet::*;
 pub(super) use gateway_wallet_adapter::RuntimeWalletAdapter;
 
@@ -1129,6 +1136,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         .route(
             "/api/viewers/prepare-grant",
             axum::routing::post(super::viewer_open::prepare_owned_grant),
+        )
+        .route(
+            "/api/viewers/prepare-grant/sign",
+            axum::routing::post(super::viewer_grant_sign::create_delegation_sign_request),
+        )
+        .route(
+            "/api/viewers/prepare-grant/sign/:request_id",
+            get(super::viewer_grant_sign::delegation_sign_status_route),
         )
         .route(
             "/api/market/buy",

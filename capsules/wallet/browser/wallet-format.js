@@ -243,6 +243,9 @@ export function requestTitle(request) {
   if (request.intent === "browser_typed_data_sign") {
     return "Browser typed data";
   }
+  if (request.intent === "ddrm_delegation_sign") {
+    return "Authorize protected content";
+  }
   if (isManagedRequest(request)) {
     return "Built-in approval";
   }

@@ -517,8 +517,13 @@ struct RuntimeCapabilityPendingRequest {
     requested_at: u64,
 }
 
+// `pub(in crate::api)`, not private: `viewer_open::prepare_owned_grant` (a sibling of `gateway`)
+// calls `system_wallet_accounts_summary`/`default_evm_connector_id`, both of which take/return
+// this type in their public interface — it must be at least as visible as those functions for
+// callers outside `gateway` to use them. The nested `SystemWalletAccountSummary` /
+// `SystemWalletDefaultSummary` stay private; only this outer type is named across the boundary.
 #[derive(Debug, Clone, Default, Serialize)]
-struct SystemWalletAccountsSummary {
+pub(in crate::api) struct SystemWalletAccountsSummary {
     available: bool,
     linked_count: usize,
     #[serde(default)]

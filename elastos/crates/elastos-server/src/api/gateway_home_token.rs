@@ -393,35 +393,32 @@ pub(crate) fn require_owned_open_token_context(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
-    let result = require_home_launch_token_for_any_context(
+    require_home_launch_token_for_any_context(
         data_dir,
         headers,
         &[HOME_CAPSULE_ID, HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID],
-    );
-    if let Err(err) = &result {
-        // TEMP DIAGNOSTIC (owned-open 403 trace): decode the presented header token to reveal its
-        // actor + delivery shape, so the exact rejection is visible in the gateway log.
-        let header_actor = home_launch_token_header(headers)
-            .and_then(|tok| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(tok.trim())
-                    .ok()
-            })
-            .and_then(|bytes| serde_json::from_slice::<HomeLaunchTokenEnvelope>(&bytes).ok())
-            .map(|env| env.payload.launch_context.executable_actor)
-            .unwrap_or_else(|| "<undecodable/none>".to_string());
-        let origin = headers
-            .get(axum::http::header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("<none>");
-        let has_cookie = headers.get(axum::http::header::COOKIE).is_some();
-        let has_header = headers.get("x-elastos-home-token").is_some();
-        tracing::warn!(
-            "OWNED-OPEN GATE DENY: err={err} | token_actor={header_actor} | origin={origin} | \
-             has_home_token_header={has_header} | has_cookie={has_cookie}"
-        );
-    }
-    result
+    )
+}
+
+/// The same owned-open authority [`require_owned_open_token_context`] proves — identical actor
+/// allowlist (`HOME_CAPSULE_ID`, `HOME_GUI_SHELL_ID`, `HOME_CLI_SHELL_ID`), identical token source —
+/// but returning the WHOLE verified launch instead of just the principal context.
+///
+/// `prepare_owned_grant` needs the full launch to mint a [`RuntimeWalletAuthority`] (via
+/// [`runtime_wallet_authority`]) so it can look up the principal's default EVM wallet connector for
+/// the shell to auto-route the delegation signature to. The context alone cannot mint that
+/// authority — see the "PARKED: subject-resolution rewire" note in `viewer_open.rs` for the prior
+/// investigation of this exact gap.
+pub(in crate::api) fn require_owned_open_token_launch(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<RequiredHomeLaunchToken> {
+    require_home_launch_token_for_any_from(
+        data_dir,
+        headers,
+        &[HOME_CAPSULE_ID, HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID],
+        None,
+    )
 }
 
 pub(crate) fn require_home_projection_launch_token_context(

@@ -33,8 +33,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::gateway::{
-    consume_passkey_step_up_token, issue_home_launch_token_with_context, require_home_token_launch,
-    require_owned_open_token_context, GatewayState, HomeLaunchTokenContext,
+    consume_passkey_step_up_token, default_evm_connector_id, issue_home_launch_token_with_context,
+    require_home_token_launch, require_owned_open_token_context, require_owned_open_token_launch,
+    runtime_wallet_authority, system_wallet_accounts_summary, GatewayState, HomeLaunchTokenContext,
 };
 use super::media_authority::{
     resolve_decrypt_bin, resolve_helper_bin, resolve_key_bin, MediaAuthorityProc,
@@ -684,10 +685,17 @@ pub async fn prepare_owned_grant(
     headers: HeaderMap,
     Json(req): Json<PrepareGrantRequest>,
 ) -> Response {
-    let context = match require_owned_open_token_context(&state.data_dir, &headers) {
-        Ok(context) => context,
+    // The FULL launch (not just the context `require_owned_open_token_context` returns) is needed
+    // here: `runtime_wallet_authority` can only be minted from a whole `RequiredHomeLaunchToken`
+    // (launch id + launch context), and that authority is what lets us list the principal's wallet
+    // accounts to resolve their default EVM connector below. Identical actor allowlist to
+    // `require_owned_open_token_context` — this does NOT admit any caller the context-only gate
+    // would have rejected.
+    let required_launch = match require_owned_open_token_launch(&state.data_dir, &headers) {
+        Ok(required) => required,
         Err(err) => return (StatusCode::FORBIDDEN, err.to_string()).into_response(),
     };
+    let context = required_launch.context.clone();
     let principal_id = context.principal_id.clone();
 
     // The wallet-signed grant is only meaningful when the dKMS nodes do their OWN node-side
@@ -808,20 +816,59 @@ pub async fn prepare_owned_grant(
         }
     };
 
+    // Best-effort: tell the shell which connector is the user's DEFAULT EVM signer, so it can
+    // auto-route the `personal_sign` popup there instead of guessing. This is a UX hint, not an
+    // authorization decision — the on-chain rights gate and dKMS quorum recover are what actually
+    // gate the plaintext, so a summary-lookup failure here degrades to "no default" (null) rather
+    // than failing the whole prepare-grant response the user is waiting on.
+    let default_connector_id = match runtime_wallet_authority(&required_launch) {
+        Ok(authority) => {
+            let summary = system_wallet_accounts_summary(&state, &authority).await;
+            default_evm_connector_id(&summary)
+        }
+        Err(err) => {
+            tracing::warn!("prepare-grant: could not mint wallet authority for default connector lookup: {err}");
+            None
+        }
+    };
+
     (
         StatusCode::OK,
         [("cache-control", "no-store")],
-        Json(json!({
-            "schema": "elastos.viewer.prepare-grant/v1",
-            "grant_handle": prepared.handle,
-            // The exact UTF-8 string the browser must EIP-191 personal_sign.
-            "delegation_canonical": prepared.delegation_canonical,
-            "owner_address": prepared.owner_address,
-            "kid": prepared.kid_hex,
-            "chain_id": prepared.chain_id,
-        })),
+        Json(prepare_grant_response_json(
+            &prepared.handle,
+            &prepared.delegation_canonical,
+            &prepared.owner_address,
+            &prepared.kid_hex,
+            prepared.chain_id,
+            default_connector_id.as_deref(),
+        )),
     )
         .into_response()
+}
+
+/// Pure response-shaping for the prepare-grant success path — unit-testable without a
+/// `GatewayState` or a live launch token. `default_connector_id` is always present in the object,
+/// `null` when the principal has no resolvable default EVM connector, so the shell can distinguish
+/// "no default" from a malformed response.
+fn prepare_grant_response_json(
+    grant_handle: &str,
+    delegation_canonical: &str,
+    owner_address: &str,
+    kid_hex: &str,
+    chain_id: u64,
+    default_connector_id: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "schema": "elastos.viewer.prepare-grant/v1",
+        "grant_handle": grant_handle,
+        // The exact UTF-8 string the browser must EIP-191 personal_sign.
+        "delegation_canonical": delegation_canonical,
+        "owner_address": owner_address,
+        "kid": kid_hex,
+        "chain_id": chain_id,
+        "default_connector_id": default_connector_id,
+    })
 }
 
 /// How recent a passkey assertion must be for a money verb to honour it. Identical to the window
@@ -1831,18 +1878,24 @@ pub(crate) async fn resolve_subject_address(state: &GatewayState, principal_id: 
             return pinned;
         }
     }
-    // Wallet account enumeration is AUTHORITY-BOUND on this substrate: it goes through
-    // `WalletProviderOperationV2::ListAccounts` behind a `RuntimeWalletAuthority` minted
-    // from a validated launch token, and a raw account-listing dispatch is barred
-    // from every production route (pinned by
-    // `gateway_tests::wallet::accounts::raw_wallet_account_dispatch_is_absent_from_production_routes`).
-    // This principal-only signature cannot mint that authority, so until the dDRM open
-    // path threads the full `RequiredHomeLaunchToken` through, resolve FAIL-CLOSED.
-    // An empty subject means "no bound wallet", which every caller already treats as
-    // "no rights" — never as "rights granted". `ELASTOS_DDRM_SUBJECT` above still pins a
-    // subject for local development.
-    let _ = (state, principal_id);
-    String::new()
+    // Resolve the signed-in principal's OWN verified EVM wallet from the auth store — the wallet the
+    // user bound through the wallet app, persisted as an `EvmAccount` proof binding. This is the DRM
+    // subject: resolved per-principal from already-verified state, no operator pin, and available
+    // from the `principal_id` alone (no `RuntimeWalletAuthority` needed, because a proof binding is
+    // persisted verified state, not a live wallet-account enumeration).
+    //
+    // A live wallet-provider `ListAccounts` path (with default-`browser_connect`-account precedence,
+    // see the parked `select_subject_from_accounts` below) remains the richer future source for the
+    // multi-wallet case; it needs the full `RequiredHomeLaunchToken` threaded through. Until then the
+    // verified proof binding is the correct, sufficient subject. Empty => no bound wallet, which every
+    // caller treats as "no rights" — never as "rights granted".
+    let data_dir = state.data_dir.clone();
+    let principal = principal_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::auth::linked_evm_subject_for_principal(&data_dir, &principal).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 // ── PARKED: subject-resolution rewire ─────────────────────────────────────────────────────────
@@ -1857,9 +1910,8 @@ pub(crate) async fn resolve_subject_address(state: &GatewayState, principal_id: 
 // not a viewer_open one):
 //   1. `resolve_subject_address` must take `&RequiredHomeLaunchToken` instead of `principal_id`.
 //      `buy_owned_access` and `mint_create_asset` now hold one (`authorize_money_verb`), but the
-//      other seven call sites do not: `open_owned_in_viewer`, `prepare_owned_grant` (this file)
-//      and five reads in `gateway_marketplace.rs` all authenticate with
-//      `require_home_token_context`, which discards the launch. Each needs
+//      other six call sites do not: `open_owned_in_viewer` and five reads in `gateway_marketplace.rs`
+//      all authenticate with `require_home_token_context`, which discards the launch. Each needs
 //      `require_home_token_launch` instead.
 //   2. `gateway_wallet_accounts::runtime_wallet_data` is `pub(in crate::api::gateway)`, so
 //      `crate::api::viewer_open` cannot call it. Its visibility must widen to `pub(in crate::api)`
@@ -2191,5 +2243,44 @@ mod tests {
             log_fp(wallet),
             log_fp("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
         );
+    }
+
+    // --- Task 2 (ESP connector delegation signing): prepare-grant response carries the default
+    // connector id, so the shell can auto-route the delegation signature to it. ---------------
+
+    /// The prepare-grant response object MUST carry `default_connector_id` equal to the resolved
+    /// default EVM connector when one exists.
+    #[test]
+    fn prepare_grant_response_carries_default_connector_id_when_present() {
+        let body = prepare_grant_response_json(
+            "handle-1",
+            "delegation-canonical-text",
+            "0xowner",
+            "0xkid",
+            8453,
+            Some("metamask-1"),
+        );
+        assert_eq!(body["schema"], "elastos.viewer.prepare-grant/v1");
+        assert_eq!(body["grant_handle"], "handle-1");
+        assert_eq!(body["delegation_canonical"], "delegation-canonical-text");
+        assert_eq!(body["owner_address"], "0xowner");
+        assert_eq!(body["kid"], "0xkid");
+        assert_eq!(body["chain_id"], 8453);
+        assert_eq!(body["default_connector_id"], "metamask-1");
+    }
+
+    /// No default EVM connector on file -> the field is present but JSON `null`, never omitted (the
+    /// shell must be able to distinguish "no default" from a malformed response).
+    #[test]
+    fn prepare_grant_response_default_connector_id_is_null_when_absent() {
+        let body = prepare_grant_response_json(
+            "handle-2",
+            "delegation-canonical-text-2",
+            "0xowner2",
+            "0xkid2",
+            8453,
+            None,
+        );
+        assert!(body["default_connector_id"].is_null());
     }
 }
