@@ -78,7 +78,10 @@ pub(super) async fn home_launch(
         }
         None => format!("{route}  (NO home_token in route!)"),
     };
-    tracing::info!("home_launch: target={} route={masked_route}", target_summary.target);
+    tracing::info!(
+        "home_launch: target={} route={masked_route}",
+        target_summary.target
+    );
 
     Ok(Json(HomeLaunchResponse {
         target: target_summary.target,

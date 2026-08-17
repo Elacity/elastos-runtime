@@ -3168,7 +3168,11 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
     let app =
         gateway_router(browser_wallet_read_timeout_test_state(dir.path(), wallet, chain).await);
 
-    let started = std::time::Instant::now();
+    // Virtual-clock elapsed (the callers run `start_paused`): proves the route gave up at
+    // its own read timeout instead of waiting out the delayed provider. A real-clock bound
+    // here would flake under full-suite CPU load, where compile/test contention can stretch
+    // wall time past any fixed budget.
+    let started = tokio::time::Instant::now();
     let (first_status, first_body) = browser_eth_call(app.clone(), &browser_token, address).await;
     assert_eq!(first_status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(first_body, "Browser wallet read timed out");

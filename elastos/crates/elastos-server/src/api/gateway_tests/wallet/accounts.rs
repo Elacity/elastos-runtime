@@ -61,10 +61,6 @@ fn raw_wallet_account_dispatch_is_absent_from_production_routes() {
     // dispatch outside this list fails the test, and so does an entry that was fixed
     // but left here (so the ledger cannot rot).
     let tracked: Vec<(String, String, usize)> = [
-        // The Create portal reads the principal's linked accounts and resolves the mint
-        // owner account. Needs the full RequiredHomeLaunchToken threaded through so it
-        // can mint a RuntimeWalletAuthority instead.
-        ("creator.rs", "accounts", 2),
         // The wallet-signer sidecar drives a locally-spawned wallet-provider process
         // directly (its own session, not the gateway registry).
         ("wallet_signer.rs", "create_managed_account", 1),

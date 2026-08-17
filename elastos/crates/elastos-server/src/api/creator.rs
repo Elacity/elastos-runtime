@@ -606,15 +606,20 @@ pub async fn creator_prepare_mint(
     // The mint's owner-signature step dispatches a v2 `RequestApproval` through the runtime wallet
     // authority (minted from this same creator launch token) — the legacy `{op:"request_signature"}`
     // is rejected by the v2 wallet provider.
-    let authority = match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
-        .and_then(|required| runtime_wallet_authority(&required))
-    {
-        Ok(authority) => authority,
-        Err(err) => {
-            tracing::warn!("creator_prepare_mint: runtime wallet authority unavailable: {err}");
-            return staged_error(StatusCode::BAD_GATEWAY, "sign", "wallet authority unavailable");
-        }
-    };
+    let authority =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
+            .and_then(|required| runtime_wallet_authority(&required))
+        {
+            Ok(authority) => authority,
+            Err(err) => {
+                tracing::warn!("creator_prepare_mint: runtime wallet authority unavailable: {err}");
+                return staged_error(
+                    StatusCode::BAD_GATEWAY,
+                    "sign",
+                    "wallet authority unavailable",
+                );
+            }
+        };
 
     let Json(req) = match body {
         Ok(json) => json,
@@ -784,7 +789,11 @@ pub async fn creator_wallet(State(state): State<GatewayState>, headers: HeaderMa
         .and_then(Value::as_array)
         .map(|list| {
             list.iter()
-                .filter_map(|a| a.get("chain_namespace").and_then(Value::as_str).map(str::to_string))
+                .filter_map(|a| {
+                    a.get("chain_namespace")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -894,18 +903,21 @@ pub async fn creator_create_channel(
     // Auth AND wallet authority in ONE gate: the channel-create signature dispatches a v2
     // `RequestApproval` through the runtime wallet authority, which is minted from — and so validates
     // — this creator launch token. A missing/invalid token fails here (401); no separate token check.
-    let authority = match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
-        .and_then(|required| runtime_wallet_authority(&required))
-    {
-        Ok(authority) => authority,
-        Err(err) => {
-            tracing::warn!("creator_create_channel: launch token / wallet authority rejected: {err}");
-            return error_json(
-                StatusCode::UNAUTHORIZED,
-                "missing or invalid home launch token",
-            );
-        }
-    };
+    let authority =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
+            .and_then(|required| runtime_wallet_authority(&required))
+        {
+            Ok(authority) => authority,
+            Err(err) => {
+                tracing::warn!(
+                    "creator_create_channel: launch token / wallet authority rejected: {err}"
+                );
+                return error_json(
+                    StatusCode::UNAUTHORIZED,
+                    "missing or invalid home launch token",
+                );
+            }
+        };
     let Json(req) = match body {
         Ok(json) => json,
         Err(rejection) => return error_json(StatusCode::BAD_REQUEST, &rejection.body_text()),
@@ -1161,7 +1173,9 @@ pub async fn creator_mint_status(
             {
                 Ok(authority) => resolve_mint_tx_hash(registry, &authority, request_id).await,
                 Err(err) => {
-                    tracing::warn!("creator_mint_status: runtime wallet authority unavailable: {err}");
+                    tracing::warn!(
+                        "creator_mint_status: runtime wallet authority unavailable: {err}"
+                    );
                     None
                 }
             }
@@ -1228,20 +1242,21 @@ pub async fn creator_prepare_trade_approval(
     // Auth AND wallet authority in ONE gate: the enable-trading signature dispatches a v2
     // `RequestApproval` through the runtime wallet authority, which is minted from — and so validates
     // — this creator launch token. A missing/invalid token fails here (401); no separate token check.
-    let authority = match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
-        .and_then(|required| runtime_wallet_authority(&required))
-    {
-        Ok(authority) => authority,
-        Err(err) => {
-            tracing::warn!(
+    let authority =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
+            .and_then(|required| runtime_wallet_authority(&required))
+        {
+            Ok(authority) => authority,
+            Err(err) => {
+                tracing::warn!(
                 "creator_prepare_trade_approval: launch token / wallet authority rejected: {err}"
             );
-            return error_json(
-                StatusCode::UNAUTHORIZED,
-                "missing or invalid home launch token",
-            );
-        }
-    };
+                return error_json(
+                    StatusCode::UNAUTHORIZED,
+                    "missing or invalid home launch token",
+                );
+            }
+        };
     let Json(req) = match body {
         Ok(json) => json,
         Err(rejection) => return error_json(StatusCode::BAD_REQUEST, &rejection.body_text()),

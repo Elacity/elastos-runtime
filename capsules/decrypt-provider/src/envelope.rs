@@ -281,9 +281,20 @@ mod tests {
     fn wrong_session_key_fails_closed() {
         let sk = SecretKey::random(&mut OsRng);
         let other_sk = SecretKey::random(&mut OsRng);
-        let env = make_envelope(&sk, &[0xAA; 16], 0x03);
+        let cek = [0xAA; 16];
+        let env = make_envelope(&sk, &cek, 0x03);
         let parsed = parse(&env).unwrap();
-        assert!(ecdh_unwrap(&other_sk, &parsed).is_err());
+        // CBC carries no integrity tag: a wrong key almost always dies at PKCS#7
+        // unpadding, but random garbage unpads "successfully" ~1/256 of the time.
+        // The fail-closed invariant is therefore not "unwrap errors" but "the CEK
+        // never materializes" — an accidental unpad must still not yield the CEK.
+        let recovered = ecdh_unwrap(&other_sk, &parsed)
+            .ok()
+            .and_then(|pt| extract_cek(&pt).ok());
+        assert!(
+            !recovered.is_some_and(|key| key.as_slice() == cek),
+            "wrong session key must never recover the sealed CEK"
+        );
     }
 
     /// CEK-containment: the sealed envelope bytes must never contain the raw CEK
