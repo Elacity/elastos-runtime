@@ -415,7 +415,7 @@ and review items pass.
   Reopen a slice only for a newly proven release-candidate defect with a named
   owner and verification command.
 - [ ] Treat Remote Carrier Exit as part of the Carrier slice: two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint evidence; the installed artifact readiness report and route-readiness report must be hash-bound; evidence for route readiness, installed artifact readiness, discovery, policy, accounting, stream transport, Browser proof, and cleanup must cite reviewed route nouns; the local Browser machine-proof artifact must cite the reviewed route target or target host; local artifacts must stay redacted, and remote paths need an explicit digest and review trail. Compose Inspector, typed Runtime authority, installed artifact readiness, route-readiness, operator evidence, Browser handoff, manual UX, performance/zoom, and clean-worktree proof before any full-goal claim.
-- [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` where protected-content providers are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
+- [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` only as the provisional provider retirement guard where those old capsules are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
 - [ ] Do not add visible UI, protocol surface, provider behavior, or blockchain hooks unless the runtime capability path, fail-closed behavior, and docs contract are already explicit.
 - [ ] Keep first-party capsule projection validation covered by
   `first_party_capsules_have_complete_projection_contract`; extend the same
@@ -655,7 +655,7 @@ and review items pass.
   2. Runtime: signed bundle identity, whole-package verification, interface/version contracts, install receipts, update policy
   3. Carrier: package/update distribution and peer discovery for trusted sources
   4. Blockchain: publisher identity, provenance receipts, and optional license/payment hooks without making token mechanics the core model
-- [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. Marketplace may browse installed and verified Runtime apps, show details, and open installed Home launch targets, but remote actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, dDRM rights/key/decrypt policy, and Home/capsule change events before one-click install is exposed. Loose repo/dev folders can remain Home/dev targets, but they must not be presented as remotely installable Marketplace apps.
+- [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. Marketplace may browse installed and verified Runtime apps, show details, and open installed Home launch targets, but remote actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, protected-content rights/custody/decrypt policy, and Home/capsule change events before one-click install is exposed. Loose repo/dev folders can remain Home/dev targets, but they must not be presented as remotely installable Marketplace apps.
 - [ ] Do not prioritize rich DRM economics, DeFi/BtcFi, Android box specifics, or literal Capsule-NFT mechanics before the package identity, principal, space, and provider contracts are real.
 
 ### Runtime primitives missing for the PC2 world-computer model
@@ -709,26 +709,24 @@ and review items pass.
 
 ### Trusted content and access rights
 
-The source-only protected-content stack now has four review layers in order:
-published canonical contracts, published custody helpers, the accepted local
-operational-contract child line, and the current local custody-operations child
-line. Remaining work must stay in this order. Carrier remains transport only
-throughout every stage below.
+The source-only protected-content stack now has two published review branches
+in order: canonical contracts, then custody and node operations. Remaining work
+must stay in this order. Carrier remains transport only throughout every stage
+below.
 
-The accepted local operational-contract line defines the reviewed source-only
-EVM `has_access_by_content_id` policy/evidence contract, including the exact
+The published custody branch defines the source-only EVM
+`has_access_by_content_id` policy/evidence contract, including the exact
 contract right string mapped from one product action, Profile-signed
 recipient-key authorization, signed immutable custody epoch, and authenticated
-replay-pending Runtime release-operation envelope. The current local
-custody-operations line adds the node-local durable dual-key replay-claim store
-and the private claim-gated transition from authenticated replay-pending
-Runtime evidence to node-actionable release authority. Remaining tasks start
-after those boundaries; they do not reopen them as ambient provider
+replay-pending Runtime release-operation envelope. It also adds the node-local
+durable dual-key replay store and the private claim-gated transition from
+authenticated replay-pending evidence to an exact persisted encrypted
+contribution. Exact retries replay only that result after restart. Remaining
+tasks start after those boundaries; they do not reopen them as ambient provider
 configuration. Runtime owns its own orchestration replay. Each custody node
-owns only its exact local dual-key claim. A crash after a successful local
-claim but before contribution settlement is fail closed and currently requires
-a fresh Runtime release operation; there is no durable operation-resume
-journal yet.
+owns only its local claim and result. A crash after the claim becomes durable
+but before the result becomes durable remains fail closed and requires a fresh
+Runtime release operation; there is no operation-resume journal for that state.
 
 #### A. Source-only review gate
 
@@ -777,12 +775,12 @@ journal yet.
   transition into full operational node state: retained claim pruning policy,
   multi-process operational audit retention, node admission and issuer-key
   lifecycle, recovery tooling, and storage review for production hosts. The
-  current local child line already proves one owner-only durable dual-key
-  claim-many store, atomic no-partial-claim updates, restart survival, and the
-  private claim-before-open transition from authenticated replay-pending
-  Runtime evidence to node-actionable release authority. It does not yet add a
-  durable operation-resume journal after claim success, so a post-claim crash
-  still requires a fresh Runtime release operation.
+  published custody branch already proves one owner-only durable dual-key
+  claim store, atomic no-partial-claim updates, restart survival, private
+  claim-before-release authority, exact encrypted-result persistence, and exact
+  retry replay. It does not yet add an operation-resume journal for a claim
+  that became durable before its result, so that state still requires a fresh
+  Runtime release operation.
 
 #### C. Atomic Runtime/provider cutover plus source allow/deny proof
 
@@ -827,7 +825,8 @@ journal yet.
   typed `chain-provider` reads, with every release node verifying the Wallet's
   exact right independently. Do not put license logic in app UI or
   gateway-only checks.
-- [ ] Wire `key-provider` to the reviewed threshold-custody backend only after
+- [ ] Wire Runtime-selected custody providers to the reviewed threshold-custody
+  backend only after
   node contribution authentication, same-node rights evidence,
   recipient-sealing encryption, exact-threshold settlement, durable replay
   rejection, expiry, revocation, and failure cleanup are proven. Verify the

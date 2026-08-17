@@ -60,6 +60,10 @@ cargo fmt --manifest-path capsules/chain-provider/Cargo.toml -- --check
 just verify
 ```
 
+`protected-content-provider-contract-smoke.sh` is a fail-closed retirement
+guard for the provisional provider capsules. It does not verify the canonical
+v1 Runtime, rights, custody, and decrypt architecture.
+
 `just verify` is the complete source gate in this tree. There is no separate
 `terminology-lint` recipe. Any unavailable command or accepted target-specific
 exception must be recorded explicitly rather than reported as a pass.

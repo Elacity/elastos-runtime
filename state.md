@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-14 UTC
+Last updated: 2026-08-17 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Historical
@@ -27,37 +27,26 @@ the public repository.
   the shared strict DID/Carrier codec correction required by that contract
   surface. It does not integrate Runtime orchestration, provider replacement,
   decryption, playback, installation, or deployment.
-- `feat/protected-content-custody` is the source-only child review line
+- `origin/feat/protected-content-custody` is the published source-only child
+  review line
   stacked on `origin/feat/protected-content-contracts`. It adds the
   `elastos-protected-content-custody` crate plus custody-envelope
   provisioning, recipient-sealed node release, and recipient-side threshold
-  reconstruction for new content. Its current reviewed behavior rejects
+  reconstruction for new content. It also includes the typed EVM rights-policy
+  and evidence contracts, Profile-signed recipient-key authorization, signed
+  custody epochs, the Runtime-to-release-node operation envelope, and one
+  owner-only node-local durable dual-key replay store. That store privately
+  gates release, persists the exact encrypted node contribution, and replays
+  only that result after restart. Its current reviewed behavior rejects
   invalid X25519 contract key bytes before HPKE use, requires exactly the
   bound released threshold, and checks a manifest-bound CEK commitment after
   reconstruction to detect a wrong reconstructed key. It does not integrate
   Runtime/provider/Carrier orchestration, Runtime-owned durable replay
-  storage, full operational custody state, recipient key-possession proof,
-  decrypt/render product flows, installation, or deployment.
-- `feat/protected-content-operational-contracts` is the accepted local
-  dependent source-only child line stacked on
-  `origin/feat/protected-content-custody`. It adds the narrow typed v1 EVM
-  rights-policy body plus exact evidence request/result contracts, including
-  the exact EVM right string mapped from one product action, the
-  Profile-signed recipient-key authorization, the signed immutable custody
-  epoch, and the authenticated replay-pending Runtime-to-release-node
-  operation envelope. It does not prove X25519 secret-key possession, wire
-  Runtime/provider/product flows, or make an installed confidentiality claim.
-- `feat/protected-content-custody-operations` is the current local dependent
-  source-only child line stacked on
-  `feat/protected-content-operational-contracts`. It adds one owner-only
-  durable dual-key replay-claim store for custody nodes plus the private
-  claim-gated transition from authenticated replay-pending Runtime evidence to
-  node-actionable release authority. It still does not add Runtime-owned
-  replay orchestration, recipient key-possession proof, node admission or
-  issuer lifecycle services, provider wiring, product flows, installation, or
-  deployment. A crash after a successful local claim but before contribution
-  settlement is fail closed and currently requires a fresh Runtime release
-  operation; there is no durable operation-resume journal yet.
+  storage, full operational custody state, recipient key-possession proof, node
+  admission or issuer lifecycle services, decrypt/render product flows,
+  installation, or deployment. A durable local claim without a stored result
+  fails closed and currently requires a fresh Runtime release operation; there
+  is no operation-resume journal for that state.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -176,8 +165,9 @@ the public repository.
   `local-identity-profile-smoke.sh`, depending on target role.
 - Public Linux runtime portability proof path:
   `audit-linux-runtime-portability.sh`.
-- Protected-content provider journey proof path:
-  `protected-content-provider-contract-smoke.sh`.
+- Provisional protected-content provider retirement guard:
+  `protected-content-provider-contract-smoke.sh`. It does not verify the
+  canonical v1 custody or Runtime path.
 
 ## Browser Truth
 
