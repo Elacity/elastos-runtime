@@ -84,6 +84,8 @@ jobs:
           workspaces: elastos
           prefix-key: ${{ runner.os }}-elastos
       - name: source-home into isolated HOME
+        env:
+          ELASTOS_COLLABORATION_STARTUP_MODE: isolated
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
@@ -154,6 +156,8 @@ jobs:
       - name: host tools from MAC.md
         run: brew install e2fsprogs
       - name: source-home into isolated MAC_TEST_HOME
+        env:
+          ELASTOS_COLLABORATION_STARTUP_MODE: isolated
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/source-home-logs"
