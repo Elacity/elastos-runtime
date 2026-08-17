@@ -4,12 +4,14 @@ Protected content is Runtime-mediated. App, viewer, and content capsules ask to
 open an object; they do not receive raw wallet, chain, IPFS, Elacity, or key
 authority.
 
-The source tree currently has one canonical source-only review stack and one
-provisional retirement surface:
+The source tree currently has one canonical published source-only review stack
+through `origin/feat/protected-content-key-reconstruction` and one provisional
+retirement surface:
 
-- The canonical v1 source-only review stack is the
-  `elastos-protected-content-contracts` crate plus the companion
-  `elastos-protected-content-custody` crate, documented in
+- The canonical v1 published review stack is the
+  `elastos-protected-content-contracts` branch, the companion
+  `elastos-protected-content-custody` branch, and the published child
+  `feat/protected-content-key-reconstruction` branch, documented in
   [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md). That
   stack now defines canonical authority bindings, typed rights-policy and
   evidence contracts, Profile-signed recipient-key authorization, signed
@@ -17,11 +19,10 @@ provisional retirement surface:
   envelope, a local durable dual-key replay-claim store for custody nodes,
   a claim-gated node release path, and source-only custody helpers for
   custody-envelope provisioning, recipient-sealed node release, and
-  recipient-scoped threshold reconstruction inside the decrypt boundary for new
-  content. It is not yet wired
-  into Runtime orchestration, provider integration, Runtime-owned replay
-  storage, recipient key-possession proof, decryption, playback, installation,
-  or deployment.
+  threshold reconstruction inside the decrypt boundary for new content. It is
+  not yet wired into Runtime orchestration, provider integration,
+  Runtime-owned replay storage, recipient key-possession proof, decryption,
+  playback, installation, or deployment.
 - The older installed/provider surface is the provisional
   `elastos_common::protected_content` DTO set plus the fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -57,16 +58,19 @@ Capsules must also never receive provider routes, endpoint DIDs, IP addresses,
 ports, credentials, Wallet RPC, Chain RPC, Kubo/IPFS APIs, or Elacity SDK
 authority.
 
-This architecture is not yet installed or wired into Runtime. The current
-branch is source-only contracts and custody behavior.
+This architecture is not yet installed or wired into Runtime. Published source
+truth is source-only through contracts, custody behavior, and
+decrypt-boundary reconstruction. The new protected-content product path is not
+yet connected or usable.
 
 ## Provisional retirement surface
 
 Released 0.6 still contains the provisional `elastos_common::protected_content`
 DTOs and the fail-closed `drm-provider`, `rights-provider`, `key-provider`, and
-`decrypt-provider` capsules. They remain only as a disabled retirement surface
-until the canonical Runtime path replaces them. They are not a second product
-architecture and are not evidence that the canonical v1 path works.
+`decrypt-provider` capsules. That old DRM/provider code remains installed and
+source-visible only until the canonical Runtime path replaces it atomically. It
+is not a second product architecture, and it is not evidence that the canonical
+v1 path works.
 
 The provisional provider smoke verifies only that this old surface rejects raw
 authority and remains unavailable without configured backends. It must not be

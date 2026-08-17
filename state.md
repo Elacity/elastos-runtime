@@ -31,27 +31,34 @@ the public repository.
   review line
   stacked on `origin/feat/protected-content-contracts`. It adds the
   `elastos-protected-content-custody` crate plus custody-envelope
-  provisioning, recipient-sealed node release, and recipient-side threshold
-  reconstruction for new content. It also includes the typed EVM rights-policy
-  and evidence contracts, Profile-signed recipient-key authorization, signed
-  custody epochs, the Runtime-to-release-node operation envelope, and one
-  owner-only node-local durable dual-key replay store. That store privately
-  gates release, persists the exact encrypted node contribution, and replays
-  only that result after restart. Its current reviewed behavior rejects
-  invalid X25519 contract key bytes before HPKE use, requires exactly the
-  bound released threshold, and checks a manifest-bound CEK commitment after
-  reconstruction to detect a wrong reconstructed key. It does not integrate
-  Runtime/provider/Carrier orchestration, Runtime-owned durable replay
-  storage, full operational custody state, recipient key-possession proof, node
-  admission or issuer lifecycle services, decrypt/render product flows,
+  provisioning and recipient-sealed node release. It also includes the typed
+  EVM rights-policy and evidence contracts, Profile-signed recipient-key
+  authorization, signed custody epochs, the Runtime-to-release-node operation
+  envelope, and one owner-only node-local durable dual-key replay store. That
+  store privately gates release, persists the exact encrypted node
+  contribution, and replays only that result after restart.
+- `origin/feat/protected-content-key-reconstruction` is the published
+  source-only child review line stacked on
+  `origin/feat/protected-content-custody`. It adds authenticated release
+  reconstruction inside the decrypt boundary for new content. Its current
+  reviewed behavior rejects invalid X25519 contract key bytes before HPKE use,
+  requires exactly the bound released threshold, and checks a manifest-bound
+  CEK commitment after reconstruction to detect a wrong reconstructed key. The
+  published protected-content stack therefore has three source-only review
+  branches through `a8d0a9a6`. It does not integrate Runtime/provider/Carrier
+  orchestration, Runtime-owned durable replay storage, full operational
+  custody state, recipient key-possession proof, product decrypt/render flows,
   installation, or deployment. A durable local claim without a stored result
   fails closed and currently requires a fresh Runtime release operation; there
   is no operation-resume journal for that state.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
-  capsules. That surface does not consume or prove the new v1 contract.
-  Installed-target truth requires separate target evidence.
+  capsules. That old DRM/provider surface remains installed and source-visible
+  only until an atomic Runtime cutover replaces it. It does not consume or
+  prove the new v1 contract, and the new protected-content product path is not
+  yet connected or usable. Installed-target truth requires separate target
+  evidence.
 - An independent branch-local source/contract review of the published
   `origin/feat/protected-content-contracts` branch completed with no code
   findings after the strict DID codec and Carrier codec consolidation. This is

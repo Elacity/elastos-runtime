@@ -709,10 +709,11 @@ and review items pass.
 
 ### Trusted content and access rights
 
-The source-only protected-content stack now has two published review branches
-in order: canonical contracts, then custody and node operations. Remaining work
-must stay in this order. Carrier remains transport only throughout every stage
-below.
+The published source-only protected-content stack now has three review branches
+through `origin/feat/protected-content-key-reconstruction`: canonical
+contracts, custody and node operations, then decrypt-boundary reconstruction.
+Remaining work must stay in this order. Carrier remains transport only
+throughout every stage below.
 
 The published custody branch defines the source-only EVM
 `has_access_by_content_id` policy/evidence contract, including the exact
@@ -764,13 +765,14 @@ Runtime release operation; there is no operation-resume journal for that state.
   epoch and release-operation contracts: node admission and rotation, review or
   replacement of the pinned threshold and recipient-encryption suites,
   revocation, audit retention, issuer-key lifecycle, and recovery operations.
-  The source-only `elastos-protected-content-custody` crate now implements new
-  content share provisioning, recipient-sealed node release, and recipient-side
-  threshold reconstruction, but it does not yet prove full operational custody
-  safety, complete node-state durability, or product integration. Its
-  manifest-bound CEK commitment
-  detects a wrong reconstructed key; it does not identify the malicious node or
-  add verifiable secret sharing.
+  The published source-only stack through
+  `origin/feat/protected-content-key-reconstruction` now implements new
+  content share provisioning, recipient-sealed node release, and
+  decrypt-boundary threshold reconstruction, but it does not yet prove full
+  operational custody safety, complete node-state durability, or product
+  integration. Its manifest-bound CEK commitment detects a wrong
+  reconstructed key; it does not identify the malicious node or add verifiable
+  secret sharing.
 - [ ] Extend the reviewed node-local replay-claim and claim-gated release
   transition into full operational node state: retained claim pruning policy,
   multi-process operational audit retention, node admission and issuer-key
