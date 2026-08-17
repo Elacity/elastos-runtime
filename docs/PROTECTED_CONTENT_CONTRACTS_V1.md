@@ -241,11 +241,12 @@ returns an authenticated replay-pending surface only: it proves signatures and
 exact bindings, exposes the nested request hashes and replay-claim keys, and
 does not expose actionable `VerifiedRightsRequestV1` or
 `VerifiedKeyReleaseRequestV1` values. The companion source-only custody helper
-now uses those exact claim keys for one local dual-key atomic claim transition,
-but Runtime durable replay and orchestration remain later work. A crash or
-storage failure after that node-local claim succeeds but before contribution
-settlement is fail closed and currently requires a fresh Runtime release
-operation; there is no durable operation-resume journal yet.
+uses those exact claim keys for one local dual-key atomic claim transition. It
+can persist the exact recipient-encrypted node contribution with that claim and
+replay only that result after restart. Runtime durable replay and orchestration
+remain later work. A crash or storage failure after the claim becomes durable
+but before its result becomes durable is fail closed and requires a fresh
+Runtime release operation; there is no operation-resume journal for that state.
 
 ## Node decision and contribution
 
@@ -315,10 +316,12 @@ canonical input, noncanonical Wallet/Profile encodings, and noncanonical or
 low-order X25519 contract key encodings.
 
 These contracts plus the source-only `elastos-protected-content-custody` helper
-provide one bounded node-local owner-only dual-key replay-claim store, but
-they do not solve malicious custody nodes, rights-policy correctness, Runtime
-durable replay storage, full operational custody state, durable post-claim
-resume/settlement, issuer-key lifecycle, recipient key-possession proof, node
+provide one bounded node-local owner-only dual-key replay store. It binds the
+store to one node, privately gates release on the exact claim, persists the
+exact recipient-encrypted contribution, and replays only that result. They do
+not solve malicious custody nodes, rights-policy correctness, Runtime durable
+replay storage, full operational custody state, recovery from a durable claim
+without a result, issuer-key lifecycle, recipient key-possession proof, node
 admission/rotation/recovery, availability, decryption, rendering, or product
 workflow safety. The custody helper uses `hpke` 0.13, whose upstream
 documentation says it has not been formally audited. These source-only crates

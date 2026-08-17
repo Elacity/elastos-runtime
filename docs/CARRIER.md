@@ -142,15 +142,19 @@ Carrier should make content exchange feel like one SmartWeb, but it should not
 own all storage policy. The content provider owns publish/fetch/status/repair
 semantics and availability receipts. Carrier owns secure peer discovery,
 messaging, relay, and peer/object transport. IPLD gives the traversable CID graph
-shape. Rights/decryption remain in the access provider and dDRM layer.
+shape. In the target protected-content cutover, rights, custody, and decryption
+remain in Runtime-selected providers.
 
 Provider-to-provider Carrier invocation follows the same boundary. Runtime adds
-an `elastos.provider.invocation/v1` envelope, selects `carrier-provider-plane`,
-and sends a generic Carrier `provider_invoke` message only between service
-providers such as `content`, `availability`, `rights`, `key`, `decrypt`, and
-`drm`. Raw connect tickets stay inside Runtime transport state and are not
-returned in app-visible receipts. Raw backend providers such as `ipfs` or
-`localhost` remain local implementation details, not remote Carrier authorities.
+an `elastos.provider.invocation/v1` envelope and selects
+`carrier-provider-plane`. The current Carrier provider target allowlist includes
+`content`, `availability`, and the provisional `rights`, `key`, `decrypt`, and
+`drm` labels. It does not yet include a custody route. The target cutover keeps
+the same transport envelope but replaces the provisional protected-content
+surface with Runtime-selected `rights`, `custody`, and `decrypt` providers. Raw
+connect tickets stay inside Runtime transport state and are not returned in
+app-visible receipts. Raw backend providers such as `ipfs` or `localhost` remain
+local implementation details, not remote Carrier authorities.
 If the provider transfer is `stream`, the Carrier side also validates the
 target-visible `elastos.provider.stream/v1` base64-chunk contract before
 dispatching the request. Carrier availability fetches use that path for remote

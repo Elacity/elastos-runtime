@@ -108,7 +108,15 @@ authorizes every launch, approval, provider, and shell-switch effect.
 
 ## Provider
 
-A capsule that implements a protocol contract for other capsules to consume. Examples: `localhost-provider` (file-backed localhost roots), `did-provider` (identity), `ai-provider` (LLM routing), `chain-provider` (typed chain reads/proofs), `wallet-provider` (wallet proof, account-link, and approval authority), `drm-provider` (protected-content open boundary), `rights-provider` (protected-content rights questions), `key-provider` (protected-content key release), `decrypt-provider` (protected-content decrypt/render sessions), `availability-provider` (configured replication adapter), and `ipfs-provider` (low-level IPFS via Kubo). P2P networking is provided by built-in Carrier, not a separate provider capsule. Application capsules use providers through `elastos://` or rooted `localhost://` resources rather than implementing protocols directly.
+A capsule or Runtime-owned service that implements a typed contract. Examples
+include `localhost-provider` for rooted local storage, `did-provider` for
+identity, `chain-provider` for typed chain reads and proofs, `wallet-provider`
+for Wallet proof and approval authority, `rights-provider` for protected-content
+rights evidence, `decrypt-provider` for scoped decrypt/render sessions,
+`availability-provider` for configured replication, and `ipfs-provider` for
+low-level local IPFS through Kubo. Runtime selects providers. Application
+capsules use typed Runtime resources instead of choosing providers or network
+routes. P2P networking is provided by Carrier below Runtime routing.
 
 ## Content Availability Provider
 
@@ -119,18 +127,22 @@ Elacity/supernodes, served by volunteer nodes, or later backed by paid storage
 markets. Normal app capsules should use `elastos://content/*`, not raw
 `elastos://ipfs/*`.
 
-## Protected Content Provider
+## Protected Content Coordination
 
-The Runtime-mediated `elastos://drm/*` contract for sealed/protected content.
-It validates open requests and delegates rights, key release, and decrypt/render
-work to provider-owned authority. Apps do not receive raw CEKs, key-backend SDKs, wallet
-RPC, chain RPC, Kubo/IPFS APIs, or Elacity credentials.
+The intended Runtime-owned sequence for sealed content. Runtime will bind the
+exact object, Profile, Wallet-approved action, session, rights evidence, custody
+epoch, and decrypt session. It will then coordinate rights, custody, and decrypt
+providers.
+Apps receive scoped output or an opaque handle. They do not receive raw CEKs,
+custody shares, provider routes, endpoint DIDs, network locations, credentials,
+Wallet RPC, Chain RPC, Kubo/IPFS APIs, or Elacity authority.
 
 ## dKMS
 
 Distributed key-management system for protected content. The ElastOS direction is
 PQ-hybrid threshold release for new content: AES-256 CEKs, `t-of-n` shares,
-hybrid X25519 + ML-KEM share wrapping, and provider-owned key/decrypt sessions.
+hybrid X25519 + ML-KEM share wrapping, Runtime-selected custody providers, and
+scoped decrypt sessions.
 FROST may help sign classical v0 receipts or cohort decisions, but it is not the
 long-term dKMS security root.
 
