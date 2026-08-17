@@ -71,8 +71,9 @@ Common branch gates include:
 - `wallet-product-safety-smoke.sh` for product Wallet release safety
 - `wallet-connector-transaction-smoke.mjs` for fake-DOM, fake-provider
   connector handoff source proof, not hosted Browser acceptance
-- `protected-content-provider-contract-smoke.sh` for rights, key, decrypt, and
-  DRM provider boundaries
+- `protected-content-provider-contract-smoke.sh` as the fail-closed retirement
+  guard for the provisional rights, key, decrypt, and DRM providers; it does not
+  verify the canonical v1 custody path
 - `people-conversations-local-smoke.sh` for profile, discovery, contacts, and
   Chat handoff
 - `capsule-inspector-act-check.sh` for Inspector scope and Inbox approval
