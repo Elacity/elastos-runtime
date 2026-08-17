@@ -509,27 +509,38 @@ pub mod mint_progress {
 /// Report whether the Create capability is ready: the launch token is valid for the
 /// creator app AND a PUBLIC-ONLY quorum descriptor is present. Carries no key material.
 pub async fn creator_status(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    if require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]).is_err()
+    if let Err(err) =
+        require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP])
     {
+        tracing::warn!("creator_status: launch-token rejected (401): {err}");
         return error_json(
             StatusCode::UNAUTHORIZED,
             "missing or invalid home launch token",
         );
     }
     match load_quorum_descriptor(&state.data_dir) {
-        Ok(nodes) => Json(json!({
-            "schema": "elastos.creator.status/v1",
-            "ready": true,
-            "quorum": format!("2-of-{} dKMS", nodes.len()),
-            "node_count": nodes.len(),
-            "protection_type": THRESHOLD_PROTECTION_TYPE,
-        }))
-        .into_response(),
-        Err(message) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ready": false, "error": message })),
-        )
-            .into_response(),
+        Ok(nodes) => {
+            tracing::info!(
+                "creator_status: READY — quorum descriptor OK ({} nodes)",
+                nodes.len()
+            );
+            Json(json!({
+                "schema": "elastos.creator.status/v1",
+                "ready": true,
+                "quorum": format!("2-of-{} dKMS", nodes.len()),
+                "node_count": nodes.len(),
+                "protection_type": THRESHOLD_PROTECTION_TYPE,
+            }))
+            .into_response()
+        }
+        Err(message) => {
+            tracing::warn!("creator_status: quorum descriptor unavailable (503): {message}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "ready": false, "error": message })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -693,17 +704,23 @@ pub async fn creator_wallet(State(state): State<GatewayState>, headers: HeaderMa
         &[CREATOR_APP],
     ) {
         Ok(ctx) => ctx,
-        Err(_) => {
+        Err(err) => {
+            tracing::warn!("creator_wallet: launch-token rejected (401): {err}");
             return error_json(
                 StatusCode::UNAUTHORIZED,
                 "missing or invalid home launch token",
-            )
+            );
         }
     };
     let Some(registry) = state.provider_registry.as_ref() else {
+        tracing::warn!("creator_wallet: provider registry unavailable (503)");
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
     let namespace = mint_chain_namespace();
+    tracing::info!(
+        "creator_wallet: principal={} mint_namespace={namespace} — querying wallet provider accounts",
+        ctx.principal_id
+    );
     let accounts = match provider_data(
         registry,
         "wallet",
@@ -712,7 +729,10 @@ pub async fn creator_wallet(State(state): State<GatewayState>, headers: HeaderMa
     .await
     {
         Ok(value) => value,
-        Err(message) => return error_json(StatusCode::BAD_GATEWAY, &message),
+        Err(message) => {
+            tracing::warn!("creator_wallet: wallet accounts op failed (502): {message}");
+            return error_json(StatusCode::BAD_GATEWAY, &message);
+        }
     };
     let mut addresses: Vec<String> = accounts
         .get("accounts")
@@ -731,6 +751,23 @@ pub async fn creator_wallet(State(state): State<GatewayState>, headers: HeaderMa
     // The same EVM address may be linked under several eip155 chains — show it once.
     addresses.sort();
     addresses.dedup();
+    // Diagnostic: how many accounts the wallet provider returned vs how many survived the
+    // mint-signable filter, with the raw namespaces seen. If raw>0 but signable=0 the filter is
+    // the culprit; if raw=0 the provider store is empty for this principal (base_path/session).
+    let raw_namespaces: Vec<String> = accounts
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| a.get("chain_namespace").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    tracing::info!(
+        "creator_wallet: wallet provider returned {} account(s) namespaces={raw_namespaces:?}; {} address(es) can sign the {namespace} mint",
+        raw_namespaces.len(),
+        addresses.len()
+    );
     Json(json!({
         "schema": "elastos.creator.wallet/v1",
         "network": mint_network(),

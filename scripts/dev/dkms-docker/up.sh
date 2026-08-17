@@ -25,6 +25,10 @@ case "${1:-up}" in
 esac
 
 mkdir -p shared
+# Host-visible node logs (see docker-compose.yml x-node-logs): pre-create the bind source so
+# docker never has to (root-owned) create it, and the logs sit next to the runtime's own
+# dkms state under ~/Library/Application Support/ElastOS.
+mkdir -p "${DKMS_NODE_LOG_DIR:-${HOME}/Library/Application Support/ElastOS/dkms/docker-logs}"
 
 echo "== build the node image (dkms-authority + dkms-carrier-node + dkms-keygen) =="
 $COMPOSE build
@@ -141,5 +145,8 @@ QUORUM UP. Point a runtime at it:
   ./scripts/dev/run-creator-gateway.sh
 
 Health:   docker compose ps && docker compose logs --tail=20
+Logs:     debug-level node traces (every handshake/recover + outcome) also land in
+          ~/Library/Application Support/ElastOS/dkms/docker-logs/node-{0,1,2}.log
+          (tune with DKMS_AUTHORITY_LOG_LEVEL / DKMS_CARRIER_NODE_LOG_LEVEL: error|warn|info|debug|trace)
 Restart:  master seeds live in named volumes — nodes come back with the SAME identities.
 EOF

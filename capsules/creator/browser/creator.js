@@ -118,15 +118,20 @@ let tradeGated = false;
 const DEFAULT_TRADE_HINT =
   "Once the mint confirms on-chain, approve the gateway so others can trade your asset.";
 
-function query(name) {
+// The ESP shell delivers the launch capability in the URL FRAGMENT (`#home_token=…`), never the
+// query string: a fragment is never transmitted to the server, so the token cannot leak into an
+// access log. Read it exactly like every other capsule (elacity-player, ddrm-viewer, browser, …);
+// the legacy query-string read (`?home_token=`) silently yielded null under the ESP shell, so
+// preflight() bailed with "no launch capability" and the wallet/channel pickers never populated.
+function fragmentValue(name) {
   try {
-    return new URL(window.location.href).searchParams.get(name);
+    return new URLSearchParams(window.location.hash.replace(/^#/, "")).get(name);
   } catch (_error) {
     return null;
   }
 }
 
-const homeToken = query("home_token");
+const homeToken = fragmentValue("home_token");
 
 function launchHeaders() {
   return homeToken ? { "x-elastos-home-token": homeToken } : {};

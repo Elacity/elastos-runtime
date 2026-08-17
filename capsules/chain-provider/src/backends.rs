@@ -203,16 +203,7 @@ impl ChainProvider {
             ));
         }
         let params = json!([filter]);
-        let mut last_err: Option<Response> = None;
-        for url in pool {
-            match self.evm_rpc_once(url, "eth_getLogs", &params) {
-                Ok(value) => return Ok(value),
-                Err(response) => last_err = Some(response),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| {
-            Response::error("upstream_unreachable", "all log-query RPC endpoints failed")
-        }))
+        self.evm_rpc_pool_call(&pool, "eth_getLogs", &params)
     }
 
     /// Call an EVM JSON-RPC method, failing over across the network's RPC pool: a transport
@@ -233,19 +224,55 @@ impl ChainProvider {
                 &format!("no RPC endpoint is configured for {}", network.id),
             ));
         }
+        self.evm_rpc_pool_call(&pool, method, &params)
+    }
+
+    /// Run `method` across a pre-resolved RPC `pool` with rotate-on-error failover AND a bounded
+    /// retry-with-backoff on TRANSIENT upstream failures — a rate limit (HTTP 429), a gateway/5xx,
+    /// or a transport error — because the public RPC endpoints are out of our control and
+    /// intermittently throttle. A full pool pass that fails only transiently is retried after an
+    /// exponential backoff; a permanent failure (a real JSON-RPC error, a client 4xx, a missing
+    /// result) fails fast without retry. The answer itself is never softened.
+    fn evm_rpc_pool_call(
+        &self,
+        pool: &[&str],
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, Response> {
+        const MAX_RPC_ATTEMPTS: usize = 4;
         let mut last_err: Option<Response> = None;
-        for url in pool {
-            match self.evm_rpc_once(url, method, &params) {
-                Ok(value) => return Ok(value),
-                Err(response) => last_err = Some(response),
+        for attempt in 1..=MAX_RPC_ATTEMPTS {
+            let mut any_transient = false;
+            for &url in pool {
+                match self.evm_rpc_once(url, method, params) {
+                    Ok(value) => return Ok(value),
+                    Err((transient, response)) => {
+                        any_transient = any_transient || transient;
+                        last_err = Some(response);
+                    }
+                }
             }
+            if !any_transient || attempt == MAX_RPC_ATTEMPTS {
+                break;
+            }
+            // Exponential backoff between full pool passes: 200ms, 400ms, 800ms.
+            std::thread::sleep(std::time::Duration::from_millis(200u64 << (attempt - 1)));
         }
         Err(last_err
             .unwrap_or_else(|| Response::error("upstream_unreachable", "all RPC endpoints failed")))
     }
 
-    /// A single JSON-RPC round trip against one endpoint URL.
-    fn evm_rpc_once(&self, url: &str, method: &str, params: &Value) -> Result<Value, Response> {
+    /// A single JSON-RPC round trip against one endpoint URL. On failure returns
+    /// `(transient, response)`: `transient` is true when the failure is worth retrying against the
+    /// pool after a backoff — a transport error, a rate limit (HTTP 429), or a gateway/5xx — and
+    /// false when it is a definitive answer we must not retry: a real JSON-RPC error (e.g. a revert),
+    /// a client 4xx, or a missing result.
+    fn evm_rpc_once(
+        &self,
+        url: &str,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, (bool, Response)> {
         let response = self
             .client
             .post(url)
@@ -256,23 +283,26 @@ impl ChainProvider {
                 "params": params,
             }))
             .send()
-            .map_err(|err| Response::error("upstream_unreachable", &err.to_string()))?;
+            .map_err(|err| (true, Response::error("upstream_unreachable", &err.to_string())))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(Response::error(
-                "upstream_http_error",
-                &format!("upstream returned HTTP {}", status.as_u16()),
+            return Err((
+                http_status_is_transient(status.as_u16()),
+                Response::error(
+                    "upstream_http_error",
+                    &format!("upstream returned HTTP {}", status.as_u16()),
+                ),
             ));
         }
         let body = response
             .json::<Value>()
-            .map_err(|err| Response::error("upstream_invalid_json", &err.to_string()))?;
+            .map_err(|err| (true, Response::error("upstream_invalid_json", &err.to_string())))?;
         if let Some(error) = body.get("error") {
-            return Err(Response::error("upstream_rpc_error", &error.to_string()));
+            return Err((false, Response::error("upstream_rpc_error", &error.to_string())));
         }
         body.get("result")
             .cloned()
-            .ok_or_else(|| Response::error("upstream_missing_result", "RPC result missing"))
+            .ok_or_else(|| (false, Response::error("upstream_missing_result", "RPC result missing")))
     }
 
     pub(super) fn bitcoin_rpc(
@@ -315,5 +345,34 @@ impl ChainProvider {
         body.get("result")
             .cloned()
             .ok_or_else(|| Response::error("upstream_missing_result", "RPC result missing"))
+    }
+}
+
+/// An upstream HTTP status worth retrying against the RPC pool after a backoff: a rate limit
+/// (HTTP 429) or a gateway/server error (5xx). Other 4xx statuses are definitive client-side
+/// answers and are NOT retried.
+fn http_status_is_transient(status: u16) -> bool {
+    status == 429 || (500..=599).contains(&status)
+}
+
+#[cfg(test)]
+mod backends_retry_tests {
+    use super::http_status_is_transient;
+
+    #[test]
+    fn only_rate_limit_and_5xx_are_transient() {
+        // Retryable: rate limit + the whole 5xx range.
+        assert!(http_status_is_transient(429));
+        assert!(http_status_is_transient(500));
+        assert!(http_status_is_transient(502));
+        assert!(http_status_is_transient(503));
+        assert!(http_status_is_transient(599));
+        // Not retryable: success and definitive client errors.
+        assert!(!http_status_is_transient(200));
+        assert!(!http_status_is_transient(400));
+        assert!(!http_status_is_transient(401));
+        assert!(!http_status_is_transient(403));
+        assert!(!http_status_is_transient(404));
+        assert!(!http_status_is_transient(422));
     }
 }

@@ -1331,6 +1331,34 @@ fn dkms_capsule(bytes: &[u8]) -> Option<serde_json::Value> {
     Some(v)
 }
 
+/// Derive the dKMS node-set id (standard base64) from a live open-descriptor file, using the
+/// canonical derivation (`ddrm_envelope::threshold_node_set_id_n`): SHA-256 over the domain tag,
+/// the threshold `t` byte, then each node's verifying key (`u32`-BE length ‖ bytes) IN DESCRIPTOR
+/// ORDER. It lets the gateway compare — host-side, up front — the node-set an asset was SEALED to
+/// (its `protections[0].node_set_id_b64`) against the node-set the RUNNING quorum enforces. A
+/// mismatch is EXACTLY the node-side `bad_node_set` refusal, surfaced before we spawn a recover so
+/// the failure is self-evident from the gateway log alone (the helper reports it only on stderr).
+fn descriptor_node_set_id_b64(descriptor_path: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let raw = std::fs::read(descriptor_path).ok()?;
+    let d: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let th = d.get("threshold")?;
+    let t = th.get("t").and_then(|v| v.as_u64())? as u8;
+    let nodes = th.get("nodes").and_then(|n| n.as_array())?;
+    let mut h = Sha256::new();
+    h.update(b"elastos.dkms.threshold.node-set/v1");
+    h.update([t]);
+    for n in nodes {
+        let vk_b64 = n.get("verifying_key_b64").and_then(|v| v.as_str())?;
+        let vk = base64::engine::general_purpose::STANDARD
+            .decode(vk_b64)
+            .ok()?;
+        h.update((vk.len() as u32).to_be_bytes());
+        h.update(&vk);
+    }
+    Some(base64::engine::general_purpose::STANDARD.encode(h.finalize()))
+}
+
 /// Single source of truth for the on-chain content id of an owned dDRM asset, shared by BOTH
 /// `/api/viewers/open` and the legacy owned-root re-buy branch of [`buy_owned_access`]. The open
 /// path is authoritative: its precedence is the capsule `content_id` (else `kid`) FIRST, then
@@ -1425,6 +1453,96 @@ async fn open_quorum(
         }
     };
 
+    // ── UNAMBIGUOUS node-set evidence (dKMS `bad_node_set` root-cause trace) ──────────────────
+    // A node refuses a recover ("access grant rejected: bad_node_set") when the node-set an asset
+    // was SEALED to differs from the one the running quorum enforces. That refusal is the single
+    // most common reason an owned open fails, yet the helper reports it only on its (inherited)
+    // stderr — the gateway otherwise sees a generic "capsule exited before answering" and mints an
+    // opaque 502. Compute BOTH ids host-side and log the verdict so the cause is self-evident from
+    // the gateway log alone, BEFORE we spawn the recover.
+    let asset_node_set = capsule
+        .get("protections")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .and_then(|p| p.get("node_set_id_b64"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let quorum_node_set = descriptor_node_set_id_b64(&descriptor).unwrap_or_default();
+    tracing::trace!(
+        "dKMS open_quorum: kid={kid_hex} mime={mime} object_cid={} descriptor={descriptor}",
+        log_fp(&object_cid)
+    );
+    // DEEP evidence: fingerprint the ORDERED node verifying-keys on BOTH sides. This tells a
+    // genuinely-different quorum (DISJOINT vk sets — the asset's secret-holders no longer exist)
+    // apart from a mere derivation/ordering mismatch (SAME vk set, different id). The mint seals
+    // each share under its node's `verifying_key_b64` (encrypt-provider), and node_set_id is derived
+    // from exactly those keys — so identical fp sets here would mean the shares ARE recoverable and
+    // only the id derivation drifted. All values are PUBLIC keys, logged as non-reversible fps.
+    let asset_vk_fps: Vec<String> = capsule
+        .get("protections")
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .and_then(|p| p.get("shares"))
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|sh| sh.get("verifying_key_b64").and_then(|v| v.as_str()))
+                .map(log_fp)
+                .collect()
+        })
+        .unwrap_or_default();
+    let quorum_vk_fps: Vec<String> = std::fs::read(&descriptor)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|d| {
+            d.get("threshold")
+                .and_then(|t| t.get("nodes"))
+                .and_then(|n| n.as_array())
+                .cloned()
+        })
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| n.get("verifying_key_b64").and_then(|v| v.as_str()))
+                .map(log_fp)
+                .collect()
+        })
+        .unwrap_or_default();
+    tracing::warn!(
+        "dKMS node-set evidence: asset node-vk fps={asset_vk_fps:?} vs running quorum node-vk fps={quorum_vk_fps:?} (kid={kid_hex}) — DISJOINT sets ⇒ dead quorum (shares gone); SAME set ⇒ id-derivation drift"
+    );
+    if asset_node_set.is_empty() || quorum_node_set.is_empty() {
+        tracing::warn!(
+            "dKMS node-set precheck: could not derive both ids (asset='{asset_node_set}', quorum='{quorum_node_set}') — proceeding to recover"
+        );
+    } else if asset_node_set == quorum_node_set {
+        tracing::info!(
+            "dKMS node-set precheck: MATCH node_set={asset_node_set} kid={kid_hex} — asset is recoverable by the running quorum"
+        );
+    } else {
+        // Fail FAST and HONESTLY (still fail-closed): the node-set is a permanent property of how the
+        // asset was sealed. When it differs from the running quorum EVERY node rejects the recover with
+        // bad_node_set — retrying cannot help. We know this host-side, before spawning, so surface a
+        // clear, actionable message instead of three doomed attempts and an opaque 502. (Our derivation
+        // is the canonical `threshold_node_set_id_n`, verified equal to the node's own pin, so a
+        // MISMATCH here is exactly the refusal the quorum would return; we never block a recoverable
+        // asset. If either id could not be derived we do NOT take this branch — we proceed to recover.)
+        tracing::warn!(
+            "dKMS node-set precheck: MISMATCH — asset sealed to node_set={asset_node_set} but the running quorum is node_set={quorum_node_set} (kid={kid_hex}). \
+             Every share would be refused with bad_node_set; failing fast instead of spawning a doomed recover."
+        );
+        let short = |s: &str| s.chars().take(12).collect::<String>();
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "This protected asset was sealed to a different dKMS quorum (node-set {}…) than the one currently running (node-set {}…), so its keys cannot be recovered here. Re-mint it against the current quorum, or start the quorum whose nodes hold its shares.",
+                short(&asset_node_set),
+                short(&quorum_node_set)
+            ),
+        )
+            .into_response();
+    }
+
     let capsule_bytes = match serde_json::to_vec(&capsule) {
         Ok(b) => b,
         Err(_) => {
@@ -1472,6 +1590,10 @@ async fn open_quorum(
     let mut launched = None;
     let mut last_err = String::new();
     for attempt in 1..=MAX_QUORUM_ATTEMPTS {
+        tracing::trace!(
+            "dKMS recover (object) attempt {attempt}/{MAX_QUORUM_ATTEMPTS}: spawning quorum helper (grant={}) kid={kid_hex}",
+            if access_grant_b64.is_some() { "wallet-signed" } else { "enrolled" }
+        );
         let helper_bin = helper_bin.clone();
         let decrypt_bin = decrypt_bin.clone();
         let key_bin = key_bin.clone();
@@ -1701,6 +1823,10 @@ async fn open_quorum_media(
     let mut launched = None;
     let mut last_err = String::new();
     for attempt in 1..=MAX_QUORUM_ATTEMPTS {
+        tracing::trace!(
+            "dKMS recover (media) attempt {attempt}/{MAX_QUORUM_ATTEMPTS}: spawning quorum helper (grant={}) kid={kid_hex}",
+            if access_grant_b64.is_some() { "wallet-signed" } else { "enrolled" }
+        );
         let helper_bin = helper_bin.clone();
         let decrypt_bin = decrypt_bin.clone();
         let key_bin = key_bin.clone();

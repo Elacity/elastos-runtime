@@ -3047,6 +3047,237 @@ fn serve_socket(path: &str) {
     );
 }
 
+/// Leveled operator logging, configured ONCE from `DKMS_AUTHORITY_LOG_LEVEL`
+/// (`error|warn|info|debug|trace`; default `info`, which preserves the live nodes' current
+/// posture). The dev mesh (scripts/dev/dkms-docker) runs at `debug`, where the node traces every
+/// accepted connection, every parsed request (a SECRET-FREE summary, [`request_summary`]), every
+/// response outcome (ok / error code), and channel establishment; `trace` adds per-frame detail.
+/// INVARIANT (same as [`counters`]): nothing logged at ANY level is secret — op names,
+/// kid/content/session identifiers, bounded FINGERPRINTS of public values, and error codes only.
+/// No CEK, envelope, seed, token, signature, or share material is ever rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+    Debug = 3,
+    Trace = 4,
+}
+
+impl LogLevel {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "error" => Some(Self::Error),
+            "warn" | "warning" => Some(Self::Warn),
+            "info" => Some(Self::Info),
+            "debug" => Some(Self::Debug),
+            "trace" => Some(Self::Trace),
+            _ => None,
+        }
+    }
+}
+
+/// The configured level, resolved once. An unrecognized value falls back to `info` (never a
+/// silently muted node — misconfiguring the LOG level must not hide fail-closed signals).
+fn log_level() -> LogLevel {
+    static LEVEL: std::sync::OnceLock<LogLevel> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("DKMS_AUTHORITY_LOG_LEVEL")
+            .ok()
+            .and_then(|v| LogLevel::parse(&v))
+            .unwrap_or(LogLevel::Info)
+    })
+}
+
+fn log_enabled(level: LogLevel) -> bool {
+    level <= log_level()
+}
+
+/// Emit one stderr log line iff `$level` is enabled by `DKMS_AUTHORITY_LOG_LEVEL`.
+macro_rules! oplog {
+    ($level:expr, $($arg:tt)*) => {
+        if log_enabled($level) {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+/// Monotonic id for accepted connections, so interleaved verbose lines from concurrent connection
+/// threads stay attributable. Module-level (NOT a static inside the generic accept loop, which
+/// would mint one counter per transport monomorphization).
+#[cfg(unix)]
+static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A bounded display handle for a PUBLIC base64 value (verifying key, node-set id, challenge,
+/// delegation nonce handle): the first 12 characters — enough to correlate "which caller / which
+/// set" across log lines, never a usable key. Only ever applied to public values.
+fn fp(b64: &str) -> String {
+    let head: String = b64.chars().take(12).collect();
+    if head.len() < b64.len() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// Bound a client-supplied free-form identifier for logging: hostile input must not be able to
+/// bloat the log line (the protocol validates these later, not at parse time).
+fn bounded(s: &str) -> String {
+    const MAX: usize = 96;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(MAX).collect();
+        format!("{head}…({} bytes)", s.len())
+    }
+}
+
+/// The wire op name of a parsed request — the label verbose response lines carry.
+fn op_name(request: &Request) -> &'static str {
+    match request {
+        Request::Init { .. } => "init",
+        Request::Status {} => "status",
+        Request::Hello { .. } => "hello",
+        Request::Recover { .. } => "recover",
+        Request::RotateShare { .. } => "rotate_share",
+        Request::RevokeCaller { .. } => "revoke_caller",
+        Request::RevokeDelegation { .. } => "revoke_delegation",
+        Request::ReshareContribute { .. } => "reshare_contribute",
+        Request::ReshareInstall { .. } => "reshare_install",
+        Request::DkgContribute { .. } => "dkg_contribute",
+        Request::DkgInstall { .. } => "dkg_install",
+        Request::Shutdown {} => "shutdown",
+    }
+}
+
+/// One SECRET-FREE line summarizing an inbound request for the verbose trace: the op plus its
+/// public bindings (kid, content/principal/session/right, coordinates, fingerprints of public
+/// keys). Deliberately renders NO secret-bearing field — no wrapped/sealed envelope, sub-share,
+/// signature, token, or challenge beyond a bounded fingerprint.
+fn request_summary(request: &Request) -> String {
+    match request {
+        Request::Init { .. } => "init (wire init is always refused)".to_string(),
+        Request::Status {} => "status".to_string(),
+        Request::Hello {
+            challenge_b64,
+            caller_pub_b64,
+            now_unix,
+            channel_pub_b64,
+        } => format!(
+            "hello caller_vk={} channel_key={} challenge={} now_unix={:?}",
+            fp(caller_pub_b64),
+            if channel_pub_b64.is_some() {
+                "offered"
+            } else {
+                "none"
+            },
+            fp(challenge_b64),
+            now_unix
+        ),
+        Request::Recover {
+            kid_hex,
+            scheme,
+            content_id,
+            principal_id,
+            session_id,
+            right,
+            recover_seq,
+            access_grant,
+            attest_node_set_id_b64,
+            ..
+        } => format!(
+            "recover kid={} scheme={} content={} principal={} session={} right={} seq={recover_seq} grant={} attestation={}",
+            bounded(kid_hex),
+            bounded(scheme),
+            bounded(content_id),
+            bounded(principal_id),
+            bounded(session_id),
+            bounded(right),
+            if access_grant.is_some() {
+                "wallet-signed"
+            } else {
+                "absent(legacy-receipt)"
+            },
+            if attest_node_set_id_b64.is_some() {
+                "requested"
+            } else {
+                "none"
+            },
+        ),
+        Request::RotateShare {
+            kid_hex,
+            scheme,
+            successor_recipient_pub_b64,
+            ..
+        } => format!(
+            "rotate_share kid={} scheme={} successor={}",
+            bounded(kid_hex),
+            bounded(scheme),
+            fp(successor_recipient_pub_b64)
+        ),
+        Request::RevokeCaller { caller_pub_b64, .. } => {
+            format!("revoke_caller caller_vk={}", fp(caller_pub_b64))
+        }
+        Request::RevokeDelegation {
+            delegation_nonce_b64,
+            expires_at,
+            issued_at,
+            ..
+        } => format!(
+            "revoke_delegation nonce={} expires_at={expires_at} issued_at={issued_at}",
+            fp(delegation_nonce_b64)
+        ),
+        Request::ReshareContribute {
+            kid_hex,
+            old_node_set_id_b64,
+            new_node_set_id_b64,
+            k,
+            m,
+            ..
+        } => format!(
+            "reshare_contribute kid={} old_set={} new_set={} k={k} m={m}",
+            bounded(kid_hex),
+            fp(old_node_set_id_b64),
+            fp(new_node_set_id_b64)
+        ),
+        Request::ReshareInstall {
+            kid_hex,
+            target_x,
+            contributions,
+            ..
+        } => format!(
+            "reshare_install kid={} target_x={target_x} contributions={}",
+            bounded(kid_hex),
+            contributions.len()
+        ),
+        Request::DkgContribute {
+            kid_hex,
+            dkg_id_b64,
+            t,
+            m,
+            dealer_x,
+            ..
+        } => format!(
+            "dkg_contribute kid={} dkg_id={} t={t} m={m} dealer_x={dealer_x}",
+            bounded(kid_hex),
+            fp(dkg_id_b64)
+        ),
+        Request::DkgInstall {
+            kid_hex,
+            dkg_id_b64,
+            target_x,
+            contributions,
+            ..
+        } => format!(
+            "dkg_install kid={} dkg_id={} target_x={target_x} contributions={}",
+            bounded(kid_hex),
+            fp(dkg_id_b64),
+            contributions.len()
+        ),
+        Request::Shutdown {} => "shutdown".to_string(),
+    }
+}
+
 /// A transport an accepted connection can be served over (Unix or TCP). Abstracts the two
 /// otherwise-identical accept loops behind one generic [`serve_accept_loop`], so the per-connection
 /// lifecycle — read-timeout arming, reader split, concurrency cap, thread spawn — lives in EXACTLY
@@ -3059,6 +3290,9 @@ trait AcceptedConn: io::Write + Send + Sized + 'static {
     fn arm_read_timeout(&self);
     /// A buffered reader over a clone of this connection (the write half stays on `self`).
     fn split_reader(&self) -> io::Result<Self::Reader>;
+    /// A short, secret-free label naming the peer for the verbose trace (TCP peer address, or
+    /// "unix" — the Unix transport is host-local and filesystem-permissioned, no address to name).
+    fn peer_label(&self) -> String;
 }
 
 #[cfg(unix)]
@@ -3070,6 +3304,9 @@ impl AcceptedConn for std::os::unix::net::UnixStream {
     fn split_reader(&self) -> io::Result<Self::Reader> {
         Ok(io::BufReader::new(self.try_clone()?))
     }
+    fn peer_label(&self) -> String {
+        "unix".to_string()
+    }
 }
 
 #[cfg(unix)]
@@ -3080,6 +3317,11 @@ impl AcceptedConn for std::net::TcpStream {
     }
     fn split_reader(&self) -> io::Result<Self::Reader> {
         Ok(io::BufReader::new(self.try_clone()?))
+    }
+    fn peer_label(&self) -> String {
+        self.peer_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "tcp:unknown".to_string())
     }
 }
 
@@ -3163,6 +3405,17 @@ fn serve_accept_loop<S, I>(
             continue;
         }
         let slot = ActiveSlot(Arc::clone(&active));
+        // Verbose trace (dev mesh): name the connection ONCE — a monotonic id + the peer — so every
+        // subsequent request/response line from its thread is attributable amid interleaving.
+        let conn_label = format!(
+            "conn{} {}",
+            CONN_SEQ.fetch_add(1, Ordering::Relaxed),
+            stream.peer_label()
+        );
+        oplog!(
+            LogLevel::Debug,
+            "dkms-authority[{conn_label}]: connection accepted"
+        );
         let conn_authority = Arc::clone(&authority);
         let allowed = Arc::clone(&allowed_callers);
         let operator = Arc::clone(&operator_vk);
@@ -3183,6 +3436,7 @@ fn serve_accept_loop<S, I>(
                 &replay,
                 &lifecycle,
                 require_channel,
+                &conn_label,
             );
         });
     }
@@ -3511,6 +3765,7 @@ struct ServerChannel {
 /// connection without serving anything. When `require_channel` (the TCP transport), a plaintext
 /// `recover` is refused outright — the hostile network never carries an unencrypted recover.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // daemon plumbing (see serve_accept_loop) + the trace label
 fn serve_connection_io<R: io::Read, W: io::Write>(
     mut reader: R,
     mut writer: W,
@@ -3522,6 +3777,7 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
     replay: &ReplayStore,
     lifecycle_replay: &LifecycleReplaySet,
     require_channel: bool,
+    conn_label: &str,
 ) {
     use ddrm_envelope::frame::{read_frame, write_frame};
     let mut node = DkmsAuthorityNode {
@@ -3553,7 +3809,10 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             Ok(None) => break, // clean half-close at a frame boundary
             Err(err) => {
                 // Torn/oversized/hostile frame: refuse + drop the connection (the listener serves on).
-                eprintln!("dkms-authority: framing error, dropping connection: {err}");
+                oplog!(
+                    LogLevel::Warn,
+                    "dkms-authority[{conn_label}]: framing error, dropping connection: {err}"
+                );
                 if channel.is_none() {
                     let _ = write_frame(
                         &mut writer,
@@ -3575,7 +3834,7 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                 let env = match ddrm_envelope::PqSealedEnvelope::from_bytes(&raw) {
                     Ok(env) => env,
                     Err(_) => {
-                        eprintln!("dkms-authority: PLAINTEXT/garbled frame on an established channel — dropping connection (no downgrade)");
+                        oplog!(LogLevel::Warn, "dkms-authority[{conn_label}]: PLAINTEXT/garbled frame on an established channel — dropping connection (no downgrade)");
                         break;
                     }
                 };
@@ -3596,7 +3855,7 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                     // order. Integrity is the seal above; padding is metadata-hiding only.
                     Ok(opened) => ddrm_envelope::channel_pad::unpad_incoming(&opened),
                     Err(_) => {
-                        eprintln!("dkms-authority: sealed frame failed to open (tampered/replayed/wrong key) — dropping connection");
+                        oplog!(LogLevel::Warn, "dkms-authority[{conn_label}]: sealed frame failed to open (tampered/replayed/wrong key) — dropping connection");
                         break;
                     }
                 }
@@ -3605,6 +3864,11 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
         let request = match serde_json::from_slice::<Request>(&payload) {
             Ok(request) => request,
             Err(err) => {
+                // serde errors carry field names/positions, never payload values — secret-free.
+                oplog!(
+                    LogLevel::Debug,
+                    "dkms-authority[{conn_label}]: <- unparseable request ({err})"
+                );
                 let resp = Response::error("invalid_request", err.to_string());
                 if respond(&mut writer, &mut channel, &node, &resp).is_err() {
                     break;
@@ -3612,6 +3876,21 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                 continue;
             }
         };
+        oplog!(
+            LogLevel::Debug,
+            "dkms-authority[{conn_label}]: <- {}",
+            request_summary(&request)
+        );
+        oplog!(
+            LogLevel::Trace,
+            "dkms-authority[{conn_label}]: frame detail: {} payload bytes, {}",
+            payload.len(),
+            if channel.is_some() {
+                "sealed channel frame"
+            } else {
+                "plaintext frame"
+            }
+        );
         // FAIL-CLOSED TRANSPORT GATE: on a network transport, a recover — and the lifecycle ops,
         // which move rotated share escrows + operator instructions (Day 109–112) — NEVER travel in
         // plaintext: no channel, no service. (init/hello/status are public-protocol messages; the
@@ -3630,6 +3909,11 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                     | Request::DkgInstall { .. }
             )
         {
+            oplog!(
+                LogLevel::Debug,
+                "dkms-authority[{conn_label}]: -> {} error code=channel_required",
+                op_name(&request)
+            );
             let resp = Response::error(
                 "channel_required",
                 "this transport requires the encrypted channel: re-run `hello` with a channel_pub_b64 first",
@@ -3655,8 +3939,19 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             _ => None,
         };
         let is_shutdown = matches!(request, Request::Shutdown {});
+        let op = op_name(&request);
         let response = node.handle(request);
         let accepted = matches!(response, Response::Ok { .. });
+        match &response {
+            Response::Ok { .. } => {
+                oplog!(LogLevel::Debug, "dkms-authority[{conn_label}]: -> {op} ok")
+            }
+            Response::Error { code, message } => oplog!(
+                LogLevel::Debug,
+                "dkms-authority[{conn_label}]: -> {op} error code={code} ({})",
+                bounded(message)
+            ),
+        }
         if respond(&mut writer, &mut channel, &node, &response).is_err() {
             break;
         }
@@ -3678,9 +3973,16 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                 })
             };
             match establish() {
-                Some(state) => channel = Some(state),
+                Some(state) => {
+                    oplog!(
+                        LogLevel::Debug,
+                        "dkms-authority[{conn_label}]: encrypted channel established (caller_vk={}) — all further frames sealed",
+                        fp(&caller_b64)
+                    );
+                    channel = Some(state);
+                }
                 None => {
-                    eprintln!("dkms-authority: channel establishment failed after an accepted hello — dropping connection");
+                    oplog!(LogLevel::Warn, "dkms-authority[{conn_label}]: channel establishment failed after an accepted hello — dropping connection");
                     break;
                 }
             }
@@ -3689,6 +3991,10 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             break;
         }
     }
+    oplog!(
+        LogLevel::Debug,
+        "dkms-authority[{conn_label}]: connection closed"
+    );
     // No write-back needed: `node.revoked_callers` IS the shared daemon-lifetime set (an `Arc`
     // clone), so every revocation was already published to all connections the instant it landed.
 }
@@ -4557,6 +4863,50 @@ mod tests {
         );
     }
 
+    /// The debug trace never renders secrets: a recover's [`request_summary`] carries the PUBLIC
+    /// bindings (kid/content/principal/session/right/seq) and NEVER the escrowed envelope, token
+    /// signature, or possession-proof material — the same invariant [`counters`] holds. Also pins
+    /// the `DKMS_AUTHORITY_LOG_LEVEL` grammar (case-insensitive names, severity ordering).
+    #[test]
+    fn request_summary_is_secret_free_and_log_levels_parse() {
+        // Stands in for every sealed/secret base64 field; must never appear in the summary.
+        let secret_marker = "U0VDUkVUX0NFS19CWVRFUw==";
+        let req: Request = serde_json::from_value(json!({
+            "op": "recover",
+            "wrapped_cek_b64": secret_marker, "scheme": "pq-hybrid-v1",
+            "kid_hex": "00112233445566778899aabbccddeeff",
+            "producer_vk_b64": "AA==", "decrypt_session_pub_b64": "AA==",
+            "ciphertext_b64": secret_marker, "content_hash_b64": "AA==", "nonce_b64": secret_marker,
+            "rights_receipt": good_receipt(),
+            "content_id": CONTENT, "principal_id": PRINCIPAL, "session_id": SESSION, "right": RIGHT,
+            "session_token": { "challenge_b64": "AA==", "caller_pub_b64": "AA==", "expires_at": 1, "sig_b64": secret_marker },
+            "caller_sig_b64": secret_marker,
+            "recover_seq": 7,
+        }))
+        .expect("a complete recover parses");
+        let line = request_summary(&req);
+        assert!(line.starts_with("recover"), "op named first: {line}");
+        assert!(line.contains("kid=00112233445566778899aabbccddeeff"));
+        assert!(line.contains(&format!("content={CONTENT}")));
+        assert!(line.contains("seq=7"));
+        assert!(
+            !line.contains(secret_marker),
+            "no sealed/secret field is ever rendered: {line}"
+        );
+        assert!(
+            !line.contains('\n') && line.len() < 512,
+            "one bounded line: {line}"
+        );
+
+        // Level grammar: case-insensitive names; unknown values are refused (the resolver then
+        // falls back to `info`, never a muted node); severity orders error < … < trace.
+        assert_eq!(LogLevel::parse("DEBUG"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse(" warn "), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::parse("nonsense"), None);
+        assert!(LogLevel::Error < LogLevel::Warn && LogLevel::Warn < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Debug && LogLevel::Debug < LogLevel::Trace);
+    }
+
     /// Fail-closed protocol surface (Principle 11): the empty variants must REJECT unknown fields.
     /// serde's container `deny_unknown_fields` does NOT cover UNIT variants of an internally-tagged
     /// enum, so `Status`/`Shutdown` are empty STRUCT variants precisely so a smuggled field is
@@ -4645,6 +4995,7 @@ mod tests {
                 &ReplayStore::default(),
                 &LifecycleReplaySet::default(),
                 false,
+                "test",
             )
         });
 
@@ -4735,6 +5086,7 @@ mod tests {
                 &ReplayStore::default(),
                 &LifecycleReplaySet::default(),
                 false,
+                "test",
             )
         });
         // A header promising 64 bytes followed by only 3, then half-close.
@@ -4853,6 +5205,7 @@ mod tests {
                 &ReplayStore::default(),
                 &LifecycleReplaySet::default(),
                 true,
+                "test",
             )
         });
         let call_plain = |client: &mut UnixStream, req: Value| -> Value {
@@ -8053,6 +8406,7 @@ mod tests {
                 &ReplayStore::default(),
                 &LifecycleReplaySet::default(),
                 require_channel,
+                "test",
             );
         });
         write_frame(&mut client, &serde_json::to_vec(&req).unwrap()).unwrap();

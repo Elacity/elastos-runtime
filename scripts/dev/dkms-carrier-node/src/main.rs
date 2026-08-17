@@ -33,6 +33,52 @@ use tokio::net::TcpStream;
 
 /// The Carrier ALPN this transport multiplexes. Must match `dkms-carrier-client`.
 const DKMS_AUTHORITY_ALPN: &[u8] = b"elastos/dkms-authority/1";
+
+/// Leveled stderr logging, configured once from `DKMS_CARRIER_NODE_LOG_LEVEL`
+/// (`error|warn|info|debug|trace`; default `info`). At `debug` the bridge traces every inbound
+/// Carrier connection (the dialer's endpoint id), every relayed stream, and the byte counts each
+/// stream moved. Secret-free by construction: the relay only ever sees ciphertext, and it logs
+/// only peer ids, the target address, and byte tallies — never payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+    Debug = 3,
+    Trace = 4,
+}
+
+fn log_level() -> LogLevel {
+    static LEVEL: std::sync::OnceLock<LogLevel> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        match std::env::var("DKMS_CARRIER_NODE_LOG_LEVEL")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "error" => LogLevel::Error,
+            "warn" | "warning" => LogLevel::Warn,
+            "debug" => LogLevel::Debug,
+            "trace" => LogLevel::Trace,
+            // "info", unset, and anything unrecognized: the default posture.
+            _ => LogLevel::Info,
+        }
+    })
+}
+
+fn log_enabled(level: LogLevel) -> bool {
+    level <= log_level()
+}
+
+/// Emit one stderr log line iff `$level` is enabled by `DKMS_CARRIER_NODE_LOG_LEVEL`.
+macro_rules! oplog {
+    ($level:expr, $($arg:tt)*) => {
+        if log_enabled($level) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 const DEFAULT_TARGET: &str = "10.66.66.1:9443";
 const DEFAULT_SEED_PATH: &str = "/var/lib/elastos/dkms/carrier.seed";
 /// Bound how long we wait for a relay/online before we begin serving (best-effort:
@@ -58,31 +104,60 @@ impl ProtocolHandler for BridgeHandler {
 }
 
 async fn handle_connection(conn: iroh::endpoint::Connection, target: Arc<String>) -> Result<()> {
+    // The dialer's Carrier endpoint id (its public key) — the "who is knocking" handle for the
+    // trace. This authenticates the TRANSPORT peer only; end-to-end identity/authorization stays
+    // between key-provider and dkms-authority.
+    let remote = conn.remote_id().to_string();
+    oplog!(
+        LogLevel::Debug,
+        "dkms-carrier-node: inbound carrier connection from {remote}"
+    );
     // `key-provider` opens one bi-stream per session and runs init/hello/recover/shutdown
     // over it. A connection may carry more than one stream; relay each independently.
+    let mut streams = 0u64;
     loop {
         let (send, recv) = match conn.accept_bi().await {
-            Ok(streams) => streams,
+            Ok(pair) => pair,
             Err(_) => break, // peer closed the connection: stop accepting on it
         };
+        streams += 1;
+        oplog!(
+            LogLevel::Debug,
+            "dkms-carrier-node: [{remote}] stream {streams} opened — relaying to dkms-authority at {target}"
+        );
         let target = target.clone();
+        let remote = remote.clone();
         tokio::spawn(async move {
-            if let Err(err) = relay_stream(send, recv, &target).await {
-                eprintln!("dkms-carrier-node: stream relay ended with error: {err:#}");
+            match relay_stream(send, recv, &target).await {
+                Ok((to_node, to_client)) => oplog!(
+                    LogLevel::Debug,
+                    "dkms-carrier-node: [{remote}] stream closed ({to_node} B client->node, {to_client} B node->client)"
+                ),
+                Err(err) => {
+                    oplog!(
+                        LogLevel::Warn,
+                        "dkms-carrier-node: [{remote}] stream relay ended with error: {err:#}"
+                    );
+                }
             }
         });
     }
+    oplog!(
+        LogLevel::Debug,
+        "dkms-carrier-node: carrier connection from {remote} closed ({streams} stream(s) served)"
+    );
     Ok(())
 }
 
 /// Pump bytes between one Carrier bi-stream (the runtime client) and a fresh TCP
 /// connection to the local `dkms-authority`. Fully transparent: the length-prefixed
-/// framed protocol and the PQ channel inside it are opaque to this relay.
+/// framed protocol and the PQ channel inside it are opaque to this relay. Returns the
+/// byte counts moved in each direction (client->node, node->client) for the trace.
 async fn relay_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     target: &str,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     let tcp = TcpStream::connect(target)
         .await
         .with_context(|| format!("dkms-carrier-node: local dkms-authority at {target} is unreachable"))?;
@@ -91,16 +166,18 @@ async fn relay_stream(
 
     // client -> node: relay request bytes, then half-close so the node sees EOF.
     let client_to_node = async {
-        let _ = tokio::io::copy(&mut recv, &mut tcp_write).await;
+        let copied = tokio::io::copy(&mut recv, &mut tcp_write).await.unwrap_or(0);
         let _ = tcp_write.shutdown().await;
+        copied
     };
     // node -> client: relay response bytes, then finish the Carrier send stream (FIN).
     let node_to_client = async {
-        let _ = tokio::io::copy(&mut tcp_read, &mut send).await;
+        let copied = tokio::io::copy(&mut tcp_read, &mut send).await.unwrap_or(0);
         let _ = send.finish();
+        copied
     };
-    tokio::join!(client_to_node, node_to_client);
-    Ok(())
+    let (to_node, to_client) = tokio::join!(client_to_node, node_to_client);
+    Ok((to_node, to_client))
 }
 
 #[tokio::main]

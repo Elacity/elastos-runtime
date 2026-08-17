@@ -755,6 +755,17 @@ fn establish_dkms_session(
             .starts_with("did:")
             .then_some(client.endpoint.as_str())
     });
+    eprintln!(
+        "key-provider: dkms dial {} (transport={})",
+        client.endpoint,
+        if carrier_target.is_some() {
+            "carrier"
+        } else if client.endpoint.starts_with("tcp:") {
+            "tcp"
+        } else {
+            "unix"
+        }
+    );
     let (writer, reader, network): (
         Box<dyn std::io::Write + Send>,
         Box<dyn std::io::Read + Send>,
@@ -880,31 +891,21 @@ fn establish_dkms_session(
     };
 
     eprintln!(
-        "key-provider timing:   connect+preamble {} ms",
+        "key-provider timing:   connect+preamble ({}) {} ms",
+        client.endpoint,
         t_phase.elapsed().as_millis()
     );
+    // DKMS-7: the node is provisioned OFFLINE (the `provision` subcommand) and loads its OWN master
+    // store BEFORE it binds a listener — `init` is NOT a wire operation, and a hardened node rejects
+    // it outright ("init is not a network operation — a client cannot select the key store"). The
+    // client therefore does NOT init over the wire; it goes straight to the identity handshake. The
+    // secret's location is the node's concern, never the client's.
     t_phase = std::time::Instant::now();
-    // The node loads its OWN master store (config-less init → it falls back to its env). We pass NO
-    // store path: the secret's location is the node's concern, never the client's.
-    let init = conn.call(&json!({ "op": "init", "config": {} }))?;
-    if init.get("status").and_then(|v| v.as_str()) != Some("ok") {
-        return Err(format!(
-            "dkms node init failed: {}",
-            init.get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-        ));
-    }
 
     // IDENTITY HANDSHAKE: prove we are talking to the AUTHENTIC node before delegating anything, send
     // our ephemeral pubkey so the token is bound to a key only WE hold, and capture the node-signed
     // SESSION TOKEN that will gate every recover over this connection. On the NETWORK transport, ALSO
     // offer our ephemeral channel KEM key — the hello establishes the encrypted channel.
-    eprintln!(
-        "key-provider timing:   init call {} ms",
-        t_phase.elapsed().as_millis()
-    );
-    t_phase = std::time::Instant::now();
     let channel_keys = if network {
         Some(ddrm_envelope::mint_session())
     } else {
@@ -985,8 +986,13 @@ fn establish_dkms_session(
     conn.session_token = token;
     conn.expires_at = expires_at;
     eprintln!(
-        "key-provider timing:   hello+channel {} ms",
+        "key-provider timing:   hello+channel ({}) {} ms",
+        client.endpoint,
         t_phase.elapsed().as_millis()
+    );
+    eprintln!(
+        "key-provider: dkms session established ({}) expires_at={expires_at}",
+        client.endpoint
     );
     Ok(conn)
 }

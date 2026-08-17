@@ -20,6 +20,20 @@ STORE=/data/node.store.json
 mkdir -p /data /shared
 chmod 700 /data
 
+# CEK-recovery debugging: mirror each daemon's stderr into a HOST-visible, timestamped log file.
+# docker-compose binds /logs to ~/Library/Application Support/ElastOS/dkms/docker-logs (override:
+# DKMS_NODE_LOG_DIR), so the node-side trace lands next to the host-side key-provider and
+# carrier-client logs it correlates with. Lines still reach container stderr for `docker logs`.
+mkdir -p /logs
+LOG_FILE="/logs/node-${IDX}.log"
+log_tee() {
+  while IFS= read -r line; do
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$line" >> "$LOG_FILE"
+    printf '%s\n' "$line" >&2
+  done
+}
+echo "node${IDX}: mirroring daemon logs to ${LOG_FILE} (host: dkms/docker-logs/node-${IDX}.log)"
+
 echo "node${IDX}: provision (offline create-or-load master seed store) ..."
 # DKMS-7: identity is provisioned OFFLINE from the operator-owned state root (the `provision`
 # subcommand), not by a wire `init`. The path comes from process configuration only.
@@ -45,7 +59,7 @@ fi
 echo "node${IDX}: starting dkms-authority on tcp:0.0.0.0:9443 (allow-listed caller — production-like) ..."
 DKMS_AUTHORITY_LISTEN="tcp:0.0.0.0:9443" \
 DKMS_AUTHORITY_KEY_STORE="$STORE" \
-  dkms-authority &
+  dkms-authority 2> >(log_tee) &
 AUTH_PID=$!
 
 for _ in $(seq 1 100); do
@@ -57,7 +71,7 @@ echo "node${IDX}: starting dkms-carrier-node bridge ..."
 rm -f "/shared/node-${IDX}.did"
 DKMS_CARRIER_NODE_TARGET="127.0.0.1:9443" \
 DKMS_CARRIER_NODE_SEED="/data/carrier.seed" \
-  dkms-carrier-node > "/shared/node-${IDX}.did" &
+  dkms-carrier-node > "/shared/node-${IDX}.did" 2> >(log_tee) &
 BRIDGE_PID=$!
 
 for _ in $(seq 1 120); do
