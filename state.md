@@ -61,6 +61,18 @@ the public repository.
   returns canonical metadata only after ciphertext staging and custody
   provisioning both succeed; callers must discard staged output after every
   error. This branch is source-only and unpublished.
+- The local unpublished `feat/protected-content-decrypt-output` child branch
+  depends on that sealing branch and keeps decrypt-output inside the same
+  custody boundary. It accepts the exact encrypted-content identity plus the
+  existing authenticated release inputs, reconstructs the CEK only inside the
+  custody crate, verifies the full framed ciphertext identity before any
+  plaintext write, authenticates every chunk before staging plaintext, and
+  returns only bounded plaintext metadata after full success. On any error it
+  returns no success metadata and callers must discard staged plaintext output.
+  This branch is source-only and unpublished. It does not add provider wire,
+  Runtime integration, viewer output protocol, installation, or deployment.
+  The next blocker is the private decrypt-provider/output boundary that can
+  carry scoped viewer bytes without exposing CEK, shares, or topology.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`

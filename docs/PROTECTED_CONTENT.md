@@ -132,6 +132,16 @@ protected content:
   writes only to a staging sink and returns canonical metadata only after both
   ciphertext staging and custody provisioning succeed; callers must discard
   staged output after any error.
+- The local unpublished `feat/protected-content-decrypt-output` child branch
+  extends that same custody boundary with source-only staged decrypt output.
+  It accepts the exact encrypted-content identity plus the existing
+  authenticated release inputs, reconstructs the CEK only inside custody,
+  verifies the full framed ciphertext identity before any plaintext write,
+  authenticates each chunk before staging plaintext, and returns only bounded
+  plaintext metadata after full success. On any error it returns no success
+  metadata and callers must discard staged plaintext output. It does not yet
+  add provider wire, Runtime orchestration, viewer output protocol,
+  installation, or deployment.
 - It is source-only. There are no running custody nodes, Runtime/provider
   routes, Runtime-owned replay orchestration, recipient key-possession proof,
   decrypt/render product flow, installation, or deployment in this branch. The
@@ -142,6 +152,9 @@ protected content:
   integrity digest to detect same-length corruption or torn local state, but it
   does not defend against a malicious same-UID rewrite that can recompute the
   digest.
+  The next blocker after those local custody-only branches is a private
+  decrypt-provider/output boundary that can carry scoped viewer bytes without
+  exposing CEK, shares, or topology.
 
 This helper does not make a PQ claim. PQ-hybrid custody, dKMS node lifecycle,
 and product wiring remain future work. The current HPKE dependency is `hpke`

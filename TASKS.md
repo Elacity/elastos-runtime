@@ -846,6 +846,14 @@ Runtime release operation; there is no operation-resume journal for that state.
 - [ ] Wire `decrypt-provider` to a real decrypt/render backend that returns
   scoped rendered output or decrypt sessions to the viewer instead of broad raw
   key access.
+- [ ] Define and wire the private decrypt-provider output/read boundary over
+  the canonical authenticated chunk payload. The local unpublished
+  `feat/protected-content-decrypt-output` child branch currently proves only
+  custody-local staged decrypt output from the exact authenticated release
+  inputs, full ciphertext identity verification before plaintext write, and
+  chunk authentication inside the custody boundary. It does not yet add
+  provider wire, Runtime orchestration, viewer streaming, or product
+  integration.
 - [ ] Evaluate decrypt/render/media helper crates as provider-internal
   implementation candidates only after the fail-closed protected-content
   sequence is wired and source-path tests prove capsules receive neither key
