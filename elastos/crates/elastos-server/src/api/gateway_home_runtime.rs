@@ -68,6 +68,18 @@ pub(super) async fn home_launch(
             )
         })?;
 
+    // PROOF (token delivery): log the route this launch hands the shell, with the token VALUE
+    // masked but its PRESENCE and location (fragment vs query) preserved — so we can prove whether
+    // `#home_token=` is actually attached for this target, without leaking the capability.
+    let masked_route = match route.split_once("home_token=") {
+        Some((head, tok)) => {
+            let end = tok.find(['&', '#']).unwrap_or(tok.len());
+            format!("{head}home_token=<{} chars>{}", end, &tok[end..])
+        }
+        None => format!("{route}  (NO home_token in route!)"),
+    };
+    tracing::info!("home_launch: target={} route={masked_route}", target_summary.target);
+
     Ok(Json(HomeLaunchResponse {
         target: target_summary.target,
         title: target_summary.title,

@@ -340,6 +340,228 @@ synced in-tree.
 
 ---
 
+## The Create → mint → open flow (dDRM / dKMS end-to-end)
+
+This branch (`feat/dkms-esp-port`) is a **deliberate breaking change** from the legacy runtime to the
+**ESP (Elastos Shell Protocol)** model. Several Create-portal and asset-open failures traced to **one
+recurring pattern**: a component still speaking the *legacy* contract that ESP changed underneath it.
+§11–§16 document each, in the order you hit them going mint → open. When debugging this flow, turn on
+the per-stage logging described in [§17](#17-debugging-the-createopen-flow--logs--instrumentation) — every
+section below was diagnosed from those log lines, not guesswork.
+
+> **The single most important invariant:** a dKMS asset can only be opened by the **exact quorum
+> node-set it was sealed to at mint time**. Docker `up.sh destroy` (or any volume recreation) rolls the
+> node identities and **orphans every previously-minted asset**. To test the open path, **mint a fresh
+> asset against the currently-running node-set** — see §11.
+
+---
+
+## 11. Opening a protected asset fails: "could not open … from the dKMS quorum" / all nodes reject `bad_node_set`
+
+**Symptom** — double-clicking an owned `.ddrm` shows a lock + a 502 after ~9s. The docker node logs show
+the recover reaching all three nodes and each rejecting it:
+
+```
+-> recover error code=access_denied (access grant rejected: bad_node_set)
+2-of-3 quorum NOT met — only 0 of 3 secret-holders served [node A: … bad_node_set; node B: … bad_node_set; …]
+```
+
+**Cause** — **not** a transport, rights, or grant failure (rights pass, the grant assembles, the handshake
+succeeds). The asset's CEK shares were sealed to a **different quorum node-set** than the one currently
+running. Each node enforces a cross-quorum replay defense: the grant's declared node-set id must equal the
+node's own pinned `DKMS_AUTHORITY_NODE_SET_ID_B64`. A prior `up.sh destroy` (or a fresh clone) rolled the
+docker node master seeds, so older assets are sealed to a now-dead node-set.
+
+**Fix / how to confirm** — This is expected for orphaned assets; there is no way to recover shares from a
+node-set whose seeds are gone. To verify the open rail itself is healthy, **mint a fresh asset against the
+running node-set and open that** — it recovers cleanly (`recover ok` ×3). The gateway now proves this
+host-side *before* spawning a doomed recover: `open_quorum` in
+[`viewer_open.rs`](elastos/crates/elastos-server/src/api/viewer_open.rs) derives both node-set ids and logs a
+verdict —
+
+```
+dKMS node-set precheck: MATCH   node_set=…  — asset is recoverable by the running quorum
+dKMS node-set precheck: MISMATCH — asset sealed to node_set=X but the running quorum is node_set=Y …
+dKMS node-set evidence: asset node-vk fps=[…] vs running quorum node-vk fps=[…]   (DISJOINT ⇒ dead quorum)
+```
+
+- To keep a stable node-set across restarts, bring the mesh down with `up.sh down` (preserves the named
+  volumes / seeds), **not** `up.sh destroy` (wipes them).
+
+---
+
+## 12. Create portal: wallet & channel pickers stay empty ("No launch capability")
+
+**Symptom** — the Create portal renders, but the **Wallet** dropdown never fills (stuck on
+"Connect a wallet on Base…") and **Channel** stays "Select a wallet first…". A breakpoint in the frame's
+`loadWallets()` never hits, and the gateway shows **zero** `/api/apps/creator/wallet` (or `/status`)
+requests.
+
+**Cause** — `loadWallets()` only runs if `preflight()` returns true, and `preflight()` bails at its very
+first line — `if (!homeToken) …` — because `homeToken` is `null`. The ESP shell delivers the launch
+capability in the URL **fragment** (`…#home_token=…`, so it never reaches a server / access log), but
+`creator.js` read it from the **query string** (`?home_token=`). It was the *only* capsule of ~19 still
+reading the query; every other one (`elacity-player`, `ddrm-viewer`, `browser`, …) reads the fragment.
+
+**Fix** — [`capsules/creator/browser/creator.js`](capsules/creator/browser/creator.js) now reads the
+fragment, matching every other capsule:
+
+```js
+function fragmentValue(name) {
+  return new URLSearchParams(window.location.hash.replace(/^#/, "")).get(name);
+}
+const homeToken = fragmentValue("home_token");   // was: query("home_token") → searchParams
+```
+
+Browser capsule assets are served `no-store` from the **installed** copy
+(`<data_dir>/capsules/creator/browser/…`), so after editing the repo file, sync it to the installed path
+and bump the `?v=` cache-buster in `index.html` (a hard refresh alone is enough since `no-store` disables
+caching — but the version bump is belt-and-suspenders).
+
+---
+
+## 13. Create portal / mint fails: `wallet: unknown variant 'accounts' (or 'request_signature')`
+
+**Symptom** — with the token fixed (§12), `/api/apps/creator/wallet` is now called but 502s, and the mint's
+"Sign with wallet" step errors, both with a wallet-provider deserialization error:
+
+```
+wallet: unknown variant `accounts`, expected one of `init`, `status`, `wallet_contract`, `shutdown`
+```
+
+**Cause** — The wallet provider was migrated to a **v2 (`WalletContract`) protocol**: real operations
+(`ListAccounts`, `RequestApproval`, `ListApprovals`) go through a runtime-signed `WalletContract` envelope,
+and the top-level ops are only `init`/`status`/`wallet_contract`/`shutdown`. The entire creator
+money-path (`creator.rs`) still hand-built the **legacy v1** shapes (`{op:"accounts"}`,
+`{op:"request_signature"}`, `{op:"approval_requests"}`), which the v2 provider rejects.
+
+**Fix** — Migrated the whole creator money-path to v2 in
+[`creator.rs`](elastos/crates/elastos-server/src/api/creator.rs), routed through **one seam** so no caller
+hand-builds a wallet request:
+
+- `wallet_invoke(registry, authority, op)` — the single dispatch over `RuntimeWalletAdapter` (the one place
+  that speaks v2).
+- `resolve_owner_account` → `ListAccounts`; `resolve_mint_tx_hash` → `ListApprovals`.
+- `request_transaction_approval(…)` — the single `RequestApproval` dispatch shared by create-channel, mint,
+  and enable-trading (was three copy-pasted blocks).
+- Each handler mints a `RuntimeWalletAuthority` from its creator launch token
+  (`require_home_launch_token_binding` → `runtime_wallet_authority`); the `authority` carries the principal,
+  so the redundant `principal_id` params and the duplicate token-validation gates were removed.
+
+---
+
+## 14. Mint "Sign with wallet" fails: "Wallet connector returned an invalid typed handoff: missing field `gas`"
+
+**Symptom** — after §13, the sign step reaches the wallet connector (MetaMask), which then errors:
+
+```
+request failed: 400 Bad Request  Wallet connector returned an invalid typed handoff: missing field `gas`
+```
+
+**Cause** — Another legacy→ESP mismatch, exposed once the sign path finally reached the connector. The ESP
+connector handoff requires a **fully-specified** transaction: `HomeWalletConnectorTransaction`
+([`gateway_home_wallet_connector.rs`](elastos/crates/elastos-server/src/api/gateway_home_wallet_connector.rs))
+and the browser validator (`validTransaction` in
+[`home-wallet-connector-host.js`](capsules/home/browser/home-wallet-connector-host.js)) both require
+`gas`/`gasPrice`/`nonce` as hex. But the creator built a **gas-less** intent (the legacy "let MetaMask
+estimate" approach), and the wallet provider forwards those fields only when present.
+
+**Fix** — The chain-provider already has a `prepare_transaction` op that populates `nonce`/`gas_price`/
+`gas_limit` via RPC into the exact intent shape. `request_transaction_approval` in
+[`creator.rs`](elastos/crates/elastos-server/src/api/creator.rs) now re-materializes the caller's
+`{from,to,value,data}` through it before the `RequestApproval` — one central place, so every money-path
+transaction is fully specified before the handoff.
+
+> `prepare_transaction` runs `eth_estimateGas`; if the mint would revert on-chain (e.g. channel not created
+> yet), estimateGas errors there — a real on-chain condition, surfaced clearly instead of a cryptic handoff.
+
+---
+
+## 15. Opening a recovered asset fails: "object session unavailable: 401" / `authority context mismatch`
+
+**Symptom** — a **fresh** asset (§11) recovers successfully (`node-set precheck: MATCH`, `recover ok` ×3,
+the viewer loads), then the viewer shows a lock:
+
+```
+Could not open the protected asset: object session unavailable: 401
+```
+
+and the gateway log names the reason exactly:
+
+```
+authorize_object_session: launch-token rejected for viewer='ddrm-viewer' … (401): home launch token authority context mismatch
+```
+
+**Cause** — The manifest gate
+([`gateway_home_token.rs`](elastos/crates/elastos-server/src/api/gateway_home_token.rs), the
+`authority context mismatch` check) requires the token's `launch_context.authority_actor` to be in the
+active auth-session **grant's `apps`** list. That list is the **shells only** —
+`["home", "system"]` ([`auth_gateway.rs`](elastos/crates/elastos-server/src/api/auth_gateway.rs)) — never a
+viewer capsule. But the open path minted the viewer token via `direct("ddrm-viewer")`, whose
+`authority_actor` **is** `"ddrm-viewer"` → not in the grant → 401. (Proof it's this: the creator app works
+because it's minted via `projection`, whose `authority_actor` is `"home"`, which *is* in the grant.)
+
+**Fix** — All four viewer-token mint sites (object + media) in
+[`viewer_open.rs`](elastos/crates/elastos-server/src/api/viewer_open.rs) now use
+`issue_home_projection_launch_token_with_context` (authority_actor=`home`, executable_actor=the viewer) —
+the same **projection** path Home uses for every other app. `executable_actor` still scopes the token to the
+viewer (the manifest's app check passes); only the authority is now `home`, which the grant admits.
+
+---
+
+## 16. (Infra, prerequisite to §11) dKMS recover never completes: node rejects the `init` handshake / RPC 429s
+
+**Symptom** — before §11 could even surface `bad_node_set`, the recover 502'd earlier: the key-provider's
+wire `init` was rejected by the DKMS-7-hardened node, and/or the on-chain rights check flapped with HTTP
+`429` from `mainnet.base.org`.
+
+**Cause & Fix** — two independent infra issues:
+- **`init` handshake** — DKMS-7 nodes are provisioned **offline** and reject a wire `init`
+  ("init is not a network operation"). The key-provider
+  ([`key-provider/src/main.rs`](capsules/key-provider/src/main.rs)) no longer sends it — it goes straight
+  from connect+preamble to the identity/hello handshake.
+- **RPC 429s** — [`chain-provider/src/backends.rs`](capsules/chain-provider/src/backends.rs) got
+  retry-with-backoff on transient errors (`evm_rpc_pool_call`, 429/5xx/transport), and the reliable
+  `https://base-rpc.publicnode.com` is pinned as the default `ELASTOS_CHAIN_BASE_RPC`.
+
+---
+
+## 17. Debugging the Create/open flow — logs & instrumentation
+
+Every failure above was diagnosed from **per-stage gateway logs**. The `.vscode` debug task
+(`elastos: bring up gateway (debug)`) is wired to write them to a file and use the right log level:
+
+- `RUST_LOG=info,elastos_server=debug,elastos_server::api::viewer_open=trace,elastos_server::api::media_authority=trace,elastos::provider::latency=error`
+- the gateway's full output is `tee`'d to **`~/Library/Application Support/elastos/dkms/gateway.log`**.
+
+**Log surfaces to correlate (a single open touches all of them):**
+
+| Log | Path | Shows |
+|---|---|---|
+| Gateway | `~/Library/Application Support/elastos/dkms/gateway.log` | node-set precheck, rights decision, `creator_*`, `authorize_object_session`, `home_launch` route, `serve_browser_capsule` |
+| dKMS nodes | `~/Library/Application Support/ElastOS/dkms/docker-logs/node-{0,1,2}.log` | `hello ok` / `recover ok` / `bad_node_set` (set `DKMS_AUTHORITY_LOG_LEVEL=debug`) |
+| Warm key-provider daemon | `~/Library/Application Support/elastos/dkms/key-provider-daemon.out` | dial/session/recover per node |
+| Carrier sidecar | `~/Library/Application Support/elastos/dkms/carrier-client.{out,err}` | did:key warm connections over iroh/QUIC |
+
+**High-signal lines to grep** (added as diagnostics this cycle):
+
+```bash
+grep -nE "node-set precheck|node-set evidence|creator_status|creator_wallet|home_launch:|serve_browser_capsule|authorize_object_session" \
+  "$HOME/Library/Application Support/elastos/dkms/gateway.log"
+```
+
+- `creator_status: READY` + `creator_wallet: … returned N account(s)` → the Create portal preflight + wallet
+  list both worked (§12/§13).
+- `home_launch: target=… route=…#home_token=<N chars>` → proves the launch token is delivered (in the
+  **fragment**) for a given app (§12).
+- `serve_browser_capsule: app=… path=…` → proves which capsule assets the browser actually fetched.
+
+**Meta-lesson for this branch:** when a Create/open step fails, first ask *"what legacy contract did ESP
+change here?"* — token location (query→fragment), wallet protocol (v1→v2), transaction completeness
+(estimate→fully-specified), and launch-token authority (direct→projection) were all the same shape of bug.
+
+---
+
 ## Further reading — documentation map
 
 **Dev setup & running Home**

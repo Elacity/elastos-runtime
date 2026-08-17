@@ -414,7 +414,10 @@ fn authorize_object_session(
     // an active view keeps serving if the viewer capsule is uninstalled mid-session; the principal
     // still owns the content and the token + session + principal gates below are unchanged.)
     let context = require_home_launch_token_for_any_context(data_dir, headers, &[viewer.as_str()])
-        .map_err(|_| {
+        .map_err(|err| {
+            tracing::warn!(
+                "authorize_object_session: launch-token rejected for viewer='{viewer}' session='{session_id}' (401): {err}"
+            );
             Box::new(object_error(
                 StatusCode::UNAUTHORIZED,
                 "missing or invalid home launch token",

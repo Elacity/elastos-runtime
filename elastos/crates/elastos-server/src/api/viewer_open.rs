@@ -33,7 +33,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::gateway::{
-    consume_passkey_step_up_token, default_evm_connector_id, issue_home_launch_token_with_context,
+    consume_passkey_step_up_token, default_evm_connector_id,
+    issue_home_projection_launch_token_with_context,
     require_home_token_launch, require_owned_open_token_context, require_owned_open_token_launch,
     runtime_wallet_authority, system_wallet_accounts_summary, GatewayState, HomeLaunchTokenContext,
 };
@@ -1195,8 +1196,15 @@ async fn open_media(
     put_media_session(session_id.clone(), session);
 
     let token =
-        match issue_home_launch_token_with_context(&state.data_dir, MEDIA_VIEWER_CAPSULE, &context)
-        {
+        // PROJECTION launch (authority_actor = "home", executable_actor = the viewer): the media
+        // viewer's session reads validate against the auth-session grant whose `apps` are the shells,
+        // so a `direct` token (authority_actor = the viewer) fails with "authority context mismatch".
+        match issue_home_projection_launch_token_with_context(
+            &state.data_dir,
+            MEDIA_VIEWER_CAPSULE,
+            MEDIA_VIEWER_CAPSULE,
+            &context,
+        ) {
             Ok(token) => token,
             Err(err) => {
                 return (
@@ -1266,8 +1274,14 @@ async fn open_object(
         ObjectSession::from_authority(OBJECT_VIEWER_CAPSULE, context.principal_id.clone(), proc);
     put_object_session(session_id.clone(), session);
 
-    let token = match issue_home_launch_token_with_context(
+    // PROJECTION launch (authority_actor = "home", executable_actor = the viewer) — NOT a `direct`
+    // token. The viewer authenticates its object-session reads against the auth-session grant, whose
+    // `apps` list is the shells ("home"/"system"), never the viewer capsule. A `direct` token
+    // (authority_actor = "ddrm-viewer") fails that grant.apps membership check with "authority
+    // context mismatch" (401); projection is exactly how Home launches every other app.
+    let token = match issue_home_projection_launch_token_with_context(
         &state.data_dir,
+        OBJECT_VIEWER_CAPSULE,
         OBJECT_VIEWER_CAPSULE,
         &context,
     ) {
@@ -1684,8 +1698,14 @@ async fn open_quorum(
         ObjectSession::from_authority(OBJECT_VIEWER_CAPSULE, context.principal_id.clone(), proc);
     put_object_session(session_id.clone(), session);
 
-    let token = match issue_home_launch_token_with_context(
+    // PROJECTION launch (authority_actor = "home", executable_actor = the viewer) — NOT a `direct`
+    // token. The viewer authenticates its object-session reads against the auth-session grant, whose
+    // `apps` list is the shells ("home"/"system"), never the viewer capsule. A `direct` token
+    // (authority_actor = "ddrm-viewer") fails that grant.apps membership check with "authority
+    // context mismatch" (401); projection is exactly how Home launches every other app.
+    let token = match issue_home_projection_launch_token_with_context(
         &state.data_dir,
+        OBJECT_VIEWER_CAPSULE,
         OBJECT_VIEWER_CAPSULE,
         &context,
     ) {
@@ -1929,8 +1949,15 @@ async fn open_quorum_media(
     put_media_session(session_id.clone(), session);
 
     let token =
-        match issue_home_launch_token_with_context(&state.data_dir, MEDIA_VIEWER_CAPSULE, &context)
-        {
+        // PROJECTION launch (authority_actor = "home", executable_actor = the viewer): the media
+        // viewer's session reads validate against the auth-session grant whose `apps` are the shells,
+        // so a `direct` token (authority_actor = the viewer) fails with "authority context mismatch".
+        match issue_home_projection_launch_token_with_context(
+            &state.data_dir,
+            MEDIA_VIEWER_CAPSULE,
+            MEDIA_VIEWER_CAPSULE,
+            &context,
+        ) {
             Ok(token) => token,
             Err(err) => {
                 return (

@@ -40,7 +40,11 @@ use elastos_runtime::provider::ProviderRegistry;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::gateway::{require_home_launch_token_for_any_context, GatewayState};
+use super::gateway::{
+    require_home_launch_token_binding, require_home_launch_token_for_any_context,
+    runtime_wallet_authority, runtime_wallet_data, GatewayState, RuntimeWalletAdapter,
+    RuntimeWalletAuthority,
+};
 
 /// The de-privileged app this route serves. A launch token for any other context is refused.
 const CREATOR_APP: &str = "creator";
@@ -599,6 +603,18 @@ pub async fn creator_prepare_mint(
             "providers unavailable",
         );
     };
+    // The mint's owner-signature step dispatches a v2 `RequestApproval` through the runtime wallet
+    // authority (minted from this same creator launch token) — the legacy `{op:"request_signature"}`
+    // is rejected by the v2 wallet provider.
+    let authority = match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
+        .and_then(|required| runtime_wallet_authority(&required))
+    {
+        Ok(authority) => authority,
+        Err(err) => {
+            tracing::warn!("creator_prepare_mint: runtime wallet authority unavailable: {err}");
+            return staged_error(StatusCode::BAD_GATEWAY, "sign", "wallet authority unavailable");
+        }
+    };
 
     let Json(req) = match body {
         Ok(json) => json,
@@ -643,6 +659,7 @@ pub async fn creator_prepare_mint(
     let outcome = if meta.is_media {
         run_prepare_mint_media(
             registry,
+            &authority,
             &ctx.principal_id,
             &file_bytes,
             &meta,
@@ -653,6 +670,7 @@ pub async fn creator_prepare_mint(
     } else {
         run_prepare_mint(
             registry,
+            &authority,
             &ctx.principal_id,
             &file_bytes,
             &meta,
@@ -698,40 +716,47 @@ pub async fn creator_prepare_mint(
 /// frame holds NO wallet authority (#3); it only learns which already-linked address to bind.
 /// Returns addresses ONLY — no keys, no account secrets.
 pub async fn creator_wallet(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
-    let ctx = match require_home_launch_token_for_any_context(
-        &state.data_dir,
-        &headers,
-        &[CREATOR_APP],
-    ) {
-        Ok(ctx) => ctx,
+    // The wallet provider is a v2 (WalletContract) provider: account listing goes through a
+    // runtime-signed `ListAccounts` operation, NOT the legacy `{op:"accounts"}` — the v2 provider
+    // rejects that with "unknown variant `accounts`" (502), which is exactly why the Create wallet
+    // picker was empty. Build the runtime wallet authority from the creator launch token and list
+    // accounts the same way `gateway_wallet_accounts` / `viewer_open` do.
+    let required =
+        match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP]) {
+            Ok(required) => required,
+            Err(err) => {
+                tracing::warn!("creator_wallet: launch-token rejected (401): {err}");
+                return error_json(
+                    StatusCode::UNAUTHORIZED,
+                    "missing or invalid home launch token",
+                );
+            }
+        };
+    let authority = match runtime_wallet_authority(&required) {
+        Ok(authority) => authority,
         Err(err) => {
-            tracing::warn!("creator_wallet: launch-token rejected (401): {err}");
-            return error_json(
-                StatusCode::UNAUTHORIZED,
-                "missing or invalid home launch token",
-            );
+            tracing::warn!("creator_wallet: runtime wallet authority unavailable (502): {err}");
+            return error_json(StatusCode::BAD_GATEWAY, "wallet authority unavailable");
         }
-    };
-    let Some(registry) = state.provider_registry.as_ref() else {
-        tracing::warn!("creator_wallet: provider registry unavailable (503)");
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
     let namespace = mint_chain_namespace();
     tracing::info!(
-        "creator_wallet: principal={} mint_namespace={namespace} — querying wallet provider accounts",
-        ctx.principal_id
+        "creator_wallet: principal={} mint_namespace={namespace} — listing wallet accounts (v2 ListAccounts)",
+        required.context.principal_id
     );
-    let accounts = match provider_data(
-        registry,
-        "wallet",
-        &json!({ "op": "accounts", "principal_id": ctx.principal_id }),
+    let accounts = match runtime_wallet_data(
+        &state,
+        &authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
     )
     .await
     {
         Ok(value) => value,
-        Err(message) => {
-            tracing::warn!("creator_wallet: wallet accounts op failed (502): {message}");
-            return error_json(StatusCode::BAD_GATEWAY, &message);
+        Err(err) => {
+            tracing::warn!("creator_wallet: ListAccounts failed (502): {err}");
+            return error_json(StatusCode::BAD_GATEWAY, &err.to_string());
         }
     };
     let mut addresses: Vec<String> = accounts
@@ -863,27 +888,29 @@ pub async fn creator_create_channel(
     headers: HeaderMap,
     body: Result<Json<CreateChannelRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ctx = match require_home_launch_token_for_any_context(
-        &state.data_dir,
-        &headers,
-        &[CREATOR_APP],
-    ) {
-        Ok(ctx) => ctx,
-        Err(_) => {
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
+    };
+    // Auth AND wallet authority in ONE gate: the channel-create signature dispatches a v2
+    // `RequestApproval` through the runtime wallet authority, which is minted from — and so validates
+    // — this creator launch token. A missing/invalid token fails here (401); no separate token check.
+    let authority = match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
+        .and_then(|required| runtime_wallet_authority(&required))
+    {
+        Ok(authority) => authority,
+        Err(err) => {
+            tracing::warn!("creator_create_channel: launch token / wallet authority rejected: {err}");
             return error_json(
                 StatusCode::UNAUTHORIZED,
                 "missing or invalid home launch token",
-            )
+            );
         }
-    };
-    let Some(registry) = state.provider_registry.as_ref() else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
     let Json(req) = match body {
         Ok(json) => json,
         Err(rejection) => return error_json(StatusCode::BAD_REQUEST, &rejection.body_text()),
     };
-    match run_create_channel(registry, &ctx.principal_id, &req).await {
+    match run_create_channel(registry, &authority, &req).await {
         Ok(result) => Json(result).into_response(),
         Err(message) => error_json(StatusCode::BAD_GATEWAY, &message),
     }
@@ -893,7 +920,7 @@ pub async fn creator_create_channel(
 /// assemble pure `createChannel` calldata -> resolve the owner's wallet -> enqueue approval.
 async fn run_create_channel(
     registry: &ProviderRegistry,
-    principal_id: &str,
+    authority: &RuntimeWalletAuthority,
     req: &CreateChannelRequest,
 ) -> Result<Value, String> {
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -974,7 +1001,7 @@ async fn run_create_channel(
 
     // 4) Bind the owner's linked wallet + enqueue the MetaMask approval (owner deploys).
     let namespace = mint_chain_namespace();
-    let account_id = resolve_owner_account(registry, principal_id, signer, &namespace).await?;
+    let account_id = resolve_owner_account(registry, authority, signer, &namespace).await?;
     // Let MetaMask estimate gas / gas price / nonce (PC2's createChannel sends only
     // to/data/value/chainId). createChannel also deploys a contract, so a fixed gas cap is
     // both fragile and unnecessary on the external-signer path.
@@ -989,24 +1016,16 @@ async fn run_create_channel(
         "requires_wallet_approval": true,
         "wallet_intent": "transaction_intent",
     });
-    let sign_req = json!({
-        "op": "request_signature",
-        "principal_id": principal_id,
-        "account_id": account_id,
-        "chain_namespace": namespace,
-        "intent": "transaction_intent",
-        "capsule_id": CREATOR_APP,
-        "resource": format!("elastos://chain/{}/broadcast_transaction", mint_network()),
-        "reason": format!("Create dDRM channel \"{name}\" on {}", mint_network()),
-        "payload": intent,
-    });
-    let approval = provider_data(registry, "wallet", &sign_req).await?;
-    let request_id = approval
-        .get("approval_request")
-        .and_then(|r| r.get("request_id"))
-        .and_then(Value::as_str)
-        .ok_or("wallet returned no approval request id")?
-        .to_string();
+    let request_id = request_transaction_approval(
+        registry,
+        authority,
+        account_id,
+        namespace,
+        format!("elastos://chain/{}/broadcast_transaction", mint_network()),
+        format!("Create dDRM channel \"{name}\" on {}", mint_network()),
+        intent,
+    )
+    .await?;
 
     Ok(json!({
         "schema": "elastos.creator.prepared-channel/v1",
@@ -1051,17 +1070,15 @@ pub struct TradeApprovalRequest {
 /// completed yet / no hash recorded → the caller falls back to the chain provider's log scan.
 async fn resolve_mint_tx_hash(
     registry: &ProviderRegistry,
-    principal_id: &str,
+    authority: &RuntimeWalletAuthority,
     request_id: &str,
 ) -> Option<String> {
-    let data = provider_data(
+    let data = wallet_invoke(
         registry,
-        "wallet",
-        &json!({
-            "op": "approval_requests",
-            "principal_id": principal_id,
-            "include_resolved": true,
-        }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ListApprovals {
+            include_resolved: true,
+        },
     )
     .await
     .ok()?;
@@ -1097,19 +1114,13 @@ pub async fn creator_mint_status(
     headers: HeaderMap,
     body: Result<Json<TradeApprovalRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ctx = match require_home_launch_token_for_any_context(
-        &state.data_dir,
-        &headers,
-        &[CREATOR_APP],
-    ) {
-        Ok(ctx) => ctx,
-        Err(_) => {
-            return error_json(
-                StatusCode::UNAUTHORIZED,
-                "missing or invalid home launch token",
-            )
-        }
-    };
+    if require_home_launch_token_for_any_context(&state.data_dir, &headers, &[CREATOR_APP]).is_err()
+    {
+        return error_json(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid home launch token",
+        );
+    }
     let Some(registry) = state.provider_registry.as_ref() else {
         return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
@@ -1137,13 +1148,24 @@ pub async fn creator_mint_status(
         .filter(|s| !s.is_empty());
     // Fast-path: resolve the mint's broadcast tx hash from its wallet approval so the chain provider
     // confirms via the receipt (one cheap call) rather than a wide log scan. None ⇒ provider scans.
+    // The approval read is a v2 `ListApprovals` through the runtime wallet authority.
     let tx_hash = match req
         .request_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(request_id) => resolve_mint_tx_hash(registry, &ctx.principal_id, request_id).await,
+        Some(request_id) => {
+            match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
+                .and_then(|required| runtime_wallet_authority(&required))
+            {
+                Ok(authority) => resolve_mint_tx_hash(registry, &authority, request_id).await,
+                Err(err) => {
+                    tracing::warn!("creator_mint_status: runtime wallet authority unavailable: {err}");
+                    None
+                }
+            }
+        }
         None => None,
     };
     match provider_data(
@@ -1200,27 +1222,31 @@ pub async fn creator_prepare_trade_approval(
     headers: HeaderMap,
     body: Result<Json<TradeApprovalRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let ctx = match require_home_launch_token_for_any_context(
-        &state.data_dir,
-        &headers,
-        &[CREATOR_APP],
-    ) {
-        Ok(ctx) => ctx,
-        Err(_) => {
+    let Some(registry) = state.provider_registry.as_ref() else {
+        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
+    };
+    // Auth AND wallet authority in ONE gate: the enable-trading signature dispatches a v2
+    // `RequestApproval` through the runtime wallet authority, which is minted from — and so validates
+    // — this creator launch token. A missing/invalid token fails here (401); no separate token check.
+    let authority = match require_home_launch_token_binding(&state.data_dir, &headers, &[CREATOR_APP])
+        .and_then(|required| runtime_wallet_authority(&required))
+    {
+        Ok(authority) => authority,
+        Err(err) => {
+            tracing::warn!(
+                "creator_prepare_trade_approval: launch token / wallet authority rejected: {err}"
+            );
             return error_json(
                 StatusCode::UNAUTHORIZED,
                 "missing or invalid home launch token",
-            )
+            );
         }
-    };
-    let Some(registry) = state.provider_registry.as_ref() else {
-        return error_json(StatusCode::SERVICE_UNAVAILABLE, "providers unavailable");
     };
     let Json(req) = match body {
         Ok(json) => json,
         Err(rejection) => return error_json(StatusCode::BAD_REQUEST, &rejection.body_text()),
     };
-    match run_prepare_trade_approval(registry, &ctx.principal_id, &req).await {
+    match run_prepare_trade_approval(registry, &authority, &req).await {
         Ok(result) => Json(result).into_response(),
         Err(message) => error_json(StatusCode::BAD_GATEWAY, &message),
     }
@@ -1234,7 +1260,7 @@ pub async fn creator_prepare_trade_approval(
 /// just means the mint hasn't landed yet — the caller retries.
 async fn run_prepare_trade_approval(
     registry: &ProviderRegistry,
-    principal_id: &str,
+    authority: &RuntimeWalletAuthority,
     req: &TradeApprovalRequest,
 ) -> Result<Value, String> {
     let channel = req.channel.trim();
@@ -1262,7 +1288,7 @@ async fn run_prepare_trade_approval(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(request_id) => resolve_mint_tx_hash(registry, principal_id, request_id).await,
+        Some(request_id) => resolve_mint_tx_hash(registry, authority, request_id).await,
         None => None,
     };
     let assembled = provider_data(
@@ -1316,7 +1342,7 @@ async fn run_prepare_trade_approval(
         .to_string();
 
     let namespace = mint_chain_namespace();
-    let account_id = resolve_owner_account(registry, principal_id, signer, &namespace).await?;
+    let account_id = resolve_owner_account(registry, authority, signer, &namespace).await?;
     // Let MetaMask estimate gas / gas price / nonce (same external-signer path as the mint).
     let intent = json!({
         "schema": "elastos.chain.unsigned_transaction_intent/v1",
@@ -1329,24 +1355,16 @@ async fn run_prepare_trade_approval(
         "requires_wallet_approval": true,
         "wallet_intent": "transaction_intent",
     });
-    let sign_req = json!({
-        "op": "request_signature",
-        "principal_id": principal_id,
-        "account_id": account_id,
-        "chain_namespace": namespace,
-        "intent": "transaction_intent",
-        "capsule_id": CREATOR_APP,
-        "resource": format!("elastos://chain/{}/broadcast_transaction", mint_network()),
-        "reason": format!("Approve gateway to enable trading on {}", mint_network()),
-        "payload": intent,
-    });
-    let approval = provider_data(registry, "wallet", &sign_req).await?;
-    let request_id = approval
-        .get("approval_request")
-        .and_then(|r| r.get("request_id"))
-        .and_then(Value::as_str)
-        .ok_or("wallet returned no approval request id")?
-        .to_string();
+    let request_id = request_transaction_approval(
+        registry,
+        authority,
+        account_id,
+        namespace,
+        format!("elastos://chain/{}/broadcast_transaction", mint_network()),
+        format!("Approve gateway to enable trading on {}", mint_network()),
+        intent,
+    )
+    .await?;
 
     Ok(json!({
         "schema": "elastos.creator.trade-approval/v1",
@@ -1425,6 +1443,7 @@ fn stage_err(stage: &'static str, message: impl Into<String>) -> StagedError {
 /// -> prepare unsigned mint. Returns the prepared mint for the user's wallet to sign.
 async fn run_prepare_mint(
     registry: &ProviderRegistry,
+    authority: &RuntimeWalletAuthority,
     principal_id: &str,
     file_bytes: &[u8],
     meta: &MintMeta,
@@ -1529,7 +1548,7 @@ async fn run_prepare_mint(
     mint_progress::advance(job_id, "sign");
     finalize_mint(
         registry,
-        principal_id,
+        authority,
         meta,
         MintTail {
             kid_hex: &kid_hex,
@@ -1577,7 +1596,7 @@ struct MintTail<'a> {
 /// runtime signs NOTHING; the owner completes the mint, so the owner is the on-chain creator.
 async fn finalize_mint(
     registry: &ProviderRegistry,
-    principal_id: &str,
+    authority: &RuntimeWalletAuthority,
     meta: &MintMeta,
     tail: MintTail<'_>,
 ) -> Result<Value, StagedError> {
@@ -1714,7 +1733,7 @@ async fn finalize_mint(
         ));
     }
     let namespace = mint_chain_namespace();
-    let account_id = resolve_owner_account(registry, principal_id, signer, &namespace)
+    let account_id = resolve_owner_account(registry, authority, signer, &namespace)
         .await
         .map_err(|e| stage_err("sign", e))?;
 
@@ -1734,26 +1753,17 @@ async fn finalize_mint(
         "wallet_intent": "transaction_intent",
     });
     let title = meta.title.trim();
-    let sign_req = json!({
-        "op": "request_signature",
-        "principal_id": principal_id,
-        "account_id": account_id,
-        "chain_namespace": namespace,
-        "intent": "transaction_intent",
-        "capsule_id": CREATOR_APP,
-        "resource": format!("elastos://chain/{}/broadcast_transaction", mint_network()),
-        "reason": format!("Mint dDRM asset \"{title}\" on {}", mint_network()),
-        "payload": intent,
-    });
-    let approval = provider_data(registry, "wallet", &sign_req)
-        .await
-        .map_err(|e| stage_err("sign", e))?;
-    let request_id = approval
-        .get("approval_request")
-        .and_then(|r| r.get("request_id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| stage_err("sign", "wallet returned no approval request id"))?
-        .to_string();
+    let request_id = request_transaction_approval(
+        registry,
+        authority,
+        account_id,
+        namespace,
+        format!("elastos://chain/{}/broadcast_transaction", mint_network()),
+        format!("Mint dDRM asset \"{title}\" on {}", mint_network()),
+        intent,
+    )
+    .await
+    .map_err(|e| stage_err("sign", e))?;
 
     Ok(json!({
         "schema": "elastos.creator.prepared-mint/v1",
@@ -1801,6 +1811,7 @@ fn pkg_progress_sink_path() -> std::path::PathBuf {
 /// mint tail. The CEK never leaves the encrypt-provider boundary; only sealed shares return.
 async fn run_prepare_mint_media(
     registry: &ProviderRegistry,
+    authority: &RuntimeWalletAuthority,
     principal_id: &str,
     file_bytes: &[u8],
     meta: &MintMeta,
@@ -2130,7 +2141,7 @@ async fn run_prepare_mint_media(
     mint_progress::advance(job_id, "sign");
     finalize_mint(
         registry,
-        principal_id,
+        authority,
         meta,
         MintTail {
             kid_hex: &kid_hex,
@@ -2318,22 +2329,110 @@ async fn confirm_channel_owned(
     }
 }
 
+/// Current wall-clock in whole seconds since the Unix epoch (approval-request expiry stamp).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How long an owner has to approve a creator money-path signature (mint / channel / enable-trading)
+/// in their wallet before the queued approval request expires.
+const CREATOR_APPROVAL_TTL_SECS: u64 = 10 * 60;
+
+/// The ONE seam between the creator money-path and the v2 wallet provider. Every account lookup,
+/// signature request, and approval read dispatches its `WalletProviderOperationV2` through here — so
+/// no caller hand-builds the legacy `{op:"…"}` shape the v2 provider rejects, and the runtime-signed
+/// `WalletContract` plumbing (nonce, issued-at, verified context) lives in exactly one place.
+async fn wallet_invoke(
+    registry: &ProviderRegistry,
+    authority: &RuntimeWalletAuthority,
+    operation: elastos_wallet_contract::WalletProviderOperationV2,
+) -> Result<Value, String> {
+    match RuntimeWalletAdapter::new(registry, authority)
+        .invoke(operation)
+        .await
+        .map_err(|err| err.to_string())?
+        .result
+    {
+        elastos_wallet_contract::WalletResultV2::Ok { data } => Ok(data),
+        elastos_wallet_contract::WalletResultV2::Error { message, .. } => Err(message),
+    }
+}
+
+/// Single dispatch for a creator TRANSACTION approval: create-channel, mint, and enable-trading each
+/// enqueue their owner-signature request through THIS one v2 `RequestApproval`, so the three
+/// money-path callers can never drift on how an approval is shaped. Returns the approval `request_id`
+/// the browser polls to drive the owner's wallet (the runtime never signs — the owner's wallet does).
+async fn request_transaction_approval(
+    registry: &ProviderRegistry,
+    authority: &RuntimeWalletAuthority,
+    account_id: String,
+    chain_namespace: String,
+    resource: String,
+    reason: String,
+    payload: Value,
+) -> Result<String, String> {
+    // Re-materialize the caller's raw {from,to,value,data} as a FULLY-SPECIFIED transaction: the
+    // chain-provider's `prepare_transaction` populates nonce, gas_price, and gas_limit via RPC. The
+    // ESP wallet-connector handoff requires a complete transaction (it validates gas/gasPrice/nonce
+    // as hex) — a legacy intent that omitted them, expecting MetaMask to estimate, is rejected by the
+    // connector. Doing it here keeps the estimation in ONE place for all three money-path callers.
+    let prepared = provider_data(
+        registry,
+        "chain",
+        &json!({
+            "op": "prepare_transaction",
+            "network": mint_network(),
+            "from": payload.get("from").and_then(Value::as_str).unwrap_or_default(),
+            "to": payload.get("to").and_then(Value::as_str).unwrap_or_default(),
+            "value": payload.get("value").and_then(Value::as_str).unwrap_or("0x0"),
+            "data": payload.get("data").and_then(Value::as_str).unwrap_or("0x"),
+        }),
+    )
+    .await?;
+    let data = wallet_invoke(
+        registry,
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RequestApproval {
+            account_id,
+            chain_namespace,
+            intent: "transaction_intent".to_string(),
+            resource,
+            reason,
+            payload: prepared,
+            expires_at: now_unix_secs().saturating_add(CREATOR_APPROVAL_TTL_SECS),
+        },
+    )
+    .await?;
+    data.get("approval_request")
+        .and_then(|request| request.get("request_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "wallet returned no approval request id".to_string())
+}
+
 /// Find the OWNER's linked EVM account that can sign the mint, matched by signer address.
 /// The mint is signed by the OWNER's wallet (not the runtime). An EVM address is the same
 /// key on every `eip155:*` chain, so an account linked on ANY EVM chain (e.g. `eip155:1`)
 /// can sign the Base mint — the wallet provider accepts it (`chain_namespaces_compatible`)
 /// and the metamask connector switches to Base at sign time. We prefer an exact mint-chain
 /// match, then fall back to any compatible EVM account. Returns the `account_id` to bind.
+/// The principal comes from the runtime wallet `authority` (the v2 provider derives it from the
+/// runtime-signed context), so it is no longer passed explicitly.
 async fn resolve_owner_account(
     registry: &ProviderRegistry,
-    principal_id: &str,
+    authority: &RuntimeWalletAuthority,
     signer: &str,
     namespace: &str,
 ) -> Result<String, String> {
-    let accounts = provider_data(
+    let accounts = wallet_invoke(
         registry,
-        "wallet",
-        &json!({ "op": "accounts", "principal_id": principal_id }),
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::ListAccounts {
+            include_revoked: false,
+        },
     )
     .await?;
     let list = accounts
