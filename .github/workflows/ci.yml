@@ -1,27 +1,47 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to check out and test (feat SHA, not a second workflow)"
+        required: false
+        default: ""
   pull_request:
-    branches: [main]
+  push:
+    branches:
+      - main
+      - review/collaboration-candidate
+      - feat/home-agent-harness-rebuild
+      - chore/ci-source-home-matrix
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: Check + Clippy + Format
+  source-gate:
+    name: source-gate
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
+          prefix-key: ${{ runner.os }}-elastos
       - name: cargo fmt
         working-directory: elastos
         run: cargo fmt --all -- --check
@@ -42,31 +62,116 @@ jobs:
       - name: cargo check
         working-directory: elastos
         run: cargo check --workspace
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.91.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: elastos
       - name: cargo test
         working-directory: elastos
         run: cargo test --workspace
         # Network-sensitive tests are #[ignore] and won't run.
         # Run them explicitly with: cargo test --workspace -- --ignored
 
-  build-release:
-    name: Build Release (x86_64)
+  source-home-linux:
+    name: source-home-linux
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-      - name: cargo build --release
+          prefix-key: ${{ runner.os }}-elastos
+      - name: source-home into isolated HOME
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/source-home-logs"
+          USER_HOME="${HOME}"
+          SOURCE_HOME="${RUNNER_TEMP}/elastos-source-home"
+          mkdir -p "${SOURCE_HOME}"
+          export CARGO_HOME="${CARGO_HOME:-${USER_HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
+          export HOME="${SOURCE_HOME}"
+          export XDG_DATA_HOME="${SOURCE_HOME}/.local/share"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
+          ELASTOS_DATA_DIR="${XDG_DATA_HOME}/elastos" \
+            scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: local-carrier setup smoke
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/source-home-logs"
+          scripts/local-carrier-setup-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/local-carrier-setup-smoke.log"
+      - name: Upload source-home logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-home-linux-logs
+          path: ${{ runner.temp }}/source-home-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  source-macos:
+    name: source-macos
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          prefix-key: ${{ runner.os }}-elastos
+      - name: cargo fmt
         working-directory: elastos
-        run: cargo build --workspace --release
+        run: cargo fmt --all -- --check
+      - name: architecture entropy checks
+        run: |
+          bash scripts/check-wci-alignment.sh
+          node scripts/home-entropy-check.mjs
+          node scripts/browser-entropy-check.mjs
+      - name: product UI source proofs
+        run: |
+          node scripts/home-shell-regression-smoke.mjs
+          node scripts/people-discovery-smoke.mjs
+      - name: Browser close handshake
+        run: node --test scripts/browser-window-close-handshake.test.mjs
+      - name: cargo clippy
+        working-directory: elastos
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo check
+        working-directory: elastos
+        run: cargo check --workspace
+      - name: cargo test
+        working-directory: elastos
+        run: cargo test --workspace
+      - name: host tools from MAC.md
+        run: brew install e2fsprogs
+      - name: source-home into isolated MAC_TEST_HOME
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/source-home-logs"
+          USER_HOME="${HOME}"
+          MAC_TEST_HOME="${RUNNER_TEMP}/elastos-mac-test-home"
+          mkdir -p "${MAC_TEST_HOME}"
+          export CARGO_HOME="${CARGO_HOME:-${USER_HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${USER_HOME}/.rustup}"
+          export HOME="${MAC_TEST_HOME}"
+          export PATH="${CARGO_HOME}/bin:/opt/homebrew/bin:/opt/homebrew/opt/e2fsprogs/sbin:${PATH}"
+          scripts/setup-source-home.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/setup-source-home.log"
+          ELASTOS_DATA_DIR="${MAC_TEST_HOME}/Library/Application Support/elastos" \
+            scripts/installed-provider-verify.sh 2>&1 | tee "${RUNNER_TEMP}/source-home-logs/installed-provider-verify.log"
+      - name: Upload source-home logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-macos-logs
+          path: ${{ runner.temp }}/source-home-logs/
+          retention-days: 7
+          if-no-files-found: ignore
