@@ -40,6 +40,7 @@ const linkedDocuments = [
   mapReadmePath,
   resolve(repoRoot, "docs/system-map/tree.md"),
   resolve(repoRoot, "docs/AGENT_ARCHITECTURE.md"),
+  resolve(repoRoot, "docs/CONSEQUENCE_AWARE_EFFECTS.md"),
   resolve(repoRoot, "docs/MODEL_PROVIDER.md"),
   resolve(repoRoot, "docs/PRIVATE_NETWORK.md"),
 ];
@@ -140,6 +141,7 @@ for (const required of [
   "Exit is a typed egress service",
   "never enters Runtime, Carrier, or an ordinary App",
   "cannot select a host path",
+  "Consequence-aware effects",
 ]) {
   if (!c4.includes(required)) failures.push(`c4.md is missing: ${required}`);
 }
@@ -151,6 +153,7 @@ for (const required of [
   "Browser projection code still selects",
   "`test -e /dev/kvm` returned 1",
   "implemented by `8dd54706`",
+  "No shipped capsule manifest declares `actuator`",
 ]) {
   if (!state.includes(required)) failures.push(`state.md is missing: ${required}`);
 }
@@ -171,6 +174,7 @@ for (const required of [
   "Capability:",
   "Hidden detail:",
   "Done-check:",
+  "Consequence-aware effects",
 ]) {
   if (!mapReadme.includes(required)) failures.push(`system-map README is missing: ${required}`);
 }

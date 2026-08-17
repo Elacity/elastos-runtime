@@ -205,6 +205,23 @@ launch applications with ambient host authority.
 - portability means independently verifiable and re-instantiable on compatible ElastOS nodes under current trust policy, not an immortal process or a bypass of revocation
 - shells, browser frames, routes, and app stores may project or distribute capsules, but they never become capsule identity or authority
 
+## 19. Consequences govern effects, not transports
+
+ElastOS uses one typed Runtime effect path for digital, economic, rights, and
+physical operations. The operation's consequences determine its authority,
+approval, retry, settlement, and safety requirements. HTTP, Carrier, a webhook,
+a field bus, or an in-process call does not.
+
+- Runtime policy sets and enforces the minimum classification from the admitted provider operation contract; capsule-declared risk may tighten that policy but cannot weaken it
+- observations used for authority or safety decisions must bind their source, subject, schema, time, freshness, integrity, and replay boundary
+- retry-sensitive effects require an idempotent contract or a durable effect identifier that can be reconciled before retry
+- transport acceptance, provider acceptance, execution, and observed outcome are separate claims; uncertainty after dispatch must remain explicit
+- a destination Runtime independently authorizes a remote operation, and a physical controller retains the final local safety decision
+- a DID, ownership record, right, or payment proof may inform policy but does not become control authority by itself
+- Runtime authorizes, routes, reconciles, and audits; hard real-time control, interlocks, emergency stops, and safe-state behavior remain local to the device provider or controller
+
+The detailed contract is [Consequence-aware effects](docs/CONSEQUENCE_AWARE_EFFECTS.md).
+
 ## Decision rule
 
 When two choices both work technically, prefer the one that:

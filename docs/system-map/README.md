@@ -59,6 +59,9 @@ ready.
   services, Carrier routes, and optional compatibility adapters.
 - [Model provider contract](../MODEL_PROVIDER.md): explicit selection,
   streaming, cancellation, recovery, and terminal results.
+- [Consequence-aware effects](../CONSEQUENCE_AWARE_EFFECTS.md): one Runtime
+  effect path with operation-specific observation, actuation, settlement, and
+  local-safety requirements.
 
 Use the canonical [Glossary](../GLOSSARY.md) for terminology. Use the
 [documentation index](../README.md) to find detailed contracts and verification

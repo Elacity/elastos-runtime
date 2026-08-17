@@ -116,6 +116,24 @@ the public repository.
   can request accounts, but the page receives no selected address until the
   Runtime-mediated request is approved through the trusted review path.
 
+## Consequence-aware effect truth
+
+- The manifest schema includes `AffordanceRisk::Actuator`, and Runtime maps it
+  to the `execute` capability action. The generic catalog invocation path still
+  rejects actuator, payment, rights, and privileged affordances because its
+  explicit user-approval dispatch is not enabled.
+- No shipped capsule manifest declares `actuator`. This branch has no general
+  sensor-observation envelope, installed physical-actuator provider proof, or
+  hard real-time safety claim.
+- Wallet transactions have durable effect IDs and uncertain-outcome
+  reconciliation. Browser launch has bounded `DidNotAct` reconciliation, and
+  remote service contracts forbid blind retry after uncertain dispatch. These
+  are provider-specific proofs, not a shipped universal effect state machine.
+- [Consequence-aware effects](docs/CONSEQUENCE_AWARE_EFFECTS.md) defines the
+  shared target contract. Physical effects still require an operation-specific
+  provider, destination admission, local interlock proof, truthful settlement,
+  and installed-target evidence before any readiness claim.
+
 ## Proof Path Ledger
 
 - Installed operator/update proof path: `public-install-operator-smoke.sh`.

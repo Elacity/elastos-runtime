@@ -124,6 +124,27 @@ protocol, expansion, authority layer, or capsule ABI.
 
 A capsule that implements a protocol contract for other capsules to consume. Examples: `localhost-provider` (file-backed localhost roots), `did-provider` (identity), `ai-provider` (LLM routing), `chain-provider` (typed chain reads/proofs), `wallet-provider` (wallet proof, account-link, and approval authority), `drm-provider` (protected-content open boundary), `rights-provider` (protected-content rights questions), `key-provider` (protected-content key release), `decrypt-provider` (protected-content decrypt/render sessions), `availability-provider` (configured replication adapter), and `ipfs-provider` (low-level IPFS via Kubo). P2P networking is provided by built-in Carrier, not a separate provider capsule. Application capsules use providers through `elastos://` or rooted `localhost://` resources rather than implementing protocols directly.
 
+## Observation
+
+A provider report about a named subject at a stated time. An observation used
+for authority or safety must carry enough source, freshness, integrity, and
+replay evidence for the consuming policy. Receiving a webhook or transport
+message does not establish that the reported state is true.
+
+## Actuation
+
+An effect intended to change digital, economic, rights, or physical state.
+Runtime authorizes and routes it through a typed provider operation. A physical
+controller retains the final local safety decision. Ownership evidence is not
+an actuation capability.
+
+## Effect settlement
+
+Runtime's durable knowledge of whether an external effect occurred. Transport
+acceptance, provider acceptance, execution, and observed outcome are separate
+claims. If Runtime cannot prove the outcome after dispatch, settlement remains
+unknown and retry follows the operation's reconciliation contract.
+
 ## Content Availability Provider
 
 The intended higher-level provider contract for publishing, fetching, checking,

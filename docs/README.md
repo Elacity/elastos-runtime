@@ -29,6 +29,8 @@ Each top-level ledger has one job:
 - [Carrier](CARRIER.md): endpoint-authenticated communication and content transport
 - [Private network](PRIVATE_NETWORK.md): signed membership, named services,
   optional IP compatibility, Exit, and LAN Gateway policy
+- [Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md): shared observation,
+  actuation, settlement, and local-safety rules
 - [Content availability](CONTENT_AVAILABILITY.md): CID, IPLD, availability, and replication
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
   discovery, and current Chat integration

@@ -148,6 +148,25 @@ The Capsule Runtime contract binds an artifact, session, capabilities,
 resources, state, and lifecycle. User-scoped authority also requires a verified
 principal. The contract should remain stable across compatible substrates.
 
+### Consequence-aware effects
+
+ElastOS does not split information systems and operational systems into
+parallel authority stacks. A document read, sensor observation, model request,
+payment, rights change, and physical actuation all enter the same typed Runtime
+boundary. Their provider contracts impose different authority, timing, retry,
+settlement, and safety requirements.
+
+The admitted provider contract describes operation semantics and hazards.
+Runtime sets and enforces the minimum classification and may strengthen it. A
+capsule declaration cannot downgrade that policy. A remote destination admits
+the operation independently, and a physical controller retains its local
+interlocks and final safety decision. Runtime does not replace a hard real-time
+controller.
+
+[Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md) defines observation,
+actuation, settlement, ownership, and local-safety rules. It is a cross-cutting
+Runtime/provider contract, not another quadrant or a raw device API.
+
 ### Host adapters
 
 The target architecture keeps the capsule contract stable while host adapters
