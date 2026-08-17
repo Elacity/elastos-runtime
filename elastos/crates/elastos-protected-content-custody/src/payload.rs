@@ -2,15 +2,16 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use rand09::{rngs::StdRng, RngCore as _, SeedableRng as _};
 use sha2::{Digest as _, Sha256};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use zeroize::Zeroizing;
 
 use elastos_protected_content_contracts::{
-    CustodyEnvelopeV1, CustodyEpochIdentityV1, Digest32, EncryptedContentIdentityV1,
-    NodeCustodyPublicKeyV1, NodePublicKey, ThresholdV1, MAX_ENCRYPTED_CONTENT_BYTES,
+    AuthenticatedRuntimeReleaseOperationV1, CustodyEnvelopeV1, CustodyEpochIdentityV1, Digest32,
+    EncryptedContentIdentityV1, NodeCustodyPublicKeyV1, NodePublicKey, SignedNodeContributionV1,
+    SignedTerminalReceiptV1, TerminalReceiptIssuerKey, ThresholdV1, MAX_ENCRYPTED_CONTENT_BYTES,
 };
 
-use crate::{ContentEncryptionKeyV1, CustodyError};
+use crate::{ContentEncryptionKeyV1, CustodyError, RecipientSecretKeyV1};
 
 const PAYLOAD_MAGIC_V1: [u8; 4] = *b"EPC1";
 const PAYLOAD_HEADER_LENGTH_BYTES_V1: usize = 2;
@@ -19,6 +20,7 @@ const PAYLOAD_TAG_BYTES_V1: usize = 16;
 const PAYLOAD_SCHEMA_V1: &str = "elastos.protected-content.payload/v1";
 const PAYLOAD_SUITE_ID_V1: &str = "aes-256-gcm-chunked/v1";
 const PAYLOAD_CHUNK_AAD_DOMAIN_V1: &[u8] = b"elastos.protected-content.payload.chunk-aad/v1";
+const PAYLOAD_IDENTITY_VERIFY_BUFFER_BYTES_V1: usize = 64 * 1024;
 
 pub const PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1: u32 = 1_048_576;
 pub const MAX_PAYLOAD_CONTENT_TYPE_BYTES_V1: usize = 255;
@@ -155,71 +157,6 @@ impl AuthenticatedChunkPayloadHeaderV1 {
             .and_then(|value| value.checked_add(tag_bytes))
             .ok_or(CustodyError::InvalidPayload("framed_ciphertext_bytes"))
     }
-
-    #[cfg(test)]
-    fn parse_framed(bytes: &[u8]) -> Result<(Self, usize), CustodyError> {
-        if bytes.len() < PAYLOAD_MAGIC_V1.len() + PAYLOAD_HEADER_LENGTH_BYTES_V1 {
-            return Err(CustodyError::InvalidPayload("framed_ciphertext_bytes"));
-        }
-        if bytes[..PAYLOAD_MAGIC_V1.len()] != PAYLOAD_MAGIC_V1 {
-            return Err(CustodyError::InvalidPayload("payload_magic"));
-        }
-        let header_len_offset = PAYLOAD_MAGIC_V1.len();
-        let header_len = u16::from_be_bytes(
-            bytes[header_len_offset..header_len_offset + PAYLOAD_HEADER_LENGTH_BYTES_V1]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let prefix_end = PAYLOAD_MAGIC_V1
-            .len()
-            .checked_add(PAYLOAD_HEADER_LENGTH_BYTES_V1)
-            .and_then(|value| value.checked_add(header_len))
-            .ok_or(CustodyError::InvalidPayload("header_bytes"))?;
-        if prefix_end > bytes.len() {
-            return Err(CustodyError::InvalidPayload("header_bytes"));
-        }
-        let header = Self::decode_bytes(
-            &bytes[PAYLOAD_MAGIC_V1.len() + PAYLOAD_HEADER_LENGTH_BYTES_V1..prefix_end],
-        )?;
-        let expected_len = usize::try_from(header.expected_framed_bytes()?)
-            .map_err(|_| CustodyError::InvalidPayload("framed_ciphertext_bytes"))?;
-        if bytes.len() != expected_len {
-            return Err(CustodyError::InvalidPayload("framed_ciphertext_bytes"));
-        }
-        Ok((header, prefix_end))
-    }
-
-    #[cfg(test)]
-    fn decode_bytes(bytes: &[u8]) -> Result<Self, CustodyError> {
-        let mut offset = 0usize;
-        let schema = read_len_prefixed(bytes, &mut offset, "schema")?;
-        let suite = read_len_prefixed(bytes, &mut offset, "suite_id")?;
-        let content_type = read_len_prefixed(bytes, &mut offset, "content_type")?;
-        let plaintext_bytes = read_u64(bytes, &mut offset, "plaintext_bytes")?;
-        let base_nonce =
-            read_fixed::<PAYLOAD_BASE_NONCE_BYTES_V1>(bytes, &mut offset, "base_nonce")?;
-        let content_key_commitment = Digest32::new(read_fixed::<32>(
-            bytes,
-            &mut offset,
-            "content_key_commitment",
-        )?);
-        if offset != bytes.len() {
-            return Err(CustodyError::InvalidPayload("header_bytes"));
-        }
-        if schema != PAYLOAD_SCHEMA_V1.as_bytes() {
-            return Err(CustodyError::InvalidPayload("schema"));
-        }
-        if suite != PAYLOAD_SUITE_ID_V1.as_bytes() {
-            return Err(CustodyError::InvalidPayload("suite_id"));
-        }
-        Self::new_authenticated(
-            String::from_utf8(content_type.to_vec())
-                .map_err(|_| CustodyError::InvalidPayload("content_type"))?,
-            plaintext_bytes,
-            base_nonce,
-            content_key_commitment,
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +164,24 @@ pub struct SealedPayloadMetadataV1 {
     header: AuthenticatedChunkPayloadHeaderV1,
     encrypted_content_identity: EncryptedContentIdentityV1,
     custody_envelope: CustodyEnvelopeV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptedPayloadMetadataV1 {
+    content_type: String,
+    plaintext_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct AuthenticatedPayloadDecryptInputsV1<'a> {
+    pub expected_encrypted_content_identity: &'a EncryptedContentIdentityV1,
+    pub operation: &'a AuthenticatedRuntimeReleaseOperationV1,
+    pub envelope: &'a CustodyEnvelopeV1,
+    pub contributions: &'a [SignedNodeContributionV1],
+    pub terminal_receipt: &'a SignedTerminalReceiptV1,
+    pub expected_terminal_issuer: TerminalReceiptIssuerKey,
+    pub recipient_secret: &'a RecipientSecretKeyV1,
+    pub now: u64,
 }
 
 struct PayloadSealContextV1 {
@@ -248,6 +203,16 @@ impl SealedPayloadMetadataV1 {
 
     pub const fn custody_envelope(&self) -> &CustodyEnvelopeV1 {
         &self.custody_envelope
+    }
+}
+
+impl DecryptedPayloadMetadataV1 {
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    pub const fn plaintext_bytes(&self) -> u64 {
+        self.plaintext_bytes
     }
 }
 
@@ -279,6 +244,35 @@ pub fn seal_payload_to_staging_writer_v1<R: Read, W: Write>(
         plaintext,
         staging_ciphertext,
         &context,
+    )
+}
+
+pub fn decrypt_payload_to_staging_writer_from_authenticated_operation_v1<
+    R: Read + Seek,
+    W: Write,
+>(
+    ciphertext_source: &mut R,
+    plaintext_staging: &mut W,
+    inputs: AuthenticatedPayloadDecryptInputsV1<'_>,
+) -> Result<DecryptedPayloadMetadataV1, CustodyError> {
+    if inputs.operation.binding().encrypted_content() != inputs.expected_encrypted_content_identity
+    {
+        return Err(CustodyError::BindingMismatch("encrypted_content"));
+    }
+    let content_key = crate::reconstruct_content_key_from_authenticated_operation(
+        inputs.operation,
+        inputs.envelope,
+        inputs.contributions,
+        inputs.terminal_receipt,
+        inputs.expected_terminal_issuer,
+        inputs.recipient_secret,
+        inputs.now,
+    )?;
+    decrypt_payload_to_staging_writer_with_content_key_v1(
+        inputs.expected_encrypted_content_identity,
+        ciphertext_source,
+        plaintext_staging,
+        &content_key,
     )
 }
 
@@ -372,6 +366,78 @@ fn seal_payload_to_staging_writer_inner<R: Read, W: Write>(
     })
 }
 
+fn decrypt_payload_to_staging_writer_with_content_key_v1<R: Read + Seek, W: Write>(
+    expected_encrypted_content_identity: &EncryptedContentIdentityV1,
+    ciphertext_source: &mut R,
+    plaintext_staging: &mut W,
+    content_key: &ContentEncryptionKeyV1,
+) -> Result<DecryptedPayloadMetadataV1, CustodyError> {
+    let (header, prefix_len) = verify_framed_ciphertext_identity_v1(
+        ciphertext_source,
+        expected_encrypted_content_identity,
+    )?;
+    if !content_key.matches_commitment(header.content_key_commitment) {
+        return Err(CustodyError::ContentKeyCommitmentMismatch);
+    }
+    let header_bytes = header.encoded_bytes()?;
+    let chunk_count = header.chunk_count()?;
+
+    seek_to_start(ciphertext_source)?;
+    ciphertext_source
+        .seek(SeekFrom::Start(prefix_len))
+        .map_err(|_| CustodyError::PayloadIo)?;
+
+    // Keep the expanded AEAD state inside the shortest possible scope.
+    // This crate explicitly zeroizes CEK bytes and plaintext chunk buffers.
+    // The enabled upstream `aes` zeroize support clears AES round keys
+    // where that dependency implements it. However, the composite
+    // `Aes256Gcm`/GHASH state does not expose a complete public
+    // zeroization contract across all backends; notably, the AArch64 PMULL
+    // POLYVAL path does not provide a full zeroizing `Drop`. We therefore
+    // keep the cipher lifetime as short as possible and report any stronger
+    // whole-AEAD-state erasure claim as unsupported by the current audited
+    // primitive stack.
+    let cipher = content_key.with_bytes(|bytes| {
+        Aes256Gcm::new_from_slice(bytes).map_err(|_| CustodyError::InvalidPayload("content_key"))
+    })?;
+
+    for chunk_index in 0..chunk_count {
+        let ciphertext_chunk_len = chunk_ciphertext_len(&header, chunk_index)?;
+        let mut ciphertext_chunk = vec![0u8; ciphertext_chunk_len];
+        read_exact_payload_bytes(
+            ciphertext_source,
+            &mut ciphertext_chunk,
+            "framed_ciphertext_bytes",
+        )?;
+        let nonce = derive_chunk_nonce(&header, chunk_index)?;
+        let aad = chunk_aad_bytes(&header_bytes, chunk_index);
+        let plaintext_chunk = Zeroizing::new(
+            cipher
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &ciphertext_chunk,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| CustodyError::InvalidPayload("payload_chunk"))?,
+        );
+        plaintext_staging
+            .write_all(plaintext_chunk.as_slice())
+            .map_err(|_| CustodyError::PayloadIo)?;
+    }
+
+    let mut trailing = [0u8; 1];
+    match ciphertext_source.read(&mut trailing) {
+        Ok(0) => Ok(DecryptedPayloadMetadataV1 {
+            content_type: header.content_type().to_string(),
+            plaintext_bytes: header.plaintext_bytes(),
+        }),
+        Ok(_) => Err(CustodyError::InvalidPayload("framed_ciphertext_bytes")),
+        Err(_) => Err(CustodyError::PayloadIo),
+    }
+}
+
 fn random_base_nonce() -> Result<[u8; PAYLOAD_BASE_NONCE_BYTES_V1], CustodyError> {
     let mut nonce = [0u8; PAYLOAD_BASE_NONCE_BYTES_V1];
     StdRng::try_from_os_rng()
@@ -423,6 +489,15 @@ fn chunk_plaintext_len(
         .map_err(|_| CustodyError::InvalidPayload("chunk_index"))
 }
 
+fn chunk_ciphertext_len(
+    header: &AuthenticatedChunkPayloadHeaderV1,
+    chunk_index: u64,
+) -> Result<usize, CustodyError> {
+    chunk_plaintext_len(header, chunk_index)?
+        .checked_add(PAYLOAD_TAG_BYTES_V1)
+        .ok_or(CustodyError::InvalidPayload("framed_ciphertext_bytes"))
+}
+
 #[cfg(test)]
 fn chunk_ciphertext_range(
     header: &AuthenticatedChunkPayloadHeaderV1,
@@ -454,7 +529,6 @@ fn write_len_prefixed(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CustodyE
     Ok(())
 }
 
-#[cfg(test)]
 fn read_len_prefixed<'a>(
     bytes: &'a [u8],
     offset: &mut usize,
@@ -472,17 +546,14 @@ fn read_len_prefixed<'a>(
     Ok(slice)
 }
 
-#[cfg(test)]
 fn read_u16(bytes: &[u8], offset: &mut usize, field: &'static str) -> Result<u16, CustodyError> {
     Ok(u16::from_be_bytes(read_fixed::<2>(bytes, offset, field)?))
 }
 
-#[cfg(test)]
 fn read_u64(bytes: &[u8], offset: &mut usize, field: &'static str) -> Result<u64, CustodyError> {
     Ok(u64::from_be_bytes(read_fixed::<8>(bytes, offset, field)?))
 }
 
-#[cfg(test)]
 fn read_fixed<const N: usize>(
     bytes: &[u8],
     offset: &mut usize,
@@ -542,46 +613,133 @@ fn reject_trailing_plaintext(reader: &mut impl Read) -> Result<(), CustodyError>
     }
 }
 
+fn seek_to_start(reader: &mut impl Seek) -> Result<(), CustodyError> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map(|_| ())
+        .map_err(|_| CustodyError::PayloadIo)
+}
+
+fn read_framed_header_from_reader_v1(
+    reader: &mut (impl Read + Seek),
+) -> Result<(AuthenticatedChunkPayloadHeaderV1, u64), CustodyError> {
+    seek_to_start(reader)?;
+    let mut magic = [0u8; PAYLOAD_MAGIC_V1.len()];
+    read_exact_payload_bytes(reader, &mut magic, "framed_ciphertext_bytes")?;
+    if magic != PAYLOAD_MAGIC_V1 {
+        return Err(CustodyError::InvalidPayload("payload_magic"));
+    }
+    let mut header_len_bytes = [0u8; PAYLOAD_HEADER_LENGTH_BYTES_V1];
+    read_exact_payload_bytes(reader, &mut header_len_bytes, "header_bytes")?;
+    let header_len = usize::from(u16::from_be_bytes(header_len_bytes));
+    let mut header_bytes = vec![0u8; header_len];
+    read_exact_payload_bytes(reader, &mut header_bytes, "header_bytes")?;
+    let header = decode_header_bytes_v1(&header_bytes)?;
+    let prefix_len = u64::try_from(PAYLOAD_MAGIC_V1.len() + PAYLOAD_HEADER_LENGTH_BYTES_V1)
+        .unwrap()
+        .checked_add(u64::try_from(header_len).unwrap())
+        .ok_or(CustodyError::InvalidPayload("header_bytes"))?;
+    Ok((header, prefix_len))
+}
+
+fn verify_framed_ciphertext_identity_v1(
+    reader: &mut (impl Read + Seek),
+    expected_encrypted_content_identity: &EncryptedContentIdentityV1,
+) -> Result<(AuthenticatedChunkPayloadHeaderV1, u64), CustodyError> {
+    let (header, prefix_len) = read_framed_header_from_reader_v1(reader)?;
+    let expected_framed_bytes = header.expected_framed_bytes()?;
+    seek_to_start(reader)?;
+    let mut hasher = Sha256::new();
+    let mut total_bytes = 0u64;
+    let mut buffer = [0u8; PAYLOAD_IDENTITY_VERIFY_BUFFER_BYTES_V1];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                total_bytes = total_bytes
+                    .checked_add(u64::try_from(read).unwrap())
+                    .ok_or(CustodyError::InvalidPayload("framed_ciphertext_bytes"))?;
+            }
+            Err(_) => return Err(CustodyError::PayloadIo),
+        }
+    }
+    if total_bytes != expected_framed_bytes {
+        return Err(CustodyError::InvalidPayload("framed_ciphertext_bytes"));
+    }
+    let actual_encrypted_content_identity =
+        EncryptedContentIdentityV1::new(Digest32::new(hasher.finalize().into()), total_bytes)?;
+    if &actual_encrypted_content_identity != expected_encrypted_content_identity {
+        return Err(CustodyError::BindingMismatch("encrypted_content"));
+    }
+    Ok((header, prefix_len))
+}
+
+fn read_exact_payload_bytes(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+    field: &'static str,
+) -> Result<(), CustodyError> {
+    let mut offset = 0usize;
+    while offset < buffer.len() {
+        match reader.read(&mut buffer[offset..]) {
+            Ok(0) => return Err(CustodyError::InvalidPayload(field)),
+            Ok(read) => {
+                offset = offset
+                    .checked_add(read)
+                    .ok_or(CustodyError::InvalidPayload(field))?;
+            }
+            Err(_) => return Err(CustodyError::PayloadIo),
+        }
+    }
+    Ok(())
+}
+
+fn decode_header_bytes_v1(bytes: &[u8]) -> Result<AuthenticatedChunkPayloadHeaderV1, CustodyError> {
+    let mut offset = 0usize;
+    let schema = read_len_prefixed(bytes, &mut offset, "schema")?;
+    let suite = read_len_prefixed(bytes, &mut offset, "suite_id")?;
+    let content_type = read_len_prefixed(bytes, &mut offset, "content_type")?;
+    let plaintext_bytes = read_u64(bytes, &mut offset, "plaintext_bytes")?;
+    let base_nonce = read_fixed::<PAYLOAD_BASE_NONCE_BYTES_V1>(bytes, &mut offset, "base_nonce")?;
+    let content_key_commitment = Digest32::new(read_fixed::<32>(
+        bytes,
+        &mut offset,
+        "content_key_commitment",
+    )?);
+    if offset != bytes.len() {
+        return Err(CustodyError::InvalidPayload("header_bytes"));
+    }
+    if schema != PAYLOAD_SCHEMA_V1.as_bytes() {
+        return Err(CustodyError::InvalidPayload("schema"));
+    }
+    if suite != PAYLOAD_SUITE_ID_V1.as_bytes() {
+        return Err(CustodyError::InvalidPayload("suite_id"));
+    }
+    AuthenticatedChunkPayloadHeaderV1::new_authenticated(
+        String::from_utf8(content_type.to_vec())
+            .map_err(|_| CustodyError::InvalidPayload("content_type"))?,
+        plaintext_bytes,
+        base_nonce,
+        content_key_commitment,
+    )
+}
+
 #[cfg(test)]
-fn open_payload_for_tests(
+fn decrypt_payload_to_vec_with_content_key_for_tests(
+    expected_encrypted_content_identity: &EncryptedContentIdentityV1,
     framed: &[u8],
     content_key: &ContentEncryptionKeyV1,
-) -> Result<(AuthenticatedChunkPayloadHeaderV1, Vec<u8>), CustodyError> {
-    let (header, prefix_end) = AuthenticatedChunkPayloadHeaderV1::parse_framed(framed)?;
-    if !content_key.matches_commitment(header.content_key_commitment) {
-        return Err(CustodyError::ContentKeyCommitmentMismatch);
-    }
-    let cipher = content_key.with_bytes(|bytes| {
-        Aes256Gcm::new_from_slice(bytes).map_err(|_| CustodyError::InvalidPayload("content_key"))
-    })?;
-    let header_bytes = header.encoded_bytes()?;
-    let plaintext_capacity = usize::try_from(header.plaintext_bytes())
-        .map_err(|_| CustodyError::InvalidPayload("plaintext_bytes"))?;
-    let mut plaintext = Vec::with_capacity(plaintext_capacity);
-    for chunk_index in 0..header.chunk_count()? {
-        let range = chunk_ciphertext_range(&header, prefix_end, chunk_index)?;
-        let nonce = derive_chunk_nonce(&header, chunk_index)?;
-        let aad = chunk_aad_bytes(&header_bytes, chunk_index);
-        let decrypted = Zeroizing::new(
-            cipher
-                .decrypt(
-                    Nonce::from_slice(&nonce),
-                    Payload {
-                        msg: &framed[range],
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| CustodyError::InvalidPayload("payload_chunk"))?,
-        );
-        plaintext.extend_from_slice(decrypted.as_slice());
-    }
-    if u64::try_from(plaintext.len())
-        .map_err(|_| CustodyError::InvalidPayload("plaintext_bytes"))?
-        != header.plaintext_bytes()
-    {
-        return Err(CustodyError::InvalidPayload("plaintext_bytes"));
-    }
-    Ok((header, plaintext))
+) -> Result<(DecryptedPayloadMetadataV1, Vec<u8>), CustodyError> {
+    let mut reader = std::io::Cursor::new(framed.to_vec());
+    let mut plaintext = Vec::new();
+    let metadata = decrypt_payload_to_staging_writer_with_content_key_v1(
+        expected_encrypted_content_identity,
+        &mut reader,
+        &mut plaintext,
+        content_key,
+    )?;
+    Ok((metadata, plaintext))
 }
 
 #[cfg(test)]
@@ -615,11 +773,435 @@ fn seal_payload_to_vec_with_test_material(
 mod tests {
     use super::*;
 
-    use elastos_protected_content_contracts::CanonicalContract;
-    use std::collections::BTreeSet;
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use elastos_protected_content_contracts::{
+        AtomicReplayClaimer, CanonicalContract, Digest32, EncryptedContentIdentityV1,
+        EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1,
+        KeyReleaseRequestV1, NodeContributionRefV1, ProtectedContentBindingV1,
+        RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayClaimError, ReplayClaimKeyV1,
+        ReplayNonce16, RightsActionV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
+        RightsRequestV1, RightsSubjectSourceV1, RightsVerificationContextV1,
+        RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
+        RuntimeSessionBindingV1, SignedNodeContributionV1, SignedRecipientKeyAuthorizationV1,
+        SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
+        TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1, WalletAddress,
+        WalletSignedRightsRequestV1, CUSTODY_HPKE_SUITE_ID_V1,
+    };
+    use k256::ecdsa::SigningKey as WalletSigningKey;
+    use rand09::rngs::StdRng;
+    use sha3::Keccak256;
+    use std::collections::{BTreeSet, HashMap};
 
     fn node_keys() -> Vec<(NodePublicKey, NodeCustodyPublicKeyV1)> {
         crate::test_support::custody_nodes()
+    }
+
+    #[derive(Default)]
+    struct ReplayClaimsForTests(HashMap<ReplayClaimKeyV1, u64>);
+
+    impl AtomicReplayClaimer for ReplayClaimsForTests {
+        fn claim(
+            &mut self,
+            key: ReplayClaimKeyV1,
+            expires_at: u64,
+            now: u64,
+        ) -> Result<(), ReplayClaimError> {
+            self.0.retain(|_, expiry| *expiry > now);
+            if self.0.contains_key(&key) {
+                return Err(ReplayClaimError::AlreadyClaimed);
+            }
+            self.0.insert(key, expires_at);
+            Ok(())
+        }
+    }
+
+    fn payload_identity_for_tests(framed: &[u8]) -> EncryptedContentIdentityV1 {
+        EncryptedContentIdentityV1::new(
+            Digest32::new(Sha256::digest(framed).into()),
+            u64::try_from(framed.len()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn framed_prefix_end_for_tests(framed: &[u8]) -> usize {
+        let mut reader = std::io::Cursor::new(framed.to_vec());
+        let (_, prefix_end) = read_framed_header_from_reader_v1(&mut reader).unwrap();
+        usize::try_from(prefix_end).unwrap()
+    }
+
+    fn wallet_for_tests(seed: u8) -> WalletAddress {
+        let key = WalletSigningKey::from_slice(&[seed; 32]).unwrap();
+        let encoded = key.verifying_key().to_encoded_point(false);
+        let digest = Keccak256::digest(&encoded.as_bytes()[1..]);
+        WalletAddress::new(digest[12..].try_into().unwrap())
+    }
+
+    fn policy_body_for_tests() -> RightsPolicyBodyV1 {
+        RightsPolicyBodyV1::new(
+            "content:alpha",
+            RightsActionV1::View,
+            "view",
+            RightsSubjectSourceV1::WalletAddress,
+            11155111,
+            EvmContractAddressV1::new([0x11; 20]).unwrap(),
+            EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
+            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
+            RightsObservationFinalityV1::new(12),
+        )
+        .unwrap()
+    }
+
+    fn recipient_identity_for_tests(seed: u8) -> RecipientKeyIdentityV1 {
+        let recipient_public_key = crate::test_support::recipient_public_key(seed);
+        RecipientKeyIdentityV1::new(
+            CUSTODY_HPKE_SUITE_ID_V1,
+            Digest32::new(sha2::Sha256::digest(recipient_public_key.as_bytes()).into()),
+        )
+        .unwrap()
+    }
+
+    fn binding_for_sealed_envelope_for_tests(
+        encrypted_content_identity: EncryptedContentIdentityV1,
+        envelope: &CustodyEnvelopeV1,
+        wallet: WalletAddress,
+    ) -> ProtectedContentBindingV1 {
+        let policy_body = policy_body_for_tests();
+        ProtectedContentBindingV1::new(
+            encrypted_content_identity,
+            envelope.key_envelope_identity().unwrap(),
+            policy_body.policy_identity().unwrap(),
+            elastos_protected_content_contracts::ProfileIdentityV1::from_public_key_bytes(
+                SigningKey::from_bytes(&[0x26; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            )
+            .unwrap(),
+            wallet,
+            RuntimeSessionBindingV1::new(crate::test_support::digest(0x66)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn signed_rights_request_for_sealed_envelope_for_tests(
+        encrypted_content_identity: EncryptedContentIdentityV1,
+        envelope: &CustodyEnvelopeV1,
+        recipient_seed: u8,
+    ) -> WalletSignedRightsRequestV1 {
+        let wallet = wallet_for_tests(7);
+        let request = RightsRequestV1::new(
+            binding_for_sealed_envelope_for_tests(encrypted_content_identity, envelope, wallet),
+            RightsActionV1::View,
+            recipient_identity_for_tests(recipient_seed),
+            crate::test_support::NOW,
+            crate::test_support::NOW + 180,
+            ReplayNonce16::new([0x55; 16]),
+        )
+        .unwrap();
+        let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
+        let (signature, recovery_id) = key
+            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
+                &request.canonical_bytes().unwrap(),
+            ))
+            .unwrap();
+        let mut signature_bytes = signature.to_bytes().to_vec();
+        signature_bytes.push(recovery_id.to_byte());
+        WalletSignedRightsRequestV1::new(request, signature_bytes).unwrap()
+    }
+
+    fn verified_release_request_for_sealed_envelope_for_tests(
+        encrypted_content_identity: EncryptedContentIdentityV1,
+        envelope: &CustodyEnvelopeV1,
+        recipient_seed: u8,
+    ) -> VerifiedKeyReleaseRequestV1 {
+        let signed = signed_rights_request_for_sealed_envelope_for_tests(
+            encrypted_content_identity,
+            envelope,
+            recipient_seed,
+        );
+        let context = RightsVerificationContextV1::new(
+            signed.request().binding().clone(),
+            signed.request().action(),
+            signed.request().recipient().clone(),
+            crate::test_support::NOW + 1,
+        );
+        let rights = signed
+            .verify(&context, &mut ReplayClaimsForTests::default())
+            .unwrap();
+        KeyReleaseRequestV1::new(
+            rights.binding().clone(),
+            rights.request_hash(),
+            rights.action(),
+            rights.recipient().clone(),
+            crate::test_support::NOW + 1,
+            crate::test_support::NOW + 50,
+            ReplayNonce16::new([0x66; 16]),
+        )
+        .unwrap()
+        .verify(
+            &rights,
+            crate::test_support::NOW + 3,
+            &mut ReplayClaimsForTests::default(),
+        )
+        .unwrap()
+    }
+
+    fn authenticated_runtime_release_operation_for_sealed_envelope_for_tests(
+        encrypted_content_identity: EncryptedContentIdentityV1,
+        envelope: &CustodyEnvelopeV1,
+        recipient_seed: u8,
+    ) -> AuthenticatedRuntimeReleaseOperationV1 {
+        let runtime_key = SigningKey::from_bytes(&[0x42; 32]);
+        let recipient_public_key = crate::test_support::recipient_public_key(recipient_seed);
+        let recipient_public_key_bytes =
+            RecipientPublicKeyBytesV1::new(*recipient_public_key.as_bytes()).unwrap();
+        let rights_request = signed_rights_request_for_sealed_envelope_for_tests(
+            encrypted_content_identity,
+            envelope,
+            recipient_seed,
+        );
+        let release_request = KeyReleaseRequestV1::new(
+            rights_request.request().binding().clone(),
+            rights_request.request().request_hash().unwrap(),
+            RightsActionV1::View,
+            rights_request.request().recipient().clone(),
+            crate::test_support::NOW + 1,
+            crate::test_support::NOW + 50,
+            ReplayNonce16::new([0x66; 16]),
+        )
+        .unwrap();
+        let profile = SigningKey::from_bytes(&[0x26; 32]);
+        let authorization_statement =
+            elastos_protected_content_contracts::RecipientKeyAuthorizationStatementV1::new(
+                rights_request.request().binding().clone(),
+                RightsActionV1::View,
+                recipient_public_key_bytes,
+                rights_request.request().recipient().clone(),
+                RuntimeOperationIssuerKeyV1::new(runtime_key.verifying_key().to_bytes()).unwrap(),
+                crate::test_support::NOW,
+                crate::test_support::NOW + 90,
+            )
+            .unwrap();
+        let authorization = SignedRecipientKeyAuthorizationV1::new(
+            authorization_statement.clone(),
+            profile
+                .sign(&authorization_statement.canonical_bytes().unwrap())
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        let policy_body = policy_body_for_tests();
+        let binding = rights_request.request().binding().clone();
+        let statement = RuntimeReleaseOperationStatementV1::new(
+            RuntimeOperationIssuerKeyV1::new(runtime_key.verifying_key().to_bytes()).unwrap(),
+            rights_request,
+            release_request,
+            recipient_public_key_bytes,
+            authorization,
+            policy_body.clone(),
+            elastos_protected_content_contracts::RightsEvaluationEvidenceRequestV1::new(
+                binding,
+                policy_body.policy_identity().unwrap(),
+            )
+            .unwrap(),
+            crate::test_support::signed_custody_epoch(),
+            RuntimeReleaseAuditIdV1::new(crate::test_support::digest(0x91)).unwrap(),
+            crate::test_support::NOW + 2,
+            crate::test_support::NOW + 40,
+        )
+        .unwrap();
+        SignedRuntimeReleaseOperationV1::new(
+            statement.clone(),
+            runtime_key
+                .sign(&statement.canonical_bytes().unwrap())
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap()
+        .verify(crate::test_support::NOW + 3)
+        .unwrap()
+    }
+
+    fn released_contribution(
+        request: &VerifiedKeyReleaseRequestV1,
+        envelope: &CustodyEnvelopeV1,
+        encrypted_content_identity: EncryptedContentIdentityV1,
+        node_seed: u8,
+        recipient_seed: u8,
+        hpke_seed: u8,
+    ) -> SignedNodeContributionV1 {
+        crate::release::produce_node_contribution_with_rng(
+            &claimed_runtime_release_operation_for_sealed_envelope_and_node_seed(
+                encrypted_content_identity,
+                envelope,
+                node_seed,
+                recipient_seed,
+            ),
+            &crate::test_support::signed_node_decision(
+                request,
+                node_seed,
+                elastos_protected_content_contracts::RightsDecisionV1::Allowed,
+            ),
+            envelope,
+            &crate::test_support::node_signing_key(node_seed),
+            &crate::test_support::node_custody_secret(node_seed),
+            &crate::test_support::recipient_public_key(recipient_seed),
+            crate::test_support::NOW + 5,
+            crate::test_support::NOW + 45,
+            crate::test_support::NOW + 6,
+            &mut StdRng::from_seed([hpke_seed; 32]),
+        )
+        .unwrap()
+    }
+
+    fn claimed_runtime_release_operation_for_sealed_envelope_and_node_seed(
+        encrypted_content_identity: EncryptedContentIdentityV1,
+        envelope: &CustodyEnvelopeV1,
+        node_seed: u8,
+        recipient_seed: u8,
+    ) -> crate::replay_store::ClaimedNodeReleaseOperationV1 {
+        let authenticated = authenticated_runtime_release_operation_for_sealed_envelope_for_tests(
+            encrypted_content_identity,
+            envelope,
+            recipient_seed,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut store = crate::DurableReplayClaimStoreV1::new(
+            crate::test_support::node_public_key(node_seed),
+            temp.path().join("replay"),
+        );
+        store
+            .claim_node_release_operation(
+                authenticated,
+                envelope,
+                crate::test_support::node_public_key(node_seed),
+                crate::test_support::NOW + 3,
+            )
+            .unwrap()
+    }
+
+    fn terminal_receipt(
+        request: &VerifiedKeyReleaseRequestV1,
+        envelope: &CustodyEnvelopeV1,
+        contributions: &[SignedNodeContributionV1],
+        issuer_seed: u8,
+        outcome: KeyReleaseOutcomeV1,
+    ) -> SignedTerminalReceiptV1 {
+        let verified = contributions
+            .iter()
+            .map(|contribution| {
+                contribution
+                    .verify(
+                        request,
+                        &envelope.manifest().node_set().unwrap(),
+                        crate::test_support::NOW + 7,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let issuer_key = SigningKey::from_bytes(&[issuer_seed; 32]);
+        let issuer = TerminalReceiptIssuerKey::new(issuer_key.verifying_key().to_bytes()).unwrap();
+        let refs = match outcome {
+            KeyReleaseOutcomeV1::Denied => Vec::new(),
+            KeyReleaseOutcomeV1::Released => {
+                verified.iter().map(NodeContributionRefV1::from).collect()
+            }
+        };
+        let statement = TerminalReceiptStatementV1::new(
+            request.request_hash(),
+            request.binding().clone(),
+            issuer,
+            outcome,
+            refs,
+            crate::test_support::NOW + 7,
+            crate::test_support::NOW + 40,
+        )
+        .unwrap();
+        SignedTerminalReceiptV1::new(
+            statement.clone(),
+            issuer_key
+                .sign(&statement.canonical_bytes().unwrap())
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    struct AuthenticatedDecryptFixture {
+        framed: Vec<u8>,
+        sealed: SealedPayloadMetadataV1,
+        operation: AuthenticatedRuntimeReleaseOperationV1,
+        contributions: Vec<SignedNodeContributionV1>,
+        terminal: SignedTerminalReceiptV1,
+        recipient_secret: RecipientSecretKeyV1,
+        terminal_issuer: TerminalReceiptIssuerKey,
+        plaintext: Vec<u8>,
+    }
+
+    fn authenticated_decrypt_fixture(plaintext: Vec<u8>) -> AuthenticatedDecryptFixture {
+        let recipient_seed = 0x30;
+        let mut plaintext_reader = std::io::Cursor::new(plaintext.clone());
+        let mut framed = Vec::new();
+        let sealed = seal_payload_to_staging_writer_v1(
+            "application/octet-stream",
+            u64::try_from(plaintext.len()).unwrap(),
+            &mut plaintext_reader,
+            &mut framed,
+            crate::test_support::custody_epoch_identity(),
+            ThresholdV1::new(2, 3).unwrap(),
+            node_keys(),
+        )
+        .unwrap();
+        let operation = authenticated_runtime_release_operation_for_sealed_envelope_for_tests(
+            sealed.encrypted_content_identity().clone(),
+            sealed.custody_envelope(),
+            recipient_seed,
+        );
+        let request = verified_release_request_for_sealed_envelope_for_tests(
+            sealed.encrypted_content_identity().clone(),
+            sealed.custody_envelope(),
+            recipient_seed,
+        );
+        let contributions = vec![
+            released_contribution(
+                &request,
+                sealed.custody_envelope(),
+                sealed.encrypted_content_identity().clone(),
+                1,
+                recipient_seed,
+                0x71,
+            ),
+            released_contribution(
+                &request,
+                sealed.custody_envelope(),
+                sealed.encrypted_content_identity().clone(),
+                2,
+                recipient_seed,
+                0x72,
+            ),
+        ];
+        let terminal = terminal_receipt(
+            &request,
+            sealed.custody_envelope(),
+            &contributions,
+            0x21,
+            KeyReleaseOutcomeV1::Released,
+        );
+        let terminal_issuer = terminal.statement().issuer();
+        AuthenticatedDecryptFixture {
+            framed,
+            sealed,
+            operation,
+            contributions,
+            terminal,
+            recipient_secret: crate::test_support::recipient_secret(recipient_seed),
+            terminal_issuer,
+            plaintext,
+        }
     }
 
     struct FailAfterWriter {
@@ -644,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_round_trips_through_private_verifier() {
+    fn payload_round_trips_through_production_decoder() {
         let content_key = ContentEncryptionKeyV1::from_test_bytes([0x44; 32]);
         let (framed, metadata) = seal_payload_to_vec_with_test_material(
             "application/octet-stream",
@@ -654,9 +1236,18 @@ mod tests {
         )
         .unwrap();
 
-        let (header, plaintext) = open_payload_for_tests(&framed, &content_key).unwrap();
+        let (decrypted, plaintext) = decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &framed,
+            &content_key,
+        )
+        .unwrap();
         assert_eq!(plaintext, b"hello protected content");
-        assert_eq!(header, metadata.header().clone());
+        assert_eq!(decrypted.content_type(), metadata.header().content_type());
+        assert_eq!(
+            decrypted.plaintext_bytes(),
+            metadata.header().plaintext_bytes()
+        );
         assert_eq!(
             metadata.custody_envelope().manifest().encrypted_content(),
             metadata.encrypted_content_identity()
@@ -717,33 +1308,58 @@ mod tests {
             [0x71; PAYLOAD_BASE_NONCE_BYTES_V1],
         )
         .unwrap();
-        let (_, prefix_end) = AuthenticatedChunkPayloadHeaderV1::parse_framed(&framed).unwrap();
+        let prefix_end = framed_prefix_end_for_tests(&framed);
         let first_range = chunk_ciphertext_range(metadata.header(), prefix_end, 0).unwrap();
         let second_range = chunk_ciphertext_range(metadata.header(), prefix_end, 1).unwrap();
 
         let mut header_tampered = framed.clone();
         header_tampered[prefix_end - 1] ^= 0x01;
-        assert!(open_payload_for_tests(&header_tampered, &content_key).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &header_tampered,
+            &content_key,
+        )
+        .is_err());
 
         let mut chunk_tampered = framed.clone();
         chunk_tampered[first_range.start] ^= 0x01;
-        assert!(open_payload_for_tests(&chunk_tampered, &content_key).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &chunk_tampered,
+            &content_key,
+        )
+        .is_err());
 
         let mut tag_tampered = framed.clone();
         tag_tampered[first_range.end - 1] ^= 0x01;
-        assert!(open_payload_for_tests(&tag_tampered, &content_key).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &tag_tampered,
+            &content_key,
+        )
+        .is_err());
 
         let mut reordered = framed.clone();
         let first = framed[first_range.clone()].to_vec();
         let second = framed[second_range.clone()].to_vec();
         reordered[first_range.clone()].copy_from_slice(&second);
         reordered[second_range.clone()].copy_from_slice(&first);
-        assert!(open_payload_for_tests(&reordered, &content_key).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &reordered,
+            &content_key,
+        )
+        .is_err());
 
         let mut duplicated = framed.clone();
         let first = framed[first_range.clone()].to_vec();
         duplicated[second_range.clone()].copy_from_slice(&first);
-        assert!(open_payload_for_tests(&duplicated, &content_key).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &duplicated,
+            &content_key,
+        )
+        .is_err());
 
         let other_plaintext =
             vec![0x6b; usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1).unwrap() * 2];
@@ -756,7 +1372,12 @@ mod tests {
         .unwrap();
         let mut spliced = framed.clone();
         spliced[second_range.clone()].copy_from_slice(&other_framed[second_range.clone()]);
-        assert!(open_payload_for_tests(&spliced, &content_key).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &spliced,
+            &content_key,
+        )
+        .is_err());
 
         let mut wrong_length = framed.clone();
         let length_offset = PAYLOAD_MAGIC_V1.len()
@@ -768,7 +1389,12 @@ mod tests {
             + 2
             + "application/octet-stream".len();
         wrong_length[length_offset + 7] ^= 0x01;
-        assert!(AuthenticatedChunkPayloadHeaderV1::parse_framed(&wrong_length).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &wrong_length,
+            &content_key,
+        )
+        .is_err());
 
         let mut wrong_type = framed.clone();
         let type_offset = PAYLOAD_MAGIC_V1.len()
@@ -779,7 +1405,12 @@ mod tests {
             + PAYLOAD_SUITE_ID_V1.len()
             + 2;
         wrong_type[type_offset] ^= 0x01;
-        assert!(open_payload_for_tests(&wrong_type, &content_key).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            metadata.encrypted_content_identity(),
+            &wrong_type,
+            &content_key,
+        )
+        .is_err());
     }
 
     #[test]
@@ -792,13 +1423,21 @@ mod tests {
             [0x61; PAYLOAD_BASE_NONCE_BYTES_V1],
         )
         .unwrap();
-        assert!(
-            AuthenticatedChunkPayloadHeaderV1::parse_framed(&framed[..framed.len() - 1]).is_err()
-        );
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            &payload_identity_for_tests(&framed),
+            &framed[..framed.len() - 1],
+            &content_key,
+        )
+        .is_err());
 
         let mut trailing = framed.clone();
         trailing.push(0);
-        assert!(AuthenticatedChunkPayloadHeaderV1::parse_framed(&trailing).is_err());
+        assert!(decrypt_payload_to_vec_with_content_key_for_tests(
+            &payload_identity_for_tests(&framed),
+            &trailing,
+            &content_key,
+        )
+        .is_err());
     }
 
     #[test]
@@ -814,20 +1453,209 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            open_payload_for_tests(&framed, &wrong_key),
+            decrypt_payload_to_vec_with_content_key_for_tests(
+                metadata.encrypted_content_identity(),
+                &framed,
+                &wrong_key,
+            ),
             Err(CustodyError::ContentKeyCommitmentMismatch)
         ));
 
         let mut wrong_commitment = framed.clone();
-        let commitment_offset = wrong_commitment.len()
-            - usize::try_from(metadata.header().plaintext_bytes()).unwrap()
-            - 32;
+        let commitment_offset = framed_prefix_end_for_tests(&wrong_commitment) - 32;
         wrong_commitment[commitment_offset] ^= 0x01;
         assert!(matches!(
-            open_payload_for_tests(&wrong_commitment, &content_key),
+            decrypt_payload_to_vec_with_content_key_for_tests(
+                &payload_identity_for_tests(&wrong_commitment),
+                &wrong_commitment,
+                &content_key,
+            ),
             Err(CustodyError::ContentKeyCommitmentMismatch)
-                | Err(CustodyError::InvalidPayload("payload_chunk"))
         ));
+    }
+
+    #[test]
+    fn decrypt_output_round_trips_through_sealing_reconstruction_and_authenticated_output() {
+        let fixture =
+            authenticated_decrypt_fixture(vec![
+                0x7a;
+                usize::try_from(PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1)
+                    .unwrap()
+                    + 257
+            ]);
+        let mut reader = std::io::Cursor::new(fixture.framed.clone());
+        let mut plaintext = Vec::new();
+        let metadata = decrypt_payload_to_staging_writer_from_authenticated_operation_v1(
+            &mut reader,
+            &mut plaintext,
+            AuthenticatedPayloadDecryptInputsV1 {
+                expected_encrypted_content_identity: fixture.sealed.encrypted_content_identity(),
+                operation: &fixture.operation,
+                envelope: fixture.sealed.custody_envelope(),
+                contributions: &fixture.contributions,
+                terminal_receipt: &fixture.terminal,
+                expected_terminal_issuer: fixture.terminal_issuer,
+                recipient_secret: &fixture.recipient_secret,
+                now: crate::test_support::NOW + 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.content_type(),
+            fixture.sealed.header().content_type()
+        );
+        assert_eq!(
+            metadata.plaintext_bytes(),
+            fixture.sealed.header().plaintext_bytes()
+        );
+        assert_eq!(plaintext, fixture.plaintext);
+    }
+
+    #[test]
+    fn decrypt_output_rejects_wrong_ciphertext_before_any_plaintext_write() {
+        let fixture = authenticated_decrypt_fixture(b"identity mismatch".to_vec());
+        let mut tampered = fixture.framed.clone();
+        tampered[0] ^= 0x01;
+        let mut reader = std::io::Cursor::new(tampered);
+        let mut plaintext = Vec::new();
+        let err = decrypt_payload_to_staging_writer_from_authenticated_operation_v1(
+            &mut reader,
+            &mut plaintext,
+            AuthenticatedPayloadDecryptInputsV1 {
+                expected_encrypted_content_identity: fixture.sealed.encrypted_content_identity(),
+                operation: &fixture.operation,
+                envelope: fixture.sealed.custody_envelope(),
+                contributions: &fixture.contributions,
+                terminal_receipt: &fixture.terminal,
+                expected_terminal_issuer: fixture.terminal_issuer,
+                recipient_secret: &fixture.recipient_secret,
+                now: crate::test_support::NOW + 8,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, CustodyError::InvalidPayload("payload_magic")));
+        assert!(plaintext.is_empty());
+    }
+
+    #[test]
+    fn decrypt_output_rejects_wrong_operation_binding_and_invalid_contribution_sets() {
+        let fixture = authenticated_decrypt_fixture(b"binding checks".to_vec());
+        let mut wrong_operation_reader = std::io::Cursor::new(fixture.framed.clone());
+        let wrong_operation = authenticated_runtime_release_operation_for_sealed_envelope_for_tests(
+            fixture.sealed.encrypted_content_identity().clone(),
+            fixture.sealed.custody_envelope(),
+            0x31,
+        );
+        let mut plaintext = Vec::new();
+        assert!(
+            decrypt_payload_to_staging_writer_from_authenticated_operation_v1(
+                &mut wrong_operation_reader,
+                &mut plaintext,
+                AuthenticatedPayloadDecryptInputsV1 {
+                    expected_encrypted_content_identity: fixture
+                        .sealed
+                        .encrypted_content_identity(),
+                    operation: &wrong_operation,
+                    envelope: fixture.sealed.custody_envelope(),
+                    contributions: &fixture.contributions,
+                    terminal_receipt: &fixture.terminal,
+                    expected_terminal_issuer: fixture.terminal_issuer,
+                    recipient_secret: &fixture.recipient_secret,
+                    now: crate::test_support::NOW + 8,
+                },
+            )
+            .is_err()
+        );
+        assert!(plaintext.is_empty());
+
+        let mut insufficient_reader = std::io::Cursor::new(fixture.framed.clone());
+        let mut insufficient_plaintext = Vec::new();
+        assert!(
+            decrypt_payload_to_staging_writer_from_authenticated_operation_v1(
+                &mut insufficient_reader,
+                &mut insufficient_plaintext,
+                AuthenticatedPayloadDecryptInputsV1 {
+                    expected_encrypted_content_identity: fixture
+                        .sealed
+                        .encrypted_content_identity(),
+                    operation: &fixture.operation,
+                    envelope: fixture.sealed.custody_envelope(),
+                    contributions: &fixture.contributions[..1],
+                    terminal_receipt: &fixture.terminal,
+                    expected_terminal_issuer: fixture.terminal_issuer,
+                    recipient_secret: &fixture.recipient_secret,
+                    now: crate::test_support::NOW + 8,
+                },
+            )
+            .is_err()
+        );
+        assert!(insufficient_plaintext.is_empty());
+
+        let mut duplicate_reader = std::io::Cursor::new(fixture.framed.clone());
+        let mut duplicate_plaintext = Vec::new();
+        let duplicate_contributions = vec![
+            fixture.contributions[0].clone(),
+            fixture.contributions[0].clone(),
+        ];
+        assert!(
+            decrypt_payload_to_staging_writer_from_authenticated_operation_v1(
+                &mut duplicate_reader,
+                &mut duplicate_plaintext,
+                AuthenticatedPayloadDecryptInputsV1 {
+                    expected_encrypted_content_identity: fixture
+                        .sealed
+                        .encrypted_content_identity(),
+                    operation: &fixture.operation,
+                    envelope: fixture.sealed.custody_envelope(),
+                    contributions: &duplicate_contributions,
+                    terminal_receipt: &fixture.terminal,
+                    expected_terminal_issuer: fixture.terminal_issuer,
+                    recipient_secret: &fixture.recipient_secret,
+                    now: crate::test_support::NOW + 8,
+                },
+            )
+            .is_err()
+        );
+        assert!(duplicate_plaintext.is_empty());
+
+        let mut mixed_reader = std::io::Cursor::new(fixture.framed);
+        let mut mixed_plaintext = Vec::new();
+        let wrong_request = verified_release_request_for_sealed_envelope_for_tests(
+            fixture.sealed.encrypted_content_identity().clone(),
+            fixture.sealed.custody_envelope(),
+            0x31,
+        );
+        let mixed_contributions = vec![
+            fixture.contributions[0].clone(),
+            released_contribution(
+                &wrong_request,
+                fixture.sealed.custody_envelope(),
+                fixture.sealed.encrypted_content_identity().clone(),
+                2,
+                0x31,
+                0x73,
+            ),
+        ];
+        assert!(
+            decrypt_payload_to_staging_writer_from_authenticated_operation_v1(
+                &mut mixed_reader,
+                &mut mixed_plaintext,
+                AuthenticatedPayloadDecryptInputsV1 {
+                    expected_encrypted_content_identity: fixture
+                        .sealed
+                        .encrypted_content_identity(),
+                    operation: &fixture.operation,
+                    envelope: fixture.sealed.custody_envelope(),
+                    contributions: &mixed_contributions,
+                    terminal_receipt: &fixture.terminal,
+                    expected_terminal_issuer: fixture.terminal_issuer,
+                    recipient_secret: &fixture.recipient_secret,
+                    now: crate::test_support::NOW + 8,
+                },
+            )
+            .is_err()
+        );
+        assert!(mixed_plaintext.is_empty());
     }
 
     #[test]
@@ -977,6 +1805,31 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_output_writer_failure_returns_no_success_metadata() {
+        let content_key = ContentEncryptionKeyV1::from_test_bytes([0x44; 32]);
+        let (framed, metadata) = seal_payload_to_vec_with_test_material(
+            "application/octet-stream",
+            &[0x33; 4096],
+            &content_key,
+            [0x73; PAYLOAD_BASE_NONCE_BYTES_V1],
+        )
+        .unwrap();
+        let mut reader = std::io::Cursor::new(framed);
+        let mut writer = FailAfterWriter {
+            limit: 0,
+            written: 0,
+        };
+        let err = decrypt_payload_to_staging_writer_with_content_key_v1(
+            metadata.encrypted_content_identity(),
+            &mut reader,
+            &mut writer,
+            &content_key,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CustodyError::PayloadIo));
+    }
+
+    #[test]
     fn payload_partial_writer_failure_returns_no_complete_object() {
         let content_key = ContentEncryptionKeyV1::from_test_bytes([0x44; 32]);
         let mut reader = std::io::Cursor::new(vec![0x11; 4096]);
@@ -1033,11 +1886,29 @@ mod tests {
                 )
             )
         ));
-        let (header, decrypted) = open_payload_for_tests(&staged, &content_key).unwrap();
+        let (decrypted_metadata, decrypted) = decrypt_payload_to_vec_with_content_key_for_tests(
+            &payload_identity_for_tests(&staged),
+            &staged,
+            &content_key,
+        )
+        .unwrap();
         assert_eq!(decrypted, plaintext);
         assert_eq!(
             u64::try_from(staged.len()).unwrap(),
-            header.expected_framed_bytes().unwrap()
+            metadata_from_plaintext_for_tests(
+                "application/octet-stream",
+                u64::try_from(plaintext.len()).unwrap(),
+            )
+            .expected_framed_bytes()
+            .unwrap()
+        );
+        assert_eq!(
+            decrypted_metadata.content_type(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            decrypted_metadata.plaintext_bytes(),
+            u64::try_from(plaintext.len()).unwrap()
         );
     }
 
@@ -1082,5 +1953,18 @@ mod tests {
             *slot = *base ^ *derived;
         }
         u64::from_be_bytes(index_bytes)
+    }
+
+    fn metadata_from_plaintext_for_tests(
+        content_type: &str,
+        plaintext_bytes: u64,
+    ) -> AuthenticatedChunkPayloadHeaderV1 {
+        AuthenticatedChunkPayloadHeaderV1::new_authenticated(
+            content_type,
+            plaintext_bytes,
+            [0x11; PAYLOAD_BASE_NONCE_BYTES_V1],
+            ContentEncryptionKeyV1::from_test_bytes([0x44; 32]).commitment(),
+        )
+        .unwrap()
     }
 }

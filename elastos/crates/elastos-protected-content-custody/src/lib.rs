@@ -14,7 +14,9 @@ mod test_support;
 use thiserror::Error;
 
 pub use payload::{
-    seal_payload_to_staging_writer_v1, AuthenticatedChunkPayloadHeaderV1, SealedPayloadMetadataV1,
+    decrypt_payload_to_staging_writer_from_authenticated_operation_v1,
+    seal_payload_to_staging_writer_v1, AuthenticatedChunkPayloadHeaderV1,
+    AuthenticatedPayloadDecryptInputsV1, DecryptedPayloadMetadataV1, SealedPayloadMetadataV1,
     MAX_PAYLOAD_CONTENT_TYPE_BYTES_V1, PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1,
 };
 pub use provision::provision_custody_envelope;
