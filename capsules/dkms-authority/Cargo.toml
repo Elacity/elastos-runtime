@@ -35,6 +35,8 @@ ddrm-envelope = { path = "../ddrm-envelope", features = ["access-grant"] }
 # Shared rights-receipt contract — the node RE-CHECKS authorization in its own boundary (reads the
 # canonical RightsDecisionReceiptV1; defines no new shared type).
 elastos-common = { path = "../../elastos/crates/elastos-common" }
+# Shared leveled logger — subsumes this capsule's bespoke LogLevel/oplog! (Task 8).
+elastos-logger = { path = "../../elastos/crates/elastos-logger" }
 base64 = "0.22"
 hex = "0.4"
 zeroize = "1"

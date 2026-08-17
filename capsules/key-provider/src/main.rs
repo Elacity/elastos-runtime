@@ -755,8 +755,8 @@ fn establish_dkms_session(
             .starts_with("did:")
             .then_some(client.endpoint.as_str())
     });
-    eprintln!(
-        "key-provider: dkms dial {} (transport={})",
+    elastos_logger::log_info!(
+        "dkms dial {} (transport={})",
         client.endpoint,
         if carrier_target.is_some() {
             "carrier"
@@ -890,8 +890,8 @@ fn establish_dkms_session(
         recover_seq: 0,
     };
 
-    eprintln!(
-        "key-provider timing:   connect+preamble ({}) {} ms",
+    elastos_logger::log_trace!(
+        "timing connect+preamble ({}) {} ms",
         client.endpoint,
         t_phase.elapsed().as_millis()
     );
@@ -985,13 +985,13 @@ fn establish_dkms_session(
         .ok_or("dkms node session token is missing an expiry")?;
     conn.session_token = token;
     conn.expires_at = expires_at;
-    eprintln!(
-        "key-provider timing:   hello+channel ({}) {} ms",
+    elastos_logger::log_trace!(
+        "timing hello+channel ({}) {} ms",
         client.endpoint,
         t_phase.elapsed().as_millis()
     );
-    eprintln!(
-        "key-provider: dkms session established ({}) expires_at={expires_at}",
+    elastos_logger::log_info!(
+        "dkms session established ({}) expires_at={expires_at}",
         client.endpoint
     );
     Ok(conn)
@@ -1812,8 +1812,8 @@ impl KeyProvider {
                 Ok(conn) => *guard = Some(Box::new(conn)),
                 Err(err) => return Err(Response::error("not_configured", err)),
             }
-            eprintln!(
-                "key-provider timing: establish session ({}) {} ms",
+            elastos_logger::log_trace!(
+                "timing establish session ({}) {} ms",
                 client.endpoint,
                 t_sess.elapsed().as_millis()
             );
@@ -1835,8 +1835,8 @@ impl KeyProvider {
                 Err(err) => Err(err),
             }
         };
-        eprintln!(
-            "key-provider timing: recover call ({}) {} ms",
+        elastos_logger::log_trace!(
+            "timing recover call ({}) {} ms",
             client.endpoint,
             t_rec.elapsed().as_millis()
         );
@@ -1904,8 +1904,8 @@ impl KeyProvider {
                 }
                 Err(err) => Err(err),
             };
-        eprintln!(
-            "key-provider timing: recover call ({}) {} ms",
+        elastos_logger::log_trace!(
+            "timing recover call ({}) {} ms",
             client_endpoint,
             t_rec.elapsed().as_millis()
         );
@@ -1962,8 +1962,8 @@ impl KeyProvider {
                 .map_err(|_| "dkms pool lock poisoned".to_string())?;
             match guard.remove(&client.endpoint) {
                 Some(c) if c.session_live(now) => {
-                    eprintln!(
-                        "key-provider timing: reuse warm session ({})",
+                    elastos_logger::log_trace!(
+                        "timing reuse warm session ({})",
                         client.endpoint
                     );
                     (c, true)
@@ -1972,8 +1972,8 @@ impl KeyProvider {
                     drop(guard);
                     let t_sess = std::time::Instant::now();
                     let c = establish_dkms_session(client, now)?;
-                    eprintln!(
-                        "key-provider timing: establish session ({}) {} ms",
+                    elastos_logger::log_trace!(
+                        "timing establish session ({}) {} ms",
                         client.endpoint,
                         t_sess.elapsed().as_millis()
                     );
@@ -2007,8 +2007,8 @@ impl KeyProvider {
             // instead of failing closed below quorum. A genuine node outage fails the fresh attempt
             // too and then fails closed.
             Err(outcome) if reused && outcome.is_retryable_on_fresh_session() => {
-                eprintln!(
-                    "key-provider: warm dkms session transport-failed ({}); re-establishing once",
+                elastos_logger::log_warn!(
+                    "warm dkms session transport-failed ({}); re-establishing once",
                     client.endpoint
                 );
                 let mut fresh = establish_dkms_session(client, now)?;
@@ -2208,8 +2208,8 @@ impl KeyProvider {
                 ));
             }
         }
-        eprintln!(
-            "key-provider timing: threshold-with-grace quorum recover ({successes}/{expected} served) {} ms",
+        elastos_logger::log_trace!(
+            "timing threshold-with-grace quorum recover ({successes}/{expected} served) {} ms",
             t_par.elapsed().as_millis()
         );
 
@@ -2950,7 +2950,7 @@ fn serve_conn<R: BufRead, W: Write>(provider: &mut KeyProvider, reader: R, write
         let line = match line {
             Ok(line) => line,
             Err(err) => {
-                eprintln!("key-provider read error: {}", err);
+                elastos_logger::log_error!("read error: {}", err);
                 return false;
             }
         };
@@ -3002,8 +3002,8 @@ fn run_daemon(provider: &mut KeyProvider, sock_path: &str) {
                 }
             }
             let resp = provider.handle(Request::Init { config });
-            eprintln!(
-                "key-provider daemon: self-init -> {}",
+            elastos_logger::log_info!(
+                "daemon: self-init -> {}",
                 serde_json::to_string(&resp).unwrap_or_default()
             );
         }
@@ -3013,25 +3013,25 @@ fn run_daemon(provider: &mut KeyProvider, sock_path: &str) {
     let listener = match UnixListener::bind(sock_path) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("key-provider daemon: cannot bind {sock_path}: {err}");
+            elastos_logger::log_error!("daemon: cannot bind {sock_path}: {err}");
             return;
         }
     };
-    eprintln!(
-        "key-provider daemon: warm provider LISTENING on {sock_path} (node sessions reused across opens)"
+    elastos_logger::log_info!(
+        "daemon: warm provider LISTENING on {sock_path} (node sessions reused across opens)"
     );
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("key-provider daemon: accept error: {err}");
+                elastos_logger::log_warn!("daemon: accept error: {err}");
                 continue;
             }
         };
         let reader = match stream.try_clone() {
             Ok(clone) => BufReader::new(clone),
             Err(err) => {
-                eprintln!("key-provider daemon: connection clone error: {err}");
+                elastos_logger::log_warn!("daemon: connection clone error: {err}");
                 continue;
             }
         };
@@ -3043,8 +3043,15 @@ fn run_daemon(provider: &mut KeyProvider, sock_path: &str) {
 }
 
 fn main() {
-    eprintln!(
-        "key-provider: starting v{} (protected content keys)",
+    {
+        use elastos_logger::{resolve_level, Level, LoggerConfig};
+        // Level: env `KEY_PROVIDER_LOG_LEVEL` then shared `ELASTOS_LOG`, default Info. (No CLI here.)
+        let level = resolve_level(None, &["KEY_PROVIDER_LOG_LEVEL", "ELASTOS_LOG"], Level::Info);
+        elastos_logger::init(LoggerConfig::new("key-provider", level).build());
+    }
+
+    elastos_logger::log_info!(
+        "starting v{} (protected content keys)",
         PROVIDER_VERSION
     );
 
@@ -3055,7 +3062,7 @@ fn main() {
     if let Ok(sock_path) = std::env::var("KEY_PROVIDER_LISTEN") {
         if !sock_path.trim().is_empty() {
             run_daemon(&mut provider, &sock_path);
-            eprintln!("key-provider daemon exiting");
+            elastos_logger::log_info!("daemon exiting");
             return;
         }
     }
@@ -3064,7 +3071,7 @@ fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     serve_conn(&mut provider, stdin.lock(), &mut stdout);
-    eprintln!("key-provider exiting");
+    elastos_logger::log_info!("exiting");
 }
 
 #[cfg(test)]

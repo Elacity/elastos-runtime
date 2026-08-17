@@ -2791,7 +2791,14 @@ fn decode_kid_bytes16(kid_hex: &str) -> Result<[u8; 16], String> {
 }
 
 fn main() {
-    eprintln!("dkms-authority: starting v{PROVIDER_VERSION} (external key authority node)");
+    {
+        use elastos_logger::{resolve_level, Level, LoggerConfig};
+        // Legacy DKMS_AUTHORITY_LOG_LEVEL still works (docker-compose sets it); shared
+        // ELASTOS_LOG is a fallback.
+        let level = resolve_level(None, &["DKMS_AUTHORITY_LOG_LEVEL", "ELASTOS_LOG"], Level::Info);
+        elastos_logger::init(LoggerConfig::new("dkms-authority", level).build());
+    }
+    elastos_logger::log_info!("starting v{PROVIDER_VERSION} (external key authority node)");
     // OFFLINE PROVISIONING (DKMS-7): `dkms-authority provision` (alias `identity`) creates-or-loads
     // the node identity from the operator-owned state root and prints ONLY the PUBLIC identity, then
     // exits. This is the sanctioned way to bring an identity into being — a listener never does it,
@@ -2817,7 +2824,7 @@ fn main() {
     }
     #[cfg(not(unix))]
     serve_stdio();
-    eprintln!("dkms-authority exiting");
+    elastos_logger::log_info!("exiting");
 }
 
 /// DKMS-7: derive the node authority ONCE from the operator-owned state root, BEFORE any listener
@@ -2884,7 +2891,7 @@ fn run_provision() -> i32 {
             0
         }
         Err(err) => {
-            eprintln!("dkms-authority provision: {err}");
+            elastos_logger::log_error!("provision: {err}");
             1
         }
     }
@@ -2947,7 +2954,7 @@ fn serve_stdio() {
         Err(err) => {
             // Corrupt/unreadable/unknown-schema durable security state ⇒ refuse to serve (fail
             // closed), exactly like `serve_socket`/`serve_tcp` do before binding.
-            eprintln!("dkms-authority: cannot start — {err}");
+            elastos_logger::log_error!("cannot start — {err}");
             std::process::exit(1);
         }
     };
@@ -2960,7 +2967,7 @@ fn serve_stdio() {
         let line = match line {
             Ok(line) => line,
             Err(err) => {
-                eprintln!("dkms-authority read error: {err}");
+                elastos_logger::log_error!("read error: {err}");
                 break;
             }
         };
@@ -3000,7 +3007,7 @@ fn serve_socket(path: &str) {
     let authority = match load_daemon_authority() {
         Ok(authority) => authority,
         Err(err) => {
-            eprintln!("dkms-authority: cannot start — {err}");
+            elastos_logger::log_error!("cannot start — {err}");
             std::process::exit(1);
         }
     };
@@ -3014,7 +3021,7 @@ fn serve_socket(path: &str) {
     let listener = match UnixListener::bind(path) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("dkms-authority: failed to bind {path}: {err}");
+            elastos_logger::log_error!("failed to bind {path}: {err}");
             std::process::exit(1);
         }
     };
@@ -3023,7 +3030,7 @@ fn serve_socket(path: &str) {
     // shared across connections — a caller revoked on one connection stays revoked on the next.
     let operator_vk = operator_vk_from_env();
     if operator_vk.is_some() {
-        eprintln!("dkms-authority: operator identity pinned (lifecycle ops enabled)");
+        elastos_logger::log_info!("operator identity pinned (lifecycle ops enabled)");
     }
     // DKMS-6: load + validate the durable security state and hydrate the shared caches BEFORE
     // serving. A corrupt/unverifiable state is a hard startup error (the node never serves with
@@ -3031,11 +3038,11 @@ fn serve_socket(path: &str) {
     let (security, revoked_callers, replay) = match load_daemon_security(operator_vk.clone()) {
         Ok(triple) => triple,
         Err(err) => {
-            eprintln!("dkms-authority: cannot start — {err}");
+            elastos_logger::log_error!("cannot start — {err}");
             std::process::exit(1);
         }
     };
-    eprintln!("dkms-authority: listening on {path}");
+    elastos_logger::log_info!("listening on {path}");
     serve_unix_listener(
         listener,
         authority,
@@ -3047,60 +3054,15 @@ fn serve_socket(path: &str) {
     );
 }
 
-/// Leveled operator logging, configured ONCE from `DKMS_AUTHORITY_LOG_LEVEL`
-/// (`error|warn|info|debug|trace`; default `info`, which preserves the live nodes' current
-/// posture). The dev mesh (scripts/dev/dkms-docker) runs at `debug`, where the node traces every
-/// accepted connection, every parsed request (a SECRET-FREE summary, [`request_summary`]), every
-/// response outcome (ok / error code), and channel establishment; `trace` adds per-frame detail.
+/// Leveled operator logging is provided by the shared `elastos-logger` crate, configured ONCE
+/// at the top of `main()` from `DKMS_AUTHORITY_LOG_LEVEL` (falling back to `ELASTOS_LOG`, then
+/// `info`, which preserves the live nodes' current posture). The dev mesh
+/// (scripts/dev/dkms-docker) runs at `debug` (an alias for the crate's `trace`), where the node
+/// traces every accepted connection, every parsed request (a SECRET-FREE summary,
+/// [`request_summary`]), every response outcome (ok / error code), and channel establishment.
 /// INVARIANT (same as [`counters`]): nothing logged at ANY level is secret — op names,
 /// kid/content/session identifiers, bounded FINGERPRINTS of public values, and error codes only.
 /// No CEK, envelope, seed, token, signature, or share material is ever rendered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum LogLevel {
-    Error = 0,
-    Warn = 1,
-    Info = 2,
-    Debug = 3,
-    Trace = 4,
-}
-
-impl LogLevel {
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "error" => Some(Self::Error),
-            "warn" | "warning" => Some(Self::Warn),
-            "info" => Some(Self::Info),
-            "debug" => Some(Self::Debug),
-            "trace" => Some(Self::Trace),
-            _ => None,
-        }
-    }
-}
-
-/// The configured level, resolved once. An unrecognized value falls back to `info` (never a
-/// silently muted node — misconfiguring the LOG level must not hide fail-closed signals).
-fn log_level() -> LogLevel {
-    static LEVEL: std::sync::OnceLock<LogLevel> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        std::env::var("DKMS_AUTHORITY_LOG_LEVEL")
-            .ok()
-            .and_then(|v| LogLevel::parse(&v))
-            .unwrap_or(LogLevel::Info)
-    })
-}
-
-fn log_enabled(level: LogLevel) -> bool {
-    level <= log_level()
-}
-
-/// Emit one stderr log line iff `$level` is enabled by `DKMS_AUTHORITY_LOG_LEVEL`.
-macro_rules! oplog {
-    ($level:expr, $($arg:tt)*) => {
-        if log_enabled($level) {
-            eprintln!($($arg)*);
-        }
-    };
-}
 
 /// Monotonic id for accepted connections, so interleaved verbose lines from concurrent connection
 /// threads stay attributable. Module-level (NOT a static inside the generic accept loop, which
@@ -3374,12 +3336,12 @@ fn serve_accept_loop<S, I>(
     // Stage 8 observability: emit a baseline ops-counters line as the loop comes up (secret-free —
     // tallies + bounded collection sizes only). After a restart it reads zero, so a non-zero value on
     // this line is a durable-state carry-over the operator can notice.
-    eprintln!("{}", counters::render_line(&replay));
+    elastos_logger::log_info!("{}", counters::render_line(&replay));
     for stream in incoming {
         let stream = match stream {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("dkms-authority: accept error: {err}");
+                elastos_logger::log_warn!("accept error: {err}");
                 continue;
             }
         };
@@ -3387,7 +3349,7 @@ fn serve_accept_loop<S, I>(
         let reader = match stream.split_reader() {
             Ok(reader) => reader,
             Err(err) => {
-                eprintln!("dkms-authority: connection clone failed: {err}");
+                elastos_logger::log_warn!("connection clone failed: {err}");
                 continue;
             }
         };
@@ -3396,12 +3358,12 @@ fn serve_accept_loop<S, I>(
         // spawn an unbounded thread — a slow-loris peer can hold at most the cap, not exhaust us.
         if active.fetch_add(1, Ordering::AcqRel) >= MAX_ACTIVE_CONNECTIONS {
             active.fetch_sub(1, Ordering::AcqRel);
-            eprintln!(
-                "dkms-authority: connection cap reached ({MAX_ACTIVE_CONNECTIONS}) — dropping connection"
+            elastos_logger::log_warn!(
+                "connection cap reached ({MAX_ACTIVE_CONNECTIONS}) — dropping connection"
             );
             // A cap hit is a load/DoS signal: dump the fail-closed counters alongside it so the
             // operator sees replay/quorum pressure at the moment the node starts shedding load.
-            eprintln!("{}", counters::render_line(&replay));
+            elastos_logger::log_info!("{}", counters::render_line(&replay));
             continue;
         }
         let slot = ActiveSlot(Arc::clone(&active));
@@ -3412,10 +3374,7 @@ fn serve_accept_loop<S, I>(
             CONN_SEQ.fetch_add(1, Ordering::Relaxed),
             stream.peer_label()
         );
-        oplog!(
-            LogLevel::Debug,
-            "dkms-authority[{conn_label}]: connection accepted"
-        );
+        elastos_logger::log_trace!("[{conn_label}]: connection accepted");
         let conn_authority = Arc::clone(&authority);
         let allowed = Arc::clone(&allowed_callers);
         let operator = Arc::clone(&operator_vk);
@@ -3483,7 +3442,7 @@ fn serve_tcp(addr: &str) {
     let authority = match load_daemon_authority() {
         Ok(authority) => authority,
         Err(err) => {
-            eprintln!("dkms-authority: cannot start — {err}");
+            elastos_logger::log_error!("cannot start — {err}");
             std::process::exit(1);
         }
     };
@@ -3493,24 +3452,24 @@ fn serve_tcp(addr: &str) {
     let listener = match TcpListener::bind(addr) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("dkms-authority: failed to bind tcp:{addr}: {err}");
+            elastos_logger::log_error!("failed to bind tcp:{addr}: {err}");
             std::process::exit(1);
         }
     };
     let operator_vk = operator_vk_from_env();
     if operator_vk.is_some() {
-        eprintln!("dkms-authority: operator identity pinned (lifecycle ops enabled)");
+        elastos_logger::log_info!("operator identity pinned (lifecycle ops enabled)");
     }
     // DKMS-6: load + validate durable security state and hydrate the caches before the hostile
     // network listener serves anything (fail closed on a corrupt/unverifiable state).
     let (security, revoked_callers, replay) = match load_daemon_security(operator_vk.clone()) {
         Ok(triple) => triple,
         Err(err) => {
-            eprintln!("dkms-authority: cannot start — {err}");
+            elastos_logger::log_error!("cannot start — {err}");
             std::process::exit(1);
         }
     };
-    eprintln!("dkms-authority: listening on tcp:{addr}");
+    elastos_logger::log_info!("listening on tcp:{addr}");
     serve_tcp_listener(
         listener,
         authority,
@@ -3708,15 +3667,15 @@ fn caller_policy_from_env() -> Result<CallerPolicy, ConfigError> {
 fn resolve_caller_policy_or_exit() -> Option<Vec<Vec<u8>>> {
     match caller_policy_from_env() {
         Ok(CallerPolicy::Anonymous) => {
-            eprintln!(
-                "dkms-authority: caller policy = ANONYMOUS (explicit opt-in; any well-formed caller \
+            elastos_logger::log_info!(
+                "caller policy = ANONYMOUS (explicit opt-in; any well-formed caller \
                  may hello — recover still requires a trustless grant)"
             );
             CallerPolicy::Anonymous.into_allowed_callers()
         }
         Ok(CallerPolicy::AllowListed(list)) => {
-            eprintln!(
-                "dkms-authority: caller policy = ALLOW-LIST ({} entr{} enforced)",
+            elastos_logger::log_info!(
+                "caller policy = ALLOW-LIST ({} entr{} enforced)",
                 list.len(),
                 if list.len() == 1 { "y" } else { "ies" }
             );
@@ -3724,7 +3683,7 @@ fn resolve_caller_policy_or_exit() -> Option<Vec<Vec<u8>>> {
         }
         Err(err) => {
             counters::incr(&counters::INVALID_ALLOW_LIST);
-            eprintln!("dkms-authority: cannot start — {err}");
+            elastos_logger::log_error!("cannot start — {err}");
             std::process::exit(1);
         }
     }
@@ -3809,9 +3768,8 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             Ok(None) => break, // clean half-close at a frame boundary
             Err(err) => {
                 // Torn/oversized/hostile frame: refuse + drop the connection (the listener serves on).
-                oplog!(
-                    LogLevel::Warn,
-                    "dkms-authority[{conn_label}]: framing error, dropping connection: {err}"
+                elastos_logger::log_warn!(
+                    "[{conn_label}]: framing error, dropping connection: {err}"
                 );
                 if channel.is_none() {
                     let _ = write_frame(
@@ -3834,7 +3792,7 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                 let env = match ddrm_envelope::PqSealedEnvelope::from_bytes(&raw) {
                     Ok(env) => env,
                     Err(_) => {
-                        oplog!(LogLevel::Warn, "dkms-authority[{conn_label}]: PLAINTEXT/garbled frame on an established channel — dropping connection (no downgrade)");
+                        elastos_logger::log_warn!("[{conn_label}]: PLAINTEXT/garbled frame on an established channel — dropping connection (no downgrade)");
                         break;
                     }
                 };
@@ -3855,7 +3813,7 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                     // order. Integrity is the seal above; padding is metadata-hiding only.
                     Ok(opened) => ddrm_envelope::channel_pad::unpad_incoming(&opened),
                     Err(_) => {
-                        oplog!(LogLevel::Warn, "dkms-authority[{conn_label}]: sealed frame failed to open (tampered/replayed/wrong key) — dropping connection");
+                        elastos_logger::log_warn!("[{conn_label}]: sealed frame failed to open (tampered/replayed/wrong key) — dropping connection");
                         break;
                     }
                 }
@@ -3865,9 +3823,8 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             Ok(request) => request,
             Err(err) => {
                 // serde errors carry field names/positions, never payload values — secret-free.
-                oplog!(
-                    LogLevel::Debug,
-                    "dkms-authority[{conn_label}]: <- unparseable request ({err})"
+                elastos_logger::log_trace!(
+                    "[{conn_label}]: <- unparseable request ({err})"
                 );
                 let resp = Response::error("invalid_request", err.to_string());
                 if respond(&mut writer, &mut channel, &node, &resp).is_err() {
@@ -3876,14 +3833,12 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                 continue;
             }
         };
-        oplog!(
-            LogLevel::Debug,
-            "dkms-authority[{conn_label}]: <- {}",
+        elastos_logger::log_trace!(
+            "[{conn_label}]: <- {}",
             request_summary(&request)
         );
-        oplog!(
-            LogLevel::Trace,
-            "dkms-authority[{conn_label}]: frame detail: {} payload bytes, {}",
+        elastos_logger::log_trace!(
+            "[{conn_label}]: frame detail: {} payload bytes, {}",
             payload.len(),
             if channel.is_some() {
                 "sealed channel frame"
@@ -3909,9 +3864,8 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
                     | Request::DkgInstall { .. }
             )
         {
-            oplog!(
-                LogLevel::Debug,
-                "dkms-authority[{conn_label}]: -> {} error code=channel_required",
+            elastos_logger::log_trace!(
+                "[{conn_label}]: -> {} error code=channel_required",
                 op_name(&request)
             );
             let resp = Response::error(
@@ -3944,11 +3898,10 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
         let accepted = matches!(response, Response::Ok { .. });
         match &response {
             Response::Ok { .. } => {
-                oplog!(LogLevel::Debug, "dkms-authority[{conn_label}]: -> {op} ok")
+                elastos_logger::log_trace!("[{conn_label}]: -> {op} ok")
             }
-            Response::Error { code, message } => oplog!(
-                LogLevel::Debug,
-                "dkms-authority[{conn_label}]: -> {op} error code={code} ({})",
+            Response::Error { code, message } => elastos_logger::log_trace!(
+                "[{conn_label}]: -> {op} error code={code} ({})",
                 bounded(message)
             ),
         }
@@ -3974,15 +3927,14 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             };
             match establish() {
                 Some(state) => {
-                    oplog!(
-                        LogLevel::Debug,
-                        "dkms-authority[{conn_label}]: encrypted channel established (caller_vk={}) — all further frames sealed",
+                    elastos_logger::log_trace!(
+                        "[{conn_label}]: encrypted channel established (caller_vk={}) — all further frames sealed",
                         fp(&caller_b64)
                     );
                     channel = Some(state);
                 }
                 None => {
-                    oplog!(LogLevel::Warn, "dkms-authority[{conn_label}]: channel establishment failed after an accepted hello — dropping connection");
+                    elastos_logger::log_warn!("[{conn_label}]: channel establishment failed after an accepted hello — dropping connection");
                     break;
                 }
             }
@@ -3991,10 +3943,7 @@ fn serve_connection_io<R: io::Read, W: io::Write>(
             break;
         }
     }
-    oplog!(
-        LogLevel::Debug,
-        "dkms-authority[{conn_label}]: connection closed"
-    );
+    elastos_logger::log_trace!("[{conn_label}]: connection closed");
     // No write-back needed: `node.revoked_callers` IS the shared daemon-lifetime set (an `Arc`
     // clone), so every revocation was already published to all connections the instant it landed.
 }
@@ -4865,10 +4814,11 @@ mod tests {
 
     /// The debug trace never renders secrets: a recover's [`request_summary`] carries the PUBLIC
     /// bindings (kid/content/principal/session/right/seq) and NEVER the escrowed envelope, token
-    /// signature, or possession-proof material — the same invariant [`counters`] holds. Also pins
-    /// the `DKMS_AUTHORITY_LOG_LEVEL` grammar (case-insensitive names, severity ordering).
+    /// signature, or possession-proof material — the same invariant [`counters`] holds.
+    /// (The `DKMS_AUTHORITY_LOG_LEVEL` grammar itself is now the shared `elastos-logger` crate's
+    /// job — see its own `level::tests`.)
     #[test]
-    fn request_summary_is_secret_free_and_log_levels_parse() {
+    fn request_summary_is_secret_free() {
         // Stands in for every sealed/secret base64 field; must never appear in the summary.
         let secret_marker = "U0VDUkVUX0NFS19CWVRFUw==";
         let req: Request = serde_json::from_value(json!({
@@ -4897,14 +4847,6 @@ mod tests {
             !line.contains('\n') && line.len() < 512,
             "one bounded line: {line}"
         );
-
-        // Level grammar: case-insensitive names; unknown values are refused (the resolver then
-        // falls back to `info`, never a muted node); severity orders error < … < trace.
-        assert_eq!(LogLevel::parse("DEBUG"), Some(LogLevel::Debug));
-        assert_eq!(LogLevel::parse(" warn "), Some(LogLevel::Warn));
-        assert_eq!(LogLevel::parse("nonsense"), None);
-        assert!(LogLevel::Error < LogLevel::Warn && LogLevel::Warn < LogLevel::Info);
-        assert!(LogLevel::Info < LogLevel::Debug && LogLevel::Debug < LogLevel::Trace);
     }
 
     /// Fail-closed protocol surface (Principle 11): the empty variants must REJECT unknown fields.

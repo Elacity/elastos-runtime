@@ -14,6 +14,7 @@ COPY capsules/ddrm-envelope capsules/ddrm-envelope
 COPY capsules/dkms-authority capsules/dkms-authority
 COPY capsules/dkms-keygen capsules/dkms-keygen
 COPY elastos/crates/elastos-common elastos/crates/elastos-common
+COPY elastos/crates/elastos-logger elastos/crates/elastos-logger
 # elastos-common embeds the bus contract at compile time (include_bytes! in manifest.rs)
 COPY elastos/wit elastos/wit
 COPY scripts/dev/dkms-carrier-node scripts/dev/dkms-carrier-node

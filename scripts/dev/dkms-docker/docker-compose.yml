@@ -30,12 +30,13 @@ x-node: &node
     # computes it from the assembled descriptor (b64(SHA-256 over t + the ordered node
     # vks)) and fills this via .env after the identities are published.
     DKMS_AUTHORITY_NODE_SET_ID_B64: ${DKMS_AUTHORITY_NODE_SET_ID_B64:-}
-    # Log levels (error|warn|info|debug|trace; live-node default is info). The dev mesh runs
-    # at debug so EVERY inbound connection, handshake (hello/channel establishment), recover,
-    # and its outcome is traced — as secret-free summaries (op, kid, content/principal/session
-    # ids, key fingerprints; never key/envelope material). trace adds per-frame detail.
-    DKMS_AUTHORITY_LOG_LEVEL: ${DKMS_AUTHORITY_LOG_LEVEL:-debug}
-    DKMS_CARRIER_NODE_LOG_LEVEL: ${DKMS_CARRIER_NODE_LOG_LEVEL:-debug}
+    # Log levels (critical|error|warn|info|trace; `debug` is accepted as an alias for `trace`;
+    # live-node default is info). The dev mesh runs at TRACE — the most verbose — so EVERY inbound
+    # connection, handshake (hello/channel establishment), recover, and its outcome is traced,
+    # plus per-frame detail — as secret-free summaries (op, kid, content/principal/session ids,
+    # key fingerprints; NEVER key/envelope material).
+    DKMS_AUTHORITY_LOG_LEVEL: ${DKMS_AUTHORITY_LOG_LEVEL:-trace}
+    DKMS_CARRIER_NODE_LOG_LEVEL: ${DKMS_CARRIER_NODE_LOG_LEVEL:-trace}
   volumes:
     - ./shared:/shared
 

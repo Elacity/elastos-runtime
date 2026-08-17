@@ -1630,6 +1630,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elastos-logger"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2 0.10.9",
+ "time",
+]
+
+[[package]]
 name = "elastos-namespace"
 version = "0.6.0"
 dependencies = [

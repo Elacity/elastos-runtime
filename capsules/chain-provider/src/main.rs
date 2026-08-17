@@ -2318,11 +2318,17 @@ fn is_contract_revert(resp: &Response) -> bool {
 }
 
 fn main() {
-    eprintln!("chain-provider: starting v{} (typed RPC)", PROVIDER_VERSION);
+    {
+        use elastos_logger::{resolve_level, Level, LoggerConfig};
+        let level = resolve_level(None, &["CHAIN_PROVIDER_LOG_LEVEL", "ELASTOS_LOG"], Level::Info);
+        elastos_logger::init(LoggerConfig::new("chain-provider", level).build());
+    }
+
+    elastos_logger::log_info!("starting v{} (typed RPC)", PROVIDER_VERSION);
 
     let info = CapsuleInfo::from_env();
     if info.is_elastos_runtime() {
-        eprintln!("Running as: {} ({})", info.name(), info.id());
+        elastos_logger::log_info!("running as: {} ({})", info.name(), info.id());
     }
 
     let mut provider = ChainProvider::new();
@@ -2333,7 +2339,7 @@ fn main() {
         let line = match line {
             Ok(line) => line,
             Err(err) => {
-                eprintln!("chain-provider read error: {}", err);
+                elastos_logger::log_error!("read error: {}", err);
                 break;
             }
         };
@@ -2359,5 +2365,5 @@ fn main() {
         }
     }
 
-    eprintln!("chain-provider exiting");
+    elastos_logger::log_info!("exiting");
 }

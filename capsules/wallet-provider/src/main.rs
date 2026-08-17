@@ -987,10 +987,13 @@ fn write_response(response: &Response) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    eprintln!(
-        "wallet-provider: starting v{} (metadata authority)",
-        PROVIDER_VERSION
-    );
+    {
+        use elastos_logger::{resolve_level, Level, LoggerConfig};
+        let level = resolve_level(None, &["WALLET_PROVIDER_LOG_LEVEL", "ELASTOS_LOG"], Level::Info);
+        elastos_logger::init(LoggerConfig::new("wallet-provider", level).build());
+    }
+
+    elastos_logger::log_info!("starting v{} (metadata authority)", PROVIDER_VERSION);
     let stdin = io::stdin();
     let mut provider = WalletProvider::new();
     for line in stdin.lock().lines() {
@@ -1016,7 +1019,7 @@ fn main() -> io::Result<()> {
             break;
         }
     }
-    eprintln!("wallet-provider: exiting");
+    elastos_logger::log_info!("exiting");
     Ok(())
 }
 

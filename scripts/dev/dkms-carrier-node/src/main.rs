@@ -34,51 +34,12 @@ use tokio::net::TcpStream;
 /// The Carrier ALPN this transport multiplexes. Must match `dkms-carrier-client`.
 const DKMS_AUTHORITY_ALPN: &[u8] = b"elastos/dkms-authority/1";
 
-/// Leveled stderr logging, configured once from `DKMS_CARRIER_NODE_LOG_LEVEL`
-/// (`error|warn|info|debug|trace`; default `info`). At `debug` the bridge traces every inbound
+/// Leveled logging is provided by the shared `elastos-logger` crate, configured once at the
+/// top of `main()` from `DKMS_CARRIER_NODE_LOG_LEVEL` (falling back to `ELASTOS_LOG`, then
+/// `info`). At `trace` (the crate's alias for legacy `debug`) the bridge traces every inbound
 /// Carrier connection (the dialer's endpoint id), every relayed stream, and the byte counts each
 /// stream moved. Secret-free by construction: the relay only ever sees ciphertext, and it logs
 /// only peer ids, the target address, and byte tallies — never payload bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum LogLevel {
-    Error = 0,
-    Warn = 1,
-    Info = 2,
-    Debug = 3,
-    Trace = 4,
-}
-
-fn log_level() -> LogLevel {
-    static LEVEL: std::sync::OnceLock<LogLevel> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        match std::env::var("DKMS_CARRIER_NODE_LOG_LEVEL")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "error" => LogLevel::Error,
-            "warn" | "warning" => LogLevel::Warn,
-            "debug" => LogLevel::Debug,
-            "trace" => LogLevel::Trace,
-            // "info", unset, and anything unrecognized: the default posture.
-            _ => LogLevel::Info,
-        }
-    })
-}
-
-fn log_enabled(level: LogLevel) -> bool {
-    level <= log_level()
-}
-
-/// Emit one stderr log line iff `$level` is enabled by `DKMS_CARRIER_NODE_LOG_LEVEL`.
-macro_rules! oplog {
-    ($level:expr, $($arg:tt)*) => {
-        if log_enabled($level) {
-            eprintln!($($arg)*);
-        }
-    };
-}
 const DEFAULT_TARGET: &str = "10.66.66.1:9443";
 const DEFAULT_SEED_PATH: &str = "/var/lib/elastos/dkms/carrier.seed";
 /// Bound how long we wait for a relay/online before we begin serving (best-effort:
@@ -108,10 +69,7 @@ async fn handle_connection(conn: iroh::endpoint::Connection, target: Arc<String>
     // trace. This authenticates the TRANSPORT peer only; end-to-end identity/authorization stays
     // between key-provider and dkms-authority.
     let remote = conn.remote_id().to_string();
-    oplog!(
-        LogLevel::Debug,
-        "dkms-carrier-node: inbound carrier connection from {remote}"
-    );
+    elastos_logger::log_trace!("inbound carrier connection from {remote}");
     // `key-provider` opens one bi-stream per session and runs init/hello/recover/shutdown
     // over it. A connection may carry more than one stream; relay each independently.
     let mut streams = 0u64;
@@ -121,30 +79,26 @@ async fn handle_connection(conn: iroh::endpoint::Connection, target: Arc<String>
             Err(_) => break, // peer closed the connection: stop accepting on it
         };
         streams += 1;
-        oplog!(
-            LogLevel::Debug,
-            "dkms-carrier-node: [{remote}] stream {streams} opened — relaying to dkms-authority at {target}"
+        elastos_logger::log_trace!(
+            "[{remote}] stream {streams} opened — relaying to dkms-authority at {target}"
         );
         let target = target.clone();
         let remote = remote.clone();
         tokio::spawn(async move {
             match relay_stream(send, recv, &target).await {
-                Ok((to_node, to_client)) => oplog!(
-                    LogLevel::Debug,
-                    "dkms-carrier-node: [{remote}] stream closed ({to_node} B client->node, {to_client} B node->client)"
+                Ok((to_node, to_client)) => elastos_logger::log_trace!(
+                    "[{remote}] stream closed ({to_node} B client->node, {to_client} B node->client)"
                 ),
                 Err(err) => {
-                    oplog!(
-                        LogLevel::Warn,
-                        "dkms-carrier-node: [{remote}] stream relay ended with error: {err:#}"
+                    elastos_logger::log_warn!(
+                        "[{remote}] stream relay ended with error: {err:#}"
                     );
                 }
             }
         });
     }
-    oplog!(
-        LogLevel::Debug,
-        "dkms-carrier-node: carrier connection from {remote} closed ({streams} stream(s) served)"
+    elastos_logger::log_trace!(
+        "carrier connection from {remote} closed ({streams} stream(s) served)"
     );
     Ok(())
 }
@@ -182,6 +136,14 @@ async fn relay_stream(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    {
+        use elastos_logger::{resolve_level, Level, LoggerConfig};
+        // Legacy DKMS_CARRIER_NODE_LOG_LEVEL still works (docker-compose sets it); shared
+        // ELASTOS_LOG is a fallback.
+        let level = resolve_level(None, &["DKMS_CARRIER_NODE_LOG_LEVEL", "ELASTOS_LOG"], Level::Info);
+        elastos_logger::init(LoggerConfig::new("dkms-carrier-node", level).build());
+    }
+
     let mut args = std::env::args().skip(1);
     let target = args
         .next()
@@ -243,12 +205,12 @@ async fn main() -> Result<()> {
     // Best-effort: wait for a relay so our address publishes to the DHT promptly.
     let _ = tokio::time::timeout(Duration::from_secs(ONLINE_TIMEOUT_SECS), endpoint.online()).await;
 
-    eprintln!(
-        "dkms-carrier-node: bridging Carrier ALPN '{}' -> dkms-authority at {}",
+    elastos_logger::log_info!(
+        "bridging Carrier ALPN '{}' -> dkms-authority at {}",
         String::from_utf8_lossy(DKMS_AUTHORITY_ALPN),
         target
     );
-    eprintln!("dkms-carrier-node: node DID {did}");
+    elastos_logger::log_info!("node DID {did}");
     // stdout carries ONLY the did so tooling can capture it for the descriptor.
     println!("{did}");
 

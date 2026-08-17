@@ -25,6 +25,8 @@ name = "dkms-carrier-node"
 path = "src/main.rs"
 
 [dependencies]
+# Shared leveled logger — subsumes this bin's bespoke LogLevel/oplog! (Task 8).
+elastos-logger = { path = "../../../elastos/crates/elastos-logger" }
 iroh = { version = "0.96", features = ["address-lookup-mdns"] }
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 futures-lite = "2.6"
