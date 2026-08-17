@@ -709,11 +709,11 @@ and review items pass.
 
 ### Trusted content and access rights
 
-The published source-only protected-content stack now has three review branches
-through `origin/feat/protected-content-key-reconstruction`: canonical
-contracts, custody and node operations, then decrypt-boundary reconstruction.
-Remaining work must stay in this order. Carrier remains transport only
-throughout every stage below.
+The published source-only protected-content stack currently ends at
+`origin/feat/protected-content-key-reconstruction`: canonical contracts,
+custody and node operations, then decrypt-boundary reconstruction. Remaining
+work must stay in this order. Carrier remains transport only throughout every
+stage below.
 
 The published custody branch defines the source-only EVM
 `has_access_by_content_id` policy/evidence contract, including the exact
@@ -816,6 +816,15 @@ Runtime release operation; there is no operation-resume journal for that state.
   contributions or raw keys. Bind the fresh opaque contract value to the
   verified session in Runtime state; never place a session ID, session cookie,
   launch token, capability token, or bearer credential in the contract.
+- [ ] Keep the later Runtime open/buy integration aligned with the reviewed
+  authority model: viewer launches must use Home projection authority; Runtime
+  must derive Wallet v2 authority from verified launch authority; Chain may
+  prepare nonce/gas, but approval and broadcast must use the existing durable
+  Runtime transaction coordinator. Do not add Creator-local transaction
+  workflow, broad chain-scan fallback, debug logging flood, CBC envelope, or
+  sidecar/WireGuard/topology path. The public, unmerged PR #15 commits `ffea5998`
+  and `e148218b` are source evidence only, not current code or accepted
+  behavior.
 - [ ] Replace the provisional `elastos_common::protected_content` DTOs and
   their current provider consumers atomically with the reviewed v1 crate during
   the integration slice. Delete the superseded shapes; do not keep parallel

@@ -124,6 +124,14 @@ protected content:
   bound threshold count. Required-plus-one contributions are rejected.
 - It returns only opaque, redacted secret wrappers; it does not expose a
   capsule-visible raw-key API.
+- The local unpublished `feat/protected-content-payload-sealing` child branch
+  adds source-only staged payload sealing inside this same custody crate. That
+  is intentional: keeping CEK generation, commitment, payload encryption,
+  custody-envelope provisioning, and zeroization in one crypto boundary is
+  safer than exposing or duplicating CEK APIs across crates. The sealing API
+  writes only to a staging sink and returns canonical metadata only after both
+  ciphertext staging and custody provisioning succeed; callers must discard
+  staged output after any error.
 - It is source-only. There are no running custody nodes, Runtime/provider
   routes, Runtime-owned replay orchestration, recipient key-possession proof,
   decrypt/render product flow, installation, or deployment in this branch. The

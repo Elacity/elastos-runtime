@@ -44,13 +44,23 @@ the public repository.
   reviewed behavior rejects invalid X25519 contract key bytes before HPKE use,
   requires exactly the bound released threshold, and checks a manifest-bound
   CEK commitment after reconstruction to detect a wrong reconstructed key. The
-  published protected-content stack therefore has three source-only review
-  branches through `a8d0a9a6`. It does not integrate Runtime/provider/Carrier
+  current published protected-content stack therefore ends at `a8d0a9a6` on
+  `origin/feat/protected-content-key-reconstruction`. It does not integrate
+  Runtime/provider/Carrier
   orchestration, Runtime-owned durable replay storage, full operational
   custody state, recipient key-possession proof, product decrypt/render flows,
   installation, or deployment. A durable local claim without a stored result
   fails closed and currently requires a fresh Runtime release operation; there
   is no operation-resume journal for that state.
+- The local unpublished `feat/protected-content-payload-sealing` child branch
+  keeps staged payload sealing inside
+  `elastos-protected-content-custody`. That is an additive custody-extension
+  exception, not a new product path: keeping CEK generation, CEK commitment,
+  custody-envelope provisioning, and zeroization in one crypto boundary is
+  safer than exposing or duplicating CEK APIs across crates. The staging writer
+  returns canonical metadata only after ciphertext staging and custody
+  provisioning both succeed; callers must discard staged output after every
+  error. This branch is source-only and unpublished.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
