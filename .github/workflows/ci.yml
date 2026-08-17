@@ -69,9 +69,13 @@ jobs:
         # Run them explicitly with: cargo test --workspace -- --ignored
 
   source-home-linux:
-    name: source-home-linux
-    runs-on: ubuntu-latest
+    name: source-home-linux (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -82,7 +86,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: elastos
-          prefix-key: ${{ runner.os }}-elastos
+          prefix-key: ${{ runner.os }}-${{ runner.arch }}-elastos
       - name: source-home into isolated HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
@@ -109,7 +113,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: source-home-linux-logs
+          name: source-home-linux-${{ matrix.os }}-logs
           path: ${{ runner.temp }}/source-home-logs/
           retention-days: 7
           if-no-files-found: ignore
