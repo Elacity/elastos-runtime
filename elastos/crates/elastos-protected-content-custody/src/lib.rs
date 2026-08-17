@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod hpke_helpers;
+mod payload;
 mod provision;
 mod reconstruct;
 mod release;
@@ -12,6 +13,10 @@ mod test_support;
 
 use thiserror::Error;
 
+pub use payload::{
+    seal_payload_to_staging_writer_v1, AuthenticatedChunkPayloadHeaderV1, SealedPayloadMetadataV1,
+    MAX_PAYLOAD_CONTENT_TYPE_BYTES_V1, PAYLOAD_PLAINTEXT_CHUNK_BYTES_V1,
+};
 pub use provision::provision_custody_envelope;
 pub use reconstruct::reconstruct_content_key_from_authenticated_operation;
 pub use replay_store::DurableReplayClaimStoreV1;
@@ -46,6 +51,10 @@ pub enum CustodyError {
     MalformedShare(&'static str),
     #[error("reconstructed content key does not match the envelope commitment")]
     ContentKeyCommitmentMismatch,
+    #[error("payload framing is invalid: {0}")]
+    InvalidPayload(&'static str),
+    #[error("payload I/O failed")]
+    PayloadIo,
     #[error("required cryptographic randomness is unavailable")]
     RandomnessUnavailable,
 }
