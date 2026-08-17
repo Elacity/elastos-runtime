@@ -1,0 +1,40 @@
+[package]
+name = "ddrm-media-authority"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The LOCAL KEY-AUTHORITY, run as an isolated subprocess (a "local test KMS"
+# adapter in Anders' terms). The gateway spawns ONE of these per media open; it
+# CENC-packs the asset under a fresh CEK, launches a SEPARATE rail decrypt-provider
+# boundary, seals the CEK to that boundary's in-VM-minted session key (PQ-hybrid,
+# ddrm-envelope), zeroizes the CEK, and then answers per-segment read requests over
+# a tiny stdio protocol — relaying ONLY already-decrypted, senc-stripped segment
+# bytes. The CEK never leaves this process unsealed; the gateway never sees it.
+#
+# It lives in its own workspace specifically so the PQ crypto stack (ml-dsa/ml-kem)
+# is NOT linked into elastos-server, whose existing ed25519-dalek 3.0-pre / iroh
+# stack feature-unifies onto a pre-release sha2 that the PQ crates would break.
+
+[[bin]]
+name = "ddrm-media-authority"
+path = "src/main.rs"
+
+[dependencies]
+ddrm-media = { path = "../../../capsules/ddrm-media" }
+serde_json = "1.0"
+base64 = "0.22"
+# The SAME shared transcript encoder the rail binds (key authority seals to it; the decrypt
+# boundary rebuilds it). The `--quorum` open mode computes the canonical decrypt-transcript
+# AAD with it — no private re-implementation, so it cannot drift from the capsules.
+# `access-grant` adds the wallet-signed AccessGrantV1 builder (grant-prepare/grant-assemble
+# sidecar modes): the gateway shells out to these so it never links the PQ session signer.
+# `av-variants` adds the forensic variant manifest + serve-time selector (chunk 3): the open mode
+# loads the published manifest, derives the per-asset bias from this node's master, and serves the
+# per-buyer selected variant — the same canonical construction the offline extractor mirrors.
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope", features = ["access-grant", "av-variants"] }
+
+[profile.dev]
+opt-level = 1
+
+[workspace]

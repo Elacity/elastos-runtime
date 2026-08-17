@@ -71,10 +71,14 @@ pub async fn auth_middleware(
     next.run(req).await
 }
 
-/// Shell-only middleware - requires session to be a shell
+/// Consent-broker-only middleware — restricts an endpoint to the **consent
+/// broker**, the trusted authority that grants/denies capability consent on the
+/// user's behalf (capability grant/deny/revoke, supervisor + capsule lifecycle).
 ///
+/// Gates on [`Session::is_consent_broker`], the consent decision-engine
+/// predicate (today the Shell-role session — see `docs/KNOWN_GAPS.md` G-CIE).
 /// Must be used AFTER auth_middleware (expects Session in extensions).
-pub async fn shell_only_middleware(req: Request<Body>, next: Next) -> Response {
+pub async fn consent_broker_only_middleware(req: Request<Body>, next: Next) -> Response {
     let session = match req.extensions().get::<Session>() {
         Some(s) => s,
         None => {
@@ -87,10 +91,10 @@ pub async fn shell_only_middleware(req: Request<Body>, next: Next) -> Response {
         }
     };
 
-    if !session.is_shell() {
+    if !session.is_consent_broker() {
         return (
             StatusCode::FORBIDDEN,
-            "This endpoint requires shell privileges",
+            "This endpoint requires consent-broker privileges",
         )
             .into_response();
     }

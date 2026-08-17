@@ -51,7 +51,9 @@ if (launch.launch_status !== "launched") {
 if (typeof launch.capsule_id !== "string" || launch.capsule_id.trim() === "") {
   fail("chat-room launch did not return a capsule id", launch);
 }
-if (!String(launch.route || "").startsWith("/apps/chat-room/?home_token=")) {
+// Home launches deliver the token in the URL FRAGMENT
+// (gateway_home_runtime.rs::append_home_launch_token_to_route), never the query string.
+if (!String(launch.route || "").startsWith("/apps/chat-room/#home_token=")) {
   fail("chat-room launch route is not Home-scoped", launch);
 }
 

@@ -133,16 +133,27 @@ pub(super) fn sign_managed_approval(
 pub(super) fn external_wallet_handoff(request: &WalletApprovalRequest) -> Result<Value, String> {
     if request.intent == "transaction_intent" {
         let chain_id = payload_u64(&request.payload, "chain_id")?;
-        let transaction = json!({
+        let mut transaction = json!({
             "from": payload_str(&request.payload, "from")?,
             "to": payload_str(&request.payload, "to")?,
             "value": payload_str(&request.payload, "value")?,
             "data": payload_str(&request.payload, "data")?,
-            "gas": payload_str(&request.payload, "gas_limit")?,
-            "gasPrice": payload_str(&request.payload, "gas_price")?,
-            "nonce": payload_str(&request.payload, "nonce")?,
             "chainId": format!("0x{chain_id:x}"),
         });
+        // gas / gasPrice / nonce are forwarded ONLY when the intent supplies them. When
+        // omitted, the external wallet (MetaMask) estimates them — exactly PC2's EOA mint,
+        // which sends only to/data/value/chainId. This avoids dictating a too-low gas limit
+        // (out-of-gas reverts) or a wrong gas price (inflated fees) to the user's wallet.
+        let tx_obj = transaction.as_object_mut().expect("transaction is an object");
+        if let Ok(gas) = payload_str(&request.payload, "gas_limit") {
+            tx_obj.insert("gas".to_string(), Value::String(gas.to_string()));
+        }
+        if let Ok(gas_price) = payload_str(&request.payload, "gas_price") {
+            tx_obj.insert("gasPrice".to_string(), Value::String(gas_price.to_string()));
+        }
+        if let Ok(nonce) = payload_str(&request.payload, "nonce") {
+            tx_obj.insert("nonce".to_string(), Value::String(nonce.to_string()));
+        }
         return Ok(json!({
             "schema": "elastos.wallet.webconnect_handoff/v1",
             "request_id": request.request_id,
@@ -219,7 +230,13 @@ pub(super) fn managed_signed_result(
 pub(super) fn external_signature_message(
     request: &WalletApprovalRequest,
 ) -> Result<String, String> {
-    if request.intent == "browser_personal_sign" {
+    // `ddrm_delegation_sign` (the connector-brokered dDRM delegation signature, minted by
+    // `viewer_grant_sign::create_delegation_sign_request`) shares the EXACT same connector
+    // `personal_sign` shape as `browser_personal_sign` — a `payload.message` string the connector
+    // EIP-191 signs verbatim — so it must be extracted and hashed identically, not fall through to
+    // the generic `ElastOS Wallet Approval...` canned message below (which would never match what
+    // the wallet actually signed).
+    if request.intent == "browser_personal_sign" || request.intent == "ddrm_delegation_sign" {
         return request
             .payload
             .get("message")

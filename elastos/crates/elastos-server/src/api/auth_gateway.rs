@@ -3557,7 +3557,6 @@ mod tests {
             full_recovery_bundle_semantic_digest(&first).unwrap(),
             full_recovery_bundle_semantic_digest(&reordered).unwrap()
         );
-
         let mut kit_substitution = reordered.clone();
         kit_substitution["data_kit"]["kit_id"] = json!("kit:substituted");
         assert_ne!(
@@ -3577,6 +3576,7 @@ mod tests {
         GatewayState {
             provider_registry: None,
             identity_manager: Arc::new(std::sync::OnceLock::new()),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
             cache_dir: data_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
         }
@@ -3599,6 +3599,7 @@ mod tests {
         GatewayState {
             provider_registry: Some(registry),
             identity_manager: Arc::new(std::sync::OnceLock::new()),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
             cache_dir: data_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
         }

@@ -14,14 +14,32 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-use crate::carrier_service::CarrierServiceProvider;
+use crate::carrier_service::{CarrierLiveness, CarrierServiceProvider};
 use crate::ownership;
 use crate::setup::{CapsuleEntry, ComponentsManifest};
 use crate::vm_provider::VmCapsuleProvider;
 
-use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
+use elastos_common::CapsuleRole;
+use elastos_crosvm::{
+    reflink_or_copy, CrosvmConfig, EgressFirewall, NetworkConfig, RunningVm, VmConfig,
+    EGRESS_LOG_RATE_PER_SEC, EGRESS_NFLOG_GROUP,
+};
 use elastos_runtime::provider::ProviderRegistry;
+
+/// The capsule the runtime treats as the active shell when no active-shell
+/// pointer has been set. Preserves historical behaviour (the bundled `shell`).
+const DEFAULT_ACTIVE_SHELL: &str = "shell";
+
+/// Whether a launching capsule is eligible for the privileged shell session
+/// token (W3). De-hardcodes the old `name == "shell"` magic string: a capsule
+/// gets the shell token ONLY if it both holds the `Shell` role AND is the
+/// user-selected active shell. Fail-closed — a non-`Shell` capsule can never
+/// receive the shell token even if the active-shell pointer names it.
+fn shell_token_eligible(name: &str, role: &CapsuleRole, active_shell: &str) -> bool {
+    matches!(role, CapsuleRole::Shell) && name == active_shell
+}
 use elastos_runtime::session::{SessionRegistry, SessionType};
+use elastos_runtime::signature::{hash_content, SignatureVerifier};
 
 /// TCP port used by VM provider capsules for raw JSON request/response over the
 /// Carrier-managed control network.
@@ -152,7 +170,10 @@ enum CapsuleBackend {
     Vm(Box<RunningVm>),
     /// Carrier-plane host process (for `permissions.carrier: true`).
     /// These are explicit runtime-owned providers, not ordinary app capsules.
-    Carrier,
+    /// BUG-7: carries a pending-safe liveness probe over the host child so reap
+    /// can collect a dead carrier service. `None` when route registration did not
+    /// produce a provider (no child to probe) ⇒ treated as alive (fail-safe).
+    Carrier(Option<CarrierLiveness>),
 }
 
 struct RunningCapsule {
@@ -160,8 +181,16 @@ struct RunningCapsule {
     handle: String,
     vsock_cid: u32,
     started_at: std::time::Instant,
-    provider_route: Option<ProviderRoute>,
+    provider_route: Option<BoundProviderRoute>,
     backend: CapsuleBackend,
+    /// BUG-2: the microVM Carrier bridge accept-loop task. Previously detached
+    /// (`spawn_carrier_bridge` dropped its `JoinHandle`), so it leaked on every
+    /// teardown. Held here so stop/reap/wait abort it. `None` for the Carrier
+    /// backend and for a launch with no provider registry (no bridge spawned).
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+    /// BUG-2: the per-launch `<handle>-carrier.sock` unix socket file. Previously
+    /// never unlinked on teardown. Held here so it is removed with the task.
+    carrier_socket: Option<PathBuf>,
 }
 
 struct RunningGateway {
@@ -169,10 +198,85 @@ struct RunningGateway {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// BUG-3: defuse-on-success cleanup for the microVM launch window. Between
+/// creating the rootfs overlay / spawning the Carrier bridge / recording the TAP
+/// and the running-map insert, an early return (e.g. `vm.start()` boot failure)
+/// would orphan all of those. This guard owns them and, UNLESS explicitly defused
+/// after a successful insert, runs best-effort cleanup on drop — so every error
+/// path in that window is covered by construction, including ones added later.
+/// (`RunningVm::start` already tears down its OWN TAP + egress firewall on its
+/// internal error paths; this guard covers only the supervisor-created artifacts.)
+struct LaunchCleanupGuard {
+    carrier_socket: Option<PathBuf>,
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+    overlay_path: Option<PathBuf>,
+    tap_name: Option<String>,
+    tap_registry: crate::egress_audit::TapRegistry,
+    armed: bool,
+}
+
+impl Drop for LaunchCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop is sync: use std::fs + the sync JoinHandle::abort (best-effort).
+        if let Some(task) = self.bridge_task.take() {
+            task.abort();
+        }
+        if let Some(ref sock) = self.carrier_socket {
+            let _ = std::fs::remove_file(sock);
+        }
+        if let Some(ref overlay) = self.overlay_path {
+            let _ = std::fs::remove_file(overlay);
+        }
+        if let Some(ref tap) = self.tap_name {
+            self.tap_registry.forget(tap);
+        }
+        tracing::warn!("launch aborted: cleaned up orphaned microVM launch artifacts");
+    }
+}
+
+/// BUG-2: abort the Carrier-bridge accept-loop task and unlink its per-launch unix
+/// socket on a teardown path. Best-effort + idempotent (both are `None` for the
+/// Carrier backend or a registry-less launch).
+async fn cleanup_bridge_artifacts(
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+    carrier_socket: Option<PathBuf>,
+) {
+    if let Some(task) = bridge_task {
+        task.abort();
+    }
+    if let Some(sock) = carrier_socket {
+        let _ = tokio::fs::remove_file(&sock).await;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProviderRoute {
     SubProvider(String),
     Scheme(String),
+}
+
+/// A route this supervisor actually bound, paired with the exact provider object it bound.
+///
+/// Teardown is identity-keyed (see `ProviderRegistry::unregister`): unpinned slots stay
+/// last-write-wins, so between binding and reaping, another capsule may have legitimately taken
+/// the slot over. Carrying the `Arc` lets the registry refuse to evict a binding this capsule no
+/// longer owns — without it, reaping a dead capsule would tear down whoever holds the name now.
+#[derive(Clone)]
+struct BoundProviderRoute {
+    route: ProviderRoute,
+    provider: Arc<dyn elastos_runtime::provider::Provider>,
+}
+
+impl std::fmt::Debug for BoundProviderRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundProviderRoute")
+            .field("route", &self.route)
+            .field("provider", &self.provider.name())
+            .finish()
+    }
 }
 
 // ── Supervisor ──────────────────────────────────────────────────────
@@ -191,8 +295,12 @@ pub struct Supervisor {
     next_cid: Arc<RwLock<u32>>,
     /// crosvm configuration (paths to binary, kernel, etc.)
     crosvm_config: CrosvmConfig,
-    /// Shell session token — only injected into the shell capsule VM
+    /// Shell session token — only injected into the active shell capsule VM
     shell_token: Option<String>,
+    /// Name of the capsule currently selected as the active shell (W3). The
+    /// privileged shell token is issued only to this capsule, and only if it
+    /// holds the `Shell` role. Defaults to [`DEFAULT_ACTIVE_SHELL`].
+    active_shell: String,
     /// API address injected into VM boot args (set by forward_to_shell)
     api_addr: Option<String>,
     /// Session registry for minting per-capsule tokens
@@ -203,8 +311,99 @@ pub struct Supervisor {
     capability_manager: Option<Arc<elastos_runtime::capability::CapabilityManager>>,
     /// Pending capability request store for shell-mediated approval.
     pending_store: Option<Arc<elastos_runtime::capability::pending::PendingRequestStore>>,
+    /// The shared runtime/infra custody log, threaded to the serve gateway so its audit
+    /// events ride the SAME signed chain as carrier/capability/spend. `None` ⇒ the gateway
+    /// keeps its own file sink. Only adopted by the gateway when durable (see
+    /// [`crate::api::gateway::seed_gateway_audit_log`]) — never a durable→memory downgrade.
+    shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
+    /// W1b/C3: TAP→`vm-{name}` map so a kernel egress drop (logged on a TAP) becomes an
+    /// `EgressDenied` keyed on the canonical capsule identity. Populated at firewall-install;
+    /// shared with the NFLOG audit-reader thread.
+    tap_registry: crate::egress_audit::TapRegistry,
+    /// W1b/C3: per-TAP reconciliation counters (per-drop emitted vs. kernel-suppressed accounted),
+    /// shared with the reader + reconcile-sweep threads and read at teardown for the final delta.
+    egress_counters: crate::egress_audit::EgressCounters,
+    /// Author-signature verifier for the launch gate (AUD-1). Default is empty (no
+    /// trusted keys), in which case the gate skips and launches are byte-for-byte
+    /// today's behavior; seeded from config `trusted_keys` at serve time to activate.
+    signature_verifier: SignatureVerifier,
     /// Optional running gateway server task.
     gateway: Arc<RwLock<Option<RunningGateway>>>,
+}
+
+/// AUD-1 author-signature launch gate, FAIL-CLOSED WHEN CONFIGURED. With no trusted
+/// keys (the default) it logs a warning and allows the launch — byte-for-byte today's
+/// behavior, zero breakage. With >=1 trusted key it REFUSES (returns Err, before boot)
+/// a capsule that is unsigned OR whose signature matches no trusted key. Uses the same
+/// canonical content-hash domain as `trust_cmd` signing (`SHA256(manifest_without_sig)
+/// || hash_content(entrypoint bytes)`), so it never false-denies a legitimately-signed
+/// capsule (the sign and verify domains are byte-identical — see `signature/verifier.rs`).
+/// A pure, sync, VM-free function so the gate is unit-testable without a crosvm boot.
+fn gate_author_signature(
+    verifier: &SignatureVerifier,
+    capsule_dir: &Path,
+    manifest: &elastos_common::CapsuleManifest,
+) -> Result<()> {
+    if !verifier.is_enabled() {
+        tracing::warn!(
+            "author-signature verification skipped for '{}' (no trusted keys configured)",
+            manifest.name
+        );
+        return Ok(());
+    }
+    if manifest.signature.is_none() {
+        bail!(
+            "capsule '{}' is unsigned but trusted keys are configured; refusing launch",
+            manifest.name
+        );
+    }
+    let entrypoint_path = capsule_dir.join(&manifest.entrypoint);
+    let content = std::fs::read(&entrypoint_path).with_context(|| {
+        format!(
+            "failed to read entrypoint {} for the signature gate",
+            manifest.entrypoint
+        )
+    })?;
+    let content_hash = hash_content(&content);
+    if !verifier
+        .verify_capsule(manifest, &content_hash)
+        .map_err(|e| anyhow::anyhow!("signature verification error for '{}': {e}", manifest.name))?
+    {
+        bail!(
+            "capsule '{}' signature does not match any trusted key; refusing launch",
+            manifest.name
+        );
+    }
+    tracing::info!("author signature verified for '{}'", manifest.name);
+    Ok(())
+}
+
+/// Lowest assignable vsock guest CID. 0 (any/hypervisor), 1 (local), and 2
+/// (host) are reserved by the vsock transport, so guest CIDs start at 3.
+const MIN_GUEST_CID: u32 = 3;
+
+/// Pick the next free vsock CID at or after `from`, skipping reserved low CIDs
+/// and any CID currently in use by a live VM, wrapping the u32 space WITHOUT
+/// overflow (the old `*next += 1` could wrap and re-hand a live VM's CID — BUG-8).
+///
+/// Returns `(cid, advance)` where `cid` is the allocated CID and `advance` is the
+/// value to store as the next starting point. Returns `None` (fail-closed) only
+/// if every CID is in use — the caller refuses the launch rather than colliding.
+///
+/// Pure + VM-free so it is unit-testable without a crosvm boot. The scan is
+/// bounded by `in_use.len() + 1` candidates: by pigeonhole, that many distinct
+/// CIDs cannot all be occupied if any free CID exists.
+fn allocate_cid(from: u32, in_use: &HashSet<u32>) -> Option<(u32, u32)> {
+    let mut candidate = from.max(MIN_GUEST_CID);
+    for _ in 0..=in_use.len() {
+        if !in_use.contains(&candidate) {
+            // Wrap back to the first guest CID instead of overflowing past u32::MAX.
+            let advance = candidate.checked_add(1).unwrap_or(MIN_GUEST_CID);
+            return Some((candidate, advance));
+        }
+        candidate = candidate.checked_add(1).unwrap_or(MIN_GUEST_CID);
+    }
+    None
 }
 
 impl Supervisor {
@@ -370,11 +569,16 @@ impl Supervisor {
             next_cid: Arc::new(RwLock::new(Self::initial_cid_seed())),
             crosvm_config,
             shell_token: None,
+            active_shell: DEFAULT_ACTIVE_SHELL.to_string(),
             api_addr: None,
             session_registry: None,
             provider_registry: None,
             capability_manager: None,
             pending_store: None,
+            shared_audit_log: None,
+            tap_registry: crate::egress_audit::TapRegistry::new(),
+            egress_counters: crate::egress_audit::EgressCounters::new(),
+            signature_verifier: SignatureVerifier::new(),
             gateway: Arc::new(RwLock::new(None)),
         }
     }
@@ -391,6 +595,19 @@ impl Supervisor {
         self.shell_token = Some(shell_token);
         self.api_addr = Some(api_addr);
         self.session_registry = Some(session_registry);
+    }
+
+    /// Select which capsule is the active shell (W3). The privileged shell token
+    /// is issued only to this capsule, and only if it holds the `Shell` role
+    /// (see [`shell_token_eligible`]). Lets a user run a shell other than the
+    /// bundled default without the runtime hardcoding a name.
+    pub fn set_active_shell(&mut self, active_shell: impl Into<String>) {
+        self.active_shell = active_shell.into();
+    }
+
+    /// The capsule currently selected as the active shell.
+    pub fn active_shell(&self) -> &str {
+        &self.active_shell
     }
 
     /// Attach runtime provider registry so launched VM providers can be routed.
@@ -412,6 +629,70 @@ impl Supervisor {
         pending_store: Arc<elastos_runtime::capability::pending::PendingRequestStore>,
     ) {
         self.pending_store = Some(pending_store);
+    }
+
+    /// Attach the shared runtime/infra custody log so the serve gateway unifies its audit
+    /// events onto the one signed chain (carrier/capability/spend). `None` (the default)
+    /// leaves the gateway with its own file sink. The gateway adopts this only when it is
+    /// durable — see [`crate::api::gateway::seed_gateway_audit_log`].
+    pub fn set_shared_audit_log(
+        &mut self,
+        shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
+    ) {
+        self.shared_audit_log = shared_audit_log;
+    }
+
+    /// W1b/C3: start the single process-wide NFLOG egress-audit reader, which turns kernel egress
+    /// drops into signed `EgressDenied` events on the shared custody chain (keyed on `vm-{name}`
+    /// via [`tap_registry`](Self::tap_registry)). No-op without a shared audit log. Best-effort and
+    /// enforcement-independent: a reader that can't bind never affects the in-kernel DROP. Call
+    /// once at serve time, AFTER [`set_shared_audit_log`](Self::set_shared_audit_log).
+    pub fn start_egress_audit_reader(&self) {
+        if let Some(audit_log) = &self.shared_audit_log {
+            crate::egress_audit::spawn_egress_audit_reader(
+                audit_log.clone(),
+                self.tap_registry.clone(),
+                self.egress_counters.clone(),
+            );
+            // W1b/C3: alongside the per-drop reader, the periodic reconcile sweep emits a signed
+            // suppressed-marker EgressDenied for drops the kernel rate-limit elided (counter ground
+            // truth − per-drop logged). Also best-effort and enforcement-independent.
+            #[cfg(target_os = "linux")]
+            crate::egress_audit::spawn_egress_reconcile_poller(
+                audit_log.clone(),
+                self.tap_registry.clone(),
+                self.egress_counters.clone(),
+            );
+        }
+    }
+
+    /// W1b/C3: best-effort FINAL suppressed-delta read for a VM-backed capsule's TAP, called at an
+    /// orchestrated teardown BEFORE the egress chains are deleted (teardown zeroes the nft
+    /// counters, so the last sub-sweep-interval delta would otherwise be lost). Custody-only and
+    /// enforcement-independent — it never gates or alters the teardown (C2 still deletes the chains
+    /// reader-independently at all four `RunningVm` sites). Also forgets the TAP's registry/counter
+    /// entries to bound memory.
+    fn final_egress_reconcile(&self, backend: &CapsuleBackend) {
+        if let (Some(audit_log), CapsuleBackend::Vm(vm)) = (&self.shared_audit_log, backend) {
+            if let Some(tap) = vm.config.network.as_ref().map(|n| n.tap_name.as_str()) {
+                crate::egress_audit::reconcile_tap(
+                    audit_log,
+                    &self.tap_registry,
+                    &self.egress_counters,
+                    tap,
+                );
+                self.tap_registry.forget(tap);
+                self.egress_counters.forget(tap);
+            }
+        }
+    }
+
+    /// Seed the author-signature launch gate with trusted keys (AUD-1). Called at
+    /// serve time from the config `trusted_keys`. An empty verifier (the default)
+    /// leaves the gate inert (launches unchanged); a non-empty one makes
+    /// [`gate_author_signature`] refuse unsigned / wrong-signer capsules before boot.
+    pub fn set_signature_verifier(&mut self, verifier: SignatureVerifier) {
+        self.signature_verifier = verifier;
     }
 
     /// Handle a supervisor request from the shell.
@@ -472,6 +753,18 @@ impl Supervisor {
             }
             return Some(ProviderRoute::SubProvider(sub.to_ascii_lowercase()));
         }
+        if scheme == "localhost" {
+            // `localhost` is one scheme but not one provider. The registry delegates
+            // `localhost://WebSpaces/...` to whatever is bound under the `webspace` slot, so a
+            // manifest claiming that namespace must bind THAT slot — not the whole file plane.
+            // Read as a bare scheme the claim is a seizure of every capsule's file I/O, which
+            // PINNED_SCHEMES refuses, and webspace-provider then runs launched-but-routeless.
+            // `localhost_delegated_scheme` is the registry's own routing predicate, so the slot a
+            // claim binds and the slot requests arrive on cannot drift apart.
+            if let Some(delegated) = elastos_runtime::provider::localhost_delegated_scheme(rest) {
+                return Some(ProviderRoute::Scheme(delegated.to_string()));
+            }
+        }
         match scheme.as_str() {
             "localhost" | "http" => Some(ProviderRoute::Scheme(scheme)),
             _ => None,
@@ -484,7 +777,7 @@ impl Supervisor {
         provides: Option<&str>,
         guest_ip: &str,
         init_config: serde_json::Value,
-    ) -> Option<ProviderRoute> {
+    ) -> Option<BoundProviderRoute> {
         if !vm_provider_bridge_enabled() {
             return None;
         }
@@ -515,7 +808,7 @@ impl Supervisor {
 
         match route.clone() {
             ProviderRoute::SubProvider(sub) => {
-                match registry.register_sub_provider(&sub, provider).await {
+                match registry.register_sub_provider(&sub, provider.clone()).await {
                     Ok(_) => {
                         tracing::info!(
                         "Registered VM sub-provider route elastos://{}/... -> capsule '{}' (guest={}, port={})",
@@ -524,7 +817,10 @@ impl Supervisor {
                         guest_ip,
                         VM_PROVIDER_PORT
                     );
-                        Some(ProviderRoute::SubProvider(sub))
+                        Some(BoundProviderRoute {
+                            route: ProviderRoute::SubProvider(sub),
+                            provider,
+                        })
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -538,7 +834,19 @@ impl Supervisor {
                 }
             }
             ProviderRoute::Scheme(scheme) => {
-                registry.register(provider).await;
+                // A main-scheme claim goes through the SAME first-writer-wins guard as the
+                // sub-provider claim above: a refused binding must not hand the capsule a
+                // teardown route that would unbind the boot provider it failed to seize.
+                if !registry.register(provider.clone()).await {
+                    tracing::warn!(
+                        "Failed to register VM provider route for '{}' ({}): scheme '{}' is \
+                         pinned and already bound",
+                        capsule_name,
+                        provides,
+                        scheme
+                    );
+                    return None;
+                }
                 tracing::info!(
                     "Registered VM provider route {}://... -> capsule '{}' (guest={}, port={})",
                     scheme,
@@ -546,7 +854,10 @@ impl Supervisor {
                     guest_ip,
                     VM_PROVIDER_PORT
                 );
-                Some(ProviderRoute::Scheme(scheme))
+                Some(BoundProviderRoute {
+                    route: ProviderRoute::Scheme(scheme),
+                    provider,
+                })
             }
         }
     }
@@ -558,7 +869,7 @@ impl Supervisor {
         binary_path: &Path,
         env_vars: Vec<(String, String)>,
         init_config: serde_json::Value,
-    ) -> Option<ProviderRoute> {
+    ) -> Option<(BoundProviderRoute, CarrierLiveness)> {
         if !vm_provider_bridge_enabled() {
             return None;
         }
@@ -570,17 +881,20 @@ impl Supervisor {
             ProviderRoute::Scheme(scheme) => scheme.clone(),
         };
 
-        let provider: Arc<dyn elastos_runtime::provider::Provider> =
-            Arc::new(CarrierServiceProvider::new(
-                provider_scheme,
-                binary_path.display().to_string(),
-                env_vars,
-                init_config,
-            ));
+        let concrete = CarrierServiceProvider::new(
+            provider_scheme,
+            binary_path.display().to_string(),
+            env_vars,
+            init_config,
+        );
+        // BUG-7: grab the liveness probe over the SAME bridge before the concrete
+        // provider is erased into Arc<dyn Provider> and handed to the registry.
+        let liveness = concrete.liveness();
+        let provider: Arc<dyn elastos_runtime::provider::Provider> = Arc::new(concrete);
 
         match route.clone() {
             ProviderRoute::SubProvider(sub) => {
-                match registry.register_sub_provider(&sub, provider).await {
+                match registry.register_sub_provider(&sub, provider.clone()).await {
                     Ok(_) => {
                         tracing::info!(
                             "Registered carrier service route elastos://{}/... -> '{}' (binary={})",
@@ -588,7 +902,13 @@ impl Supervisor {
                             capsule_name,
                             binary_path.display()
                         );
-                        Some(ProviderRoute::SubProvider(sub))
+                        Some((
+                            BoundProviderRoute {
+                                route: ProviderRoute::SubProvider(sub),
+                                provider,
+                            },
+                            liveness,
+                        ))
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -602,42 +922,79 @@ impl Supervisor {
                 }
             }
             ProviderRoute::Scheme(scheme) => {
-                registry.register(provider).await;
+                if !registry.register(provider.clone()).await {
+                    tracing::warn!(
+                        "Failed to register carrier service route for '{}' ({}): scheme '{}' is \
+                         pinned and already bound",
+                        capsule_name,
+                        provides,
+                        scheme
+                    );
+                    return None;
+                }
                 tracing::info!(
                     "Registered carrier service route {}://... -> '{}' (binary={})",
                     scheme,
                     capsule_name,
                     binary_path.display()
                 );
-                Some(ProviderRoute::Scheme(scheme))
+                Some((
+                    BoundProviderRoute {
+                        route: ProviderRoute::Scheme(scheme),
+                        provider,
+                    },
+                    liveness,
+                ))
             }
         }
     }
 
-    async fn unregister_provider_route(&self, route: &ProviderRoute) {
+    /// Tear down a route this supervisor bound.
+    ///
+    /// The registry only drops the binding if `bound.provider` is still the one occupying the
+    /// name, so reaping capsule A cannot evict capsule B that legitimately took an unpinned slot
+    /// over in the meantime — and a capsule cannot seize a slot, exit, and take the incumbent
+    /// down with it.
+    async fn unregister_provider_route(&self, bound: &BoundProviderRoute) {
         let Some(registry) = &self.provider_registry else {
             return;
         };
-        match route {
+        match &bound.route {
             ProviderRoute::SubProvider(sub) => {
-                registry.unregister_sub_provider(sub).await;
+                registry.unregister_sub_provider(sub, &bound.provider).await;
             }
             ProviderRoute::Scheme(scheme) => {
-                registry.unregister(scheme).await;
+                registry.unregister(scheme, &bound.provider).await;
             }
         }
     }
 
     async fn reap_dead_capsules(&self) {
-        let mut dead: Vec<(String, Option<ProviderRoute>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut dead: Vec<(
+            String,
+            Option<BoundProviderRoute>,
+            Option<tokio::task::JoinHandle<()>>,
+            Option<PathBuf>,
+        )> = Vec::new();
         {
             let mut running = self.running.write().await;
+            // iter_mut so the VM branch can REAP a self-exited child via
+            // has_exited() (try_wait), not merely probe liveness. A zombie still
+            // answers kill(pid,0), so an is_running()-only sweep would never
+            // collect it (BUG-1). We hold the write lock here, so reaping is safe.
             let dead_handles: Vec<String> = running
-                .iter()
+                .iter_mut()
                 .filter_map(|(handle, capsule)| {
-                    let alive = match &capsule.backend {
-                        CapsuleBackend::Vm(vm) => vm.is_running(),
-                        CapsuleBackend::Carrier => true, // managed by carrier service bridge
+                    let alive = match &mut capsule.backend {
+                        CapsuleBackend::Vm(vm) => !vm.has_exited(),
+                        // BUG-7: a carrier service whose host child has exited is now
+                        // reaped instead of treated as unconditionally alive. The probe
+                        // is pending-safe (a lazily-not-yet-spawned child reads alive);
+                        // a missing probe (registration produced no provider) is alive.
+                        CapsuleBackend::Carrier(probe) => {
+                            probe.as_ref().map(|p| p.is_alive()).unwrap_or(true)
+                        }
                     };
                     if alive {
                         None
@@ -647,16 +1004,26 @@ impl Supervisor {
                 })
                 .collect();
             for handle in dead_handles {
-                if let Some(capsule) = running.remove(&handle) {
-                    dead.push((handle, capsule.provider_route));
+                if let Some(mut capsule) = running.remove(&handle) {
+                    // W1b/C3: read the TAP's final suppressed delta before `capsule` drops here
+                    // (RunningVm::Drop tears down the egress chains, zeroing the counters).
+                    self.final_egress_reconcile(&capsule.backend);
+                    dead.push((
+                        handle,
+                        capsule.provider_route,
+                        capsule.bridge_task.take(),
+                        capsule.carrier_socket.take(),
+                    ));
                 }
             }
         }
 
-        for (handle, route) in dead {
+        for (handle, route, bridge_task, carrier_socket) in dead {
             if let Some(route) = route.as_ref() {
                 self.unregister_provider_route(route).await;
             }
+            // BUG-2: abort the Carrier-bridge task + unlink its socket (both leaked before).
+            cleanup_bridge_artifacts(bridge_task, carrier_socket).await;
             let overlay_path = self
                 .crosvm_config
                 .rootfs_cache_dir
@@ -911,6 +1278,11 @@ impl Supervisor {
                 .await;
         }
 
+        // AUD-1: author-signature gate (VM path). Fail-closed when trusted keys are
+        // configured, skips (warns) when none are. Runs BEFORE the KVM check and the
+        // overlay copy, so it hashes the signed base entrypoint in capsule_dir.
+        gate_author_signature(&self.signature_verifier, &capsule_dir, &manifest)?;
+
         // VM path — hard require KVM
         if !elastos_crosvm::is_supported() {
             bail!("/dev/kvm not available — crosvm requires KVM. Cannot launch capsule '{name}'.");
@@ -925,12 +1297,26 @@ impl Supervisor {
         self.verify_host_artifact("crosvm", &self.crosvm_config.crosvm_bin)?;
         self.verify_host_artifact("vmlinux", &self.crosvm_config.kernel_path)?;
 
-        // Assign vsock CID (unique per VM)
+        // Assign vsock CID (unique per live VM). Hold the counter lock across the
+        // live-set scan so concurrent launches serialize; the scan is the
+        // belt-and-suspenders guard that a wrapped counter never re-hands a CID a
+        // running VM still holds (BUG-8).
         let cid = {
             let mut next = self.next_cid.write().await;
-            let cid = *next;
-            *next += 1;
-            cid
+            let in_use: HashSet<u32> = {
+                let running = self.running.read().await;
+                running.values().map(|c| c.vsock_cid).collect()
+            };
+            match allocate_cid(*next, &in_use) {
+                Some((cid, advance)) => {
+                    *next = advance;
+                    cid
+                }
+                None => bail!(
+                    "no free vsock CID available ({} live VMs occupy the CID space)",
+                    in_use.len()
+                ),
+            }
         };
 
         let handle = Self::unique_handle(name, cid);
@@ -995,13 +1381,18 @@ impl Supervisor {
         // Inject session credentials — shell gets its privileged token,
         // all other capsules get a fresh Capsule-type token.
         if let Some(api_addr) = &self.api_addr {
-            let token = if name == "shell" {
+            let token = if shell_token_eligible(name, &manifest.role, &self.active_shell) {
                 self.shell_token.clone()
             } else {
                 // Mint a fresh Capsule token via the session registry
                 match &self.session_registry {
                     Some(reg) => {
-                        let session = reg.create_session(SessionType::Capsule, None).await;
+                        // G-ID: carry the real capsule identity ("vm-{name}", the
+                        // same string the carrier gate uses at supervisor.rs:1099)
+                        // on the session, so the grant path can record it.
+                        let session = reg
+                            .create_session(SessionType::Capsule, Some(format!("vm-{}", name)))
+                            .await;
                         Some(session.token)
                     }
                     None => {
@@ -1071,6 +1462,19 @@ impl Supervisor {
         vm_config.carrier_socket_path = Some(carrier_socket.clone());
         vm_config.boot_args = format!("{} elastos.carrier_path=/dev/hvc0", vm_config.boot_args);
 
+        // BUG-3: arm the defuse-on-success cleanup for the launch window. Every
+        // early return from here until the running-map insert (overlay copy,
+        // egress-firewall build, `vm.start()` boot failure, …) now cleans up the
+        // supervisor-created artifacts by construction. Defused after the insert.
+        let mut cleanup = LaunchCleanupGuard {
+            carrier_socket: None,
+            bridge_task: None,
+            overlay_path: None,
+            tap_name: None,
+            tap_registry: self.tap_registry.clone(),
+            armed: true,
+        };
+
         // Create rootfs overlay (writable copy)
         let rootfs_base = capsule_dir.join("rootfs.ext4");
         if rootfs_base.is_file() {
@@ -1078,7 +1482,12 @@ impl Supervisor {
             tokio::fs::create_dir_all(&overlay_dir).await?;
             let overlay_path = overlay_dir.join(format!("{}.ext4", handle));
             let _ = tokio::fs::remove_file(&overlay_path).await;
-            tokio::fs::copy(&rootfs_base, &overlay_path).await?;
+            // Track BEFORE the fallible copy so a partial overlay is cleaned too.
+            cleanup.overlay_path = Some(overlay_path.clone());
+            // Reflink (CoW) clone when the cache filesystem supports it — O(1)
+            // instead of a full byte copy of the rootfs image — falling back to
+            // a full copy otherwise.
+            reflink_or_copy(&rootfs_base, &overlay_path).await?;
             vm_config.rootfs_path = overlay_path;
         }
 
@@ -1103,7 +1512,7 @@ impl Supervisor {
                 }),
                 _ => None,
             };
-            if let Err(e) = crate::carrier_bridge::spawn_carrier_bridge(
+            match crate::carrier_bridge::spawn_carrier_bridge(
                 &carrier_socket,
                 registry.clone(),
                 session_token,
@@ -1111,12 +1520,56 @@ impl Supervisor {
             )
             .await
             {
-                tracing::warn!("Carrier bridge failed for '{}': {}", name, e);
+                // BUG-2: hold the accept-loop task + its socket so teardown (and
+                // the launch-failure guard) abort the task and unlink the socket.
+                Ok(task) => {
+                    cleanup.bridge_task = Some(task);
+                    cleanup.carrier_socket = Some(carrier_socket.clone());
+                }
+                Err(e) => {
+                    tracing::warn!("Carrier bridge failed for '{}': {}", name, e);
+                }
             }
         }
 
         // Start the VM (after bridge socket is listening)
         let mut vm = RunningVm::new(vm_config, manifest, socket_path);
+
+        // W1b: bind the per-TAP egress firewall before boot. Keyed on the REAL
+        // TAP device name (not vm-{name}); the guest is leashed to the host
+        // runtime API and default-drops everything else, fail-closed. Installed
+        // and torn down with the TAP inside RunningVm.
+        let net_params = vm
+            .config
+            .network
+            .as_ref()
+            .map(|n| (n.tap_name.clone(), n.host_ip.clone()));
+        if let Some((tap_name, host_ip)) = net_params {
+            // The one allowed destination port is the host runtime HTTP API.
+            // Absent (carrier-only token path) ⇒ port 0 ⇒ no accept ⇒ deny-all.
+            let api_port = self
+                .api_addr
+                .as_ref()
+                .and_then(|a| a.rsplit(':').next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            let firewall = EgressFirewall::new(
+                &tap_name,
+                &host_ip,
+                api_port,
+                EGRESS_NFLOG_GROUP,
+                EGRESS_LOG_RATE_PER_SEC,
+            )
+            .map_err(|e| anyhow::anyhow!("egress firewall build failed for '{}': {}", name, e))?;
+            // W1b/C3: map this TAP to the canonical vm-{name} so a kernel drop logged on it
+            // becomes an EgressDenied keyed on the same identity as the spend/grant chain.
+            // Overwrite-on-record handles TAP reuse (re-label before any of the new VM's drops).
+            self.tap_registry.record(&tap_name, &format!("vm-{name}"));
+            // BUG-3: a boot failure after this must forget the registry entry.
+            cleanup.tap_name = Some(tap_name.clone());
+            vm.set_egress_firewall(Some(firewall));
+        }
+
         vm.start(&self.crosvm_config.crosvm_bin)
             .await
             .map_err(|e| anyhow::anyhow!("VM boot failed for '{}': {}", name, e))?;
@@ -1135,6 +1588,13 @@ impl Supervisor {
                 None
             };
 
+        // BUG-3: launch survived the fragile window — defuse the guard and move its
+        // tracked bridge task + socket into the RunningCapsule for normal teardown
+        // (BUG-2). The overlay + TAP-registry entry now belong to the live VM.
+        let bridge_task = cleanup.bridge_task.take();
+        let carrier_socket = cleanup.carrier_socket.take();
+        cleanup.armed = false;
+
         // Register as running
         {
             let mut running = self.running.write().await;
@@ -1147,6 +1607,8 @@ impl Supervisor {
                     started_at: std::time::Instant::now(),
                     provider_route,
                     backend: CapsuleBackend::Vm(Box::new(vm)),
+                    bridge_task,
+                    carrier_socket,
                 },
             );
         }
@@ -1188,12 +1650,16 @@ impl Supervisor {
             env_vars.push(("ELASTOS_API".into(), format!("http://{api_addr}")));
         }
         if let Some(reg) = &self.session_registry {
-            let session = reg.create_session(SessionType::Capsule, None).await;
+            // G-ID: carry the real capsule identity ("vm-{name}") on the session.
+            let session = reg
+                .create_session(SessionType::Capsule, Some(format!("vm-{}", name)))
+                .await;
             env_vars.push(("ELASTOS_TOKEN".into(), session.token));
         }
 
-        // Register provider route using CarrierServiceProvider
-        let provider_route = self
+        // Register provider route using CarrierServiceProvider. The route carries
+        // a BUG-7 liveness probe over the host child so reap can collect it.
+        let (provider_route, carrier_liveness) = match self
             .register_carrier_service_route(
                 name,
                 provides.as_deref(),
@@ -1201,7 +1667,11 @@ impl Supervisor {
                 env_vars,
                 config,
             )
-            .await;
+            .await
+        {
+            Some((route, liveness)) => (Some(route), Some(liveness)),
+            None => (None, None),
+        };
 
         eprintln!(
             "[supervisor] Launched carrier service '{}': handle={} binary={}",
@@ -1220,7 +1690,10 @@ impl Supervisor {
                     vsock_cid: cid,
                     started_at: std::time::Instant::now(),
                     provider_route,
-                    backend: CapsuleBackend::Carrier,
+                    backend: CapsuleBackend::Carrier(carrier_liveness),
+                    // Carrier services have no per-launch microVM Carrier bridge.
+                    bridge_task: None,
+                    carrier_socket: None,
                 },
             );
         }
@@ -1250,13 +1723,19 @@ impl Supervisor {
     /// Stop a running capsule.
     async fn stop_capsule(&self, handle: &str) -> Result<()> {
         let mut running = self.running.write().await;
-        let capsule = running
+        let mut capsule = running
             .remove(handle)
             .ok_or_else(|| anyhow::anyhow!("no capsule with handle '{handle}'"))?;
 
         if let Some(route) = capsule.provider_route.as_ref() {
             self.unregister_provider_route(route).await;
         }
+
+        // W1b/C3: final suppressed-delta read before `vm.stop()` deletes the egress chains.
+        self.final_egress_reconcile(&capsule.backend);
+
+        // BUG-2: abort the Carrier-bridge task + unlink its socket (both leaked before).
+        cleanup_bridge_artifacts(capsule.bridge_task.take(), capsule.carrier_socket.take()).await;
 
         match capsule.backend {
             CapsuleBackend::Vm(mut vm) => {
@@ -1272,10 +1751,11 @@ impl Supervisor {
                     .join(format!("{}.ext4", handle));
                 let _ = tokio::fs::remove_file(&overlay_path).await;
             }
-            CapsuleBackend::Carrier => {
+            CapsuleBackend::Carrier(_) => {
                 // Carrier service child process is killed when CarrierServiceProvider
                 // is dropped (via CarrierServiceBridge::drop). Unregistering the
-                // provider route above drops the last Arc reference.
+                // provider route above drops the last Arc reference. (The liveness
+                // probe holds an Arc too, but it is dropped with `capsule` here.)
             }
         }
 
@@ -1287,7 +1767,7 @@ impl Supervisor {
     /// Returns Ok(exit_code) on clean exit, Err on wait failure or non-zero exit.
     pub async fn wait_for_exit(&self, handle: &str) -> Result<i32> {
         // Take the capsule out of running map so we get exclusive access to the VM
-        let capsule = {
+        let mut capsule = {
             let mut running = self.running.write().await;
             running
                 .remove(handle)
@@ -1297,6 +1777,12 @@ impl Supervisor {
         if let Some(route) = capsule.provider_route.as_ref() {
             self.unregister_provider_route(route).await;
         }
+
+        // W1b/C3: final suppressed-delta read before the VM drops and tears down its egress chains.
+        self.final_egress_reconcile(&capsule.backend);
+
+        // BUG-2: abort the Carrier-bridge task + unlink its socket (both leaked before).
+        cleanup_bridge_artifacts(capsule.bridge_task.take(), capsule.carrier_socket.take()).await;
 
         let exit_code = match capsule.backend {
             CapsuleBackend::Vm(mut vm) => {
@@ -1327,7 +1813,7 @@ impl Supervisor {
                 let _ = tokio::fs::remove_file(&overlay_path).await;
                 code
             }
-            CapsuleBackend::Carrier => {
+            CapsuleBackend::Carrier(_) => {
                 // Carrier services are background services — they don't "exit".
                 // Waiting on them is a no-op; they run until stopped.
                 eprintln!(
@@ -1357,7 +1843,12 @@ impl Supervisor {
                             "stopped"
                         }
                     }
-                    CapsuleBackend::Carrier => "running",
+                    // BUG-7: report a carrier whose host child has exited as stopped
+                    // (pending/not-yet-spawned and probe-less both read running, fail-safe).
+                    CapsuleBackend::Carrier(probe) => match probe {
+                        Some(p) if !p.is_alive() => "stopped",
+                        _ => "running",
+                    },
                 };
 
                 Ok(SupervisorResponse {
@@ -1458,12 +1949,15 @@ impl Supervisor {
             let listen_addr = listen_addr.clone();
             let cache_path = cache_path.clone();
             let data_dir = self.data_dir.clone();
+            // Unify the gateway audit sink onto the shared runtime custody chain (when durable).
+            let shared_audit_log = self.shared_audit_log.clone();
             async move {
                 if let Err(e) = crate::api::gateway::start_gateway_server(
                     &listen_addr,
                     Some(registry),
                     cache_path,
                     data_dir,
+                    shared_audit_log,
                 )
                 .await
                 {
@@ -1494,6 +1988,188 @@ mod tests {
     };
     use sha2::Digest;
     use std::sync::Arc;
+
+    // ── BUG-8: vsock CID allocation is checked + collision-free ──
+
+    #[test]
+    fn allocate_cid_floors_reserved_low_cids() {
+        // 0/1/2 are reserved; an allocator seeded below 3 must floor to 3.
+        let (cid, advance) = allocate_cid(0, &HashSet::new()).unwrap();
+        assert_eq!(cid, MIN_GUEST_CID);
+        assert_eq!(advance, MIN_GUEST_CID + 1);
+    }
+
+    #[test]
+    fn allocate_cid_skips_live_cids() {
+        let in_use = HashSet::from([5u32, 6, 7]);
+        let (cid, advance) = allocate_cid(5, &in_use).unwrap();
+        assert_eq!(cid, 8, "5/6/7 are live, so 8 is the first free CID");
+        assert_eq!(advance, 9);
+    }
+
+    #[test]
+    fn allocate_cid_wraps_without_overflow() {
+        // The old `*next += 1` would overflow/wrap here; the allocator wraps
+        // cleanly back to the first guest CID for the NEXT call.
+        let (cid, advance) = allocate_cid(u32::MAX, &HashSet::new()).unwrap();
+        assert_eq!(cid, u32::MAX);
+        assert_eq!(
+            advance, MIN_GUEST_CID,
+            "advance wraps to 3, not 0 or overflow"
+        );
+    }
+
+    /// THE bug: a counter that wraps onto a CID a live VM still holds must NOT
+    /// re-hand it — the live-set scan steps past the collision to a free CID.
+    #[test]
+    fn allocate_cid_wrap_does_not_collide_with_a_live_vm() {
+        // Counter has wrapped to u32::MAX, but a long-lived VM already holds it.
+        let in_use = HashSet::from([u32::MAX]);
+        let (cid, advance) = allocate_cid(u32::MAX, &in_use).unwrap();
+        assert_eq!(cid, MIN_GUEST_CID, "skips the live MAX CID, wraps to 3");
+        assert_eq!(advance, MIN_GUEST_CID + 1);
+        assert!(!in_use.contains(&cid), "the chosen CID is provably free");
+    }
+
+    #[test]
+    fn allocate_cid_returns_a_free_cid_within_the_bound() {
+        // A contiguous live block is stepped over to the next free CID.
+        let in_use = HashSet::from([3u32, 4, 5, 6]);
+        let (cid, _) = allocate_cid(3, &in_use).unwrap();
+        assert_eq!(cid, 7);
+        assert!(!in_use.contains(&cid));
+    }
+
+    // ── BUG-2 / BUG-3: the Carrier-bridge task + its socket no longer leak ──
+    // These exercise the leak-prone logic WITHOUT a crosvm boot (the boot-failure
+    // path + reap integration are validated on the KVM box).
+
+    #[tokio::test]
+    async fn cleanup_bridge_artifacts_unlinks_socket_and_aborts_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h-carrier.sock");
+        std::fs::write(&sock, b"").unwrap();
+        assert!(sock.exists());
+
+        // A long-running task that flips the flag ONLY if it is never aborted.
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        cleanup_bridge_artifacts(Some(task), Some(sock.clone())).await;
+
+        assert!(
+            !sock.exists(),
+            "BUG-2: the per-launch carrier socket must be unlinked on teardown"
+        );
+        // Give the runtime a beat; an aborted task never reaches completion.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "BUG-2: the bridge accept-loop task must be aborted, not left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_bridge_artifacts_is_a_noop_when_nothing_to_clean() {
+        // The Carrier backend / registry-less launch path passes both None.
+        cleanup_bridge_artifacts(None, None).await;
+    }
+
+    #[test]
+    fn launch_cleanup_guard_armed_drop_removes_overlay_socket_and_forgets_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h-carrier.sock");
+        let overlay = dir.path().join("h.ext4");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::write(&overlay, b"").unwrap();
+        let reg = crate::egress_audit::TapRegistry::default();
+        reg.record("cvtap0001", "vm-x");
+
+        {
+            let _guard = LaunchCleanupGuard {
+                carrier_socket: Some(sock.clone()),
+                bridge_task: None,
+                overlay_path: Some(overlay.clone()),
+                tap_name: Some("cvtap0001".to_string()),
+                tap_registry: reg.clone(),
+                armed: true,
+            };
+        } // BUG-3: armed guard cleans up the launch window on drop.
+
+        assert!(!sock.exists(), "armed guard must unlink the carrier socket");
+        assert!(
+            !overlay.exists(),
+            "armed guard must remove the rootfs overlay"
+        );
+        assert!(
+            reg.resolve("cvtap0001").is_none(),
+            "armed guard must forget the TAP-registry entry"
+        );
+    }
+
+    #[test]
+    fn launch_cleanup_guard_defused_drop_preserves_the_live_capsules_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("h-carrier.sock");
+        let overlay = dir.path().join("h.ext4");
+        std::fs::write(&sock, b"").unwrap();
+        std::fs::write(&overlay, b"").unwrap();
+        let reg = crate::egress_audit::TapRegistry::default();
+        reg.record("cvtap0002", "vm-y");
+
+        {
+            let mut guard = LaunchCleanupGuard {
+                carrier_socket: Some(sock.clone()),
+                bridge_task: None,
+                overlay_path: Some(overlay.clone()),
+                tap_name: Some("cvtap0002".to_string()),
+                tap_registry: reg.clone(),
+                armed: true,
+            };
+            // Mirror the success path: move the task/sock into the RunningCapsule
+            // and defuse — the live VM owns the overlay + TAP entry.
+            let _ = guard.bridge_task.take();
+            let _ = guard.carrier_socket.take();
+            guard.armed = false;
+        }
+
+        assert!(
+            sock.exists(),
+            "defused guard must NOT remove the carrier socket"
+        );
+        assert!(
+            overlay.exists(),
+            "defused guard must NOT remove the overlay"
+        );
+        assert!(
+            reg.resolve("cvtap0002").is_some(),
+            "defused guard must keep the live capsule's TAP entry"
+        );
+    }
+
+    #[test]
+    fn shell_token_eligible_is_role_based_and_fail_closed() {
+        // The bundled shell (Shell role, matches the active pointer) stays eligible
+        // — behaviour-neutral default.
+        assert!(shell_token_eligible(
+            "shell",
+            &CapsuleRole::Shell,
+            DEFAULT_ACTIVE_SHELL
+        ));
+        // The de-hardcoded point: a DIFFERENT Shell-role capsule selected as the
+        // active shell is eligible — no longer tied to the magic name "shell".
+        assert!(shell_token_eligible("flint", &CapsuleRole::Shell, "flint"));
+        // Fail-closed: a non-Shell capsule can NEVER get the shell token, even if
+        // the active-shell pointer names it.
+        assert!(!shell_token_eligible("flint", &CapsuleRole::App, "flint"));
+        // A Shell-role capsule that is NOT the active shell is not eligible.
+        assert!(!shell_token_eligible("flint", &CapsuleRole::Shell, "shell"));
+    }
 
     #[test]
     fn test_supervisor_request_serialization() {
@@ -1568,6 +2244,7 @@ mod tests {
                 sha256: String::new(),
                 size: 0,
                 repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );
@@ -1593,6 +2270,196 @@ mod tests {
         assert!(err
             .to_string()
             .contains("principal launch grants are only valid for shell-launchable capsules"));
+    }
+
+    /// Snapshot the file names directly under `dir` (empty set if it doesn't exist),
+    /// so a leaked artifact shows up as a set difference across a launch attempt.
+    #[cfg(target_os = "linux")]
+    fn dir_snapshot(dir: &Path) -> std::collections::HashSet<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// BUG-3 BOX VALIDATION — the forced-boot-failure proof the cloud can't run.
+    ///
+    /// Drives the REAL `launch_capsule` against the real kernel + real crosvm/vmlinux,
+    /// then forces `vm.start()` to fail AFTER the `LaunchCleanupGuard` has tracked all
+    /// four supervisor-created artifacts (rootfs overlay, carrier socket, bridge task,
+    /// tap_registry entry). A `guest_network` capsule makes `vm.start()` create a TAP,
+    /// which needs CAP_NET_ADMIN; run as the NON-root box user it fails deterministically
+    /// in the fragile window. The guard must then have removed the overlay + carrier
+    /// socket and forgotten the tap_registry entry — no orphans.
+    ///
+    /// `#[ignore]`d: it COMPILES in normal CI (so launch-path drift fails the build here)
+    /// but only RUNS on the provisioned box. Prereqs: real `~/.local/share/elastos`
+    /// (components.json with linux-arm64 crosvm+vmlinux that verify, and the act-emitter
+    /// capsule's rootfs.ext4); a readable `/dev/kvm`; a NON-root shell (so the TAP create
+    /// fails). Run:
+    ///   cargo test -p elastos-server --lib -- --ignored --nocapture launch_failure_leaves_no_orphaned
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "box-only: needs real ~/.local/share/elastos provisioning + /dev/kvm + a non-root shell"]
+    async fn launch_failure_leaves_no_orphaned_overlay_socket_or_tap_on_real_kernel() {
+        let data_dir = std::path::PathBuf::from(std::env::var("HOME").expect("HOME set"))
+            .join(".local/share/elastos");
+        let components_path = data_dir.join("components.json");
+        let mut registry: ComponentsManifest = serde_json::from_str(
+            &std::fs::read_to_string(&components_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", components_path.display())),
+        )
+        .expect("parse components.json");
+
+        // Reuse the act-emitter fixture's real rootfs.ext4 so the overlay copy succeeds
+        // and the launch reaches vm.start().
+        let src_rootfs = data_dir.join("capsules/act-emitter/rootfs.ext4");
+        assert!(
+            src_rootfs.is_file(),
+            "missing act-emitter rootfs.ext4 fixture at {}",
+            src_rootfs.display()
+        );
+
+        let name = format!("bug3leaktest{}", std::process::id());
+        // ensure_capsule resolves a local capsule when the registry CID matches the
+        // cached CID and the sha is empty (skips the artifact-sha gate). Register a
+        // local entry so the load reaches the launch path instead of a download.
+        registry.capsules.insert(
+            name.clone(),
+            CapsuleEntry {
+                cid: format!("local-{name}"),
+                sha256: String::new(),
+                size: 0,
+                repository: None,
+                source_path: None,
+                platforms: vec![],
+            },
+        );
+        let capsule_dir = data_dir.join("capsules").join(&name);
+        std::fs::create_dir_all(&capsule_dir).unwrap();
+        let dst_rootfs = capsule_dir.join("rootfs.ext4");
+        // Hardlink the 335MB image (same filesystem); fall back to a copy.
+        if std::fs::hard_link(&src_rootfs, &dst_rootfs).is_err() {
+            std::fs::copy(&src_rootfs, &dst_rootfs).unwrap();
+        }
+        std::fs::write(capsule_dir.join(CACHED_CID_FILE), format!("local-{name}\n")).unwrap();
+        std::fs::write(
+            capsule_dir.join("capsule.json"),
+            serde_json::json!({
+                "schema": "elastos.capsule/v1",
+                "name": name,
+                "version": "0.1.0",
+                "role": "provider",
+                "type": "microvm",
+                "entrypoint": "rootfs.ext4",
+                "permissions": { "guest_network": true }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut supervisor = Supervisor::new(data_dir.clone(), registry);
+        // The carrier bridge (and thus the socket the guard must clean) only spawns
+        // when a provider registry is present.
+        supervisor.set_provider_registry(Arc::new(ProviderRegistry::new()));
+
+        let overlay_dir = data_dir.join("rootfs-cache/overlays");
+        let socket_dir = data_dir.join("crosvm");
+        let overlays_before = dir_snapshot(&overlay_dir);
+        let socks_before = dir_snapshot(&socket_dir);
+
+        let result = supervisor
+            .launch_capsule(&name, serde_json::json!({}), None)
+            .await;
+
+        // Remove the fixture capsule dir (and its hardlinked rootfs) regardless of outcome.
+        let _ = std::fs::remove_dir_all(&capsule_dir);
+
+        println!("[BUG-3] launch_capsule result: {result:?}");
+        assert!(
+            result.is_err(),
+            "guest_network launch as non-root must fail at TAP creation (did this run as root?)"
+        );
+
+        // 1) tap_registry entry forgotten (the registry is fresh per Supervisor).
+        let leaked_taps = supervisor.tap_registry.taps();
+        println!("[BUG-3] tap_registry after failed launch: {leaked_taps:?}");
+        assert!(
+            leaked_taps.is_empty(),
+            "BUG-3: orphaned tap_registry entries: {leaked_taps:?}"
+        );
+
+        // 2) no new overlay .ext4 and 3) no new -carrier.sock leaked.
+        let leaked_overlays: Vec<_> = dir_snapshot(&overlay_dir)
+            .difference(&overlays_before)
+            .cloned()
+            .collect();
+        let leaked_socks: Vec<_> = dir_snapshot(&socket_dir)
+            .difference(&socks_before)
+            .cloned()
+            .collect();
+        println!("[BUG-3] leaked overlays: {leaked_overlays:?} | leaked socks: {leaked_socks:?}");
+        assert!(
+            leaked_overlays.is_empty(),
+            "BUG-3: orphaned rootfs overlay(s): {leaked_overlays:?}"
+        );
+        assert!(
+            leaked_socks.is_empty(),
+            "BUG-3: orphaned carrier socket(s): {leaked_socks:?}"
+        );
+    }
+
+    /// BUG-7: the reap loop collects a carrier service whose host child has exited,
+    /// while a pending (probe-less / not-yet-spawned) carrier survives — the
+    /// pending-safe fail-safe that prevents reaping a live, just-unused service.
+    #[tokio::test]
+    async fn reap_collects_a_dead_carrier_but_spares_a_pending_one() {
+        let supervisor = make_test_supervisor();
+        {
+            let mut running = supervisor.running.write().await;
+            running.insert(
+                "carrier-dead".to_string(),
+                RunningCapsule {
+                    name: "carrier-dead".to_string(),
+                    handle: "carrier-dead".to_string(),
+                    vsock_cid: 0,
+                    started_at: std::time::Instant::now(),
+                    provider_route: None,
+                    backend: CapsuleBackend::Carrier(Some(CarrierLiveness::exited_for_test())),
+                    bridge_task: None,
+                    carrier_socket: None,
+                },
+            );
+            running.insert(
+                "carrier-pending".to_string(),
+                RunningCapsule {
+                    name: "carrier-pending".to_string(),
+                    handle: "carrier-pending".to_string(),
+                    vsock_cid: 0,
+                    started_at: std::time::Instant::now(),
+                    provider_route: None,
+                    // No probe ⇒ pending/indeterminate ⇒ alive (fail-safe).
+                    backend: CapsuleBackend::Carrier(None),
+                    bridge_task: None,
+                    carrier_socket: None,
+                },
+            );
+        }
+
+        supervisor.reap_dead_capsules().await;
+
+        let running = supervisor.running.read().await;
+        assert!(
+            !running.contains_key("carrier-dead"),
+            "BUG-7: a carrier whose child exited must be reaped"
+        );
+        assert!(
+            running.contains_key("carrier-pending"),
+            "BUG-7 fail-safe: a pending (probe-less) carrier must NOT be reaped"
+        );
     }
 
     #[test]
@@ -1659,6 +2526,57 @@ mod tests {
         assert_eq!(
             Supervisor::parse_provider_route_from_provides("elastos://"),
             None
+        );
+    }
+
+    /// webspace-provider's manifest claims `localhost://WebSpaces/*` — it must bind the `webspace`
+    /// delegation slot the registry actually routes those requests to, NOT the whole `localhost`
+    /// plane. Read as a bare scheme the claim is a seizure attempt, PINNED_SCHEMES refuses it, and
+    /// the capsule ends up launched with no route at all.
+    #[test]
+    fn webspaces_namespace_binds_the_webspace_delegation_slot() {
+        for provides in [
+            "localhost://WebSpaces/*",
+            "localhost://WebSpaces",
+            "LOCALHOST://WebSpaces/Elastos/content",
+        ] {
+            assert_eq!(
+                Supervisor::parse_provider_route_from_provides(provides),
+                Some(ProviderRoute::Scheme("webspace".to_string())),
+                "{provides} must bind the webspace slot",
+            );
+        }
+        // Every other localhost root is still a claim on the file plane itself, and stays one so
+        // PINNED_SCHEMES can refuse it.
+        for provides in [
+            "localhost://Users/*",
+            "localhost://Public/*",
+            "localhost://ElastOS/*",
+        ] {
+            assert_eq!(
+                Supervisor::parse_provider_route_from_provides(provides),
+                Some(ProviderRoute::Scheme("localhost".to_string())),
+                "{provides} must not be treated as a delegated slot",
+            );
+        }
+    }
+
+    /// The shipped manifest is the thing that has to resolve — pin it, not just the parser.
+    #[test]
+    fn shipped_webspace_provider_manifest_resolves_to_a_route() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../capsules/webspace-provider/capsule.json");
+        let raw =
+            std::fs::read_to_string(&manifest).expect("webspace-provider manifest is readable");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("manifest is valid JSON");
+        let provides = value
+            .get("provides")
+            .and_then(serde_json::Value::as_str)
+            .expect("webspace-provider declares a provides namespace");
+        assert_eq!(
+            Supervisor::parse_provider_route_from_provides(provides),
+            Some(ProviderRoute::Scheme("webspace".to_string())),
+            "shipped provides `{provides}` does not resolve to the webspace slot",
         );
     }
 
@@ -1760,6 +2678,7 @@ mod tests {
             version: None,
             install_path: Some(install_path.to_string()),
             repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -1969,6 +2888,7 @@ mod tests {
                 sha256: "sha256:test-artifact".to_string(),
                 size: 0,
                 repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );
@@ -2013,6 +2933,7 @@ mod tests {
                 sha256: "sha256:test-artifact".to_string(),
                 size: 0,
                 repository: None,
+                source_path: None,
                 platforms: vec![],
             },
         );
@@ -2073,5 +2994,330 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("kubo not found"));
+    }
+
+    // ── AUD-1: the author-signature launch gate ─────────────────────
+    use elastos_runtime::signature::{generate_keypair, sign_capsule, SigningKey};
+
+    fn aud1_signed_capsule(
+        signing_key: &SigningKey,
+        bytes: &[u8],
+    ) -> (tempfile::TempDir, elastos_common::CapsuleManifest) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.wasm"), bytes).unwrap();
+        let mut manifest: elastos_common::CapsuleManifest =
+            serde_json::from_value(serde_json::json!({
+                "schema": "elastos.capsule/v1", "version": "0.1.0", "name": "probe",
+                "role": "app", "type": "wasm", "entrypoint": "main.wasm"
+            }))
+            .unwrap();
+        let content_hash = hash_content(bytes);
+        sign_capsule(signing_key, &mut manifest, &content_hash).unwrap();
+        (dir, manifest)
+    }
+
+    #[test]
+    fn aud1_gate_trusted_signed_capsule_passes() {
+        let (sk, vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+        assert!(gate_author_signature(&verifier, dir.path(), &manifest).is_ok());
+    }
+
+    #[test]
+    fn aud1_gate_foreign_signed_capsule_refused() {
+        let (sk, _vk) = generate_keypair();
+        let (_, trusted_vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(trusted_vk);
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_err(),
+            "a capsule signed by a non-trusted key must be refused"
+        );
+    }
+
+    #[test]
+    fn aud1_gate_unsigned_capsule_refused_when_configured() {
+        let (sk, vk) = generate_keypair();
+        let (dir, mut manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        manifest.signature = None;
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_err(),
+            "an unsigned capsule must be refused when trusted keys are configured"
+        );
+    }
+
+    #[test]
+    fn aud1_gate_empty_verifier_passes_as_today() {
+        let (sk, _vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        let verifier = SignatureVerifier::new();
+        let mut unsigned = manifest.clone();
+        unsigned.signature = None;
+        assert!(gate_author_signature(&verifier, dir.path(), &manifest).is_ok());
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &unsigned).is_ok(),
+            "with zero trusted keys the gate is inert (zero breakage)"
+        );
+    }
+
+    #[test]
+    fn aud1_gate_tampered_entrypoint_refused() {
+        let (sk, vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"original rootfs");
+        std::fs::write(dir.path().join("main.wasm"), b"TAMPERED rootfs").unwrap();
+        let mut verifier = SignatureVerifier::new();
+        verifier.add_trusted_key(vk);
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_err(),
+            "a tampered entrypoint must fail the signature gate"
+        );
+    }
+
+    // AUD-1 ACTIVATION round-trip: the founder path is config `trusted_keys` (HEX) →
+    // `from_trusted_keys_hex` (the seed) → `gate_author_signature` (the launch gate).
+    // These pin that the seed and the gate compose end to end, so a HEX-configured key
+    // admits exactly its own capsules — not just that `add_trusted_key(vk)` works.
+    #[test]
+    fn aud1_activation_hex_configured_key_admits_its_capsule() {
+        let (sk, vk) = generate_keypair();
+        let (dir, manifest) = aud1_signed_capsule(&sk, b"rootfs bytes");
+        // Exactly what serve does: seed the verifier from the configured hex public key.
+        let verifier =
+            SignatureVerifier::from_trusted_keys_hex([hex::encode(vk.as_bytes())]).unwrap();
+        assert!(
+            verifier.is_enabled(),
+            "a configured key must enable the gate"
+        );
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_ok(),
+            "a capsule signed by the hex-configured trusted key must launch"
+        );
+    }
+
+    #[test]
+    fn aud1_activation_hex_configured_key_refuses_a_foreign_capsule() {
+        let (_founder_sk, founder_vk) = generate_keypair();
+        let (foreign_sk, _foreign_vk) = generate_keypair();
+        // The capsule is signed by a key NOT in the founder's configured trusted set.
+        let (dir, manifest) = aud1_signed_capsule(&foreign_sk, b"rootfs bytes");
+        let verifier =
+            SignatureVerifier::from_trusted_keys_hex([hex::encode(founder_vk.as_bytes())]).unwrap();
+        assert!(
+            gate_author_signature(&verifier, dir.path(), &manifest).is_err(),
+            "a capsule signed by a key outside the configured trusted set must be refused"
+        );
+    }
+
+    // ── The pinned-provider invariant on the CAPSULE-LAUNCH registration path ──────────
+    //
+    // `register_provider_route` / `register_carrier_service_route` are the ONLY routes by
+    // which a launched (untrusted) capsule's manifest `provides:` claim binds a runtime
+    // route. Boot binds the security-critical providers first; a capsule that declares the
+    // same route must not be able to seize it — ambient authority via registration order
+    // (Principle 3). These tests exercise the supervisor route, not the registry directly,
+    // so a future launch path that skips the registry guard fails here.
+
+    struct PinnedBootProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl Provider for PinnedBootProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "boot provider not exercised".into(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec![self.0]
+        }
+
+        fn name(&self) -> &'static str {
+            "pinned-boot-provider"
+        }
+    }
+
+    /// Name of the provider currently bound to `route` under `route_kind`.
+    async fn bound_provider(
+        registry: &ProviderRegistry,
+        route_kind: &str,
+        route: &str,
+    ) -> Option<String> {
+        registry
+            .registrations()
+            .await
+            .into_iter()
+            .find(|r| r.route_kind == route_kind && r.route == route)
+            .map(|r| r.provider)
+    }
+
+    async fn supervisor_with_registry(registry: &Arc<ProviderRegistry>) -> Supervisor {
+        let mut supervisor = make_test_supervisor();
+        supervisor.set_provider_registry(Arc::clone(registry));
+        supervisor
+    }
+
+    #[tokio::test]
+    async fn launch_registration_cannot_seize_a_pinned_sub_provider() {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("wallet", Arc::new(PinnedBootProvider("wallet")))
+            .await
+            .expect("boot binds the pinned sub-provider first");
+        let supervisor = supervisor_with_registry(&registry).await;
+
+        let route = supervisor
+            .register_provider_route(
+                "hostile-capsule",
+                Some("elastos://wallet/accounts"),
+                "10.0.0.9",
+                serde_json::json!({}),
+            )
+            .await;
+
+        assert!(
+            route.is_none(),
+            "a launched capsule must not bind a pinned sub-provider (and must not own a \
+             teardown route that would unbind the boot provider)"
+        );
+        assert_eq!(
+            bound_provider(&registry, "elastos-sub-provider", "wallet")
+                .await
+                .as_deref(),
+            Some("pinned-boot-provider"),
+            "elastos://wallet/... must still route to the boot provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_service_registration_cannot_seize_a_pinned_sub_provider() {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("key", Arc::new(PinnedBootProvider("key")))
+            .await
+            .expect("boot binds the pinned sub-provider first");
+        let supervisor = supervisor_with_registry(&registry).await;
+
+        let route = supervisor
+            .register_carrier_service_route(
+                "hostile-carrier-service",
+                Some("elastos://key/escrow"),
+                Path::new("/nonexistent/hostile-provider"),
+                Vec::new(),
+                serde_json::json!({}),
+            )
+            .await;
+
+        assert!(
+            route.is_none(),
+            "a carrier-plane service must not bind a pinned sub-provider either"
+        );
+        assert_eq!(
+            bound_provider(&registry, "elastos-sub-provider", "key")
+                .await
+                .as_deref(),
+            Some("pinned-boot-provider"),
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_registration_cannot_seize_the_pinned_localhost_scheme() {
+        // `provides: "localhost://..."` parses to a MAIN-scheme route, which took a
+        // different registration path than the sub-provider guard. `localhost` is the
+        // user's whole file plane, bound at boot by the localhost-provider capsule.
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register(Arc::new(PinnedBootProvider("localhost")))
+            .await;
+        let supervisor = supervisor_with_registry(&registry).await;
+
+        let route = supervisor
+            .register_provider_route(
+                "hostile-capsule",
+                // Any real localhost root proves the point — the guard is on the SCHEME, not the
+                // root. Deliberately NOT the obsolete shared per-user storage alias that principal
+                // roots replaced: it no longer resolves to anything, and
+                // `scripts/home-entropy-check.mjs` fails the build on unreviewed uses of it
+                // precisely so it cannot creep back in as a copied test fixture.
+                Some("localhost://Public/Documents"),
+                "10.0.0.9",
+                serde_json::json!({}),
+            )
+            .await;
+
+        assert!(
+            route.is_none(),
+            "a launched capsule must not bind the pinned localhost scheme"
+        );
+        assert_eq!(
+            bound_provider(&registry, "scheme", "localhost")
+                .await
+                .as_deref(),
+            Some("pinned-boot-provider"),
+            "localhost://... must still route to the boot file plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_registration_still_binds_an_unpinned_reserved_route() {
+        // Negative control: the guard must refuse ONLY pinned, already-bound routes —
+        // the ordinary capsule provider route still mounts.
+        let registry = Arc::new(ProviderRegistry::new());
+        let supervisor = supervisor_with_registry(&registry).await;
+
+        let route = supervisor
+            .register_provider_route(
+                "market-capsule",
+                Some("elastos://market/listings"),
+                "10.0.0.9",
+                serde_json::json!({}),
+            )
+            .await;
+
+        assert!(
+            matches!(&route, Some(bound) if bound.route == ProviderRoute::SubProvider("market".to_string())),
+            "an unpinned reserved sub-provider must still register: {route:?}"
+        );
+        assert_eq!(
+            bound_provider(&registry, "elastos-sub-provider", "market")
+                .await
+                .as_deref(),
+            Some("vm-capsule-provider"),
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_registration_binds_a_free_pinned_slot_then_holds_it() {
+        // First-writer-wins, not never-writes: an unbound pinned slot is still bindable
+        // (that is how boot binds it), and the SECOND writer is the one refused.
+        let registry = Arc::new(ProviderRegistry::new());
+        let supervisor = supervisor_with_registry(&registry).await;
+
+        let first = supervisor
+            .register_provider_route(
+                "first-capsule",
+                Some("elastos://drm/license"),
+                "10.0.0.9",
+                serde_json::json!({}),
+            )
+            .await;
+        assert!(first.is_some(), "a free pinned slot is bindable");
+
+        let second = supervisor
+            .register_provider_route(
+                "second-capsule",
+                Some("elastos://drm/license"),
+                "10.0.0.10",
+                serde_json::json!({}),
+            )
+            .await;
+        assert!(second.is_none(), "the second writer is refused");
     }
 }

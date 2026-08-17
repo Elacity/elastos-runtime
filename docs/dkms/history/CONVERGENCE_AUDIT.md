@@ -1,0 +1,254 @@
+# ElastOS ⇄ PC2 dDRM Convergence — Audit & Roadmap
+
+> **Purpose:** a single, honest, bird's-eye answer to "where are we, what's built, what's
+> left, and how do we get to the full creator → package → sign → IPFS/chain → buy/trade →
+> download → run loop for **both media and non-media** assets — as the superior,
+> ElastOS-native version of PC2."
+>
+> Read alongside `PRODUCT_VISION.md` (the why), `CONVERGENCE_PLAYBOOK.md` (the how),
+> `STRATEGIC_ROADMAP.md` (**sequencing + timing** for the portals, Lit bridge, and 3‑node dKMS,
+> grounded in a real `~/.pc2` source audit), `SYSTEM_ARCHITECTURE_MAP.md` (the detailed map),
+> `DDRM_STATUS.md` (the day-by-day ladder), and `PRINCIPLES.md` (the constitution). Where those
+> disagree, `DDRM_STATUS.md` is the most current on crypto state and this doc is the most current
+> on product-loop state.
+>
+> **Date:** 2026-06-11 · **Branch:** `feat/ddrm-home-playback`
+
+---
+
+## 0. TL;DR
+
+The **cryptographic engine and provider contracts are essentially built and are genuinely
+superior to PC2** — born-distributed threshold keys, PQ-hybrid sealing, in-VM decrypt with
+CEK containment, IPFS/Helia-byte-compatible content addressing, on-chain mint calldata, a
+marketplace indexer, and (as of 2026-06-11) **real video playback inside Home**. What is
+**not** done is the **product skin and the remaining live plumbing** around that engine: a
+creator/packaging UI (Create portal) + Market portal, live IPFS pinning, the real
+**operative/paymentProcessor** buy path, a **non-media viewer** (documents/images/3D), a
+shipped **Lit compat adapter**, and **production multi-node dKMS deployment**. The
+wallet-signed **mint** broadcast is now wired (assemble → sign → broadcast) via
+`mint_authority`, on the same managed-key rail as buy.
+
+**The hard part (the trustworthy core) is done. The remaining work is wiring it to
+chain/IPFS/UI for real, and adding the surfaces.**
+
+---
+
+## 1. The full lifecycle, color-coded by reality
+
+🟢 done/proven · 🟡 partial · 🔴 gap
+
+| # | Stage | Capsule(s) | State | What's real | What's left |
+|---|---|---|---|---|---|
+| 1 | Encrypt / CENC seal | `encrypt-provider`, `ddrm-envelope` | 🟢 | CEK minted in-VM, CENC AES-128-CTR fMP4, escrow envelope, PQ-hybrid | feed real creator bytes |
+| 1 | Content addressing | importer (`ddrm-runtime-open`), `ipfs-provider` | 🟢 | CIDv1 raw leaves + dag-pb balanced tree, **byte-identical to Helia**, fail-closed | live Kubo pin/serve at scale |
+| 1 | Packaging (non-media) | — | 🔴 | decrypt is content-agnostic | render-tier packaging for pdf/img/epub/3D |
+| 2 | Mint intent + calldata | `publish-provider`, `chain-provider` | 🟢 | `UnsignedMintV1`, PC2-faithful `mint()` ABI calldata, payee/royalty arrays | — |
+| 2 | **Mint sign + broadcast** | `mint_authority`, `wallet-provider`, `chain-provider` | 🟢 | **live mint wired**: `assemble_mint` (real selector `0x47cbeeb4`) → managed-key sign → broadcast, via `/api/create/mint`; shares the `chain_tx` rail with buy; proven offline (`chain_mock_mint`) | drive from a Create portal UI (B4) |
+| 2 | Wallet sign + broadcast | `wallet-provider`, `chain-provider` | 🟢 | **live `prepare→sign→broadcast` wired** via `wallet_signer`: real EIP-155 RLP+secp256k1 signing inside `wallet-provider` (key never leaves the capsule), nonce/gas from `chain-provider.prepare_transaction`, broadcast through `chain-provider`; proven offline (`chain_mock_wallet_signs`) | EIP-1559 (type-2) txs |
+| 2 | IPFS pin | `ipfs-provider` | 🟡 | contract + addressing | live pin wired into publish |
+| 3 | Marketplace / discovery | `content-market` | 🟢 (offline) | listing from calldata + chain event + metadata | live `eth_getLogs` |
+| 3 | Buy / trade access | `buy_authority`, `wallet_signer`, `wallet-provider`, `chain-provider` | 🟡 | **buy assemble→SIGN→broadcast→record→re-check wired** on the **real `buyAccess` ABI** (`buyAccess(address seller,address ledger,uint256 tokenId,uint256 qty,uint256 price[,address payToken])` → AuthorityGateway; native `0xf7580ad9` / ERC‑20 USDC `0x0ede2294`); `ELASTOS_DDRM_BUY_SIGN=wallet` signs inside `wallet-provider`; offline `denied→buy→owned→open` loop proven | live listing resolution (seller/price/tokenId) + the USDC `approve(paymentProcessor)` batch (Market portal B5); funded account + consent UI |
+| 4 | Rights check | `rights-provider`, `chain-provider` | 🟢 | **real Base ABI** `hasAccessByContentId(address holder, bytes16 contentId)` (selector `0x54d42821`) on the live path; defaults to the real AuthorityGateway; chain-mock keeps the tolerant string shape for local CIDs (owned→open, not-owned→fail-closed) | — |
+| 4 | Key authority (dKMS) | `key-provider`, `dkms-authority` | 🟢 built | born-distributed DKG, 2-of-2 + 2-of-3, rotatable/reconfigurable, authenticated PQ channel over TCP, quorum attestation | **production multi-node deployment** (ops) |
+| 4 | Lit compat backend | `key-provider` | 🟡 seam-only | operator-selectable slot, fails closed honestly | ship a Lit proxy adapter |
+| 4 | Decrypt boundary | `decrypt-provider` | 🟢 | in-VM unwrap, multi-segment, single+threshold+quorum rails, `Zeroizing` | — |
+| 4 | Media viewer | `elacity-player` | 🟢 **playing** | MSE segment streaming, fails closed on key fields | swap test clip → real owned title |
+| 4 | Non-media viewer | — | 🔴 | — | `ddrm-viewer` render-tier capsule (PC2 `wasm-renderer`) + a 3D tier |
+| — | Creator app UI | `library`/new | 🔴 | — | the "package & publish" surface |
+| — | Orchestration host | `ddrm-plan-runner` (`DrmHost`) | 🟢 | composition root, capability table, fail-closed | fold into product gateway |
+
+**Engine ≈ 90–97% done & verified; product loop (UI + live chain/IPFS + non-media + node
+deployment) is the remaining real work.**
+
+---
+
+## 2. The Carrier thesis (and where we actually stand)
+
+**Your understanding is correct and it is the core thesis:** sandboxed environments (microVM
+/ WASM / frame) connected through a **Carrier capability plane**, gated by **capability
+tokens**. This is `PRINCIPLES.md` #4 ("Carrier Plane For Local And Off-Box") and the product
+vision verbatim.
+
+**The one refinement:** "Carrier" is the **contract shape**, not a specific wire. Per
+`PRINCIPLES.md` #4 and `CARRIER.md`, a capsule speaks **one capability-plane contract** — a
+signed capability envelope authorized by a capability token — and **never names its own
+transport**. The transport beneath is swappable **adapter plumbing**: in-process / shared
+gossip buffer locally, stdio / vsock / loopback HTTP for adapters, **iroh P2P** off-box. Two
+capsules on the same machine talk in-process (instant, no network) and that is still
+"Carrier-shaped," not a violation.
+
+> One-liner: **one Carrier-shaped capability plane, transport-agnostic — in-process locally,
+> iroh P2P remotely, swappable underneath without any capsule code change.** Not "everything
+> physically rides the P2P wire."
+
+**Conformance grade today:**
+
+| Hop | Carrier-shaped contract? | Transport today | Verdict |
+|---|---|---|---|
+| browser capsule → provider | ✅ capability call + Home token | loopback HTTP / `carrier_invoke` rail | ✅ compliant adapter |
+| provider → off-box provider | ✅ | iroh P2P | ✅ |
+| key-provider → dKMS node | ✅ endpoint descriptor | Unix socket / `tcp:` | ✅ permitted adapter (#4) |
+| media-authority (today's demo) | ⚠️ **names its transport** | gateway spawns stdio subprocess | 🟡 valid adapter, **not yet lifted behind the unified plane** |
+
+**Honest gap:** a few rails (the dKMS socket, the media-authority subprocess) are *valid host
+adapters* but the gateway still *names the transport* instead of receiving a transport-blind
+capability handoff. Lifting those behind the unified Carrier-capability plane (capsule never
+names a transport) is a tracked roadmap slice — **not a correctness hole**, a maturity step.
+
+---
+
+## 3. You vs PC2 — where the "superior version" already is
+
+| Dimension | PC2 (net repo) | ElastOS Runtime | Verdict |
+|---|---|---|---|
+| Key custody | Lit PKP threshold (opaque, off-platform) | **Owned born-distributed PQ dKMS**, you run the nodes, inspectable | ✅ superior |
+| Crypto root | P-256 / ECDSA (classical) | **PQ-hybrid** (x25519‖ML-KEM-768, ML-DSA-65) | ✅ superior |
+| Decrypt sandbox | WASM, CEK never crosses FFI | same invariant **+ full transcript binding + audit + expiry** | ✅ matched & extended |
+| Node channel | HTTPS `rejectUnauthorized:false` | **channel authenticates the node** (attested KEM key, sealed framed frames) | ✅ superior |
+| Key rotation | redeploy a constant | **live share rotation/reconfig, CEK never reassembles** | ✅ superior |
+| Isolation | escapable iframe | **microVM/WASM/frame tiers, zero ambient authority** | ✅ superior |
+| Content addressing | Helia/Kubo | byte-identical, **fail-closed integrity at every tree level** | ✅ matched |
+| Creator UI / upload | mature (ela.city) | **gap** | 🔴 PC2 ahead |
+| Non-media players | `wasm-renderer` (pdf/epub/cbz/image/code) | **gap** (no capsule yet) | 🔴 PC2 ahead |
+| Live buy/trade + broadcast | live on Base | calldata done, **live broadcast/purchase gap** | 🔴 PC2 ahead |
+
+**Architecturally ahead on the trust/crypto core; behind on product surfaces.**
+
+---
+
+## 4. Media vs non-media, Lit vs PQ
+
+- **Media (today): ✅ playing.** `elacity-player` + the rail; real video decrypts in Home.
+- **Non-media (docs/images/3D): 🔴 not yet a capsule.** Decrypt is content-agnostic so the
+  *bytes* decrypt; the missing piece is a `ddrm-viewer` render-tier capsule (port PC2's
+  `wasm-renderer`: pdf/epub/cbz/image/code, **plus a new 3D tier** PC2 lacks). **← active slice.**
+- **Lit assets: 🟡 seam ready, adapter not shipped.** `key-provider` has an operator-selectable
+  `lit` backend slot; it fails closed because no Lit proxy ships. Playing legacy Lit content =
+  wire **one Lit-proxy adapter behind key-provider** — no app/decrypt change.
+- **Quantum-resistant dKMS: 🟢 built, needs deployment.** The PQ threshold network runs as real
+  daemons over TCP today (proven across 3+ nodes). "Node deployment" = standing those daemons up
+  off-box in production (ops + provisioning), not new crypto.
+
+---
+
+## 5. Roadmap — sequenced thin vertical slices
+
+1. **Non-media viewer** (`ddrm-viewer`: documents/images, then 3D) — biggest capability gap,
+   reuses the proven rail. **← in progress.**
+2. **Lift local adapters behind the unified Carrier capability plane** — close the §2 maturity
+   gap so no capsule names a transport.
+3. **Live chain** — wallet-sign → broadcast mint to Base + live `eth_getLogs`.
+4. **Buy/trade** — the `buyAccess` purchase flow + UI.
+5. **dKMS production** — multi-node off-box deployment + provisioning.
+6. **Lit compat adapter** — serve legacy Lit-escrowed assets through the runtime.
+7. **Creator app** — the package-and-publish surface tying it together.
+
+Each slice: contract-first → characterization/golden tests → fail-closed proof → live
+demoable increment → honest status + next-slice prompt (per `CONVERGENCE_PLAYBOOK.md` §8).
+
+---
+
+## 6. Principle conformance (non-negotiable)
+
+- dDRM is the crown jewel; every slice serves the protected-content loop.
+- Capability security: each step is a capability-scoped provider call; no ambient authority;
+  the decrypt VM has no outbound key-fetch.
+- Fail-closed by default; live wiring behind dev/feature profiles; shared contract
+  byte-identical until blessed.
+- CEK clear only inside the decrypt sandbox, in `Zeroizing`, bound to the full transcript;
+  never on the wire, never to the app.
+- ElastOS-native PQ-hybrid is the root; P-256/Lit is compatibility, not product truth.
+
+---
+
+## 7. Chain access (PC2 fidelity) — how ownership is queried
+
+PC2 gates a viewer on **on-chain access-token ownership** (the predicate Lit's
+access-control-conditions wrapped). The runtime reproduces that predicate natively via the
+`chain-provider` capsule, so the answer is owned by us, not Lit.
+
+- **Contract method (real Base ABI):** `hasAccessByContentId(address holder, bytes16
+  contentId) → bool` — the AuthorityGateway read, confirmed against `~/.pc2`
+  `contracts/abis.ts` (selector `0x54d42821`). Encoded by `chain-provider/src/abi.rs::
+  encode_has_access_by_content_id_address_bytes16` and decoded by `decode_evm_bool` (exactly
+  32 bytes, high bytes zero, last byte 0/1). The selector + AuthorityGateway address default
+  to the real Base values and are config-overridable; never keccak'd in-capsule. The earlier
+  guessed `(string,address,string)` shape is retained only as a config-selectable fallback
+  (used by the chain-mock loop, where local CIDs aren't `bytes16` KIDs).
+- **`contentId` (`bytes16`):** the asset's on-chain content identity == the **KID** the
+  producer minted (see `abi.rs::abi_word_bytes16`, "`contentId == KID`", and `mint()`
+  `opRawData`). Must be `0x` + 32 hex or the live read fails closed. Local owned files (not
+  real Elacity mints) use the object CID and so route through chain-mock, not the live read.
+- **`right`:** access is **binary per contentId** on-chain, so `right` (view/stream/…) is
+  NOT an on-chain parameter — the gateway keeps it only in the signed decision receipt.
+- **`subject`:** the buyer's EVM wallet address. In Home this is the signed-in principal's
+  linked `eip155:` account (`wallet-provider` `accounts`), or `ELASTOS_DDRM_SUBJECT`.
+- **Network/RPC:** Base (chain id 8453) via `ELASTOS_CHAIN_BASE_RPC`; the contract +
+  selector are configured, never hard-coded into product paths.
+
+**Where it runs.** The canonical CLI vertical (`scripts/dev/ddrm-runtime-open`) has driven
+this real path since Day 136–140 with a `ChainRpcMock` for offline proof. As of
+`feat/ddrm-home-playback`, the **Home gateway** open path (`/api/viewers/open`) drives the
+SAME real `chain-provider` read behind the rights gate (`ELASTOS_DDRM_RIGHTS=chain` /
+`chain-mock`), feeds the typed `ChainAccessAttestationV1` into `rights-provider.
+decide_access_from_chain`, and welds the minted receipt hash into the decrypt transcript.
+Owned → opens; not-owned → `403`, nothing sealed; no wallet in chain mode → fail closed.
+
+---
+
+## 8. Buy flow (PC2 stage 5) — putting a token in the wallet
+
+PC2 buys access via `AuthorityGateway.buyAccess(...)` (USDC/USDT/ETH → operative Access
+Token, role 1). The runtime now mirrors this as an **orchestration over the existing real
+seams**, in `elastos-server/src/api/buy_authority.rs`:
+
+```
+resolve object + listing/price → assemble buyAccess tx { to, value, data }
+  → sign (wallet) → broadcast (chain-provider eth_sendRawTransaction)
+  → await/record → the rights gate's hasAccessByContentId now reads owned
+```
+
+- The `buyAccess` **calldata is now the real Elacity ABI** (confirmed against `~/.pc2`
+  `wallet.js`): `buyAccess(address seller, address ledger, uint256 tokenId, uint256
+  quantity, uint256 pricePerToken[, address payToken])` sent to the **AuthorityGateway**
+  (default `0x09dBe…`). The 5-arg form pays the native token (`value = price`, selector
+  `0xf7580ad9`); the 6-arg form pays an ERC-20 (USDC default, selector `0x0ede2294`) and
+  requires a prior `approve(paymentProcessor, price)` — the gateway flags this via
+  `requires_erc20_approve`. Listing terms (seller/ledger/tokenId/price/payToken) are
+  overridable via env and are sourced from the real listing by the Market portal (B5).
+- **chain-mock** broadcasts a representative signed tx through the REAL
+  `chain-provider.broadcast_transaction` op against an in-process RPC mock, then records
+  the purchase in a local owned-token ledger; the chain-mock rights read
+  (`ELASTOS_DDRM_CHAIN_ACCESS=ledger`) consults that ledger. This proves
+  **not-owned → buy → owned → open** end to end, offline, exercising the production
+  broadcast path. (`buy_then_open_loop` integration test.)
+- **dev** records the purchase in the ledger and returns a synthetic hash.
+- **chain** with `ELASTOS_DDRM_BUY_SIGN=wallet` is **genuinely live**: the gateway sources
+  real nonce/gas via `chain-provider.prepare_transaction`, signs inside `wallet-provider`
+  (managed account, key never leaves the capsule), and broadcasts the signed bytes through
+  `chain-provider`. Absent the opt-in it broadcasts an externally-signed tx
+  (`ELASTOS_DDRM_BUY_SIGNED_TX`) or returns the unsigned tx (`409`). Ownership is read back
+  from `hasAccessByContentId`, never the ledger.
+- **Live EVM signing is wired** (`elastos-server/src/api/wallet_signer.rs`): it drives the
+  wallet capsule's own `create → request_signature(transaction_intent) → approve →
+  sign_approved` flow. The real RLP + secp256k1 + keccak signer already lived in
+  `wallet-provider` (`sign_eip155_legacy_transaction`); the gateway only orchestrates it,
+  and `chain-provider.prepare_transaction` emits the exact `unsigned_transaction_intent/v1`
+  the wallet consumes — the two providers compose with no invented fields. Proven offline
+  by the `chain_mock_wallet_signs` integration test (genuine signature → real broadcast).
+- The **Home shell auto-recovers**: a rights-denied open calls `POST /api/market/buy`
+  and retries the open once, so a click goes `denied → buy → owned → plays`.
+
+**Still open:** live listing resolution + the USDC `approve(paymentProcessor)` batch (Market
+portal B5); EIP-1559 (type-2)
+txs (legacy EIP-155 today, accepted by Base); a **funded** managed account + a user-consent
+**approval UI** for live spends (the gateway grants approval inline today, gated behind the
+operator's `ELASTOS_DDRM_BUY_SIGN=wallet` opt-in); and pointing it at a real Base RPC +
+the production contract/selector. The same `wallet_signer` rail now unblocks the live
+**mint** broadcast (stage 2).
+
+---
+
+*Living document. Update as slices land and the live chain / dKMS deployment / Lit adapter
+come online.*

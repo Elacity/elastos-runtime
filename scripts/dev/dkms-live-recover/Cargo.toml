@@ -1,0 +1,31 @@
+[package]
+name = "dkms-live-recover"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# LIVE 2-of-3 dKMS recover proof (dev driver, NOT a capsule, never shipped).
+#
+# Plays the PRODUCER + the runtime CLIENT + the decrypt-boundary combine against the
+# THREE REAL production authority daemons named in a PUBLIC-ONLY v2 descriptor
+# (tcp:10.66.66.x:9443 over the dkms0 mesh). It mints a CEK, Shamir-splits it 2-of-3
+# over GF(256), escrows each indexed share to that node's PUBLISHED recipient key,
+# opens the SAME app-layer encrypted, mutually-authenticated channel the production
+# `key-provider` uses (verifying the node's attestation + channel key under the PINNED
+# descriptor vk), drives the full session/possession/freshness recover, and reconstructs
+# the CEK in-boundary from ANY TWO nodes — proving any-2-of-3 opens and one-node-down
+# still opens, while a single share is information-theoretically useless. The raw CEK and
+# the raw shares never cross a node boundary.
+#
+# Built via --manifest-path (no root workspace); cross-compiled for linux to run on a
+# host that is on the dkms0 mesh. Reuses ddrm-envelope so there is NO private
+# re-implementation of the wire, the escrow AAD, the split, or the combine.
+
+[[bin]]
+name = "dkms-live-recover"
+path = "src/main.rs"
+
+[dependencies]
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope", features = ["access-grant"] }
+serde_json = "1.0"
+base64 = "0.22"

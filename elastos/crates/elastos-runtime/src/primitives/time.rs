@@ -24,17 +24,33 @@ impl SecureTimeSource {
         Self { counter_path: None }
     }
 
-    /// Create a time source with persistence to the given path
+    /// Create a time source with persistence to the given path.
+    ///
+    /// RECOVERY SEMANTICS: an unreadable or unparseable counter file restarts the monotonic
+    /// counter from zero (loudly — a warning names the file), the same as a first run. Within one
+    /// process timestamps stay strictly monotonic either way; what a corrupt file costs is
+    /// CROSS-RESTART ordering against records stamped before the corruption. The audit chain does
+    /// not depend on that (its ordering is the hash chain's `seq`, not the timestamp counter).
     pub fn with_persistence(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
 
         // Load existing counter if file exists
         if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(value) = content.trim().parse::<u64>() {
+            match fs::read_to_string(&path) {
+                Ok(content) => match content.trim().parse::<u64>() {
                     // Start from saved value + 1 to ensure monotonicity
-                    SecureTimestamp::init_counter(value + 1);
-                }
+                    Ok(value) => SecureTimestamp::init_counter(value + 1),
+                    Err(e) => tracing::warn!(
+                        "monotonic counter file {} is unparseable ({e}) — restarting the \
+                         counter from zero (cross-restart ordering lost)",
+                        path.display()
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    "monotonic counter file {} is unreadable ({e}) — restarting the counter \
+                     from zero (cross-restart ordering lost)",
+                    path.display()
+                ),
             }
         }
 

@@ -147,6 +147,22 @@ impl CapabilityStore {
         Ok(*count)
     }
 
+    /// Refund one use of a token — the saturating atomic inverse of
+    /// [`try_use_token`]. Returns the new use count.
+    ///
+    /// Used ONLY when a consumed single-use was provably a no-op (e.g. the
+    /// provider was never invoked — a routing failure), so the slot is returned
+    /// to the holder. Saturates at 0 so it can never mint extra uses. Uses are
+    /// fungible counters, so returning one slot after a no-op keeps the count
+    /// equal to the number of *effectful* uses, with no double-spend (the slot is
+    /// returned only for a failure that provably caused no side effect).
+    pub async fn refund_token_use(&self, token_id: &TokenId) -> u32 {
+        let mut counts = self.use_counts.write().await;
+        let count = counts.entry(*token_id).or_insert(0);
+        *count = count.saturating_sub(1);
+        *count
+    }
+
     /// Revoke a specific token
     pub async fn revoke_token(&self, token_id: TokenId) {
         {
@@ -269,6 +285,41 @@ mod tests {
 
         assert!(store.is_epoch_valid(1));
         assert!(!store.is_epoch_valid(0));
+    }
+
+    #[tokio::test]
+    async fn refund_token_use_is_the_saturating_inverse_of_try_use() {
+        // BUG-4 core: a refunded single use is returned exactly once, and the
+        // refund can never mint extra uses (saturates at 0).
+        let store = CapabilityStore::new();
+        let token_id = TokenId::new();
+
+        assert_eq!(
+            store.try_use_token(&token_id, 1).await,
+            Ok(1),
+            "consume the one use"
+        );
+        assert_eq!(store.try_use_token(&token_id, 1).await, Err(1), "exhausted");
+
+        assert_eq!(
+            store.refund_token_use(&token_id).await,
+            0,
+            "refund returns the slot"
+        );
+        assert_eq!(
+            store.try_use_token(&token_id, 1).await,
+            Ok(1),
+            "reusable after refund"
+        );
+
+        // Saturates: refunding past zero never creates extra uses.
+        assert_eq!(store.refund_token_use(&token_id).await, 0);
+        assert_eq!(store.refund_token_use(&token_id).await, 0);
+        assert_eq!(
+            store.try_use_token(&token_id, 1).await,
+            Ok(1),
+            "still exactly one use"
+        );
     }
 
     #[tokio::test]

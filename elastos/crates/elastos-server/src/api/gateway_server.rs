@@ -8,11 +8,13 @@ use tokio::net::TcpListener;
 
 use super::{gateway_router_with_api_url, GatewayState, GATEWAY_VERSION};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_gateway_server(
     addr: &str,
     provider_registry: Option<Arc<ProviderRegistry>>,
     cache_dir: PathBuf,
     data_dir: PathBuf,
+    shared_audit_log: Option<Arc<elastos_runtime::primitives::audit::AuditLog>>,
 ) -> anyhow::Result<()> {
     crate::auth::verify_auth_audit_chain_ready(&data_dir)?;
     let listener = TcpListener::bind(addr).await?;
@@ -22,11 +24,17 @@ pub async fn start_gateway_server(
         identity_manager: Arc::new(OnceLock::new()),
         cache_dir,
         data_dir,
+        // Unify onto the shared runtime custody chain when it is durable; otherwise the
+        // gateway opens its own durable file sink (never a durable→memory downgrade).
+        audit_log: super::seed_gateway_audit_log(shared_audit_log),
     };
     let browser_lifecycle_reconciler =
         super::gateway_browser::start_browser_lifecycle_reconciler(state.clone())
             .map_err(anyhow::Error::msg)?;
     let app = gateway_router_with_api_url(state, gateway_api_url);
+    // Release expired viewer sessions on the clock, not only on the next store access —
+    // an idle machine must not keep an expired authority subprocess alive past its TTL.
+    crate::api::session_lifecycle::spawn_sweeper();
     let advertised = advertised_gateway_urls(addr);
     println!("ElastOS Gateway v{}", GATEWAY_VERSION);
     println!("  Bind:      http://{}", addr);

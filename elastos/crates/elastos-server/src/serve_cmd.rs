@@ -27,7 +27,7 @@ pub async fn run_serve(
     if !subordinate_host {
         elastos_server::host_lock::spawn_installed_binary_supersession_watch(&data_dir, "serve");
     }
-    let (_runtime_config, is_first_run) = bootstrap::RuntimeConfig::load(&data_dir);
+    let (runtime_config, is_first_run) = bootstrap::RuntimeConfig::load(&data_dir);
     if is_first_run {
         crate::print_first_run_welcome(&data_dir);
     }
@@ -151,13 +151,21 @@ pub async fn run_serve(
                     .and_then(|m| m.http_port)
                     .unwrap_or(4100);
 
+                // G2b: resolve the honest verified-signer (Some only on a real trusted-key
+                // ed25519 match; None when verification is off / unsigned / unmatched), so
+                // the inspector reports "verified" trust strictly behind a genuine check.
+                let verified_signer = runtime
+                    .resolve_verified_signer(&handle.manifest, &capsule_dir)
+                    .await;
                 let runtime_arc = Arc::new(runtime);
                 let capsule_info = elastos_server::runtime::RunningCapsuleInfo {
                     id: handle.id.0.clone(),
                     name: handle.manifest.name.clone(),
                     status: "running".to_string(),
                     capsule_type: handle.manifest.capsule_type.clone(),
+                    manifest: Box::new(handle.manifest.clone()),
                     handle: Some(handle.clone()),
+                    verified_signer,
                 };
                 runtime_arc.register_capsule(capsule_info).await;
 
@@ -285,6 +293,9 @@ pub async fn run_serve(
         .await;
 
     let runtime = Arc::new(runtime);
+
+    // Register the read-only Capsule Inspector on the shared provider registry
+
     let docs_dir = std::env::current_dir().ok().and_then(|d| {
         let docs = d.join("..");
         if docs.join("ROADMAP.md").exists() {
@@ -315,7 +326,14 @@ pub async fn run_serve(
             } else {
                 std::process::Stdio::piped()
             };
-            match tokio::process::Command::new(&shell_path)
+            let mut shell_cmd = tokio::process::Command::new(&shell_path);
+            // P16 (Sprint 46): the shell is a capsule spawn — strip the runtime-only secrets
+            // (rail bearer, broadcastable signed tx). ONE shared list:
+            // `provider::RUNTIME_ONLY_SECRETS`.
+            for secret in elastos_runtime::provider::RUNTIME_ONLY_SECRETS {
+                shell_cmd.env_remove(secret);
+            }
+            match shell_cmd
                 .env("ELASTOS_API", &api_url)
                 .env("ELASTOS_TOKEN", &shell_session.token)
                 .env("ELASTOS_SHELL_MODE", &shell_mode)
@@ -367,6 +385,26 @@ pub async fn run_serve(
             s.set_provider_registry(infra.provider_registry.clone());
             s.set_capability_manager(infra.capability_manager.clone());
             s.set_pending_store(infra.pending_store.clone());
+            // Unify the serve gateway's audit sink onto the shared runtime custody chain
+            // (adopted only when durable — never a durable→memory downgrade).
+            s.set_shared_audit_log(Some(infra.audit_log.clone()));
+            // W1b/C3: start the NFLOG egress-audit reader so kernel egress drops become signed
+            // EgressDenied events on the shared chain (Linux-only; no-op otherwise; best-effort).
+            s.start_egress_audit_reader();
+            // AUD-1: seed the author-signature launch gate from config `trusted_keys`.
+            // Empty by default (gate inert, launches byte-for-byte unchanged); a
+            // malformed hex key aborts serve startup LOUDLY (fail-closed at boot) rather
+            // than dropping it and leaving a partial/empty keyset that fails open. The
+            // all-or-nothing seed is the unit-tested `from_trusted_keys_hex` primitive.
+            let verifier = elastos_runtime::signature::SignatureVerifier::from_trusted_keys_hex(
+                runtime_config.effective_trusted_keys(),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid trusted_keys entry in runtime config (refusing to start): {e}"
+                )
+            })?;
+            s.set_signature_verifier(verifier);
             Some(Arc::new(s))
         } else {
             None

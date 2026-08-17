@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::capability::Action;
 
 /// Why a preview cannot produce a safe invocation plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum InvokeError {
     InputTypeMismatch { expected: String },
     MissingRequiredField(String),
@@ -23,7 +23,7 @@ pub enum InvokeError {
 }
 
 /// Preview for an affordance method.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InvocationPlan {
     pub capability_action: Action,
     pub approval: AffordanceApprovalMode,
@@ -31,7 +31,7 @@ pub struct InvocationPlan {
 }
 
 /// Preview for a provider operation declared in manifest authority metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProviderOperationPlan {
     pub resources: Vec<String>,
     pub actions: Vec<Action>,

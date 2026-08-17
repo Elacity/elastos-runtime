@@ -31,6 +31,8 @@ pub(crate) struct ServerInfrastructure {
     pub(crate) host_helpers: Vec<api::server::HostHelperProcess>,
 }
 
+/// Opt-in durable, verified-on-open audit log (the EU AI Act custody mode). Unset → in-memory.
+const AUDIT_LOG_PATH_ENV: &str = "ELASTOS_AUDIT_LOG_PATH";
 const CONTENT_REPAIR_SCHEDULER_ENV: &str = "ELASTOS_CONTENT_REPAIR_SCHEDULER";
 const CONTENT_REPAIR_SCHEDULER_INTERVAL_ENV: &str = "ELASTOS_CONTENT_REPAIR_INTERVAL_SECS";
 const CONTENT_REPAIR_SCHEDULER_LIMIT_ENV: &str = "ELASTOS_CONTENT_REPAIR_LIMIT";
@@ -199,19 +201,74 @@ pub(crate) async fn setup_control_plane_infrastructure() -> anyhow::Result<Serve
     setup_server_infrastructure_impl(false).await
 }
 
+/// Build the server's audit log.
+///
+/// DEFAULT (unset env): the in-memory fail-loud chain — no per-emit `fsync` on the hot path. Making
+/// the default file-backed would force an fsync on every capability validate; that perf change waits
+/// on the audit group-commit rewrite (KNOWN_GAPS G8, measure-first).
+///
+/// DURABLE CUSTODY MODE (`ELASTOS_AUDIT_LOG_PATH` set): the log is file-backed AND **verified on
+/// open** — if the existing on-disk chain fails the hash + signature walk, startup ABORTS rather
+/// than appending a fresh, valid-looking tail onto a tampered history. This is the EU AI Act
+/// durable audit trail an operator opts into. The path may be absolute or relative to `data_dir`.
+fn build_audit_log(data_dir: &Path) -> anyhow::Result<Arc<primitives::audit::AuditLog>> {
+    match std::env::var_os(AUDIT_LOG_PATH_ENV) {
+        Some(raw) if !raw.is_empty() => {
+            let configured = PathBuf::from(raw);
+            let path = if configured.is_absolute() {
+                configured
+            } else {
+                data_dir.join(configured)
+            };
+            let log = primitives::audit::AuditLog::with_file_verified(&path).map_err(|e| {
+                // A lock conflict means ANOTHER INSTANCE holds the log (S52 single-opener) — say
+                // that, not "tamper" (council S52 LOW2: the wrong hint costs an operator real time).
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    anyhow::anyhow!(
+                        "durable audit log at {} is already open by another live process ({e}); \
+                         is another elastos instance running against this data dir?",
+                        path.display()
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "durable audit log at {} failed to open or verify ({e}); set {} only to a \
+                         trusted, untampered custody log",
+                        path.display(),
+                        AUDIT_LOG_PATH_ENV
+                    )
+                }
+            })?;
+            tracing::info!(
+                "Durable audit log enabled (verified-on-open): {}",
+                path.display()
+            );
+            Ok(Arc::new(log))
+        }
+        _ => Ok(Arc::new(primitives::audit::AuditLog::new())),
+    }
+}
+
 async fn setup_server_infrastructure_impl(
     spawn_host_providers: bool,
 ) -> anyhow::Result<ServerInfrastructure> {
     let data_dir = default_data_dir();
     let _ = ownership::repair_path_recursive(&data_dir);
 
-    let audit_log = Arc::new(primitives::audit::AuditLog::new());
+    let audit_log = build_audit_log(&data_dir)?;
     let session_registry = Arc::new(session::SessionRegistry::new(audit_log.clone()));
     session_registry
         .set_default_owner(local_session_owner(&data_dir)?)
         .await;
     let metrics = Arc::new(primitives::metrics::MetricsManager::new());
-    let capability_store = Arc::new(capability::CapabilityStore::new());
+    // PERSISTENT store: token revocations and the epoch must survive a restart, or every
+    // individually-revoked (still unexpired) token would validate again after a reboot — a revoke
+    // that is durably ATTESTED on the audit chain must also be durably ENFORCED. Fail-closed: if
+    // the store cannot persist, the server does not start with silently-amnesiac revocation.
+    let capability_store = Arc::new(
+        capability::CapabilityStore::with_persistence(data_dir.join("capability_store"))
+            .await
+            .map_err(|e| anyhow::anyhow!("capability store persistence unavailable: {e}"))?,
+    );
     let capability_manager = Arc::new(capability::CapabilityManager::load_or_generate(
         &data_dir,
         capability_store,
@@ -284,6 +341,32 @@ async fn setup_server_infrastructure_impl(
     let device_key_hex = hex::encode(device_key.as_ref());
     let mut provider_cid = "sha256:unavailable".to_string();
     let verify_provider_binary = |name: &str, path: &std::path::Path| -> anyhow::Result<()> {
+        // OPERATOR/DEV OVERRIDE (Principle #6 — explicit operator boundary): when the
+        // operator EXPLICITLY points at a provider binary via `ELASTOS_<NAME>_BIN`, that
+        // env is itself an explicit trust decision, so we honor it WITHOUT the signed
+        // installed-manifest check. That check only covers verified install platforms
+        // (currently linux); a macOS dev host has no manifest entry. This stays principled
+        // because it is narrow (one named binary the operator chose), loud (warns), and
+        // NON-AMBIENT (#3) — with no env set, the default install path still fails closed.
+        let env_name = format!(
+            "ELASTOS_{}_BIN",
+            name.to_ascii_uppercase().replace('-', "_")
+        );
+        if let Some(override_path) = std::env::var_os(&env_name) {
+            let same = std::fs::canonicalize(&override_path)
+                .ok()
+                .zip(std::fs::canonicalize(path).ok())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false);
+            if same {
+                tracing::warn!(
+                    "{name}: trusting operator-provided binary from {env_name} WITHOUT manifest \
+                     verification (explicit dev override) — {}",
+                    path.display()
+                );
+                return Ok(());
+            }
+        }
         let checksum = crate::setup::verify_installed_component_binary(&data_dir, name, path)?;
         tracing::info!(
             "{} binary verified against installed manifest ({})",
@@ -363,7 +446,19 @@ async fn setup_server_infrastructure_impl(
         );
         let provider: Arc<dyn provider::Provider> =
             Arc::new(provider::CapsuleProvider::new(Arc::new(bridge)));
-        provider_registry.register(provider).await;
+        // `register` reports refusal rather than panicking, and `localhost` is pinned
+        // first-writer-wins — so a `false` here means the user's ENTIRE file plane is already
+        // bound to something that is not the localhost-provider we just spawned. At boot that is
+        // unreachable by design, which is exactly why it must not be swallowed: booting on past it
+        // would leave every capsule's file I/O routed through whatever got there first. Fail the
+        // boot instead.
+        if !provider_registry.register(provider).await {
+            anyhow::bail!(
+                "Refused to bind the localhost-provider capsule: the `localhost` scheme is \
+                 already bound. The runtime will not serve the user file plane through an \
+                 unknown provider."
+            );
+        }
 
         let mut llama_endpoint: Option<String> = None;
         if let Some(path) = crate::find_installed_provider_binary("llama-provider") {
@@ -698,6 +793,103 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn chain-provider: {}", e),
             }
         }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("encrypt-provider") {
+        if let Err(e) = verify_provider_binary("encrypt-provider", &path) {
+            tracing::warn!(
+                "Skipping encrypt-provider due to verification failure: {}",
+                e
+            );
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let encrypt_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "encrypt"),
+                    );
+                    // AUD-6: `encrypt` (CEK escrow) is boot-critical. A spawned-but-unregisterable
+                    // provider is an INVARIANT violation (a dark mint path), not an optional-absent
+                    // binary — fail the boot LOUD rather than warn-and-continue. (Absent binary is
+                    // still the outer `else` warn: genuinely optional in a build without it.)
+                    provider_registry
+                        .register_sub_provider("encrypt", encrypt_provider)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "boot-critical sub-provider 'encrypt' (CEK escrow) spawned but \
+                                 failed to register: {e} (AUD-6: refusing to boot with a dark \
+                                 mint path)"
+                            )
+                        })?;
+                    tracing::info!("encrypt-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn encrypt-provider: {}", e),
+            }
+        }
+    } else {
+        tracing::warn!(
+            "encrypt-provider binary is not installed; the Create portal mint path will fail closed"
+        );
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("publish-provider") {
+        if let Err(e) = verify_provider_binary("publish-provider", &path) {
+            tracing::warn!(
+                "Skipping publish-provider due to verification failure: {}",
+                e
+            );
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let publish_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "publish"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("publish", publish_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://publish sub-provider: {}", e);
+                    }
+                    tracing::info!("publish-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn publish-provider: {}", e),
+            }
+        }
+    } else {
+        tracing::warn!(
+            "publish-provider binary is not installed; the Create portal mint path will fail closed"
+        );
+    }
+
+    // media-provider (Create portal, video/audio): the runtime-native analogue of PC2's
+    // ffmpeg transcode + DASH fragmentation. Holds NO key material — it returns PLAINTEXT
+    // segments + track metadata; CENC + dKMS escrow happen in encrypt-provider. ffmpeg path
+    // + scratch dir come from the operator config `ELASTOS_MEDIA_PROVIDER_CONFIG` (inherited
+    // by the spawned child); unconfigured ⇒ the provider's `package` op fails closed.
+    if let Some(path) = crate::find_installed_provider_binary("media-provider") {
+        if let Err(e) = verify_provider_binary("media-provider", &path) {
+            tracing::warn!("Skipping media-provider due to verification failure: {}", e);
+        } else {
+            match provider::ProviderBridge::spawn(&path, Default::default()).await {
+                Ok(bridge) => {
+                    let media_provider: Arc<dyn provider::Provider> = Arc::new(
+                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "media"),
+                    );
+                    if let Err(e) = provider_registry
+                        .register_sub_provider("media", media_provider)
+                        .await
+                    {
+                        tracing::warn!("Failed to register elastos://media sub-provider: {}", e);
+                    }
+                    tracing::info!("media-provider capsule from {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to spawn media-provider: {}", e),
+            }
+        }
+    } else {
+        tracing::warn!(
+            "media-provider binary is not installed; the Create portal media (video/audio) path will fail closed"
+        );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("net-provider") {
@@ -1749,6 +1941,33 @@ mod tests {
         let requests = provider.await.unwrap();
         assert_eq!(requests[0]["op"], "status");
         assert_eq!(requests[1]["op"], "shutdown");
+    }
+
+    // AUD-6 ratchet (build-visible; #[ignore]d = fails today, non-blocking): every boot-critical
+    // sub-provider must PROPAGATE a register_sub_provider failure (a spawned-but-unregisterable
+    // escrow/keys/signing/mint provider is an invariant violation = a dark path), NOT warn-and-
+    // continue. `encrypt` (CEK escrow) is rewired to fail loud; the rest still warn-swallow, so this
+    // is ignored until they are classified + rewired. Close the gap = remove the warn lines for the
+    // set below, delete `#[ignore]`, the test goes green, and AUD-6 moves to Closed.
+    // (Absent-binary stays a warn — genuinely optional — and is NOT scanned here.)
+    #[test]
+    #[ignore = "AUD-6: only `encrypt` fails loud so far; flip when the rest of the boot-critical spine propagates registration failures"]
+    fn aud6_boot_critical_sub_provider_registration_fails_loud() {
+        let src = include_str!("server_infra.rs");
+        let mut still_swallowing = Vec::new();
+        for critical in [
+            "encrypt", "publish", "media", "key", "decrypt", "drm", "rights", "wallet", "chain",
+        ] {
+            let warn = format!("Failed to register elastos://{critical} sub-provider");
+            if src.contains(&warn) {
+                still_swallowing.push(critical);
+            }
+        }
+        assert!(
+            still_swallowing.is_empty(),
+            "boot-critical sub-providers still warn-swallow their registration failure (AUD-6, \
+             invariant violation should fail boot loud): {still_swallowing:?}"
+        );
     }
 
     struct EnvGuard {

@@ -102,6 +102,13 @@ async fn serve_browser_capsule_path(
     app: &str,
     requested_path: Option<&str>,
 ) -> Response {
+    // PROOF (which assets the browser actually loads): every capsule asset fetch is logged with the
+    // app + path, so we can see whether `/apps/creator/` (entrypoint) and `creator.js` are requested
+    // at all when the user opens Create — i.e. whether the app is even being loaded.
+    tracing::info!(
+        "serve_browser_capsule: app={app} path={}",
+        requested_path.unwrap_or("<entrypoint index.html>")
+    );
     if ensure_wallet_connector_configured(data_dir, app).is_err() {
         return (StatusCode::NOT_FOUND, "Browser capsule not found").into_response();
     }

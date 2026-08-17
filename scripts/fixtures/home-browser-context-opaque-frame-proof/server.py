@@ -26,7 +26,7 @@ HARNESS = r"""<!doctype html>
       HOME_BROWSER_CONTEXT_STORAGE_KEY,
       isHomeBrowserContextId,
       loadOrCreateHomeBrowserContextId,
-    } from "/capsules/home/browser/home-browser-context.js?v=home-20260725a";
+    } from "/capsules/home/browser/home-browser-context.js?v=home-20260807a";
 
     const phaseKey = "elastos.home.browser-context-proof-phase";
     const priorObservationKey = "elastos.home.browser-context-proof-prior";
@@ -129,7 +129,7 @@ CHILD = r"""<!doctype html>
     const {
       acceptHomeBrowserContextId,
       shellState,
-    } = await import("/capsules/home-gui/browser/shell-core.js?v=home-20260725a");
+    } = await import("/capsules/home-gui/browser/shell-core.js?v=home-20260807a");
     const initialContext = shellState.browserContextId;
     const instanceId = window.crypto.randomUUID();
     let contextMessagesBeforeAcceptedReady = 0;

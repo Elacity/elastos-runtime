@@ -1,0 +1,36 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "creator",
+  "version": "0.1.0",
+  "description": "Create portal: a de-privileged app frame that mints a dDRM asset on PQ custody. Drives encrypt-provider (seal_inline_threshold), publish-provider (prepare_publish), and the host-mediated wallet-sign and chain-broadcast capabilities. Swaps the Lit CEK system for the dKMS threshold escrow (cenc:elastos-pq-hybrid-threshold-v0); holds no keys, no chain RPC, no wallet.",
+  "role": "app",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "author": "elastos",
+  "entrypoint": "browser/index.html",
+  "interfaces": [
+    {
+      "id": "elastos.creator.mint",
+      "version": "0.1.0",
+      "description": "Seal source bytes under PQ-hybrid threshold custody and prepare a publish record",
+      "methods": [
+        {
+          "id": "asset.mint",
+          "description": "Mint a dDRM asset: seal_inline_threshold + prepare_publish, host-mediated wallet sign and chain broadcast",
+          "risk": "write",
+          "approval": "user",
+          "audit": "full",
+          "resource": "elastos://creator/asset",
+          "operation": "mint"
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 32,
+    "gpu": false
+  }
+}

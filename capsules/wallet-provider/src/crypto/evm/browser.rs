@@ -42,7 +42,12 @@ pub(crate) fn browser_personal_sign_result(
     request: &WalletApprovalRequest,
     signature: &str,
 ) -> Option<Value> {
-    if request.intent != "browser_personal_sign" {
+    // `ddrm_delegation_sign` reuses this same connector `personal_sign` result shape (see
+    // `external_signature_message` in crypto.rs for why it is treated identically to
+    // `browser_personal_sign` throughout the completion path) — without this, a completed
+    // delegation-sign approval would carry `signed_result: null` and the status endpoint reading
+    // `signed_result.signature` would fail closed forever.
+    if request.intent != "browser_personal_sign" && request.intent != "ddrm_delegation_sign" {
         return None;
     }
     Some(json!({

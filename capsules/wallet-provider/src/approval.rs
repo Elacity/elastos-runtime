@@ -607,7 +607,9 @@ impl WalletProvider {
                     Ok(message) => message,
                     Err(err) => return Response::error("invalid_request", err),
                 };
-                if request_snapshot.intent == "browser_personal_sign" {
+                if request_snapshot.intent == "browser_personal_sign"
+                    || request_snapshot.intent == "ddrm_delegation_sign"
+                {
                     let message = match browser_personal_sign_message_bytes(&message) {
                         Ok(message) => message,
                         Err(err) => return Response::error("invalid_request", err),

@@ -16,9 +16,14 @@ alignment check. Set `ELASTOS_NODE_BIN` to choose a Node.js binary if `node` is
 not on `PATH`.
 
 The scope tests prove that `NoGrant` fails closed, `System` can view all, and
-pure SelfOnly can view only self. Current product routing keeps
-`/api/provider/inspect/self` System-only. Do not treat the pure SelfOnly test as proof
-of ordinary-capsule access.
+pure SelfOnly can view only self.
+
+`/api/provider/inspect/self` is a live, caller-bound app/browser-tier route
+(`"self" => &[BROWSER_CAPSULE_ID]`): fail-closed SelfOnly — the gateway injects
+the authenticated `principal_id`, a client-supplied `id` is ignored, and
+`authorize_view` enforces caller == target. The other inspect ops
+(`capsules`, `capsule`, `plan`, `intent`, `discover`, `request_act`) remain
+System-only.
 
 ## Manual approval loop
 

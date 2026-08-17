@@ -586,6 +586,54 @@
       display: block;
     }
 
+    /* Protected `.ddrm` asset showing its real cover art instead of a type icon (PC2 parity):
+       a framed thumbnail with a small neutral "protected" lock badge. No accent colour — the lime
+       accent is reserved for verified/active states. */
+    .file-icon.has-cover {
+      position: relative;
+      filter: none;
+    }
+
+    .content[data-view="grid"] .file-icon.has-cover img {
+      width: 45px;
+      height: 45px;
+      max-width: 45px;
+      max-height: 45px;
+      object-fit: cover;
+      border-radius: 5px;
+      background: #111;
+      box-shadow:
+        0 0 0 1px rgba(0, 0, 0, 0.14),
+        0 1px 3px rgba(0, 0, 0, 0.22);
+    }
+
+    .content[data-view="grid"] .file-icon.has-cover::after {
+      content: "";
+      position: absolute;
+      right: -3px;
+      bottom: -3px;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background-color: #1a1a1a;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='white'%3E%3Cpath d='M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-1V6a5 5 0 0 0-5-5zm3 8H9V6a3 3 0 0 1 6 0v3z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: 9px 9px;
+      box-shadow: 0 0 0 1.5px #fff;
+      pointer-events: none;
+    }
+
+    .content[data-view="list"] .file-icon.has-cover img {
+      width: 15px;
+      height: 15px;
+      max-width: 15px;
+      max-height: 15px;
+      object-fit: cover;
+      border-radius: 3px;
+      background: #111;
+    }
+
     .item-name {
       max-width: 100%;
       overflow: hidden;
@@ -602,6 +650,17 @@
     .content[data-view="grid"] .item-name {
       max-width: 110px;
       text-align: center;
+      display: flex;
+      flex-flow: row nowrap;
+      align-items: baseline;
+      justify-content: center;
+      column-gap: 5px;
+    }
+
+    .content[data-view="grid"] .item-name-text {
+      min-width: 0;
+      overflow: hidden;
+      word-break: break-word;
     }
 
     .content[data-view="list"] .item-name {
@@ -930,6 +989,98 @@
 
     .menu-item:hover .menu-item-mark {
       color: rgba(255, 255, 255, 0.74);
+    }
+
+    /* file-manager-style colour-tag row in the context menu: seven dots + a clear button. */
+    .menu-tags-row {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 7px 14px 8px;
+    }
+
+    .menu-tag-dot {
+      width: 17px;
+      height: 17px;
+      flex: 0 0 auto;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      cursor: pointer;
+      background: var(--tag-color, #9aa0a6);
+      box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12);
+      transition: transform 0.08s ease;
+    }
+
+    .menu-tag-dot:hover {
+      transform: scale(1.15);
+    }
+
+    .menu-tag-dot[data-active="true"] {
+      box-shadow: 0 0 0 2px #fff, 0 0 0 3.5px var(--tag-color, #9aa0a6);
+    }
+
+    .menu-tag-clear {
+      margin-left: auto;
+      width: 17px;
+      height: 17px;
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      cursor: pointer;
+      background: #e6e6e6;
+      color: #555;
+      font-size: 10px;
+      line-height: 1;
+    }
+
+    .menu-tag-clear:hover {
+      background: #d6d6d6;
+    }
+
+    /* The colour-tag dot rendered on a tagged item. Absolutely placed via grid so it never shifts
+       the list columns. */
+    .item-tag {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--tag-color, #9aa0a6);
+      box-shadow: 0 0 0 1.5px #fff, 0 0 1px rgba(0, 0, 0, 0.35);
+      pointer-events: none;
+    }
+
+    .content[data-view="list"] .item-tag {
+      grid-column: 2;
+      grid-row: 1;
+      justify-self: end;
+      align-self: center;
+      margin-right: 96px;
+    }
+
+    /* Grid view: the right-aligned badge dot is an explicit grid cell, which displaced the
+       auto-placed icon. Hide it in grid and use the inline dot inside the name instead (file-manager
+       style — sits just left of the centered filename, never moving the icon). */
+    .content[data-view="grid"] .item-tag {
+      display: none;
+    }
+
+    .item-tag-inline {
+      display: none;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--tag-color, #9aa0a6);
+      box-shadow: 0 0 0 1.5px #fff, 0 0 1px rgba(0, 0, 0, 0.35);
+    }
+
+    .content[data-view="grid"] .item-tag-inline {
+      display: block;
+      flex: 0 0 auto;
+      align-self: center;
     }
 
     .menu-item[disabled],

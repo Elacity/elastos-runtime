@@ -1,0 +1,36 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "elacity-player",
+  "version": "0.1.0",
+  "description": "Play an owned, protected video (fMP4/CENC) via MSE. Satisfies the elastos.viewer/media@1 interface; consumes only scoped decrypted segments over a session handle, never the CEK or IV.",
+  "role": "viewer",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "author": "elastos",
+  "entrypoint": "browser/index.html",
+  "interfaces": [
+    {
+      "id": "elastos.viewer.media",
+      "version": "1.0.0",
+      "description": "Play protected fMP4/CENC media over a scoped decrypt session handle",
+      "methods": [
+        {
+          "id": "media.open",
+          "description": "Open a protected media asset via MSE, consuming only scoped decrypted segments",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "event",
+          "resource": "elastos://content/asset",
+          "operation": "open"
+        }
+      ]
+    }
+  ],
+  "resources": {
+    "memory_mb": 96,
+    "gpu": false
+  }
+}

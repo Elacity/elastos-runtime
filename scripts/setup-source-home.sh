@@ -518,6 +518,16 @@ APP_CAPSULES=(
     gba-emulator
     gba-ucity
     chat-room
+    # Owned-asset viewers. library.rs::viewer_ids_for_name routes `.ddrm` -> `ddrm-viewer`
+    # (Protected Viewer) and `.mp4`/`.mp3` -> `elacity-player` (Media Player); both must be
+    # INSTALLED (installed_viewer_option filters the active browser-capsule catalog) or the
+    # Library falls back to Properties instead of opening the viewer.
+    ddrm-viewer
+    elacity-player
+    # The Create portal (mint dDRM assets). Ported in with the dkms capsules but only
+    # registered here + components.json later: without both, provisioning never installs
+    # it and the Home launcher silently drops it (list_launchable_browser_capsules).
+    creator
 )
 
 APP_CAPSULES_JSON="$(printf '%s\n' "${APP_CAPSULES[@]}" | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"

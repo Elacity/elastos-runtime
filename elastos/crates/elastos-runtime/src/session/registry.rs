@@ -70,7 +70,7 @@ impl SessionRegistry {
 
         // Audit
         self.audit_log
-            .emit(crate::primitives::audit::AuditEvent::SessionCreated {
+            .emit_best_effort(crate::primitives::audit::AuditEvent::SessionCreated {
                 timestamp: SecureTimestamp::now(),
                 session_id: session.id.to_string(),
                 session_type: session.session_type.to_string(),
@@ -124,12 +124,13 @@ impl SessionRegistry {
             }
 
             // Audit
-            self.audit_log
-                .emit(crate::primitives::audit::AuditEvent::SessionDestroyed {
+            self.audit_log.emit_best_effort(
+                crate::primitives::audit::AuditEvent::SessionDestroyed {
                     timestamp: SecureTimestamp::now(),
                     session_id: session.id.to_string(),
                     reason: "invalidated".to_string(),
-                });
+                },
+            );
         }
 
         session
@@ -156,12 +157,13 @@ impl SessionRegistry {
 
             if let Some(ref session) = session {
                 // Audit
-                self.audit_log
-                    .emit(crate::primitives::audit::AuditEvent::SessionDestroyed {
+                self.audit_log.emit_best_effort(
+                    crate::primitives::audit::AuditEvent::SessionDestroyed {
                         timestamp: SecureTimestamp::now(),
                         session_id: session.id.to_string(),
                         reason: format!("vm_terminated:{}", vm_id),
-                    });
+                    },
+                );
             }
 
             session
@@ -221,15 +223,16 @@ impl SessionRegistry {
                 vm_sessions.remove(vm_id);
             }
 
-            self.audit_log
-                .emit(crate::primitives::audit::AuditEvent::SessionDestroyed {
+            self.audit_log.emit_best_effort(
+                crate::primitives::audit::AuditEvent::SessionDestroyed {
                     timestamp: SecureTimestamp::now(),
                     session_id: session.id.to_string(),
                     reason: format!(
                         "stale_cleanup:idle_{}s",
                         now.unix_secs.saturating_sub(session.last_active.unix_secs)
                     ),
-                });
+                },
+            );
 
             tracing::info!(
                 session_id = %session.id,

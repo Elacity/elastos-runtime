@@ -10,6 +10,7 @@ name = "elastos_runtime"
 path = "src/lib.rs"
 
 [dependencies]
+libc = "0.2"
 elastos-common = { path = "../elastos-common" }
 elastos-namespace = { path = "../elastos-namespace" }
 elastos-storage = { path = "../elastos-storage" }
@@ -47,3 +48,8 @@ tar = "0.4"
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tempfile = "3.10"
+
+# First throughput benchmark (audit emit ceiling). Hermetic std-timing harness, no criterion.
+[[bench]]
+name = "audit_emit"
+harness = false

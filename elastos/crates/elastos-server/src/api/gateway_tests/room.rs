@@ -42,6 +42,25 @@ impl Provider for MockPeerProvider {
     }
 }
 
+/// Generous but bounded wall-clock cap for the room-transport settlement waits
+/// below.
+///
+/// The room transport bridge runs on a dedicated blocking OS thread that
+/// reconciles on a real-clock cadence (a 250ms idle poll, with the trusted-
+/// source bootstrap pull and peer-count refresh gated to every eighth tick, so
+/// ~2s between bootstrap reconciles). These tests are NOT on a paused clock, so
+/// there is no virtual-time auto-advance at play; the settlement is a genuine
+/// real-clock coordination with that background thread. A fixed 80 x 50ms
+/// iteration budget silently assumed near-ideal scheduling. Under whole-suite
+/// load the harness oversubscribes CPU (every parallel test thread already runs
+/// a runtime, and each room test spawns this EXTRA bridge thread on top), so the
+/// bridge starves and its ~2s cadence stretches past the old 4s budget -- the
+/// operation is not spuriously cancelled, it just needs more wall time. Waiting
+/// on the real condition against a generous wall-clock deadline absorbs that
+/// starvation while still failing loudly (not hanging forever) if the bridge is
+/// genuinely stuck.
+const ROOM_TRANSPORT_SETTLE_CAP: Duration = Duration::from_secs(30);
+
 async fn poll_chat_room_until<F>(
     app: Router,
     token: &str,
@@ -51,8 +70,9 @@ async fn poll_chat_room_until<F>(
 where
     F: Fn(&serde_json::Value) -> bool,
 {
-    let mut last = serde_json::Value::Null;
-    for _ in 0..80 {
+    let deadline = std::time::Instant::now() + ROOM_TRANSPORT_SETTLE_CAP;
+    let mut last;
+    loop {
         let response = app
             .clone()
             .oneshot(
@@ -74,6 +94,9 @@ where
         if predicate(&last) {
             return last;
         }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("{label} did not converge; last poll: {last}");
@@ -83,8 +106,9 @@ async fn summary_chat_room_until<F>(app: Router, predicate: F, label: &str) -> s
 where
     F: Fn(&serde_json::Value) -> bool,
 {
-    let mut last = serde_json::Value::Null;
-    for _ in 0..80 {
+    let deadline = std::time::Instant::now() + ROOM_TRANSPORT_SETTLE_CAP;
+    let mut last;
+    loop {
         let response = app
             .clone()
             .oneshot(
@@ -103,6 +127,9 @@ where
         if predicate(&last) {
             return last;
         }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("{label} did not converge; last summary: {last}");
@@ -116,12 +143,17 @@ async fn wait_for_peer_request<F>(
 where
     F: Fn(&serde_json::Value) -> bool,
 {
-    for _ in 0..80 {
-        let requests = runtime.provider_requests.lock().await;
-        if let Some(request) = requests.iter().find(|request| predicate(request)) {
-            return request.clone();
+    let deadline = std::time::Instant::now() + ROOM_TRANSPORT_SETTLE_CAP;
+    loop {
+        {
+            let requests = runtime.provider_requests.lock().await;
+            if let Some(request) = requests.iter().find(|request| predicate(request)) {
+                return request.clone();
+            }
         }
-        drop(requests);
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let requests = runtime.provider_requests.lock().await;
@@ -189,6 +221,7 @@ async fn test_gateway_carrier_bootstrap_route_returns_live_ticket() {
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     });
 
     let response = app
@@ -232,6 +265,7 @@ async fn test_gateway_carrier_bootstrap_prefers_managed_runtime_ticket() {
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     });
 
     let response = app
@@ -268,6 +302,7 @@ async fn test_gateway_carrier_bootstrap_publisher_role_uses_gateway_ticket() {
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     });
 
     let response = app

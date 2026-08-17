@@ -399,11 +399,16 @@ impl IpfsStreamingProvider {
         Ok(())
     }
 
-    /// Download and verify a file using block-level CID verification
+    /// Download a file by CID **without** local content verification.
     ///
-    /// This downloads as CAR (Content Addressable aRchive) format which includes
-    /// block CIDs for verification during download.
-    pub async fn download_verified(
+    /// This currently performs a plain streaming download and does not verify
+    /// the received bytes against the CID — integrity depends entirely on the
+    /// gateway. Per Principles 2 and 15 (a CID identifies content, not
+    /// availability; trust must not anchor in gateway location), this stays named
+    /// `_unverified` until block-level CAR verification or a final-hash check
+    /// lands. Callers that need trusted bytes must use a local IPFS node or add
+    /// an explicit hash check against the CID before trusting the result.
+    pub async fn download_unverified(
         &self,
         cid: &str,
         dest: &Path,

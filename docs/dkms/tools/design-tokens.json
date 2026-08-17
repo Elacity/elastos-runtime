@@ -1,0 +1,65 @@
+{
+  "_meta": {
+    "purpose": "Shared brand/design SSOT across BOTH Elacity products: the production dApp (elacity-web v4.4.0, MUI theme) and the runtime marketplace-content shell (vanilla CSS :root vars). One source, two emitters — so the look converges WITHOUT coupling code (elacity-web stays MUI, the runtime stays vanilla/auditable). Step 7 of the 2026-06-24 council audit.",
+    "rule": "BRAND tokens (color/effect) are donated FROM elacity-web (the production identity). STRUCTURAL tokens (space/radius/type/motion/elevation) are owned BY the runtime shell — its CSS-var contract is the more disciplined core (council finding: Devon). Neither product imports the other's code.",
+    "source_dapp": "/Users/sash/Projects/elacity-web-docs/src/themes/{common,dark,light}.ts",
+    "source_shell": "capsules/marketplace-content/browser/styles.css (:root)"
+  },
+
+  "_brandDecision": {
+    "status": "RESOLVED 2026-06-24 — CEO chose the production identity (turquoise + gold).",
+    "chosen": { "primary": "#5edad9", "gold": "#DAA520", "onPrimary_dark": "#04211f", "onPrimary_light": "#ffffff" },
+    "source_branch": "elacity-web feature/ui-polish-2026 (the latest brand; palette confirmed identical to release, + a shadowBorder/press/text-wrap polish pass)",
+    "applied": "capsules/marketplace-content/browser/styles.css :root (dark = vivid #5edad9 + dark on-accent; [data-theme=light] = deeper teal #0a7370 + white on-accent, for AA)",
+    "_convergence": "elacity-web ui-polish-2026 (19h-ago pass) and the runtime shell BOTH independently applied the make-interfaces-feel-better skill (press-scale 0.96, concentric radius, text-wrap balance/pretty, no transition:all). The shadowBorder depth recipe was the one item the shell had deferred — now adopted (see effect.shadowBorder)."
+  },
+
+  "color": {
+    "brand": {
+      "_from": "elacity-web common.ts — the production identity, transplantable as values (no MUI dependency)",
+      "primary": "#5edad9",
+      "primaryAlt": "#39D5D5",
+      "gold": "#DAA520",
+      "vivid": "#FDECB6",
+      "secondary": "#656E97",
+      "accent": "#131A22"
+    },
+    "semantic": {
+      "success": "#24ae60",
+      "error": "#FF4E45",
+      "warning": "#F27200"
+    },
+    "onPrimary": { "dark": "#0a0a0a", "light": "#FFFFFF" },
+    "surface": {
+      "dark":  { "default": "#080B0F", "paper": "#090b10", "sidebar": "#202123" },
+      "light": { "default": "#F1F3F5", "paper": "#FFFFFF", "sidebar": "#FFFFFF" }
+    },
+    "_shellCurrent": { "accent": "#5b8cff", "accent2": "#7c5bff", "_note": "what styles.css :root ships today; superseded once _brandDecision resolves" }
+  },
+
+  "effect": {
+    "_from": "elacity-web signature treatments — reproduce as ~30 lines of vanilla CSS (council steps 4-5), no CSS-in-JS",
+    "glass": { "backdropBlur": "9px", "_note": "FrostedGlassSnackbar / DockNav; shell already uses backdrop-filter on .nav/.toast; now a .glassy utility" },
+    "shadowBorder": {
+      "_from": "elacity-web feature/ui-polish-2026 src/themes/common.ts — shadow-as-border depth (NOT for dividers; those stay real borders)",
+      "light": "0px 0px 0px 1px rgba(0,0,0,0.06), 0px 1px 2px -1px rgba(0,0,0,0.06), 0px 2px 4px 0px rgba(0,0,0,0.04)",
+      "lightHover": "0px 0px 0px 1px rgba(0,0,0,0.08), 0px 1px 2px -1px rgba(0,0,0,0.08), 0px 2px 4px 0px rgba(0,0,0,0.06)",
+      "dark": "0 0 0 1px rgba(255,255,255,0.08)",
+      "darkHover": "0 0 0 1px rgba(255,255,255,0.13)",
+      "_applied": "shell styles.css :root as --depth / --depth-hover (tokens defined; card application is the follow-up depth pass)"
+    },
+    "gradientBrand": "linear-gradient(135deg, var(--primary), var(--secondary))",
+    "gradientAccent": "linear-gradient(45deg, var(--primary), var(--gold))",
+    "gradientSurfaceWash": "linear-gradient(135deg, color-mix(in srgb, var(--primary) 3%, transparent), color-mix(in srgb, var(--secondary) 3%, transparent))",
+    "_note": "elacity-web uses primary→secondary at 135deg; the 08-hex (≈3%) alpha wash is the subtle card/section background signature"
+  },
+
+  "structural": {
+    "_owner": "runtime shell styles.css — already a clean CSS-var contract; elacity-web should READ these, not the reverse",
+    "spaceScale": "4pt grid (--s1..--s6)",
+    "radius": "--r / --r-lg",
+    "type": "--fxs..--fxl ramp; tabular-nums on numerics; text-wrap balance/pretty",
+    "motion": "named easings; cubic-bezier(.2,0,0,1) for icon cross-fade; prefers-reduced-motion guard",
+    "elevation": "--e1..--e3 (shell) vs 25-step per-mode ramp (elacity-web) — shell's 3-step is sufficient; do NOT import the 25-step"
+  }
+}

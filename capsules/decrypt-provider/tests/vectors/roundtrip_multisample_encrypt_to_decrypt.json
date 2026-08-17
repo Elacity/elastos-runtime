@@ -1,0 +1,7 @@
+{
+  "cek_b64": "v2o5Lkp9dImZZZIdNGu2Qw==",
+  "description": "encrypt-provider in-boundary mint+CENC (4 full samples) -> decrypt-provider cenc; CEK captured (rail stand-in)",
+  "encrypted_segment_b64": "AAAAYG1vb2YAAABYdHJhZgAAACB0cnVuAAACAAAAAAQAAAAQAAAAFwAAAAgAAAATAAAAMHNlbmMAAAAAAAAABDMzMzMzMzMzMzMzMzMzMzQzMzMzMzMzNTMzMzMzMzM2AAAASm1kYXTYlj7zMio5A4zWbQ4dMaNvlqpUFXvmMVgBpwHIc9jZ3PueTOKigWh7DJzkP/uV9YdDvXTS3svm8K1pzbcV+XGUD30=",
+  "expected_plaintext_b64": "ZnJhbWUwLWJ5dGVzLi4uLmZyYW1lMS1sb25nZXItYnl0ZXMuLi4uZnJhbWUyLi5mcmFtZTMtZmluYWwtYnl0ZXMh",
+  "kid_hex": "5284dd44c4a35375dac8124f2628d2fb"
+}

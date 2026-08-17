@@ -5,6 +5,7 @@ import {
   windowErrorTemplate,
   SYSTEM_APP_ID,
   shellState,
+  fetchJson,
   targetTitle,
   canonicalTargetTitle,
   escapeHtml,
@@ -18,7 +19,7 @@ import {
   saveShellSessionState,
   ignoreRepeatedAction,
   targetById,
-} from "./shell-core.js?v=home-20260725a";
+} from "./shell-core.js?v=home-20260807a";
 import {
   fitWindowBounds,
   fitWindowToBrowserAspect,
@@ -29,7 +30,7 @@ import {
   hideWindowSnapPreview,
   attachWindowDrag,
   attachWindowResize,
-} from "./shell-window-geometry.js?v=home-20260725a";
+} from "./shell-window-geometry.js?v=home-20260807a";
 
 let windowHooks = null;
 const REQUIRED_WINDOW_HOOKS = [
@@ -40,6 +41,7 @@ const REQUIRED_WINDOW_HOOKS = [
   "renderTaskbar",
   "updateTaskbarState",
   "launchTarget",
+  "moneyVerb",
 ];
 const WINDOW_CONTROL_GUARD_MS = 400;
 const WINDOW_MAXIMIZE_CLOSE_GUARD_MS = 360;
@@ -85,6 +87,28 @@ const SYSTEM_IFRAME_SANDBOX_EXTRAS = [
 const COMMON_IFRAME_ALLOW = ["autoplay", "fullscreen"];
 const pendingWindowLaunches = new Set();
 const pendingBrowserWindowCloses = new Map();
+
+// Viewer capsules whose windows pin a gateway decrypt session (and the authority
+// subprocess behind it). Closing such a window releases the session explicitly instead
+// of leaving it to the server-side TTL. The viewer's own pagehide beacon fires too —
+// the close endpoint is idempotent, so a double release is harmless.
+const VIEWER_SESSION_KINDS = new Map([
+  ["ddrm-viewer", "object"],
+  ["elacity-player", "media"],
+]);
+
+// Owned/protected opens in flight, keyed by launch action. A dKMS open takes seconds
+// (wallet sign + 2-of-3 geo-quorum recover + decrypt), so a second double-click would
+// otherwise kick off a DUPLICATE recover. We track the loading window and re-focus it.
+const inFlightOwnedOpens = new Map();
+
+// The ordered phases a protected (dKMS quorum) open passes through, shown as a live checklist
+// so the user sees WHERE the open is. The quorum recover (phase 1) is the long, variable pole.
+const OWNED_OPEN_STAGES = [
+  "Preparing secure session",
+  "Verifying access & recovering keys (2-of-3 quorum)",
+  "Decrypting & preparing playback",
+];
 
 window.addEventListener("message", handleBrowserWindowCloseResult);
 
@@ -456,6 +480,53 @@ function hideWindowEntries(entries) {
   return true;
 }
 
+// Single choke point for how a viewer-session-close call authenticates itself. The launch route
+// carries the session id in the query and the viewer-scoped launch token in the FRAGMENT
+// (`/apps/<viewer>/?session=..#home_token=..`) — a fragment is never transmitted to a server, so
+// the token stays out of Referer, access logs and history. It is delivery only: the close endpoint
+// reads it from the `x-elastos-home-token` header, the same header `fetchJson` sends for every
+// other call (shell-core.js), which is what makes the fragment viable here at all.
+//
+// Kept in step with `homeLaunchTokenFromRoute` in home-shell-host.js and the two viewer capsules
+// (elacity-player/player.js, ddrm-viewer/viewer.js); the server side is
+// `api::viewer_route_with_launch_token`.
+function viewerSessionCloseAuthHeaders(route) {
+  const token = new URLSearchParams(route.split("#")[1] || "").get("home_token");
+  return token ? { "x-elastos-home-token": token } : null;
+}
+
+function releaseViewerSession(entry) {
+  try {
+    const frame = entry.node && entry.node.querySelector(".window-frame");
+    const route = (frame && frame.dataset && frame.dataset.route) || "";
+    const match = route.match(/^\/apps\/([^/?#]+)\//);
+    const kind = match ? VIEWER_SESSION_KINDS.get(match[1]) : null;
+    if (!kind) {
+      return;
+    }
+    // Strip the fragment before parsing the query: `URLSearchParams` has no notion of `#`, so
+    // `?session=abc#home_token=…` would otherwise yield the session id with the whole fragment
+    // glued onto it.
+    const params = new URLSearchParams((route.split("?")[1] || "").split("#")[0]);
+    const session = params.get("session");
+    const headers = viewerSessionCloseAuthHeaders(route);
+    if (!session || !headers) {
+      return;
+    }
+    fetch(
+      "/api/viewers/" + encodeURIComponent(match[1])
+        + "/" + kind + "/" + encodeURIComponent(session) + "/close",
+      {
+        method: "POST",
+        keepalive: true,
+        headers,
+      },
+    ).catch(() => {});
+  } catch (_e) {
+    /* best effort — the viewer beacon and the server TTL sweep are the backstops */
+  }
+}
+
 function removeWindowEntries(entries) {
   if (entries.length === 0) {
     return false;
@@ -469,6 +540,7 @@ function removeWindowEntries(entries) {
       WALLET_CONNECTOR_TARGETS.has(entry.targetId),
   );
   for (const entry of entries) {
+    releaseViewerSession(entry);
     cleanupFrameAutoFit(entry.node);
     shellState.windows.delete(entry.id);
     entry.node.remove();
@@ -966,6 +1038,56 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
+  // Protected owned-asset viewers open in one of two modes:
+  //   • bound to a REAL owned object (Library passes objectUri/uri) — the gateway seals
+  //     THAT file through the local key-authority and picks the viewer itself;
+  //   • standalone from the launcher (no object) — a sample asset demo.
+  // Either way the CEK stays in the decrypt boundary; the browser only ever sees
+  // already-decrypted bytes.
+  if (targetId === "elacity-player" || targetId === "ddrm-viewer") {
+    const ownedUri = libraryUriFromQuery(options.query);
+    const openKey = launchActionKey(targetId, options.query);
+    // A protected open can take several seconds (wallet sign + 2-of-3 geo-quorum recover +
+    // decrypt). The repeat-guard is far too short for that, so a second double-click would
+    // start a DUPLICATE recover. If one is already in flight, just focus its window.
+    const inflightId = inFlightOwnedOpens.get(openKey);
+    if (inflightId && shellState.windows.has(inflightId)) {
+      focusWindow(inflightId);
+      return;
+    }
+    const loading = openLoadingWindow(
+      targetId,
+      "Opening protected asset…",
+      "Verifying your on-chain access and recovering keys from the dKMS quorum…",
+      OWNED_OPEN_STAGES,
+    );
+    inFlightOwnedOpens.set(openKey, loading.id);
+    const launch = ownedUri
+      ? () => launchOwnedFromLibrary(ownedUri, options, loading)
+      : targetId === "elacity-player"
+        ? () => launchOwnedMediaWindow(options, loading)
+        : () => launchOwnedObjectWindow(options, loading);
+    launch()
+      .catch((error) => {
+        const status = Number(error && error.status);
+        // A 401 means "not signed in" — re-authenticating can actually resolve it, so prompt a Home
+        // unlock. A 403 is an authorization REFUSAL (token scope, ownership, or rights) that signing
+        // in again cannot fix; funnelling it into requestHomeUnlock() reboots Home and drops the
+        // pending open, which the user experiences as an endless sign-in loop. Surface the server's
+        // reason as an explicit, actionable error instead of looping.
+        if (status === 401) {
+          closeWindow(loading.id);
+          requireWindowHooks().requestHomeUnlock?.();
+          return;
+        }
+        console.error("failed to open owned asset", error);
+        renderLoadingWindowError(loading, error);
+      })
+      .finally(() => {
+        inFlightOwnedOpens.delete(openKey);
+      });
+    return;
+  }
   if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
     activateTargetGroup(targetId);
     return;
@@ -1004,6 +1126,445 @@ export function openTarget(targetId, options = {}) {
     .finally(() => {
       pendingWindowLaunches.delete(pendingLaunchKey);
     });
+}
+
+// ---------------------------------------------------------------------------
+// Owned / protected (dKMS) asset opens. These mint the decrypt session server-side
+// (POST /api/viewers/open, wallet-signed grant + 2-of-3 quorum recover + decrypt) and open
+// the viewer at the returned session URL. The CEK never reaches the browser — only
+// already-decrypted bytes are loaded.
+// ---------------------------------------------------------------------------
+
+function loadingStagesHtml(stages) {
+  return `<ul class="window-loading-stages" aria-hidden="false">${stages
+    .map(
+      (label, i) =>
+        `<li data-stage="${i}" class="${i === 0 ? "is-active" : "is-pending"}">` +
+        `<span class="stage-mark" aria-hidden="true"></span>` +
+        `<span class="stage-label">${escapeHtml(label)}</span></li>`,
+    )
+    .join("")}</ul>`;
+}
+
+function loadingBodyHtml(title, detail, stages) {
+  if (Array.isArray(stages) && stages.length) {
+    return `
+    <div class="window-loading" role="status" aria-live="polite">
+      <div class="window-loading-title">${escapeHtml(title || "Opening…")}</div>
+      ${loadingStagesHtml(stages)}
+    </div>
+  `;
+  }
+  return `
+    <div class="window-loading" role="status" aria-live="polite">
+      <div class="window-loading-spinner" aria-hidden="true"></div>
+      <div class="window-loading-title">${escapeHtml(title || "Opening…")}</div>
+      <div class="window-loading-detail">${escapeHtml(detail || "")}</div>
+    </div>
+  `;
+}
+
+// Advance the staged checklist: every phase before `activeIndex` is done (✓), `activeIndex` is the
+// live one (spinner), the rest stay pending. No-op for windows without stages (legacy spinner).
+function setLoadingStage(entry, activeIndex) {
+  if (!entry || !entry.node) return;
+  const items = entry.node.querySelectorAll(".window-loading-stages li");
+  items.forEach((li, i) => {
+    li.classList.toggle("is-done", i < activeIndex);
+    li.classList.toggle("is-active", i === activeIndex);
+    li.classList.toggle("is-pending", i > activeIndex);
+  });
+}
+
+// Open a window with an immediate loading state. The real iframe is swapped in by
+// `navigateLoadingWindow` once the (slow) open resolves; failures are surfaced in-place
+// by `renderLoadingWindowError` instead of leaving a dead spinner.
+function openLoadingWindow(targetId, title, detail, stages) {
+  const offset = browserWindowEntries().length;
+  const windowSpec = browserWindowSpec({ target: targetId }, offset);
+  const windowId = nextBrowserWindowId(targetId);
+  const node = createWindow({
+    id: windowId,
+    title,
+    x: windowSpec.x,
+    y: windowSpec.y,
+    width: windowSpec.width,
+    height: windowSpec.height,
+    tone: glyphTone(targetId),
+    glyphTarget: targetId,
+  });
+  armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
+  node.dataset.target = targetId;
+  const body = node.querySelector(".window-body");
+  body.classList.add("window-body-frame");
+  body.innerHTML = loadingBodyHtml(title, detail, stages);
+
+  windowHostContainer().appendChild(node);
+  const entry = {
+    id: windowId,
+    targetId,
+    serial: shellState.browserWindowSerial,
+    node,
+    kind: "browser",
+    title,
+    loading: true,
+  };
+  shellState.windows.set(windowId, entry);
+  renderWindowTaskbar();
+  focusWindow(windowId);
+  return entry;
+}
+
+// Swap a loading window over to the resolved iframe route.
+function navigateLoadingWindow(entry, launched) {
+  entry.loading = false;
+  entry.title = launched.title;
+  const node = entry.node;
+  node.querySelector(".window-head-title").textContent = launched.title;
+  node.setAttribute("aria-label", launched.title);
+  const body = node.querySelector(".window-body");
+  body.classList.add("window-body-frame");
+  body.innerHTML = `
+    <iframe
+      class="window-frame"
+      title="${escapeHtml(launched.title)}"
+      allow="${iframeAllowForLaunch(launched)}"
+      sandbox="${iframeSandboxForLaunch(launched)}"
+    ></iframe>
+  `;
+  syncBrowserWindow(entry, launched);
+  renderWindowTaskbar();
+}
+
+// Surface a failed slow-open INSIDE its loading window so the user sees why playback
+// didn't start (rather than a dead spinner or a window that silently never appears).
+function renderLoadingWindowError(entry, error) {
+  if (!entry || !shellState.windows.has(entry.id)) {
+    return;
+  }
+  entry.loading = false;
+  const body = entry.node.querySelector(".window-body");
+  if (!body) {
+    return;
+  }
+  const detail = String((error && error.message) || error || "The open did not complete.");
+  body.innerHTML = `
+    <div class="window-loading is-error" role="alert">
+      <div class="window-loading-title">Couldn’t open this asset</div>
+      <div class="window-loading-detail">${escapeHtml(detail)}</div>
+    </div>
+  `;
+}
+
+// Either navigate an already-open loading window to the resolved route, or open a fresh
+// window when there's no loading window (keeps non-owned callers working unchanged).
+function placeLaunched(launched, options, loading) {
+  if (loading && shellState.windows.has(loading.id)) {
+    navigateLoadingWindow(loading, launched);
+    return loading;
+  }
+  return openLaunchedWindow(launched, options);
+}
+
+// Open a window for an already-resolved launch descriptor (route + title + attach_kind).
+// Sibling to `launchBrowserTargetWindow`, minus the `launchTarget` hook round-trip — the
+// caller already has the resolved descriptor from the owned-open POST.
+function openLaunchedWindow(launched, options = {}) {
+  const offset = browserWindowEntries().length;
+  const restoredPlacement = options.restoredPlacement || null;
+  const windowSpec = restoredPlacement || browserWindowSpec(launched, offset);
+  const windowId = nextBrowserWindowId(launched.target);
+  const node = createWindow({
+    id: windowId,
+    title: launched.title,
+    x: windowSpec.x,
+    y: windowSpec.y,
+    width: windowSpec.width,
+    height: windowSpec.height,
+    tone: glyphTone(launched.target),
+    glyphTarget: launched.target,
+  });
+  armWindowControlGuard(node, { closeMs: WINDOW_OPEN_CLOSE_GHOST_GUARD_MS });
+  node.dataset.target = launched.target;
+  const body = node.querySelector(".window-body");
+  body.classList.add("window-body-frame");
+  body.innerHTML = `
+    <iframe
+      class="window-frame"
+      title="${escapeHtml(launched.title)}"
+      allow="${iframeAllowForLaunch(launched)}"
+      sandbox="${iframeSandboxForLaunch(launched)}"
+    ></iframe>
+  `;
+
+  windowHostContainer().appendChild(node);
+  if (restoredPlacement) {
+    applyWindowPlacement(node, restoredPlacement);
+  }
+  const entry = {
+    id: windowId,
+    targetId: launched.target,
+    serial: shellState.browserWindowSerial,
+    node,
+    kind: "browser",
+    title: launched.title,
+  };
+  shellState.windows.set(windowId, entry);
+  syncBrowserWindow(entry, launched);
+  renderWindowTaskbar();
+  focusWindow(windowId);
+  if (restoredPlacement?.hidden) {
+    entry.node.classList.add("hidden");
+    entry.node.classList.remove("window-active");
+    entry.node.setAttribute("aria-hidden", "true");
+  }
+  if (!shellState.restoringSession) {
+    persistBrowserSession();
+  }
+  return entry;
+}
+
+// Owned-media: ask the gateway to stand up a decrypt session through the local
+// key-authority + a SEPARATE decrypt-provider boundary, then open elacity-player
+// at the returned play URL (session + scoped launch token baked in).
+async function launchOwnedMediaWindow(options = {}, loading = null) {
+  setLoadingStage(loading, 1);
+  const opened = await fetchJson("/api/viewers/elacity-player/media/open", {
+    method: "POST",
+  });
+  if (typeof opened.play_url !== "string" || opened.play_url === "") {
+    throw new Error("media open did not return a play URL");
+  }
+  setLoadingStage(loading, 2);
+  const launched = {
+    target: "elacity-player",
+    title: canonicalTargetTitle("elacity-player", "Owned video"),
+    route: opened.play_url,
+    attach_kind: "iframe",
+    launch_status: "launched",
+  };
+  return placeLaunched(launched, options, loading);
+}
+
+// The Library object URI an open carries, if any. Library hands us `objectUri`
+// (preferred) or `uri` when a user opens an item with one of the dDRM viewers.
+function libraryUriFromQuery(query) {
+  const q = normalizedLaunchQuery(query);
+  const uri = q.objectUri || q.uri || "";
+  return typeof uri === "string" && uri.trim() ? uri.trim() : null;
+}
+
+// Owned object bound to a REAL Library file: ask the gateway to seal THAT object through
+// the local key-authority + a SEPARATE decrypt-provider boundary. The gateway resolves the
+// URI inside the principal's own root (ownership gate), reads the plaintext, picks the
+// viewer by content type, and returns { viewer, play_url }.
+async function launchOwnedFromLibrary(uri, options = {}, loading = null) {
+  let opened;
+  try {
+    opened = await openOwnedRequest(uri, loading);
+  } catch (error) {
+    // A rights-denied open (no access token yet) is recoverable: buy the access token,
+    // then retry the open ONCE. Auth failures (no wallet / locked) are not retried here.
+    if (isRightsDeniedError(error)) {
+      // Node-signed spend: brokered through Home so it runs under a fresh step-up bound to
+      // EXACTLY this intent. `{ uri }` is both what Home's step-up signs over and what the
+      // gateway re-derives the binding from — keep them identical.
+      await requireWindowHooks().moneyVerb("market.buy", { uri });
+      opened = await openOwnedRequest(uri, loading);
+    } else {
+      throw error;
+    }
+  }
+  if (typeof opened.play_url !== "string" || opened.play_url === "") {
+    throw new Error("owned open did not return a view URL");
+  }
+  setLoadingStage(loading, 2);
+  const target = typeof opened.viewer === "string" && opened.viewer ? opened.viewer : "ddrm-viewer";
+  const launched = {
+    target,
+    title: canonicalTargetTitle(
+      target,
+      typeof opened.title === "string" && opened.title ? opened.title : "Owned asset",
+    ),
+    route: opened.play_url,
+    attach_kind: "iframe",
+    launch_status: "launched",
+  };
+  return placeLaunched(launched, options, loading);
+}
+
+// TRUSTLESS open: a protected dKMS asset is opened by handing the quorum a WALLET-SIGNED grant
+// the nodes verify themselves. Phase 1 asks the gateway to bind a fresh session key to (this
+// asset's on-chain contentId, this quorum's node-set, the user's wallet) and return the canonical
+// delegation; the user signs it ONCE (EIP-191 personal_sign); phase 2 submits the signature so the
+// gateway assembles + forwards the grant. Falls back to the plain open (legacy enrolled-caller
+// path) when the asset is not a quorum capsule (prepare-grant 400) or no injected wallet exists.
+async function openOwnedRequest(uri, loading = null) {
+  setLoadingStage(loading, 0);
+  let prepared = null;
+  try {
+    prepared = await fetchJson("/api/viewers/prepare-grant", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uri }),
+    });
+  } catch (_error) {
+    // 400 => not a dKMS quorum capsule (no wallet grant needed). Anything else (e.g. 403 no
+    // wallet) we surface by falling through to the plain open, which returns the precise error.
+    prepared = null;
+  }
+
+  const body = { uri };
+  if (prepared && prepared.already_delegated) {
+    // Secure-view session: the wallet already signed a delegation for this asset earlier in the
+    // window — open with just { uri } and the gateway assembles a fresh grant (no MetaMask popup).
+  } else if (prepared && typeof prepared.delegation_canonical === "string" && prepared.grant_handle) {
+    const sig = await signDelegationViaConnector(uri, prepared);
+    if (sig) {
+      body.grant_handle = prepared.grant_handle;
+      body.delegation_sig_hex = sig;
+    }
+  }
+
+  setLoadingStage(loading, 1);
+  return fetchJson("/api/viewers/open", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+// Obtain the wallet's EIP-191 `personal_sign` over `delegation_canonical` through the user's
+// DEFAULT wallet CONNECTOR capsule (`wallet-metamask` / `wallet-unisat` — whichever holds the
+// injected wallet) instead of `window.ethereum`, which this shell frame cannot use: it is an
+// opaque-origin frame with no injected provider of its own. Mints a connector `personal_sign`
+// approval via Task 3's `POST /api/viewers/prepare-grant/sign`, auto-routes the shell to that
+// connector capsule's own window so its approval UI surfaces, then polls
+// `GET .../prepare-grant/sign/:request_id` for the result. Returns the 0x-hex signature, or null
+// on no-default-connector / rejection / timeout (the caller then falls back to the enrolled-caller
+// path, which surfaces its own clean error).
+//
+// CRITICAL: both the mint and the poll go through THIS module's `fetchJson` (from
+// `shell-core.js`), which always attaches the home-gui shell's OWN launch token
+// (`x-elastos-home-token`). The gateway's status read is scoped to the EXACT actor that minted
+// the request (`viewer_grant_sign.rs::delegation_sign_status_from_approvals` requires
+// `requested_by_actor == actor`) — routing either call through a different frame/token would mint
+// under one actor and poll under another, and the status GET would never find its own request.
+const DELEGATION_SIGN_POLL_INTERVAL_MS = 1000;
+const DELEGATION_SIGN_POLL_DEADLINE_MS = 120_000;
+
+async function signDelegationViaConnector(uri, prepared) {
+  const connectorId = typeof prepared?.default_connector_id === "string"
+    ? prepared.default_connector_id.trim()
+    : "";
+  if (!connectorId) {
+    // No default connector on file: fall through to the enrolled-caller path (existing clean
+    // error) rather than guessing at one.
+    return null;
+  }
+  let minted;
+  try {
+    minted = await fetchJson("/api/viewers/prepare-grant/sign", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        uri,
+        delegation_canonical: prepared.delegation_canonical,
+        owner_address: prepared.owner_address,
+        kid: prepared.kid,
+        connector_id: connectorId,
+      }),
+    });
+  } catch (error) {
+    console.warn("delegation-sign request could not be minted", error);
+    return null;
+  }
+  const requestId = typeof minted?.request_id === "string" ? minted.request_id.trim() : "";
+  if (!requestId) {
+    return null;
+  }
+  // Auto-route using the connector id the GATEWAY echoed back (it validated `connectorId` against
+  // the principal's actual default before minting), and only ever open a target from the known
+  // wallet-connector set — never an arbitrary server-supplied string.
+  const routedConnectorId = typeof minted?.connector_id === "string" ? minted.connector_id.trim() : "";
+  if (WALLET_CONNECTOR_TARGETS.has(routedConnectorId)) {
+    routeToDefaultConnector(routedConnectorId);
+  }
+  return pollDelegationSignRequest(requestId);
+}
+
+// Surface the pending approval by bringing the connector capsule's own window to the front,
+// launching it fresh if it is not already open. This is the SAME `openTarget` path taskbar clicks
+// use (`handleTaskbarTargetClick` below). Wallet connector capsules are deliberately excluded from
+// the Home summary's visible-target list (server-side `is_home_visible_target`), so the generic
+// "visible-target" policy `canOpenTargetFromHomeMessage` applies to this shell frame would deny
+// them; `home-shell-host.js` carries a narrow, id-scoped exception (home-gui shell frame + known
+// `WALLET_CONNECTOR_TARGETS` only) that admits exactly this call.
+function routeToDefaultConnector(connectorId) {
+  const existing = topBrowserWindowEntryForTarget(connectorId);
+  if (existing) {
+    focusWindow(existing.id);
+    return;
+  }
+  openTarget(connectorId, {});
+}
+
+async function pollDelegationSignRequest(requestId) {
+  const deadline = Date.now() + DELEGATION_SIGN_POLL_DEADLINE_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, DELEGATION_SIGN_POLL_INTERVAL_MS));
+    let status;
+    try {
+      status = await fetchJson(`/api/viewers/prepare-grant/sign/${encodeURIComponent(requestId)}`);
+    } catch (error) {
+      console.warn("delegation-sign status poll failed", error);
+      return null;
+    }
+    if (status?.status === "completed") {
+      return typeof status.delegation_sig_hex === "string" && status.delegation_sig_hex
+        ? status.delegation_sig_hex
+        : null;
+    }
+    if (status?.status === "rejected") {
+      return null;
+    }
+    // "pending" (or anything unrecognized) -> keep polling until the deadline.
+  }
+  console.warn("delegation-sign request timed out waiting for the connector");
+  return null;
+}
+
+// A 403 whose body is the rights-provider's denial (no access token yet) — distinct from an
+// auth/lock 403, which we leave to the unlock prompt. The buy-and-retry loop only triggers here.
+function isRightsDeniedError(error) {
+  const status = Number(error && error.status);
+  if (status !== 403) {
+    return false;
+  }
+  const message = String((error && error.message) || "");
+  return message.includes("rights provider denied") || message.includes("no valid access token");
+}
+
+// Owned non-media: ask the gateway to stand up an OBJECT decrypt session through the local
+// key-authority + a SEPARATE decrypt-provider boundary, then open ddrm-viewer at the returned
+// view URL (session + scoped launch token baked in).
+async function launchOwnedObjectWindow(options = {}, loading = null) {
+  setLoadingStage(loading, 1);
+  const opened = await fetchJson("/api/viewers/ddrm-viewer/object/open", {
+    method: "POST",
+  });
+  if (typeof opened.play_url !== "string" || opened.play_url === "") {
+    throw new Error("object open did not return a view URL");
+  }
+  setLoadingStage(loading, 2);
+  const launched = {
+    target: "ddrm-viewer",
+    title: canonicalTargetTitle("ddrm-viewer", "Owned asset"),
+    route: opened.play_url,
+    attach_kind: "iframe",
+    launch_status: "launched",
+  };
+  return placeLaunched(launched, options, loading);
 }
 
 function withBrowserInstanceQuery(options) {

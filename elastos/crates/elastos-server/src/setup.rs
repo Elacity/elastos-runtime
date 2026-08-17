@@ -43,6 +43,8 @@ pub struct Component {
     pub install_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     #[serde(default)]
     pub size_mb: Option<u64>,
     #[serde(default)]
@@ -60,6 +62,8 @@ pub struct CapsuleEntry {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     #[serde(default)]
     pub platforms: Vec<String>,
 }
@@ -781,14 +785,18 @@ pub(crate) fn capsule_component_has_release_identity(data_dir: &Path, name: &str
 }
 
 fn package_identity_is_present(entry: Option<&CapsuleEntry>, platform_info: &PlatformInfo) -> bool {
-    let cid_present = platform_info
-        .cid
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-        || entry
-            .map(|entry| !entry.cid.trim().is_empty())
-            .unwrap_or(false);
+    // A CID only counts as a materializable release identity when it is an ACTUALLY VALID CID —
+    // the same check the materializer enforces in `validate_capsule_package_identity`. A locally
+    // built capsule carries a `local-*` placeholder in its registry entry (no real release); if we
+    // treated that non-empty placeholder as "present", the home-launch gate would send the launcher
+    // down the JIT-materialize path (which then fails closed on the invalid CID) instead of falling
+    // back to the local capsule tree.
+    let cid_is_valid = |value: &str| {
+        let value = value.trim();
+        !value.is_empty() && cid::Cid::try_from(value).is_ok()
+    };
+    let cid_present = platform_info.cid.as_deref().is_some_and(cid_is_valid)
+        || entry.is_some_and(|entry| cid_is_valid(&entry.cid));
     let checksum_present = platform_info
         .checksum
         .as_deref()
@@ -2334,6 +2342,7 @@ mod tests {
             version: None,
             install_path: Some("bin/test".to_string()),
             repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms: HashMap::new(),
@@ -2384,6 +2393,7 @@ mod tests {
             version: Some("0.20.0-rc30".to_string()),
             install_path: Some("bin/site-provider".to_string()),
             repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -2430,6 +2440,7 @@ mod tests {
             version: Some("0.1.0".to_string()),
             install_path: Some("capsules/home-cli".to_string()),
             repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,
@@ -2672,6 +2683,7 @@ mod tests {
         let component = Component {
             version: None,
             install_path: Some("capsules/marketplace".to_string()),
+            source_path: None,
             repository: None,
             size_mb: None,
             description: None,
@@ -2727,6 +2739,51 @@ mod tests {
         assert!(capsule_component_has_release_identity(
             tmp.path(),
             "marketplace"
+        ));
+    }
+
+    #[test]
+    fn capsule_component_release_identity_rejects_local_placeholder_cid() {
+        // A locally-built capsule (empty platform release + a `local-*` placeholder CID in the
+        // registry entry) has NO materializable release. The home-launch gate must treat it as
+        // "no release identity" so the launcher falls back to the local capsule tree instead of
+        // trying to JIT-materialize a release and failing closed on the invalid placeholder CID.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("components.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "external": {
+                    "library": {
+                        "install_path": "capsules/library",
+                        "platforms": {
+                            "*": {
+                                "cid": "",
+                                "checksum": "",
+                                "size": 0,
+                                "release_path": "library.tar.gz",
+                                "extract_path": "library",
+                                "install_path": "capsules/library"
+                            }
+                        }
+                    }
+                },
+                "capsules": {
+                    "library": {
+                        "cid": "local-library-45f74580c625889e",
+                        "sha256": "45f74580c625889e815032d548fb59ccbe64946a7755e2503f39711d8c03650d",
+                        "size": 24472,
+                        "platforms": ["any"]
+                    }
+                },
+                "profiles": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(!capsule_component_has_release_identity(
+            tmp.path(),
+            "library"
         ));
     }
 
@@ -2941,17 +2998,22 @@ mod tests {
         fs::write(&source_path, b"arm64-kernel").unwrap();
         fs::write(&install_path, b"arm64-kernel").unwrap();
 
+        // Host-independent: stamp + verify under the resolved host platform, not a fixed
+        // linux-amd64 (json! needs a literal key, so build the platforms map dynamically).
+        let mut platforms = serde_json::Map::new();
+        platforms.insert(
+            platform.clone(),
+            serde_json::json!({
+                "strategy": "local-copy",
+                "source": source_path.to_string_lossy(),
+                "install_path": "bin/vmlinux"
+            }),
+        );
         let manifest: ComponentsManifest = serde_json::from_value(serde_json::json!({
             "external": {
                 "vmlinux": {
                     "install_path": "bin/vmlinux",
-                    "platforms": {
-                        platform.clone(): {
-                            "strategy": "local-copy",
-                            "source": source_path.to_string_lossy(),
-                            "install_path": "bin/vmlinux"
-                        }
-                    }
+                    "platforms": platforms
                 }
             },
             "capsules": {},
@@ -3017,6 +3079,7 @@ mod tests {
             version: None,
             install_path: Some("bin/vmlinux".to_string()),
             repository: None,
+            source_path: None,
             size_mb: None,
             description: None,
             platforms,

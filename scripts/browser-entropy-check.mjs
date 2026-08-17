@@ -1806,10 +1806,10 @@ assert(
       "homeClipboardHost.resetFrame(context.clipboardState, context)",
     ) &&
     homeClipboardHost.includes(
-      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+      'from "./home-clipboard-protocol.js?v=home-20260807a"',
     ) &&
     homeClipboardClient.includes(
-      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+      'from "./home-clipboard-protocol.js?v=home-20260807a"',
     ) &&
     homeClipboardProtocol.includes(
       "MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES = 65_536",

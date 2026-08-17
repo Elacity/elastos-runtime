@@ -155,12 +155,47 @@ fn home_launch_cookie_header(
     path: &str,
     secure: bool,
 ) -> anyhow::Result<HeaderValue> {
-    let mut value =
-        format!("{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite=Strict");
+    home_launch_cookie_header_same_site(name, token, max_age_secs, path, secure, "Strict")
+}
+
+fn home_launch_cookie_header_same_site(
+    name: &str,
+    token: &str,
+    max_age_secs: u64,
+    path: &str,
+    secure: bool,
+    same_site: &str,
+) -> anyhow::Result<HeaderValue> {
+    let mut value = format!(
+        "{name}={token}; Max-Age={max_age_secs}; Path={path}; HttpOnly; SameSite={same_site}"
+    );
     if secure {
         value.push_str("; Secure");
     }
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
+}
+
+/// The Set-Cookie header for an APP-scoped launch-token cookie (Sprint 33, the money surface):
+/// `HttpOnly` (an XSS in the frame can still ride it same-origin but can never EXFILTRATE it),
+/// `SameSite=Strict` (never sent on any cross-site request), and `Path`-scoped to the one app's
+/// API prefix so it rides nothing else. This replaces the URL-borne `?home_token=…` delivery for
+/// surfaces that carry money verbs — a launch URL is copyable, logged, and shoulder-surfable; an
+/// HttpOnly cookie is none of those.
+#[allow(dead_code)]
+pub(crate) fn app_launch_cookie_header_for_token(
+    name: &str,
+    token: &str,
+    path: &str,
+    secure: bool,
+) -> anyhow::Result<HeaderValue> {
+    home_launch_cookie_header_same_site(
+        name,
+        token,
+        HOME_LAUNCH_TOKEN_TTL_SECS,
+        path,
+        secure,
+        "Strict",
+    )
 }
 
 pub(crate) fn local_home_launch_token_context(
@@ -341,6 +376,51 @@ pub(crate) fn require_home_launch_token_for_any_app_context(
         .map(|required| (required.launch_context.executable_actor, required.context))
 }
 
+/// Authorize an owned-asset OPEN driven by a Home SHELL, not the top-level Home app.
+///
+/// The owned-open endpoints (`/api/viewers/open`, `/api/viewers/prepare-grant`,
+/// `/api/viewers/ddrm-viewer/object/open`, `/api/viewers/elacity-player/media/open`) are invoked by
+/// the graphical shell's `shell-windows.js` with the SHELL's launch token — `executable_actor` is
+/// `home-gui` (or `home-cli`), never `home`. The plain [`require_home_token_context`] admits only
+/// the `home` app AND reads the `HOME_SESSION_COOKIE`, so a shell-driven open fails twice over:
+/// the actor is not allow-listed, and the shell's header token conflicts with the still-present Home
+/// session cookie. This gate mirrors the shell-state gate (`require_home_shell_state_token_context`):
+/// it admits the trusted Home surfaces — the graphical/CLI shells plus the Home app — and reads ONLY
+/// the `x-elastos-home-token` header (no cookie, hence no conflict). It proves the caller is a
+/// trusted, signed-in Home surface acting for its principal; ownership, the on-chain rights gate, and
+/// the dKMS quorum recover still independently gate the actual plaintext downstream.
+pub(crate) fn require_owned_open_token_context(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<HomeLaunchTokenContext> {
+    require_home_launch_token_for_any_context(
+        data_dir,
+        headers,
+        &[HOME_CAPSULE_ID, HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID],
+    )
+}
+
+/// The same owned-open authority [`require_owned_open_token_context`] proves — identical actor
+/// allowlist (`HOME_CAPSULE_ID`, `HOME_GUI_SHELL_ID`, `HOME_CLI_SHELL_ID`), identical token source —
+/// but returning the WHOLE verified launch instead of just the principal context.
+///
+/// `prepare_owned_grant` needs the full launch to mint a [`RuntimeWalletAuthority`] (via
+/// [`runtime_wallet_authority`]) so it can look up the principal's default EVM wallet connector for
+/// the shell to auto-route the delegation signature to. The context alone cannot mint that
+/// authority — see the "PARKED: subject-resolution rewire" note in `viewer_open.rs` for the prior
+/// investigation of this exact gap.
+pub(in crate::api) fn require_owned_open_token_launch(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<RequiredHomeLaunchToken> {
+    require_home_launch_token_for_any_from(
+        data_dir,
+        headers,
+        &[HOME_CAPSULE_ID, HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID],
+        None,
+    )
+}
+
 pub(crate) fn require_home_projection_launch_token_context(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
@@ -393,6 +473,20 @@ pub(crate) fn require_home_token_context(
     data_dir: &std::path::Path,
     headers: &HeaderMap,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
+    require_home_token_launch(data_dir, headers).map(|required| required.context)
+}
+
+/// The same Home-hosted authority [`require_home_token_context`] proves, but returning the WHOLE
+/// verified launch (launch id + launch context), not just the principal context.
+///
+/// A money verb needs the full launch: `consume_passkey_step_up_token` binds the step-up assertion
+/// to the exact launch it was minted under (`original_launch_id` + `launch_context`), so a token
+/// obtained inside one Home launch cannot be replayed from another. The context alone cannot carry
+/// that binding.
+pub(in crate::api) fn require_home_token_launch(
+    data_dir: &std::path::Path,
+    headers: &HeaderMap,
+) -> anyhow::Result<RequiredHomeLaunchToken> {
     require_home_launch_token_for_any_from_with_origin(
         data_dir,
         headers,
@@ -400,7 +494,6 @@ pub(crate) fn require_home_token_context(
         Some(HOME_SESSION_COOKIE),
         HomeLaunchOriginPolicy::Browser,
     )
-    .map(|required| required.context)
 }
 
 pub(crate) fn home_launch_token_header(headers: &HeaderMap) -> Option<String> {
@@ -1397,6 +1490,57 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing same-origin provenance"));
+    }
+
+    #[test]
+    fn owned_open_gate_admits_the_home_gui_shell_token_the_home_only_gate_rejects() {
+        // Regression: the owned-asset open endpoints (/api/viewers/open, /prepare-grant,
+        // /ddrm-viewer/object/open, /elacity-player/media/open) are driven by the graphical Home
+        // SHELL's `shell-windows.js`, which sends the shell's `home-gui`-actor launch token over the
+        // capsule iframe (opaque origin, `x-elastos-home-token` header, NO Home session cookie).
+        // The home-only `require_home_token_context` rejects that token — the actor is not `home` —
+        // which surfaced as a 403 the shell mapped to `requestHomeUnlock()`, rebooting Home in an
+        // endless sign-in loop. `require_owned_open_token_context` admits the trusted shell surfaces.
+        let data_dir = tempfile::tempdir().unwrap();
+        elastos_identity::load_or_create_did(data_dir.path()).unwrap();
+
+        // The two Home shells drive owned opens over the capsule iframe (opaque origin, header-only).
+        for actor in [HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID] {
+            let token = issue_home_launch_token_with_context(
+                data_dir.path(),
+                actor,
+                &local_home_launch_token_context(data_dir.path()).unwrap(),
+            )
+            .unwrap();
+            require_owned_open_token_context(data_dir.path(), &capsule_headers(&token))
+                .unwrap_or_else(|err| panic!("owned-open gate must admit {actor}: {err}"));
+        }
+
+        // The Home app itself keeps working too — it uses the exact-home-origin regime.
+        let home_token = issue_home_launch_token_with_context(
+            data_dir.path(),
+            HOME_CAPSULE_ID,
+            &local_home_launch_token_context(data_dir.path()).unwrap(),
+        )
+        .unwrap();
+        let mut home = HeaderMap::new();
+        home.insert("x-elastos-home-token", home_token.parse().unwrap());
+        home.insert("host", "localhost:45542".parse().unwrap());
+        home.insert("origin", "http://localhost:45542".parse().unwrap());
+        home.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        require_owned_open_token_context(data_dir.path(), &home).unwrap();
+
+        // The shell token is still rejected by the home-only gate — the exact pre-fix failure.
+        let shell_token = issue_home_launch_token_with_context(
+            data_dir.path(),
+            HOME_GUI_SHELL_ID,
+            &local_home_launch_token_context(data_dir.path()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            require_home_token_context(data_dir.path(), &capsule_headers(&shell_token)).is_err(),
+            "home-only gate must still reject the shell token (proves the widening is necessary)"
+        );
     }
 
     #[test]

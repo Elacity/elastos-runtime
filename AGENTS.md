@@ -19,27 +19,6 @@ lives in [state.md](state.md), and open work lives in [TASKS.md](TASKS.md).
 - Always report remote divergence. A local branch being green is not the same as
   `elacity/<branch>` being up to date.
 
-## Creating Work Branches
-
-New feature or bugfix branches start from an `upstream/XX-dev` integration
-branch (e.g. `upstream/0.6-dev`) — never silently from `main` or from whatever
-branch happens to be checked out. The user chooses the base; do not pick it
-yourself:
-
-- Run `git fetch origin --prune`, then list `upstream/*-dev` lines and active
-  `feat/*`/`fix/*` branches before proposing bases.
-- Ask the user which base to start from, offering each `upstream/XX-dev`
-  (newest recommended) plus "an existing working branch" for work that depends
-  on another in-flight branch. Ask even when only one dev line exists.
-- If the chosen base is a working branch rather than `upstream/XX-dev`, warn
-  immediately: the new branch must merge back only after (or together with)
-  its parent, merging it into `upstream/XX-dev` may conflict with the parent's
-  changes, and it needs a rebase if the parent moves.
-- Name branches `feat/<slug>` or `fix/<slug>`; do not push or set upstream
-  tracking until asked.
-
-Canonical workflow: [.claude/skills/branching-strategy/SKILL.md](.claude/skills/branching-strategy/SKILL.md).
-
 ## Branch Lifecycle
 
 Before creating, deleting, merging, or publishing branches, produce a short

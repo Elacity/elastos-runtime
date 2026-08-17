@@ -1034,6 +1034,48 @@
         }
       }
     },
+    "creator": {
+      "install_path": "capsules/creator",
+      "description": "Create portal: mints a dDRM asset on PQ custody via the capability bus",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "creator.tar.gz",
+          "extract_path": "creator",
+          "install_path": "capsules/creator"
+        }
+      }
+    },
+    "ddrm-viewer": {
+      "install_path": "capsules/ddrm-viewer",
+      "description": "Protected dDRM viewer for owned non-media assets opened from Library",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "ddrm-viewer.tar.gz",
+          "extract_path": "ddrm-viewer",
+          "install_path": "capsules/ddrm-viewer"
+        }
+      }
+    },
+    "elacity-player": {
+      "install_path": "capsules/elacity-player",
+      "description": "Protected media player for owned fMP4/CENC audio and video opened from Library",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "elacity-player.tar.gz",
+          "extract_path": "elacity-player",
+          "install_path": "capsules/elacity-player"
+        }
+      }
+    },
     "inbox": {
       "install_path": "capsules/inbox",
       "description": "Inbox capsule for reviewing Home requests",

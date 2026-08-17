@@ -1,13 +1,16 @@
 //! Common types and utilities for ElastOS
 
+pub mod canonical_hash;
 pub mod chat_protocol;
 mod error;
 pub mod localhost;
 mod manifest;
 pub mod protected_content;
+pub mod reach;
 pub mod timestamp;
 mod types;
 
+pub use canonical_hash::canonical_input_hash;
 pub use error::{ElastosError, Result};
 pub use manifest::{
     elastos_bus_v1_wit_sha256, AffordanceApprovalMode, AffordanceAuditMode, AffordanceRisk,
@@ -15,6 +18,10 @@ pub use manifest::{
     CapsuleProjection, CapsuleRequirement, CapsuleRole, CapsuleRuntimeAbi, CapsuleType,
     MicroVmConfig, Permissions, ProviderAuthority, ProviderCapabilitySchema, RequirementKind,
     ResourceLimits, ELASTOS_BUS_V1_CONTRACT, ELASTOS_BUS_V1_WORLD, SCHEMA_V1,
+};
+pub use reach::{
+    EgressAllowlist, EgressReach, IsolationTier, ReachDescriptorV1, ResourceScope, Reversibility,
+    REACH_DESCRIPTOR_SCHEMA_V1,
 };
 use sha2::{Digest, Sha256};
 pub use timestamp::{SecureTimestamp, CLOCK_SKEW_TOLERANCE_SECS};

@@ -1,6 +1,11 @@
 use super::*;
 
-pub(in crate::api::gateway) async fn system_wallet_accounts_summary(
+/// `pub(in crate::api)`, not the narrower `pub(in crate::api::gateway)` most of this module's
+/// siblings use: `viewer_open::prepare_owned_grant` (a sibling of `gateway`, not a descendant of
+/// it) needs to build the same summary the wallet-connector handlers use, to resolve the
+/// principal's default EVM connector for the wallet delegation signature. Keep everything else in
+/// this file at the narrower default — only this one entry point needed widening.
+pub(in crate::api) async fn system_wallet_accounts_summary(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
 ) -> SystemWalletAccountsSummary {
@@ -15,7 +20,12 @@ pub(in crate::api::gateway) async fn system_wallet_accounts_summary(
     wallet_accounts_summary_from_response(response)
 }
 
-pub(in crate::api::gateway) async fn runtime_wallet_data(
+// `pub(in crate::api)`, not the narrower `pub(in crate::api::gateway)` most callers use:
+// `viewer_grant_sign` (a sibling of `gateway`, not a descendant of it) dispatches its own
+// `RequestApproval`/`ListApprovals` wallet-provider operations directly through this generic
+// primitive for the dDRM delegation-sign approval flow, the same way `viewer_open::prepare_owned_grant`
+// already reaches `system_wallet_accounts_summary` at this width.
+pub(in crate::api) async fn runtime_wallet_data(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     operation: elastos_wallet_contract::WalletProviderOperationV2,

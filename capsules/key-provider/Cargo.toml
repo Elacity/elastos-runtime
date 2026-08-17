@@ -9,10 +9,37 @@ license = "MIT"
 name = "key-provider"
 path = "src/main.rs"
 
+[features]
+# dev-modes: the single, uniform opt-in (matching dkms-authority/elastos-server) that UNFENCES
+# the forgeable in-runtime `reference` key backend. NOTE: `key-authority-ref` gates BOTH the
+# production `dkms` delegation/quorum path AND the dev `reference` backend, so production builds
+# DO compile it (the run script: `--features key-authority-ref`). The actual fence is at
+# SELECTION: `release` refuses the `reference` backend unless `dev-modes` is on (see main.rs).
+# `dev-modes` pulls in `key-authority-ref` so a dev build (`--features dev-modes`) has the
+# reference backend both compiled AND selectable; a production build (`--features
+# key-authority-ref` only) has dkms but the reference backend fails closed at selection.
+dev-modes = ["key-authority-ref"]
+# key-authority-ref: the in-runtime REFERENCE key-delivery backend (Phase A.2) AND the external
+# `dkms` delegation/quorum client. Required in production for the dKMS path; the dev-only
+# reference backend it also compiles is fenced out at selection unless `dev-modes` is set.
+# The reference authority seals a recovered CEK to a decrypt session's published
+# key via the shared `ddrm-envelope` crate, producing the exact suite-tagged
+# `SealedDecryptMaterialV1` the decrypt boundary opens. Exposed through a
+# capsule-local `release_ref` op so the shared `KeyReleaseRequestV1` contract stays
+# byte-identical (Parallel Change). OFF by default — the default build + `release`
+# stay fail-closed; no raw CEK ever leaves this boundary (only sealed material).
+key-authority-ref = ["dep:ddrm-envelope", "dep:base64", "dep:zeroize"]
+
 [dependencies]
 elastos-common = { path = "../../elastos/crates/elastos-common" }
+elastos-logger = { path = "../../elastos/crates/elastos-logger" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Shared PQ-hybrid seal/unwrap — single source of truth with decrypt-provider
+# (feature `key-authority-ref` only).
+ddrm-envelope = { path = "../ddrm-envelope", optional = true }
+base64 = { version = "0.22", optional = true }
+zeroize = { version = "1", optional = true }
 
 [dev-dependencies]
 

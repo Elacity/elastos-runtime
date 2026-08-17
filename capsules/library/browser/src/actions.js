@@ -17,6 +17,11 @@ import {
   viewerOptions,
 } from "./model.js";
 
+// Viewers that render owned, protected (dKMS) content. An owner opening one of these from their
+// own Library must go through the owned-library open (local file + 2-of-3 quorum recover), never
+// the public published-CID path — see `openWithViewer`.
+const PROTECTED_VIEWERS = new Set(["ddrm-viewer", "elacity-player"]);
+
 export function createLibraryActions({
   clearSelection,
   closeSelf,
@@ -84,7 +89,13 @@ export function createLibraryActions({
   function openWithViewer(object, viewer) {
     if (!viewer) return false;
     const cid = publishedCid(object);
-    if (object.published && cid) {
+    // A protected asset (ddrm-viewer / elacity-player) that the owner opens from their OWN
+    // Library always opens through the owned-library path below — the gateway resolves the
+    // local owned file and recovers the key via the dKMS quorum — regardless of whether the
+    // asset is ALSO published to a public content link. Only non-protected viewers (documents)
+    // open the raw published content by CID; `resolveOpenUri` in Home routes just those. Sending
+    // a protected open down the published-URI path yields no resolvable target and never opens.
+    if (object.published && cid && !PROTECTED_VIEWERS.has(viewer)) {
       openPublishedUri("elastos://" + cid, viewer);
       return true;
     }

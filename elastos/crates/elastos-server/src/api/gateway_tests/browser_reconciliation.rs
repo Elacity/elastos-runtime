@@ -101,22 +101,6 @@ async fn yield_until_atomic(counter: &std::sync::atomic::AtomicUsize, expected: 
     );
 }
 
-async fn yield_until_close_count(
-    close_calls: &Arc<TokioMutex<Vec<serde_json::Value>>>,
-    expected: usize,
-) {
-    for _ in 0..10_000 {
-        if close_calls.lock().await.len() >= expected {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!(
-        "close calls did not reach {expected}; observed {}",
-        close_calls.lock().await.len()
-    );
-}
-
 async fn yield_until_cleanup_obligation_count(state: &GatewayState, expected: usize) {
     for _ in 0..10_000 {
         if browser_engine_cleanup_obligation_count(&state.data_dir).await == expected {
@@ -136,19 +120,36 @@ async fn finish_current_reconciliation_sweep() {
     }
 }
 
-async fn advance_until_atomic(
-    counter: &std::sync::atomic::AtomicUsize,
-    expected: usize,
-    step: Duration,
+/// Settle one controlled reconciler sweep under a paused virtual clock WITHOUT
+/// letting tokio's auto-advance jump time to the reconciliation-call timeout.
+///
+/// A retry close is briefly parked on the process-global browser session
+/// registry mutex, which parallel tests hold across blocking `std::fs` I/O in
+/// their own reconcilers. While this runtime's close is parked there it has no
+/// ready work, so a bare `wait_for_completed_sweeps` (which merely parks on a
+/// watch channel) lets the paused clock auto-advance straight to the 30s
+/// `BROWSER_LAUNCH_RECONCILIATION_CALL_TIMEOUT` and cancel a close that would
+/// otherwise finish in microseconds. Keeping a task perpetually runnable via
+/// `yield_now` denies the runtime the fully-idle state auto-advance requires,
+/// so virtual time stays frozen until the (instant) close really completes. The
+/// bounded spin still fails loudly if a sweep genuinely never settles rather
+/// than hanging forever.
+async fn settle_sweep_without_virtual_time_autoadvance(
+    reconciler: &BrowserLifecycleReconciler,
+    expected_completed_sweeps: usize,
 ) {
-    for _ in 0..10 {
-        if counter.load(Ordering::SeqCst) >= expected {
-            return;
-        }
-        tokio::time::advance(step).await;
-        finish_current_reconciliation_sweep().await;
+    tokio::select! {
+        biased;
+        _ = reconciler.wait_for_completed_sweeps(expected_completed_sweeps) => {}
+        _ = async {
+            for _ in 0..5_000_000 {
+                tokio::task::yield_now().await;
+            }
+        } => panic!(
+            "reconciler sweep {expected_completed_sweeps} did not settle under a paused clock \
+             without a real-clock timeout"
+        ),
     }
-    yield_until_atomic(counter, expected).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -185,8 +186,40 @@ async fn runtime_restart_scans_pending_launch_and_closes_late_success_without_an
 
     let restarted_runtime =
         start_browser_lifecycle_reconciler(state.clone()).expect("restarted Runtime reconciler");
-    yield_until_atomic(&reconciliation_calls, 2).await;
-    yield_until_close_count(&close_calls, 1).await;
+    // Drive the restarted reconciler to its REAL terminal outcome -- a
+    // late-success close that drains the launch obligation -- instead of waiting
+    // on a proxy reconciliation-call count and then a fixed close-yield budget.
+    // The late-success close is briefly parked on the process-global browser
+    // session registry mutex, which parallel tests hold across blocking
+    // `std::fs` I/O in their own reconcilers. While this runtime's close is
+    // parked there it has no ready work, so a bare fixed-budget yield loop lets
+    // the paused clock auto-advance straight to the 30s reconciliation-call
+    // timeout and cancel a close that would otherwise finish in microseconds.
+    // Keeping a task perpetually runnable (yield_now) denies the runtime the
+    // fully-idle state auto-advance requires, so virtual time stays frozen until
+    // the (instant) close really lands. The `&&` short-circuits the durable
+    // obligation reads until a close has actually landed, so the pre-close spin
+    // stays cheap. The cap is generous but bounded so a genuine stall still
+    // fails loudly rather than looping forever.
+    let mut closed_and_drained = false;
+    for _ in 0..2_000_000 {
+        if !close_calls.lock().await.is_empty()
+            && browser_launch_reconciliation_obligation_count(&state.data_dir).await == 0
+            && browser_engine_cleanup_obligation_count(&state.data_dir).await == 0
+        {
+            closed_and_drained = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        closed_and_drained,
+        "restarted reconciler must rescan the pending launch and land a late-success close that drains the obligation"
+    );
+    assert!(
+        reconciliation_calls.load(Ordering::SeqCst) >= 2,
+        "the terminal close must follow the restart rescan, not the pre-restart attempt"
+    );
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         0
@@ -241,11 +274,33 @@ async fn newly_committed_launch_obligation_wakes_reconciler_without_time_advance
     )
     .await;
 
-    yield_until_atomic(&reconciliation_calls, 1).await;
-    yield_until_close_count(&close_calls, 1).await;
-    assert_eq!(
-        browser_launch_reconciliation_obligation_count(&state.data_dir).await,
-        0
+    // Drive the free-running reconciler to its REAL terminal outcome -- the
+    // immediate late-success close that drains the obligation -- via a
+    // keep-runtime-busy poll on the real drained condition, instead of a fixed
+    // close-count yield budget. The close is briefly parked on the process-global
+    // browser session registry mutex (held across blocking std::fs I/O by
+    // parallel tests); a fixed budget can expire before that mutex frees under
+    // load, and a park that idles the runtime would let the paused clock
+    // auto-advance to the 30s reconciliation-call timeout and cancel an instant
+    // close. Spinning yield_now keeps virtual time frozen until the close lands;
+    // the `&&` keeps the pre-close spin cheap and the cap is generous but bounded.
+    let mut closed_and_drained = false;
+    for _ in 0..2_000_000 {
+        if !close_calls.lock().await.is_empty()
+            && browser_launch_reconciliation_obligation_count(&state.data_dir).await == 0
+        {
+            closed_and_drained = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        closed_and_drained,
+        "a newly committed obligation must wake the reconciler and land a late-success close that drains it"
+    );
+    assert!(
+        reconciliation_calls.load(Ordering::SeqCst) >= 1,
+        "the drained obligation must have been reconciled without an explicit time advance"
     );
     assert_eq!(close_calls.lock().await.len(), 1);
     reconciler.cancel();
@@ -445,18 +500,29 @@ async fn stale_stream_timeout_releases_exact_claim_for_retry_without_restart() {
         1
     );
 
+    // Drain the exact engine + stream cleanup obligations by settling retry
+    // sweeps until they actually reach 0, instead of trusting a fixed sweep
+    // budget. Each settle keeps the runtime busy so the paused clock cannot
+    // auto-advance to the call timeout and cancel an instant retry close (see
+    // helper). The cap is generous but bounded so a genuine hang still fails.
     let mut completed_sweeps = 2;
-    for _ in 0..4 {
+    let mut drained = false;
+    for _ in 0..64 {
         if browser_engine_cleanup_obligation_count(&state.data_dir).await == 0
             && browser_stream_cleanup_obligation_count(&state.data_dir).await == 0
         {
+            drained = true;
             break;
         }
         notify_browser_lifecycle_reconciler(&state.data_dir);
         reconciler.resume_sweeps();
         completed_sweeps += 1;
-        reconciler.wait_for_completed_sweeps(completed_sweeps).await;
+        settle_sweep_without_virtual_time_autoadvance(&reconciler, completed_sweeps).await;
     }
+    assert!(
+        drained,
+        "exact engine and stream cleanup obligations must drain to 0 via retry sweeps without a restart"
+    );
     let calls = exit_close_calls.lock().await;
     assert!(calls.len() >= 2);
     assert!(calls.iter().all(|call| {
@@ -537,16 +603,28 @@ async fn hanging_stream_timeout_releases_exact_claim_for_retry_without_restart()
         1
     );
 
+    // Drain the exact stream cleanup obligation by settling retry sweeps until
+    // it actually reaches 0, rather than trusting a fixed sweep budget. Each
+    // settle keeps the runtime busy so the paused clock cannot auto-advance to
+    // the call timeout and cancel an instant retry close (see helper). The cap
+    // is generous but bounded so a genuine hang still fails instead of looping
+    // forever.
     let mut completed_sweeps = 1;
-    for _ in 0..4 {
+    let mut drained = false;
+    for _ in 0..64 {
         if browser_stream_cleanup_obligation_count(&state.data_dir).await == 0 {
+            drained = true;
             break;
         }
         notify_browser_lifecycle_reconciler(&state.data_dir);
         reconciler.resume_sweeps();
         completed_sweeps += 1;
-        reconciler.wait_for_completed_sweeps(completed_sweeps).await;
+        settle_sweep_without_virtual_time_autoadvance(&reconciler, completed_sweeps).await;
     }
+    assert!(
+        drained,
+        "exact stream cleanup obligation must drain to 0 via retry sweeps without a restart"
+    );
     let calls = exit_close_calls.lock().await;
     assert!(calls.len() >= 2);
     assert!(calls.iter().all(|call| {
@@ -594,8 +672,34 @@ async fn transient_reconciliation_failure_retries_with_backoff_and_retains_owner
     );
     assert!(close_calls.lock().await.is_empty());
     finish_current_reconciliation_sweep().await;
-    advance_until_atomic(&reconciliation_calls, 2, Duration::from_millis(100)).await;
-    yield_until_close_count(&close_calls, 1).await;
+    // Drive the backoff retry to its terminal outcome -- a late-success close
+    // that drains the obligation -- instead of waiting on a proxy
+    // reconciliation-call count and then a fixed close-yield budget. Interleave
+    // small virtual-time advances (so the retry backoff sleep actually fires)
+    // with cooperative-yield bursts (so each sweep makes progress AND the
+    // runtime is never fully idle, denying the paused clock the auto-advance it
+    // would otherwise use to jump to a 30s call timeout under registry-mutex
+    // contention). Poll the real terminal condition under a generous but bounded
+    // cap so a genuine stall still fails loudly.
+    let mut retried_to_terminal_close = false;
+    for _ in 0..256 {
+        if !close_calls.lock().await.is_empty()
+            && browser_launch_reconciliation_obligation_count(&state.data_dir).await == 0
+        {
+            retried_to_terminal_close = true;
+            break;
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        finish_current_reconciliation_sweep().await;
+    }
+    assert!(
+        retried_to_terminal_close,
+        "transient failure must retry with backoff and reach a late-success close that drains the obligation"
+    );
+    assert!(
+        reconciliation_calls.load(Ordering::SeqCst) >= 2,
+        "the terminal close must follow a backoff retry, not the first attempt"
+    );
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         0
@@ -637,8 +741,34 @@ async fn reconciliation_timeout_retains_exact_ownership_until_late_terminal_clea
     );
     assert!(close_calls.lock().await.is_empty());
 
-    advance_until_atomic(&reconciliation_calls, 2, Duration::from_millis(100)).await;
-    yield_until_close_count(&close_calls, 1).await;
+    // Drive the post-timeout backoff retry to its terminal outcome -- a
+    // late-success close that drains the obligation -- instead of waiting on a
+    // proxy reconciliation-call count and then a fixed close-yield budget.
+    // Interleave small virtual-time advances (so the retry backoff sleep fires)
+    // with cooperative-yield bursts (so each sweep makes progress AND the
+    // runtime is never fully idle, denying the paused clock the auto-advance it
+    // would otherwise use to jump to a 30s call timeout under registry-mutex
+    // contention). Poll the real terminal condition under a generous but bounded
+    // cap so a genuine stall still fails loudly.
+    let mut retried_to_terminal_close = false;
+    for _ in 0..256 {
+        if !close_calls.lock().await.is_empty()
+            && browser_launch_reconciliation_obligation_count(&state.data_dir).await == 0
+        {
+            retried_to_terminal_close = true;
+            break;
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        finish_current_reconciliation_sweep().await;
+    }
+    assert!(
+        retried_to_terminal_close,
+        "reconciliation timeout must retry with backoff and reach a late-success close that drains the obligation"
+    );
+    assert!(
+        reconciliation_calls.load(Ordering::SeqCst) >= 2,
+        "the terminal close must follow a post-timeout backoff retry, not the first attempt"
+    );
     assert_eq!(
         browser_launch_reconciliation_obligation_count(&state.data_dir).await,
         0

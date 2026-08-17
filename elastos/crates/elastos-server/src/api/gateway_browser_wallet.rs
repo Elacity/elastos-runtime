@@ -10,8 +10,20 @@ use gateway_browser_wallet_bridge::browser_wallet_account_is_signable_evm;
 pub(in crate::api::gateway) use gateway_browser_wallet_bridge::{
     browser_chain_namespace_network, browser_wallet_bridge_payload, is_browser_wallet_intent,
 };
+// `default_evm_connector_id` is already `pub(in crate::api)` at its definition (Task 1) so it can
+// reach `viewer_open::prepare_owned_grant`, a sibling of `gateway` — re-export it at that width
+// through this module too (the block above stays at the narrower default for everything else).
+// `validate_connector_and_resolve_account` needs the same width for the same reason —
+// `viewer_grant_sign` (a sibling of `gateway`) validates the caller-supplied connector against the
+// default and resolves the exact linked account for the connector-sign approval through it.
+// `evm_account_for_connector` itself (the piece `validate_connector_and_resolve_account` wraps)
+// stays at its `pub(in crate::api)` definition width but is not separately re-exported past here —
+// nothing outside `gateway` calls it directly.
 use gateway_browser_wallet_bridge::{
     browser_projected_evm_accounts, BROWSER_SUPPORTED_EVM_CHAIN_NAMESPACES,
+};
+pub(in crate::api) use gateway_browser_wallet_bridge::{
+    default_evm_connector_id, validate_connector_and_resolve_account,
 };
 use gateway_browser_wallet_reads::browser_wallet_read;
 
@@ -740,7 +752,6 @@ async fn create_browser_wallet_signature_request(
     })?;
     let (
         intent,
-        resource_action,
         reason,
         payload_params,
         message,
@@ -751,7 +762,6 @@ async fn create_browser_wallet_signature_request(
         let (requested_address, typed_data, canonical) =
             browser_typed_data_signature_parts(params, &address)?;
         (
-            "browser_typed_data_sign",
             "browser_typed_data_sign",
             format!("Browser page requests {method}"),
             serde_json::json!([requested_address.clone(), canonical.clone()]),
@@ -782,7 +792,6 @@ async fn create_browser_wallet_signature_request(
             .unwrap_or(address.as_str())
             .to_string();
         (
-            "browser_personal_sign",
             "browser_personal_sign",
             format!("Browser page requests {method}"),
             serde_json::json!([message, requested_address.clone()]),
@@ -844,26 +853,71 @@ async fn create_browser_wallet_signature_request(
     if let Some(canonical) = typed_data_canonical {
         payload["typed_data_canonical"] = serde_json::Value::String(canonical);
     }
-    let data = runtime_wallet_data(
+    let data = create_connector_personal_sign_approval(
         state,
         authority,
-        elastos_wallet_contract::WalletProviderOperationV2::RequestApproval {
+        ConnectorPersonalSignApprovalInput {
             account_id,
-            chain_namespace: chain_namespace.clone(),
-            intent: intent.to_string(),
-            resource: format!("elastos://wallet/{chain_namespace}/sign/{resource_action}"),
+            chain_namespace,
+            // Browser callers always use the SAME value for both the approval's `intent` (what a
+            // status reader filters on) and its resource-URI action segment — `intent` and
+            // `resource_action` were never observed to differ here, so the shared core collapses
+            // them into one field.
+            resource_action: intent.to_string(),
             reason,
             payload,
-            expires_at: now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
         },
     )
-    .await
-    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    .await?;
     Ok(serde_json::json!({
         "schema": "elastos.browser.wallet-approval-result/v1",
         "requires_approval": true,
         "approval_request": data.get("approval_request").cloned().unwrap_or(serde_json::Value::Null),
     }))
+}
+
+/// Shared core: mint a connector `personal_sign`-style wallet-provider approval bound to an EIP-191
+/// message. Both the Browser wallet bridge (`create_browser_wallet_signature_request`, above —
+/// `resource_action` "browser_personal_sign" / "browser_typed_data_sign") and the dDRM
+/// delegation-sign endpoints (`viewer_grant_sign`, `resource_action` "ddrm_delegation_sign") mint
+/// their connector approval through this ONE `RequestApproval` dispatch, so the two callers can
+/// never drift on how an approval is shaped. `resource_action` is used as BOTH the approval's
+/// `intent` (what a status reader filters on) and the last path segment of its `resource` URI.
+///
+/// `pub(in crate::api)`, not the narrower `pub(in crate::api::gateway)` most of this module's
+/// exports use: `viewer_grant_sign` is a sibling of `gateway`, not a descendant of it.
+pub(in crate::api) struct ConnectorPersonalSignApprovalInput {
+    pub(in crate::api) account_id: String,
+    pub(in crate::api) chain_namespace: String,
+    pub(in crate::api) resource_action: String,
+    pub(in crate::api) reason: String,
+    pub(in crate::api) payload: serde_json::Value,
+}
+
+pub(in crate::api) async fn create_connector_personal_sign_approval(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    input: ConnectorPersonalSignApprovalInput,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let resource = format!(
+        "elastos://wallet/{}/sign/{}",
+        input.chain_namespace, input.resource_action
+    );
+    runtime_wallet_data(
+        state,
+        authority,
+        elastos_wallet_contract::WalletProviderOperationV2::RequestApproval {
+            account_id: input.account_id,
+            chain_namespace: input.chain_namespace,
+            intent: input.resource_action,
+            resource,
+            reason: input.reason,
+            payload: input.payload,
+            expires_at: now_ts().saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
+        },
+    )
+    .await
+    .map_err(|err| (StatusCode::SERVICE_UNAVAILABLE, err.to_string()))
 }
 
 fn is_browser_typed_data_sign_method(method: &str) -> bool {

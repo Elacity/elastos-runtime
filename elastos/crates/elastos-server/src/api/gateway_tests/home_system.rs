@@ -6571,3 +6571,98 @@ fn test_chat_request_bodies_reject_hidden_identity_fields() {
         "ipfs_gateway": "https://example.invalid/ipfs"
     }));
 }
+
+/// Launch-token DELIVERY, end to end. Two channels carry a Home session's authority into an app,
+/// and NEITHER is the request URL:
+///
+///   * the `home-session` cookie — `HttpOnly` (script cannot read or exfiltrate it),
+///     `SameSite=Strict` (never attached to a cross-site request, so a hostile page cannot drive
+///     a money verb with it), `Path=/`, and `Secure` whenever the node is served over TLS;
+///   * the launch route's URL FRAGMENT — a fragment is never transmitted to any server, so it
+///     stays out of the `Referer` header, the gateway's access log, and shared-link history.
+///
+/// A query-string `?home_token=…` has none of those properties, which is why this test also pins
+/// its absence. The cookie half is proven against a real money verb (`POST /api/market/buy`): the
+/// request carries NO token header and NO token in the URL, and it still reaches the step-up gate
+/// — proof the cookie alone conveyed the launch authority.
+#[tokio::test]
+async fn test_app_launch_delivers_token_via_samesite_cookie_not_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority(dir.path());
+    let app = gateway_router(test_state(dir.path()));
+
+    // (1) The cookie the runtime mints over TLS carries the full attribute set.
+    let secure_cookie = home_session_cookie_header_for_token(&authority.home_token, true).unwrap();
+    let secure_cookie = secure_cookie.to_str().unwrap();
+    assert!(
+        secure_cookie.starts_with(&format!("{HOME_SESSION_COOKIE}=")),
+        "launch authority must ride the Home session cookie: {secure_cookie}"
+    );
+    for attribute in ["HttpOnly", "SameSite=Strict", "Path=/", "Secure"] {
+        assert!(
+            secure_cookie.contains(attribute),
+            "Home session cookie is missing {attribute}: {secure_cookie}"
+        );
+    }
+    // Over plain HTTP (the localhost node) only `Secure` is dropped — a Secure cookie would never
+    // be stored by the browser at all. Nothing else relaxes.
+    let plain_cookie = home_session_cookie_header_for_token(&authority.home_token, false).unwrap();
+    let plain_cookie = plain_cookie.to_str().unwrap();
+    assert!(!plain_cookie.contains("Secure"));
+    assert!(plain_cookie.contains("HttpOnly") && plain_cookie.contains("SameSite=Strict"));
+
+    // (2) That cookie ALONE authenticates a money verb — no `x-elastos-home-token`, no URL token.
+    let buy = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "http://localhost:61180")
+                .method("POST")
+                .uri("/api/market/buy")
+                .header(
+                    COOKIE,
+                    format!("{HOME_SESSION_COOKIE}={}", authority.home_token),
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "content_id": "0f0e0d0c" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(buy.status(), StatusCode::FORBIDDEN);
+    let refusal = String::from_utf8(
+        axum::body::to_bytes(buy.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        refusal.contains("fresh passkey step-up"),
+        "the cookie must carry the launch authority through to the step-up gate, got: {refusal}"
+    );
+    assert!(
+        !refusal.contains("home launch token"),
+        "cookie-only delivery must not be mistaken for a missing credential: {refusal}"
+    );
+
+    // (3) The route the shell opens keeps the app's launch token in the fragment, never the query,
+    //     and the launch response body leaks no URL-borne token either.
+    let (status, launched) = home_test_post_json(
+        &app,
+        "/api/apps/home/launch",
+        &authority.home_token,
+        "http://localhost:61180",
+        json!({ "target": "library" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let route = launched["route"].as_str().unwrap();
+    assert_isolated_launch_route(route, "library");
+    let body_text = launched.to_string();
+    for url_borne in ["?home_token=", "&home_token="] {
+        assert!(
+            !body_text.contains(url_borne),
+            "no URL-borne tokens on the launch surface ({url_borne}): {body_text}"
+        );
+    }
+}

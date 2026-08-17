@@ -1,0 +1,15 @@
+{
+  "cek_b64": "EXZNDLJSfjVLXCTXVBQwSw==",
+  "description": "encrypt-provider in-boundary mint+CENC (3 segments, ONE CEK, globally-unique per-sample IVs continuing across segments) -> decrypt-provider multi-segment loop; CEK captured (rail stand-in)",
+  "expected_plaintexts_b64": [
+    "c2VnMC1zYW1wbGUtMC4uIXNlZzAtc2FtcGxlLTEtbG9uZ2Vy",
+    "c2VnMS1zaW5nbGUtc2FtcGxlLTMyLWJ5dGVzLWxvbmc=",
+    "QUFBc2VnMkJCQnNlZzJDQw=="
+  ],
+  "kid_hex": "7dbabad90a052522fbd75ef15fa1aeae",
+  "segments_b64": [
+    "AAAASG1vb2YAAABAdHJhZgAAABh0cnVuAAACAAAAAAIAAAAQAAAAFAAAACBzZW5jAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAABAAAALG1kYXSrTuCp/PzO3/OSx5M12ixkCI6IYxxouBXrLJ3im6YsRT6hZ00=",
+    "AAAAPG1vb2YAAAA0dHJhZgAAABR0cnVuAAACAAAAAAEAAAAgAAAAGHNlbmMAAAAAAAAAAQAAAAAAAAACAAAAKG1kYXSD3wTXLmX+SmI2h81E/nRlh2zf/kBCSP1m97QHzu5kVg==",
+    "AAAASG1vb2YAAABAdHJhZgAAABh0cnVuAAACAAAAAAIAAAAIAAAACAAAACBzZW5jAAAAAAAAAAIAAAAAAAAAAwAAAAAAAAAEAAAAGG1kYXT7hHxEHedrmk+IE73541xN"
+  ]
+}

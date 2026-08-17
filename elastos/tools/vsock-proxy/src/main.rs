@@ -14,6 +14,28 @@ use std::os::unix::io::FromRawFd;
 use std::process::{Command, Stdio};
 use std::thread;
 
+/// Upper bound on a single framed JSON line (pre-audit #4). The provider protocol is one JSON
+/// request/response per line; without a cap, a peer (or a runaway provider) that never sends a
+/// newline drives `read_line` to grow its `String` until the bridge OOMs. 16 MiB is far above any
+/// legitimate request and below any memory-pressure concern. An over-long line FAILS CLOSED (the
+/// session is dropped) rather than being silently truncated.
+const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read one newline-terminated line, refusing any line longer than [`MAX_LINE_BYTES`]. Returns the
+/// number of bytes read (0 on EOF), exactly like [`BufRead::read_line`], but errors closed if the cap
+/// is hit before a newline arrives.
+fn read_line_capped(reader: &mut impl BufRead, buf: &mut String) -> std::io::Result<usize> {
+    // `Take<&mut R>` is itself `BufRead` when `R: BufRead`, so the cap composes with `read_line`.
+    let n = reader.by_ref().take(MAX_LINE_BYTES).read_line(buf)?;
+    if n as u64 >= MAX_LINE_BYTES && !buf.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "framed line exceeds MAX_LINE_BYTES cap",
+        ));
+    }
+    Ok(n)
+}
+
 // Vsock address family (from linux/socket.h)
 const AF_VSOCK: i32 = 40;
 // Vsock socket type
@@ -170,7 +192,7 @@ fn handle_provider_session(
 
     loop {
         let mut request = String::new();
-        let n = socket_reader.read_line(&mut request)?;
+        let n = read_line_capped(&mut socket_reader, &mut request)?;
         if n == 0 {
             break; // client closed connection
         }
@@ -181,7 +203,7 @@ fn handle_provider_session(
 
         // Read response from provider
         let mut response = String::new();
-        let rn = child_stdout.read_line(&mut response)?;
+        let rn = read_line_capped(child_stdout, &mut response)?;
         if rn == 0 {
             eprintln!("provider process closed stdout unexpectedly");
             break;
@@ -201,7 +223,7 @@ fn handle_provider_stream(
 ) -> std::io::Result<()> {
     loop {
         let mut request = String::new();
-        let n = socket_reader.read_line(&mut request)?;
+        let n = read_line_capped(&mut socket_reader, &mut request)?;
         if n == 0 {
             break;
         }
@@ -210,7 +232,7 @@ fn handle_provider_stream(
         child_stdin.flush()?;
 
         let mut response = String::new();
-        let rn = child_stdout.read_line(&mut response)?;
+        let rn = read_line_capped(child_stdout, &mut response)?;
         if rn == 0 {
             eprintln!("provider process closed stdout unexpectedly");
             break;
@@ -487,5 +509,39 @@ fn main() {
                 eprintln!("Accept error: {}", e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_line_capped_accepts_a_normal_framed_line() {
+        let mut reader = Cursor::new(b"{\"op\":\"status\"}\n".to_vec());
+        let mut buf = String::new();
+        let n = read_line_capped(&mut reader, &mut buf).expect("normal line reads");
+        assert_eq!(n, buf.len());
+        assert!(buf.ends_with('\n'));
+        assert_eq!(buf, "{\"op\":\"status\"}\n");
+    }
+
+    #[test]
+    fn read_line_capped_returns_zero_on_eof() {
+        let mut reader = Cursor::new(Vec::new());
+        let mut buf = String::new();
+        let n = read_line_capped(&mut reader, &mut buf).expect("eof is not an error");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn read_line_capped_refuses_an_overlong_newlineless_stream() {
+        // A peer that never sends a newline: 1 byte over the cap, no '\n' → fail closed, not OOM.
+        let flood = vec![b'a'; (MAX_LINE_BYTES + 1) as usize];
+        let mut reader = Cursor::new(flood);
+        let mut buf = String::new();
+        let err = read_line_capped(&mut reader, &mut buf).expect_err("over-long line must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

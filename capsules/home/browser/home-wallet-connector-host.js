@@ -1,4 +1,4 @@
-import { fetchJson } from "./shell-core.js?v=home-20260725a";
+import { fetchJson } from "./shell-core.js?v=home-20260807a";
 
 export const WALLET_CONNECTOR_EFFECT_TYPE = "home:wallet-connector-effect";
 export const WALLET_CONNECTOR_EFFECT_SCHEMA = "elastos.home.wallet-connector-effect/v1";
@@ -118,7 +118,36 @@ function requestEip6963Providers() {
   window.dispatchEvent(new Event("eip6963:requestProvider"));
 }
 
-function selectMetaMaskCompatibleProvider() {
+// Re-request EIP-6963 announcements and wait briefly for a MetaMask/Brave candidate to arrive.
+// `installEip6963Discovery` only ever fires once at module load, so a wallet extension that
+// injects/announces slowly (or right after that first request) would otherwise never be seen
+// before `selectMetaMaskCompatibleProvider` reads the (still-empty) `eip6963Providers` list and
+// fails closed. Resolves as soon as a candidate is seen, or after `timeoutMs`.
+function ensureEip6963Discovery(timeoutMs = 400) {
+  requestEip6963Providers();
+  if (eip6963Overflow || eip6963Providers.some((entry) => (
+    entry.rdns === METAMASK_RDNS || entry.rdns === BRAVE_RDNS
+  ))) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      const haveCandidate = eip6963Overflow || eip6963Providers.some((entry) => (
+        entry.rdns === METAMASK_RDNS || entry.rdns === BRAVE_RDNS
+      ));
+      if (haveCandidate || Date.now() - start >= timeoutMs) {
+        resolve();
+        return;
+      }
+      window.setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
+
+async function selectMetaMaskCompatibleProvider() {
+  await ensureEip6963Discovery();
   requestEip6963Providers();
   if (eip6963Overflow) {
     throw new Error("Injected wallet provider discovery is ambiguous.");
@@ -173,7 +202,7 @@ async function performConnectorEffect(connectorId, connectorToken, action) {
 }
 
 async function linkEvmWallet(connectorToken) {
-  const provider = selectMetaMaskCompatibleProvider();
+  const provider = await selectMetaMaskCompatibleProvider();
   const accounts = await provider.request({ method: "eth_requestAccounts" });
   const address = requireEvmAddress(firstProviderAccount(accounts));
   const chainId = requireEvmChainId(await provider.request({ method: "eth_chainId" }));
@@ -231,7 +260,7 @@ async function linkBitcoinWallet(connectorToken) {
 
 async function completeApproval(connectorId, connectorToken, approvalRequestId) {
   const provider = connectorId === METAMASK_CONNECTOR_ID
-    ? selectMetaMaskCompatibleProvider()
+    ? await selectMetaMaskCompatibleProvider()
     : requireUniSatProvider();
   const encodedRequestId = encodeURIComponent(approvalRequestId);
   const response = await runtimePost(

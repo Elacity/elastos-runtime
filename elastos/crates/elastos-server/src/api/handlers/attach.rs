@@ -58,9 +58,20 @@ pub async fn attach(
         _ => SessionType::Capsule,
     };
 
+    // G-ID: attached host clients get an HONEST caller identity, not None. The attach
+    // secret is owner-only (chmod 600), so the caller IS the host user; "host-client" /
+    // "host-shell" records that truthfully. Without it, every downstream fail-closed
+    // identity gate correctly refuses the session — capability grants 403 ("no requester
+    // capsule identity") and token redemption is denied ("session has no capsule
+    // identity") — which silently bricked the managed-home attach flow (`elastos home`).
+    let host_identity = match session_type {
+        SessionType::Shell => "host-shell",
+        _ => "host-client",
+    };
+
     let session = state
         .session_registry
-        .create_session(session_type, None)
+        .create_session(session_type, Some(host_identity.to_string()))
         .await;
 
     (
@@ -131,6 +142,53 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_type"], "shell");
+    }
+
+    /// G-ID regression guard for the managed-home flow: attached sessions MUST carry an
+    /// honest host identity. With `vm_id: None`, capability intake records no requester
+    /// identity, the consent-broker's grant 403s fail-closed ("no requester capsule
+    /// identity"), and `elastos home` hangs at "Capability request still pending" — the
+    /// exact local-carrier-setup-smoke failure this pins.
+    #[tokio::test]
+    async fn attach_sessions_carry_host_identity_for_gid_grants() {
+        let registry = Arc::new(SessionRegistry::new(Arc::new(AuditLog::new())));
+        let state = AttachState {
+            session_registry: registry.clone(),
+            secret: "secret".to_string(),
+        };
+        let app = Router::new()
+            .route("/api/auth/attach", post(attach))
+            .with_state(state);
+
+        for (scope, expected_identity) in [("client", "host-client"), ("shell", "host-shell")] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/auth/attach")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"secret":"secret","scope":"{scope}"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let token = json["token"].as_str().unwrap();
+            let session = registry
+                .validate_token(token)
+                .await
+                .expect("attached session resolves");
+            assert_eq!(
+                session.vm_id.as_deref(),
+                Some(expected_identity),
+                "attached {scope} session must carry an honest host identity for G-ID grants"
+            );
+        }
     }
 
     #[tokio::test]

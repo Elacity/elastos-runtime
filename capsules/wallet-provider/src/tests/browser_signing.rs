@@ -142,6 +142,126 @@ fn browser_personal_sign_is_a_typed_approval_request() {
     };
 }
 
+/// Regression for the ESP connector delegation-signing feature: a `ddrm_delegation_sign` approval
+/// (minted by `viewer_grant_sign::create_delegation_sign_request` in elastos-server) uses a
+/// DIFFERENT payload schema than `browser_personal_sign`
+/// (`elastos.viewer.delegation-sign-request/v1`, no `address`/`account_id`/`chain_namespace`/
+/// `page_url`/`origin` fields) but must still be EIP-191 `personal_sign`-verified against its exact
+/// `payload.message` and must end up with a readable `signed_result.signature`, mirroring
+/// `browser_personal_sign_is_a_typed_approval_request` above.
+#[test]
+fn ddrm_delegation_sign_round_trip_completes_with_a_readable_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut provider = init_provider(dir.path());
+    let principal_id = "person:local:alice";
+    let signing_key = SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+    let address = test_address(&signing_key);
+    let account_id = format!("wallet:eip155:20:{}", normalize_evm_address(&address));
+    let delegation_canonical = "delegation-canonical-text-for-content-kid";
+
+    assert!(matches!(
+        invoke_wallet(
+            &mut provider,
+            principal_id,
+            "wallet-metamask",
+            WalletProviderOperationV2::LinkVerifiedAccount {
+                proof_binding_id: format!("proof:eip155:20:{}", normalize_evm_address(&address)),
+                chain_namespace: "eip155:20".into(),
+                address: address.clone(),
+                proof_type: "siwe".into(),
+                label: None,
+            },
+        ),
+        Response::Ok { .. }
+    ));
+
+    let (request_id, payload_hash) = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "home",
+        WalletProviderOperationV2::RequestApproval {
+            account_id: account_id.clone(),
+            chain_namespace: "eip155:20".into(),
+            intent: "ddrm_delegation_sign".into(),
+            resource: "elastos://wallet/eip155:20/sign/ddrm_delegation_sign".into(),
+            reason: "Confirm the dDRM delegation signature for content 0xkid".into(),
+            payload: json!({
+                "schema": "elastos.viewer.delegation-sign-request/v1",
+                "method": "personal_sign",
+                "message": delegation_canonical,
+                "owner_address": address.clone(),
+                "kid": "0xkid",
+                "uri": "elastos://owned/asset-1",
+                "connector_id": "wallet-metamask",
+                "principal_id": principal_id,
+                "session_id": "session-1",
+                "requires_wallet_approval": true
+            }),
+            expires_at: now_ts().saturating_add(APPROVAL_REQUEST_TTL_SECS),
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["approval_request"]["intent"], "ddrm_delegation_sign");
+            assert_eq!(data["approval_request"]["status"], "pending");
+            (
+                data["approval_request"]["request_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                data["approval_request"]["payload_hash"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        }
+        other => panic!("expected ddrm delegation-sign approval request, got {other:?}"),
+    };
+
+    let handoff_message = match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet-metamask",
+        WalletProviderOperationV2::ApproveConnectorHandoff {
+            request_id: request_id.clone(),
+            reason: "Looks correct".into(),
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["approval_request"]["status"], "approved");
+            data["handoff"]["message"].as_str().unwrap().to_string()
+        }
+        other => panic!("expected ddrm delegation-sign handoff, got {other:?}"),
+    };
+    // The connector must be handed the EXACT delegation_canonical string to sign — not the generic
+    // `ElastOS Wallet Approval...` fallback message other unrecognized intents get.
+    assert_eq!(handoff_message, delegation_canonical);
+
+    let signature = sign_message(&signing_key, delegation_canonical);
+    match invoke_wallet(
+        &mut provider,
+        principal_id,
+        "wallet-metamask",
+        WalletProviderOperationV2::CompleteConnectorHandoff {
+            request_id,
+            payload_hash,
+            signature: Some(signature.clone()),
+            signature_type: Some("personal_sign".into()),
+            public_key: None,
+            signer: address.clone(),
+            transaction_hash: None,
+        },
+    ) {
+        Response::Ok { data: Some(data) } => {
+            assert_eq!(data["approval_request"]["status"], "completed");
+            assert_eq!(
+                data["approval_request"]["signed_result"]["signature"],
+                signature
+            );
+        }
+        other => panic!("expected ddrm delegation-sign signature completion, got {other:?}"),
+    };
+}
+
 #[test]
 fn managed_browser_personal_sign_decodes_hex_messages_like_injected_wallets() {
     let dir = tempfile::tempdir().unwrap();

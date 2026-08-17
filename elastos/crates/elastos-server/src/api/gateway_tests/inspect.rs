@@ -146,6 +146,7 @@ async fn inspect_test_state(dir: &std::path::Path) -> GatewayState {
     GatewayState {
         provider_registry: Some(registry),
         identity_manager: Arc::new(std::sync::OnceLock::new()),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.to_path_buf(),
         data_dir: dir.to_path_buf(),
     }

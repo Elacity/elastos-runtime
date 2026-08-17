@@ -8,8 +8,15 @@ provider authority.
 
 - `elastos://inspect/*` is the System-wide view.
 - `elastos://inspect/self` defines the pure SelfOnly scope rule.
-- Current product routing keeps `/api/provider/inspect/self` System-only.
-  Ordinary capsules do not yet have a caller-bound SelfOnly route.
+- Self scope is a live, fail-closed route. `/api/provider/inspect/self` is
+  served to the app/browser tier (`"self" => &[BROWSER_CAPSULE_ID]` in
+  `gateway_provider_proxy.rs`), not the System tier. It is caller-bound: the
+  gateway injects the authenticated `principal_id`,
+  any client-supplied `id` is ignored, and the provider routes through
+  `inspect::authorize_view` under
+  `InspectScope::SelfOnly`, so a capsule reads only its own record.
+- Every other inspect op (`capsules`, `capsule`, `plan`, `intent`, `discover`,
+  `request_act`) stays pinned to the System tier.
 - System can read facts, preview an operation, and request approval.
 - System cannot approve, dispatch, or revoke an Inspector action.
 

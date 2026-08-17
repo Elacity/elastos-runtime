@@ -669,6 +669,7 @@ mod tests {
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: data_dir.path().to_path_buf(),
             data_dir: data_dir.path().to_path_buf(),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
         };
         let response = capsule_contract_audit(State(state), HeaderMap::new()).await;
 
@@ -1363,6 +1364,7 @@ mod tests {
             identity_manager: Arc::new(std::sync::OnceLock::new()),
             cache_dir: data_dir.path().to_path_buf(),
             data_dir: data_dir.path().to_path_buf(),
+            audit_log: Arc::new(std::sync::OnceLock::new()),
         };
         let token = issue_home_launch_token(data_dir.path(), "marketplace").unwrap();
         let mut headers = HeaderMap::new();

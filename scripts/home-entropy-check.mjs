@@ -313,10 +313,20 @@ function assertCapabilityRequestStructsRejectUnknownFields() {
   );
 }
 
+// Markdown link syntax that appears INSIDE an inline-code span is documentation of the syntax,
+// not a link — `- [Title](FILE.md): description` describes a convention and has no target to
+// resolve. Blanking code spans (and fenced blocks) before scanning keeps the check honest without
+// weakening it: a real link is never written inside backticks.
+function withoutMarkdownCode(source) {
+  return source
+    .replace(/```[\s\S]*?```/g, (block) => block.replace(/[^\n]/g, " "))
+    .replace(/`[^`\n]*`/g, (span) => " ".repeat(span.length));
+}
+
 function assertMarkdownLocalLinksResolve() {
   const failures = [];
   for (const file of listMarkdownFiles()) {
-    const source = readFileSync(file, "utf8");
+    const source = withoutMarkdownCode(readFileSync(file, "utf8"));
     const relativeFile = file.slice(repoRootPath.length);
     for (const match of source.matchAll(/\[[^\]\n]+\]\(([^)]+)\)/g)) {
       let target = match[1].trim();
@@ -368,6 +378,9 @@ function assertUsersSelfReferencesAreApproved() {
     "elastos/crates/elastos-server/src/carrier_bridge.rs",
     "elastos/crates/elastos-server/src/notifications.rs",
     "elastos/crates/elastos-server/src/runtime_control.rs",
+    // Docs: explains the microVM fixture targets Public/, NOT Users/self (mentions the alias
+    // only to say why it is out of scope).
+    "capsules/act-emitter/README.md",
   ]);
   const files = [
     ...listTextFiles(resolve(repoRootPath, "capsules")),
@@ -917,6 +930,7 @@ const homeGuiJs = read("capsules/home-gui/browser/home-gui.js");
 const homeGuiCore = read("capsules/home-gui/browser/shell-core.js");
 const shellSurface = read("capsules/home-gui/browser/shell-surface.js");
 const shellJs = read("capsules/home/browser/home-shell-host.js");
+const homeSpendPrompt = read("capsules/home/browser/home-spend-prompt.js");
 const homeBrowserContext = read("capsules/home/browser/home-browser-context.js");
 const homeClipboardHost = read(
   "capsules/home/browser/home-clipboard-host.js",
@@ -1592,10 +1606,10 @@ const gbaOpaqueBrowserProof = read("scripts/fixtures/gba-opaque-frame-browser-pr
 const gbaOpaqueBrowserInput = read("scripts/fixtures/gba-opaque-frame-browser-proof/cdp-input.mjs");
 const gbaOpaqueBrowserServer = read("scripts/fixtures/gba-opaque-frame-browser-proof/server.py");
 const gbaProjectionSmoke = read("scripts/gba-projection-smoke.mjs");
-const homeAssetVersion = "home-20260725a";
-const homeClipboardAssetVersion = "home-20260726a";
-const homeGuiAssetVersion = "home-20260731b";
-const homeShellHostAssetVersion = "home-20260731b";
+const homeAssetVersion = "home-20260807a";
+const homeClipboardAssetVersion = "home-20260807a";
+const homeGuiAssetVersion = "home-20260807a";
+const homeShellHostAssetVersion = "home-20260807a";
 for (const [file, source] of [
   ["home-shell-auth-gate-smoke.mjs", homeShellAuthGateSmoke],
   ["home-shell-bridge-smoke.mjs", homeShellBridgeSmoke],
@@ -1875,6 +1889,52 @@ assert(
   shellIndex.includes(`home-shell-host.js?v=${homeShellHostAssetVersion}`),
   "Home entry module must cache-bust after shell browser changes",
 );
+// A node-signed money verb must be confirmed by the USER, in HOME's chrome, against the terms
+// that will actually be signed — and before the authenticator is ever prompted. The step-up
+// ceremony proves a human touched the authenticator; it names no terms, so on its own it cannot
+// tell the purchase the user saw from one a compromised frame substituted.
+const moneyVerbIntentConfirmation = {
+  // Home owns the dialog markup — it is in Home's own document, not built from frame input.
+  homeOwnedChrome:
+    shellIndex.includes('id="home-spend-prompt"') &&
+    shellIndex.includes('id="home-spend-terms"') &&
+    shellIndex.includes('id="home-spend-allow"') &&
+    shellIndex.includes('id="home-spend-cancel"'),
+  // Terms are written as text, never markup: a frame supplies strings, never DOM.
+  escapedTermsOnly:
+    homeSpendPrompt.includes("textContent") &&
+    !homeSpendPrompt.includes("innerHTML") &&
+    !homeSpendPrompt.includes("insertAdjacentHTML") &&
+    !homeSpendPrompt.includes("outerHTML"),
+  // Every key of the request is rendered. A field the display does not recognize is still signed,
+  // so hiding it would let a frame smuggle a term past the user.
+  rendersEveryRequestField:
+    homeSpendPrompt.includes("for (const key of Object.keys(source))") &&
+    homeSpendPrompt.includes("export function moneyVerbIntentRows"),
+  // Confirmation gates the ceremony, and only an explicit click resolves it.
+  gatesTheCeremony:
+    shellJs.includes("await homeSpendPrompt.confirm(operation, request)") &&
+    shellJs.indexOf("homeSpendPrompt.confirm(operation, request)") <
+      shellJs.indexOf("requestPasskeyStepUp(appToken, operation, request)") &&
+    homeSpendPrompt.includes('allowButton.addEventListener("click", () => settle(true))'),
+  // A decline is reported as a decline, not as a generic failure.
+  distinctRefusal:
+    homeSpendPrompt.includes("export const SPEND_DECLINED_MESSAGE") &&
+    shellJs.includes("throw new Error(SPEND_DECLINED_MESSAGE)"),
+  // One spend at a time: stacked dialogs are a click-through attack, so a second request while
+  // one is open is refused rather than queued.
+  noStackedPrompts: homeSpendPrompt.includes("if (active) {"),
+};
+assert(
+  Object.values(moneyVerbIntentConfirmation).every(Boolean),
+  "Money verbs must be confirmed against their real terms in Home-owned chrome before the passkey ceremony",
+  moneyVerbIntentConfirmation,
+);
+assert(
+  shellIndex.includes(`home-spend-prompt.js?v=`) === false &&
+    shellJs.includes(`./home-spend-prompt.js?v=${homeAssetVersion}`),
+  "Home spend prompt must load through the shell host on the current Home asset generation",
+);
 assert(
   shellIndex.includes(`style.css?v=${homeClipboardAssetVersion}`),
   "Home stylesheet must cache-bust after shell browser changes",
@@ -1986,10 +2046,10 @@ assert(
     homeClipboardHost.includes("MAX_HOME_CLIPBOARD_REPLAY_IDS = 64") &&
     homeClipboardHost.includes("HOME_CLIPBOARD_TIMEOUT_MS = 15_000") &&
     homeClipboardHost.includes(
-      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+      'from "./home-clipboard-protocol.js?v=home-20260807a"',
     ) &&
     homeClipboardClient.includes(
-      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+      'from "./home-clipboard-protocol.js?v=home-20260807a"',
     ) &&
     homeClipboardProtocol.includes(
       "MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES = 65_536",
@@ -5496,7 +5556,10 @@ assert(
     serverInfra.includes("InspectProvider::with_registry") &&
     serverInfra.includes('register_sub_provider("inspect"') &&
     gatewayProviderProxy.includes('"inspect" => match op.as_str()') &&
-    gatewayProviderProxy.includes('"capsules" | "capsule" | "self" | "plan" | "request_act" => &[SYSTEM_CAPSULE_ID]') &&
+    // Post-merge routing (deliberate): System-operator ops pin to SYSTEM; `self` is a
+    // separate browser-tier arm whose provider branch forces target = the caller.
+    /"capsules" \| "capsule" \| "plan" \| "intent" \| "discover" \| "request_act" => \{\s*&\[SYSTEM_CAPSULE_ID\]/.test(gatewayProviderProxy) &&
+    gatewayProviderProxy.includes('"self" => &[BROWSER_CAPSULE_ID]') &&
     gatewayProviderProxy.includes('if scheme == "inspect" && op == "request_act"') &&
     !gatewayProviderProxy.includes('"dispatch_approved" => &[SYSTEM_CAPSULE_ID]') &&
     !gatewayProviderProxy.includes('"revoke" => &[SYSTEM_CAPSULE_ID]') &&
@@ -5573,9 +5636,10 @@ assert(
     capsuleInspectorDocs.includes("System launch token can") &&
     capsuleInspectorDocs.includes("cannot call the Inbox action endpoint") &&
     capsuleInspectorDocs.includes("fresh same-principal passkey Home token") &&
-    capsuleInspectorDocs.includes("Current product routing keeps `/api/provider/inspect/self` System-only") &&
+    capsuleInspectorDocs.includes("Self scope is a live, fail-closed route") &&
+    capsuleInspectorDocs.includes("any client-supplied `id` is ignored") &&
     inspectorTestingDocs.includes("pure SelfOnly can view only self") &&
-    inspectorTestingDocs.includes("Do not treat the pure SelfOnly test as proof") &&
+    inspectorTestingDocs.includes("live, caller-bound app/browser-tier route") &&
     inspectorProvider.includes("signature_fingerprint") &&
     inspectorProvider.includes("signature_present") &&
     inspectorProvider.includes("elastos.inspect.trust-evidence/v1") &&
@@ -6234,7 +6298,7 @@ assert(
 );
 assert(
   libraryIndex.includes('rel="stylesheet" href="library.css"') &&
-  libraryIndex.includes('type="module" src="src/app.js?v=library-20260726a"') &&
+  libraryIndex.includes('type="module" src="src/app.js?v=library-20260807a"') &&
     !libraryIndex.includes("<style>") &&
     !libraryIndex.includes("function renderContent"),
   "Library index must stay a static shell with CSS and app code split out",
@@ -6242,7 +6306,7 @@ assert(
 assert(
   libraryApp.includes('from "./model.js"') &&
     libraryApp.includes('from "./actions.js?v=library-20260711d"') &&
-    libraryApp.includes('from "./api.js?v=library-20260711c"') &&
+    libraryApp.includes('from "./api.js?v=library-20260807a"') &&
     libraryApp.includes('from "./dialog.js?v=library-20260711d"') &&
     libraryApp.includes('from "./editor.js"') &&
     libraryApp.includes('from "./events.js"') &&
@@ -6250,7 +6314,7 @@ assert(
     libraryApp.includes('from "./navigation.js"') &&
     libraryApp.includes('from "./preview.js"') &&
     libraryApp.includes('from "./realtime.js"') &&
-    libraryApp.includes('from "./render.js?v=library-20260711d"') &&
+    libraryApp.includes('from "./render.js?v=library-20260807a"') &&
     libraryApp.includes('from "./selection.js"') &&
     libraryApp.includes('from "./state.js"') &&
     libraryApp.includes('from "./uploads.js"') &&

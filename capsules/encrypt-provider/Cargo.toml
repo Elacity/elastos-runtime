@@ -1,0 +1,72 @@
+[package]
+name = "encrypt-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS protected-content encrypt/seal provider capsule (invariant #1: in-boundary CEK+KID)"
+license = "MIT"
+
+[[bin]]
+name = "encrypt-provider"
+path = "src/main.rs"
+
+# NOTE (Day 39): reconciled to `elastos-common` (Day 16's self-containment retired).
+# The capsule was kept self-contained while Anders redid 0.4.0; the contract has
+# since been byte-identical for many days and `ddrm-drift-check.sh` pins the full
+# consumed surface, so the duplication was a rebase liability, not a safeguard. The
+# sealed OUTPUT is now the shared `SealedObjectV1`/`KeyEnvelopeV1`; only the encrypt
+# INPUT (`SealRequest`) stays local — there is no shared seal-request type yet
+# (tracked in DDRM_ENCRYPT_INVARIANT.md).
+[dependencies]
+elastos-common = { path = "../../elastos/crates/elastos-common" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+zeroize = "1"
+# Shared, container-agnostic AES-128-CTR CENC cipher primitive (IV pad + CTR xor),
+# reused so encrypt-provider's keystream stays byte-identical to decrypt-provider's.
+cenc-core = { path = "../cenc-core" }
+# CSPRNG for in-boundary CEK + KID minting. getrandom resolves to the WASI
+# `random_get` source on wasm32-wasip1, so keygen happens inside the sandbox.
+getrandom = "0.2"
+# PQ-hybrid CEK-seal/unwrap + the shared escrow AAD encoder. Optional — only pulled
+# in by the `escrow` feature so the default build stays minimal and fail-closed.
+ddrm-envelope = { path = "../ddrm-envelope", optional = true }
+# The single canonical fMP4 CENC fragment encryptor (PRINCIPLE #10) — reused so the
+# multi-segment media seal produces segments the decrypt rail already opens. Pure box
+# surgery; pulled in only by `escrow`. (We use only `mp4::{split_fragmented,encrypt_fragment}`.)
+ddrm-media = { path = "../ddrm-media", optional = true }
+# sha2-256 for content-addressing the ciphertext: the producer derives the IPFS
+# CIDv1 (raw codec) of the sealed segment in-boundary, exactly as PC2's Helia
+# `unixfs.addBytes` does (rawLeaves, 1 MiB chunk). Pure + wasm-clean; no network.
+sha2 = "0.10"
+
+[dev-dependencies]
+# Independent reference AES-128-CTR cipher used ONLY by src/cenc.rs's
+# `#[cfg(test)]` round-trip tests, instantiated directly (not via `cenc_core`)
+# so those tests prove the keystream against a separately-built cipher rather
+# than only self-consistency. Production content encryption now goes through
+# `cenc-core` (see the `cenc-core` dependency above); it is the sole in-boundary
+# CENC cipher.
+aes = "0.8"
+ctr = "0.9"
+
+[features]
+# gen-vectors: emit the encrypt->decrypt round-trip golden produced by THIS
+# provider's real in-boundary engine (mint CEK+KID -> CENC encrypt -> mux), into
+# decrypt-provider/tests/vectors/ for the consumer to replay. OFF by default.
+# Run: `cargo test --features gen-vectors emit_roundtrip`.
+gen-vectors = []
+# escrow (Phase C, Day 59): fill the CEK-escrow seam with the REAL PQ-hybrid seal —
+# the producer seals a freshly-minted CEK to the key authority's published recipient
+# key via ddrm-envelope, under the shared escrow AAD. OFF by default -> `seal` and the
+# escrow seam stay fail-closed (`not_configured`).
+# `ddrm-envelope/av-variants` adds the forensic variant manifest + bias-committed codeword so the
+# media seal can OPT-IN to emitting per-segment {A,B} variants + `av-variants.json` (AV chunk 3 mint
+# emit). Inert unless the request sets `av_variants` AND the boundary env carries the bias master.
+escrow = ["dep:ddrm-envelope", "dep:ddrm-media", "ddrm-envelope/av-variants"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

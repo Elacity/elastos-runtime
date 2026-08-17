@@ -1,0 +1,33 @@
+[package]
+name = "ddrm-producer-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Dev-only orchestrator (NOT a capsule, never shipped): drives the REAL encrypt-,
+# key- and decrypt-provider binaries over their stdin/stdout JSON protocol to prove the
+# PRODUCER half of the dDRM chain runs end to end — a CEK minted NOW is escrowed,
+# recovered, re-sealed and used to decrypt content sealed NOW, with no raw CEK on any
+# wire and no golden. See scripts/ddrm-producer-smoke.sh.
+
+[[bin]]
+name = "ddrm-producer-smoke"
+path = "src/main.rs"
+
+[dependencies]
+# The SAME shared transcript encoder all rail sides bind: the orchestrator computes the
+# canonical AAD the key authority seals to and the decrypt boundary rebuilds. No private
+# re-implementation -> no drift.
+ddrm-envelope = { path = "../../../capsules/ddrm-envelope" }
+serde_json = "1.0"
+base64 = "0.22"
+# Independent CID oracle: the canonical IPLD `cid` crate (+ sha2) recomputes the
+# ciphertext's CIDv1 via a DIFFERENT encoding path than encrypt-provider's hand-rolled
+# one, so the cross-binary smoke proves the producer's payload_cid against the
+# ecosystem-standard library, not against a copy of its own code.
+cid = "0.11"
+sha2 = "0.10"
+# The SHARED chain contract: the smoke deserializes the production `seal` output into the
+# real `SealedObjectV1` and runs the SAME algorithm validator the downstream key-provider
+# runs — proving cross-binary that the producer emits an object the chain accepts.
+elastos-common = { path = "../../../elastos/crates/elastos-common" }

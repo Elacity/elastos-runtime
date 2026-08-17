@@ -68,6 +68,21 @@ pub(super) async fn home_launch(
             )
         })?;
 
+    // PROOF (token delivery): log the route this launch hands the shell, with the token VALUE
+    // masked but its PRESENCE and location (fragment vs query) preserved — so we can prove whether
+    // `#home_token=` is actually attached for this target, without leaking the capability.
+    let masked_route = match route.split_once("home_token=") {
+        Some((head, tok)) => {
+            let end = tok.find(['&', '#']).unwrap_or(tok.len());
+            format!("{head}home_token=<{} chars>{}", end, &tok[end..])
+        }
+        None => format!("{route}  (NO home_token in route!)"),
+    };
+    tracing::info!(
+        "home_launch: target={} route={masked_route}",
+        target_summary.target
+    );
+
     Ok(Json(HomeLaunchResponse {
         target: target_summary.target,
         title: target_summary.title,
@@ -564,6 +579,7 @@ fn system_runtime_event_summary(
         | AuditEvent::CapabilityRevoke { timestamp, .. }
         | AuditEvent::CapabilityUse { timestamp, .. }
         | AuditEvent::ContentFetch { timestamp, .. }
+        | AuditEvent::ContentOpen { timestamp, .. }
         | AuditEvent::AuthAttempt { timestamp, .. }
         | AuditEvent::EpochAdvance { timestamp, .. }
         | AuditEvent::ConfigChange { timestamp, .. }
@@ -572,6 +588,13 @@ fn system_runtime_event_summary(
         | AuditEvent::SessionDestroyed { timestamp, .. }
         | AuditEvent::CapabilityRequested { timestamp, .. }
         | AuditEvent::CapabilityDenied { timestamp, .. }
+        | AuditEvent::CapabilityApproved { timestamp, .. }
+        | AuditEvent::SpendDebit { timestamp, .. }
+        | AuditEvent::BudgetExhausted { timestamp, .. }
+        | AuditEvent::EgressDenied { timestamp, .. }
+        | AuditEvent::IntentDeclared { timestamp, .. }
+        | AuditEvent::IntentDenied { timestamp, .. }
+        | AuditEvent::IntentReconciled { timestamp, .. }
         | AuditEvent::IdentityRegistered { timestamp, .. }
         | AuditEvent::StorageAccess { timestamp, .. }
         | AuditEvent::MessageSent { timestamp, .. }
@@ -610,6 +633,11 @@ fn system_runtime_event_summary(
             }
             format!("Content fetch failed — {cid}")
         }
+        AuditEvent::ContentOpen {
+            content_id,
+            decision,
+            ..
+        } => format!("Content {decision} — {content_id}"),
         AuditEvent::AuthAttempt {
             identity,
             success,
@@ -634,6 +662,45 @@ fn system_runtime_event_summary(
         AuditEvent::SessionDestroyed { .. } => return None,
         AuditEvent::CapabilityRequested { .. } => return None,
         AuditEvent::CapabilityDenied { reason, .. } => format!("Capability denied — {reason}"),
+        AuditEvent::CapabilityApproved {
+            action, resource, ..
+        } => format!("Capability approved — {action} {resource}"),
+        // Per-act debits are too frequent for the ribbon; an EXHAUSTION (a refused act) is notable.
+        AuditEvent::SpendDebit { .. } => return None,
+        AuditEvent::BudgetExhausted {
+            capsule_id,
+            operation,
+            ..
+        } => format!("Spend budget exhausted — {capsule_id} ({operation})"),
+        // A contained egress attempt is a notable custody moment for the ribbon.
+        AuditEvent::EgressDenied {
+            capsule_id, dest, ..
+        } => format!("Egress blocked — {capsule_id} → {dest}"),
+        // The routine "before" of every act (intent-proof loop) — too frequent for the ribbon.
+        AuditEvent::IntentDeclared { .. } => return None,
+        // A refused act (intent ⊄ envelope) is a notable containment moment.
+        AuditEvent::IntentDenied {
+            capsule_id,
+            method_id,
+            reason,
+            ..
+        } => format!("Intent denied — {capsule_id} {method_id} ({reason})"),
+        // Only a DIVERGED / UNDELIVERED verdict is notable; a clean match is routine.
+        AuditEvent::IntentReconciled {
+            capsule_id,
+            status,
+            divergence_detail,
+            ..
+        } => {
+            if status == "matched" {
+                return None;
+            }
+            if divergence_detail.is_empty() {
+                format!("Intent {status} — {capsule_id}")
+            } else {
+                format!("Intent {status} — {capsule_id} ({divergence_detail})")
+            }
+        }
         AuditEvent::IdentityRegistered {
             user_id, method, ..
         } => format!("Registered identity {user_id} via {method}"),
@@ -734,6 +801,8 @@ fn app_shell_title(name: &str) -> String {
         "archive-manager" => "Archive".to_string(),
         "home-cli" => "Home CLI".to_string(),
         "gba-emulator" => "GBA Emulator".to_string(),
+        "elacity-player" => "Owned Video".to_string(),
+        "ddrm-viewer" => "Owned Asset".to_string(),
         _ if is_wallet_connector_capsule_id(name) => wallet_connector_label(name).to_string(),
         _ => title_case_capsule_name(name),
     }
@@ -763,6 +832,14 @@ fn app_shell_description(name: &str, manifest_description: Option<String>) -> St
             wallet_connector_label(name)
         ),
         "gba-emulator" => "Play GBA games from Library.".to_string(),
+        "elacity-player" => {
+            "Play an owned, protected video end-to-end through the local dDRM decrypt boundary."
+                .to_string()
+        }
+        "ddrm-viewer" => {
+            "Open an owned, protected asset (image, document, 3D) through the local dDRM decrypt boundary."
+                .to_string()
+        }
         _ => manifest_description
             .unwrap_or_else(|| format!("Open {} from Home.", app_shell_title(name))),
     }

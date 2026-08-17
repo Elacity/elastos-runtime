@@ -2308,4 +2308,47 @@ mod tests {
         assert!(manifest.provides.is_some());
         assert!(manifest.validate().is_ok());
     }
+
+    #[test]
+    fn first_party_capsules_declare_typed_affordances() {
+        // The set of shipped capsules that expose a typed tool surface to the agent.
+        // Each must parse, validate, and declare at least one affordance
+        // (interfaces[].methods[]). Add a capsule here as it gains an interfaces[]
+        // block; the test fails closed if a listed capsule regresses to
+        // affordances:[] or breaks its manifest contract. (The capsule-inspector's
+        // own affordance contract is pinned on the Flint branch, where that capsule
+        // ships. `chat-wasm` shipped its own capsule.json on an earlier line of this
+        // branch's history, but ESP main's "remove redundant WASI app shims" cleanup
+        // (b2fea63d) deleted the capsule entirely — dropped from this registry to
+        // match, same as capsule-inspector above.)
+        const EXPECTED: &[&str] = &[
+            "documents",
+            "library",
+            "inbox",
+            "chat",
+            "archive-manager",
+            "gba-emulator",
+            "system",
+            "chat-room",
+        ];
+        for capsule in EXPECTED {
+            let path = format!(
+                "{}/../../../capsules/{}/capsule.json",
+                env!("CARGO_MANIFEST_DIR"),
+                capsule
+            );
+            let data = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {capsule} manifest at {path}: {e}"));
+            let manifest: CapsuleManifest = serde_json::from_str(&data)
+                .unwrap_or_else(|e| panic!("{capsule} manifest parses: {e}"));
+            manifest
+                .validate()
+                .unwrap_or_else(|e| panic!("{capsule} manifest validates: {e}"));
+            let method_count: usize = manifest.interfaces.iter().map(|i| i.methods.len()).sum();
+            assert!(
+                method_count > 0,
+                "{capsule} must declare at least one typed affordance (interfaces[].methods[])"
+            );
+        }
+    }
 }

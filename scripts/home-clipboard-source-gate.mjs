@@ -106,7 +106,7 @@ for (const [path, targetBinding] of Object.entries(canonicalClientImports)) {
   const source = readFileSync(join(repoRoot, path), "utf8");
   assert(
     source.includes(
-      'from "/apps/home/home-clipboard-client.js?v=home-20260726a"',
+      'from "/apps/home/home-clipboard-client.js?v=home-20260807a"',
     ) &&
       source.includes("createHomeClipboardClient({") &&
       source.includes(targetBinding) &&
@@ -138,10 +138,10 @@ assert(
     protocolSource.includes('"resource.identifier"') &&
     protocolSource.includes('"resource.uri"') &&
     hostSource.includes(
-      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+      'from "./home-clipboard-protocol.js?v=home-20260807a"',
     ) &&
     clientSource.includes(
-      'from "./home-clipboard-protocol.js?v=home-20260726a"',
+      'from "./home-clipboard-protocol.js?v=home-20260807a"',
     ) &&
     hostSource.includes("context.targetId") &&
     !hostSource.includes("data.targetId"),

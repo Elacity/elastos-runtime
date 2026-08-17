@@ -1,0 +1,32 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "encrypt-provider",
+  "version": "0.1.0",
+  "description": "Runtime protected-content encrypt/seal boundary: generates CEK+KID in-boundary and emits only ciphertext + non-secret relatives",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://encrypt/*",
+  "authority": {
+    "reason": "Owns content-encryption-key generation and sealing for protected content. The raw CEK and the plaintext asset are generated and consumed entirely inside this boundary; callers receive only ciphertext, KID, IV, and a wrapped (sealed) CEK. No app capsule ever receives a raw CEK, the plaintext asset, KMS credentials, chain RPC, or wallet RPC.",
+    "capabilities": [
+      {
+        "resource": "elastos://encrypt/*",
+        "actions": ["read"],
+        "operations": ["status"]
+      },
+      {
+        "resource": "elastos://encrypt/*",
+        "actions": ["write"],
+        "operations": ["seal"]
+      }
+    ],
+    "audit_events": ["encrypt.status", "encrypt.seal.denied"]
+  },
+  "resources": {
+    "memory_mb": 128,
+    "gpu": false
+  },
+  "permissions": {}
+}

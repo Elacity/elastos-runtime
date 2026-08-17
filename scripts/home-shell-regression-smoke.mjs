@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const moduleVersion = "home-20260725a";
+const moduleVersion = "home-20260807a";
 const savedStatePatches = [];
 const requests = [];
 const windowEventListeners = new Map();

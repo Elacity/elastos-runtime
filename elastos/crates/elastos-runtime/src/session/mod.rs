@@ -145,6 +145,19 @@ impl Session {
         self.session_type == SessionType::Shell
     }
 
+    /// Whether this session is the **consent broker** — the trusted authority
+    /// permitted to grant/deny capability consent on the user's behalf.
+    ///
+    /// This is the consent decision-engine predicate, named distinctly from the
+    /// capsule role it currently maps to. Today the Shell-role session fills this
+    /// role (the grant root IS the trusted shell — see `docs/KNOWN_GAPS.md` G-CIE),
+    /// so this delegates to [`Session::is_shell`]. The seam exists so the consent
+    /// trust boundary reads in consent vocabulary at its enforcement points, and
+    /// so a future dedicated consent-broker tier changes only this one bridge.
+    pub fn is_consent_broker(&self) -> bool {
+        self.is_shell()
+    }
+
     /// Update last activity timestamp
     pub fn touch(&mut self) {
         self.last_active = SecureTimestamp::now();
@@ -168,6 +181,20 @@ mod tests {
         let session = Session::new_shell("vm-123".to_string());
         assert!(session.is_shell());
         assert_eq!(session.vm_id, Some("vm-123".to_string()));
+    }
+
+    #[test]
+    fn consent_broker_is_the_shell_role_today() {
+        // The consent-broker predicate names the consent decision-engine at its
+        // seam; today it maps exactly onto the Shell-role session. A capsule
+        // session is NOT a consent broker (fail-closed by construction).
+        let broker = Session::new_shell("vm-shell".to_string());
+        assert!(broker.is_consent_broker());
+        assert_eq!(broker.is_consent_broker(), broker.is_shell());
+
+        let capsule = Session::new_capsule("vm-app".to_string());
+        assert!(!capsule.is_consent_broker());
+        assert_eq!(capsule.is_consent_broker(), capsule.is_shell());
     }
 
     #[test]

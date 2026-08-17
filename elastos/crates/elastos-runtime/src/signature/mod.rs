@@ -2,4 +2,6 @@
 
 mod verifier;
 
-pub use verifier::{generate_keypair, hash_content, sign_capsule, SignatureVerifier, SigningKey};
+pub use verifier::{
+    generate_keypair, hash_content, key_fingerprint, sign_capsule, SignatureVerifier, SigningKey,
+};

@@ -1590,7 +1590,7 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        self.refresh_shell_summary().await?;
         Ok(())
     }
 
@@ -1603,7 +1603,7 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        self.refresh_shell_summary().await?;
         Ok(())
     }
 
@@ -1616,7 +1616,7 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        self.refresh_shell_summary().await?;
         Ok(())
     }
 
@@ -1651,7 +1651,7 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        self.refresh_shell_summary().await?;
         Ok(())
     }
 
@@ -1731,7 +1731,7 @@ impl App {
         )
         .await?;
         self.node_did_input.set_value("");
-        let _ = self.refresh_shell_summary().await?;
+        self.refresh_shell_summary().await?;
         Ok(())
     }
 
@@ -1745,7 +1745,7 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        self.refresh_shell_summary().await?;
         Ok(())
     }
 
@@ -1759,7 +1759,7 @@ impl App {
             &self.home_token_headers(),
         )
         .await?;
-        let _ = self.refresh_shell_summary().await?;
+        self.refresh_shell_summary().await?;
         Ok(())
     }
 

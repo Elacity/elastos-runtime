@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Marketplace — ElastOS</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Top nav -->
+  <header class="nav">
+    <div class="wrap row">
+      <div class="logo">elacity<b>·</b>market</div>
+      <label class="search">
+        <span class="kbd">⌘K</span>
+        <input id="search" type="search" placeholder="Search assets, creators, collections…" autocomplete="off">
+      </label>
+      <span class="spacer"></span>
+      <span class="pill" id="chain-pill" data-icon="link">Base</span>
+      <span class="pill" id="wallet-pill">◎ —</span>
+      <a class="pill" id="vault-pill" href="#/vault" data-icon="key">Vault</a>
+      <button class="glyph theme" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme"></button>
+    </div>
+  </header>
+
+  <div class="wrap shell">
+    <!-- Left rail -->
+    <nav class="rail" id="rail">
+      <a href="#/discover" data-route="discover" class="active" aria-current="page" data-icon="compass">Discover</a>
+      <a href="#/vault" data-route="vault" data-icon="key">Vault</a>
+      <a href="#/activity" data-route="activity" data-icon="bell">Activity</a>
+      <div class="lbl">Type</div>
+      <div class="facets" id="medium-facets">
+        <button data-kind="video" data-icon="tv">Video</button>
+        <button data-kind="audio" data-icon="headphones">Audio</button>
+        <button data-kind="image" data-icon="image">Images</button>
+        <button data-kind="document" data-icon="book">Documents</button>
+        <button data-kind="ebook" data-icon="bookOpen">e-books</button>
+        <button data-kind="comic" data-icon="book">Comics</button>
+        <button data-kind="3d" data-icon="layers">3D</button>
+        <button data-kind="article" data-icon="fileText">Articles</button>
+        <button data-kind="other" data-icon="box">Other</button>
+      </div>
+      <div class="lbl">Rights</div>
+      <div class="facets" id="op-facets">
+        <button data-op="free" data-icon="unlock">Free to open</button>
+        <button data-op="buy_once" data-icon="cart">Buy once</button>
+        <button data-op="buy_and_resell" data-icon="recycle">Resellable</button>
+      </div>
+    </nav>
+
+    <!-- View outlet (no aria-live here — re-announcing the whole view on every render floods SR users;
+         status messages go through the dedicated #toast live region below) -->
+    <main id="view"></main>
+  </div>
+
+  <!-- Modal mount (buy / wallet-routing / secure-open) -->
+  <div id="modal-root"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+
+  <script src="mock.js"></script>
+  <script src="api.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

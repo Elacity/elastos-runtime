@@ -993,7 +993,11 @@ async fn test_browser_open_launches_engine_with_attached_stream_receipt() {
     let runtime_stream_path = browser_runtime_stream_socket_path(dir.path(), stream_id).unwrap();
     #[cfg(unix)]
     {
-        assert!(runtime_stream_path.starts_with("/tmp/elastos-browser-streams"));
+        // String prefix, not Path::starts_with: the socket dir is euid-scoped
+        // (`/tmp/elastos-browser-streams-<euid>`), which component-wise matching would reject.
+        assert!(runtime_stream_path
+            .to_string_lossy()
+            .starts_with("/tmp/elastos-browser-streams"));
         assert!(
             runtime_stream_path.to_string_lossy().len() < 100,
             "runtime stream socket path must fit conservative Unix sun_path budget: {}",
@@ -3089,6 +3093,7 @@ async fn browser_wallet_read_timeout_test_state(
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: cache_dir.to_path_buf(),
         data_dir: cache_dir.to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     }
 }
 
@@ -3163,7 +3168,11 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
     let app =
         gateway_router(browser_wallet_read_timeout_test_state(dir.path(), wallet, chain).await);
 
-    let started = std::time::Instant::now();
+    // Virtual-clock elapsed (the callers run `start_paused`): proves the route gave up at
+    // its own read timeout instead of waiting out the delayed provider. A real-clock bound
+    // here would flake under full-suite CPU load, where compile/test contention can stretch
+    // wall time past any fixed budget.
+    let started = tokio::time::Instant::now();
     let (first_status, first_body) = browser_eth_call(app.clone(), &browser_token, address).await;
     assert_eq!(first_status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(first_body, "Browser wallet read timed out");
@@ -3182,13 +3191,29 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
         "the second read waited for the first provider result"
     );
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !late_result_observed.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::task::yield_now().await;
+    // Let the discarded late provider result resolve in the background, proving
+    // the timeout only discarded (not cancelled) the first provider's work. The
+    // callers run this under a paused virtual clock (`start_paused`), which makes
+    // the 100ms read timeout deterministically beat the 250ms delayed provider
+    // for the assertions above -- no real-clock race between the second read
+    // completing and the delayed task firing. The flip side is that the delayed
+    // provider's 250ms timer only fires once virtual time is advanced past it; a
+    // bare yield loop would keep the runtime busy and deny the paused clock that
+    // advance, so drive it explicitly and then settle under a bounded cap that
+    // fails loudly if the discarded result never lands.
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    let mut late_observed = false;
+    for _ in 0..1_000_000 {
+        if late_result_observed.load(std::sync::atomic::Ordering::SeqCst) {
+            late_observed = true;
+            break;
         }
-    })
-    .await
-    .unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        late_observed,
+        "the discarded late provider result must still resolve in the background"
+    );
 
     let auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
     let events = auth_state
@@ -3208,12 +3233,12 @@ async fn verify_browser_wallet_read_timeout_boundary(delay_wallet_refresh: bool)
     assert_ne!(events[0].challenge_id, events[2].challenge_id);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_browser_wallet_read_timeout_does_not_poison_wallet_refresh() {
     verify_browser_wallet_read_timeout_boundary(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_browser_wallet_read_timeout_does_not_poison_chain_dispatch() {
     verify_browser_wallet_read_timeout_boundary(false).await;
 }
@@ -5188,6 +5213,40 @@ async fn test_browser_no_first_frame_cleanup_retries_exact_effect_without_replac
     assert_eq!(status.status(), StatusCode::NOT_FOUND);
 }
 
+/// Replace the live `browser-engine` sub-provider in a test registry.
+///
+/// `browser-engine` is pinned FIRST-WRITER-WINS (a launched capsule must not be able to seize the
+/// engine route from the boot provider), so a straight re-registration is refused. A test that
+/// deliberately models a provider swap has to do what a real teardown→restart does: hand the
+/// incumbent binding back, then bind the replacement. Asserting both halves here keeps the pin
+/// itself covered from the caller's side.
+async fn swap_browser_engine_provider(
+    registry: &Arc<elastos_runtime::provider::ProviderRegistry>,
+    replacement: Arc<dyn elastos_runtime::provider::Provider>,
+) {
+    let incumbent = registry
+        .get_sub_provider("browser-engine")
+        .await
+        .expect("a browser-engine provider is bound");
+    assert!(
+        registry
+            .register_sub_provider("browser-engine", replacement.clone())
+            .await
+            .is_err(),
+        "the pinned browser-engine slot must refuse an overwrite of a live binding",
+    );
+    assert!(
+        registry
+            .unregister_sub_provider("browser-engine", &incumbent)
+            .await,
+        "the incumbent must be able to hand its own binding back",
+    );
+    registry
+        .register_sub_provider("browser-engine", replacement)
+        .await
+        .expect("the freed slot accepts the replacement");
+}
+
 #[tokio::test]
 async fn test_browser_pending_cleanup_rejects_foreign_authority_and_effect_substitution() {
     let dir = tempfile::tempdir().unwrap();
@@ -5291,15 +5350,17 @@ async fn test_browser_pending_cleanup_rejects_foreign_authority_and_effect_subst
     assert_eq!(close_calls.lock().await.len(), 1);
 
     let foreign_provider_close_calls = Arc::new(TokioMutex::new(Vec::new()));
-    registry
-        .register_sub_provider(
-            "browser-engine",
-            Arc::new(MockForeignIdentityBrowserEngineProvider {
-                close_calls: foreign_provider_close_calls.clone(),
-            }),
-        )
-        .await
-        .unwrap();
+    // `browser-engine` is pinned first-writer-wins, so swapping the provider under a live runtime
+    // means handing the incumbent binding back first. That refusal is a second, independent line
+    // of defence for what this test asserts — but the point here is the runtime-level rejection,
+    // so tear down explicitly to put the foreign provider genuinely in place.
+    swap_browser_engine_provider(
+        &registry,
+        Arc::new(MockForeignIdentityBrowserEngineProvider {
+            close_calls: foreign_provider_close_calls.clone(),
+        }),
+    )
+    .await;
     let substituted_provider = app
         .clone()
         .oneshot(
@@ -5322,17 +5383,15 @@ async fn test_browser_pending_cleanup_rejects_foreign_authority_and_effect_subst
     assert_eq!(browser_engine_cleanup_obligation_count(dir.path()).await, 1);
 
     let restored_close_calls = Arc::new(TokioMutex::new(Vec::new()));
-    registry
-        .register_sub_provider(
-            "browser-engine",
-            Arc::new(MockRetryingBrowserEngineProvider::new(
-                restored_close_calls.clone(),
-                MockBrowserEngineCloseFailure::Transport,
-                0,
-            )),
-        )
-        .await
-        .unwrap();
+    swap_browser_engine_provider(
+        &registry,
+        Arc::new(MockRetryingBrowserEngineProvider::new(
+            restored_close_calls.clone(),
+            MockBrowserEngineCloseFailure::Transport,
+            0,
+        )),
+    )
+    .await;
     let terminal = app
         .oneshot(
             test_browser_request("localhost:61180", "null")
@@ -6620,6 +6679,7 @@ async fn test_browser_net_provider_fails_closed_without_adapter_provider() {
         identity_manager: Arc::new(std::sync::OnceLock::new()),
         cache_dir: dir.path().to_path_buf(),
         data_dir: dir.path().to_path_buf(),
+        audit_log: Arc::new(std::sync::OnceLock::new()),
     });
 
     let forbidden = app

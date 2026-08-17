@@ -121,6 +121,9 @@ pub enum ProviderError {
     NoProvider(String),
     /// IO error
     Io(std::io::Error),
+    /// The provider accepted the request but performed NO effect (BUG-4 discipline): a
+    /// single-use/consent token spent on it must be REFUNDED, not consumed. Carries a reason.
+    DidNotAct(String),
 }
 
 /// Provider-to-provider invocation transfer contract.
@@ -415,6 +418,7 @@ impl std::fmt::Display for ProviderError {
             ProviderError::Provider(msg) => write!(f, "provider error: {}", msg),
             ProviderError::NoProvider(scheme) => write!(f, "no provider for scheme: {}", scheme),
             ProviderError::Io(e) => write!(f, "IO error: {}", e),
+            ProviderError::DidNotAct(reason) => write!(f, "provider did not act: {}", reason),
         }
     }
 }
@@ -477,8 +481,124 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "inspect",
     "availability",
     "block-graph",
+    // dDRM producer spine (Create portal) — server_infra registers all three at boot; they MUST
+    // stay reserved or their `register_sub_provider` calls fail closed and the mint path goes dark.
+    // `encrypt` holds in-boundary CEK escrow + on-chain mint assembly; `publish` assembles the
+    // on-chain mint; `media` does ffmpeg transcode -> DASH fragmentation (PLAINTEXT segments, NO
+    // key material — CENC + escrow stay in `encrypt`).
+    "encrypt",
+    "publish",
+    "media",
+    // First-party capsule providers whose manifests declare `provides: elastos://<name>/*` and are
+    // registered at capsule launch (supervisor `register_provider_route`). A name missing here makes
+    // that route fail `register_sub_provider` (warn-swallowed) and the provider silently goes dark:
+    // `market` (content-market storefront) has no boot fallback; `object` (Library object authority)
+    // and `operator-drive-adapter` also register a boot main-provider but lose their VM sub-route.
+    "market",
+    "object",
+    "operator-drive-adapter",
+];
+
+/// Whether `name` is a reserved `elastos://` sub-provider scheme. The reserved set is the single
+/// source of truth for which sub-provider names the runtime may register; a boot- or launch-time
+/// registration of an unreserved name fails closed. Exposed so a conformance test can assert the
+/// invariant "every name the runtime registers is reserved" without booting.
+pub fn is_reserved_sub_name(name: &str) -> bool {
+    RESERVED_SUB_NAMES.contains(&name)
+}
+
+/// Security-critical sub-providers pinned FIRST-WRITER-WINS: once one of these is bound (at boot, by
+/// `server_infra`), a later `register_sub_provider` for the SAME name is refused rather than
+/// silently overwriting it (the map is otherwise last-write-wins). Without this, a launched capsule
+/// whose manifest declares e.g. `provides: elastos://encrypt/*` would seize the CEK-escrow /
+/// key / signing route from the trusted boot provider — ambient authority via registration order
+/// (Principle 3), and a break of the mediated key/decrypt plane (Principle 15). The escrow + keys +
+/// signing + mint spine. `unregister_sub_provider` frees the slot, so a genuine teardown→restart of
+/// the SAME provider re-mounts cleanly; only an overwrite of a still-live pinned slot is refused.
+///
+/// **The rule is "boot-bound", not "feels sensitive".** This list used to cover only the escrow /
+/// key / signing spine, which left every OTHER boot-registered sub-provider last-write-wins and so
+/// seizable from the launch path by any capsule shipping a matching `provides:` claim — `did`
+/// (identity resolution), `content` + `ipfs` + `block-graph` (content addressing and DAG repair),
+/// `net` + `exit` + `peer` (transport and egress), `browser-engine`, `inspect`, `ai` + `llama`,
+/// `availability`. None of those is less load-bearing than `chain`; they were simply not on the
+/// list. Anything `server_infra` binds at boot belongs here, and
+/// `every_boot_registered_sub_provider_is_pinned_or_carved_out` reads the boot source directly so
+/// a newly-added boot registration cannot quietly reopen the hole.
+const PINNED_SUB_NAMES: &[&str] = &[
+    // Escrow / keys / signing / mint spine.
+    "encrypt",
+    "publish",
+    "media",
+    "key",
+    "decrypt",
+    "drm",
+    "rights",
+    "wallet",
+    "chain",
+    // The rest of the boot-bound set — see BOOT_UNPINNED_SUB_NAMES, currently empty.
+    "did",
+    "content",
+    "inspect",
+    "browser-engine",
+    "ipfs",
+    "net",
+    "exit",
+    "ai",
+    "llama",
+    "block-graph",
+    "availability",
+    "peer",
     "object",
 ];
+
+/// Sub-provider names `server_infra` binds at boot that are deliberately NOT pinned. **Empty, and
+/// the bar for adding one is high.**
+///
+/// The escape hatch exists so that a name whose boot binding is genuinely meant to be replaced from
+/// the launch path can be declared rather than silently omitted — but "this capsule also ships as a
+/// microVM" is NOT such a case, and `object` was wrongly parked here on that reasoning. `object` is
+/// bound at boot by the same `find_installed_provider_binary` -> `ProviderBridge::spawn` ->
+/// `CapsuleProvider::with_scheme` shape as `did`, `encrypt`, `chain` and `ipfs`, every one of which
+/// is pinned; and pinning costs it nothing, because first-writer-wins is conditional on the slot
+/// being OCCUPIED. On a node where the object-provider binary is not installed, boot never binds
+/// and the launched capsule takes the slot exactly as before. The only case pinning changes is the
+/// one that matters: boot already bound it, and something else tries to take it.
+///
+/// `market` and `operator-drive-adapter` never needed an entry either: `market` is never
+/// boot-bound, and `operator-drive-adapter` is boot-bound as a MAIN scheme, so neither sub-name is
+/// occupied when the launch path arrives.
+///
+const BOOT_UNPINNED_SUB_NAMES: &[&str] = &[];
+
+/// Whether `name` is a boot-bound sub-provider deliberately left seizable. Exposed on the same
+/// terms as [`is_reserved_sub_name`] — so a conformance test can hold the carve-out set to exactly
+/// what is documented, without booting.
+pub fn is_boot_unpinned_sub_name(name: &str) -> bool {
+    BOOT_UNPINNED_SUB_NAMES.contains(&name)
+}
+
+/// Security-critical MAIN URI schemes pinned FIRST-WRITER-WINS, for the same reason as
+/// [`PINNED_SUB_NAMES`] and on the same terms (an explicit [`ProviderRegistry::unregister`]
+/// frees the slot). A capsule manifest's `provides:` claim can name a main scheme, not only an
+/// `elastos://` sub-route — `provides: "localhost://…"` binds through [`ProviderRegistry::register`],
+/// which was otherwise unconditional last-write-wins. `localhost` is the user's ENTIRE file plane
+/// (bound at boot by the localhost-provider capsule), so a launched capsule seizing it would put
+/// every other capsule's file I/O inside that capsule's VM — the broadest ambient-authority
+/// escalation the registry can hand out (Principle 3), and strictly worse than the sub-route case.
+///
+/// `webspace` is the delegation slot every `localhost://WebSpaces/...` request is routed to (see
+/// [`localhost_delegated_scheme`]) and is bound at boot by `server_infra`. It is pinned on the
+/// same reasoning one level down: seizing it does not take the whole file plane, but it does take
+/// every mounted WebSpace — each one a remote resolver handle — so a later binder would answer for
+/// content it does not own.
+const PINNED_SCHEMES: &[&str] = &["localhost", "webspace"];
+
+/// Whether `scheme` is a first-writer-wins main URI scheme. Exposed so a launch path can report
+/// a refused binding instead of assuming it succeeded.
+pub fn is_pinned_scheme(scheme: &str) -> bool {
+    PINNED_SCHEMES.contains(&scheme)
+}
 
 /// Registry of providers
 pub struct ProviderRegistry {
@@ -505,10 +625,34 @@ impl ProviderRegistry {
         *self.carrier_invoker.write().await = Some(invoker);
     }
 
-    /// Register a provider for its schemes
-    pub async fn register(&self, provider: Arc<dyn Provider>) {
+    /// Register a provider for its schemes.
+    ///
+    /// Returns `false` if ANY of the provider's schemes was refused because it is in
+    /// [`PINNED_SCHEMES`] and already bound (first-writer-wins — see the constant for why).
+    /// The unrefused schemes still bind, so a caller that must fail closed on a refusal is
+    /// expected to check the result; boot-time registrations of distinct schemes ignore it.
+    /// Deliberately NOT `#[must_use]`: the many trusted boot call sites bind one free scheme
+    /// and have nothing to decide.
+    pub async fn register(&self, provider: Arc<dyn Provider>) -> bool {
         let mut providers = self.providers.write().await;
+        let mut all_bound = true;
         for scheme in provider.schemes() {
+            // Checked under the write lock so it is race-free, exactly like the pinned
+            // sub-provider guard below.
+            if is_pinned_scheme(scheme) && providers.contains_key(scheme) {
+                all_bound = false;
+                tracing::warn!(
+                    "Refused to bind provider '{}' to pinned scheme '{}': already bound to '{}' \
+                     (unregister it first to rebind)",
+                    provider.name(),
+                    scheme,
+                    providers
+                        .get(scheme)
+                        .map(|p| p.name())
+                        .unwrap_or("<unknown>"),
+                );
+                continue;
+            }
             tracing::info!(
                 "Registered provider '{}' for scheme '{}'",
                 provider.name(),
@@ -516,17 +660,44 @@ impl ProviderRegistry {
             );
             providers.insert(scheme.to_string(), provider.clone());
         }
+        all_bound
     }
 
-    /// Unregister a provider
-    pub async fn unregister(&self, scheme: &str) {
+    /// Unregister a provider, but ONLY if `bound` is the provider currently occupying `scheme`.
+    ///
+    /// Teardown is identity-keyed, not name-keyed. Unpinned slots are last-write-wins, so between
+    /// capsule A binding a slot and A being reaped, capsule B may legitimately have taken it over.
+    /// A name-keyed removal would then have A's death evict B — a live capsule silently losing its
+    /// route to an unrelated teardown, and (worse) the reverse shape: seize a slot, exit, and take
+    /// the incumbent down with you. Compared by `Arc::ptr_eq` because provider identity is the
+    /// registered object; `name()` is a type-level label (every VM-backed route reports
+    /// `"vm-capsule-provider"`), so comparing names would treat any two capsule routes as the same
+    /// binding.
+    ///
+    /// Returns whether the binding was removed.
+    pub async fn unregister(&self, scheme: &str, bound: &Arc<dyn Provider>) -> bool {
         let mut providers = self.providers.write().await;
-        if let Some(provider) = providers.remove(scheme) {
-            tracing::info!(
-                "Unregistered provider '{}' for scheme '{}'",
-                provider.name(),
-                scheme
-            );
+        match providers.get(scheme) {
+            Some(current) if Arc::ptr_eq(current, bound) => {
+                providers.remove(scheme);
+                tracing::info!(
+                    "Unregistered provider '{}' for scheme '{}'",
+                    bound.name(),
+                    scheme
+                );
+                true
+            }
+            Some(current) => {
+                tracing::warn!(
+                    "Refused to unregister scheme '{}': it is now bound to '{}', not to the \
+                     '{}' binding being torn down",
+                    scheme,
+                    current.name(),
+                    bound.name(),
+                );
+                false
+            }
+            None => false,
         }
     }
 
@@ -546,9 +717,21 @@ impl ProviderRegistry {
         provider: Arc<dyn Provider>,
     ) -> Result<(), ProviderError> {
         let name = name.to_lowercase();
-        if !RESERVED_SUB_NAMES.contains(&name.as_str()) {
+        if !is_reserved_sub_name(&name) {
             return Err(ProviderError::Provider(format!(
                 "sub-provider '{}' is not a reserved name",
+                name
+            )));
+        }
+        let mut sub_providers = self.sub_providers.write().await;
+        // First-writer-wins for the security-critical spine: refuse to overwrite a still-live pinned
+        // slot (Principle 3 — no ambient authority via registration order). Checked under the write
+        // lock so it is race-free. A teardown (`unregister_sub_provider`) frees the slot first, so a
+        // genuine restart of the same provider re-mounts.
+        if PINNED_SUB_NAMES.contains(&name.as_str()) && sub_providers.contains_key(&name) {
+            return Err(ProviderError::Provider(format!(
+                "sub-provider '{}' is pinned and already bound; refusing to overwrite the \
+                 security-critical provider (unregister it first to rebind)",
                 name
             )));
         }
@@ -557,26 +740,46 @@ impl ProviderRegistry {
             provider.name(),
             name
         );
-        self.sub_providers.write().await.insert(name, provider);
+        sub_providers.insert(name, provider);
         Ok(())
     }
 
-    /// Unregister a sub-provider from `elastos://` hierarchical dispatch.
+    /// Unregister a sub-provider from `elastos://` hierarchical dispatch, but ONLY if `bound` is
+    /// the provider currently occupying `name`. See [`ProviderRegistry::unregister`] for why
+    /// teardown is identity-keyed.
     ///
-    /// No-op if the name is not currently registered.
-    pub async fn unregister_sub_provider(&self, name: &str) {
+    /// No-op if the name is not currently registered. Returns whether the binding was removed.
+    pub async fn unregister_sub_provider(&self, name: &str, bound: &Arc<dyn Provider>) -> bool {
         let key = name.to_lowercase();
-        if let Some(provider) = self.sub_providers.write().await.remove(&key) {
-            tracing::info!(
-                "Unregistered sub-provider '{}' for elastos://{}/...",
-                provider.name(),
-                key
-            );
+        let mut sub_providers = self.sub_providers.write().await;
+        match sub_providers.get(&key) {
+            Some(current) if Arc::ptr_eq(current, bound) => {
+                sub_providers.remove(&key);
+                tracing::info!(
+                    "Unregistered sub-provider '{}' for elastos://{}/...",
+                    bound.name(),
+                    key
+                );
+                true
+            }
+            Some(current) => {
+                tracing::warn!(
+                    "Refused to unregister sub-provider '{}': it is now bound to '{}', not to \
+                     the '{}' binding being torn down",
+                    key,
+                    current.name(),
+                    bound.name(),
+                );
+                false
+            }
+            None => false,
         }
     }
 
-    /// Get a sub-provider by name (case-insensitive).
-    async fn get_sub_provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
+    /// Get a sub-provider by name (case-insensitive). Public so a teardown caller can read back
+    /// the binding it must hand to [`ProviderRegistry::unregister_sub_provider`], mirroring
+    /// [`ProviderRegistry::get`] on the main-scheme side.
+    pub async fn get_sub_provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
         let key = name.to_lowercase();
         self.sub_providers.read().await.get(&key).cloned()
     }
@@ -949,11 +1152,30 @@ impl ProviderRegistry {
     }
 
     fn is_webspaces_localhost_path(path: &str) -> bool {
-        parse_localhost_uri(path)
-            .or_else(|| parse_localhost_path(path))
-            .map(|(root, _)| root == "WebSpaces")
-            .unwrap_or(false)
+        localhost_delegated_scheme(path).is_some()
     }
+}
+
+/// The main-provider slot a `localhost://` path is delegated to, if any.
+///
+/// `localhost` is one scheme but not one provider: the boot localhost-provider owns the file
+/// plane, while the `WebSpaces` root is a DYNAMIC namespace resolved by webspace-provider. The
+/// registry honours that split on every read path ([`ProviderRegistry::route_with_options`],
+/// [`ProviderRegistry::registration_for_uri`], [`ProviderRegistry::send_raw`]), dispatching
+/// `localhost://WebSpaces/...` to the provider bound under the `webspace` slot rather than to the
+/// `localhost` one.
+///
+/// This is the single source of truth for that split, so a *binding* path can agree with the
+/// routing path. It has to: a capsule manifest may only declare `provides:` under `elastos://` or
+/// `localhost://` (`elastos_common::manifest::is_allowed_uri_scheme`), so webspace-provider's
+/// honest namespace claim is `localhost://WebSpaces/*`. Read as a bare scheme that claim reads as
+/// "bind the entire localhost plane", which [`PINNED_SCHEMES`] rightly refuses — leaving the
+/// capsule launched but routeless. Resolved here instead: the claim binds the `webspace`
+/// delegation slot, which is exactly what the boot path binds (`server_infra`
+/// `CapsuleProvider::with_scheme(.., "webspace")`).
+pub fn localhost_delegated_scheme(path: &str) -> Option<&'static str> {
+    let (root, _) = parse_localhost_uri(path).or_else(|| parse_localhost_path(path))?;
+    (root == "WebSpaces").then_some("webspace")
 }
 
 fn validate_provider_transfer_contract(
@@ -2263,9 +2485,445 @@ mod tests {
             assert!(registry.get_sub_provider(name).await.is_some());
         }
 
-        // Unregister removes the route (case-insensitive)
-        registry.unregister_sub_provider("DiD").await;
+        // Unregister removes the route (case-insensitive), keyed on the bound provider.
+        let did = registry
+            .get_sub_provider("did")
+            .await
+            .expect("did is bound");
+        assert!(registry.unregister_sub_provider("DiD", &did).await);
         assert!(registry.get_sub_provider("did").await.is_none());
+    }
+
+    // Regression guard: server_infra registers the dDRM producer spine (encrypt/publish/media) at
+    // boot. If any is dropped from RESERVED_SUB_NAMES its registration fails closed (swallowed as a
+    // warn!) and the Create-portal mint path silently goes dark — a live-only capability loss that
+    // no other unit test exercises (provider wiring runs only on a real boot).
+    #[tokio::test]
+    async fn test_ddrm_producer_spine_sub_providers_are_reserved() {
+        let registry = ProviderRegistry::new();
+        for name in ["encrypt", "publish", "media"] {
+            registry
+                .register_sub_provider(name, Arc::new(MockProvider::new()))
+                .await
+                .unwrap_or_else(|e| panic!("dDRM producer-spine scheme '{name}' must be reserved so server_infra can register it at boot: {e}"));
+            assert!(registry.get_sub_provider(name).await.is_some());
+        }
+    }
+
+    // The general invariant behind the dDRM-spine guard above: EVERY first-party capsule that
+    // declares `provides: elastos://<sub>/*` is registered at capsule launch, so <sub> MUST be
+    // reserved or that route fails closed (warn-swallowed) and the provider silently goes dark.
+    // Scans the shipped manifests directly (no boot needed) so a newly-added provider capsule with
+    // an unreserved scheme reds this test instead of dying only in production. This is the test that
+    // would have caught market/object/operator-drive-adapter.
+    #[test]
+    fn test_all_capsule_provided_sub_schemes_are_reserved() {
+        let capsules_dir =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../capsules"));
+        let entries = std::fs::read_dir(capsules_dir).expect("capsules dir exists");
+        let mut checked = 0usize;
+        let mut unreserved: Vec<(String, String)> = Vec::new();
+        for entry in entries {
+            let dir = entry.expect("dir entry").path();
+            let manifest_path = dir.join("capsule.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&manifest_path).expect("read manifest");
+            let manifest: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some(provides) = manifest.get("provides").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(sub) = provides
+                .strip_prefix("elastos://")
+                .and_then(|rest| rest.split('/').next())
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            checked += 1;
+            if !is_reserved_sub_name(sub) {
+                let name = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                unreserved.push((name, sub.to_string()));
+            }
+        }
+        assert!(
+            checked >= 15,
+            "expected to scan many provider manifests, only saw {checked}"
+        );
+        assert!(
+            unreserved.is_empty(),
+            "capsule manifests declare `provides` sub-schemes missing from RESERVED_SUB_NAMES; \
+             their launch-time registration will fail closed and the provider will silently go \
+             dark. Add each to RESERVED_SUB_NAMES: {unreserved:?}"
+        );
+    }
+
+    // Pinned first-writer-wins: a boot-registered security-critical sub-provider (e.g. `encrypt` =
+    // CEK escrow) cannot be silently overwritten by a later registration (a launched capsule
+    // declaring `provides: elastos://encrypt/*`). The overwrite is refused structurally (Err), the
+    // original stays bound, and a genuine unregister→re-register (restart) still works.
+    #[tokio::test]
+    async fn test_pinned_sub_provider_is_first_writer_wins() {
+        let registry = ProviderRegistry::new();
+        registry
+            .register_sub_provider("encrypt", Arc::new(MockProvider::new()))
+            .await
+            .expect("boot registration of the pinned provider succeeds");
+
+        // A second registration of the still-live pinned slot is refused, not silently applied.
+        let overwrite = registry
+            .register_sub_provider("encrypt", Arc::new(MockProvider::new()))
+            .await;
+        assert!(
+            overwrite.is_err(),
+            "overwriting a still-live pinned sub-provider must fail closed"
+        );
+        assert!(
+            registry.get_sub_provider("encrypt").await.is_some(),
+            "the original pinned provider must remain bound after a refused overwrite"
+        );
+
+        // Teardown frees the slot, so a legitimate restart of the same provider re-mounts.
+        let encrypt = registry
+            .get_sub_provider("encrypt")
+            .await
+            .expect("encrypt is bound");
+        assert!(registry.unregister_sub_provider("encrypt", &encrypt).await);
+        registry
+            .register_sub_provider("encrypt", Arc::new(MockProvider::new()))
+            .await
+            .expect("re-registration after unregister (restart) must succeed");
+
+        // Non-pinned reserved names keep last-write-wins (hot-reload / test double-registration).
+        registry
+            .register_sub_provider("market", Arc::new(MockProvider::new()))
+            .await
+            .expect("first non-pinned registration succeeds");
+        registry
+            .register_sub_provider("market", Arc::new(MockProvider::new()))
+            .await
+            .expect("non-pinned re-registration is still allowed (last-write-wins)");
+    }
+
+    /// The pin used to cover only the escrow/key/signing spine, so every OTHER boot-bound
+    /// sub-provider was seizable from the launch path by a capsule shipping a matching `provides:`
+    /// claim. `did` is the sharpest case: seize identity resolution and every DID lookup in the
+    /// runtime answers from the attacker's VM.
+    #[tokio::test]
+    async fn a_launch_registration_cannot_seize_a_boot_bound_sub_provider() {
+        for name in [
+            "did",
+            "content",
+            "inspect",
+            "browser-engine",
+            "ipfs",
+            "net",
+            "exit",
+            "ai",
+            "llama",
+            "block-graph",
+            "availability",
+            // `object` (Library object authority) is bound at boot by the same
+            // find_installed_provider_binary -> spawn -> with_scheme shape as `did` and `ipfs`.
+            // It was briefly carved out on the reasoning that it also ships as a microVM capsule;
+            // that does not distinguish it from the names above, and
+            // `a_pinned_slot_still_binds_from_launch_when_boot_never_bound_it` shows the carve-out
+            // bought nothing.
+            "object",
+            "peer",
+        ] {
+            let registry = ProviderRegistry::new();
+            let boot: Arc<dyn Provider> = Arc::new(MockProvider::new());
+            registry
+                .register_sub_provider(name, boot.clone())
+                .await
+                .unwrap_or_else(|e| panic!("boot must be able to bind `{name}`: {e}"));
+
+            let seizure = registry
+                .register_sub_provider(name, Arc::new(MockProvider::new()))
+                .await;
+            assert!(
+                seizure.is_err(),
+                "a launch-path registration of boot-bound `{name}` must fail closed"
+            );
+            let still_bound = registry
+                .get_sub_provider(name)
+                .await
+                .expect("the boot provider stays bound after a refused seizure");
+            assert!(
+                Arc::ptr_eq(&still_bound, &boot),
+                "`{name}` must still be the boot binding, not the seizer's"
+            );
+        }
+    }
+
+    /// The launch-registered routes have to keep working, or the pin trades a seizure hole for a
+    /// capability loss. Neither of these names is boot-bound as a sub-provider — `market` is never
+    /// boot-bound at all, and `operator-drive-adapter` is boot-bound as a MAIN scheme — so both
+    /// stay last-write-wins.
+    #[tokio::test]
+    async fn launch_registered_sub_providers_still_bind() {
+        for name in ["market", "operator-drive-adapter"] {
+            let registry = ProviderRegistry::new();
+            registry
+                .register_sub_provider(name, Arc::new(MockProvider::new()))
+                .await
+                .unwrap_or_else(|e| panic!("`{name}` must bind from the launch path: {e}"));
+            registry
+                .register_sub_provider(name, Arc::new(MockProvider::new()))
+                .await
+                .unwrap_or_else(|e| panic!("`{name}` must re-bind (unpinned): {e}"));
+            assert!(registry.get_sub_provider(name).await.is_some());
+        }
+    }
+
+    /// Why pinning `object` costs nothing — and why the carve-out was unnecessary.
+    ///
+    /// First-writer-wins is conditional on the slot being OCCUPIED. On a node where the
+    /// object-provider binary is not installed, boot never binds `object`, so a launched microVM
+    /// capsule declaring `provides: elastos://object/*` still takes the slot exactly as before.
+    /// Pinning changes only the case that matters: boot already bound it, and something else tries
+    /// to take it over.
+    #[tokio::test]
+    async fn a_pinned_slot_still_binds_from_launch_when_boot_never_bound_it() {
+        for name in ["object", "did", "ipfs", "encrypt"] {
+            let registry = ProviderRegistry::new();
+            let launched: Arc<dyn Provider> = Arc::new(MockProvider::new());
+            registry
+                .register_sub_provider(name, launched.clone())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("`{name}` must bind from launch when boot left the slot free: {e}")
+                });
+            assert!(
+                Arc::ptr_eq(&registry.get_sub_provider(name).await.unwrap(), &launched),
+                "the launched capsule must own the free `{name}` slot"
+            );
+        }
+    }
+
+    /// Every sub-provider `server_infra` binds at boot must be pinned or an explicit, documented
+    /// carve-out. Reads the boot source so a newly-added boot registration reds this test instead
+    /// of quietly reopening the hole — the same shape as
+    /// `test_all_capsule_provided_sub_schemes_are_reserved`, from the other direction.
+    #[test]
+    fn every_boot_registered_sub_provider_is_pinned_or_carved_out() {
+        let boot_source = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elastos-server/src/server_infra.rs"
+        ));
+        let source = std::fs::read_to_string(boot_source).expect("boot source is readable");
+
+        let mut names: Vec<String> = Vec::new();
+        for (_, rest) in source
+            .match_indices("register_sub_provider(\"")
+            .map(|(i, m)| (i, &source[i + m.len()..]))
+        {
+            if let Some(end) = rest.find('"') {
+                names.push(rest[..end].to_lowercase());
+            }
+        }
+        names.sort();
+        names.dedup();
+        assert!(
+            names.len() >= 15,
+            "expected to find the boot provider wiring, only saw {names:?}"
+        );
+
+        let unprotected: Vec<&String> = names
+            .iter()
+            .filter(|name| {
+                !PINNED_SUB_NAMES.contains(&name.as_str()) && !is_boot_unpinned_sub_name(name)
+            })
+            .collect();
+        assert!(
+            unprotected.is_empty(),
+            "these sub-providers are bound at boot but stay last-write-wins, so any launched \
+             capsule declaring `provides: elastos://<name>/*` seizes the route from the trusted \
+             boot provider. Add each to PINNED_SUB_NAMES, or to BOOT_UNPINNED_SUB_NAMES with a \
+             written reason: {unprotected:?}"
+        );
+
+        // The carve-out list must stay minimal: every entry has to actually be bound at boot,
+        // otherwise it is a stale hole nobody is watching.
+        for carved in BOOT_UNPINNED_SUB_NAMES {
+            assert!(
+                names.iter().any(|name| name == carved),
+                "`{carved}` is carved out of the pin but is not bound at boot — drop it"
+            );
+        }
+    }
+
+    /// Teardown must be identity-keyed. Unpinned slots are last-write-wins, so capsule B may take
+    /// a slot over from capsule A; when A is later reaped, its teardown must NOT evict B. The
+    /// mirror of that shape is the attack: seize a slot, exit, and take the incumbent down.
+    #[tokio::test]
+    async fn teardown_never_evicts_another_capsules_binding() {
+        let registry = ProviderRegistry::new();
+        let capsule_a: Arc<dyn Provider> = Arc::new(MockProvider::new());
+        let capsule_b: Arc<dyn Provider> = Arc::new(MockProvider::new());
+
+        // Sub-provider slot: A binds, B legitimately takes over (unpinned = last-write-wins).
+        registry
+            .register_sub_provider("market", capsule_a.clone())
+            .await
+            .expect("A binds the slot");
+        registry
+            .register_sub_provider("market", capsule_b.clone())
+            .await
+            .expect("B takes the unpinned slot over");
+
+        assert!(
+            !registry.unregister_sub_provider("market", &capsule_a).await,
+            "A's teardown must report that it removed nothing"
+        );
+        let still_bound = registry
+            .get_sub_provider("market")
+            .await
+            .expect("B must still be bound after A is reaped");
+        assert!(
+            Arc::ptr_eq(&still_bound, &capsule_b),
+            "A's teardown evicted B's live binding"
+        );
+
+        // B's own teardown still works, and is idempotent.
+        assert!(registry.unregister_sub_provider("market", &capsule_b).await);
+        assert!(registry.get_sub_provider("market").await.is_none());
+        assert!(
+            !registry.unregister_sub_provider("market", &capsule_b).await,
+            "unregistering an already-free slot removes nothing"
+        );
+
+        // Same rule on the main-scheme side.
+        struct SchemeProvider(&'static str);
+        #[async_trait::async_trait]
+        impl Provider for SchemeProvider {
+            async fn handle(&self, _r: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+                Err(ProviderError::Provider("not used".into()))
+            }
+            fn schemes(&self) -> Vec<&'static str> {
+                vec![self.0]
+            }
+            fn name(&self) -> &'static str {
+                "scheme-mock"
+            }
+        }
+        let first: Arc<dyn Provider> = Arc::new(SchemeProvider("http"));
+        let second: Arc<dyn Provider> = Arc::new(SchemeProvider("http"));
+        registry.register(first.clone()).await;
+        registry.register(second.clone()).await;
+        assert!(
+            !registry.unregister("http", &first).await,
+            "the displaced binding's teardown must remove nothing"
+        );
+        assert!(
+            Arc::ptr_eq(&registry.get("http").await.unwrap(), &second),
+            "the live binding survived the displaced one's teardown"
+        );
+        assert!(registry.unregister("http", &second).await);
+        assert!(registry.get("http").await.is_none());
+    }
+
+    /// The MAIN-scheme half of the same rule. `register` is otherwise unconditional
+    /// last-write-wins, so without the pin any launched capsule whose manifest claims a pinned
+    /// scheme would seize it from the boot provider just by starting later.
+    #[tokio::test]
+    async fn pinned_main_schemes_are_first_writer_wins() {
+        struct SchemeProvider(&'static str, &'static str);
+        #[async_trait::async_trait]
+        impl Provider for SchemeProvider {
+            async fn handle(&self, _r: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+                Err(ProviderError::Provider("not used".into()))
+            }
+            fn schemes(&self) -> Vec<&'static str> {
+                vec![self.0]
+            }
+            fn name(&self) -> &'static str {
+                self.1
+            }
+        }
+
+        for scheme in ["localhost", "webspace"] {
+            let registry = ProviderRegistry::new();
+            assert!(
+                registry
+                    .register(Arc::new(SchemeProvider(scheme, "boot")))
+                    .await,
+                "the first (boot) binding of `{scheme}` must succeed"
+            );
+            assert!(
+                !registry
+                    .register(Arc::new(SchemeProvider(scheme, "seizer")))
+                    .await,
+                "a later binding of pinned `{scheme}` must report refusal"
+            );
+            assert_eq!(
+                registry.get(scheme).await.map(|p| p.name()),
+                Some("boot"),
+                "the boot provider must still own `{scheme}` after a refused seizure"
+            );
+
+            // An explicit teardown frees the slot, so a genuine restart re-mounts.
+            let boot_bound = registry.get(scheme).await.expect("boot binding is present");
+            assert!(registry.unregister(scheme, &boot_bound).await);
+            assert!(
+                registry
+                    .register(Arc::new(SchemeProvider(scheme, "restart")))
+                    .await,
+                "re-binding `{scheme}` after unregister must succeed"
+            );
+        }
+
+        // An unpinned scheme keeps last-write-wins.
+        let registry = ProviderRegistry::new();
+        assert!(
+            registry
+                .register(Arc::new(SchemeProvider("http", "first")))
+                .await
+        );
+        assert!(
+            registry
+                .register(Arc::new(SchemeProvider("http", "second")))
+                .await
+        );
+        assert_eq!(registry.get("http").await.map(|p| p.name()), Some("second"));
+    }
+
+    /// The binding path and the routing path must agree on which slot serves
+    /// `localhost://WebSpaces/...`, or a capsule binds one slot and requests arrive on another.
+    #[test]
+    fn localhost_webspaces_root_is_the_only_delegated_slot() {
+        for path in [
+            "WebSpaces",
+            "WebSpaces/*",
+            "WebSpaces/Elastos/content/bafy",
+            "localhost://WebSpaces/*",
+            "/WebSpaces/",
+        ] {
+            assert_eq!(
+                localhost_delegated_scheme(path),
+                Some("webspace"),
+                "{path} must delegate to the webspace slot"
+            );
+        }
+        for path in ["Users/alice", "Public", "ElastOS/app", "NotARoot/x", ""] {
+            assert_eq!(
+                localhost_delegated_scheme(path),
+                None,
+                "{path} must stay on the localhost provider"
+            );
+        }
+        // Every delegated slot must itself be pinned, or delegation just relocates the seizure.
+        assert!(is_pinned_scheme("webspace"));
+        assert!(is_pinned_scheme("localhost"));
     }
 
     #[tokio::test]

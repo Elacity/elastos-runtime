@@ -46,6 +46,14 @@ export function clearHomeAuthorityToken() {
   homeAuthorityToken = "";
 }
 
+// Home's OWN launch token (`executable_actor == "home"`). Only Home holds one, and only Home
+// may use it: it is the app token the passkey step-up ceremony binds a money-verb assertion to
+// (`gateway_passkey_step_up.rs::require_step_up_binding` compares `original_launch_id`), so the
+// spend and the ceremony must be driven from the same launch. Never forwarded to a frame.
+export function homeAuthorityTokenValue() {
+  return homeAuthorityToken;
+}
+
 export async function fetchJson(url, init) {
   const authorityHeaders = url === "/api/apps/home/launch" && homeAuthorityToken
     ? { "x-elastos-home-token": homeAuthorityToken }
