@@ -1,0 +1,20 @@
+[package]
+name = "elastos-protected-content-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Internal protected-content Runtime coordination state and provider seams"
+
+[dependencies]
+elastos-protected-content-contracts = { path = "../elastos-protected-content-contracts" }
+hex = "0.4"
+nix = { version = "0.29", features = ["fs", "user"] }
+sha2 = "0.10"
+thiserror = "1.0"
+
+[dev-dependencies]
+elastos-auth = { path = "../elastos-auth" }
+ed25519-dalek = "2.1"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+tempfile = "3.12"

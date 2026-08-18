@@ -1698,6 +1698,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "elastos-protected-content-runtime"
+version = "0.6.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "elastos-auth",
+ "elastos-protected-content-contracts",
+ "hex",
+ "k256",
+ "nix",
+ "sha2 0.10.9",
+ "sha3",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "elastos-runtime"
 version = "0.6.0"
 dependencies = [
