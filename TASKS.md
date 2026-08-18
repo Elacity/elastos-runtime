@@ -710,10 +710,11 @@ and review items pass.
 ### Trusted content and access rights
 
 The published source-only protected-content stack currently ends at
-`origin/feat/protected-content-key-reconstruction`: canonical contracts,
-custody and node operations, then decrypt-boundary reconstruction. Remaining
-work must stay in this order. Carrier remains transport only throughout every
-stage below.
+`origin/feat/protected-content-key-reconstruction` at `a8d0a9a6`: canonical
+contracts, custody and node operations, then decrypt-boundary reconstruction.
+The local `feat/protected-content-custody-pool` branch is source-only and
+unpublished. Remaining work must stay in this order. Carrier remains transport
+only throughout every stage below.
 
 The published custody branch defines the source-only EVM
 `has_access_by_content_id` policy/evidence contract, including the exact
@@ -773,6 +774,20 @@ Runtime release operation; there is no operation-resume journal for that state.
   integration. Its manifest-bound CEK commitment detects a wrong
   reconstructed key; it does not identify the malicious node or add verifiable
   secret sharing.
+- [ ] Keep the new custody pool, each object's selected committee, and any
+  later Runtime route resolution as three separate truths.
+- [ ] Bind each protected object or manifest to the exact custody-pool
+  identity, exact immutable `SignedCustodyEpochV1` identity, and exact
+  `CustodyCommitteeAuthorizationIdentityV1` so Runtime open can require those
+  object-bound identities rather than any newer pool or authorization.
+- [ ] Define the explicit re-share and new-epoch transition that replaces an
+  object's committee only by minting a new signed custody epoch plus a new
+  bound committee authorization, without rewriting older object authority.
+- [ ] Keep `CustodyEnvelopeV1` private to the trusted mint/custody provisioning
+  handoff. It must not become public asset metadata or capsule-visible state.
+  Future durable custody storage persists exactly one node-sealed share at each
+  selected custody node. Public metadata contains no shares: only bounded
+  identities, threshold/epoch/pool facts, CEK commitment, and signatures.
 - [ ] Extend the reviewed node-local replay-claim and claim-gated release
   transition into full operational node state: retained claim pruning policy,
   multi-process operational audit retention, node admission and issuer-key
@@ -843,6 +858,15 @@ Runtime release operation; there is no operation-resume journal for that state.
   rejection, expiry, revocation, and failure cleanup are proven. Verify the
   capsule-visible response is the authenticated terminal receipt, not
   provider-private contribution bytes or key-backend authority.
+- [ ] Implement the typed custody-provider boundary and Runtime route
+  resolution keyed by `node_public_key`, keeping pool eligibility policy,
+  per-object committee authority, and current reachability separate. Runtime
+  must choose a currently available typed provider route for the exact
+  committee node; Carrier remains transport only. Do not add service IDs,
+  endpoint identities, or topology to the signed pool or custody epoch. This is
+  the next implementation gate, followed by one true Runtime
+  allow/deny/replay end-to-end test over real provider selection and audit. Do
+  not resurrect a fallback rail.
 - [ ] Wire `decrypt-provider` to a real decrypt/render backend that returns
   scoped rendered output or decrypt sessions to the viewer instead of broad raw
   key access.
@@ -871,6 +895,19 @@ Runtime release operation; there is no operation-resume journal for that state.
   target: resolve object by stable identity, verify trust material, authorize
   access, decrypt for the rightful user, open in the correct viewer/app, and
   fail closed for everyone else.
+- [ ] Keep PR #15 / `feat/dkms-esp-port` limited to source evidence for later
+  UX and node-operation extraction only. Keep as research its threshold crypto,
+  node-local custody, recipient-sealed contributions, CEK commitment, lifecycle
+  scenarios, and fail-closed negative tests. Reimplement at the canonical
+  boundary: per-node durable shard storage, DKG/rotation/re-share/revocation,
+  pool/governance policy, provider roles, and Runtime-open scenarios. Reject
+  from the product path: public aggregated `shares[]` metadata, capsule-owned
+  authority, raw CEK operations, `rail_shim`/reference fallbacks, old
+  `drm-provider` orchestration, direct TCP/IP/port topology in capsules or
+  contracts, static authorization fallbacks, and the standalone harness as a
+  product route. Treat PR #15's generated `escrow.json` as historical dev
+  evidence only: it aggregates wrapped shares and its writer omits
+  `cek_commitment_b64` while the reload path requires it.
 - [ ] Only after stages A-D, decide whether to add permissioned ElastOS
   PQ-hybrid dKMS custody for new protected content. Do not use FROST as the
   long-term dKMS root; FROST is only a classical helper for receipts or cohort

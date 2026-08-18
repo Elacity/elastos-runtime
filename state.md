@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-17 UTC
+Last updated: 2026-08-18 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Historical
@@ -71,8 +71,46 @@ the public repository.
   returns no success metadata and callers must discard staged plaintext output.
   This branch is source-only and unpublished. It does not add provider wire,
   Runtime integration, viewer output protocol, installation, or deployment.
-  The next blocker is the private decrypt-provider/output boundary that can
-  carry scoped viewer bytes without exposing CEK, shares, or topology.
+- The local unpublished `feat/protected-content-custody-pool` child branch
+  depends on that unpublished custody-local stack and adds a source-only
+  custody-pool module inside the canonical
+  `elastos-protected-content-contracts` crate. Validation requires the exact
+  signed pool, exact signed custody epoch, exact signed committee
+  authorization, a caller-supplied trusted policy-authority key, and a
+  caller-supplied expected `CustodyCommitteeAuthorizationIdentityV1`. It
+  enforces fixed 2-of-3 diversity across distinct operators and failure
+  domains and rejects topology-bearing fields. Object-bound pool/epoch/
+  authorization identity commitment, Runtime/provider routing, installation,
+  and deployment are not implemented. This branch is source-only and
+  unpublished.
+- `CustodyEnvelopeV1` is current source-only provisioning authority, not public
+  asset metadata. Future durable custody storage must keep exactly one
+  node-sealed share at each selected custody node. Public metadata contains no
+  shares; it contains bounded identities, threshold/epoch/pool facts, CEK
+  commitment, and signatures only.
+- Raw CEK and private-key JSON vectors in historical protected-content work are
+  deterministic test fixtures only. Product operations, responses, logs, public
+  metadata, and durable product state must not contain raw CEKs.
+- PR #15 / `feat/dkms-esp-port` remains public, unmerged source evidence only:
+  keep its threshold crypto, node-local custody, recipient-sealed
+  contributions, CEK commitment, lifecycle scenarios, and fail-closed negative
+  tests as research; reimplement per-node durable shard storage,
+  DKG/rotation/re-share/revocation, pool/governance policy, provider roles, and
+  Runtime-open scenarios at the canonical boundary; reject its public
+  aggregated `shares[]` metadata, capsule-owned authority, raw CEK operations,
+  `rail_shim`/reference fallbacks, old `drm-provider` orchestration, direct
+  topology in capsules or contracts, static authorization fallbacks, and
+  standalone harness as a product route. Its generated `escrow.json` is
+  historical dev evidence only because it aggregates wrapped shares and its
+  writer omits `cek_commitment_b64` while the reload path requires it.
+- Current protected-content source proof covers canonical contracts, node
+  release, exact-threshold reconstruction inside the decrypt boundary,
+  tamper/expiry/wrong-binding rejection, commitment checking, and CEK
+  zeroization. PR #15 adds provider/dev-harness encryption and decryption
+  evidence. No accepted test yet proves
+  `mint -> Runtime authority/provider selection/audit -> per-node custody
+  release -> private reconstruction/decryption -> plaintext/playback` through
+  the real Runtime product path.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`

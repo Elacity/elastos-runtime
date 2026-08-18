@@ -165,14 +165,26 @@ C. replace the provisional DTO/provider surface atomically and wire
    source allow flow and one source deny flow; and
 D. prove the installed end-to-end open/decrypt/render path.
 
+The published source-only stack currently ends at
+`origin/feat/protected-content-key-reconstruction` (`a8d0a9a6`). The local
+custody-pool work is unpublished policy-contract source only. PR #15 /
+`feat/dkms-esp-port` is research evidence for threshold crypto, node-local
+custody, lifecycle scenarios, and UX shape; its public `shares[]` metadata,
+raw-CEK/reference operations, old DRM orchestration, direct TCP/IP topology,
+and standalone harness must not become the product path.
+
 Carrier remains transport only throughout that sequence. It carries
 Runtime-selected traffic, but it does not define rights authority, custody
 policy, or capsule-visible contract meaning.
 
 New protected objects should carry encrypted payload identity, rights policy,
-algorithm metadata, key envelopes, provenance, availability receipts, and a
-declared viewer interface. Cryptographic upgrades use versioned envelopes and
-migration rules. A permissioned key service can precede a public network, but
+algorithm metadata, provenance, availability receipts, declared viewer
+interface, CEK commitment, and object-bound pool/epoch/committee-authorization
+identities. Public metadata must not carry custody shares. `CustodyEnvelopeV1`
+remains a private ephemeral provisioning bundle; durable custody storage is one
+node-sealed share per selected custody node. Cryptographic upgrades use
+versioned envelopes and migration rules. A permissioned key service can precede
+a public network, but
 production claims require independent review and operational evidence.
 
 The repository now has a canonical source-only v1 review candidate in

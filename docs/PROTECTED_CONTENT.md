@@ -4,9 +4,11 @@ Protected content is Runtime-mediated. App, viewer, and content capsules ask to
 open an object; they do not receive raw wallet, chain, IPFS, Elacity, or key
 authority.
 
-The source tree currently has one canonical published source-only review stack
-through `origin/feat/protected-content-key-reconstruction` and one provisional
-retirement surface:
+The canonical published source-only review stack currently ends at
+`origin/feat/protected-content-key-reconstruction` at `a8d0a9a6`. Released
+0.6 still contains the older provisional provider surface, and newer local
+child branches extend the source-only review line without changing published or
+installed product truth:
 
 - The canonical v1 published review stack is the
   `elastos-protected-content-contracts` branch, the companion
@@ -29,6 +31,9 @@ retirement surface:
   capsules. It is not current architecture and does not consume or prove the
   v1 contract. The Runtime integration stage must remove it atomically. It must
   not remain as a parallel decoder or compatibility path.
+- The local `feat/protected-content-custody-pool` branch is source-only and
+  unpublished. It is a policy-contract child branch for review, not installed
+  product behavior.
 
 ## Canonical architecture
 
@@ -58,10 +63,34 @@ Capsules must also never receive provider routes, endpoint DIDs, IP addresses,
 ports, credentials, Wallet RPC, Chain RPC, Kubo/IPFS APIs, or Elacity SDK
 authority.
 
+`CustodyEnvelopeV1` is a private, ephemeral provisioning bundle inside the
+trusted mint/custody handoff. It is not public asset metadata and must not be
+capsule-visible state. Future durable custody storage persists exactly one
+node-sealed share at each selected custody node. Public metadata contains no
+shares; it contains only bounded identities, threshold/epoch/pool facts, CEK
+commitment, and signatures.
+
+Raw CEK and private-key JSON vectors in historical branches are deterministic
+test data only. Product operations, responses, logs, public metadata, and
+durable product state must never contain raw CEKs.
+
+Operator addresses and ports may exist only in private deployment
+configuration. Contracts and capsules see Runtime-selected service or endpoint
+identities, never raw topology. Carrier transports selected endpoint traffic
+and does not grant rights or custody authority.
+
 This architecture is not yet installed or wired into Runtime. Published source
 truth is source-only through contracts, custody behavior, and
 decrypt-boundary reconstruction. The new protected-content product path is not
 yet connected or usable.
+
+Current source tests prove canonical contracts, node release, exact-threshold
+reconstruction, tamper/expiry/wrong-binding rejection, commitment checking, and
+CEK zeroization. PR #15 contains provider and development-harness encryption and
+decryption evidence. No accepted test yet proves
+`mint -> Runtime authority/provider selection/audit -> per-node custody release
+-> private reconstruction/decryption -> plaintext/playback` through the real
+Runtime product path.
 
 ## Provisional retirement surface
 
@@ -79,6 +108,28 @@ used to claim custody, Runtime orchestration, decryption, or playback readiness.
 PC2's dDRM contracts and WASM decrypt/render/media crates remain implementation
 references. A later integration may use reviewed parts inside canonical
 providers, but those parts must not create a second authority path.
+
+## PR #15 disposition
+
+The public, unmerged `feat/dkms-esp-port` / PR #15 tree is research and
+behavior evidence only:
+
+- Keep as research: threshold crypto, node-local custody, recipient-sealed
+  contributions, CEK commitment, lifecycle scenarios, and fail-closed negative
+  tests.
+- Reimplement at the canonical boundary: per-node durable shard storage,
+  DKG/rotation/re-share/revocation, pool/governance policy, provider roles, and
+  Runtime-open scenarios.
+- Reject from the product path: public aggregated `shares[]` metadata,
+  capsule-owned authority, raw CEK operations, `rail_shim` and reference
+  fallbacks, old `drm-provider` orchestration, direct TCP/IP/port topology in
+  capsules or contracts, static authorization fallbacks, and the standalone
+  harness as a product route.
+
+PR #15's generated `escrow.json` is historical development evidence only. It
+aggregates wrapped shares and its writer omits `cek_commitment_b64` while the
+reload path requires it, so ElastOS must not adopt that fixture as canonical
+metadata.
 
 ## Future sealed decrypt handoff
 
@@ -142,19 +193,24 @@ protected content:
   metadata and callers must discard staged plaintext output. It does not yet
   add provider wire, Runtime orchestration, viewer output protocol,
   installation, or deployment.
-- It is source-only. There are no running custody nodes, Runtime/provider
-  routes, Runtime-owned replay orchestration, recipient key-possession proof,
-  decrypt/render product flow, installation, or deployment in this branch. The
-  custody crate includes one node-local durable dual-key replay-claim store. It
-  privately gates release on the exact claim, persists the exact encrypted node
-  contribution, and replays only that result after restart. A durable claim
-  without a stored result fails closed. The store adds a domain-separated
-  integrity digest to detect same-length corruption or torn local state, but it
-  does not defend against a malicious same-UID rewrite that can recompute the
-  digest.
-  The next blocker after those local custody-only branches is a private
-  decrypt-provider/output boundary that can carry scoped viewer bytes without
-  exposing CEK, shares, or topology.
+- Custody-pool policy keeps three truths separate: a permissioned signed
+  custody pool for node eligibility, each immutable per-object custody
+  committee in `SignedCustodyEpochV1`, and later Runtime route resolution
+  keyed by `node_public_key`. Validation requires a caller-supplied trusted
+  policy authority, exact signed pool, exact signed custody epoch, a second
+  signed committee authorization that binds the exact pool snapshot to the
+  exact epoch identity, and a caller-supplied expected
+  `CustodyCommitteeAuthorizationIdentityV1`. Pool membership binds only node
+  signing keys, node custody keys, opaque operator identities, opaque
+  failure-domain identities, approved suites, validity, and revocation. It
+  does not sign service IDs, routes, URLs, hostnames, sockets, ports,
+  WireGuard, ALPN, or other topology. The source policy is fixed 2-of-3 across
+  distinct operators and failure domains, with no fallback or silent
+  substitution. A protected object must later commit the exact pool identity,
+  exact epoch identity, and exact committee-authorization identity it was
+  minted against; Runtime open must use those object-bound identities rather
+  than any "latest pool" view. The pool authority is permissioned, not a
+  decentralized consensus system.
 
 This helper does not make a PQ claim. PQ-hybrid custody, dKMS node lifecycle,
 and product wiring remain future work. The current HPKE dependency is `hpke`
@@ -225,8 +281,12 @@ B. Continue the source-only custody-node operations and durable node-state
    layer around the reviewed contracts. The published custody branch adds the
    durable dual-key claim boundary, claim-gated node release, and exact encrypted
    result replay. Remaining work is node admission, rotation, revocation,
-   recovery, issuer-key lifecycle, operational audit retention, and recovery
-   from a claim that completed before its result became durable.
+   recovery, issuer-key lifecycle, operational audit retention, recovery
+   from a claim that completed before its result became durable, the typed
+   custody-provider boundary, and Runtime route resolution keyed by
+   `node_public_key`. PR #15 is public source evidence only for later UX and
+   node-operation extraction; its direct network wiring and logger proof of
+   concept are explicitly excluded from the canonical path.
 C. Replace the provisional `elastos_common::protected_content` DTO/provider
    surface atomically with Runtime-owned orchestration over the reviewed v1
    contract: Wallet integration, recipient key generation and possession proof,
