@@ -349,6 +349,7 @@ build_browser_vm_guest_helpers() {
         echo "Browser VM guest helper build is unsupported on ${target_platform:-this platform}" >&2
         exit 1
     fi
+    ensure_rust_target_installed "$rust_target"
 
     echo "[setup-source-home] build Browser VM guest relay helpers"
     build_browser_vm_guest_helper \
