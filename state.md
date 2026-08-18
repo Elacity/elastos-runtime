@@ -83,6 +83,16 @@ the public repository.
   authorization identity commitment, Runtime/provider routing, installation,
   and deployment are not implemented. This branch is source-only and
   unpublished.
+- The local unpublished `feat/protected-content-custody-provider` child branch
+  depends on that custody-pool work and remains source-only and unregistered.
+  It proves exact object/pool/epoch/committee binding, one selected node and one
+  sealed-share provisioning record, expected Runtime issuer and local-node
+  validation, owner-only durable node-share storage, exact duplicate/conflict/
+  restart behavior, signed-rights-gated release, exact encrypted contribution
+  replay, bounded provider frames, and clean shutdown. It exposes no CEK, raw
+  share, topology, Carrier authority, route, host, IP address, port, or
+  credential. The old provisional `key-provider` remains the only active
+  registered product key/custody path until a later atomic Runtime cutover.
 - `CustodyEnvelopeV1` is current source-only provisioning authority, not public
   asset metadata. Future durable custody storage must keep exactly one
   node-sealed share at each selected custody node. Public metadata contains no

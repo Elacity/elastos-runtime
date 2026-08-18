@@ -798,7 +798,6 @@ Runtime release operation; there is no operation-resume journal for that state.
   retry replay. It does not yet add an operation-resume journal for a claim
   that became durable before its result, so that state still requires a fresh
   Runtime release operation.
-
 #### C. Atomic Runtime/provider cutover plus source allow/deny proof
 
 - [ ] Add a typed protected-content Wallet operation that verifies an
@@ -858,15 +857,15 @@ Runtime release operation; there is no operation-resume journal for that state.
   rejection, expiry, revocation, and failure cleanup are proven. Verify the
   capsule-visible response is the authenticated terminal receipt, not
   provider-private contribution bytes or key-backend authority.
-- [ ] Implement the typed custody-provider boundary and Runtime route
-  resolution keyed by `node_public_key`, keeping pool eligibility policy,
-  per-object committee authority, and current reachability separate. Runtime
-  must choose a currently available typed provider route for the exact
-  committee node; Carrier remains transport only. Do not add service IDs,
-  endpoint identities, or topology to the signed pool or custody epoch. This is
-  the next implementation gate, followed by one true Runtime
-  allow/deny/replay end-to-end test over real provider selection and audit. Do
-  not resurrect a fallback rail.
+- [ ] Atomically cut Runtime/Library over from the provisional `key-provider`
+  route to Runtime-selected custody providers keyed by `node_public_key`,
+  keeping pool eligibility policy, per-object committee authority, and current
+  reachability separate. Runtime must own provider lifecycle/registration,
+  choose a currently available typed provider route for each exact committee
+  node, produce one real allow/deny/replay audit over provider selection, and
+  leave no fallback rail or dual authority. Carrier remains transport only; do
+  not add service IDs, endpoint identities, or topology to the signed pool or
+  custody epoch.
 - [ ] Wire `decrypt-provider` to a real decrypt/render backend that returns
   scoped rendered output or decrypt sessions to the viewer instead of broad raw
   key access.

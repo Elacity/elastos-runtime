@@ -34,6 +34,10 @@ installed product truth:
 - The local `feat/protected-content-custody-pool` branch is source-only and
   unpublished. It is a policy-contract child branch for review, not installed
   product behavior.
+- The local `feat/protected-content-custody-provider` branch is source-only,
+  unpublished, and unregistered. It proves the next custody-node provider
+  boundary without changing installed product behavior or replacing the active
+  provisional `key-provider`.
 
 ## Canonical architecture
 
@@ -250,11 +254,20 @@ contract layer that later Runtime and custody-node integrations must consume:
   or storage failure after the node-local claim succeeds but before
   contribution settlement is fail closed and currently requires a fresh
   Runtime release operation; there is no durable operation-resume journal yet.
+- The source-only custody-provider capsule proves one configured node, one
+  selected sealed share per object, expected Runtime issuer validation,
+  local-node validation, owner-only durable node-share storage, exact duplicate/
+  conflict/restart behavior, signed-rights-gated release, exact encrypted
+  contribution replay, bounded provider frames, redacted diagnostics, and clean
+  shutdown. It is not registered by Runtime, installed, deployed, or product
+  proven. It carries no CEK, raw share, provider route, endpoint, IP address,
+  port, Carrier topology, or credential in provider responses.
 
 This operational layer is still source-only. There is no provider registry
-cutover, Runtime-owned replay store, recipient key-possession proof, node
-lifecycle service, installed product flow, or production confidentiality claim
-in this branch.
+cutover, Runtime-selected custody-provider lifecycle, Runtime-owned replay
+store, recipient key-possession proof, installed product flow, or production
+confidentiality claim in this branch. The provisional `key-provider` remains the
+only active registered product path until the atomic cutover.
 
 ## Capsule boundary
 
@@ -282,11 +295,13 @@ B. Continue the source-only custody-node operations and durable node-state
    durable dual-key claim boundary, claim-gated node release, and exact encrypted
    result replay. Remaining work is node admission, rotation, revocation,
    recovery, issuer-key lifecycle, operational audit retention, recovery
-   from a claim that completed before its result became durable, the typed
-   custody-provider boundary, and Runtime route resolution keyed by
-   `node_public_key`. PR #15 is public source evidence only for later UX and
-   node-operation extraction; its direct network wiring and logger proof of
-   concept are explicitly excluded from the canonical path.
+   from a claim that completed before its result became durable, and Runtime
+   provider lifecycle/route resolution keyed by `node_public_key`. The local
+   unpublished custody-provider branch has a source-only unregistered provider
+   process, but no Runtime registration or product cutover. PR #15 is public
+   source evidence only for later UX and node-operation extraction; its direct
+   network wiring and logger proof of concept are explicitly excluded from the
+   canonical path.
 C. Replace the provisional `elastos_common::protected_content` DTO/provider
    surface atomically with Runtime-owned orchestration over the reviewed v1
    contract: Wallet integration, recipient key generation and possession proof,
