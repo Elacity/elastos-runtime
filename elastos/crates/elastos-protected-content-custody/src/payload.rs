@@ -6,7 +6,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use zeroize::Zeroizing;
 
 use elastos_protected_content_contracts::{
-    AuthenticatedRuntimeReleaseOperationV1, CustodyEnvelopeV1, CustodyEpochIdentityV1, Digest32,
+    AuthenticatedRuntimeReleaseOperationV1, CustodyCommitteeAuthorizationIdentityV1,
+    CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyPoolIdentityV1, Digest32,
     EncryptedContentIdentityV1, NodeCustodyPublicKeyV1, NodePublicKey, SignedNodeContributionV1,
     SignedTerminalReceiptV1, TerminalReceiptIssuerKey, ThresholdV1, MAX_ENCRYPTED_CONTENT_BYTES,
 };
@@ -187,7 +188,9 @@ pub struct AuthenticatedPayloadDecryptInputsV1<'a> {
 struct PayloadSealContextV1 {
     content_key: ContentEncryptionKeyV1,
     base_nonce: [u8; PAYLOAD_BASE_NONCE_BYTES_V1],
+    custody_pool: CustodyPoolIdentityV1,
     custody_epoch: CustodyEpochIdentityV1,
+    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
     threshold: ThresholdV1,
     node_keys: Vec<(NodePublicKey, NodeCustodyPublicKeyV1)>,
 }
@@ -222,19 +225,24 @@ impl DecryptedPayloadMetadataV1 {
 ///
 /// On any error this function returns no publishable metadata. Callers must
 /// discard the staging output instead of treating it as a complete object.
+#[allow(clippy::too_many_arguments)]
 pub fn seal_payload_to_staging_writer_v1<R: Read, W: Write>(
     content_type: &str,
     plaintext_bytes: u64,
     plaintext: &mut R,
     staging_ciphertext: &mut W,
+    custody_pool: CustodyPoolIdentityV1,
     custody_epoch: CustodyEpochIdentityV1,
+    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
     threshold: ThresholdV1,
     node_keys: Vec<(NodePublicKey, NodeCustodyPublicKeyV1)>,
 ) -> Result<SealedPayloadMetadataV1, CustodyError> {
     let context = PayloadSealContextV1 {
         content_key: ContentEncryptionKeyV1::generate()?,
         base_nonce: random_base_nonce()?,
+        custody_pool,
         custody_epoch,
+        custody_committee_authorization,
         threshold,
         node_keys,
     };
@@ -355,7 +363,9 @@ fn seal_payload_to_staging_writer_inner<R: Read, W: Write>(
     let custody_envelope = crate::provision_custody_envelope(
         encrypted_content_identity.clone(),
         &context.content_key,
+        context.custody_pool,
         context.custody_epoch,
+        context.custody_committee_authorization,
         context.threshold,
         context.node_keys.clone(),
     )?;
@@ -761,7 +771,10 @@ fn seal_payload_to_vec_with_test_material(
                 content_key.with_bytes(|bytes| *bytes),
             ),
             base_nonce,
+            custody_pool: crate::test_support::custody_pool_identity(),
             custody_epoch: crate::test_support::custody_epoch_identity(),
+            custody_committee_authorization:
+                crate::test_support::custody_committee_authorization_identity(),
             threshold: ThresholdV1::new(2, 3)?,
             node_keys: crate::test_support::custody_nodes(),
         },
@@ -1151,7 +1164,9 @@ mod tests {
             u64::try_from(plaintext.len()).unwrap(),
             &mut plaintext_reader,
             &mut framed,
+            crate::test_support::custody_pool_identity(),
             crate::test_support::custody_epoch_identity(),
+            crate::test_support::custody_committee_authorization_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             node_keys(),
         )
@@ -1274,7 +1289,9 @@ mod tests {
             4096,
             &mut first_reader,
             &mut first_framed,
+            crate::test_support::custody_pool_identity(),
             crate::test_support::custody_epoch_identity(),
+            crate::test_support::custody_committee_authorization_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             node_keys(),
         )
@@ -1284,7 +1301,9 @@ mod tests {
             4096,
             &mut second_reader,
             &mut second_framed,
+            crate::test_support::custody_pool_identity(),
             crate::test_support::custody_epoch_identity(),
+            crate::test_support::custody_committee_authorization_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             node_keys(),
         )
@@ -1712,7 +1731,9 @@ mod tests {
             MAX_ENCRYPTED_CONTENT_BYTES,
             &mut reader,
             &mut writer,
+            crate::test_support::custody_pool_identity(),
             crate::test_support::custody_epoch_identity(),
+            crate::test_support::custody_committee_authorization_identity(),
             ThresholdV1::new(2, 3).unwrap(),
             node_keys(),
         )
@@ -1845,7 +1866,10 @@ mod tests {
             &PayloadSealContextV1 {
                 content_key,
                 base_nonce: [0x64; PAYLOAD_BASE_NONCE_BYTES_V1],
+                custody_pool: crate::test_support::custody_pool_identity(),
                 custody_epoch: crate::test_support::custody_epoch_identity(),
+                custody_committee_authorization:
+                    crate::test_support::custody_committee_authorization_identity(),
                 threshold: ThresholdV1::new(2, 3).unwrap(),
                 node_keys: node_keys(),
             },
@@ -1872,7 +1896,10 @@ mod tests {
                     content_key.with_bytes(|bytes| *bytes),
                 ),
                 base_nonce: [0x65; PAYLOAD_BASE_NONCE_BYTES_V1],
+                custody_pool: crate::test_support::custody_pool_identity(),
                 custody_epoch: crate::test_support::custody_epoch_identity(),
+                custody_committee_authorization:
+                    crate::test_support::custody_committee_authorization_identity(),
                 threshold: ThresholdV1::new(2, 3).unwrap(),
                 node_keys: invalid_node_keys,
             },

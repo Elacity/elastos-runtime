@@ -5,10 +5,10 @@ use k256::ecdsa::SigningKey as WalletSigningKey;
 use sha3::{Digest as _, Keccak256};
 
 use crate::{
-    AtomicReplayClaimer, CustodyEpochIdentityV1, Digest32, EncryptedContentIdentityV1,
-    KeyEnvelopeIdentityV1, NodePublicKey, NodeSetV1, ProfileIdentityV1, ProtectedContentBindingV1,
-    ReplayClaimError, ReplayClaimKeyV1, RightsPolicyIdentityV1, RuntimeSessionBindingV1,
-    ThresholdV1, WalletAddress,
+    AtomicReplayClaimer, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
+    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1,
+    NodePublicKey, NodeSetV1, ProfileIdentityV1, ProtectedContentBindingV1, ReplayClaimError,
+    ReplayClaimKeyV1, RightsPolicyIdentityV1, RuntimeSessionBindingV1, ThresholdV1, WalletAddress,
 };
 
 pub(crate) const NOW: u64 = 2_000_000_000;
@@ -44,6 +44,15 @@ pub(crate) fn custody_epoch_identity() -> CustodyEpochIdentityV1 {
     CustodyEpochIdentityV1::new(digest(0x33), 512).unwrap()
 }
 
+pub(crate) fn custody_pool_identity() -> CustodyPoolIdentityV1 {
+    CustodyPoolIdentityV1::new(digest(0x35), 512).unwrap()
+}
+
+pub(crate) fn custody_committee_authorization_identity() -> CustodyCommitteeAuthorizationIdentityV1
+{
+    CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap()
+}
+
 pub(crate) fn binding_for_wallet(wallet: WalletAddress) -> ProtectedContentBindingV1 {
     let content = EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap();
     let node_set = node_set();
@@ -54,7 +63,9 @@ pub(crate) fn binding_for_wallet(wallet: WalletAddress) -> ProtectedContentBindi
         512,
         node_set.node_set_id().unwrap(),
         threshold,
+        custody_pool_identity(),
         custody_epoch_identity(),
+        custody_committee_authorization_identity(),
     )
     .unwrap();
     let profile_key = SigningKey::from_bytes(&[0x26; 32]);

@@ -708,7 +708,9 @@ mod tests {
     fn envelope_for_epoch(custody_epoch: CustodyEpochIdentityV1) -> CustodyEnvelopeV1 {
         let manifest = crate::CustodyEnvelopeManifestV1::new(
             crate::EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+            crate::CustodyPoolIdentityV1::new(digest(0x35), 512).unwrap(),
             custody_epoch,
+            crate::CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap(),
             ThresholdV1::new(2, 3).unwrap(),
             digest(0x19),
             vec![
@@ -864,7 +866,7 @@ mod tests {
         let authenticated = operation.verify(NOW + 3).unwrap();
         assert_eq!(
             encode(authenticated.operation_hash().as_bytes()),
-            "f37a1060048335ddaf05fc2c1b767b9983bc6a16af936113b1742af679089058"
+            "71ee173d7a811fff30ac32bd1e6920378462119477bad9c233dd6e40c73e0e84"
         );
         assert_eq!(
             authenticated.rights_request_hash(),

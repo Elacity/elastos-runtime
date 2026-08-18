@@ -4,10 +4,11 @@ use sha3::{Digest as _, Keccak256};
 
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
-    CanonicalContract, CustodyApprovedSuitesV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
-    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, Digest32, EncryptedContentIdentityV1,
-    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, HpkeCiphertextV1,
-    KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1, NodeContributionStatementV1,
+    CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
+    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
+    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
+    EvmFunctionSelectorV1, EvmRightsMethodAbiV1, HpkeCiphertextV1, KeyReleaseOutcomeV1,
+    KeyReleaseRequestV1, NodeContributionRefV1, NodeContributionStatementV1,
     NodeCustodyPublicKeyV1, NodePublicKey, RecipientKeyAuthorizationStatementV1,
     RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, RecipientSealedContributionV1,
     ReplayNonce16, RightsActionV1, RightsDecisionV1, RightsEvaluationEvidenceRequestV1,
@@ -120,7 +121,9 @@ pub(crate) fn custody_envelope_for_seed(seed: u8) -> CustodyEnvelopeV1 {
     let epoch = signed_custody_epoch();
     let manifest = CustodyEnvelopeManifestV1::new(
         EncryptedContentIdentityV1::new(digest(seed), 4096).unwrap(),
+        CustodyPoolIdentityV1::new(digest(seed ^ 0x34), 512).unwrap(),
         epoch.epoch_identity().unwrap(),
+        CustodyCommitteeAuthorizationIdentityV1::new(digest(seed ^ 0x35), 512).unwrap(),
         ThresholdV1::new(2, 3).unwrap(),
         digest(seed ^ 0x33),
         epoch.statement().nodes().to_vec(),

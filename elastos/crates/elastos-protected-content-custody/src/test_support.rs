@@ -8,8 +8,9 @@ use sha3::Keccak256;
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
     AtomicReplayClaimer, AuthenticatedRuntimeReleaseOperationV1, CanonicalContract,
-    CustodyApprovedSuitesV1, CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1,
-    CustodyEpochStatementV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
+    CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1,
+    CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
+    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
     EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1,
     NodePublicKey, ProtectedContentBindingV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
     ReplayClaimError, ReplayClaimKeyV1, ReplayNonce16, RightsActionV1, RightsDecisionV1,
@@ -143,6 +144,15 @@ pub(crate) fn signed_custody_epoch() -> SignedCustodyEpochV1 {
 
 pub(crate) fn custody_epoch_identity() -> CustodyEpochIdentityV1 {
     signed_custody_epoch().epoch_identity().unwrap()
+}
+
+pub(crate) fn custody_pool_identity() -> CustodyPoolIdentityV1 {
+    CustodyPoolIdentityV1::new(digest(0x35), 512).unwrap()
+}
+
+pub(crate) fn custody_committee_authorization_identity() -> CustodyCommitteeAuthorizationIdentityV1
+{
+    CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap()
 }
 
 fn wallet(seed: u8) -> WalletAddress {
@@ -397,7 +407,9 @@ pub(crate) fn provisioned_envelope() -> CustodyEnvelopeV1 {
     provision_custody_envelope_with_rng(
         EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
         &content_key(),
+        custody_pool_identity(),
         custody_epoch_identity(),
+        custody_committee_authorization_identity(),
         ThresholdV1::new(2, 3).unwrap(),
         custody_nodes(),
         &mut HpkeStdRng::from_seed([0x41; 32]),

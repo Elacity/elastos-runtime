@@ -584,7 +584,14 @@ mod tests {
         let wrong_envelope = CustodyEnvelopeV1::new(
             CustodyEnvelopeManifestV1::new(
                 EncryptedContentIdentityV1::new(digest(0x44), 4096).unwrap(),
+                elastos_protected_content_contracts::CustodyPoolIdentityV1::new(digest(0x46), 512)
+                    .unwrap(),
                 epoch.epoch_identity().unwrap(),
+                elastos_protected_content_contracts::CustodyCommitteeAuthorizationIdentityV1::new(
+                    digest(0x47),
+                    512,
+                )
+                .unwrap(),
                 ThresholdV1::new(2, 3).unwrap(),
                 digest(0x45),
                 epoch.statement().nodes().to_vec(),

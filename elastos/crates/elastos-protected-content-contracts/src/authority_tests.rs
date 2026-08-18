@@ -278,7 +278,9 @@ fn wrong_content_policy_threshold_and_session_are_authority_mismatches() {
                 original.key_envelope().envelope_bytes(),
                 original.key_envelope().node_set_id(),
                 original.key_envelope().threshold(),
+                original.key_envelope().custody_pool(),
                 original.key_envelope().custody_epoch(),
+                original.key_envelope().custody_committee_authorization(),
             )
             .unwrap(),
             original.rights_policy().clone(),
@@ -304,7 +306,9 @@ fn wrong_content_policy_threshold_and_session_are_authority_mismatches() {
                 original.key_envelope().envelope_bytes(),
                 digest(0xee),
                 ThresholdV1::new(3, 3).unwrap(),
+                original.key_envelope().custody_pool(),
                 custody_epoch_identity(),
+                original.key_envelope().custody_committee_authorization(),
             )
             .unwrap(),
             original.rights_policy().clone(),
@@ -757,19 +761,19 @@ fn canonical_signature_golden_vectors() {
     );
     assert_eq!(
         hex::encode(rights.wallet_signature()),
-        "cda3a5d61aca1bb33e1d4df4bcca941800dab7f7739018a0c190a6d1f1faaa2e53f098e4bd6b1bc53ebc4205162cd7a283763602c48d287582adb944a86e50bb01"
+        "f8d15c5a9b765f40686169e93ec196ff7e4c2fbe93132ecd1804e492687a029414f3c9b21e239cce63a31a1958b2d069ba7b89613a8fb807738f4eb6128ea86a01"
     );
     assert_eq!(
         hex::encode(decision.node_signature()),
-        "40a27f3b03e1f72754b9a26cc8fc62d980922982d82edfb127c6f45123b7d9d1aeb8b68ce2dac78ff12328eef24b2dd807039c176ad1b442558767b353518105"
+        "ddff2144ea6f6d53445a7799ef7a4e876966562501e80cfb96e4c50e25f2f08eb7a53e9282640f3239f8c415346672d483156bf8b003250f16cd34f10c07f903"
     );
     assert_eq!(
         hex::encode(contribution.node_signature()),
-        "23c25cfe287f73dbebb1fd7ee44c790f9966419041ed38fe9a4c3858cdc0a304f85c4e3054ae586e6bfa7c0d77105c4507209e578df802231716460ad7254109"
+        "87cd0ee716585a00dc56f8f935c03829baa5e304f6859bea86ecf95994419945f19ef3519f9eb9f476e76e3cd5717a8f231bbf0b8460709e7acd69a7a3ae7706"
     );
     assert_eq!(
         hex::encode(terminal.issuer_signature()),
-        "a3ac53c9c1f7f949a959371b31351b089ba6f84ecbd827c6550a306a5d4226991246fe52a060ff866a82a565623d523287833bbf1c3ae9dd49184440986a4306"
+        "e855771c56bbbd141728fa7cfc89f2268ae243a128c11463f49f75586e08359d4adc1eb9237d187c41afa096aede30ad631dbe862846580e149483264faacf06"
     );
 
     assert_eq!(
@@ -780,10 +784,10 @@ fn canonical_signature_golden_vectors() {
             hex::encode(terminal.canonical_hash().unwrap().as_bytes()),
         ],
         [
-            "61660286259d645be3551a50320dab0317901b61623e72b84ecb22830df2ef9d",
-            "6d55a220fb555f50f96500f0a6cf28ec933b15fefc9ac8925220a3520e3958c8",
-            "1a2900de201ab561469ea632ac6e06938b2ee4a2e7c007922a1543fca9c321f0",
-            "6be094d54f410df6423d8e2872ba8f54f1d1ad6d68d05277e5acc52a421766c8",
+            "7913817772c400273f2177da95a44219cec102ee24451c17f04a4a7c0f0c46a1",
+            "8f279ff1e622a435a90f9774e2c84ecbbdd52d290fba68432b1b20bf129020e1",
+            "ea9e345a4c7cee3f29e203990a8457fad79ea9f82036d2e686388af2b947f7c0",
+            "ee09e1fe43f4d5b42c3be036472a8089b9d348527031663116d6d64a4ce307fc",
         ]
         .map(str::to_string)
     );

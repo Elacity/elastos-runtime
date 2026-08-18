@@ -433,7 +433,7 @@ mod tests {
         let verified = signed.verify(&context).unwrap();
         assert_eq!(
             encode(verified.statement_hash().as_bytes()),
-            "0fa97000353d7968ffacf1908a9325aba58888d0a40f8f497bce2949237abe9e"
+            "741d092465bb9b16a16e62b7ad521ae54d56b14e5b25c6af6855a3f810b8dabd"
         );
     }
 
