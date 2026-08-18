@@ -242,8 +242,7 @@ mod tests {
         CanonicalContract, EncryptedContentIdentityV1, HpkeCiphertextV1, KeyReleaseError,
         KeyReleaseOutcomeV1, NodeContributionRefV1, NodeContributionStatementV1,
         RecipientSealedContributionV1, SignedNodeContributionV1, SignedTerminalReceiptV1,
-        TerminalReceiptIssuerKey, TerminalReceiptStatementV1, ThresholdV1,
-        VerifiedKeyReleaseRequestV1,
+        TerminalReceiptIssuerKey, TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1,
     };
 
     use crate::{
@@ -252,10 +251,10 @@ mod tests {
         release::produce_node_contribution_with_rng,
         test_support::{
             authenticated_runtime_release_operation_for_envelope_and_recipient_seed,
-            claimed_runtime_release_operation_for_envelope_and_node_seed, content_key,
-            custody_nodes, digest, node_custody_secret, node_public_key, node_signing_key,
-            provisioned_envelope, recipient_public_key, recipient_secret, signed_node_decision,
-            verified_release_request, verified_release_request_for_envelope,
+            claimed_runtime_release_operation_for_envelope_and_node_seed, content_key, digest,
+            node_custody_secret, node_public_key, node_signing_key, provisioned_envelope,
+            recipient_public_key, recipient_secret, signed_node_decision, verified_release_request,
+            verified_release_request_for_envelope,
             verified_release_request_for_envelope_and_recipient_seed, NOW,
         },
     };
@@ -455,11 +454,7 @@ mod tests {
         provision_custody_envelope_with_rng(
             EncryptedContentIdentityV1::new(digest(0x99), 4096).unwrap(),
             &content_key(),
-            crate::test_support::custody_pool_identity(),
-            crate::test_support::custody_epoch_identity(),
-            crate::test_support::custody_committee_authorization_identity(),
-            ThresholdV1::new(2, 3).unwrap(),
-            custody_nodes(),
+            &crate::test_support::validated_custody_committee(),
             &mut StdRng::from_seed([0x51; 32]),
             &mut rand10::rngs::StdRng::from_seed([0x52; 32]),
         )

@@ -169,12 +169,13 @@ mod tests {
             authenticated_runtime_release_operation_for_envelope_and_recipient_seed, content_key,
             custody_committee_authorization_identity, custody_epoch_identity, custody_nodes,
             custody_pool_identity, digest, node_custody_secret, node_public_key,
-            provisioned_envelope, NOW,
+            provisioned_envelope, validated_custody_committee, NOW,
         },
     };
     use elastos_protected_content_contracts::{
-        CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1, CustodyPoolIdentityV1,
-        EncryptedContentIdentityV1, ThresholdV1,
+        CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeManifestV1, CustodyEpochIdentityV1,
+        CustodyNodeIdentityV1, CustodyPoolIdentityV1, EncryptedContentIdentityV1,
+        ShareCoordinateV1, ThresholdV1,
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -190,18 +191,30 @@ mod tests {
         )>,
         seed: u8,
     ) -> CustodyEnvelopeV1 {
-        provision_custody_envelope_with_rng(
+        let original = provisioned_envelope();
+        let manifest = CustodyEnvelopeManifestV1::new(
             encrypted_content,
-            &content_key(),
             custody_pool,
             custody_epoch,
             custody_committee_authorization,
             threshold,
-            nodes,
-            &mut HpkeStdRng::from_seed([seed; 32]),
-            &mut ShamirStdRng::from_seed([seed.wrapping_add(1); 32]),
+            content_key().commitment(),
+            nodes
+                .into_iter()
+                .enumerate()
+                .map(|(index, (node_public_key, custody_public_key))| {
+                    CustodyNodeIdentityV1::new(
+                        node_public_key,
+                        custody_public_key,
+                        ShareCoordinateV1::new(u8::try_from(index + 1).unwrap()).unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect(),
         )
-        .unwrap()
+        .unwrap();
+        let _ = seed;
+        CustodyEnvelopeV1::new(manifest, original.stored_shares().to_vec()).unwrap()
     }
 
     #[test]
@@ -286,11 +299,7 @@ mod tests {
                 provision_custody_envelope_with_rng(
                     EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
                     &crate::ContentEncryptionKeyV1::from_test_bytes([0x23; 32]),
-                    custody_pool_identity(),
-                    custody_epoch_identity(),
-                    custody_committee_authorization_identity(),
-                    ThresholdV1::new(2, 3).unwrap(),
-                    custody_nodes(),
+                    &validated_custody_committee(),
                     &mut HpkeStdRng::from_seed([0x57; 32]),
                     &mut ShamirStdRng::from_seed([0x58; 32]),
                 )

@@ -6,10 +6,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use zeroize::Zeroizing;
 
 use elastos_protected_content_contracts::{
-    AuthenticatedRuntimeReleaseOperationV1, CustodyCommitteeAuthorizationIdentityV1,
-    CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyPoolIdentityV1, Digest32,
-    EncryptedContentIdentityV1, NodeCustodyPublicKeyV1, NodePublicKey, SignedNodeContributionV1,
-    SignedTerminalReceiptV1, TerminalReceiptIssuerKey, ThresholdV1, MAX_ENCRYPTED_CONTENT_BYTES,
+    AuthenticatedRuntimeReleaseOperationV1, CustodyEnvelopeV1, Digest32,
+    EncryptedContentIdentityV1, SignedNodeContributionV1, SignedTerminalReceiptV1,
+    TerminalReceiptIssuerKey, ValidatedCustodyCommitteeV1, MAX_ENCRYPTED_CONTENT_BYTES,
 };
 
 use crate::{ContentEncryptionKeyV1, CustodyError, RecipientSecretKeyV1};
@@ -188,11 +187,6 @@ pub struct AuthenticatedPayloadDecryptInputsV1<'a> {
 struct PayloadSealContextV1 {
     content_key: ContentEncryptionKeyV1,
     base_nonce: [u8; PAYLOAD_BASE_NONCE_BYTES_V1],
-    custody_pool: CustodyPoolIdentityV1,
-    custody_epoch: CustodyEpochIdentityV1,
-    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
-    threshold: ThresholdV1,
-    node_keys: Vec<(NodePublicKey, NodeCustodyPublicKeyV1)>,
 }
 
 impl SealedPayloadMetadataV1 {
@@ -225,26 +219,16 @@ impl DecryptedPayloadMetadataV1 {
 ///
 /// On any error this function returns no publishable metadata. Callers must
 /// discard the staging output instead of treating it as a complete object.
-#[allow(clippy::too_many_arguments)]
 pub fn seal_payload_to_staging_writer_v1<R: Read, W: Write>(
     content_type: &str,
     plaintext_bytes: u64,
     plaintext: &mut R,
     staging_ciphertext: &mut W,
-    custody_pool: CustodyPoolIdentityV1,
-    custody_epoch: CustodyEpochIdentityV1,
-    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
-    threshold: ThresholdV1,
-    node_keys: Vec<(NodePublicKey, NodeCustodyPublicKeyV1)>,
+    committee: &ValidatedCustodyCommitteeV1,
 ) -> Result<SealedPayloadMetadataV1, CustodyError> {
     let context = PayloadSealContextV1 {
         content_key: ContentEncryptionKeyV1::generate()?,
         base_nonce: random_base_nonce()?,
-        custody_pool,
-        custody_epoch,
-        custody_committee_authorization,
-        threshold,
-        node_keys,
     };
     seal_payload_to_staging_writer_inner(
         content_type,
@@ -252,6 +236,7 @@ pub fn seal_payload_to_staging_writer_v1<R: Read, W: Write>(
         plaintext,
         staging_ciphertext,
         &context,
+        committee,
     )
 }
 
@@ -290,6 +275,7 @@ fn seal_payload_to_staging_writer_inner<R: Read, W: Write>(
     plaintext: &mut R,
     staging_ciphertext: &mut W,
     context: &PayloadSealContextV1,
+    committee: &ValidatedCustodyCommitteeV1,
 ) -> Result<SealedPayloadMetadataV1, CustodyError> {
     let header = AuthenticatedChunkPayloadHeaderV1::new_authenticated(
         content_type,
@@ -363,11 +349,7 @@ fn seal_payload_to_staging_writer_inner<R: Read, W: Write>(
     let custody_envelope = crate::provision_custody_envelope(
         encrypted_content_identity.clone(),
         &context.content_key,
-        context.custody_pool,
-        context.custody_epoch,
-        context.custody_committee_authorization,
-        context.threshold,
-        context.node_keys.clone(),
+        committee,
     )?;
     Ok(SealedPayloadMetadataV1 {
         header,
@@ -771,13 +753,8 @@ fn seal_payload_to_vec_with_test_material(
                 content_key.with_bytes(|bytes| *bytes),
             ),
             base_nonce,
-            custody_pool: crate::test_support::custody_pool_identity(),
-            custody_epoch: crate::test_support::custody_epoch_identity(),
-            custody_committee_authorization:
-                crate::test_support::custody_committee_authorization_identity(),
-            threshold: ThresholdV1::new(2, 3)?,
-            node_keys: crate::test_support::custody_nodes(),
         },
+        &crate::test_support::validated_custody_committee(),
     )?;
     Ok((framed, metadata))
 }
@@ -788,14 +765,15 @@ mod tests {
 
     use ed25519_dalek::{Signer as _, SigningKey};
     use elastos_protected_content_contracts::{
-        AtomicReplayClaimer, CanonicalContract, Digest32, EncryptedContentIdentityV1,
-        EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1,
-        KeyReleaseRequestV1, NodeContributionRefV1, ProtectedContentBindingV1,
-        RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayClaimError, ReplayClaimKeyV1,
-        ReplayNonce16, RightsActionV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
-        RightsRequestV1, RightsSubjectSourceV1, RightsVerificationContextV1,
-        RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
-        RuntimeSessionBindingV1, SignedNodeContributionV1, SignedRecipientKeyAuthorizationV1,
+        AtomicReplayClaimer, CanonicalContract, CustodyPoolError, CustodyPoolIdentityV1,
+        CustodyPoolMemberStateV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
+        EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1,
+        NodeContributionRefV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
+        RecipientPublicKeyBytesV1, ReplayClaimError, ReplayClaimKeyV1, ReplayNonce16,
+        RightsActionV1, RightsObservationFinalityV1, RightsPolicyBodyV1, RightsRequestV1,
+        RightsSubjectSourceV1, RightsVerificationContextV1, RuntimeOperationIssuerKeyV1,
+        RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1,
+        SignedNodeContributionV1, SignedRecipientKeyAuthorizationV1,
         SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
         TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1, WalletAddress,
         WalletSignedRightsRequestV1, CUSTODY_HPKE_SUITE_ID_V1,
@@ -804,10 +782,6 @@ mod tests {
     use rand09::rngs::StdRng;
     use sha3::Keccak256;
     use std::collections::{BTreeSet, HashMap};
-
-    fn node_keys() -> Vec<(NodePublicKey, NodeCustodyPublicKeyV1)> {
-        crate::test_support::custody_nodes()
-    }
 
     #[derive(Default)]
     struct ReplayClaimsForTests(HashMap<ReplayClaimKeyV1, u64>);
@@ -1172,11 +1146,7 @@ mod tests {
             u64::try_from(plaintext.len()).unwrap(),
             &mut plaintext_reader,
             &mut framed,
-            crate::test_support::custody_pool_identity(),
-            crate::test_support::custody_epoch_identity(),
-            crate::test_support::custody_committee_authorization_identity(),
-            ThresholdV1::new(2, 3).unwrap(),
-            node_keys(),
+            &crate::test_support::validated_custody_committee(),
         )
         .unwrap();
         let operation = authenticated_runtime_release_operation_for_sealed_envelope_for_tests(
@@ -1297,11 +1267,7 @@ mod tests {
             4096,
             &mut first_reader,
             &mut first_framed,
-            crate::test_support::custody_pool_identity(),
-            crate::test_support::custody_epoch_identity(),
-            crate::test_support::custody_committee_authorization_identity(),
-            ThresholdV1::new(2, 3).unwrap(),
-            node_keys(),
+            &crate::test_support::validated_custody_committee(),
         )
         .unwrap();
         let second = seal_payload_to_staging_writer_v1(
@@ -1309,11 +1275,7 @@ mod tests {
             4096,
             &mut second_reader,
             &mut second_framed,
-            crate::test_support::custody_pool_identity(),
-            crate::test_support::custody_epoch_identity(),
-            crate::test_support::custody_committee_authorization_identity(),
-            ThresholdV1::new(2, 3).unwrap(),
-            node_keys(),
+            &crate::test_support::validated_custody_committee(),
         )
         .unwrap();
 
@@ -1739,11 +1701,7 @@ mod tests {
             MAX_ENCRYPTED_CONTENT_BYTES,
             &mut reader,
             &mut writer,
-            crate::test_support::custody_pool_identity(),
-            crate::test_support::custody_epoch_identity(),
-            crate::test_support::custody_committee_authorization_identity(),
-            ThresholdV1::new(2, 3).unwrap(),
-            node_keys(),
+            &crate::test_support::validated_custody_committee(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1874,77 +1832,104 @@ mod tests {
             &PayloadSealContextV1 {
                 content_key,
                 base_nonce: [0x64; PAYLOAD_BASE_NONCE_BYTES_V1],
-                custody_pool: crate::test_support::custody_pool_identity(),
-                custody_epoch: crate::test_support::custody_epoch_identity(),
-                custody_committee_authorization:
-                    crate::test_support::custody_committee_authorization_identity(),
-                threshold: ThresholdV1::new(2, 3).unwrap(),
-                node_keys: node_keys(),
             },
+            &crate::test_support::validated_custody_committee(),
         )
         .unwrap_err();
         assert!(matches!(err, CustodyError::PayloadIo));
     }
 
     #[test]
-    fn payload_custody_provision_failure_returns_no_publishable_metadata() {
-        let content_key = ContentEncryptionKeyV1::from_test_bytes([0x44; 32]);
-        let plaintext = vec![0x31; 4096];
-        let mut reader = std::io::Cursor::new(plaintext.clone());
-        let mut staged = Vec::new();
-        let mut invalid_node_keys = node_keys();
-        invalid_node_keys[1].1 = invalid_node_keys[0].1;
-        let err = seal_payload_to_staging_writer_inner(
-            "application/octet-stream",
-            4096,
-            &mut reader,
-            &mut staged,
-            &PayloadSealContextV1 {
-                content_key: ContentEncryptionKeyV1::from_test_bytes(
-                    content_key.with_bytes(|bytes| *bytes),
-                ),
-                base_nonce: [0x65; PAYLOAD_BASE_NONCE_BYTES_V1],
-                custody_pool: crate::test_support::custody_pool_identity(),
-                custody_epoch: crate::test_support::custody_epoch_identity(),
-                custody_committee_authorization:
-                    crate::test_support::custody_committee_authorization_identity(),
-                threshold: ThresholdV1::new(2, 3).unwrap(),
-                node_keys: invalid_node_keys,
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            CustodyError::Contract(
-                elastos_protected_content_contracts::ContractError::InvalidField(
-                    "node_custody_public_key"
-                )
-            )
-        ));
-        let (decrypted_metadata, decrypted) = decrypt_payload_to_vec_with_content_key_for_tests(
-            &payload_identity_for_tests(&staged),
-            &staged,
-            &content_key,
-        )
-        .unwrap();
-        assert_eq!(decrypted, plaintext);
-        assert_eq!(
-            u64::try_from(staged.len()).unwrap(),
-            metadata_from_plaintext_for_tests(
-                "application/octet-stream",
-                u64::try_from(plaintext.len()).unwrap(),
-            )
-            .expected_framed_bytes()
-            .unwrap()
+    fn payload_rejects_invalid_committee_selection_before_staging_output() {
+        let staged = Vec::<u8>::new();
+        let epoch = crate::test_support::signed_custody_epoch();
+        let original_pool = crate::test_support::signed_custody_pool();
+        let original_authorization = crate::test_support::signed_committee_authorization(
+            original_pool.pool_identity().unwrap(),
+            epoch.epoch_identity().unwrap(),
         );
-        assert_eq!(
-            decrypted_metadata.content_type(),
-            "application/octet-stream"
+        let original_authorization_identity =
+            original_authorization.authorization_identity().unwrap();
+
+        let later_pool = crate::test_support::signed_custody_pool_with_member_state(
+            CustodyPoolMemberStateV1::Active,
+            (crate::test_support::NOW - 20, crate::test_support::NOW + 20),
         );
-        assert_eq!(
-            decrypted_metadata.plaintext_bytes(),
-            u64::try_from(plaintext.len()).unwrap()
+        let later_authorization = crate::test_support::signed_committee_authorization(
+            later_pool.pool_identity().unwrap(),
+            epoch.epoch_identity().unwrap(),
         );
+        let wrong_pool_authorization = crate::test_support::signed_committee_authorization(
+            CustodyPoolIdentityV1::new(Digest32::new([0xee; 32]), 123).unwrap(),
+            epoch.epoch_identity().unwrap(),
+        );
+
+        let revoked_pool = crate::test_support::signed_custody_pool_with_member_state(
+            CustodyPoolMemberStateV1::Revoked,
+            (crate::test_support::NOW - 10, crate::test_support::NOW + 10),
+        );
+        let revoked_authorization = crate::test_support::signed_committee_authorization(
+            revoked_pool.pool_identity().unwrap(),
+            epoch.epoch_identity().unwrap(),
+        );
+        let expired_pool = crate::test_support::signed_custody_pool_with_member_state(
+            CustodyPoolMemberStateV1::Active,
+            (crate::test_support::NOW - 20, crate::test_support::NOW - 10),
+        );
+        let expired_authorization = crate::test_support::signed_committee_authorization(
+            expired_pool.pool_identity().unwrap(),
+            epoch.epoch_identity().unwrap(),
+        );
+
+        let cases = vec![
+            (
+                "revoked",
+                revoked_pool,
+                revoked_authorization.clone(),
+                revoked_authorization.authorization_identity().unwrap(),
+                Err(CustodyPoolError::Revoked),
+            ),
+            (
+                "expired",
+                expired_pool,
+                expired_authorization.clone(),
+                expired_authorization.authorization_identity().unwrap(),
+                Err(CustodyPoolError::Expired),
+            ),
+            (
+                "wrong_pool",
+                later_pool,
+                original_authorization,
+                original_authorization_identity,
+                Err(CustodyPoolError::BindingMismatch("custody_pool_identity")),
+            ),
+            (
+                "wrong_authorization",
+                original_pool,
+                wrong_pool_authorization,
+                later_authorization.authorization_identity().unwrap(),
+                Err(CustodyPoolError::BindingMismatch(
+                    "custody_committee_authorization_identity",
+                )),
+            ),
+        ];
+
+        for (label, pool, authorization, expected_identity, expected_error) in cases {
+            let result =
+                elastos_protected_content_contracts::validate_custody_epoch_against_pool_at(
+                    crate::test_support::custody_policy_issuer(),
+                    expected_identity,
+                    &pool,
+                    &epoch,
+                    &authorization,
+                    crate::test_support::NOW,
+                );
+            assert_eq!(result, expected_error, "{label}");
+            assert!(
+                staged.is_empty(),
+                "{label} invalid selection must fail before staging output"
+            );
+        }
     }
 
     fn max_valid_plaintext_bytes_for_tests(
@@ -1988,18 +1973,5 @@ mod tests {
             *slot = *base ^ *derived;
         }
         u64::from_be_bytes(index_bytes)
-    }
-
-    fn metadata_from_plaintext_for_tests(
-        content_type: &str,
-        plaintext_bytes: u64,
-    ) -> AuthenticatedChunkPayloadHeaderV1 {
-        AuthenticatedChunkPayloadHeaderV1::new_authenticated(
-            content_type,
-            plaintext_bytes,
-            [0x11; PAYLOAD_BASE_NONCE_BYTES_V1],
-            ContentEncryptionKeyV1::from_test_bytes([0x44; 32]).commitment(),
-        )
-        .unwrap()
     }
 }

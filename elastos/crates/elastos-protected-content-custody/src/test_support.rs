@@ -8,17 +8,20 @@ use sha3::Keccak256;
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
     AtomicReplayClaimer, AuthenticatedRuntimeReleaseOperationV1, CanonicalContract,
-    CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1,
-    CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
-    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
+    CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
+    CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeV1, CustodyEpochIdentityV1,
+    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyPoolFailureDomainIdV1,
+    CustodyPoolIdentityV1, CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1,
+    CustodyPoolStatementV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
     EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1,
     NodePublicKey, ProtectedContentBindingV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
     ReplayClaimError, ReplayClaimKeyV1, ReplayNonce16, RightsActionV1, RightsDecisionV1,
     RightsEvaluationEvidenceRequestV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
     RightsRequestV1, RightsSubjectSourceV1, RightsVerificationContextV1,
     RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
-    RuntimeSessionBindingV1, SignedCustodyEpochV1, SignedNodeRightsDecisionV1,
-    SignedRecipientKeyAuthorizationV1, SignedRuntimeReleaseOperationV1, ThresholdV1,
+    RuntimeSessionBindingV1, SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1,
+    SignedCustodyPoolV1, SignedNodeRightsDecisionV1, SignedRecipientKeyAuthorizationV1,
+    SignedRuntimeReleaseOperationV1, ThresholdV1, ValidatedCustodyCommitteeV1,
     VerifiedKeyReleaseRequestV1, WalletAddress, WalletSignedRightsRequestV1,
     CUSTODY_HPKE_SUITE_ID_V1,
 };
@@ -138,6 +141,104 @@ pub(crate) fn signed_custody_epoch() -> SignedCustodyEpochV1 {
             .sign(&statement.canonical_bytes().unwrap())
             .to_bytes()
             .to_vec(),
+    )
+    .unwrap()
+}
+
+fn custody_policy_issuer_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x71; 32])
+}
+
+pub(crate) fn custody_policy_issuer() -> CustodyEpochIssuerKeyV1 {
+    CustodyEpochIssuerKeyV1::new(custody_policy_issuer_key().verifying_key().to_bytes()).unwrap()
+}
+
+fn custody_pool_member(
+    node_seed: u8,
+    custody_seed: u8,
+    active_window: (u64, u64),
+    state: CustodyPoolMemberStateV1,
+) -> CustodyPoolMemberV1 {
+    CustodyPoolMemberV1::new(
+        node_public_key(node_seed),
+        node_custody_secret(custody_seed).public_key().unwrap(),
+        CustodyPoolOperatorIdV1::new([0x80 + node_seed; 32]),
+        CustodyPoolFailureDomainIdV1::new([0x90 + node_seed; 32]),
+        CustodyApprovedSuitesV1::new(
+            CUSTODY_HPKE_SUITE_ID_V1,
+            CUSTODY_HPKE_SUITE_ID_V1,
+            CUSTODY_HPKE_SUITE_ID_V1,
+        )
+        .unwrap(),
+        active_window,
+        state,
+    )
+    .unwrap()
+}
+
+pub(crate) fn signed_custody_pool_with_member_state(
+    state: CustodyPoolMemberStateV1,
+    active_window: (u64, u64),
+) -> SignedCustodyPoolV1 {
+    let issuer_key = custody_policy_issuer_key();
+    let statement = CustodyPoolStatementV1::new(
+        custody_policy_issuer(),
+        vec![
+            custody_pool_member(1, 1, active_window, state),
+            custody_pool_member(2, 2, active_window, state),
+            custody_pool_member(3, 3, active_window, state),
+        ],
+    )
+    .unwrap();
+    SignedCustodyPoolV1::new(
+        statement.clone(),
+        issuer_key
+            .sign(&statement.canonical_bytes().unwrap())
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+pub(crate) fn signed_custody_pool() -> SignedCustodyPoolV1 {
+    signed_custody_pool_with_member_state(CustodyPoolMemberStateV1::Active, (NOW - 10, NOW + 10))
+}
+
+pub(crate) fn signed_committee_authorization(
+    pool_identity: CustodyPoolIdentityV1,
+    epoch_identity: CustodyEpochIdentityV1,
+) -> SignedCustodyCommitteeAuthorizationV1 {
+    let issuer_key = custody_policy_issuer_key();
+    let statement = CustodyCommitteeAuthorizationStatementV1::new(
+        custody_policy_issuer(),
+        pool_identity,
+        epoch_identity,
+    )
+    .unwrap();
+    SignedCustodyCommitteeAuthorizationV1::new(
+        statement.clone(),
+        issuer_key
+            .sign(&statement.canonical_bytes().unwrap())
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+pub(crate) fn validated_custody_committee() -> ValidatedCustodyCommitteeV1 {
+    let pool = signed_custody_pool();
+    let epoch = signed_custody_epoch();
+    let authorization = signed_committee_authorization(
+        pool.pool_identity().unwrap(),
+        epoch.epoch_identity().unwrap(),
+    );
+    elastos_protected_content_contracts::validate_custody_epoch_against_pool_at(
+        custody_policy_issuer(),
+        authorization.authorization_identity().unwrap(),
+        &pool,
+        &epoch,
+        &authorization,
+        NOW,
     )
     .unwrap()
 }
@@ -414,11 +515,7 @@ pub(crate) fn provisioned_envelope() -> CustodyEnvelopeV1 {
     provision_custody_envelope_with_rng(
         EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
         &content_key(),
-        custody_pool_identity(),
-        custody_epoch_identity(),
-        custody_committee_authorization_identity(),
-        ThresholdV1::new(2, 3).unwrap(),
-        custody_nodes(),
+        &validated_custody_committee(),
         &mut HpkeStdRng::from_seed([0x41; 32]),
         &mut ShamirStdRng::from_seed([0x42; 32]),
     )

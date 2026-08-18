@@ -675,12 +675,17 @@ impl VerifiedCustodyCommitteeAuthorizationV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedCustodyCommitteeV1 {
     pool_identity: CustodyPoolIdentityV1,
+    authorization_identity: CustodyCommitteeAuthorizationIdentityV1,
     committee: VerifiedCustodyEpochV1,
 }
 
 impl ValidatedCustodyCommitteeV1 {
     pub const fn pool_identity(&self) -> CustodyPoolIdentityV1 {
         self.pool_identity
+    }
+
+    pub const fn authorization_identity(&self) -> CustodyCommitteeAuthorizationIdentityV1 {
+        self.authorization_identity
     }
 
     pub fn committee(&self) -> &VerifiedCustodyEpochV1 {
@@ -727,7 +732,7 @@ pub fn validate_custody_epoch_against_pool_at(
     if verified_epoch.issuer() != expected_policy_authority {
         return Err(CustodyPoolError::UnexpectedIssuer("custody_epoch_issuer"));
     }
-    signed_committee_authorization.verify(
+    let verified_authorization = signed_committee_authorization.verify(
         expected_policy_authority,
         expected_authorization_identity,
         verified_pool.pool_identity(),
@@ -762,6 +767,7 @@ pub fn validate_custody_epoch_against_pool_at(
 
     Ok(ValidatedCustodyCommitteeV1 {
         pool_identity: verified_pool.pool_identity(),
+        authorization_identity: verified_authorization.authorization_identity(),
         committee: verified_epoch,
     })
 }
@@ -996,6 +1002,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(validated.pool_identity(), pool.pool_identity().unwrap());
+        assert_eq!(
+            validated.authorization_identity(),
+            authorization.authorization_identity().unwrap()
+        );
         assert_eq!(
             validated.committee().epoch_identity(),
             epoch.epoch_identity().unwrap()
