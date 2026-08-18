@@ -402,7 +402,7 @@ impl DecryptProviderRequestV1 {
     fn into_validated_at(
         self,
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
-        now_unix_ms: u64,
+        now_unix_seconds: u64,
     ) -> Result<ValidatedDecryptProviderRequestV1, ContractError> {
         match self.0 {
             DecryptProviderRequestKindV1::PrepareRecipient {
@@ -414,7 +414,7 @@ impl DecryptProviderRequestV1 {
                 expires_at,
                 ..
             } => {
-                if now_unix_ms < issued_at || now_unix_ms >= expires_at {
+                if now_unix_seconds < issued_at || now_unix_seconds >= expires_at {
                     return Err(ContractError::InvalidField("decrypt_prepare_window"));
                 }
                 let runtime_operation_issuer =
@@ -446,7 +446,7 @@ impl DecryptProviderRequestV1 {
             } => {
                 let authenticated_runtime_release_operation = signed_runtime_release_operation
                     .decode::<SignedRuntimeReleaseOperationV1>()?
-                    .verify(expected_runtime_issuer, now_unix_ms)
+                    .verify(expected_runtime_issuer, now_unix_seconds)
                     .map_err(|_| ContractError::InvalidField("signed_runtime_release_operation"))?;
                 let expected_terminal_issuer =
                     TerminalReceiptIssuerKey::new(expected_terminal_issuer)?;
@@ -468,13 +468,13 @@ impl DecryptProviderRequestV1 {
                     Vec::with_capacity(signed_node_contributions.len());
                 for contribution in &signed_node_contributions {
                     let verified = authenticated_runtime_release_operation
-                        .verify_node_contribution(contribution, &node_set, now_unix_ms)
+                        .verify_node_contribution(contribution, &node_set, now_unix_seconds)
                         .map_err(|_| ContractError::InvalidField("signed_node_contributions"))?;
                     authenticated_runtime_release_operation
                         .validate_node_release_claim_context(
                             &custody_envelope,
                             verified.node_public_key(),
-                            now_unix_ms,
+                            now_unix_seconds,
                         )
                         .map_err(|_| ContractError::InvalidField("custody_envelope"))?;
                     verified_contributions.push(verified);
@@ -487,7 +487,7 @@ impl DecryptProviderRequestV1 {
                         &signed_terminal_receipt,
                         &verified_contributions,
                         expected_terminal_issuer,
-                        now_unix_ms,
+                        now_unix_seconds,
                     )
                     .map_err(|_| ContractError::InvalidField("signed_terminal_receipt"))?;
                 Ok(ValidatedDecryptProviderRequestV1(
@@ -583,10 +583,10 @@ impl ValidatedDecryptProviderRequestV1 {
     pub fn decode_and_validate_at(
         bytes: &[u8],
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
-        now_unix_ms: u64,
+        now_unix_seconds: u64,
     ) -> Result<Self, serde_json::Error> {
         DecryptProviderRequestV1::decode_wire(bytes)?
-            .into_validated_at(expected_runtime_issuer, now_unix_ms)
+            .into_validated_at(expected_runtime_issuer, now_unix_seconds)
             .map_err(contract_decode_error)
     }
 

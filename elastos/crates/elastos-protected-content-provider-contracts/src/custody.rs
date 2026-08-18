@@ -235,14 +235,14 @@ impl CustodyProviderRequestV1 {
         self,
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         expected_local_node_public_key: NodePublicKey,
-        now_unix_ms: u64,
+        now_unix_seconds: u64,
     ) -> Result<ValidatedCustodyProviderRequestV1, CustodyProviderRequestValidationErrorV1> {
         match &self.0 {
             CustodyProviderRequestKindV1::ProvisionNodeShare { .. } => {
                 let record = self.custody_node_provisioning_record()?;
                 let signed_provisioning = self.signed_runtime_custody_provisioning()?;
                 let authenticated_runtime_custody_provisioning = signed_provisioning
-                    .verify_for_record(&record, expected_runtime_issuer, now_unix_ms)
+                    .verify_for_record(&record, expected_runtime_issuer, now_unix_seconds)
                     .map_err(|_| CustodyProviderRequestValidationErrorV1::Contract)?;
                 if record.selected_node_public_key() != expected_local_node_public_key {
                     return Err(CustodyProviderRequestValidationErrorV1::Contract);
@@ -262,7 +262,7 @@ impl CustodyProviderRequestV1 {
                 let signed_node_rights_decision = self.signed_node_rights_decision()?;
                 let authenticated_runtime_release_operation = self
                     .signed_runtime_release_operation()?
-                    .verify(expected_runtime_issuer, now_unix_ms)
+                    .verify(expected_runtime_issuer, now_unix_seconds)
                     .map_err(|_| CustodyProviderRequestValidationErrorV1::Contract)?;
                 let node_set = authenticated_runtime_release_operation
                     .statement()
@@ -282,7 +282,7 @@ impl CustodyProviderRequestV1 {
                     .verify_node_rights_decision(
                         &signed_node_rights_decision,
                         &node_set,
-                        now_unix_ms,
+                        now_unix_seconds,
                     )
                     .map_err(|error| match error {
                         KeyReleaseError::RightsDenied => {
@@ -355,12 +355,12 @@ impl ValidatedCustodyProviderRequestV1 {
         bytes: &[u8],
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         expected_local_node_public_key: NodePublicKey,
-        now_unix_ms: u64,
+        now_unix_seconds: u64,
     ) -> Result<Self, CustodyProviderRequestValidationErrorV1> {
         CustodyProviderRequestV1::decode_wire(bytes)?.into_validated_at(
             expected_runtime_issuer,
             expected_local_node_public_key,
-            now_unix_ms,
+            now_unix_seconds,
         )
     }
 
@@ -680,7 +680,7 @@ impl CustodyProviderResponseV1 {
         request: &CustodyProviderRequestV1,
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         expected_local_node_public_key: NodePublicKey,
-        now_unix_ms: u64,
+        now_unix_seconds: u64,
     ) -> Result<(), ContractError> {
         match &self.0 {
             CustodyProviderResponseKindV1::Provisioned { .. } => {
@@ -689,7 +689,7 @@ impl CustodyProviderResponseV1 {
                     .into_validated_at(
                         expected_runtime_issuer,
                         expected_local_node_public_key,
-                        now_unix_ms,
+                        now_unix_seconds,
                     )
                     .map_err(|_| ContractError::InvalidField("custody_provider_request"))?;
                 let provision = validated.provision_node_share()?;
@@ -720,7 +720,7 @@ impl CustodyProviderResponseV1 {
                     .into_validated_at(
                         expected_runtime_issuer,
                         expected_local_node_public_key,
-                        now_unix_ms,
+                        now_unix_seconds,
                     )
                     .map_err(|_| ContractError::InvalidField("custody_provider_request"))?;
                 let release = validated.release_contribution()?;
@@ -735,7 +735,7 @@ impl CustodyProviderResponseV1 {
                 let contribution: SignedNodeContributionV1 = signed_node_contribution.decode()?;
                 let verified = release
                     .authenticated_runtime_release_operation()
-                    .verify_node_contribution(&contribution, &node_set, now_unix_ms)
+                    .verify_node_contribution(&contribution, &node_set, now_unix_seconds)
                     .map_err(|_| ContractError::InvalidField("signed_node_contribution"))?;
                 if verified.node_public_key() != release.selected_node_public_key() {
                     return Err(ContractError::InvalidField("signed_node_contribution"));
@@ -748,7 +748,7 @@ impl CustodyProviderResponseV1 {
                     .into_validated_at(
                         expected_runtime_issuer,
                         expected_local_node_public_key,
-                        now_unix_ms,
+                        now_unix_seconds,
                     )
                     .map_err(|_| ContractError::InvalidField("custody_provider_request"))?;
                 let release = validated.release_contribution()?;

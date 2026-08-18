@@ -118,12 +118,12 @@ impl RightsProviderRequestV1 {
     fn into_validated_at(
         self,
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
-        now_unix_ms: u64,
+        now_unix_seconds: u64,
     ) -> Result<ValidatedRightsProviderRequestV1, ContractError> {
         let selected_node_public_key = self.selected_node_public_key()?;
         let signed_runtime_release_operation = self.signed_runtime_release_operation()?;
         let authenticated_runtime_release_operation = signed_runtime_release_operation
-            .verify(expected_runtime_issuer, now_unix_ms)
+            .verify(expected_runtime_issuer, now_unix_seconds)
             .map_err(|_| ContractError::InvalidField("signed_runtime_release_operation"))?;
         let node_set = authenticated_runtime_release_operation
             .statement()
@@ -168,10 +168,10 @@ impl ValidatedRightsProviderRequestV1 {
     pub fn decode_and_validate_at(
         bytes: &[u8],
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
-        now_unix_ms: u64,
+        now_unix_seconds: u64,
     ) -> Result<Self, serde_json::Error> {
         RightsProviderRequestV1::decode_wire(bytes)?
-            .into_validated_at(expected_runtime_issuer, now_unix_ms)
+            .into_validated_at(expected_runtime_issuer, now_unix_seconds)
             .map_err(contract_decode_error)
     }
 
@@ -326,7 +326,7 @@ impl RightsProviderResponseV1 {
         &self,
         request: &RightsProviderRequestV1,
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
-        now_unix_ms: u64,
+        now_unix_seconds: u64,
     ) -> Result<(), ContractError> {
         match &self.0 {
             RightsProviderResponseKindV1::Decision {
@@ -335,7 +335,7 @@ impl RightsProviderResponseV1 {
             } => {
                 let validated = request
                     .clone()
-                    .into_validated_at(expected_runtime_issuer, now_unix_ms)?;
+                    .into_validated_at(expected_runtime_issuer, now_unix_seconds)?;
                 let node_set = validated
                     .authenticated_runtime_release_operation()
                     .statement()
@@ -352,14 +352,14 @@ impl RightsProviderResponseV1 {
                 }
                 validated
                     .authenticated_runtime_release_operation()
-                    .verify_node_rights_decision(&signed_decision, &node_set, now_unix_ms)
+                    .verify_node_rights_decision(&signed_decision, &node_set, now_unix_seconds)
                     .map_err(|_| ContractError::InvalidField("signed_node_rights_decision"))?;
                 Ok(())
             }
             RightsProviderResponseKindV1::Failure { .. } => {
                 let authenticated = request
                     .clone()
-                    .into_validated_at(expected_runtime_issuer, now_unix_ms)?
+                    .into_validated_at(expected_runtime_issuer, now_unix_seconds)?
                     .authenticated_runtime_release_operation
                     .clone();
                 if self.failure_audit_request_id()? != authenticated.statement().audit_request_id()
