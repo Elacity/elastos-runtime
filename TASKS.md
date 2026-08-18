@@ -67,6 +67,19 @@ enter this candidate to satisfy the five gates above.
 
 ## Later
 
+### Consequence-aware effects
+
+- [ ] Before shipping a physical or retry-sensitive provider, define its typed
+  observation or actuation contract and provider operation classification.
+  Runtime must enforce or strengthen that classification. Also define the
+  effect-ID and reconciliation policy, deadlines, settlement evidence, and
+  local safety owner. Prove that capsule metadata cannot downgrade the policy,
+  remote authority cannot bypass a destination interlock, and reconnect or
+  timeout cannot repeat an uncertain effect. Keep field buses, controller
+  protocols, peers, host paths, backends, and credentials below the provider
+  boundary. Do not add a separate OT authority stack or claim Runtime is a hard
+  real-time controller.
+
 ### Collaboration identity and Carrier boundary
 
 - [ ] Define the wider-rollout rendezvous and abuse-control plan for People

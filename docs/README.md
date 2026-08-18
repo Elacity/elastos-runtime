@@ -15,14 +15,22 @@ Each top-level ledger has one job:
 - [Local source Home setup](HOME_LOCAL_SETUP.md): source-home browser Home on one machine
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
 - [Glossary](GLOSSARY.md): canonical terminology
+- [ElastOS system map](system-map/README.md): layered C4 and code paths for
+  people and agents
 
 ## Architecture and core model
 
 - [Architecture](ARCHITECTURE.md): responsibility, authority, and isolation boundaries
+- [Human and agent architecture](AGENT_ARCHITECTURE.md): principal parity,
+  profiles, Agent Host capsules, delegation, and provider effects
 - [Capsule model](CAPSULE_MODEL.md): artifact, Runtime contract, instance, state,
   and head
 - [Namespaces](NAMESPACES.md): `localhost://`, `elastos://`, and principal roots
 - [Carrier](CARRIER.md): endpoint-authenticated communication and content transport
+- [Private network](PRIVATE_NETWORK.md): signed membership, named services,
+  optional IP compatibility, Exit, and LAN Gateway policy
+- [Consequence-aware effects](CONSEQUENCE_AWARE_EFFECTS.md): shared observation,
+  actuation, settlement, and local-safety rules
 - [Content availability](CONTENT_AVAILABILITY.md): CID, IPLD, availability, and replication
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
   discovery, and current Chat integration
@@ -54,6 +62,8 @@ Each top-level ledger has one job:
 
 - [Peer resource contract](../elastos/docs/PEER_PROTOCOL.md): peer bootstrap,
   topic membership, gossip operations, and trust limits
+- [Model provider](MODEL_PROVIDER.md): provider and model selection, streams,
+  cancellation, recovery, and terminal outcomes
 - [Chain provider](CHAIN_PROVIDER.md): typed chain reads, proofs, and transactions
 - [Wallet provider](WALLET_PROVIDER.md): account, proof, approval, and signing authority
 - [Protected content](PROTECTED_CONTENT.md): sealed object access sequence
