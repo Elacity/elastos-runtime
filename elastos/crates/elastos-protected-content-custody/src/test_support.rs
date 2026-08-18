@@ -453,7 +453,7 @@ pub(crate) fn authenticated_runtime_release_operation_for_envelope_and_recipient
             .to_vec(),
     )
     .unwrap()
-    .verify(NOW + 3)
+    .verify(statement.runtime_operation_issuer(), NOW + 3)
     .unwrap()
 }
 

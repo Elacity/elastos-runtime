@@ -348,6 +348,7 @@ impl SignedRuntimeCustodyProvisioningV1 {
     pub fn verify_for_record(
         &self,
         record: &CustodyNodeProvisioningRecordV1,
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         now: u64,
     ) -> Result<AuthenticatedRuntimeCustodyProvisioningV1, RuntimeCustodyProvisioningError> {
         self.canonical_bytes()?;
@@ -356,6 +357,11 @@ impl SignedRuntimeCustodyProvisioningV1 {
         if self.statement.record_identity != record_identity {
             return Err(RuntimeCustodyProvisioningError::BindingMismatch(
                 "custody_node_provisioning_record_identity",
+            ));
+        }
+        if self.statement.runtime_operation_issuer != expected_runtime_issuer {
+            return Err(RuntimeCustodyProvisioningError::BindingMismatch(
+                "runtime_operation_issuer",
             ));
         }
         let signature = Signature::from_bytes(
@@ -628,7 +634,13 @@ mod tests {
         let signed = signed_for(&record, 2_000_000_000, 2_000_000_060);
         let canonical = signed.canonical_bytes().unwrap();
         let decoded = SignedRuntimeCustodyProvisioningV1::from_canonical_bytes(&canonical).unwrap();
-        let authenticated = decoded.verify_for_record(&record, 2_000_000_010).unwrap();
+        let authenticated = decoded
+            .verify_for_record(
+                &record,
+                signed.statement().runtime_operation_issuer(),
+                2_000_000_010,
+            )
+            .unwrap();
         assert_eq!(
             authenticated.record_identity(),
             record.record_identity().unwrap()
@@ -781,7 +793,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            signed.verify_for_record(&other, 2_000_000_010),
+            signed.verify_for_record(
+                &other,
+                signed.statement().runtime_operation_issuer(),
+                2_000_000_010,
+            ),
             Err(RuntimeCustodyProvisioningError::BindingMismatch(
                 "custody_node_provisioning_record_identity"
             ))
@@ -792,8 +808,25 @@ mod tests {
         bytes[last] ^= 1;
         let tampered = SignedRuntimeCustodyProvisioningV1::from_canonical_bytes(&bytes).unwrap();
         assert_eq!(
-            tampered.verify_for_record(&record, 2_000_000_010),
+            tampered.verify_for_record(
+                &record,
+                signed.statement().runtime_operation_issuer(),
+                2_000_000_010,
+            ),
             Err(RuntimeCustodyProvisioningError::InvalidRuntimeSignature)
+        );
+
+        let wrong_runtime_issuer = RuntimeOperationIssuerKeyV1::new(
+            ed25519_dalek::SigningKey::from_bytes(&[0x79; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            signed.verify_for_record(&record, wrong_runtime_issuer, 2_000_000_010),
+            Err(RuntimeCustodyProvisioningError::BindingMismatch(
+                "runtime_operation_issuer"
+            ))
         );
     }
 
@@ -801,13 +834,23 @@ mod tests {
     fn signed_runtime_custody_provisioning_rejects_expiry_and_future_time() {
         let record = record();
         assert_eq!(
-            signed_for(&record, 2_000_000_000, 2_000_000_060)
-                .verify_for_record(&record, 2_000_000_060),
+            signed_for(&record, 2_000_000_000, 2_000_000_060).verify_for_record(
+                &record,
+                signed_for(&record, 2_000_000_000, 2_000_000_060)
+                    .statement()
+                    .runtime_operation_issuer(),
+                2_000_000_060,
+            ),
             Err(RuntimeCustodyProvisioningError::Expired)
         );
         assert_eq!(
-            signed_for(&record, 2_000_000_100, 2_000_000_160)
-                .verify_for_record(&record, 2_000_000_000),
+            signed_for(&record, 2_000_000_100, 2_000_000_160).verify_for_record(
+                &record,
+                signed_for(&record, 2_000_000_100, 2_000_000_160)
+                    .statement()
+                    .runtime_operation_issuer(),
+                2_000_000_000,
+            ),
             Err(RuntimeCustodyProvisioningError::NotYetValid)
         );
     }

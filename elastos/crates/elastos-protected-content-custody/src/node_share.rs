@@ -292,7 +292,7 @@ mod tests {
                 .to_vec(),
         )
         .unwrap()
-        .verify_for_record(record, NOW + 1)
+        .verify_for_record(record, statement.runtime_operation_issuer(), NOW + 1)
         .unwrap()
     }
 

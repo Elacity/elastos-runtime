@@ -50,7 +50,7 @@ mod tests {
     use crate::test_support::{
         custody_envelope, make_signed_node_contribution, make_signed_node_rights_decision,
         make_signed_runtime_release_operation, make_signed_terminal_receipt, recipient_identity,
-        recipient_public_key, NOW,
+        recipient_public_key, runtime_operation_issuer_for_seed, NOW,
     };
 
     fn handle(seed: u8) -> [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1] {
@@ -63,13 +63,29 @@ mod tests {
     fn request_decoders() -> [fn(&[u8]) -> bool; 3] {
         [
             |bytes| {
-                ValidatedRightsProviderRequestV1::decode_and_validate_at(bytes, NOW + 10).is_ok()
+                ValidatedRightsProviderRequestV1::decode_and_validate_at(
+                    bytes,
+                    runtime_operation_issuer_for_seed(0x42),
+                    NOW + 10,
+                )
+                .is_ok()
             },
             |bytes| {
-                ValidatedCustodyProviderRequestV1::decode_and_validate_at(bytes, NOW + 10).is_ok()
+                ValidatedCustodyProviderRequestV1::decode_and_validate_at(
+                    bytes,
+                    runtime_operation_issuer_for_seed(0x42),
+                    crate::test_support::node_public_key(1),
+                    NOW + 10,
+                )
+                .is_ok()
             },
             |bytes| {
-                ValidatedDecryptProviderRequestV1::decode_and_validate_at(bytes, NOW + 10).is_ok()
+                ValidatedDecryptProviderRequestV1::decode_and_validate_at(
+                    bytes,
+                    runtime_operation_issuer_for_seed(0x42),
+                    NOW + 10,
+                )
+                .is_ok()
             },
         ]
     }

@@ -1004,7 +1004,10 @@ mod tests {
                 .to_vec(),
         )
         .unwrap()
-        .verify(crate::test_support::NOW + 3)
+        .verify(
+            statement.runtime_operation_issuer(),
+            crate::test_support::NOW + 3,
+        )
         .unwrap()
     }
 

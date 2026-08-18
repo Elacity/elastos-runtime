@@ -1,6 +1,7 @@
 use elastos_protected_content_contracts::{
     AuthenticatedRuntimeReleaseOperationV1, ContractError, Digest32, NodePublicKey,
-    RuntimeReleaseAuditIdV1, SignedNodeRightsDecisionV1, SignedRuntimeReleaseOperationV1,
+    RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, SignedNodeRightsDecisionV1,
+    SignedRuntimeReleaseOperationV1,
 };
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -93,9 +94,6 @@ impl RightsProviderRequestV1 {
                 )?;
                 let selected_node = self.selected_node_public_key()?;
                 let signed_operation = self.signed_runtime_release_operation()?;
-                signed_operation
-                    .verify(signed_operation.statement().issued_at())
-                    .map_err(|_| ContractError::InvalidField("signed_runtime_release_operation"))?;
                 let node_set = signed_operation
                     .statement()
                     .custody_epoch()
@@ -119,12 +117,13 @@ impl RightsProviderRequestV1 {
 
     fn into_validated_at(
         self,
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         now_unix_ms: u64,
     ) -> Result<ValidatedRightsProviderRequestV1, ContractError> {
         let selected_node_public_key = self.selected_node_public_key()?;
         let signed_runtime_release_operation = self.signed_runtime_release_operation()?;
         let authenticated_runtime_release_operation = signed_runtime_release_operation
-            .verify(now_unix_ms)
+            .verify(expected_runtime_issuer, now_unix_ms)
             .map_err(|_| ContractError::InvalidField("signed_runtime_release_operation"))?;
         let node_set = authenticated_runtime_release_operation
             .statement()
@@ -168,10 +167,11 @@ pub struct ValidatedRightsProviderRequestV1 {
 impl ValidatedRightsProviderRequestV1 {
     pub fn decode_and_validate_at(
         bytes: &[u8],
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         now_unix_ms: u64,
     ) -> Result<Self, serde_json::Error> {
         RightsProviderRequestV1::decode_wire(bytes)?
-            .into_validated_at(now_unix_ms)
+            .into_validated_at(expected_runtime_issuer, now_unix_ms)
             .map_err(contract_decode_error)
     }
 
@@ -325,6 +325,7 @@ impl RightsProviderResponseV1 {
     pub fn validate_against_request_at(
         &self,
         request: &RightsProviderRequestV1,
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         now_unix_ms: u64,
     ) -> Result<(), ContractError> {
         match &self.0 {
@@ -332,7 +333,9 @@ impl RightsProviderResponseV1 {
                 signed_node_rights_decision,
                 ..
             } => {
-                let validated = request.clone().into_validated_at(now_unix_ms)?;
+                let validated = request
+                    .clone()
+                    .into_validated_at(expected_runtime_issuer, now_unix_ms)?;
                 let node_set = validated
                     .authenticated_runtime_release_operation()
                     .statement()
@@ -354,10 +357,11 @@ impl RightsProviderResponseV1 {
                 Ok(())
             }
             RightsProviderResponseKindV1::Failure { .. } => {
-                let signed_operation = request.signed_runtime_release_operation()?;
-                let authenticated = signed_operation
-                    .verify(signed_operation.statement().issued_at())
-                    .map_err(|_| ContractError::InvalidField("signed_runtime_release_operation"))?;
+                let authenticated = request
+                    .clone()
+                    .into_validated_at(expected_runtime_issuer, now_unix_ms)?
+                    .authenticated_runtime_release_operation
+                    .clone();
                 if self.failure_audit_request_id()? != authenticated.statement().audit_request_id()
                 {
                     return Err(ContractError::InvalidField("audit_request_id"));
@@ -435,11 +439,20 @@ mod tests {
             custody_envelope_for_seed, make_signed_node_rights_decision,
             make_signed_runtime_release_operation,
             make_signed_runtime_release_operation_for_envelope_and_seed, node_public_key,
+            runtime_operation_issuer_for_seed,
         },
         ProviderFailureCodeV1, RightsProviderRequestV1, RightsProviderResponseStatusV1,
         RightsProviderResponseV1, ValidatedRightsProviderRequestV1,
         RIGHTS_PROVIDER_REQUEST_SCHEMA_V1,
     };
+
+    fn decode_request(bytes: &[u8]) -> Result<ValidatedRightsProviderRequestV1, serde_json::Error> {
+        ValidatedRightsProviderRequestV1::decode_and_validate_at(
+            bytes,
+            runtime_operation_issuer_for_seed(0x42),
+            crate::test_support::NOW + 10,
+        )
+    }
 
     #[test]
     fn rights_request_round_trips_with_exact_schema() {
@@ -450,11 +463,7 @@ mod tests {
         assert!(json.contains(RIGHTS_PROVIDER_REQUEST_SCHEMA_V1));
         let decoded = RightsProviderRequestV1::decode_wire(json.as_bytes()).unwrap();
         assert_eq!(decoded, request);
-        let validated = ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            json.as_bytes(),
-            crate::test_support::NOW + 10,
-        )
-        .unwrap();
+        let validated = decode_request(json.as_bytes()).unwrap();
         assert_eq!(validated.op(), request.op());
         assert_eq!(validated.selected_node_public_key(), node_public_key(1));
     }
@@ -467,11 +476,7 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_slice(&request.to_json_vec().unwrap()).unwrap();
         value["schema"] = serde_json::Value::String("wrong.schema/v1".to_string());
-        assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            &serde_json::to_vec(&value).unwrap(),
-            crate::test_support::NOW + 10,
-        )
-        .is_err());
+        assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
 
         let mut injected =
             serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
@@ -479,29 +484,17 @@ mod tests {
             "has_access": true,
             "observed_at": 123,
         });
-        assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            &serde_json::to_vec(&injected).unwrap(),
-            crate::test_support::NOW + 10,
-        )
-        .is_err());
+        assert!(decode_request(&serde_json::to_vec(&injected).unwrap()).is_err());
 
         let mut injected_has_access =
             serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
         injected_has_access["has_access"] = serde_json::json!(true);
-        assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            &serde_json::to_vec(&injected_has_access).unwrap(),
-            crate::test_support::NOW + 10,
-        )
-        .is_err());
+        assert!(decode_request(&serde_json::to_vec(&injected_has_access).unwrap()).is_err());
 
         let mut injected_now =
             serde_json::from_slice::<serde_json::Value>(&request.to_json_vec().unwrap()).unwrap();
         injected_now["now_unix_ms"] = serde_json::json!(crate::test_support::NOW + 10);
-        assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            &serde_json::to_vec(&injected_now).unwrap(),
-            crate::test_support::NOW + 10,
-        )
-        .is_err());
+        assert!(decode_request(&serde_json::to_vec(&injected_now).unwrap()).is_err());
     }
 
     #[test]
@@ -516,12 +509,20 @@ mod tests {
         let json = request.to_json_vec().unwrap();
         assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
             &json,
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW.saturating_sub(10),
         )
         .is_err());
         assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
             &json,
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW + 41,
+        )
+        .is_err());
+        assert!(ValidatedRightsProviderRequestV1::decode_and_validate_at(
+            &json,
+            runtime_operation_issuer_for_seed(0x43),
+            crate::test_support::NOW + 10,
         )
         .is_err());
     }
@@ -542,6 +543,7 @@ mod tests {
         decoded
             .validate_against_request_at(
                 &RightsProviderRequestV1::new_evaluate(node_public_key(1), &operation).unwrap(),
+                runtime_operation_issuer_for_seed(0x42),
                 crate::test_support::NOW + 10,
             )
             .unwrap();
@@ -558,11 +560,7 @@ mod tests {
         let operation = make_signed_runtime_release_operation();
         let request =
             RightsProviderRequestV1::new_evaluate(node_public_key(1), &operation).unwrap();
-        let validated = ValidatedRightsProviderRequestV1::decode_and_validate_at(
-            &request.to_json_vec().unwrap(),
-            crate::test_support::NOW + 10,
-        )
-        .unwrap();
+        let validated = decode_request(&request.to_json_vec().unwrap()).unwrap();
         let failure =
             RightsProviderResponseV1::new_failure(&validated, ProviderFailureCodeV1::NotConfigured)
                 .unwrap();
@@ -589,7 +587,11 @@ mod tests {
             validated.selected_node_public_key()
         );
         failure
-            .validate_against_request_at(&request, crate::test_support::NOW + 10)
+            .validate_against_request_at(
+                &request,
+                runtime_operation_issuer_for_seed(0x42),
+                crate::test_support::NOW + 10,
+            )
             .unwrap();
 
         let decision = make_signed_node_rights_decision(
@@ -616,6 +618,7 @@ mod tests {
             RightsProviderRequestV1::new_evaluate(node_public_key(1), &other_operation).unwrap();
         let validated_other = ValidatedRightsProviderRequestV1::decode_and_validate_at(
             &other_request.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x44),
             crate::test_support::NOW + 10,
         )
         .unwrap();
@@ -625,7 +628,11 @@ mod tests {
         )
         .unwrap();
         assert!(failure
-            .validate_against_request_at(&request, crate::test_support::NOW + 10)
+            .validate_against_request_at(
+                &request,
+                runtime_operation_issuer_for_seed(0x42),
+                crate::test_support::NOW + 10,
+            )
             .is_err());
     }
 }

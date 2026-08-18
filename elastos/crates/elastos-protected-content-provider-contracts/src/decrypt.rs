@@ -401,6 +401,7 @@ impl DecryptProviderRequestV1 {
 
     fn into_validated_at(
         self,
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         now_unix_ms: u64,
     ) -> Result<ValidatedDecryptProviderRequestV1, ContractError> {
         match self.0 {
@@ -416,6 +417,11 @@ impl DecryptProviderRequestV1 {
                 if now_unix_ms < issued_at || now_unix_ms >= expires_at {
                     return Err(ContractError::InvalidField("decrypt_prepare_window"));
                 }
+                let runtime_operation_issuer =
+                    RuntimeOperationIssuerKeyV1::new(runtime_operation_issuer)?;
+                if runtime_operation_issuer != expected_runtime_issuer {
+                    return Err(ContractError::InvalidField("runtime_operation_issuer"));
+                }
                 Ok(ValidatedDecryptProviderRequestV1(
                     ValidatedDecryptProviderRequestKindV1::PrepareRecipient {
                         protected_content_binding: protected_content_binding.decode()?,
@@ -423,9 +429,7 @@ impl DecryptProviderRequestV1 {
                             elastos_protected_content_contracts::Digest32::new(audit_request_id),
                         )?,
                         action: decode_rights_action(action)?,
-                        runtime_operation_issuer: RuntimeOperationIssuerKeyV1::new(
-                            runtime_operation_issuer,
-                        )?,
+                        runtime_operation_issuer,
                         issued_at,
                         expires_at,
                     },
@@ -442,7 +446,7 @@ impl DecryptProviderRequestV1 {
             } => {
                 let authenticated_runtime_release_operation = signed_runtime_release_operation
                     .decode::<SignedRuntimeReleaseOperationV1>()?
-                    .verify(now_unix_ms)
+                    .verify(expected_runtime_issuer, now_unix_ms)
                     .map_err(|_| ContractError::InvalidField("signed_runtime_release_operation"))?;
                 let expected_terminal_issuer =
                     TerminalReceiptIssuerKey::new(expected_terminal_issuer)?;
@@ -578,10 +582,11 @@ pub struct ValidatedDecryptProviderRequestV1(ValidatedDecryptProviderRequestKind
 impl ValidatedDecryptProviderRequestV1 {
     pub fn decode_and_validate_at(
         bytes: &[u8],
+        expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
         now_unix_ms: u64,
     ) -> Result<Self, serde_json::Error> {
         DecryptProviderRequestV1::decode_wire(bytes)?
-            .into_validated_at(now_unix_ms)
+            .into_validated_at(expected_runtime_issuer, now_unix_ms)
             .map_err(contract_decode_error)
     }
 
@@ -1116,6 +1121,7 @@ mod tests {
             make_signed_runtime_release_operation,
             make_signed_runtime_release_operation_for_envelope_and_seed,
             make_signed_terminal_receipt, recipient_identity, recipient_public_key,
+            runtime_operation_issuer_for_seed,
         },
         DecryptProviderRequestV1, DecryptProviderResponseStatusV1, DecryptProviderResponseV1,
         ProviderFailureCodeV1, ValidatedDecryptProviderRequestV1,
@@ -1128,6 +1134,16 @@ mod tests {
         bytes[0] = seed.max(1);
         bytes[31] = seed ^ 0x5a;
         bytes
+    }
+
+    fn decode_request(
+        bytes: &[u8],
+    ) -> Result<ValidatedDecryptProviderRequestV1, serde_json::Error> {
+        ValidatedDecryptProviderRequestV1::decode_and_validate_at(
+            bytes,
+            runtime_operation_issuer_for_seed(0x42),
+            crate::test_support::NOW + 10,
+        )
     }
 
     #[test]
@@ -1145,11 +1161,7 @@ mod tests {
         let decoded =
             DecryptProviderRequestV1::decode_wire(&request.to_json_vec().unwrap()).unwrap();
         assert_eq!(decoded, request);
-        let validated = ValidatedDecryptProviderRequestV1::decode_and_validate_at(
-            &request.to_json_vec().unwrap(),
-            crate::test_support::NOW + 10,
-        )
-        .unwrap();
+        let validated = decode_request(&request.to_json_vec().unwrap()).unwrap();
         assert_eq!(validated.op(), request.op());
         assert_eq!(
             validated.audit_request_id(),
@@ -1158,11 +1170,13 @@ mod tests {
 
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &request.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW + 1,
         )
         .is_err());
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &request.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW + 41,
         )
         .is_err());
@@ -1172,6 +1186,14 @@ mod tests {
         injected_now["now_unix_ms"] = serde_json::json!(crate::test_support::NOW + 10);
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &serde_json::to_vec(&injected_now).unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
+            crate::test_support::NOW + 10,
+        )
+        .is_err());
+
+        assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
+            &request.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x43),
             crate::test_support::NOW + 10,
         )
         .is_err());
@@ -1197,11 +1219,7 @@ mod tests {
         let decoded =
             DecryptProviderRequestV1::decode_wire(&request.to_json_vec().unwrap()).unwrap();
         assert_eq!(decoded, request);
-        let validated = ValidatedDecryptProviderRequestV1::decode_and_validate_at(
-            &request.to_json_vec().unwrap(),
-            crate::test_support::NOW + 10,
-        )
-        .unwrap();
+        let validated = decode_request(&request.to_json_vec().unwrap()).unwrap();
         assert_eq!(validated.op(), request.op());
         assert_eq!(
             validated.audit_request_id(),
@@ -1209,11 +1227,13 @@ mod tests {
         );
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &request.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW.saturating_sub(10),
         )
         .is_err());
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &request.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW + 41,
         )
         .is_err());
@@ -1236,6 +1256,14 @@ mod tests {
         .unwrap();
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &wrong_contributions.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
+            crate::test_support::NOW + 10,
+        )
+        .is_err());
+
+        assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
+            &request.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x43),
             crate::test_support::NOW + 10,
         )
         .is_err());
@@ -1264,6 +1292,7 @@ mod tests {
         .unwrap();
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &extra_contribution.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW + 10,
         )
         .is_err());
@@ -1279,6 +1308,7 @@ mod tests {
         .unwrap();
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &duplicate_contribution.to_json_vec().unwrap(),
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW + 10,
         )
         .is_err());
@@ -1293,6 +1323,7 @@ mod tests {
         trailing.extend_from_slice(br#"{"extra":true}"#);
         assert!(ValidatedDecryptProviderRequestV1::decode_and_validate_at(
             &trailing,
+            runtime_operation_issuer_for_seed(0x42),
             crate::test_support::NOW + 10,
         )
         .is_err());
@@ -1358,6 +1389,7 @@ mod tests {
             assert_eq!(
                 ValidatedDecryptProviderRequestV1::decode_and_validate_at(
                     &request.to_json_vec().unwrap(),
+                    runtime_operation_issuer_for_seed(0x42),
                     crate::test_support::NOW + 10,
                 )
                 .unwrap()

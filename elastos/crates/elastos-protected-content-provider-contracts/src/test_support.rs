@@ -35,6 +35,15 @@ pub(crate) fn node_public_key(seed: u8) -> NodePublicKey {
     NodePublicKey::new(node_signing_key(seed).verifying_key().to_bytes()).unwrap()
 }
 
+pub(crate) fn runtime_operation_issuer_for_seed(seed: u8) -> RuntimeOperationIssuerKeyV1 {
+    RuntimeOperationIssuerKeyV1::new(
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes(),
+    )
+    .unwrap()
+}
+
 fn wallet(seed: u8) -> WalletAddress {
     let key = WalletSigningKey::from_slice(&[seed; 32]).unwrap();
     let encoded = key.verifying_key().to_encoded_point(false);
@@ -261,7 +270,9 @@ pub(crate) fn make_signed_node_rights_decision(
     node_seed: u8,
     decision: RightsDecisionV1,
 ) -> SignedNodeRightsDecisionV1 {
-    let authenticated = operation.verify(NOW + 3).unwrap();
+    let authenticated = operation
+        .verify(operation.statement().runtime_operation_issuer(), NOW + 3)
+        .unwrap();
     let statement = elastos_protected_content_contracts::NodeRightsDecisionStatementV1::new(
         authenticated.release_request_hash(),
         authenticated.rights_request_hash(),
@@ -288,7 +299,9 @@ pub(crate) fn make_signed_node_contribution(
     operation: &SignedRuntimeReleaseOperationV1,
     node_seed: u8,
 ) -> SignedNodeContributionV1 {
-    let authenticated = operation.verify(NOW + 5).unwrap();
+    let authenticated = operation
+        .verify(operation.statement().runtime_operation_issuer(), NOW + 5)
+        .unwrap();
     let decision =
         make_signed_node_rights_decision(operation, node_seed, RightsDecisionV1::Allowed);
     let sealed =
@@ -318,7 +331,9 @@ pub(crate) fn make_signed_terminal_receipt(
     contributions: &[SignedNodeContributionV1],
     issuer_seed: u8,
 ) -> SignedTerminalReceiptV1 {
-    let authenticated = operation.verify(NOW + 6).unwrap();
+    let authenticated = operation
+        .verify(operation.statement().runtime_operation_issuer(), NOW + 6)
+        .unwrap();
     let node_set = signed_custody_epoch().statement().node_set().unwrap();
     let verified_contributions = contributions
         .iter()
