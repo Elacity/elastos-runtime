@@ -93,6 +93,9 @@ pub(super) fn validate_rights_methods(network: &ChainNetwork) -> Result<(), Stri
 
 pub(super) fn validate_rpc_url(network: &ChainNetwork) -> Result<(), String> {
     let url = network.rpc_url.trim();
+    if url_has_userinfo(url) {
+        return Err(format!("invalid RPC URL for {}", network.id));
+    }
     if network.kind == ChainKind::BitcoinCoreRpc {
         if url.is_empty()
             || url.starts_with("http://127.0.0.1:")
@@ -113,4 +116,12 @@ pub(super) fn validate_rpc_url(network: &ChainNetwork) -> Result<(), String> {
         return Err(format!("invalid RPC URL for {}", network.id));
     }
     Ok(())
+}
+
+fn url_has_userinfo(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    authority.contains('@')
 }

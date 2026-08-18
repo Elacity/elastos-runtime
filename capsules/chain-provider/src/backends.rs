@@ -173,7 +173,7 @@ impl ChainProvider {
                 "params": params,
             }))
             .send()
-            .map_err(|err| Response::error("upstream_unreachable", &err.to_string()))?;
+            .map_err(|_| Response::error("upstream_unreachable", "EVM RPC request failed"))?;
         let status = response.status();
         if !status.is_success() {
             return Err(Response::error(
@@ -183,9 +183,12 @@ impl ChainProvider {
         }
         let body = response
             .json::<Value>()
-            .map_err(|err| Response::error("upstream_invalid_json", &err.to_string()))?;
-        if let Some(error) = body.get("error") {
-            return Err(Response::error("upstream_rpc_error", &error.to_string()));
+            .map_err(|_| Response::error("upstream_invalid_json", "EVM RPC response malformed"))?;
+        if body.get("error").is_some() {
+            return Err(Response::error(
+                "upstream_rpc_error",
+                "EVM RPC request rejected",
+            ));
         }
         body.get("result")
             .cloned()

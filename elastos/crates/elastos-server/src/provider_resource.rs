@@ -54,11 +54,6 @@ pub fn build_capability_resource(
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| "chain provider request missing network".to_string())?;
             validate_chain_network(network)?;
-            if op == "has_access_by_content_id" {
-                return Ok(format!(
-                    "elastos://chain/{network}/rights/has_access_by_content_id"
-                ));
-            }
             if op == "erc1271_is_valid_signature" {
                 return Ok(format!("elastos://chain/{network}/proof/erc1271"));
             }
@@ -234,7 +229,6 @@ fn chain_op_required_action(op: &str) -> Option<Action> {
         | "balance"
         | "transaction"
         | "receipt"
-        | "has_access_by_content_id"
         | "proof"
         | "erc1271_is_valid_signature"
         | "contract_call"
@@ -844,13 +838,28 @@ mod tests {
             "elastos://chain/meta/networks"
         );
         assert_eq!(
+            build_capability_resource("rights", "has_access_by_content_id", &serde_json::json!({}))
+                .unwrap(),
+            "elastos://rights/access/has_access_by_content_id",
+            "the active provisional rights-provider mapping is preserved until product cutover"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "protected_content_rights_evidence",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content rights evidence must stay Runtime-internal"
+        );
+        assert!(
             build_capability_resource(
                 "chain",
                 "has_access_by_content_id",
                 &serde_json::json!({"network": "esc-mainnet"})
             )
-            .unwrap(),
-            "elastos://chain/esc-mainnet/rights/has_access_by_content_id"
+            .is_err(),
+            "legacy Chain rights rail must not remain capsule-invokable"
         );
         assert_eq!(
             build_capability_resource(

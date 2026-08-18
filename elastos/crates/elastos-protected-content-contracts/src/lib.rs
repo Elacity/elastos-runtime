@@ -71,7 +71,7 @@ pub use node_set::{NodePublicKey, NodeSetV1};
 pub use policy::{
     EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
     RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1, RightsObservationFinalityV1,
-    RightsPolicyBodyV1, RightsSubjectSourceV1,
+    RightsPolicyBodyV1, RightsSubjectSourceV1, MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
 };
 pub use recipient_authorization::{
     RecipientAuthorizationError, RecipientKeyAuthorizationContextV1,
