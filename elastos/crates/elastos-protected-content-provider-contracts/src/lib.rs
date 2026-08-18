@@ -16,6 +16,7 @@ mod wire;
 pub use custody::{
     CustodyProviderRequestOpV1, CustodyProviderRequestV1, CustodyProviderResponseStatusV1,
     CustodyProviderResponseV1, ValidatedCustodyProviderRequestV1,
+    ValidatedCustodyProvisionNodeShareRequestV1, ValidatedCustodyReleaseContributionRequestV1,
     CUSTODY_PROVIDER_REQUEST_SCHEMA_V1, CUSTODY_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 pub use decrypt::{
@@ -30,9 +31,10 @@ pub use rights::{
 };
 pub use wire::{
     OpaqueHandleV1, ProviderFailureCodeV1, MAX_CUSTODY_ENVELOPE_BYTES_V1,
-    MAX_PROVIDER_BINDING_BYTES_V1, MAX_PROVIDER_FRAME_BYTES_V1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, MAX_RECIPIENT_IDENTITY_BYTES_V1,
-    MAX_SIGNED_NODE_CONTRIBUTION_BYTES_V1, MAX_SIGNED_NODE_RIGHTS_DECISION_BYTES_V1,
+    MAX_CUSTODY_NODE_PROVISIONING_RECORD_BYTES_V1, MAX_PROVIDER_BINDING_BYTES_V1,
+    MAX_PROVIDER_FRAME_BYTES_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    MAX_RECIPIENT_IDENTITY_BYTES_V1, MAX_SIGNED_NODE_CONTRIBUTION_BYTES_V1,
+    MAX_SIGNED_NODE_RIGHTS_DECISION_BYTES_V1, MAX_SIGNED_RUNTIME_CUSTODY_PROVISIONING_BYTES_V1,
     MAX_SIGNED_RUNTIME_RELEASE_OPERATION_BYTES_V1, MAX_SIGNED_TERMINAL_RECEIPT_BYTES_V1,
 };
 
@@ -102,13 +104,8 @@ mod tests {
         )
         .unwrap();
         let rights_response = RightsProviderResponseV1::new_decision(&decision).unwrap();
-        let custody_request = CustodyProviderRequestV1::new_release_contribution(
-            decision.statement().node_public_key(),
-            &operation,
-            &decision,
-            &custody_envelope(),
-        )
-        .unwrap();
+        let custody_request =
+            CustodyProviderRequestV1::new_release_contribution(&operation, &decision).unwrap();
         let custody_response = CustodyProviderResponseV1::new_contribution(&contribution).unwrap();
         let decrypt_request = DecryptProviderRequestV1::new_open_viewer_session(
             handle(0x21),
@@ -250,15 +247,10 @@ mod tests {
                 .unwrap()
                 .to_json_vec()
                 .unwrap(),
-            CustodyProviderRequestV1::new_release_contribution(
-                decision.statement().node_public_key(),
-                &operation,
-                &decision,
-                &custody_envelope(),
-            )
-            .unwrap()
-            .to_json_vec()
-            .unwrap(),
+            CustodyProviderRequestV1::new_release_contribution(&operation, &decision)
+                .unwrap()
+                .to_json_vec()
+                .unwrap(),
             CustodyProviderResponseV1::new_contribution(&contribution)
                 .unwrap()
                 .to_json_vec()
