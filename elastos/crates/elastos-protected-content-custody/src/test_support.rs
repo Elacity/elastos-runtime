@@ -26,7 +26,7 @@ use elastos_protected_content_contracts::{
 use crate::{
     provision::provision_custody_envelope_with_rng, replay_store::ClaimedNodeReleaseOperationV1,
     ContentEncryptionKeyV1, DurableReplayClaimStoreV1, NodeCustodySecretKeyV1,
-    RecipientPublicKeyV1, RecipientSecretKeyV1,
+    NodeLocalStoredShareV1, RecipientPublicKeyV1, RecipientSecretKeyV1,
 };
 
 pub(crate) const NOW: u64 = 2_000_000_000;
@@ -166,10 +166,9 @@ fn binding_for_wallet_with_envelope(
     wallet: WalletAddress,
     envelope: &CustodyEnvelopeV1,
 ) -> ProtectedContentBindingV1 {
-    let content = EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap();
     let policy_body = policy_body();
     ProtectedContentBindingV1::new(
-        content.clone(),
+        envelope.manifest().encrypted_content().clone(),
         envelope.key_envelope_identity().unwrap(),
         policy_body.policy_identity().unwrap(),
         elastos_protected_content_contracts::ProfileIdentityV1::from_public_key_bytes(
@@ -374,8 +373,16 @@ pub(crate) fn claimed_runtime_release_operation_for_envelope_and_node_seed(
     }
     let mut store =
         DurableReplayClaimStoreV1::new(node_public_key(node_seed), temp.path().join("replay"));
+    let node_share =
+        NodeLocalStoredShareV1::extract_from_envelope(envelope, node_public_key(node_seed))
+            .unwrap();
     store
-        .claim_node_release_operation(authenticated, envelope, node_public_key(node_seed), NOW + 3)
+        .claim_node_release_operation(
+            authenticated,
+            &node_share,
+            node_public_key(node_seed),
+            NOW + 3,
+        )
         .unwrap()
 }
 

@@ -1054,7 +1054,11 @@ mod tests {
                 node_seed,
                 elastos_protected_content_contracts::RightsDecisionV1::Allowed,
             ),
-            envelope,
+            &crate::NodeLocalStoredShareV1::extract_from_envelope(
+                envelope,
+                crate::test_support::node_public_key(node_seed),
+            )
+            .unwrap(),
             &crate::test_support::node_signing_key(node_seed),
             &crate::test_support::node_custody_secret(node_seed),
             &crate::test_support::recipient_public_key(recipient_seed),
@@ -1090,7 +1094,11 @@ mod tests {
         store
             .claim_node_release_operation(
                 authenticated,
-                envelope,
+                &crate::NodeLocalStoredShareV1::extract_from_envelope(
+                    envelope,
+                    crate::test_support::node_public_key(node_seed),
+                )
+                .unwrap(),
                 crate::test_support::node_public_key(node_seed),
                 crate::test_support::NOW + 3,
             )

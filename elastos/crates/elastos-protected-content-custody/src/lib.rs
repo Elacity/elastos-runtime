@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod hpke_helpers;
+mod node_share;
 mod payload;
 mod provision;
 mod reconstruct;
@@ -13,6 +14,7 @@ mod test_support;
 
 use thiserror::Error;
 
+pub use node_share::NodeLocalStoredShareV1;
 pub use payload::{
     decrypt_payload_to_staging_writer_from_authenticated_operation_v1,
     seal_payload_to_staging_writer_v1, AuthenticatedChunkPayloadHeaderV1,

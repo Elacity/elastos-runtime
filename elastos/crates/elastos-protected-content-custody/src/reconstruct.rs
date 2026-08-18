@@ -253,9 +253,9 @@ mod tests {
         test_support::{
             authenticated_runtime_release_operation_for_envelope_and_recipient_seed,
             claimed_runtime_release_operation_for_envelope_and_node_seed, content_key,
-            custody_nodes, digest, node_custody_secret, node_signing_key, provisioned_envelope,
-            recipient_public_key, recipient_secret, signed_node_decision, verified_release_request,
-            verified_release_request_for_envelope,
+            custody_nodes, digest, node_custody_secret, node_public_key, node_signing_key,
+            provisioned_envelope, recipient_public_key, recipient_secret, signed_node_decision,
+            verified_release_request, verified_release_request_for_envelope,
             verified_release_request_for_envelope_and_recipient_seed, NOW,
         },
     };
@@ -280,7 +280,11 @@ mod tests {
                 node_seed,
                 elastos_protected_content_contracts::RightsDecisionV1::Allowed,
             ),
-            envelope,
+            &crate::NodeLocalStoredShareV1::extract_from_envelope(
+                envelope,
+                node_public_key(node_seed),
+            )
+            .unwrap(),
             &node_signing_key(node_seed),
             &node_custody_secret(node_seed),
             &recipient_public_key(recipient_seed),
