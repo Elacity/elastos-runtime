@@ -7,6 +7,7 @@
 mod canonical;
 mod custody_envelope;
 mod custody_epoch;
+mod custody_pool;
 mod identity;
 mod node_contribution;
 mod node_decision;
@@ -35,6 +36,13 @@ pub use custody_envelope::{
 pub use custody_epoch::{
     CustodyApprovedSuitesV1, CustodyEpochError, CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1,
     CustodyEpochStatementV1, SignedCustodyEpochV1, VerifiedCustodyEpochV1,
+};
+pub use custody_pool::{
+    validate_custody_epoch_against_pool_at, CustodyCommitteeAuthorizationIdentityV1,
+    CustodyCommitteeAuthorizationStatementV1, CustodyPoolError, CustodyPoolFailureDomainIdV1,
+    CustodyPoolIdentityV1, CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1,
+    CustodyPoolStatementV1, SignedCustodyCommitteeAuthorizationV1, SignedCustodyPoolV1,
+    ValidatedCustodyCommitteeV1, VerifiedCustodyCommitteeAuthorizationV1, VerifiedCustodyPoolV1,
 };
 pub use identity::{
     Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, ProfileIdentityV1,
