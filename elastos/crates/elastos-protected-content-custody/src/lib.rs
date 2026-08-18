@@ -2,6 +2,7 @@
 
 mod hpke_helpers;
 mod node_share;
+mod node_store;
 mod payload;
 mod provision;
 mod reconstruct;
@@ -15,6 +16,10 @@ mod test_support;
 use thiserror::Error;
 
 pub use node_share::NodeLocalStoredShareV1;
+pub use node_store::{
+    NodeLocalShareReceiptV1, NodeLocalShareStoreErrorV1, NodeLocalShareStoreV1,
+    ProvisionedNodeLocalShareV1,
+};
 pub use payload::{
     decrypt_payload_to_staging_writer_from_authenticated_operation_v1,
     seal_payload_to_staging_writer_v1, AuthenticatedChunkPayloadHeaderV1,
@@ -29,7 +34,8 @@ pub use secrets::{
 };
 
 use elastos_protected_content_contracts::{
-    ContractError, KeyReleaseError, ReplayClaimError, RuntimeReleaseOperationError,
+    ContractError, KeyReleaseError, ReplayClaimError, RuntimeCustodyProvisioningError,
+    RuntimeReleaseOperationError,
 };
 
 pub(crate) const CONTENT_KEY_BYTES: usize = 32;
@@ -44,7 +50,11 @@ pub enum CustodyError {
     #[error(transparent)]
     RuntimeReleaseOperation(#[from] RuntimeReleaseOperationError),
     #[error(transparent)]
+    RuntimeCustodyProvisioning(#[from] RuntimeCustodyProvisioningError),
+    #[error(transparent)]
     Replay(#[from] ReplayClaimError),
+    #[error(transparent)]
+    NodeShareStore(#[from] NodeLocalShareStoreErrorV1),
     #[error("hpke operation failed")]
     Hpke(#[from] hpke::HpkeError),
     #[error("shamir operation failed: {0}")]
