@@ -57,6 +57,15 @@ impl NodeCustodySecretKeyV1 {
         Ok(Self(random_bytes()?))
     }
 
+    pub fn from_guarded_bytes(bytes: Zeroizing<[u8; 32]>) -> Result<Self, CustodyError> {
+        if bytes.ct_eq(&[0u8; 32]).into() {
+            return Err(CustodyError::BindingMismatch("node_custody_secret"));
+        }
+        let value = Self(bytes);
+        value.public_key()?;
+        Ok(value)
+    }
+
     pub fn public_key(&self) -> Result<NodeCustodyPublicKeyV1, CustodyError> {
         NodeCustodyPublicKeyV1::new(public_key_bytes_from_secret(&self.0)?).map_err(Into::into)
     }
@@ -187,6 +196,26 @@ mod tests {
         assert!(!content_debug.contains("11"));
         assert!(!node_debug.contains("22"));
         assert!(!recipient_debug.contains("33"));
+    }
+
+    #[test]
+    fn node_custody_secret_import_is_guarded_and_redacted() {
+        assert!(matches!(
+            NodeCustodySecretKeyV1::from_guarded_bytes(Zeroizing::new([0; 32])),
+            Err(CustodyError::BindingMismatch("node_custody_secret"))
+        ));
+
+        let imported = NodeCustodySecretKeyV1::from_guarded_bytes(Zeroizing::new([0x22; 32]))
+            .expect("valid guarded node secret");
+        assert_eq!(
+            imported.public_key().unwrap(),
+            NodeCustodySecretKeyV1::from_test_bytes([0x22; 32])
+                .public_key()
+                .unwrap()
+        );
+        let debug = format!("{imported:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("22"));
     }
 
     #[test]

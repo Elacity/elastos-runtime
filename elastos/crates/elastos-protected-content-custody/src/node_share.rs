@@ -1,15 +1,16 @@
 use elastos_protected_content_contracts::{
-    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, CustodyEnvelopeManifestV1,
-    CustodyEnvelopeV1, CustodyNodeIdentityV1, HpkeCiphertextV1, KeyEnvelopeIdentityV1,
-    NodePublicKey, NodeSetV1, RuntimeReleaseOperationError,
+    AuthenticatedRuntimeCustodyProvisioningV1, AuthenticatedRuntimeReleaseOperationV1,
+    CanonicalContract, CustodyEnvelopeManifestV1, CustodyNodeIdentityV1,
+    CustodyNodeProvisioningRecordV1, HpkeCiphertextV1, KeyEnvelopeIdentityV1, NodePublicKey,
+    NodeSetV1, RuntimeReleaseOperationError,
 };
 
-use crate::CustodyError;
+use crate::{secrets::NodeCustodySecretKeyV1, CustodyError};
 
 /// One custody node's local share state for one protected object.
 ///
-/// This value is created only by extracting the selected node's encrypted share
-/// from a fully validated private provisioning envelope. It carries the public
+/// This value is created from an authenticated Runtime provisioning operation
+/// and its exact one-node provisioning record. It carries the public
 /// object/committee identities needed to verify release authority plus exactly
 /// one node-sealed share. It never carries the aggregate envelope's other node
 /// shares.
@@ -34,8 +35,9 @@ impl std::fmt::Debug for NodeLocalStoredShareV1 {
 }
 
 impl NodeLocalStoredShareV1 {
-    pub fn extract_from_envelope(
-        envelope: &CustodyEnvelopeV1,
+    #[cfg(test)]
+    pub(crate) fn extract_from_envelope(
+        envelope: &elastos_protected_content_contracts::CustodyEnvelopeV1,
         node_public_key: NodePublicKey,
     ) -> Result<Self, CustodyError> {
         let key_envelope_identity = envelope.key_envelope_identity()?;
@@ -49,6 +51,40 @@ impl NodeLocalStoredShareV1 {
             manifest,
             node_public_key,
             stored_share,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn from_authenticated_provisioning(
+        record: &CustodyNodeProvisioningRecordV1,
+        provisioning: &AuthenticatedRuntimeCustodyProvisioningV1,
+        expected_node_public_key: NodePublicKey,
+        node_custody_secret: &NodeCustodySecretKeyV1,
+    ) -> Result<Self, CustodyError> {
+        record.canonical_bytes()?;
+        let record_identity = record.record_identity()?;
+        if provisioning.record_identity() != record_identity {
+            return Err(CustodyError::BindingMismatch(
+                "custody_node_provisioning_record_identity",
+            ));
+        }
+        let selected_node_public_key = record.selected_node_public_key();
+        if selected_node_public_key != expected_node_public_key {
+            return Err(CustodyError::BindingMismatch("custody_node"));
+        }
+        let node = record
+            .manifest()
+            .node(selected_node_public_key)
+            .ok_or(CustodyError::BindingMismatch("custody_node"))?;
+        if node.custody_public_key() != node_custody_secret.public_key()? {
+            return Err(CustodyError::BindingMismatch("node_custody_public_key"));
+        }
+        let value = Self {
+            key_envelope_identity: record.key_envelope_identity().clone(),
+            manifest: record.manifest().clone(),
+            node_public_key: selected_node_public_key,
+            stored_share: record.sealed_share().clone(),
         };
         value.validate()?;
         Ok(value)
@@ -158,6 +194,7 @@ fn validate_operation_active_window(
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signer as _, SigningKey};
     use rand09::{rngs::StdRng as HpkeStdRng, SeedableRng as _};
     use rand10::rngs::StdRng as ShamirStdRng;
     use rand10::SeedableRng as _;
@@ -173,9 +210,11 @@ mod tests {
         },
     };
     use elastos_protected_content_contracts::{
-        CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeManifestV1, CustodyEpochIdentityV1,
-        CustodyNodeIdentityV1, CustodyPoolIdentityV1, EncryptedContentIdentityV1,
-        ShareCoordinateV1, ThresholdV1,
+        CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
+        CustodyEpochIdentityV1, CustodyNodeIdentityV1, CustodyNodeProvisioningRecordV1,
+        CustodyPoolIdentityV1, EncryptedContentIdentityV1, RuntimeCustodyProvisioningIdV1,
+        RuntimeCustodyProvisioningStatementV1, RuntimeOperationIssuerKeyV1, ShareCoordinateV1,
+        SignedRuntimeCustodyProvisioningV1, ThresholdV1,
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -217,6 +256,46 @@ mod tests {
         CustodyEnvelopeV1::new(manifest, original.stored_shares().to_vec()).unwrap()
     }
 
+    fn provisioning_record_for(
+        envelope: &CustodyEnvelopeV1,
+        node_public_key: NodePublicKey,
+    ) -> CustodyNodeProvisioningRecordV1 {
+        CustodyNodeProvisioningRecordV1::new(
+            envelope.key_envelope_identity().unwrap(),
+            envelope.manifest().clone(),
+            node_public_key,
+            envelope
+                .stored_share_for_node(node_public_key)
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+    }
+
+    fn authenticated_provisioning_for(
+        record: &CustodyNodeProvisioningRecordV1,
+    ) -> AuthenticatedRuntimeCustodyProvisioningV1 {
+        let runtime_key = SigningKey::from_bytes(&[0x7a; 32]);
+        let statement = RuntimeCustodyProvisioningStatementV1::new(
+            RuntimeOperationIssuerKeyV1::new(runtime_key.verifying_key().to_bytes()).unwrap(),
+            record.record_identity().unwrap(),
+            RuntimeCustodyProvisioningIdV1::new(digest(0xf1)).unwrap(),
+            NOW,
+            NOW + 60,
+        )
+        .unwrap();
+        SignedRuntimeCustodyProvisioningV1::new(
+            statement.clone(),
+            runtime_key
+                .sign(&statement.canonical_bytes().unwrap())
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap()
+        .verify_for_record(record, NOW + 1)
+        .unwrap()
+    }
+
     #[test]
     fn node_local_share_extracts_only_the_selected_node_share() {
         let envelope = provisioned_envelope();
@@ -239,6 +318,215 @@ mod tests {
             assert_ne!(
                 node_share.stored_share(),
                 envelope.stored_share_for_node(other_node).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn node_local_share_imports_exact_authenticated_provisioning_record() {
+        let envelope = provisioned_envelope();
+        let selected_node = node_public_key(1);
+        let record = provisioning_record_for(&envelope, selected_node);
+        let provisioning = authenticated_provisioning_for(&record);
+        let node_share = NodeLocalStoredShareV1::from_authenticated_provisioning(
+            &record,
+            &provisioning,
+            selected_node,
+            &node_custody_secret(1),
+        )
+        .unwrap();
+
+        assert_eq!(node_share.node_public_key(), selected_node);
+        assert_eq!(
+            node_share.key_envelope_identity(),
+            record.key_envelope_identity()
+        );
+        assert_eq!(node_share.manifest(), record.manifest());
+        assert_eq!(node_share.stored_share(), record.sealed_share());
+        assert_eq!(
+            node_share.manifest().custody_pool(),
+            validated_custody_committee().pool_identity()
+        );
+        assert_eq!(
+            node_share.manifest().custody_epoch(),
+            validated_custody_committee().committee().epoch_identity()
+        );
+        assert_eq!(
+            node_share.manifest().custody_committee_authorization(),
+            validated_custody_committee().authorization_identity()
+        );
+        assert_eq!(
+            node_share.manifest().threshold(),
+            validated_custody_committee().committee().threshold()
+        );
+    }
+
+    #[test]
+    fn node_local_share_rejects_authenticated_provisioning_mismatches_before_state() {
+        let envelope = provisioned_envelope();
+        let selected_node = node_public_key(1);
+        let record = provisioning_record_for(&envelope, selected_node);
+        let provisioning = authenticated_provisioning_for(&record);
+        let changed_nodes = {
+            let mut nodes = custody_nodes();
+            nodes[2] = (
+                node_public_key(4),
+                node_custody_secret(4).public_key().unwrap(),
+            );
+            nodes
+        };
+        let other_records = [
+            (
+                "object",
+                provisioning_record_for(
+                    &provisioned_envelope_with(
+                        EncryptedContentIdentityV1::new(digest(0x12), 4096).unwrap(),
+                        custody_pool_identity(),
+                        custody_epoch_identity(),
+                        custody_committee_authorization_identity(),
+                        ThresholdV1::new(2, 3).unwrap(),
+                        custody_nodes(),
+                        0x71,
+                    ),
+                    selected_node,
+                ),
+            ),
+            (
+                "pool",
+                provisioning_record_for(
+                    &provisioned_envelope_with(
+                        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+                        CustodyPoolIdentityV1::new(digest(0x37), 512).unwrap(),
+                        custody_epoch_identity(),
+                        custody_committee_authorization_identity(),
+                        ThresholdV1::new(2, 3).unwrap(),
+                        custody_nodes(),
+                        0x72,
+                    ),
+                    selected_node,
+                ),
+            ),
+            (
+                "epoch",
+                provisioning_record_for(
+                    &provisioned_envelope_with(
+                        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+                        custody_pool_identity(),
+                        CustodyEpochIdentityV1::new(digest(0x39), 512).unwrap(),
+                        custody_committee_authorization_identity(),
+                        ThresholdV1::new(2, 3).unwrap(),
+                        custody_nodes(),
+                        0x73,
+                    ),
+                    selected_node,
+                ),
+            ),
+            (
+                "committee",
+                provisioning_record_for(
+                    &provisioned_envelope_with(
+                        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+                        custody_pool_identity(),
+                        custody_epoch_identity(),
+                        CustodyCommitteeAuthorizationIdentityV1::new(digest(0x38), 512).unwrap(),
+                        ThresholdV1::new(2, 3).unwrap(),
+                        custody_nodes(),
+                        0x74,
+                    ),
+                    selected_node,
+                ),
+            ),
+            (
+                "node_set",
+                provisioning_record_for(
+                    &provisioned_envelope_with(
+                        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+                        custody_pool_identity(),
+                        custody_epoch_identity(),
+                        custody_committee_authorization_identity(),
+                        ThresholdV1::new(2, 3).unwrap(),
+                        changed_nodes,
+                        0x75,
+                    ),
+                    selected_node,
+                ),
+            ),
+            (
+                "threshold",
+                provisioning_record_for(
+                    &provisioned_envelope_with(
+                        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+                        custody_pool_identity(),
+                        custody_epoch_identity(),
+                        custody_committee_authorization_identity(),
+                        ThresholdV1::new(3, 3).unwrap(),
+                        custody_nodes(),
+                        0x76,
+                    ),
+                    selected_node,
+                ),
+            ),
+            (
+                "share_bytes",
+                CustodyNodeProvisioningRecordV1::new(
+                    envelope.key_envelope_identity().unwrap(),
+                    envelope.manifest().clone(),
+                    selected_node,
+                    envelope
+                        .stored_share_for_node(node_public_key(2))
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap(),
+            ),
+        ];
+
+        let mismatched_provisioning = authenticated_provisioning_for(&other_records[0].1);
+        assert!(matches!(
+            NodeLocalStoredShareV1::from_authenticated_provisioning(
+                &record,
+                &mismatched_provisioning,
+                selected_node,
+                &node_custody_secret(1),
+            ),
+            Err(CustodyError::BindingMismatch(
+                "custody_node_provisioning_record_identity"
+            ))
+        ));
+        assert!(matches!(
+            NodeLocalStoredShareV1::from_authenticated_provisioning(
+                &record,
+                &provisioning,
+                node_public_key(2),
+                &node_custody_secret(1),
+            ),
+            Err(CustodyError::BindingMismatch("custody_node"))
+        ));
+        assert!(matches!(
+            NodeLocalStoredShareV1::from_authenticated_provisioning(
+                &record,
+                &provisioning,
+                selected_node,
+                &node_custody_secret(2),
+            ),
+            Err(CustodyError::BindingMismatch("node_custody_public_key"))
+        ));
+
+        for (label, other_record) in other_records {
+            let result = NodeLocalStoredShareV1::from_authenticated_provisioning(
+                &other_record,
+                &provisioning,
+                selected_node,
+                &node_custody_secret(1),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(CustodyError::BindingMismatch(
+                        "custody_node_provisioning_record_identity"
+                    ))
+                ),
+                "{label} substitution should fail before local state is returned, got {result:?}"
             );
         }
     }
