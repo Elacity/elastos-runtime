@@ -297,6 +297,7 @@ pub(super) fn validate_signing_intent(value: &str) -> Result<(), String> {
         | "browser_personal_sign"
         | "browser_typed_data_sign"
         | "bitcoin_bip322_proof"
+        | PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT
         | "revocation" => Ok(()),
         _ => Err("unsupported signing intent".to_string()),
     }
@@ -310,6 +311,7 @@ pub(super) fn managed_signing_intent_is_supported(value: &str) -> bool {
             | "browser_personal_sign"
             | "browser_typed_data_sign"
             | "bitcoin_bip322_proof"
+            | PROTECTED_CONTENT_RIGHTS_SIGNATURE_INTENT
     )
 }
 
