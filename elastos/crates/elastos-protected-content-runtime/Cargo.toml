@@ -6,9 +6,12 @@ license.workspace = true
 description = "Internal protected-content Runtime coordination state and provider seams"
 
 [dependencies]
+elastos-protected-content-provider-contracts = { path = "../elastos-protected-content-provider-contracts" }
 elastos-protected-content-contracts = { path = "../elastos-protected-content-contracts" }
+elastos-wallet-contract = { path = "../elastos-wallet-contract" }
 hex = "0.4"
 nix = { version = "0.29", features = ["fs", "user"] }
+serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "1.0"
 

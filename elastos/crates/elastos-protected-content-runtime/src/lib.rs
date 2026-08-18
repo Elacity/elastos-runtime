@@ -5,8 +5,14 @@
 //! expose CEKs, shares, routes, endpoints, Carrier topology, Library UI, or
 //! product cutover behavior.
 
+mod coordinator;
 mod journal;
 
+pub use coordinator::{
+    RuntimeCustodyProvider, RuntimeProviderCallError, RuntimeReleaseCoordinator,
+    RuntimeReleaseCoordinatorError, RuntimeReleaseCoordinatorOutcome,
+    RuntimeReleaseNonterminalReason, RuntimeRightsProvider, RuntimeSelectedProvider,
+};
 pub use journal::{
     PersistedRuntimeReleaseOperation, RuntimeReleaseJournal, RuntimeReleaseJournalError,
     RuntimeReleaseOperationDraft, RuntimeReleaseTerminalResult,
