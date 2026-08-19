@@ -1163,6 +1163,9 @@ function launchActionKey(targetId, query) {
 }
 
 export function openTarget(targetId, options = {}) {
+  if (windowHooks?.holdHomeSetupAct?.(targetId) === true) {
+    return;
+  }
   if (SINGLE_SESSION_TARGETS.has(targetId) && browserWindowCount(targetId) > 0) {
     activateTargetGroup(targetId);
     return;

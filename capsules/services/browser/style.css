@@ -1,18 +1,24 @@
+/* Same token mapping as the System capsule — Services is a Settings-family
+   surface (dark default; shared tokens flip with data-el-theme). */
 :root {
-  color-scheme: light;
   --primary-color-icon: invert(0);
-  --color-settings-bg: #ffffff;
+  --color-settings-bg: var(--el-bg);
+  --color-settings-sidebar: rgba(22, 24, 29, 0.78);
+  --color-settings-card: var(--el-surface-raised);
+  --color-bg-tertiary: var(--el-inset);
+  --color-text-primary: var(--el-text);
+  --color-text-secondary: var(--el-muted);
+  --color-text-muted: var(--el-soft);
+  --color-border: var(--el-hairline);
+  --color-border-light: var(--el-hairline-strong);
+  --color-success: var(--el-ok);
+  --color-warning: var(--el-brand);
+  --color-danger: var(--el-danger);
+  font-family: var(--el-font);
+}
+
+:root[data-el-theme="light"] {
   --color-settings-sidebar: #f9f9f9;
-  --color-bg-tertiary: #f3f4f6;
-  --color-text-primary: #1f2937;
-  --color-text-secondary: #4b5563;
-  --color-text-muted: #6b7280;
-  --color-border: #e5e7eb;
-  --color-border-light: #d1d5db;
-  --color-success: #047857;
-  --color-warning: #a16207;
-  --color-danger: #b91c1c;
-  font-family: "Avenir Next", "Segoe UI", sans-serif;
 }
 
 * {
@@ -54,7 +60,7 @@ dd {
 }
 
 code {
-  font-family: "SFMono-Regular", "Monaco", "Menlo", monospace;
+  font-family: var(--el-font-mono);
 }
 
 .locked-shell {
@@ -63,7 +69,7 @@ code {
   min-height: 100dvh;
   place-items: center;
   padding: 24px;
-  background: #f6f7f9;
+  background: var(--color-settings-bg);
 }
 
 .locked-card {
@@ -71,7 +77,7 @@ code {
   border: 1px solid var(--color-border);
   border-radius: 8px;
   padding: 30px;
-  background: #fff;
+  background: var(--color-settings-card);
 }
 
 .eyebrow {
@@ -94,56 +100,82 @@ code {
   flex-direction: column;
   height: 100vh;
   height: 100dvh;
+  overflow: hidden;
+  background: var(--color-settings-bg);
 }
 
+/* Apps-level blend: flex split shell (not fixed sidebar + margin). */
 .settings {
   display: flex;
-  min-height: 100%;
-  flex-grow: 1;
+  flex: 1;
+  min-height: 0;
   -webkit-font-smoothing: antialiased;
+  background: var(--color-settings-bg);
 }
 
 .settings-sidebar {
-  position: fixed;
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 220px;
+  width: 220px;
+  min-width: 220px;
+  position: relative;
   z-index: 2;
-  width: 200px;
-  height: 100%;
-  margin-top: 1px;
-  border-right: 1px solid var(--color-border);
-  padding: 20px;
-  background-color: var(--color-settings-sidebar);
+  margin: 0;
+  overflow: auto;
+  border-right: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+  padding: var(--window-chrome-safe-top, 52px) 12px 16px;
+  background: color-mix(in srgb, var(--color-settings-sidebar) 78%, transparent);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+}
+
+:root[data-el-theme="light"] .settings-sidebar {
+  background: color-mix(in srgb, var(--color-settings-sidebar) 86%, transparent);
 }
 
 .settings-sidebar-item {
   display: flex;
-  width: 100%;
+  width: calc(100% - 8px);
   align-items: center;
   gap: 10px;
-  margin-bottom: 4px;
-  border-radius: 4px;
-  padding: 8px 10px;
+  margin: 0 4px 2px;
+  border-radius: 999px;
+  padding: 7px 12px;
   background: transparent;
-  color: var(--color-text-primary);
+  color: var(--el-muted);
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13px;
+  font-weight: 500;
   text-align: left;
 }
 
-.settings-sidebar-item:hover,
+.settings-sidebar-item:hover {
+  background: var(--el-lift);
+  color: var(--el-text);
+}
+
 .settings-sidebar-item.active {
-  background-color: var(--color-border);
+  color: var(--el-accent, var(--brand));
+  background: var(--el-lift-strong);
+  font-weight: 600;
 }
 
 .settings-sidebar-item strong {
   margin-left: auto;
   color: var(--color-text-muted);
   font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-sidebar-item.active strong {
+  color: var(--el-accent, var(--brand));
 }
 
 .settings-sidebar-icon {
   position: relative;
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
   color: currentColor;
 }
@@ -158,7 +190,7 @@ code {
   inset: 4px;
   border: 1.7px solid currentColor;
   border-radius: 5px;
-  box-shadow: inset 0 -5px 0 rgba(31, 41, 55, 0.16);
+  box-shadow: inset 0 -5px 0 var(--el-inset);
 }
 
 .settings-sidebar-icon-others::before {
@@ -181,25 +213,50 @@ code {
 
 .settings-content-container {
   flex: 1;
-  margin-left: 240px;
+  min-width: 0;
+  margin-left: 0;
   overflow-y: auto;
-  padding: 20px 30px;
-  background-color: var(--color-settings-bg);
+  padding: 28px 32px 48px;
+  background: var(--color-settings-bg);
 }
 
 .settings-content {
-  max-width: 840px;
-  margin: auto;
-  background-color: var(--color-settings-bg);
+  /* Grow with the window; keep a readable ceiling on ultra-wide. */
+  width: 100%;
+  max-width: min(1100px, 100%);
+  margin: 0;
+  background: transparent;
   color: var(--color-text-primary);
+}
+
+.pc2-section[hidden] {
+  display: none !important;
+}
+
+.services-page-title {
+  margin: 0 0 8px;
+  color: var(--el-text);
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+.services-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
 }
 
 .services-toolbar {
   display: flex;
+  flex: 0 0 auto;
   justify-content: flex-end;
-  margin-bottom: 12px;
-  border-bottom: 1px solid var(--color-border);
-  padding: 0 5px 12px;
+  margin: 0;
+  border: 0;
+  padding: 6px 0 0;
 }
 
 .services-status {
@@ -212,12 +269,12 @@ code {
 }
 
 .services-status[data-tone="error"] {
-  border-color: rgba(185, 28, 28, 0.22);
+  border-color: color-mix(in srgb, var(--color-danger) 30%, transparent);
   color: var(--color-danger);
 }
 
 .services-status[data-tone="ok"] {
-  border-color: rgba(4, 120, 87, 0.22);
+  border-color: color-mix(in srgb, var(--color-success) 30%, transparent);
   color: var(--color-success);
 }
 
@@ -226,13 +283,12 @@ code {
 }
 
 .pc2-section-title {
-  margin-bottom: 8px;
-  padding-left: 2px;
-  color: #000;
-  font-size: 11px;
+  margin: 0 0 10px;
+  padding: 0;
+  color: var(--el-text);
+  font-size: 22px;
   font-weight: 700;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
+  letter-spacing: -0.02em;
 }
 
 .pc2-group,
@@ -240,7 +296,7 @@ code {
   overflow: hidden;
   border: 1px solid var(--color-border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--color-settings-card);
 }
 
 .services-list {
@@ -257,7 +313,7 @@ code {
 
 .service-subsection-title {
   padding: 10px 16px;
-  background: #f9fafb;
+  background: var(--color-bg-tertiary);
   color: var(--color-text-muted);
   font-size: 11px;
   font-weight: 700;
@@ -325,10 +381,10 @@ code {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  border: 1px solid rgba(185, 28, 28, 0.18);
+  border: 1px solid color-mix(in srgb, var(--color-danger) 26%, transparent);
   border-radius: 7px;
   padding: 10px 12px;
-  background: #fef2f2;
+  background: color-mix(in srgb, var(--color-danger) 9%, transparent);
   color: var(--color-danger);
   font-size: 13px;
 }
@@ -347,7 +403,7 @@ code {
   border: 1px solid var(--color-border);
   border-radius: 999px;
   padding: 3px 8px;
-  background: #f9fafb;
+  background: var(--color-bg-tertiary);
   color: var(--color-text-muted);
   font-size: 11px;
   font-weight: 700;
@@ -355,19 +411,19 @@ code {
 }
 
 .status-badge[data-tone="ok"] {
-  border-color: rgba(4, 120, 87, 0.22);
-  background: #ecfdf5;
+  border-color: color-mix(in srgb, var(--color-success) 30%, transparent);
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
   color: var(--color-success);
 }
 
 .status-badge[data-tone="warn"] {
-  border-color: rgba(161, 98, 7, 0.22);
-  background: #fffbeb;
+  border-color: color-mix(in srgb, var(--color-warning) 30%, transparent);
+  background: color-mix(in srgb, var(--color-warning) 12%, transparent);
   color: var(--color-warning);
 }
 
 .status-badge[data-tone="muted"] {
-  background: #f3f4f6;
+  background: var(--color-bg-tertiary);
   color: var(--color-text-muted);
 }
 
@@ -376,18 +432,21 @@ code {
   border: 1px solid var(--color-border-light);
   border-radius: 6px;
   padding: 6px 11px;
-  background: #fff;
+  background: var(--color-settings-card);
   color: var(--color-text-primary);
   cursor: pointer;
   font-size: 13px;
   font-weight: 600;
 }
 
-.pc2-btn:hover:not(:disabled),
-.pc2-btn:focus-visible:not(:disabled) {
-  border-color: #9ca3af;
-  background: #f9fafb;
-  outline: none;
+.pc2-btn:hover:not(:disabled) {
+  border-color: var(--el-hairline-strong);
+  background: var(--el-lift);
+}
+
+.pc2-btn:focus-visible {
+  outline: 2px solid var(--el-focus);
+  outline-offset: 1px;
 }
 
 .pc2-btn:disabled {
@@ -396,46 +455,51 @@ code {
 }
 
 .pc2-btn-primary {
-  border-color: #1f2937;
-  background: #1f2937;
-  color: #fff;
+  border-color: transparent;
+  background: var(--el-accent);
+  color: var(--el-accent-ink);
 }
 
-.pc2-btn-primary:hover:not(:disabled),
-.pc2-btn-primary:focus-visible:not(:disabled) {
-  background: #111827;
-  color: #fff;
+.pc2-btn-primary:hover:not(:disabled) {
+  background: var(--el-accent-strong);
 }
 
 .pc2-btn-danger {
-  border-color: rgba(185, 28, 28, 0.36);
+  border-color: color-mix(in srgb, var(--color-danger) 42%, transparent);
   color: var(--color-danger);
 }
 
-.pc2-btn-danger:hover:not(:disabled),
-.pc2-btn-danger:focus-visible:not(:disabled) {
-  border-color: rgba(185, 28, 28, 0.5);
-  background: #fef2f2;
+.pc2-btn-danger:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--color-danger) 56%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 10%, transparent);
 }
 
 @media (max-width: 720px) {
+  /* Narrow stopgap — full mobile campaign later. */
   .settings {
-    display: block;
+    flex-direction: column;
   }
 
   .settings-sidebar {
-    position: static;
+    flex: 0 0 auto;
     width: 100%;
+    min-width: 0;
     height: auto;
+    padding: 12px;
     border-right: 0;
-    border-bottom: 1px solid var(--color-border);
+    border-bottom: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
   }
 
   .settings-content-container {
     margin-left: 0;
-    padding: 16px;
+    padding: 16px 14px 24px;
   }
 
+  .services-page-title {
+    font-size: 28px;
+  }
+
+  .services-page-head,
   .services-toolbar,
   .pc2-card-row,
   .service-card-main,

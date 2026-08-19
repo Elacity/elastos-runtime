@@ -760,36 +760,26 @@ for (const file of activeHtmlFiles) {
   assertStaticControlsAreNamed(file);
 }
 
-// Documents still owns its palette. Chat Room took the shared token sheet, so
-// it is checked below by the stronger rule instead: names must resolve to
-// shared tokens, and the file must name no colour of its own.
-const lightTokenFiles = [
-  "capsules/documents/browser/index.html",
-];
-
-const lightTokens = new Map([
-  ["--bg", "#edf1fb"],
-  ["--bg-strong", "#e3e9fb"],
-  ["--panel", "rgba(255, 255, 255, 0.9)"],
-  ["--panel-strong", "#ffffff"],
-  ["--panel-soft", "#eef2ff"],
-  ["--line", "rgba(83, 103, 164, 0.14)"],
-  ["--line-strong", "rgba(83, 103, 164, 0.22)"],
-  ["--ink", "#1d2438"],
-  ["--muted", "#66708a"],
-  ["--brand", "#f6921a"],
-  ["--brand-soft", "#fff1dc"],
-  ["--accent", "#5f76d8"],
-  ["--accent-soft", "#e8edff"],
-  ["--accent-deep", "#3c53a7"],
-  ["--danger", "#b14c5a"],
-]);
-
-for (const file of lightTokenFiles) {
-  const source = read(file);
-  for (const [token, value] of lightTokens) {
-    assertToken(source, file, token, value);
-  }
+// Documents took the shared token sheet, so it is checked by the stronger
+// rule: names must resolve to shared tokens. Deliberate exceptions: the
+// --bg-strong deep-fill and the --panel glass tint are alpha-blend design
+// values, not palette decisions.
+const documentsIndexForTokens = read("capsules/documents/browser/index.html");
+for (const [token, value] of new Map([
+  ["--bg", "var(--el-bg)"],
+  ["--panel-strong", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
+  ["--accent-deep", "var(--el-accent-strong)"],
+  ["--danger", "var(--el-danger)"],
+])) {
+  assertToken(documentsIndexForTokens, "capsules/documents/browser/index.html", token, value);
 }
 
 const chatRoomStyle = read("capsules/chat-room/browser/style.css");
@@ -880,33 +870,39 @@ const systemJs = read("capsules/system/browser/system.js");
 const systemEspProjections = read("capsules/system/browser/esp-projections.mjs");
 const walletApiSource = read("capsules/wallet/browser/wallet-api.js");
 for (const [token, value] of new Map([
-  ["--color-settings-bg", "#ffffff"],
-  ["--color-settings-sidebar", "#f9f9f9"],
-  ["--color-settings-card", "#ffffff"],
-  ["--color-bg-tertiary", "#f3f4f6"],
-  ["--color-text-primary", "#1f2937"],
-  ["--color-text-secondary", "#4b5563"],
-  ["--color-text-muted", "#6b7280"],
-  ["--color-border", "#e5e7eb"],
-  ["--color-border-light", "#d1d5db"],
-  ["--color-input-bg", "#ffffff"],
-  ["--color-input-border", "#d1d5db"],
-  ["--color-input-text", "#1f2937"],
+  ["--color-settings-bg", "var(--el-bg)"],
+  ["--color-settings-card", "var(--el-surface-raised)"],
+  ["--color-bg-tertiary", "var(--el-inset)"],
+  ["--color-text-primary", "var(--el-text)"],
+  ["--color-text-secondary", "var(--el-muted)"],
+  ["--color-text-muted", "var(--el-soft)"],
+  ["--color-border", "var(--el-hairline)"],
+  ["--color-border-light", "var(--el-hairline-strong)"],
+  ["--color-input-bg", "var(--el-inset)"],
+  ["--color-input-border", "var(--el-hairline)"],
+  ["--color-input-text", "var(--el-text)"],
 ])) {
   assertToken(systemSettingsStyle, "capsules/system/browser/style.css", token, value);
 }
 
 const libraryStyle = read("capsules/library/browser/library.css");
+// Library rides the shared token sheet (same rule as Inbox/Chat Room): every
+// palette name resolves to an --el-* token, so the capsule follows the user's
+// accent and theme instead of pinning a copy of someone else's palette.
+// Deliberate exceptions: the sidebar glass tint and brand-soft wash are
+// alpha-blend design values, not palette decisions.
 for (const [token, value] of new Map([
-  ["--bg", "#f6f7f9"],
-  ["--sidebar-bg", "#f0f1f4"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f3f4f6"],
-  ["--line", "rgba(60, 60, 67, 0.14)"],
-  ["--ink", "#1d1d1f"],
-  ["--muted", "#6b6b6b"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-strong", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
 ])) {
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
@@ -1071,6 +1067,13 @@ const appSurfaceCapsuleManifests = Object.fromEntries(
     "wallet-unisat",
     "wallet-walletconnect",
   ].map((name) => [name, JSON.parse(read(`capsules/${name}/capsule.json`))]),
+);
+assert(
+  homeGuiCapsuleManifest.icon === "browser/icons" &&
+    appSurfaceCapsuleManifests["wallet-metamask"].icon === "browser/icons" &&
+    appSurfaceCapsuleManifests["wallet-unisat"].icon === "browser/icons" &&
+    appSurfaceCapsuleManifests["wallet-walletconnect"].icon === "browser/icons",
+  "Home GUI and wallet connectors must own their icons through capsule.json",
 );
 const providerCapsuleManifests = Object.fromEntries(
   [
@@ -1781,9 +1784,121 @@ assert(
   "Shell chords live in the keyboard layer alone — a second binding in home-gui.js would toggle surfaces straight back closed",
 );
 assert(
-  homeGuiTemplateHtml.includes('id="wallet-rail"') ||
-    !/shortcuts-row"><dt>Wallet<\/dt>/.test(homeGuiTemplateHtml),
-  "The shortcuts overlay documents only surfaces that exist: no Wallet row until the wallet rail lands",
+  homeGuiTemplateHtml.includes('id="spotlight"') &&
+    homeGuiTemplateHtml.includes('id="spotlight-input"') &&
+    homeGuiTemplateHtml.includes('id="spotlight-results"') &&
+    homeGuiTemplateHtml.includes('id="quick-look"') &&
+    homeGuiTemplateHtml.includes('id="quick-look-stage"') &&
+    homeGuiTemplateHtml.includes('id="shortcuts-overlay"') &&
+    homeGuiTemplateHtml.includes('id="about-overlay"') &&
+    homeGuiTemplateHtml.includes('id="window-switcher"') &&
+    homeGuiJs.includes("bindSpotlight()") &&
+    homeGuiJs.includes("bindQuickLook()"),
+  "Spotlight, Peek, shortcuts, About, and the window switcher keep their Home chrome slots",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="control-centre-quick-open"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-spotlight"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-inbox"') &&
+    homeGuiTemplateHtml.includes('id="control-centre-quick-wallet"') &&
+    read("capsules/home-gui/browser/shell-control-centre.js").includes("showSpotlight()") &&
+    read("capsules/home-gui/browser/shell-control-centre.js").includes("showInboxRail()") &&
+    read("capsules/home-gui/browser/shell-control-centre.js").includes("function syncQuickOpen(") &&
+    homeGuiStyle.includes(".control-centre-quick-open {\n  display: none;") &&
+    !read("capsules/home-gui/browser/shell-control-centre.js").includes(
+      'openTarget("spotlight")',
+    ),
+  "Phone Control Centre Quick open is Home chrome: Spotlight, Inbox rail, Wallet rail — same doors as the toolbar, no second launch",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="wallet-rail"') &&
+    homeGuiTemplateHtml.includes('id="wallet-rail-frame"') &&
+    homeGuiTemplateHtml.includes('id="inbox-rail"') &&
+    homeGuiTemplateHtml.includes('id="connector-sheet"') &&
+    homeGuiJs.includes("bindWalletRail()") &&
+    homeGuiJs.includes("bindConnectorSheet()") &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes(
+      'const launched = await launchHomeTarget("wallet", {});',
+    ) &&
+    read("capsules/home-gui/browser/shell-wallet-rail.js").includes(
+      'route.searchParams.set("presentation", "rail")',
+    ) &&
+    read("capsules/wallet/browser/wallet.js").includes("function applyRailPresentationChrome(") &&
+    read("capsules/wallet/browser/wallet.js").includes(
+      'message?.type !== "elastos:wallet-chrome-command"',
+    ),
+  "Wallet rail is Home chrome around one host-launched opaque Wallet capsule; connectors stay on the sheet launch path",
+);
+assert(
+  homeGuiTemplateHtml.includes('id="setup-sheet"') &&
+    homeGuiTemplateHtml.includes('id="setup-sheet-recovery"') &&
+    homeGuiTemplateHtml.includes('id="setup-sheet-profile"') &&
+    homeGuiJs.includes("bindSetupSheet()") &&
+    homeGuiJs.includes("holdHomeSetupAct") &&
+    homeGuiJs.includes("syncSetupSheet(previous, summary)") &&
+    shellWindows.includes("windowHooks?.holdHomeSetupAct?.(targetId) === true") &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
+      'const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1"',
+    ) &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
+      "readiness.schema !== PROFILE_READINESS_SCHEMA",
+    ) &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
+      'openTarget("system", { query: { settings: "security" } })',
+    ) &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
+      'openTarget("people")',
+    ) &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
+      'const SETUP_HOLD_TARGETS = new Set(["chat-room"])',
+    ) &&
+    !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("localStorage") &&
+    !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("Math.random") &&
+    !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("/api/auth/recovery") &&
+    !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("/api/apps/people/profile"),
+  "First-run setup is Home chrome over host profile_readiness; Recovery and Profile stay on System and People; Chat is held until that fact is ready",
+);
+assert(
+  !homeGuiJs.includes('"#agent-harness"') &&
+    homeGuiJs.includes("hideAgentHarness({ restoreShelfApps: false, syncStage: false })") &&
+    read("capsules/home-gui/browser/shell-stages.js").includes(
+      "harness.showAgentHarness({ fromShelf: true, syncStage: false })",
+    ) &&
+    read("capsules/home-gui/browser/agent-shelf.js").includes(
+      "showAgentHarness({ fromShelf: true })",
+    ),
+  "Agent room is Shelf/harness-owned, not host chrome; host unmount must tear it down without a second morph",
+);
+assert(
+  homeGuiJs.includes("bindInboxRail()") &&
+    read("capsules/home-gui/browser/shell-inbox-rail.js").includes(
+      'const launched = await launchHomeTarget("inbox", {});',
+    ) &&
+    read("capsules/home-gui/browser/shell-inbox-rail.js").includes(
+      'route.searchParams.set("presentation", "rail")',
+    ) &&
+    read("capsules/inbox/browser/index.html").includes("function applyRailPresentationChrome(") &&
+    read("capsules/inbox/browser/index.html").includes(
+      'message?.type !== "elastos:inbox-chrome-command"',
+    ) &&
+    read("capsules/inbox/browser/index.html").includes(
+      '"el-button el-button-primary"',
+    ) &&
+    read("capsules/inbox/browser/index.html").includes(
+      '"el-button el-button-danger"',
+    ) &&
+    read("capsules/_shared/elastos-ui.css").includes(".el-button-danger {") &&
+    read("capsules/_shared/elastos-ui.css").includes("--el-rail: #111113;") &&
+    read("capsules/inbox/browser/index.html").includes(
+      "background: var(--el-rail, var(--el-bg));",
+    ) &&
+    read("capsules/home-gui/browser/agent-harness.css").includes(
+      "--harness-rail: var(--el-rail, #111113);",
+    ) &&
+    read("capsules/home-gui/browser/style.css").includes(
+      "background: var(--el-rail, var(--frame-fill));",
+    ),
+  "Inbox rail is Home chrome around one host-launched opaque Inbox capsule; request actions use the shared button primitives; rail fill matches the Agent sidebar token",
 );
 assert(
   shellStages.includes("export function agentStageId()") &&
@@ -1794,6 +1909,23 @@ assert(
     homeGuiTemplateHtml.includes('id="viewer-rail"') &&
     homeGuiTemplateHtml.includes('id="shelf-morph-stage"'),
   "Agent harness is wired: Agent Space, workspace snapshot hook, harness + viewer + shelf markup",
+);
+assert(
+  read("capsules/home-gui/browser/agent-harness.js").includes(
+    "void manageAgentTool(manageTool.dataset.toolsManage)",
+  ) &&
+    read("capsules/home-gui/browser/agent-grants.js").includes(
+      "export async function requestInboxLibraryReadGrant()",
+    ) &&
+    read("capsules/home-gui/browser/agent-grants.js").includes(
+      "export async function manageAgentTool(toolId)",
+    ) &&
+    homeGuiTemplateHtml.includes('data-tools-manage="library.read"') &&
+    !homeGuiTemplateHtml.includes("data-tools-demo-grant") &&
+    !read("capsules/home-gui/browser/agent-configure.js").includes(
+      "data-tools-demo-grant",
+    ),
+  "Agent Settings Manage creates an Inbox library.read request; it does not mint a preview grant",
 );
 assert(
   !/fetch\(/.test(shellStages) &&
@@ -1843,6 +1975,31 @@ assert(
     shellJs.includes("homeToken: context.homeToken,") &&
     !shellJs.includes("windowId: data.windowId"),
   "Home must bind a menu manifest to the sending app frame's own launch token and never take a window id from the sender",
+);
+assert(
+  shellJs.includes('data.type === "home:ui-preference"') &&
+    shellJs.includes("function handleHomeUiPreference(") &&
+    shellJs.includes("const HOME_UI_PREFERENCE_KEYS = new Set([") &&
+    shellJs.includes("function isAllowedHomeUiPreference(") &&
+    shellJs.includes("function persistHostUiPreference(") &&
+    shellJs.includes('context.targetId === SYSTEM_APP_ID') &&
+    shellJs.includes("[HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId)") &&
+    shellJs.includes('command: "ui-preference"') &&
+    homeGuiShell.includes('command === "ui-preference"') &&
+    homeGuiShell.includes("applyHomeGuiUiPreferences(preferences)"),
+  "Home must persist System/Control Centre appearance writes on one closed host path and relay them to the GUI",
+);
+assert(
+  read("capsules/home-gui/browser/shell-chrome.js").includes(
+    "summary?.identity?.profile?.display_name",
+  ) &&
+    read("capsules/home-gui/browser/shell-control-centre.js").includes(
+      "whoamiDetail.textContent = summaryDisplayName(summary)",
+    ) &&
+    !read("capsules/home-gui/browser/shell-control-centre.js").includes(
+      "principal_id",
+    ),
+  "Control Centre Signed in as uses the host Profile display name — never the principal id",
 );
 assert(
   homeGuiShell.includes('hasExactKeys(message, ["type", "command", "homeToken", "menus"])') &&
@@ -2013,6 +2170,8 @@ assert(
   ) &&
     !walletConnectorLaunchBlock.includes("activateDesktopShell") &&
     !walletOpenApprovalMethodBlock.includes("closeDrawers()") &&
+    !walletOpenApprovalMethodBlock.includes("query:") &&
+    !walletOpenApprovalMethodBlock.includes("presentation") &&
     shellWindows.includes("function walletConnectorWindowSpec()") &&
     shellWindows.includes("WALLET_CONNECTOR_WINDOW_WIDTH = 480") &&
     shellWindows.includes("WALLET_CONNECTOR_WINDOW_HEIGHT = 560") &&
@@ -2244,8 +2403,33 @@ assert(
     ) &&
     homeClipboardSourceGate.includes(
       "Only the trusted top-level Home Clipboard host may access navigator.clipboard",
-    ),
+    ) &&
+    homeClipboardProtocol.includes('"identity.did"') &&
+    homeClipboardHost.includes('"system:identity.did:write"') &&
+    systemJs.includes('targetId: "system"') &&
+    systemJs.includes('purpose: "identity.did"') &&
+    !systemJs.includes("navigator.clipboard") &&
+    !homeGuiCore.includes("navigator.clipboard") &&
+    !homeGuiShell.includes("navigator.clipboard") &&
+    !read("capsules/home-gui/browser/agent-harness.js").includes("navigator.clipboard") &&
+    !read("capsules/home-gui/browser/agent-shelf.js").includes("navigator.clipboard") &&
+    !read("capsules/home-gui/browser/agent-studio.js").includes("navigator.clipboard"),
   "Home must own one bounded, visible-user-action first-party Clipboard edge while opaque capsule frames receive no Clipboard permission",
+);
+assert(
+  !read("capsules/home-gui/browser/agent-studio.js").includes("/api/apps/home/creative") &&
+    !read("capsules/home-gui/browser/agent-stream.js").includes("/api/apps/home/creative") &&
+    read("capsules/home-gui/browser/agent-studio.js").includes("offer:h3-video:2x") &&
+    read("capsules/home-gui/browser/agent-studio.js").includes("fetchModelOffers") &&
+    read("capsules/home-gui/browser/agent-studio.js").includes("requireVideoOffer"),
+  "Studio readiness and runs must use the model offer, not a retired Home creative HTTP path",
+);
+assert(
+  read(".github/workflows/ci.yml").includes("./scripts/vendor-ui-tokens.sh --check") &&
+    read(".github/workflows/ci.yml").includes("node scripts/home-clipboard-source-gate.mjs") &&
+    read("justfile").includes("./scripts/vendor-ui-tokens.sh --check") &&
+    read("justfile").includes("node scripts/home-clipboard-source-gate.mjs"),
+  "CI source-gate and just verify must run the vendored token contract and the Home Clipboard source gate",
 );
 assert(
     shellJs.includes('const PASSKEY_STEP_UP_TARGETS = new Set(["inbox", SYSTEM_APP_ID, "wallet"])') &&
@@ -2507,7 +2691,7 @@ assert(
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260626a") &&
+    servicesIndex.includes("services-20260819a") &&
     servicesIndex.includes("services-20260711i") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
@@ -2608,6 +2792,7 @@ for (const staleServicesToken of [
   "services-20260625a",
   "services-20260625b",
   "services-20260625c",
+  "services-20260626a",
   "available-services",
   "browser-exit-card",
   "trusted-count",
@@ -4681,7 +4866,11 @@ assert(
     marketplaceUi.includes('type: "home:open-target"') &&
     !marketplaceUi.includes("/api/apps/home/launch") &&
     !marketplaceUi.includes("runtime-bundle") &&
-    !marketplaceUi.includes("isBuiltIn"),
+    !marketplaceUi.includes("isBuiltIn") &&
+    marketplaceUi.includes("function catalogIconRoute(") &&
+    marketplaceUi.includes("function ownCapsuleIconRoute(") &&
+    marketplaceUi.includes("catalogIconRoute(capsule) || ownCapsuleIconRoute(capsule)") &&
+    !marketplaceUi.includes("/apps/home-gui/icons/"),
   "Marketplace must trust the installed-active catalog instead of inferring product state from source or bundle labels",
 );
 assert(
@@ -5030,7 +5219,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260712a";
+const systemAssetVersion = "system-20260819f";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -6761,7 +6950,7 @@ assert(
 );
 assert(
   libraryIndex.includes('rel="stylesheet" href="library.css"') &&
-  libraryIndex.includes('type="module" src="src/app.js?v=library-20260726a"') &&
+  libraryIndex.includes('type="module" src="src/app.js?v=library-20260819a"') &&
     !libraryIndex.includes("<style>") &&
     !libraryIndex.includes("function renderContent"),
   "Library index must stay a static shell with CSS and app code split out",
@@ -6864,8 +7053,17 @@ assert(
     chatStyle.includes("flex-direction: column;") &&
     chatStyle.includes("grid-template-columns: 72px minmax(0, 1fr);") &&
     chatStyle.includes(".conversation-choice-copy") &&
-    !chatStyle.includes("repeat(auto-fit, minmax(min(9rem, 100%), 1fr))"),
-  "Chat conversations must use one vertical list with a compact narrow rail",
+    chatStyle.includes("padding: 52px 10px 14px;") &&
+    !chatStyle.includes("window-chrome-safe-top") &&
+    !chatStyle.includes("repeat(auto-fit, minmax(min(9rem, 100%), 1fr))") &&
+    chatRoomIndex.includes('class="chat-sidebar"') &&
+    chatRoomIndex.includes('id="conversation-selector"') &&
+    chatRoomIndex.includes('id="conversation-join-section"') &&
+    chatRoomIndex.includes('id="conversation-invite-create"') &&
+    /<aside class="chat-sidebar"[\s\S]*id="conversation-join-section"[\s\S]*id="conversation-invite-create"[\s\S]*<\/aside>/.test(
+      chatRoomIndex,
+    ),
+  "Chat conversations must use one vertical list with a compact narrow rail, and join/invite stay in that capsule sidebar — not Home chrome",
 );
 assert(
   chatStyle.includes("border-radius: 8px;") &&
@@ -7699,6 +7897,15 @@ assert(
     !walletUnisat.includes("Wallet Connector") &&
     !walletWalletconnect.includes("Wallet Connector"),
   "Wallet UI and docs must present connector capsules as approval methods under one Wallet model",
+);
+assert(
+  walletMetamask.includes('<script src="./elastos-theme.js"></script>') &&
+    walletMetamask.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    walletUnisat.includes('<script src="./elastos-theme.js"></script>') &&
+    walletUnisat.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    read("scripts/vendor-ui-tokens.sh").includes("wallet-metamask/browser") &&
+    read("scripts/vendor-ui-tokens.sh").includes("wallet-unisat/browser"),
+  "Wallet connector capsules must follow Home theme through vendored tokens, not a hardcoded light sheet",
 );
 assert(
   walletProvider.includes("external wallet links require a connector_id") &&
@@ -10473,10 +10680,10 @@ assert(
 assert(
   browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
     !browserStyle.includes(".browser-hero") &&
     !browserStyle.includes(".browser-card"),
-  "Browser capsule must have a compact responsive ElastOS-aligned host-adapter UI without proof/debug cards",
+  "Browser capsule must have a compact responsive ElastOS-aligned host-adapter UI without proof/debug cards, with its accent riding the shared token sheet",
 );
 assert(
   read("components.json").includes('"browser"') &&
@@ -10756,7 +10963,7 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet.js?v=wallet-20260726b") &&
+  wallet.includes("wallet.js?v=wallet-20260819f") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
     wallet.includes("data-wallet-create-account") &&
@@ -10773,7 +10980,7 @@ assert(
     walletJs.includes("openReceiveFlow") &&
     walletJs.includes("openSendFlow") &&
     walletJs.includes("balance_key") &&
-    walletJs.includes("wallet-detail-summary") &&
+    walletJs.includes("has-account-card") &&
     walletJs.includes("fundedSendableAccounts"),
   "Wallet must expose Send/Receive plus canonical Accounts/Settings create-import surfaces with cache-busted assets",
 );
@@ -10815,9 +11022,8 @@ assert(
 assert(
   wallet.includes("wallet-settings-drawer") &&
     wallet.includes("wallet-settings-main") &&
-    wallet.includes("wallet-settings-side") &&
-    wallet.indexOf('class="wallet-settings-side"') <
-      wallet.indexOf('id="wallet-methods"') &&
+    wallet.includes('id="wallet-signers"') &&
+    wallet.includes('id="wallet-methods"') &&
     !wallet.includes("<h2>Wallet settings</h2>") &&
     !wallet.includes("<h3>Identity</h3>") &&
     !wallet.includes('id="wallet-theme"') &&
@@ -10825,7 +11031,7 @@ assert(
     !walletJs.includes("applyStoredTheme") &&
     !walletJs.includes("setTheme") &&
     !walletJs.includes("wallet.theme"),
-  "Wallet Settings must only contain wallet-local controls, keep approval methods on the side, and leave global appearance to System",
+  "Wallet Settings must only contain wallet-local controls, keep approval methods on the page, and leave global appearance to System",
 );
 assert(
   !walletJs.includes("native balances ready") &&
@@ -10833,15 +11039,15 @@ assert(
   "Wallet must not expose implementation-count balance copy when price providers are not approved",
 );
 assert(
-  !wallet.includes("wallet-brand") &&
+  !wallet.includes('id="wallet-brand"') &&
     walletJs.includes("selectedAccountId") &&
-    walletJs.includes("wallet-detail-address") &&
-    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes("wallet-account-card") &&
+    walletJs.includes("copyIconButton") &&
     walletJs.includes('account.proof_type === "siwe"') &&
     walletJs.includes("unavailable: Boolean(payload.unavailable)") &&
     !walletJs.includes("Balances update through approved Runtime providers.") &&
     !walletJs.includes('textNode("code", account.address, "wallet-address")'),
-  "Wallet must keep top chrome minimal, map SIWE accounts, preserve price-unavailable state, and reveal one copyable account address without provider jargon or duplicate address text",
+  "Wallet must keep top chrome minimal, map SIWE accounts, preserve price-unavailable state, and reveal one copyable house identity card without provider jargon or duplicate address text",
 );
 assert(
   wallet.indexOf('aria-label="Accounts"') <
@@ -10856,7 +11062,7 @@ assert(
     walletJs.includes("balanceTargetsForAccounts") &&
     walletJs.includes("accountForAsset") &&
     walletJs.includes("account_ids") &&
-    walletJs.includes("accountActionsNode.hidden = accounts.length > 0") &&
+    walletJs.includes("accountActionsNode.hidden = false") &&
     walletJs.includes("onWalletActionClick") &&
     !walletJs.includes("createAccountTile") &&
     !walletStyle.includes(".wallet-create-card") &&
@@ -10912,32 +11118,26 @@ assert(
   "wallet-provider manifest must keep principal-sensitive operations off its public interface while retaining internal audit truth",
 );
 assert(
-  wallet.includes(
-    '<section id="wallet-account-detail" class="wallet-detail" aria-label="Default account"></section>',
-  ) &&
+  wallet.includes('id="wallet-account-card"') &&
+    wallet.includes('id="wallet-get-started"') &&
+    wallet.includes('id="wallet-signers"') &&
+    wallet.includes('class="wallet-hero-scene"') &&
     wallet.indexOf('class="wallet-hero-balance"') <
-      wallet.indexOf('id="wallet-delta"') &&
-    wallet.indexOf('id="wallet-delta"') <
-      wallet.indexOf('id="wallet-account-detail"') &&
+      wallet.indexOf('id="wallet-account-card"') &&
     wallet.indexOf('id="wallet-total-balance"') <
-      wallet.indexOf('class="wallet-action-row"') &&
+      wallet.indexOf('id="wallet-send"') &&
     walletJs.includes("renderHeroAccount(allAccounts)") &&
     walletJs.includes("selectedOrDefaultAccount") &&
     walletJs.includes("defaultWalletAccount") &&
     walletJs.includes("latestDefault") &&
-    walletJs.includes("wallet-detail-inline") &&
+    walletJs.includes("has-account-card") &&
+    walletJs.includes("copyIconButton") &&
     walletJs.includes(
       'selectedAccountId = selectedAccountId === accountId ? "" : accountId',
     ) &&
-    walletJs.includes(
-      'getSelectedAccountId() === account.account_id ? "Show default wallet" : "Show in hero"',
-    ) &&
     walletJs.includes("clearAccountSelection") &&
     walletJs.includes("is-selected") &&
-    walletJs.includes("wallet-detail-qr") &&
-    walletJs.includes("/api/wallet/qr") &&
     !walletJs.includes("visibleAccounts") &&
-    !walletJs.includes("Selected account ·") &&
     !walletJs.includes("Hide details") &&
     !walletJs.includes("clearAccountFilter") &&
     !walletJs.includes("accountDetailNode.scrollIntoView") &&
@@ -10951,7 +11151,7 @@ assert(
       ".wallet-hero-row {",
       "Wallet hero row style",
     ).includes(
-      "grid-template-columns: minmax(240px, 1fr) minmax(160px, 0.6fr) minmax(190px, 220px)",
+      "grid-template-columns: 1fr",
     ) &&
     sourceBlock(walletStyle, ".wallet-delta {", "Wallet graph style").includes(
       "justify-self: center",
@@ -10992,13 +11192,13 @@ assert(
     walletStyle.includes(
       "grid-template-columns: repeat(auto-fill, minmax(200px, 1fr))",
     ) &&
-    walletStyle.includes("min-height: 118px") &&
+    walletStyle.includes("min-height: 72px") &&
     !walletStyle.includes(".wallet-address") &&
     !walletStyle.includes(".wallet-detail-close") &&
     !walletStyle.includes(".wallet-detail-balance") &&
     !walletStyle.includes(".wallet-detail-section") &&
     walletStyle.includes(".wallet-account.is-selected"),
-  "Wallet hero must keep balance/actions on the left, graph centered, QR/address on the right, center QR on mobile, and denser account cards without separate containers, side sheets, scroll jumps, transactions placeholders, or duplicate balances",
+  "Wallet hero must keep the house identity card, get-started CTAs, and stacked rail layout without flattened QR detail or duplicate account containers",
 );
 assert(
   gatewayApi.includes('WALLET_CAPSULE_ID => "Wallet"') &&
@@ -11278,7 +11478,7 @@ assert(
   systemStyle.includes(".pc2-section-title") &&
     systemStyle.includes("font-size: 11px;") &&
     systemStyle.includes("text-transform: uppercase;") &&
-    systemStyle.includes("background: #f9f9f9;") &&
+    systemStyle.includes("--color-settings-sidebar: #f9f9f9") &&
     systemStyle.includes("border: 1px solid #d0d0d0;"),
   "System Settings must keep PC2 compact section/card styling",
 );

@@ -30,6 +30,15 @@ test("target and purpose lookup accepts own policy entries only", () => {
     ),
     false,
   );
+  assert.equal(homeClipboardTargetSupported("system"), true);
+  assert.equal(
+    homeClipboardOperationAllowed("system", "identity.did", "write"),
+    true,
+  );
+  assert.equal(
+    homeClipboardOperationAllowed("system", "identity.did", "read"),
+    false,
+  );
   assert.equal(
     homeClipboardOperationAllowed("library", "resource.identifier", "write"),
     true,

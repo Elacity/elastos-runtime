@@ -102,6 +102,7 @@ const canonicalClientImports = Object.freeze({
   "capsules/library/browser/src/app.js": 'targetId: "library"',
   "capsules/documents/browser/index.html": 'targetId: "documents"',
   "capsules/chat-room/browser/index.html": 'targetId: "chat-room"',
+  "capsules/system/browser/system.js": 'targetId: "system"',
 });
 for (const [path, targetBinding] of Object.entries(canonicalClientImports)) {
   const source = readFileSync(join(repoRoot, path), "utf8");
@@ -158,6 +159,13 @@ assert(
     chatRoomUiSource.includes('JsValue::from_str("elastosChatCopyInvite")') &&
     !chatRoomUiSource.includes('JsValue::from_str("clipboard")'),
   "Chat invite copies must use the canonical trusted Home Clipboard path",
+);
+assert(
+  protocolSource.includes('"identity.did"') &&
+    hostSource.includes('"system:identity.did:write"') &&
+    readFileSync(join(repoRoot, "capsules/system/browser/system.js"), "utf8")
+      .includes('purpose: "identity.did"'),
+  "System device-identity copies must use the canonical trusted Home Clipboard path",
 );
 assert(
   protocolSource.includes(

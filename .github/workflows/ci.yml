@@ -47,9 +47,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: architecture entropy checks
         run: |
+          ./scripts/vendor-ui-tokens.sh --check
           bash scripts/check-wci-alignment.sh
           node scripts/home-entropy-check.mjs
           node scripts/browser-entropy-check.mjs
+          node scripts/home-clipboard-source-gate.mjs
       - name: product UI source proofs
         run: |
           node scripts/home-shell-regression-smoke.mjs
@@ -139,9 +141,11 @@ jobs:
         run: cargo fmt --all -- --check
       - name: architecture entropy checks
         run: |
+          ./scripts/vendor-ui-tokens.sh --check
           bash scripts/check-wci-alignment.sh
           node scripts/home-entropy-check.mjs
           node scripts/browser-entropy-check.mjs
+          node scripts/home-clipboard-source-gate.mjs
       - name: product UI source proofs
         run: |
           node scripts/home-shell-regression-smoke.mjs

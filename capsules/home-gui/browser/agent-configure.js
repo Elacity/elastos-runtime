@@ -52,7 +52,7 @@ export const HARNESS_PAGES = {
   },
   studio: {
     title: "Studio",
-    sub: "Generate video on this Home’s creative backend.",
+    sub: "Make a clip on this Home.",
   },
 };
 export const CONFIGURE_SECTIONS = new Set([
@@ -829,7 +829,8 @@ function renderToolsInto(el) {
       `<span class="agent-tools-manage-desc"></span>` +
       `</span>` +
       `<span class="agent-tools-manage-state"></span>` +
-      `<button type="button" class="agent-tools-manage-btn" data-tools-demo-grant>Manage</button>`;
+      `<button type="button" class="agent-tools-manage-btn" data-tools-manage>Manage</button>`;
+    li.querySelector("[data-tools-manage]").dataset.toolsManage = cap.id;
     li.querySelector(".agent-tools-manage-title").textContent = cap.label;
     li.querySelector(".agent-tools-manage-desc").textContent =
       cap.id === "wallet.sign"

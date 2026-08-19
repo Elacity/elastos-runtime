@@ -60,7 +60,7 @@ import {
   updateTaskbarState,
 } from "./shell-surface.js?v=home-20260814a";
 import { bindAgentShelf } from "./agent-shelf.js?v=home-20260814a";
-import { bindAgentHarness } from "./agent-harness.js?v=home-20260814a";
+import { bindAgentHarness, hideAgentHarness } from "./agent-harness.js?v=home-20260814a";
 import {
   attachAuthorizedTarget,
   closeWindow,
@@ -139,6 +139,7 @@ import {
   viewerRailTarget,
 } from "./shell-viewer-rail.js?v=home-20260814a";
 import {
+  attachAuthorizedConnectorSheet,
   bindConnectorSheet,
   connectorSheetFrame,
   connectorSheetTarget,
@@ -147,6 +148,12 @@ import {
   retireConnectorSheet,
   showConnectorSheet,
 } from "./shell-connector-sheet.js?v=home-20260814a";
+import {
+  bindSetupSheet,
+  hideSetupSheet,
+  holdHomeSetupAct,
+  syncSetupSheet,
+} from "./shell-setup-sheet.js?v=home-20260814a";
 
 const OPAQUE_CAPSULE_ORIGIN = "null";
 const OPAQUE_FRAME_TARGET = "*";
@@ -170,6 +177,7 @@ bindWalletRail();
 bindInboxRail();
 bindViewerRail();
 bindConnectorSheet();
+bindSetupSheet();
 window.addEventListener("elastos:ui-preference-changed", (event) => {
   const detail = event?.detail;
   const key = typeof detail?.key === "string" ? detail.key.trim() : "";
@@ -192,8 +200,8 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#wallet-rail",
   "#inbox-rail",
   "#viewer-rail",
-  "#agent-harness",
   "#connector-sheet",
+  "#setup-sheet",
   "#spotlight",
   "#window-switcher",
   "#quick-look",
@@ -232,6 +240,7 @@ configureWindowHooks({
   // Host-mediated launches: GUI never fetch-launches; shell-windows and the
   // wallet rail call this hook after bindHomeGuiInteractions binds it.
   launchTarget: (...args) => homeGuiHostActions.launchTarget?.(...args),
+  holdHomeSetupAct,
   // One Wallet session: dock/desktop window launch retires the rail so we
   // do not keep two iframes / home_tokens for the same capsule — including
   // when the rail is hidden but the warm iframe is still mounted.
@@ -286,6 +295,8 @@ export function retireHomeGuiSurface(options = {}) {
   retireWalletRail();
   retireInboxRail();
   retireConnectorSheet();
+  hideSetupSheet({ restoreFocus: false, rememberDismiss: false });
+  hideAgentHarness({ restoreShelfApps: false, syncStage: false });
   hideAboutOverlay({ restoreFocus: false });
   hideQuickLook();
   closeExpose();
@@ -733,6 +744,11 @@ export function relaunchHomeGuiWindowForToken(homeToken) {
 }
 
 export function attachAuthorizedHomeGuiTarget(launched) {
+  if (isConnectorSheetTarget(launched?.target) && walletRailOpen()) {
+    return attachAuthorizedConnectorSheet(launched).then((mounted) => (
+      mounted ? true : attachAuthorizedTarget(launched)
+    ));
+  }
   return attachAuthorizedTarget(launched);
 }
 
@@ -801,6 +817,7 @@ export function syncHomeGuiChrome(previous, summary) {
   maybeShowWalletApprovalToast(previous, summary);
   recordNotifications(summary);
   syncControlCentre(summary);
+  syncSetupSheet(previous, summary);
 }
 
 /* Menus are self-declared UI, not authority: the host verifies the sender's

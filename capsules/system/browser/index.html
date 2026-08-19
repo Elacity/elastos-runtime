@@ -4,7 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System · ElastOS</title>
-<link rel="stylesheet" href="./style.css?v=system-20260712a">
+<script src="./elastos-theme.js"></script>
+<script src="./elastos-accent-picker.js"></script>
+<link rel="stylesheet" href="./elastos-ui.css">
+<link rel="stylesheet" href="./style.css?v=system-20260819f">
 </head>
 <body>
   <section id="system-locked" class="system-locked" hidden>
@@ -21,29 +24,48 @@
       </button>
 
       <aside class="settings-sidebar disable-user-select disable-context-menu" aria-label="System sections">
-        <div class="settings-sidebar-burger disable-context-menu disable-user-select" aria-hidden="true"></div>
+        <input
+          id="settings-search"
+          class="settings-search"
+          type="search"
+          placeholder="Search settings"
+          spellcheck="false"
+          aria-label="Search settings"
+        >
         <button class="settings-sidebar-item disable-context-menu disable-user-select active" type="button" data-settings="account">
-          <span class="settings-sidebar-icon settings-sidebar-icon-account" aria-hidden="true"></span>
-          <span class="settings-sidebar-text">Account</span>
+          <span class="settings-sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8.5" r="3.5"/><path d="M5 19.5a7 7 0 0 1 14 0"/></svg>
+          </span>
+          <span class="settings-sidebar-text">Accounts</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="personalization">
-          <span class="settings-sidebar-icon settings-sidebar-icon-personalization" aria-hidden="true"></span>
-          <span class="settings-sidebar-text">Personalization</span>
+          <span class="settings-sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 0 0 16" fill="currentColor" stroke="none"/></svg>
+          </span>
+          <span class="settings-sidebar-text">Appearance</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="shell">
-          <span class="settings-sidebar-icon settings-sidebar-icon-shell" aria-hidden="true"></span>
+          <span class="settings-sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 15.5h17"/></svg>
+          </span>
           <span class="settings-sidebar-text">Shell</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="security">
-          <span class="settings-sidebar-icon settings-sidebar-icon-security" aria-hidden="true"></span>
+          <span class="settings-sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5.5 6.5v5c0 4.2 2.7 7.2 6.5 8.5 3.8-1.3 6.5-4.3 6.5-8.5v-5L12 3.5z"/></svg>
+          </span>
           <span class="settings-sidebar-text">Security</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="catalog">
-          <span class="settings-sidebar-icon settings-sidebar-icon-catalog" aria-hidden="true"></span>
+          <span class="settings-sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="6.5" height="6.5" rx="1.2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.2"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.2"/></svg>
+          </span>
           <span class="settings-sidebar-text">Apps &amp; Services</span>
         </button>
         <button class="settings-sidebar-item disable-context-menu disable-user-select" type="button" data-settings="about">
-          <span class="settings-sidebar-icon settings-sidebar-icon-about" aria-hidden="true"></span>
+          <span class="settings-sidebar-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="12" rx="1.5"/><path d="M8 20h8M12 17v3"/></svg>
+          </span>
           <span class="settings-sidebar-text">About</span>
         </button>
       </aside>
@@ -53,6 +75,41 @@
           <section class="pc2-section" aria-labelledby="accounts-title">
             <h1 id="accounts-title" class="pc2-section-title">Accounts</h1>
             <div class="pc2-group">
+              <div class="pc2-group-row" id="account-picture-row">
+                <div class="pc2-card-row account-picture-card">
+                  <div class="account-picture-preview-wrap">
+                    <div
+                      id="account-picture-preview"
+                      class="account-picture-preview"
+                      role="img"
+                      aria-label="Profile picture"
+                    >
+                      <span id="account-picture-monogram" class="account-picture-monogram">·</span>
+                      <img id="account-picture-image" class="account-picture-image" alt="" hidden />
+                    </div>
+                    <div>
+                      <div class="pc2-card-label">Your picture</div>
+                      <div class="pc2-card-sublabel">Shown on this computer’s login screen.</div>
+                      <div class="account-picture-actions">
+                        <button type="button" class="system-button system-button-secondary" id="account-picture-choose">
+                          Choose picture…
+                        </button>
+                        <button type="button" class="system-button system-button-secondary" id="account-picture-remove" hidden>
+                          Remove picture
+                        </button>
+                      </div>
+                      <p id="account-picture-status" class="pc2-card-value system-value-muted" hidden></p>
+                      <input
+                        id="account-picture-file"
+                        class="visually-hidden"
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        hidden
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
                   <div>
@@ -82,6 +139,69 @@
           <section class="pc2-section" aria-labelledby="appearance-title">
             <h1 id="appearance-title" class="pc2-section-title">Appearance</h1>
             <div class="pc2-group">
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Theme</div>
+                    <div class="pc2-card-sublabel">Light or dark across the shell and apps.</div>
+                  </div>
+                  <div id="theme-segment" class="system-segment" role="radiogroup" aria-label="Theme">
+                    <button type="button" class="system-segment-option" data-theme-option="auto" role="radio" aria-checked="false">Auto</button>
+                    <button type="button" class="system-segment-option" data-theme-option="light" role="radio" aria-checked="false">Light</button>
+                    <button type="button" class="system-segment-option" data-theme-option="dark" role="radio" aria-checked="false">Dark</button>
+                  </div>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Accent color</div>
+                    <div class="pc2-card-sublabel">One accent across the shell and every app.</div>
+                  </div>
+                  <div id="accent-picker" class="system-accent-picker" role="radiogroup" aria-label="Accent color">
+                    <button type="button" class="system-accent-dot" data-accent-option="blue" role="radio" aria-checked="false" aria-label="Blue" title="Blue"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="purple" role="radio" aria-checked="false" aria-label="Purple" title="Purple"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="pink" role="radio" aria-checked="false" aria-label="Pink" title="Pink"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="red" role="radio" aria-checked="false" aria-label="Red" title="Red"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="orange" role="radio" aria-checked="false" aria-label="Orange" title="Orange"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="yellow" role="radio" aria-checked="false" aria-label="Yellow" title="Yellow"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="green" role="radio" aria-checked="false" aria-label="Green" title="Green"></button>
+                    <button type="button" class="system-accent-dot" data-accent-option="graphite" role="radio" aria-checked="false" aria-label="Graphite" title="Graphite"></button>
+                    <button type="button" class="system-accent-dot system-accent-dot-custom" data-accent-option="custom" role="radio" aria-checked="false" aria-label="Custom" title="Custom color"></button>
+                  </div>
+                </div>
+                <div id="accent-custom-popover" class="system-accent-custom-popover" hidden>
+                  <div id="accent-custom-picker" class="el-accent-picker"></div>
+                  <label class="system-accent-custom-hex">
+                    <span>Hex</span>
+                    <input id="accent-custom-hex" type="text" maxlength="7" spellcheck="false" autocomplete="off" placeholder="#4f7fff" aria-label="Custom accent hex" />
+                  </label>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Automatically hide and show the Dock</div>
+                    <div class="pc2-card-sublabel">Tuck the dock under the bottom edge until the pointer approaches.</div>
+                  </div>
+                  <label class="system-switch">
+                    <input id="dock-autohide" type="checkbox" aria-label="Automatically hide and show the Dock">
+                    <span class="system-switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="pc2-group-row">
+                <div class="pc2-card-row">
+                  <div>
+                    <div class="pc2-card-label">Play interface sounds</div>
+                    <div class="pc2-card-sublabel">Three optional cues — notification, empty Trash, and refusal. Off by default.</div>
+                  </div>
+                  <label class="system-switch">
+                    <input id="ui-sounds" type="checkbox" aria-label="Play interface sounds">
+                    <span class="system-switch-track" aria-hidden="true"></span>
+                  </label>
+                </div>
+              </div>
               <div class="pc2-group-row">
                 <div class="pc2-card-row">
                   <div>
@@ -178,11 +298,11 @@
           </section>
 
           <section class="pc2-section" aria-labelledby="technical-title">
-            <h2 id="technical-title" class="pc2-section-title">Technical Details</h2>
+            <h2 id="technical-title" class="pc2-section-title">Advanced</h2>
             <details id="technical-details" class="technical-details">
               <summary class="technical-summary">
                 <span>
-                  <span class="pc2-card-label">Inspection</span>
+                  <span class="pc2-card-label">Technical Details</span>
                   <span class="pc2-card-sublabel">Review component identity, permissions, verification, and approval requirements.</span>
                 </span>
               </summary>
@@ -216,12 +336,33 @@
             <h1 id="device-title" class="pc2-section-title">This Device</h1>
             <div class="pc2-group">
               <div class="pc2-group-row">
-                <div class="pc2-card-row">
+                <div class="pc2-card-row device-identity-row">
                   <div>
                     <div class="pc2-card-label">Device identity</div>
-                    <div class="pc2-card-sublabel">Local identity for this device.</div>
+                    <div class="pc2-card-sublabel">Identifying string for this device — not a trust grant.</div>
                   </div>
-                  <code class="pc2-card-value system-code" data-field="device-did"></code>
+                  <div class="device-did-inline">
+                    <code
+                      class="pc2-card-value system-code device-did-value"
+                      data-field="device-did"
+                      id="device-did-value"
+                    ></code>
+                    <button
+                      id="device-did-copy"
+                      class="device-did-copy el-copy-btn"
+                      type="button"
+                      aria-label="Copy device identity"
+                      title="Copy"
+                    >
+                      <svg class="el-copy-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+                        <path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5" />
+                      </svg>
+                      <svg class="el-copy-check" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" hidden>
+                        <path d="M3.25 8.25l3 3 6.5-6.5" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
                 <dl class="system-fields compact-proof">
                   <div><dt>Device identity</dt><dd></dd></div>
@@ -276,6 +417,34 @@
 
     <p class="system-error" hidden></p>
   </main>
-  <script type="module" src="./system.js?v=system-20260712a"></script>
+  <script>
+    (function () {
+      const shell = document.querySelector(".settings");
+      if (!shell) {
+        return;
+      }
+      shell.addEventListener("click", (event) => {
+        const item = event.target.closest(".settings-sidebar-item");
+        if (!item || !shell.contains(item)) {
+          return;
+        }
+        const tab = (item.getAttribute("data-settings") || "").trim();
+        if (!tab) {
+          return;
+        }
+        for (const node of document.querySelectorAll(".settings-sidebar-item")) {
+          node.classList.toggle("active", node.getAttribute("data-settings") === tab);
+        }
+        for (const node of document.querySelectorAll(".settings-content")) {
+          node.classList.toggle("active", node.getAttribute("data-settings") === tab);
+        }
+        const container = document.querySelector(".settings-content-container");
+        if (container) {
+          container.scrollTop = 0;
+        }
+      });
+    })();
+  </script>
+  <script type="module" src="./system.js?v=system-20260819f"></script>
 </body>
 </html>

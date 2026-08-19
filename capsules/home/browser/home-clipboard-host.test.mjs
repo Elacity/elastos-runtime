@@ -211,6 +211,7 @@ test("closed target and purpose policy accepts only approved writes", async () =
     ["library", "resource.uri", "object:private/document-1"],
     ["library", "resource.identifier", "bafy-library-content"],
     ["documents", "resource.uri", "elastos://bafy-document"],
+    ["system", "identity.did", "did:elastos:iG8h9DeviceIdentityExample"],
   ];
   for (const [targetId, purpose, text] of cases) {
     const writes = [];

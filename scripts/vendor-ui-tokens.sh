@@ -35,6 +35,16 @@ TARGETS=(
   people/browser
   inbox/browser
   chat-room/browser
+  archive-manager/browser
+  browser/browser
+  documents/browser
+  library/browser
+  marketplace/browser
+  services/browser
+  system/browser
+  wallet/browser
+  wallet-metamask/browser
+  wallet-unisat/browser
 )
 
 MODE="${1:-sync}"

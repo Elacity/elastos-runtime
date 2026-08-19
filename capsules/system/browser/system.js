@@ -3,6 +3,9 @@ import {
   inspectActionRequestValidation,
   provenanceView,
 } from "./esp-projections.mjs";
+import {
+  createHomeClipboardClient,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
 const errorNode = document.querySelector(".system-error");
 const backgroundInput = document.querySelector("#background-input");
@@ -18,6 +21,13 @@ const guestRegistrationInput = document.querySelector("#guest-registration");
 const guestRegistrationStatusNode = document.querySelector('[data-field="guest-registration-status"]');
 const passkeyStatusNode = document.querySelector('[data-field="passkey-status"]');
 const accountListNode = document.querySelector("#account-list");
+const accountPicturePreview = document.querySelector("#account-picture-preview");
+const accountPictureMonogram = document.querySelector("#account-picture-monogram");
+const accountPictureImage = document.querySelector("#account-picture-image");
+const accountPictureChoose = document.querySelector("#account-picture-choose");
+const accountPictureRemove = document.querySelector("#account-picture-remove");
+const accountPictureFile = document.querySelector("#account-picture-file");
+const accountPictureStatus = document.querySelector("#account-picture-status");
 const recoveryDownloadButton = document.querySelector("#recovery-download");
 const recoveryImportInput = document.querySelector("#recovery-import");
 const recoveryPasswordInput = document.querySelector("#recovery-password");
@@ -42,9 +52,15 @@ const frameHomeToken = readLaunchToken();
 const homeParentOrigin = readQueryParam("home_origin");
 const HOME_HOST_ID = "home";
 const HOME_GUI_SHELL_ID = "home-gui";
+const homeClipboard = createHomeClipboardClient({
+  targetId: "system",
+  homeOrigin: homeParentOrigin,
+  homeToken: frameHomeToken,
+});
 if (frameHomeToken && homeParentOrigin && window.top !== window) {
   window.top.postMessage({ type: "home:app-ready", homeToken: frameHomeToken }, homeParentOrigin);
 }
+homeClipboard.start();
 let apiHomeToken = frameHomeToken;
 let chainNetworks = [];
 let chainStatusById = new Map();
@@ -57,6 +73,12 @@ let passkeyAuthorityActive = false;
 let pendingRecoveryImport = null;
 let activeShellName = "";
 let activeShellBusy = false;
+let uiPreferencesReadPromise = null;
+const AVATAR_IMAGE_MAX_BYTES = 512 * 1024;
+const AVATAR_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+const AVATAR_OUTPUT_EDGE = 512;
+let currentAccountPicture = { credentialId: "", avatarCid: "", displayName: "" };
+let accountPictureBusy = false;
 const DEFAULT_BACKGROUND_IMAGE_URL = "/apps/home-gui/wallpaper.webp";
 const BACKGROUND_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const BACKGROUND_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -99,6 +121,20 @@ async function boot() {
     return;
   }
   configureSettingsTabs();
+  configureSettingsSearch();
+  configureDeviceDidCopy();
+  const settingsTab = readQueryParam("settings");
+  if (
+    settingsTab &&
+    document.querySelector(`.settings-sidebar-item[data-settings="${settingsTab}"]`)
+  ) {
+    activateSettingsTab(settingsTab);
+  }
+  configureThemeSegment();
+  configureAccentPicker();
+  configureDockAutoHide();
+  configureUiSounds();
+  configureAccountPicture();
   configureAppearanceEditor();
   configureGuestAccess();
   configurePasskeyAccess();
@@ -1479,10 +1515,13 @@ async function refreshAccountList() {
   if (!accountListNode || !hasShellAccess()) {
     return;
   }
-  const data = await fetchJson("/api/auth/passkeys", {
-    headers: shellHeaders(),
-  });
-  renderAccounts(Array.isArray(data.passkeys) ? data.passkeys : []);
+  const [data, status] = await Promise.all([
+    fetchJson("/api/auth/passkeys", { headers: shellHeaders() }),
+    fetchJson("/api/auth/passkey/status").catch(() => ({ accounts: [] })),
+  ]);
+  const passkeys = Array.isArray(data.passkeys) ? data.passkeys : [];
+  renderAccounts(passkeys);
+  refreshAccountPictureFrom(passkeys, status);
 }
 
 function renderAccounts(accounts) {
@@ -2633,4 +2672,694 @@ function showError(error) {
   }
   errorNode.hidden = false;
   errorNode.textContent = publicSystemError(error, "System could not be loaded.");
+}
+
+function panelSearchText(settingsId) {
+  const panel = document.querySelector(`.settings-content[data-settings="${settingsId}"]`);
+  if (!panel) {
+    return "";
+  }
+  const bits = [];
+  for (const node of panel.querySelectorAll(
+    "h1, h2, .pc2-card-label, .pc2-card-sublabel, .pc2-section-title, label, dt, summary",
+  )) {
+    const text = node.textContent?.trim();
+    if (text) {
+      bits.push(text);
+    }
+  }
+  return bits.join(" ").toLowerCase();
+}
+
+function clearSearchHitMarks() {
+  for (const node of document.querySelectorAll(".settings-search-hit")) {
+    node.classList.remove("settings-search-hit");
+  }
+}
+
+function markFirstContentHit(settingsId, query) {
+  if (!query) {
+    return;
+  }
+  const panel = document.querySelector(`.settings-content[data-settings="${settingsId}"]`);
+  if (!panel) {
+    return;
+  }
+  for (const node of panel.querySelectorAll(
+    "h1, h2, .pc2-card-label, .pc2-card-sublabel, .pc2-section-title, label, dt, summary",
+  )) {
+    const text = node.textContent?.trim().toLowerCase() || "";
+    if (!text.includes(query)) {
+      continue;
+    }
+    node.classList.add("settings-search-hit");
+    if (typeof node.scrollIntoView === "function") {
+      node.scrollIntoView({ block: "nearest" });
+    }
+    return;
+  }
+}
+
+const SETTINGS_SEARCH_KEYWORDS = {
+  account: ["accounts", "passkey", "credential", "sign in", "handle"],
+  personalization: [
+    "appearance",
+    "theme",
+    "background",
+    "wallpaper",
+    "accent",
+    "dark",
+    "light",
+  ],
+  shell: ["shell", "home", "gui", "cli", "desktop", "terminal"],
+  security: [
+    "security",
+    "access",
+    "guest",
+    "sessions",
+    "recovery",
+    "advanced",
+    "technical",
+    "inspection",
+  ],
+  catalog: ["apps", "services", "capsule", "installed", "viewer"],
+  about: ["device", "runtime", "version", "identity", "did", "copy"],
+};
+
+function configureSettingsSearch() {
+  const input = document.querySelector("#settings-search");
+  if (!input) {
+    return;
+  }
+  input.addEventListener("input", () => {
+    const query = input.value.trim().toLowerCase();
+    clearSearchHitMarks();
+    let firstHit = "";
+    for (const item of document.querySelectorAll(".settings-sidebar-item")) {
+      const id = item.dataset.settings || "";
+      const label = item.textContent.toLowerCase();
+      const keywords = SETTINGS_SEARCH_KEYWORDS[id] || [];
+      const content = panelSearchText(id);
+      const hit =
+        query === "" ||
+        label.includes(query) ||
+        content.includes(query) ||
+        keywords.some((keyword) => keyword.includes(query) || query.includes(keyword));
+      item.classList.toggle("search-hidden", !hit);
+      if (hit && !firstHit && query) {
+        firstHit = id;
+      }
+    }
+    if (firstHit) {
+      activateSettingsTab(firstHit);
+      markFirstContentHit(firstHit, query);
+    }
+  });
+}
+
+
+function syncDeviceDidCopy(did) {
+  const button = document.querySelector("#device-did-copy");
+  if (!button) {
+    return;
+  }
+  const value = readText(did);
+  button.disabled = value.length === 0;
+  button.dataset.did = value;
+}
+
+function pulseCopyButton(button, restoreLabel = "Copy") {
+  if (!button) {
+    return;
+  }
+  const copyIcon = button.querySelector(".el-copy-icon");
+  const checkIcon = button.querySelector(".el-copy-check");
+  button.dataset.copied = "true";
+  button.setAttribute("aria-label", "Copied");
+  button.title = "Copied";
+  if (copyIcon) {
+    copyIcon.hidden = true;
+  }
+  if (checkIcon) {
+    checkIcon.hidden = false;
+  }
+  window.setTimeout(() => {
+    delete button.dataset.copied;
+    button.setAttribute("aria-label", restoreLabel);
+    button.title = "Copy";
+    if (copyIcon) {
+      copyIcon.hidden = false;
+    }
+    if (checkIcon) {
+      checkIcon.hidden = true;
+    }
+  }, 1400);
+}
+
+function configureDeviceDidCopy() {
+  const button = document.querySelector("#device-did-copy");
+  if (!button || button.dataset.bound === "true") {
+    return;
+  }
+  button.dataset.bound = "true";
+  button.addEventListener("click", async () => {
+    const value = readText(button.dataset.did);
+    if (!value) {
+      return;
+    }
+    try {
+      await homeClipboard.writeText(value, { purpose: "identity.did" });
+      pulseCopyButton(button, "Copy device identity");
+    } catch (_error) {
+      button.setAttribute("aria-label", "Copy failed");
+      button.title = "Copy failed";
+      window.setTimeout(() => {
+        button.setAttribute("aria-label", "Copy device identity");
+        button.title = "Copy";
+      }, 1500);
+    }
+  });
+}
+
+
+function postUiPreference(key, value) {
+  if (!frameHomeToken || !homeParentOrigin || window.top === window) {
+    return;
+  }
+  window.top.postMessage({
+    type: "home:ui-preference",
+    action: "write",
+    key,
+    value,
+    homeToken: frameHomeToken,
+  }, homeParentOrigin);
+}
+
+function readUiPreferencesFromHome() {
+  if (uiPreferencesReadPromise) {
+    return uiPreferencesReadPromise;
+  }
+  uiPreferencesReadPromise = requestUiPreferencesFromHome();
+  return uiPreferencesReadPromise;
+}
+
+function requestUiPreferencesFromHome() {
+  return new Promise((resolve) => {
+    if (!frameHomeToken || !homeParentOrigin || window.top === window) {
+      resolve({});
+      return;
+    }
+    const requestId = window.crypto?.randomUUID?.() || `system-ui-pref-${Date.now()}`;
+    const timeout = window.setTimeout(() => {
+      window.removeEventListener("message", onAnswer);
+      resolve({});
+    }, 5000);
+    function onAnswer(event) {
+      if (event.source !== window.top || event.origin !== homeParentOrigin) {
+        return;
+      }
+      const message = event.data || {};
+      if (message.type !== "home:shell-response" || message.requestId !== requestId) {
+        return;
+      }
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", onAnswer);
+      resolve(message.result && typeof message.result === "object" ? message.result : {});
+    }
+    window.addEventListener("message", onAnswer);
+    window.top.postMessage({
+      type: "home:ui-preference",
+      action: "read",
+      requestId,
+      homeToken: frameHomeToken,
+    }, homeParentOrigin);
+  });
+}
+
+function configureThemeSegment() {
+  const segment = document.querySelector("#theme-segment");
+  if (!segment || !window.elastosTheme) {
+    return;
+  }
+  const options = segment.querySelectorAll("[data-theme-option]");
+  const sync = (preference) => {
+    for (const option of options) {
+      const selected = option.dataset.themeOption === preference;
+      option.classList.toggle("active", selected);
+      option.setAttribute("aria-checked", selected ? "true" : "false");
+    }
+  };
+  for (const option of options) {
+    option.addEventListener("click", () => {
+      window.elastosTheme.set(option.dataset.themeOption);
+      sync(window.elastosTheme.preference());
+      postUiPreference("theme", option.dataset.themeOption);
+    });
+  }
+  sync(window.elastosTheme.preference());
+  readUiPreferencesFromHome().then((preferences) => {
+    if (typeof preferences.theme === "string") {
+      window.elastosTheme.set(preferences.theme);
+      sync(preferences.theme);
+    }
+  });
+}
+
+function configureAccentPicker() {
+  const picker = document.querySelector("#accent-picker");
+  if (!picker || !window.elastosTheme) {
+    return;
+  }
+  const options = picker.querySelectorAll("[data-accent-option]");
+  const customPanel = document.querySelector("#accent-custom-popover");
+  const customPickerRoot = document.querySelector("#accent-custom-picker");
+  const hexInput = document.querySelector("#accent-custom-hex");
+  let customWriteTimer = 0;
+  let customPicker = null;
+
+  const paintCustom = (hex) => {
+    const swatch = picker.querySelector('[data-accent-option="custom"]');
+    if (swatch) {
+      swatch.style.background = hex;
+      swatch.style.color = hex;
+    }
+  };
+
+  const sync = (accent) => {
+    const hex = window.elastosTheme.accentCustom?.() || "#4f7fff";
+    for (const option of options) {
+      const selected = option.dataset.accentOption === accent;
+      option.classList.toggle("active", selected);
+      option.setAttribute("aria-checked", selected ? "true" : "false");
+    }
+    paintCustom(hex);
+    customPicker?.setHex?.(hex);
+    if (hexInput && document.activeElement !== hexInput) {
+      hexInput.value = hex;
+    }
+    if (customPanel) {
+      customPanel.hidden = accent !== "custom";
+    }
+    if (accent !== "custom") {
+      customPicker?.close?.();
+    }
+  };
+
+  const commitCustom = (raw, { fromWheel }) => {
+    const hex = window.elastosTheme.normalizeHex?.(raw) || "";
+    if (!hex) {
+      if (hexInput && !fromWheel) {
+        hexInput.value = window.elastosTheme.accentCustom?.() || "#4f7fff";
+      }
+      return;
+    }
+    window.elastosTheme.setAccentCustom(hex);
+    if (window.elastosTheme.accent() !== "custom") {
+      window.elastosTheme.setAccent("custom");
+      postUiPreference("accent", "custom");
+    }
+    if (hexInput && (!fromWheel || document.activeElement !== hexInput)) {
+      hexInput.value = hex;
+    }
+    if (!fromWheel) {
+      customPicker?.setHex?.(hex);
+    }
+    paintCustom(hex);
+    window.clearTimeout(customWriteTimer);
+    customWriteTimer = window.setTimeout(() => {
+      postUiPreference("accentCustom", hex);
+    }, fromWheel ? 120 : 0);
+    sync("custom");
+  };
+
+  if (customPickerRoot && window.elastosAccentPicker?.mount) {
+    customPicker = window.elastosAccentPicker.mount(customPickerRoot, {
+      getHex: () => window.elastosTheme.accentCustom?.() || "#4f7fff",
+      onChange: (hex) => {
+        commitCustom(hex, { fromWheel: true });
+      },
+    });
+  }
+
+  for (const option of options) {
+    option.addEventListener("click", () => {
+      const next = option.dataset.accentOption;
+      if (next === "custom") {
+        const hex = window.elastosTheme.accentCustom?.() || "#4f7fff";
+        window.elastosTheme.setAccentCustom(hex);
+        window.elastosTheme.setAccent("custom");
+        postUiPreference("accentCustom", hex);
+        postUiPreference("accent", "custom");
+        sync("custom");
+        customPicker?.open?.();
+        return;
+      }
+      window.elastosTheme.setAccent(next);
+      sync(next);
+      postUiPreference("accent", next);
+    });
+  }
+  hexInput?.addEventListener("change", () => {
+    commitCustom(hexInput.value, { fromWheel: false });
+  });
+  hexInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitCustom(hexInput.value, { fromWheel: false });
+    }
+  });
+  sync(window.elastosTheme.accent());
+  readUiPreferencesFromHome().then((preferences) => {
+    if (typeof preferences.accentCustom === "string") {
+      window.elastosTheme.setAccentCustom(preferences.accentCustom);
+    }
+    if (typeof preferences.accent === "string") {
+      window.elastosTheme.setAccent(preferences.accent);
+      sync(preferences.accent);
+    } else {
+      sync(window.elastosTheme.accent());
+    }
+  });
+}
+
+function configureDockAutoHide() {
+  const input = document.querySelector("#dock-autohide");
+  if (!input) {
+    return;
+  }
+  input.addEventListener("change", () => {
+    postUiPreference("dockAutoHide", input.checked ? "on" : "off");
+  });
+  readUiPreferencesFromHome().then((preferences) => {
+    input.checked = preferences.dockAutoHide === "on";
+  });
+}
+
+function configureUiSounds() {
+  const input = document.querySelector("#ui-sounds");
+  if (!input) {
+    return;
+  }
+  input.addEventListener("change", () => {
+    postUiPreference("sounds", input.checked ? "on" : "off");
+  });
+  readUiPreferencesFromHome().then((preferences) => {
+    input.checked = preferences.sounds === "on";
+  });
+}
+
+function configureAccountPicture() {
+  if (accountPictureChoose) {
+    accountPictureChoose.disabled = !hasShellAccess();
+    accountPictureChoose.addEventListener("click", () => accountPictureFile?.click());
+  }
+  if (accountPictureRemove) {
+    accountPictureRemove.addEventListener("click", onAccountPictureRemove);
+  }
+  if (accountPictureFile) {
+    accountPictureFile.addEventListener("change", onAccountPictureFileChange);
+  }
+  setAccountPictureBusy(false);
+}
+
+function refreshAccountPictureFrom(passkeys, status) {
+  const current = passkeys.find((entry) => entry && entry.current) || passkeys[0] || null;
+  const principalId = readText(current?.principal_id);
+  const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
+  // PasskeyView has no credential_id — join the unsigned login directory by principal.
+  const match =
+    (principalId
+      ? accounts.find((entry) => readText(entry?.principal_id) === principalId)
+      : null) ||
+    accounts.find(
+      (entry) => readText(entry?.credential_id) === readText(current?.credential_id),
+    ) ||
+    null;
+  renderAccountPicturePreview({
+    displayName: readText(current?.display_name) || readText(match?.display_name) || "Account",
+    avatarCid: readText(match?.avatar_cid),
+    credentialId: readText(match?.credential_id) || readText(current?.credential_id),
+  });
+}
+
+function renderAccountPicturePreview({ displayName, avatarCid, credentialId }) {
+  currentAccountPicture = {
+    displayName: readText(displayName) || "Account",
+    avatarCid: readText(avatarCid),
+    credentialId: readText(credentialId),
+  };
+  const monogram = monogramForDisplayName(currentAccountPicture.displayName);
+  if (accountPictureMonogram) {
+    accountPictureMonogram.textContent = monogram;
+    accountPictureMonogram.hidden = Boolean(currentAccountPicture.avatarCid);
+  }
+  if (accountPicturePreview) {
+    accountPicturePreview.style.background = currentAccountPicture.avatarCid
+      ? "transparent"
+      : avatarColorForId(currentAccountPicture.credentialId || currentAccountPicture.displayName);
+    accountPicturePreview.setAttribute(
+      "aria-label",
+      currentAccountPicture.avatarCid
+        ? `Profile picture for ${currentAccountPicture.displayName}`
+        : `Monogram for ${currentAccountPicture.displayName}`,
+    );
+  }
+  if (accountPictureImage) {
+    if (currentAccountPicture.avatarCid && currentAccountPicture.credentialId) {
+      accountPictureImage.hidden = false;
+      accountPictureImage.src =
+        `/api/auth/passkey/account-avatar?credential_id=${encodeURIComponent(currentAccountPicture.credentialId)}&v=${encodeURIComponent(currentAccountPicture.avatarCid)}`;
+      accountPictureImage.onerror = () => {
+        accountPictureImage.hidden = true;
+        if (accountPictureMonogram) {
+          accountPictureMonogram.hidden = false;
+        }
+        if (accountPicturePreview) {
+          accountPicturePreview.style.background = avatarColorForId(
+            currentAccountPicture.credentialId || currentAccountPicture.displayName,
+          );
+        }
+      };
+    } else {
+      accountPictureImage.removeAttribute("src");
+      accountPictureImage.hidden = true;
+    }
+  }
+  if (accountPictureRemove) {
+    accountPictureRemove.hidden = !currentAccountPicture.avatarCid;
+    accountPictureRemove.disabled = accountPictureBusy || !hasShellAccess();
+  }
+  if (accountPictureChoose) {
+    accountPictureChoose.disabled = accountPictureBusy || !hasShellAccess();
+  }
+}
+
+function showAccountPictureStatus(message, tone = "muted") {
+  if (!accountPictureStatus) {
+    return;
+  }
+  const text = readText(message);
+  accountPictureStatus.hidden = !text;
+  accountPictureStatus.textContent = text;
+  accountPictureStatus.dataset.tone = tone;
+}
+
+function setAccountPictureBusy(busy) {
+  accountPictureBusy = Boolean(busy);
+  if (accountPictureChoose) {
+    accountPictureChoose.disabled = accountPictureBusy || !hasShellAccess();
+  }
+  if (accountPictureRemove) {
+    accountPictureRemove.disabled =
+      accountPictureBusy || !hasShellAccess() || !currentAccountPicture.avatarCid;
+  }
+  if (accountPictureFile) {
+    accountPictureFile.disabled = accountPictureBusy;
+  }
+}
+
+async function onAccountPictureFileChange() {
+  if (!accountPictureFile || !hasShellAccess() || accountPictureBusy) {
+    return;
+  }
+  const file = accountPictureFile.files && accountPictureFile.files[0]
+    ? accountPictureFile.files[0]
+    : null;
+  accountPictureFile.value = "";
+  if (!file) {
+    return;
+  }
+  showAccountPictureStatus("");
+  if (!AVATAR_IMAGE_TYPES.has(file.type)) {
+    showAccountPictureStatus("Use a PNG, JPEG, or WebP image.", "error");
+    return;
+  }
+  if (file.size > AVATAR_IMAGE_MAX_BYTES * 4) {
+    showAccountPictureStatus("That image is too large. Try one under 512 KB.", "error");
+    return;
+  }
+  setAccountPictureBusy(true);
+  showAccountPictureStatus("Saving picture…", "muted");
+  try {
+    const blob = await centerCropImageFile(file, AVATAR_OUTPUT_EDGE);
+    if (blob.size > AVATAR_IMAGE_MAX_BYTES) {
+      throw new Error("That image is too large. Try one under 512 KB.");
+    }
+    const result = await fetchJson("/api/apps/system/identity/avatar", {
+      method: "POST",
+      headers: {
+        "content-type": blob.type || "image/jpeg",
+        "x-elastos-home-token": apiHomeToken,
+      },
+      body: blob,
+    });
+    // Re-join status so credential_id is present for the durable account-avatar URL.
+    await refreshAccountList().catch(() => {
+      currentAccountPicture.avatarCid = readText(result?.avatar_cid);
+      renderAccountPicturePreview({
+        ...currentAccountPicture,
+        avatarCid: currentAccountPicture.avatarCid,
+      });
+    });
+    // Immediate local preview while the bound GET warms; keep blob until swapped.
+    if (accountPictureImage && currentAccountPicture.avatarCid) {
+      const localUrl = URL.createObjectURL(blob);
+      const durableSrc =
+        currentAccountPicture.credentialId
+          ? `/api/auth/passkey/account-avatar?credential_id=${encodeURIComponent(currentAccountPicture.credentialId)}&v=${encodeURIComponent(currentAccountPicture.avatarCid)}`
+          : "";
+      accountPictureImage.hidden = false;
+      if (accountPictureMonogram) {
+        accountPictureMonogram.hidden = true;
+      }
+      if (accountPicturePreview) {
+        accountPicturePreview.style.background = "transparent";
+      }
+      if (durableSrc) {
+        accountPictureImage.onload = () => {
+          if (accountPictureImage.src === localUrl) {
+            return;
+          }
+          URL.revokeObjectURL(localUrl);
+          accountPictureImage.onload = null;
+        };
+        accountPictureImage.src = localUrl;
+        // Swap to the durable URL without flashing empty on COEP/cache delay.
+        const probe = new Image();
+        probe.onload = () => {
+          accountPictureImage.src = durableSrc;
+        };
+        probe.onerror = () => {
+          // Keep blob preview; reopen will retry the durable URL.
+        };
+        probe.src = durableSrc;
+      } else {
+        accountPictureImage.src = localUrl;
+      }
+    }
+    showAccountPictureStatus("Updated.", "success");
+  } catch (error) {
+    showAccountPictureStatus(
+      publicSystemError(error, "Couldn’t save picture. Try again."),
+      "error",
+    );
+  } finally {
+    setAccountPictureBusy(false);
+  }
+}
+
+async function onAccountPictureRemove() {
+  if (!hasShellAccess() || accountPictureBusy || !currentAccountPicture.avatarCid) {
+    return;
+  }
+  setAccountPictureBusy(true);
+  showAccountPictureStatus("Removing picture…", "muted");
+  try {
+    await fetchJson("/api/apps/system/identity/avatar", {
+      method: "DELETE",
+      headers: { "x-elastos-home-token": apiHomeToken },
+    });
+    renderAccountPicturePreview({
+      ...currentAccountPicture,
+      avatarCid: "",
+    });
+    showAccountPictureStatus("Removed.", "success");
+  } catch (error) {
+    showAccountPictureStatus(
+      publicSystemError(error, "Couldn’t remove picture. Try again."),
+      "error",
+    );
+  } finally {
+    setAccountPictureBusy(false);
+  }
+}
+
+function centerCropImageFile(file, edge) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const size = Math.max(1, Math.min(edge, Math.min(image.naturalWidth, image.naturalHeight)));
+        const canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          throw new Error("Couldn’t prepare picture.");
+        }
+        const source = Math.min(image.naturalWidth, image.naturalHeight);
+        const sx = Math.floor((image.naturalWidth - source) / 2);
+        const sy = Math.floor((image.naturalHeight - source) / 2);
+        context.drawImage(image, sx, sy, source, source, 0, 0, size, size);
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(url);
+            if (!blob) {
+              reject(new Error("Couldn’t prepare picture."));
+              return;
+            }
+            resolve(blob);
+          },
+          "image/jpeg",
+          0.9,
+        );
+      } catch (error) {
+        URL.revokeObjectURL(url);
+        reject(error);
+      }
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Couldn’t read that image."));
+    };
+    image.src = url;
+  });
+}
+
+function monogramForDisplayName(name) {
+  const parts = String(name || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (parts.length === 0) {
+    return "·";
+  }
+  const first = [...parts[0]][0] || "·";
+  if (parts.length === 1) {
+    return first.toUpperCase();
+  }
+  const second = [...parts[parts.length - 1]][0] || "";
+  return `${first}${second}`.toUpperCase().replace(/[^A-Z0-9]/g, "") || "·";
+}
+
+function avatarColorForId(seed) {
+  let hash = 0;
+  const text = String(seed || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i);
+    hash |= 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  return `linear-gradient(145deg, hsl(${hue} 52% 46%), hsl(${(hue + 28) % 360} 58% 36%))`;
 }

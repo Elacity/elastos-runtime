@@ -10,6 +10,7 @@ import {
   setHomeGuiMounted,
   showHomeGuiDesktop,
   syncHomeGuiProjection,
+  applyHomeGuiUiPreferences,
 } from "./home-gui.js?v=home-20260814a";
 import {
   acceptHomeBrowserContextId,
@@ -160,6 +161,14 @@ function handleGuiCommand(message) {
   }
   if (command === "show-desktop") {
     showHomeGuiDesktop();
+    return true;
+  }
+  if (command === "ui-preference") {
+    const preferences = message.preferences;
+    if (!preferences || typeof preferences !== "object" || Array.isArray(preferences)) {
+      return false;
+    }
+    applyHomeGuiUiPreferences(preferences);
     return true;
   }
   return false;
@@ -365,6 +374,19 @@ window.addEventListener("message", (event) => {
         console.error("home-gui command failed", error);
       });
   }
+});
+
+window.addEventListener("elastos:ui-preference-changed", (event) => {
+  const detail = event?.detail || {};
+  if (typeof detail.key !== "string" || typeof detail.value !== "string") {
+    return;
+  }
+  postToHome({
+    type: "home:ui-preference",
+    action: "write",
+    key: detail.key,
+    value: detail.value,
+  });
 });
 
 bindHomeGuiInteractions({

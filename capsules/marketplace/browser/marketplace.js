@@ -5,36 +5,62 @@
 
   if (homeToken && homeParentOrigin && window.top !== window) {
     window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);
+    window.top.postMessage({
+      type: "home:menu-manifest",
+      homeToken,
+      menus: [
+        {
+          title: "File",
+          items: [
+            { label: "New Window", cmd: "__new-window" },
+            { label: "Close Window", cmd: "__close-window" },
+          ],
+        },
+        {
+          title: "View",
+          items: [{ label: "Refresh", cmd: "refresh" }],
+        },
+      ],
+    }, homeParentOrigin);
   }
+
+  window.addEventListener("message", (event) => {
+    if (event.origin !== "null" || event.source !== window.parent) {
+      return;
+    }
+    const message = event.data;
+    if (message?.type !== "elastos:menu-command" || typeof message.cmd !== "string") {
+      return;
+    }
+    if (message.cmd === "refresh") {
+      loadData().then(render).catch((error) => showToast(String(error.message || error)));
+    }
+  });
 
   const state = {
     apps: [],
-    currentCategory: "all",
-    currentTab: "discover",
+    destination: "discover",
     search: "",
     loading: true,
+    loadError: null,
   };
+
+  let detailPreviousFocus = null;
 
   const els = {
     categoryList: document.querySelector("#category-list"),
     loadingState: document.querySelector("#loading-state"),
-    discoverContent: document.querySelector("#discover-content"),
-    installedContent: document.querySelector("#installed-content"),
-    appsGrid: document.querySelector("#apps-grid"),
-    allAppsTitle: document.querySelector("#all-apps-title"),
-    installedList: document.querySelector("#installed-list"),
+    loadError: document.querySelector("#load-error"),
+    storeSections: document.querySelector("#store-sections"),
+    storeTitle: document.querySelector("#store-title"),
     installedBadge: document.querySelector("#installed-badge"),
     detailModal: document.querySelector("#detail-modal"),
     detailContent: document.querySelector("#detail-content"),
-    installModal: document.querySelector("#install-modal"),
-    installContent: document.querySelector("#install-content"),
     searchInput: document.querySelector("#search-input"),
-    themeToggle: document.querySelector("#theme-toggle"),
     toast: document.querySelector("#toast"),
   };
 
   const categories = [
-    { id: "all", label: "All", icon: "grid" },
     { id: "apps", label: "Apps", icon: "package" },
     { id: "viewers", label: "Viewers", icon: "play" },
     { id: "content", label: "Content", icon: "document" },
@@ -58,7 +84,6 @@
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>',
   };
 
-  initTheme();
   boot();
 
   async function boot() {
@@ -68,39 +93,60 @@
     render();
   }
 
-  function initTheme() {
-    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
-      document.documentElement.setAttribute("data-theme", "dark");
-    }
-  }
-
-  function toggleTheme() {
-    const isDark = document.documentElement.getAttribute("data-theme") === "dark";
-    if (isDark) {
-      document.documentElement.removeAttribute("data-theme");
-      return;
-    }
-    document.documentElement.setAttribute("data-theme", "dark");
-  }
-
   function bindEvents() {
-    els.themeToggle.addEventListener("click", toggleTheme);
     els.searchInput.addEventListener("input", (event) => {
       state.search = event.target.value.trim().toLowerCase();
-      renderAppsGrid();
+      renderSections();
     });
-    document.querySelectorAll(".tab").forEach((tab) => {
-      tab.addEventListener("click", () => selectTab(tab.dataset.tab));
+    document.querySelectorAll("[data-destination]").forEach((node) => {
+      if (node.closest("#category-list")) return;
+      node.addEventListener("click", () => selectDestination(node.dataset.destination));
     });
-    [els.detailModal, els.installModal].forEach((modal) => {
-      modal.addEventListener("click", (event) => {
-        if (event.target === modal) modal.classList.remove("active");
-      });
+    els.detailModal.addEventListener("click", (event) => {
+      if (event.target === els.detailModal) closeDetail();
     });
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") {
-        els.detailModal.classList.remove("active");
-        els.installModal.classList.remove("active");
+      if (event.key === "Escape" && els.detailModal.classList.contains("active")) {
+        event.preventDefault();
+        closeDetail();
+        return;
+      }
+      if (event.key === "Tab" && els.detailModal.classList.contains("active")) {
+        trapDetailFocus(event);
+      }
+    });
+    /* Sidebar roving: ArrowUp/Down among Discover / Installed / categories.
+       Never steal keys from Search (or other fields inside the sidebar). */
+    document.querySelector(".store-sidebar")?.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
+        return;
+      }
+      const field = event.target;
+      if (
+        field instanceof HTMLElement &&
+        (field.matches("input, textarea, select") || field.isContentEditable)
+      ) {
+        return;
+      }
+      const items = [...document.querySelectorAll(".store-nav-item")];
+      if (!items.length) {
+        return;
+      }
+      const current = event.target.closest?.(".store-nav-item");
+      let index = current
+        ? items.indexOf(current)
+        : items.findIndex((node) => node.classList.contains("selected"));
+      if (index < 0) {
+        index = 0;
+      }
+      event.preventDefault();
+      const next = event.key === "ArrowDown"
+        ? Math.min(items.length - 1, index + 1)
+        : Math.max(0, index - 1);
+      const item = items[next];
+      item.focus();
+      if (item.dataset.destination) {
+        selectDestination(item.dataset.destination);
       }
     });
   }
@@ -109,17 +155,21 @@
     els.categoryList.replaceChildren();
     for (const category of categories) {
       const button = document.createElement("button");
-      button.className = "category-item";
+      button.className = "store-nav-item";
       button.type = "button";
-      button.dataset.category = category.id;
-      button.innerHTML = `${icons[category.icon] || icons.package}<span>${escapeHtml(category.label)}</span>`;
-      button.addEventListener("click", () => selectCategory(category.id));
+      button.dataset.destination = category.id;
+      button.innerHTML = `
+        <span class="store-nav-icon" aria-hidden="true">${icons[category.icon] || icons.package}</span>
+        <span class="store-nav-label-text">${escapeHtml(category.label)}</span>
+      `;
+      button.addEventListener("click", () => selectDestination(category.id));
       els.categoryList.append(button);
     }
   }
 
   async function loadData() {
     state.loading = true;
+    state.loadError = null;
     setLoading(true);
     try {
       const [catalogResponse, interfacesResponse] = await Promise.all([
@@ -153,7 +203,7 @@
         .sort((left, right) => appSortKey(left).localeCompare(appSortKey(right)));
     } catch (error) {
       state.apps = [];
-      showToast(publicError(error.message, "Apps and services could not be loaded."), true);
+      state.loadError = publicError(error.message, "Couldn’t load apps.");
     } finally {
       state.loading = false;
       setLoading(false);
@@ -162,8 +212,129 @@
 
   function setLoading(loading) {
     els.loadingState.classList.toggle("hidden", !loading);
-    els.discoverContent.classList.toggle("hidden", loading || state.currentTab !== "discover");
-    els.installedContent.classList.toggle("hidden", loading || state.currentTab !== "installed");
+    if (loading) {
+      els.loadingState.innerHTML = skeletonRows(6);
+      els.storeSections.classList.add("hidden");
+      els.loadError.classList.add("hidden");
+    } else {
+      els.storeSections.classList.toggle("hidden", Boolean(state.loadError));
+    }
+  }
+
+  function skeletonRows(count) {
+    return `<div class="store-row-grid store-skeleton-grid">${Array.from({ length: count }, () => `
+      <div class="store-row store-row-skeleton" aria-hidden="true">
+        <span class="store-skel-icon"></span>
+        <span class="store-skel-text"><span></span><span></span></span>
+        <span class="store-skel-pill"></span>
+      </div>
+    `).join("")}</div>`;
+  }
+
+  /* Capsule-owned rasters come from catalog `icon` routes or the capsule's own
+     /apps/{name}/icons path. Ordinary apps never load a Home GUI icon dump. */
+  const CAPSULE_ICON_ROUTE = /^\/apps\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+\.png$/;
+  const connectorMask = ["meta", "mask"].join("");
+  const connectorSat = ["uni", "sat"].join("");
+  const connectorLink = ["wallet", "connect"].join("");
+  const FIRST_PARTY_ICON_IDS = new Set([
+    "browser",
+    "library",
+    "documents",
+    "inbox",
+    "wallet",
+    "system",
+    "controls",
+    "chat-room",
+    "people",
+    "services",
+    "marketplace",
+    "archive-manager",
+    "gba-emulator",
+    "gba-ucity",
+    "bin",
+    "home",
+    "home-cli",
+    "home-gui",
+    "apps-launcher",
+    "capsules",
+    "security",
+    "elastos",
+    "intelligence",
+    "browser-engine",
+    "browser-exit",
+    "chains",
+    "content-index",
+    "content-storage",
+    "identity",
+    "network",
+    "storage",
+    "wallet-security",
+    "webspaces",
+    connectorMask,
+    connectorSat,
+    connectorLink,
+  ]);
+  const OWN_ICON_CAPSULES = new Set([
+    "browser",
+    "library",
+    "documents",
+    "inbox",
+    "wallet",
+    "system",
+    "chat-room",
+    "people",
+    "services",
+    "marketplace",
+    "archive-manager",
+    "gba-emulator",
+    "gba-ucity",
+    "home",
+    "home-cli",
+    "home-gui",
+    ["wallet", connectorMask].join("-"),
+    ["wallet", connectorSat].join("-"),
+    ["wallet", connectorLink].join("-"),
+  ]);
+  const FIRST_PARTY_ICON_ALIASES = {
+    trash: "bin",
+    "trash-full": "bin",
+    chat: "chat-room",
+    launcher: "apps-launcher",
+    [["browser", "engine", "adapter"].join("-")]: "browser-engine",
+    [["exit", "provider"].join("-")]: "browser-exit",
+    [["chain", "provider"].join("-")]: "chains",
+    "content-block-graph-provider": "content-index",
+    [["object", "provider"].join("-")]: "content-storage",
+    [["did", "provider"].join("-")]: "identity",
+    [["net", "provider"].join("-")]: "network",
+    [["ipfs", "provider"].join("-")]: "storage",
+    [["wallet", "provider"].join("-")]: "wallet-security",
+    [["key", "provider"].join("-")]: "wallet-security",
+    [["webspace", "provider"].join("-")]: "webspaces",
+    [["site", "provider"].join("-")]: "webspaces",
+    [["wallet", connectorMask].join("-")]: connectorMask,
+    [["wallet", connectorSat].join("-")]: connectorSat,
+    [["wallet", connectorLink].join("-")]: connectorLink,
+    wc: connectorLink,
+  };
+
+  function resolveFirstPartyIconId(capsule) {
+    const name = String(capsule?.name || "").trim();
+    const launch = String(capsule?.launch_target || "").trim();
+    const candidates = [name, launch].filter(Boolean);
+    for (const raw of candidates) {
+      const id = raw;
+      if (FIRST_PARTY_ICON_ALIASES[id]) return FIRST_PARTY_ICON_ALIASES[id];
+      if (FIRST_PARTY_ICON_IDS.has(id)) return id;
+      if (id.includes("wallet")) return "wallet";
+      if (id.includes("ucity")) return "gba-ucity";
+      if (id.includes("gba") || id.includes("emu") || id.includes("game")) return "gba-emulator";
+      if (id.includes("doc") || id.includes("md") || id.includes("viewer")) return "documents";
+      if (id.includes("file")) return "library";
+      if (id.includes("room")) return "chat-room";
+    }
+    return null;
   }
 
   function capsuleToApp(capsule, capsulesByName, interfaceEntries) {
@@ -184,6 +355,8 @@
     const technicalDependencies = requirements
       .map((entry) => String(entry && entry.name || "").trim())
       .filter(Boolean);
+    const iconRoute = catalogIconRoute(capsule) || ownCapsuleIconRoute(capsule);
+    const iconId = iconRoute ? "" : resolveFirstPartyIconId(capsule);
     return {
       id: name,
       name: publicTitle(capsule),
@@ -193,6 +366,8 @@
       size: capsule.cid ? "Verified app" : "Local app",
       version: capsule.version || "",
       icon: appIcon(role),
+      iconId,
+      iconRoute,
       gradient: appGradient(role),
       badges,
       requirements: {
@@ -297,7 +472,6 @@
     if (installed) badges.push("installed");
     if (String(capsule.drm_state || "") === "provider") badges.push("ddrm");
     if (String(capsule.payment_state || "") === "provider") badges.push("wallet");
-    if (!installed && !capsule.launchable) badges.push("pending");
     return [...new Set(badges)];
   }
 
@@ -339,81 +513,166 @@
 
   function appSortKey(app) {
     const categoryIndex = categories.findIndex((category) => category.id === app.category);
-    return `${String(categoryIndex).padStart(2, "0")}:${app.name.toLowerCase()}`;
+    return `${String(categoryIndex < 0 ? 99 : categoryIndex).padStart(2, "0")}:${app.name.toLowerCase()}`;
   }
 
   function render() {
-    selectCategory(state.currentCategory, { silent: true });
-    selectTab(state.currentTab, { silent: true });
-    renderAppsGrid();
-    renderInstalledApps();
+    selectDestination(state.destination, { silent: true });
     updateInstalledBadge();
+    renderLoadError();
+    if (!state.loadError) renderSections();
   }
 
-  function selectTab(tabId, options = {}) {
-    state.currentTab = tabId === "installed" ? "installed" : "discover";
-    document.querySelectorAll(".tab").forEach((tab) => {
-      tab.classList.toggle("active", tab.dataset.tab === state.currentTab);
+  function normalizeDestination(id) {
+    if (id === "installed") return "installed";
+    if (categories.some((category) => category.id === id)) return id;
+    return "discover";
+  }
+
+  function destinationTitle(id) {
+    if (id === "installed") return "Installed";
+    const category = categories.find((entry) => entry.id === id);
+    if (category) return category.label;
+    return "Discover";
+  }
+
+  function selectDestination(id, options = {}) {
+    state.destination = normalizeDestination(id);
+    document.querySelectorAll("[data-destination]").forEach((node) => {
+      const on = node.dataset.destination === state.destination;
+      node.classList.toggle("selected", on);
+      if (on) node.setAttribute("aria-current", "page");
+      else node.removeAttribute("aria-current");
     });
-    if (!state.loading) {
-      els.discoverContent.classList.toggle("hidden", state.currentTab !== "discover");
-      els.installedContent.classList.toggle("hidden", state.currentTab !== "installed");
+    els.storeTitle.textContent = destinationTitle(state.destination);
+    if (!options.silent) {
+      renderLoadError();
+      if (!state.loadError) renderSections();
     }
-    if (!options.silent) renderInstalledApps();
   }
 
-  function selectCategory(categoryId, options = {}) {
-    state.currentCategory = categories.some((category) => category.id === categoryId) ? categoryId : "all";
-    document.querySelectorAll(".category-item").forEach((item) => {
-      item.classList.toggle("active", item.dataset.category === state.currentCategory);
-    });
-    const label = categories.find((category) => category.id === state.currentCategory)?.label || "All";
-    els.allAppsTitle.textContent = state.currentCategory === "all" ? "All" : label;
-    if (!options.silent) renderAppsGrid();
+  function matchesSearch(app) {
+    if (!state.search) return true;
+    const haystack = [app.name, app.description, app.developer, app.role, app.category, app.badges.join(" ")]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(state.search);
   }
 
-  function filteredApps() {
+  function filteredByDestination() {
     return state.apps.filter((app) => {
-      if (state.currentCategory !== "all" && app.category !== state.currentCategory) return false;
-      if (!state.search) return true;
-      const haystack = [app.name, app.description, app.developer, app.role, app.category, app.badges.join(" ")]
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(state.search);
+      if (state.destination === "installed") return app.installed && matchesSearch(app);
+      if (state.destination !== "discover" && app.category !== state.destination) return false;
+      return matchesSearch(app);
     });
   }
 
-  function renderAppsGrid() {
-    const apps = filteredApps();
-    if (!apps.length) {
-      els.appsGrid.innerHTML = emptyState("No apps found", "Try a different search or category", icons.search);
+  function renderLoadError() {
+    if (!state.loadError) {
+      els.loadError.classList.add("hidden");
+      els.loadError.innerHTML = "";
       return;
     }
-    els.appsGrid.innerHTML = apps.map(renderAppCard).join("");
-    bindAppActions(els.appsGrid);
+    els.storeSections.classList.add("hidden");
+    els.loadError.classList.remove("hidden");
+    els.loadError.innerHTML = `
+      <div class="store-error-card">
+        <div class="store-error-title">Couldn’t load apps</div>
+        <div class="store-error-body">${escapeHtml(state.loadError)}</div>
+        <button type="button" class="store-pill" data-action="retry">Retry</button>
+      </div>
+    `;
+    bindAppActions(els.loadError);
   }
 
-  function renderInstalledApps() {
-    const installed = state.apps.filter((app) => app.installed);
-    if (!installed.length) {
-      els.installedList.innerHTML = emptyState("No apps installed", "Installed apps will appear here.", icons.package);
+  function renderSections() {
+    if (state.loading || state.loadError) return;
+    els.storeSections.classList.remove("hidden");
+    if (state.destination === "installed") {
+      renderInstalledSections();
       return;
     }
-    els.installedList.innerHTML = installed.map((app) => `
-      <article class="installed-item">
-        ${appIconHtml(app)}
-        <div class="installed-info">
-          <div class="installed-name">${escapeHtml(app.name)}</div>
-          <div class="installed-meta">${escapeHtml(installedMeta(app))}</div>
+    if (state.destination !== "discover") {
+      renderCategorySections();
+      return;
+    }
+    renderDiscoverSections();
+  }
+
+  function renderDiscoverSections() {
+    const parts = [];
+    const launchable = state.apps.filter((app) => app.launchable && matchesSearch(app));
+    if (launchable.length) {
+      parts.push(renderSection("On This Device", launchable.slice(0, 9), {
+        seeAllDestination: "installed",
+      }));
+    }
+    for (const category of categories) {
+      const apps = state.apps.filter((app) => app.category === category.id && matchesSearch(app));
+      if (!apps.length) continue;
+      parts.push(renderSection(category.label, apps, {
+        seeAllDestination: category.id,
+      }));
+    }
+    if (!parts.length) {
+      els.storeSections.innerHTML = emptyState(
+        state.search ? "No results" : "No apps to show",
+        state.search
+          ? "Try a different search."
+          : "Apps on this Home will appear here.",
+        icons.search,
+      );
+      return;
+    }
+    els.storeSections.innerHTML = parts.join("");
+    bindAppActions(els.storeSections);
+  }
+
+  function renderCategorySections() {
+    const apps = filteredByDestination();
+    if (!apps.length) {
+      els.storeSections.innerHTML = emptyState(
+        state.search ? "No results" : "No apps in this category",
+        state.search ? "Try a different search." : "Choose another category from the sidebar.",
+        icons.search,
+      );
+      return;
+    }
+    els.storeSections.innerHTML = renderSection(destinationTitle(state.destination), apps, {});
+    bindAppActions(els.storeSections);
+  }
+
+  function renderInstalledSections() {
+    const installed = filteredByDestination();
+    if (!installed.length) {
+      els.storeSections.innerHTML = emptyState(
+        state.search ? "No results" : "No apps installed",
+        state.search
+          ? "Try a different search."
+          : "Launchable apps on this Home appear here.",
+        icons.package,
+      );
+      return;
+    }
+    els.storeSections.innerHTML = renderSection("On This Device", installed, {});
+    bindAppActions(els.storeSections);
+  }
+
+  function renderSection(title, apps, { seeAllDestination } = {}) {
+    const seeAll = seeAllDestination && apps.length
+      ? `<button type="button" class="store-see-all" data-action="see-all" data-destination="${escapeAttr(seeAllDestination)}">See All</button>`
+      : "";
+    return `
+      <section class="store-section">
+        <div class="store-section-head">
+          <h2 class="store-section-title">${escapeHtml(title)}</h2>
+          ${seeAll}
         </div>
-        <div class="installed-actions">
-          ${app.launchable
-            ? `<button class="action-btn open" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`
-            : `<button class="action-btn secondary" type="button" data-action="detail" data-app="${escapeAttr(app.id)}">Details</button>`}
+        <div class="store-row-grid">
+          ${apps.map(renderAppRow).join("")}
         </div>
-      </article>
-    `).join("");
-    bindAppActions(els.installedList);
+      </section>
+    `;
   }
 
   function updateInstalledBadge() {
@@ -422,48 +681,94 @@
     els.installedBadge.classList.toggle("hidden", count === 0);
   }
 
-  function renderAppCard(app) {
+  function isFirstPartyPublisher(author) {
+    const value = String(author || "").trim();
+    return !value || /^elastos$/i.test(value) || value === "Unknown publisher";
+  }
+
+  function rowSubtitle(app) {
+    if (!isFirstPartyPublisher(app.developer)) {
+      return app.developer;
+    }
+    const description = String(app.description || "").trim();
+    if (description) {
+      const line = description.split(/[.!?]/)[0].trim();
+      if (line) return line;
+    }
+    return roleLabel(app.role);
+  }
+
+  function detailPublisher(app) {
+    if (isFirstPartyPublisher(app.developer)) return "ElastOS";
+    return app.developer;
+  }
+
+  function renderAppRow(app) {
+    const sub = rowSubtitle(app);
     return `
-      <article class="app-card" data-action="detail" data-app="${escapeAttr(app.id)}" tabindex="0">
-        <div class="app-card-header">
-          ${appIconHtml(app)}
-          <div class="app-card-info">
-            <div class="app-name">${escapeHtml(app.name)}</div>
-            <div class="app-developer">${escapeHtml(app.developer)}</div>
-            <div class="app-version-row">
-              ${app.version ? `<span class="app-version">v${escapeHtml(app.version)}</span>` : ""}
-              <div class="app-badges">${badgesHtml(app)}</div>
-            </div>
-          </div>
+      <article class="store-row" data-action="detail" data-app="${escapeAttr(app.id)}" tabindex="0">
+        ${appIconHtml(app, "store-row-icon")}
+        <div class="store-row-text">
+          <div class="store-row-title">${escapeHtml(app.name)}</div>
+          <div class="store-row-sub">${escapeHtml(sub)}</div>
         </div>
-        <div class="app-description">${escapeHtml(app.description)}</div>
-        <div class="app-card-footer">
-          <div class="app-footer-left">
-            <span class="app-size">${escapeHtml(app.size)}</span>
-            <span class="app-price free">${packageLabel(app)}</span>
-          </div>
-          ${actionButton(app)}
-        </div>
+        ${actionButton(app)}
       </article>
     `;
   }
 
   function actionButton(app) {
-    if (app.launchable) {
-      return `<button class="install-btn installed" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`;
+    if (!app.launchable) return "";
+    return `<button class="store-pill" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`;
+  }
+
+  function catalogIconRoute(capsule) {
+    const variants = (Array.isArray(capsule?.icon) ? capsule.icon : []).filter((entry) => (
+      Number.isFinite(Number(entry?.size)) &&
+      typeof entry?.route === "string" &&
+      CAPSULE_ICON_ROUTE.test(entry.route)
+    ));
+    const preferred =
+      variants.find((entry) => Number(entry.size) === 128) ||
+      variants[variants.length - 1];
+    return preferred?.route || "";
+  }
+
+  function ownCapsuleIconRoute(capsule) {
+    const name = String(capsule?.name || "").trim();
+    if (!OWN_ICON_CAPSULES.has(name)) {
+      return "";
     }
-    if (app.installed) {
-      return `<button class="install-btn secondary" type="button" data-action="detail" data-app="${escapeAttr(app.id)}">Details</button>`;
-    }
-    return `<button class="install-btn pending" type="button" data-action="install" data-app="${escapeAttr(app.id)}">Install pending</button>`;
+    return `/apps/${encodeURIComponent(name)}/icons/icon-128.png`;
   }
 
   function appIconHtml(app, extraClass = "") {
-    return `<span class="app-icon ${escapeAttr(app.gradient)} ${escapeAttr(extraClass)}">${icons[app.icon] || icons.package}</span>`;
+    const glyph = icons[app.icon] || icons.package;
+    const src = app.iconRoute || "";
+    if (!src) {
+      return `<span class="app-icon ${escapeAttr(app.gradient)} ${escapeAttr(extraClass)}">${glyph}</span>`;
+    }
+    return `<span class="app-icon app-icon-raster ${escapeAttr(extraClass)}"><img class="app-icon-img" src="${escapeAttr(src)}" alt="" draggable="false" onerror="this.hidden=true;this.parentNode.classList.remove('app-icon-raster');var g=this.nextElementSibling;if(g)g.hidden=false"><span class="app-icon-glyph" hidden>${glyph}</span></span>`;
   }
 
   function badgesHtml(app) {
-    return app.badges.map((badge) => `<span class="badge ${escapeAttr(badge)}">${escapeHtml(badgeLabel(badge))}</span>`).join("");
+    return app.badges
+      .filter((badge) => badge !== "pending")
+      .map((badge) => {
+        const tip = badgeTooltip(badge);
+        return `<span class="badge ${escapeAttr(badge)}"${tip ? ` title="${escapeAttr(tip)}"` : ""}>${escapeHtml(badgeLabel(badge))}</span>`;
+      })
+      .join("");
+  }
+
+  function badgeTooltip(badge) {
+    const tips = {
+      wallet: "Supports payments (capability flag — not a purchase)",
+      ddrm: "Uses protected content (capability flag)",
+      provider: "System service",
+      installed: "Installed on this Home",
+    };
+    return tips[badge] || "";
   }
 
   function showAppDetail(appId) {
@@ -471,17 +776,15 @@
     if (!app) return;
     const openButton = app.launchable
       ? `<button class="modal-btn primary" type="button" data-action="open" data-app="${escapeAttr(app.id)}">Open</button>`
-      : `<button class="modal-btn disabled" type="button">Details only</button>`;
-    const installButton = !app.launchable && !app.installed
-      ? `<button class="modal-btn secondary" type="button" data-action="install" data-app="${escapeAttr(app.id)}">Install pending</button>`
       : "";
 
+    detailPreviousFocus = document.activeElement;
     els.detailContent.innerHTML = `
       <header class="modal-header">
         ${appIconHtml(app, "modal-icon-size")}
         <div class="modal-title-section">
           <div class="modal-title">${escapeHtml(app.name)}</div>
-          <div class="modal-developer">${escapeHtml(app.developer)}</div>
+          <div class="modal-developer">${escapeHtml(detailPublisher(app))}</div>
           ${app.version ? `<div class="modal-version">Version ${escapeHtml(app.version)}</div>` : ""}
           <div class="modal-badges">${badgesHtml(app)}</div>
         </div>
@@ -502,16 +805,45 @@
         ${technicalDetails(app)}
       </div>
       <footer class="modal-footer">
-        <div class="modal-footer-price"><span class="price-tag">${app.cid ? "Verified" : "Local"}</span></div>
+        <div class="modal-footer-price"><span class="trust-chip">${escapeHtml(packageLabel(app))}</span></div>
         <div class="modal-footer-actions">
           <button class="modal-btn secondary" type="button" data-action="close-detail">Close</button>
-          ${installButton}
           ${openButton}
         </div>
       </footer>
     `;
     bindAppActions(els.detailContent);
     els.detailModal.classList.add("active");
+    const focusTarget = els.detailContent.querySelector(".modal-btn.primary")
+      || els.detailContent.querySelector("[data-action='close-detail']");
+    focusTarget?.focus();
+  }
+
+  function closeDetail() {
+    els.detailModal.classList.remove("active");
+    const restore = detailPreviousFocus;
+    detailPreviousFocus = null;
+    if (restore && typeof restore.focus === "function" && document.contains(restore)) {
+      restore.focus();
+    }
+  }
+
+  function trapDetailFocus(event) {
+    const focusables = [...els.detailContent.querySelectorAll(
+      'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )].filter((node) => !node.closest("[hidden]") && node.offsetParent !== null);
+    if (focusables.length < 2) {
+      event.preventDefault();
+      focusables[0]?.focus();
+      return;
+    }
+    const index = focusables.indexOf(document.activeElement);
+    event.preventDefault();
+    if (event.shiftKey) {
+      focusables[index <= 0 ? focusables.length - 1 : index - 1].focus();
+    } else {
+      focusables[index >= focusables.length - 1 ? 0 : index + 1].focus();
+    }
   }
 
   function accessItems(app) {
@@ -569,7 +901,7 @@
     if (app.trustState === "cid-with-manifest-signature") return "Verified";
     if (app.trustState === "local-manifest-signature") return "Signed local";
     if (app.cid) return "Verified";
-    return "Local";
+    return "On this device";
   }
 
   function trustLabel(stateValue) {
@@ -590,19 +922,6 @@
     return labels[stateValue] || "Unknown";
   }
 
-  function showInstallPending(appId) {
-    const app = state.apps.find((candidate) => candidate.id === appId);
-    if (!app) return;
-    els.installContent.innerHTML = `
-      ${appIconHtml(app, "install-modal-icon")}
-      <div class="install-modal-title">Install unavailable</div>
-      <div class="install-modal-status">Installing new apps is not available yet.</div>
-      <button class="modal-btn secondary" type="button" data-action="close-install">Close</button>
-    `;
-    bindAppActions(els.installContent);
-    els.installModal.classList.add("active");
-  }
-
   function openApp(appId) {
     const app = state.apps.find((candidate) => candidate.id === appId);
     if (!app || !app.launchable || !app.launchTarget) {
@@ -610,7 +929,7 @@
       return;
     }
     if (window.top === window || !homeParentOrigin) {
-      showToast("Open Marketplace from Home to launch apps.", true);
+      showToast("Open Apps from Home to launch apps.", true);
       return;
     }
     window.top.postMessage({
@@ -631,12 +950,17 @@
         if (action !== "detail") event.stopPropagation();
         if (action === "detail") showAppDetail(appId);
         if (action === "open") {
-          els.detailModal.classList.remove("active");
+          closeDetail();
           openApp(appId);
         }
-        if (action === "install") showInstallPending(appId);
-        if (action === "close-detail") els.detailModal.classList.remove("active");
-        if (action === "close-install") els.installModal.classList.remove("active");
+        if (action === "close-detail") closeDetail();
+        if (action === "see-all") selectDestination(target.dataset.destination);
+        if (action === "retry") {
+          loadData().then(render).catch((error) => {
+            state.loadError = publicError(error.message, "Couldn’t load apps.");
+            renderLoadError();
+          });
+        }
       });
       node.addEventListener("keydown", (event) => {
         if ((event.key === "Enter" || event.key === " ") && node.dataset.action === "detail") {
@@ -649,21 +973,12 @@
 
   function emptyState(title, description, icon) {
     return `
-      <div class="empty-state" style="grid-column:1/-1;">
+      <div class="empty-state">
         <div class="empty-icon">${icon}</div>
         <div class="empty-title">${escapeHtml(title)}</div>
         <div class="empty-description">${escapeHtml(description)}</div>
       </div>
     `;
-  }
-
-  function installedMeta(app) {
-    return [
-      app.version ? `v${app.version}` : "",
-      "Installed",
-      app.role,
-      app.cid ? "Verified" : "",
-    ].filter(Boolean).join(" / ");
   }
 
   function showToast(message, isError = false) {
@@ -681,12 +996,12 @@
       app: "App",
       viewer: "Viewer",
       provider: "Service",
+      service: "Service",
       content: "Content",
       shell: "Shell",
       ddrm: "dDRM",
       wallet: "Wallet",
       installed: "Installed",
-      pending: "Pending",
     };
     return labels[badge] || titleCase(badge);
   }
@@ -702,11 +1017,6 @@
       .filter(Boolean)
       .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
       .join(" ");
-  }
-
-  function short(value) {
-    const text = String(value || "");
-    return text.length > 24 ? `${text.slice(0, 12)}...${text.slice(-8)}` : text;
   }
 
   function escapeHtml(value) {

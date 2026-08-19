@@ -103,6 +103,12 @@ const HOME_CLIPBOARD_TARGET_PURPOSE_POLICY = Object.freeze({
       kind: "resource-uri",
     }),
   }),
+  system: Object.freeze({
+    "identity.did": Object.freeze({
+      operations: Object.freeze(["write"]),
+      maxUtf8Bytes: MAX_HOME_CLIPBOARD_IDENTIFIER_UTF8_BYTES,
+    }),
+  }),
 });
 
 export function homeClipboardExactKeys(value, expected) {

@@ -250,6 +250,11 @@ export function createHomeClipboardPrompt({
       "Continue to copy this short-lived conversation invite to this device clipboard.",
       "Copy invite",
     ],
+    "system:identity.did:write": [
+      "Copy device identity?",
+      "Continue to copy this device identity to this device clipboard.",
+      "Copy",
+    ],
   };
 
   return {

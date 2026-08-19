@@ -33,7 +33,6 @@ import {
 } from "./agent-grants.js?v=home-20260814a";
 import { syncWorkbenchPanels } from "./agent-configure.js?v=home-20260814a";
 import { showViewerRail } from "./shell-viewer-rail.js?v=home-20260814a";
-import { getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260814a";
 import {
   createProgressController,
   snapshotProgress,
@@ -1293,8 +1292,9 @@ function artifactCardEl(artifact) {
   const actions = document.createElement("span");
   actions.className = "agent-artifact-actions";
 
-  /* Save clip: pull the bytes down as a file. Only for media artifacts. */
-  if (artifact.mediaUrl) {
+  /* Save only when the card already holds bytes. No Home /creative fetch. */
+  const mediaUrl = String(artifact.mediaUrl || "");
+  if (mediaUrl.startsWith("blob:") || mediaUrl.startsWith("data:")) {
     const save = document.createElement("button");
     save.type = "button";
     save.className = "agent-artifact-action";
@@ -1310,13 +1310,13 @@ function artifactCardEl(artifact) {
     actions.append(save);
   }
 
-  /* Delete: remove the clip from this Home (media artifacts with an id). */
-  if (artifact.mediaUrl && artifact.id) {
+  /* Remove the card from this chat. Home has no clip-delete offer. */
+  if (artifact.id) {
     const del = document.createElement("button");
     del.type = "button";
     del.className = "agent-artifact-action agent-artifact-action-danger";
-    del.title = "Delete clip";
-    del.setAttribute("aria-label", "Delete clip");
+    del.title = "Remove card";
+    del.setAttribute("aria-label", "Remove card");
     del.innerHTML =
       '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 4V2.75h3V4M3.5 4l.7 9.5h7.6l.7-9.5"/></svg>';
     del.addEventListener("click", (event) => {
@@ -1331,13 +1331,14 @@ function artifactCardEl(artifact) {
   return card;
 }
 
-/* Save the clip: fetch the bytes and trigger a download. */
+/* Save only when the card already holds bytes (blob/data). No Home /creative path. */
 async function saveArtifact(artifact) {
+  const mediaUrl = String(artifact?.mediaUrl || "");
+  if (!mediaUrl.startsWith("blob:") && !mediaUrl.startsWith("data:")) {
+    return;
+  }
   try {
-    const token = getHomeGuiLaunchToken();
-    const response = await fetch(artifact.mediaUrl, {
-      headers: token ? { "x-elastos-home-token": token } : {},
-    });
+    const response = await fetch(mediaUrl);
     if (!response.ok) {
       throw new Error(`fetch failed (${response.status})`);
     }
@@ -1351,25 +1352,15 @@ async function saveArtifact(artifact) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   } catch {
-    /* best-effort save */
+    /* optional */
   }
 }
 
-/* Delete the clip from this Home, then remove its card from the chat. */
+/* Remove the card from this chat. Home has no clip-delete offer on this branch. */
 async function deleteArtifact(artifact, card) {
-  if (!window.confirm("Remove this clip from this Home?")) {
+  if (!window.confirm("Remove this card from the chat?")) {
     return;
   }
-  try {
-    const token = getHomeGuiLaunchToken();
-    await fetch(`/api/apps/home/creative/jobs/${encodeURIComponent(artifact.id)}`, {
-      method: "DELETE",
-      headers: token ? { "x-elastos-home-token": token } : {},
-    });
-  } catch {
-    /* best-effort delete */
-  }
-  /* Remove the artifact from its message and re-render so the card disappears. */
   const session = ctx.sessions.find((s) => s.id === ctx.activeSessionId);
   if (session) {
     for (const m of session.messages) {

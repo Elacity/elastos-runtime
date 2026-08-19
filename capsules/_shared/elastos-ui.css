@@ -23,6 +23,7 @@
 
   /* Palette */
   --el-bg: #0b0d10;
+  --el-rail: #111113;
   --el-surface: rgba(22, 24, 29, 0.92);
   --el-surface-raised: #16181d;
   --el-inset: rgba(255, 255, 255, 0.06);
@@ -257,6 +258,7 @@
   color-scheme: light;
 
   --el-bg: #eef1f6;
+  --el-rail: #ebecef;
   --el-surface: rgba(255, 255, 255, 0.88);
   --el-surface-raised: #ffffff;
   --el-inset: rgba(29, 36, 56, 0.055);
@@ -350,6 +352,17 @@
 
 .el-button-primary:hover {
   background: var(--el-brand-strong);
+}
+
+.el-button-danger {
+  border-color: color-mix(in srgb, var(--el-danger) 28%, transparent);
+  background: color-mix(in srgb, var(--el-danger) 10%, transparent);
+  color: var(--el-danger);
+  font-weight: 600;
+}
+
+.el-button-danger:hover {
+  background: color-mix(in srgb, var(--el-danger) 18%, transparent);
 }
 
 .el-input {

@@ -166,7 +166,7 @@ Carrier path described in [Capsule Interface Contract](CAPSULE_INTERFACE_CONTRAC
 
 First-party capsule Clipboard access terminates in the trusted top-level Home
 document. This is one closed browser edge adapter shared by Browser, Wallet,
-MetaMask, UniSat, WalletConnect, Library, and Documents. It is not an ESP
+MetaMask, UniSat, WalletConnect, Library, Documents, Chat, and System. It is not an ESP
 capability, generic app message, provider RPC, shell method, audit event, or new
 source of Home authority. `home-gui` only projects opaque capsule iframes and
 does not receive `clipboard-read` or `clipboard-write` permission. No opaque
@@ -187,7 +187,8 @@ The purpose policy is closed. Browser may read or write bounded `text/plain`
 for `browser.text`. Wallet may write addresses and Wallet Recovery Keys.
 MetaMask, UniSat, and WalletConnect may write linked Wallet addresses. Library
 may write resource URIs and bounded technical identifiers under separate
-purposes; Documents may write resource URIs. No non-Browser target may read
+purposes; Documents may write resource URIs. Chat may write conversation
+invites. System may write the device identity. No non-Browser target may read
 the OS Clipboard, and no caller-supplied purpose widens its target's policy.
 
 Every OS Clipboard read or write requires a new click on the visible,

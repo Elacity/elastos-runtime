@@ -6,7 +6,7 @@
   <title>Chat</title>
   <script src="./elastos-theme.js"></script>
   <link rel="stylesheet" href="./elastos-ui.css" />
-  <link rel="stylesheet" href="./style.css?v=chat-room-20260812a" />
+  <link rel="stylesheet" href="./style.css?v=chat-room-20260819d" />
 </head>
 <body data-room-session-active="false">
   <script>
@@ -27,6 +27,27 @@
         <h2>Chats</h2>
       </div>
       <nav id="conversation-selector" class="conversation-selector" aria-label="Conversations" hidden></nav>
+      <section id="conversation-join-section" class="join-link-card join-receive-card" hidden>
+        <div class="join-link-copy">
+          <h4>Have a link?</h4>
+          <p>Joining replaces this unused local conversation; conversations with messages or other members cannot be replaced.</p>
+        </div>
+        <form id="conversation-join-form" class="conversation-join-form">
+          <input id="conversation-join-input" type="text" autocomplete="off" placeholder="Paste invite" aria-label="Invite code or link" />
+          <button id="conversation-join-submit" type="submit">Join</button>
+        </form>
+      </section>
+      <section class="join-link-card">
+        <div class="join-link-copy">
+          <h4>Invite</h4>
+          <p>Share so another Runtime can join yours</p>
+        </div>
+        <button id="conversation-invite-create" type="button">Create link</button>
+        <div id="conversation-invite-output-row" class="join-link-output" hidden>
+          <input id="conversation-invite-output" type="text" readonly aria-label="Conversation join link" />
+          <button id="conversation-invite-copy" type="button" class="secondary">Copy</button>
+        </div>
+      </section>
     </aside>
 
     <main class="chat-thread">
@@ -62,16 +83,6 @@
           </form>
         </section>
         <p id="error-text" class="error" hidden></p>
-        <section id="conversation-join-section" class="conversation-join" hidden>
-          <div class="conversation-join-copy">
-            <h2>Join a Conversation</h2>
-            <p>Paste a join code or link from another ElastOS user. Joining replaces this unused local conversation; conversations with messages or other members cannot be replaced.</p>
-          </div>
-          <form id="conversation-join-form" class="conversation-join-form">
-            <input id="conversation-join-input" type="text" autocomplete="off" placeholder="Paste invite code or link" aria-label="Invite code or link" />
-            <button id="conversation-join-submit" type="submit">Join</button>
-          </form>
-        </section>
         <ol id="message-list" class="messages"></ol>
         <form id="composer-form" class="composer">
           <button id="attach-button" type="button" class="composer-icon" aria-label="Attach" title="Attach" hidden disabled>
@@ -124,17 +135,6 @@
           <h3 class="room-access-title">Access</h3>
         </div>
         <div id="room-policy-list" class="room-policy-list"></div>
-        <section class="join-link-card">
-          <div class="join-link-copy">
-            <h4>Invite another person</h4>
-            <p>Create a short-lived link that lets another ElastOS profile join this conversation.</p>
-          </div>
-          <button id="conversation-invite-create" type="button">Create join link</button>
-          <div id="conversation-invite-output-row" class="join-link-output" hidden>
-            <input id="conversation-invite-output" type="text" readonly aria-label="Conversation join link" />
-            <button id="conversation-invite-copy" type="button" class="secondary">Copy</button>
-          </div>
-        </section>
         <ol id="node-list" class="node-list"></ol>
       </section>
     </aside>

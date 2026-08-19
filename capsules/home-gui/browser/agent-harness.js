@@ -90,6 +90,7 @@ import {
   maybeOfferToolAfterReply,
   hydrateCapabilitiesFromSession,
   getReadyLibraryReadGrant,
+  manageAgentTool,
 } from "./agent-grants.js?v=home-20260814a";
 import {
   bindAgentStream,
@@ -2077,34 +2078,11 @@ export function bindAgentHarness() {
     const copyCode = event.target.closest?.(".agent-md-copy");
     if (copyCode) {
       event.preventDefault();
-      const block = copyCode.closest(".agent-md-code");
-      const code = block?.dataset?.mdSource ?? block?.querySelector("code")?.textContent ?? "";
-      navigator.clipboard?.writeText(code).catch(() => {});
-      copyCode.classList.add("is-copied");
-      copyCode.setAttribute("aria-label", "Copied");
-      window.setTimeout(() => {
-        copyCode.classList.remove("is-copied");
-        copyCode.setAttribute("aria-label", "Copy code");
-      }, 1500);
       return;
     }
     const copyMsg = event.target.closest?.("[data-copy-message]");
     if (copyMsg) {
       event.preventDefault();
-      const row = copyMsg.closest(".agent-msg");
-      const body = row?.querySelector(".agent-msg-body");
-      const live = row?.classList.contains("is-streaming") ? getLiveTurnCanonical() : null;
-      const text =
-        live?.answer ||
-        body?.dataset?.mdSource ||
-        body?.innerText ||
-        body?.textContent ||
-        "";
-      navigator.clipboard?.writeText(String(text)).catch(() => {});
-      copyMsg.textContent = "Copied";
-      window.setTimeout(() => {
-        copyMsg.textContent = "Copy";
-      }, 1200);
       return;
     }
     if (event.target.closest?.("[data-agent-jump-latest]")) {
@@ -2319,8 +2297,10 @@ export function bindAgentHarness() {
       openWorkbench({ tab: wbTab.dataset.workbenchTab, force: true });
       return;
     }
-    if (event.target.closest?.("[data-tools-demo-grant]")) {
+    const manageTool = event.target.closest?.("[data-tools-manage]");
+    if (manageTool) {
       event.preventDefault();
+      void manageAgentTool(manageTool.dataset.toolsManage);
       return;
     }
     const lib = event.target.closest?.("[data-library-attach-uri]");

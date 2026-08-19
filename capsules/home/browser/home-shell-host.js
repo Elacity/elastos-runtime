@@ -500,6 +500,117 @@ function postToActiveShell(message) {
   return true;
 }
 
+const HOME_UI_PREFERENCE_KEYS = new Set([
+  "theme",
+  "accent",
+  "accentCustom",
+  "dockAutoHide",
+  "sounds",
+  "focusMode",
+]);
+
+function isAllowedHomeUiPreference(key, value) {
+  if (typeof key !== "string" || typeof value !== "string") {
+    return false;
+  }
+  if (!HOME_UI_PREFERENCE_KEYS.has(key)) {
+    return false;
+  }
+  if (key === "theme") {
+    return value === "light" || value === "dark" || value === "auto";
+  }
+  if (key === "accent") {
+    return (
+      value === "custom" ||
+      value === "blue" ||
+      value === "purple" ||
+      value === "pink" ||
+      value === "red" ||
+      value === "orange" ||
+      value === "yellow" ||
+      value === "green" ||
+      value === "graphite"
+    );
+  }
+  if (key === "accentCustom") {
+    return /^#[0-9a-fA-F]{6}$/.test(value);
+  }
+  return value === "on" || value === "off";
+}
+
+function persistHostUiPreference(key, value) {
+  const theme = window.elastosTheme;
+  if (!theme) {
+    return;
+  }
+  if (key === "theme") {
+    theme.set(value);
+    return;
+  }
+  if (key === "accent") {
+    theme.setAccent?.(value);
+    return;
+  }
+  if (key === "accentCustom") {
+    theme.setAccentCustom?.(value);
+  }
+}
+
+function readHostUiPreferences() {
+  const theme = window.elastosTheme;
+  if (!theme) {
+    return {};
+  }
+  const preferences = {};
+  const pref = theme.preference?.();
+  const accent = theme.accent?.();
+  const accentCustom = theme.accentCustom?.();
+  if (typeof pref === "string" && pref) {
+    preferences.theme = pref;
+  }
+  if (typeof accent === "string" && accent) {
+    preferences.accent = accent;
+  }
+  if (typeof accentCustom === "string" && accentCustom) {
+    preferences.accentCustom = accentCustom;
+  }
+  return preferences;
+}
+
+function handleHomeUiPreference(event, context, data) {
+  const trustedSystem = context.kind === "app-frame" && context.targetId === SYSTEM_APP_ID;
+  const trustedShell =
+    context.kind === "shell-frame" &&
+    [HOME_GUI_SHELL_ID, HOME_CLI_SHELL_ID].includes(context.targetId);
+  if (!trustedSystem && !trustedShell) {
+    console.warn("home ignored unauthorized ui-preference message", context.targetId);
+    return;
+  }
+  const action = typeof data.action === "string" ? data.action : "";
+  if (action === "read") {
+    if (!hasExactMessageKeys(data, ["type", "action", "requestId", "homeToken"])) {
+      return;
+    }
+    replyToShellRequest(event, data.requestId, readHostUiPreferences());
+    return;
+  }
+  if (action !== "write") {
+    return;
+  }
+  if (!hasExactMessageKeys(data, ["type", "action", "key", "value", "homeToken"])) {
+    return;
+  }
+  if (!isAllowedHomeUiPreference(data.key, data.value)) {
+    return;
+  }
+  persistHostUiPreference(data.key, data.value);
+  postToActiveShell({
+    type: "home:gui-command",
+    command: "ui-preference",
+    preferences: { [data.key]: data.value },
+  });
+}
+
 function replyToShellRequest(event, requestId, result, error = null) {
   if (!requestId || !event.source) {
     return;
@@ -1133,6 +1244,10 @@ window.addEventListener("message", (event) => {
   }
   if (data.type === "home:refresh-summary") {
     requestShellSummaryRefresh({ reason: "child-message" });
+    return;
+  }
+  if (data.type === "home:ui-preference") {
+    handleHomeUiPreference(event, context, data);
     return;
   }
   if (data.type === "home:menu-manifest") {

@@ -244,6 +244,43 @@ function clearLauncherFaceWidth(taskbar) {
   taskbar.classList.remove("is-launcher-width-easing");
 }
 
+/** Idle dock is width:max-content. Ease back to that after Apps dismiss. */
+function hugDockToIcons(taskbar, fromW, snap = false) {
+  if (!taskbar) {
+    return;
+  }
+  const generation = morphGeneration;
+  const toW = Math.round(taskbar.getBoundingClientRect().width);
+  if (!(fromW > 0) || toW <= 0 || Math.abs(fromW - toW) <= 1) {
+    taskbar.style.removeProperty("width");
+    return;
+  }
+  if (snap || prefersReducedMotion()) {
+    taskbar.style.removeProperty("width");
+    return;
+  }
+  taskbar.classList.remove("is-launcher-width-easing", "is-dock-width-easing");
+  taskbar.style.width = `${fromW}px`;
+  void taskbar.offsetWidth;
+  taskbar.classList.add("is-dock-width-easing");
+  taskbar.style.width = `${toW}px`;
+  const finish = () => {
+    if (generation !== morphGeneration) {
+      return;
+    }
+    taskbar.removeEventListener("transitionend", onEnd);
+    taskbar.classList.remove("is-dock-width-easing");
+    taskbar.style.removeProperty("width");
+  };
+  const onEnd = (event) => {
+    if (event.propertyName === "width") {
+      finish();
+    }
+  };
+  taskbar.addEventListener("transitionend", onEnd);
+  window.setTimeout(finish, 820);
+}
+
 function readBox(taskbar) {
   const rect = taskbar.getBoundingClientRect();
   const cs = window.getComputedStyle(taskbar);
@@ -849,19 +886,16 @@ export function hideLauncherShelfFace({ snap = false } = {}) {
   clearMorphTimer();
 
   const finishClosed = () => {
-    /* Hold open-face width through the class swap — dismiss is height-only. */
-    const heldW = Math.round(taskbar.getBoundingClientRect().width);
+    const fromW = Math.round(taskbar.getBoundingClientRect().width);
     clearBoxLock(taskbar);
     delete taskbar.dataset.launcherMorphing;
     taskbar.classList.remove("is-launcher-face", "is-launcher-closing");
     clearLauncherFaceWidth(taskbar);
-    if (heldW > 0) {
-      taskbar.style.width = `${heldW}px`;
-    }
     setMorphPhase(taskbar, "");
     setLauncherDomOpen(false);
     syncFaceAria({ agent: false, launcher: false });
     toggle?.focus({ preventScroll: true });
+    hugDockToIcons(taskbar, fromW, snap);
   };
 
   if (snap || prefersReducedMotion() || !taskbar.classList.contains("is-launcher-face")) {
@@ -1189,11 +1223,6 @@ function pasteEditorEl() {
   });
   el.querySelector("[data-paste-close]").addEventListener("click", () => closePasteEditor());
   el.querySelector("[data-paste-save]").addEventListener("click", () => savePasteEditor());
-  el.querySelector("[data-paste-copy]").addEventListener("click", () => {
-    const part = composerParts.find((p) => p.id === pasteEditorPartId);
-    const text = part?.text || el.querySelector("[data-paste-body]")?.value || "";
-    void navigator.clipboard?.writeText(String(text));
-  });
   return el;
 }
 

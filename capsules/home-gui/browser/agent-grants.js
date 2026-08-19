@@ -511,6 +511,81 @@ export function sessionAlreadyHasGrant(session, toolId) {
   );
 }
 
+function activeAgentSession() {
+  return store?.getSessions?.().find((s) => s.id === store.getActiveSessionId()) || null;
+}
+
+export async function requestInboxLibraryReadGrant() {
+  const session = activeAgentSession();
+  if (!session) {
+    try {
+      showInboxRail();
+    } catch {
+      /* optional */
+    }
+    return;
+  }
+  if (sessionAlreadyHasGrant(session, "library.read")) {
+    try {
+      showInboxRail();
+    } catch {
+      /* optional */
+    }
+    return;
+  }
+  try {
+    const req = await requestAgentLibraryRead();
+    const grant = {
+      role: "grant",
+      toolId: "library.read",
+      state: "pending",
+      inbox: true,
+      requestId: req.request_id,
+      label: req.label || "Library · Read",
+      summary: req.summary || "Approve in Inbox for one Desktop list.",
+      scope: req.scope || req.resource || "Desktop",
+      args: { uri: req.resource },
+    };
+    session.messages.push(grant);
+    try {
+      host.persistAgentWorkspaceSoon?.();
+    } catch {
+      /* optional */
+    }
+    appendGrantCard(grant);
+    try {
+      showInboxRail();
+    } catch {
+      /* optional */
+    }
+  } catch (err) {
+    const grant = {
+      role: "grant",
+      toolId: "library.read",
+      state: "denied",
+      inbox: true,
+      label: "Library · Read",
+      summary: err?.message || "Could not create Inbox library.read request",
+      scope: "Desktop",
+    };
+    session.messages.push(grant);
+    appendGrantCard(grant);
+  }
+}
+
+export async function manageAgentTool(toolId) {
+  const id = String(toolId || "").trim();
+  if (id === "library.read") {
+    await requestInboxLibraryReadGrant();
+    return;
+  }
+  try {
+    showInboxRail();
+  } catch {
+    /* optional */
+  }
+}
+
 function appendWebSearchUnavailableCard(session, payload, query) {
   const grant = {
     role: "grant",
@@ -592,45 +667,8 @@ export async function maybeOfferToolAfterReply() {
     appendGrantCard(grant);
     return;
   }
-  if (wantsLibraryTool(text) && !sessionAlreadyHasGrant(session, "library.read")) {
-    try {
-      const req = await requestAgentLibraryRead();
-      const grant = {
-        role: "grant",
-        toolId: "library.read",
-        state: "pending",
-        inbox: true,
-        requestId: req.request_id,
-        label: req.label || "Library · Read",
-        summary: req.summary || "Approve in Inbox for one Desktop list.",
-        scope: req.scope || req.resource || "Desktop",
-        args: { uri: req.resource },
-      };
-      session.messages.push(grant);
-      try {
-        host.persistAgentWorkspaceSoon?.();
-      } catch {
-        /* optional */
-      }
-      appendGrantCard(grant);
-      try {
-        showInboxRail();
-      } catch {
-        /* optional */
-      }
-    } catch (err) {
-      const grant = {
-        role: "grant",
-        toolId: "library.read",
-        state: "denied",
-        inbox: true,
-        label: "Library · Read",
-        summary: err?.message || "Could not create Inbox library.read request",
-        scope: "Desktop",
-      };
-      session.messages.push(grant);
-      appendGrantCard(grant);
-    }
+  if (wantsLibraryTool(text)) {
+    await requestInboxLibraryReadGrant();
   }
 }
 

@@ -84,6 +84,25 @@ p {
   font-weight: 600;
 }
 
+.status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.4rem;
+  padding: 0 0.5rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-size: 0.72rem;
+  font-weight: 750;
+}
+
 .chat-sidebar,
 .chat-people,
 .messages {
@@ -131,18 +150,38 @@ p {
 
 .chat-sidebar {
   display: flex;
-  min-width: 0;
+  flex: 0 0 220px;
+  width: 220px;
+  min-width: 220px;
+  max-width: 220px;
   min-height: 0;
   flex-direction: column;
-  gap: 0.45rem;
-  padding: 12px 10px 14px;
-  overflow: auto;
+  gap: 0.65rem;
+  padding: 52px 10px 14px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border-right: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
   background: var(--sidebar-bg);
 }
 
+:root[data-el-theme="light"] .chat-shell {
+  background: linear-gradient(
+    to right,
+    var(--el-surface-raised) 0 220px,
+    var(--bg) 220px 100%
+  );
+}
+
 :root[data-el-theme="light"] .chat-sidebar {
   background: var(--el-surface-raised);
+}
+
+.chat-sidebar .join-link-card,
+.chat-sidebar .conversation-join {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0.55rem;
 }
 
 .conversation-list-head {
@@ -744,6 +783,23 @@ button.secondary {
   justify-content: flex-end;
 }
 
+.message-sender {
+  font-weight: 650;
+  color: var(--accent-deep);
+  letter-spacing: -0.01em;
+}
+
+.message-time {
+  margin-left: auto;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+.message.self-message .message-sender {
+  display: none;
+}
+
 .message-body {
   overflow-wrap: anywhere;
   font-size: 0.9rem;
@@ -872,6 +928,15 @@ button.secondary {
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--el-inset);
+  transition: border-radius 120ms ease;
+}
+
+.composer:has(.composer-field.is-multiline) {
+  align-items: flex-end;
+}
+
+.composer-field.is-multiline {
+  border-radius: 18px;
 }
 
 .composer-field .composer-emoji-toggle {
@@ -968,15 +1033,43 @@ body[data-room-access-mode="shell"][data-room-session-active="false"] .roster-he
 @media (max-width: 760px) {
   .chat-shell {
     grid-template-columns: 72px minmax(0, 1fr);
+    background: linear-gradient(
+      to right,
+      var(--sidebar-bg) 0 72px,
+      var(--bg) 72px 100%
+    );
+  }
+
+  :root[data-el-theme="light"] .chat-shell {
+    background: linear-gradient(
+      to right,
+      var(--el-surface-raised) 0 72px,
+      var(--bg) 72px 100%
+    );
   }
 
   .chat-sidebar {
+    flex: 0 0 72px;
+    width: 72px;
+    min-width: 72px;
+    max-width: 72px;
     align-items: center;
     padding-right: 6px;
     padding-left: 6px;
   }
 
-  .conversation-list-head {
+  /* One room (or none) does not need a switcher rail. Two or more get 72px chips. */
+  .chat-shell:not(:has(.conversation-choice:nth-child(2))) {
+    grid-template-columns: minmax(0, 1fr);
+    background: var(--bg);
+  }
+
+  .chat-shell:not(:has(.conversation-choice:nth-child(2))) .chat-sidebar {
+    display: none;
+  }
+
+  .conversation-list-head,
+  .chat-sidebar .join-link-card {
     display: none;
   }
 

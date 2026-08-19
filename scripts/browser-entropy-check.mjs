@@ -447,13 +447,13 @@ assert(
 assert(
   browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
     browserStyle.includes("overflow: hidden") &&
     browserStyle.includes("height: 100%") &&
     browserStyle.includes("min-height: 0") &&
     !browserStyle.includes(".browser-hero") &&
     !browserStyle.includes(".browser-card"),
-  "Browser UI must stay compact and responsive without old proof/debug card chrome",
+  "Browser UI must stay compact and responsive on the shared token sheet without old proof/debug card chrome",
 );
 
 assert(

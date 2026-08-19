@@ -95,7 +95,7 @@
       display: flex;
       flex-direction: column;
       gap: 4px;
-      padding: 12px 12px 16px;
+      padding: 52px 12px 16px;
       border: 0;
       border-right: 1px solid var(--line);
       border-radius: 0;
@@ -225,26 +225,8 @@
       white-space: nowrap;
     }
 
-    .action-secondary,
-    .entry-action {
-      min-height: 30px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      padding: 5px 10px;
-      background: var(--panel);
-      color: var(--text);
-      cursor: pointer;
-      font-weight: 600;
-      transition: background 150ms ease, border-color 150ms ease;
-    }
-
-    .action-secondary:hover,
-    .action-secondary:focus-visible,
-    .entry-action:hover,
-    .entry-action:focus-visible {
-      border-color: var(--border-strong);
-      background: var(--panel-soft);
-      outline: none;
+    .entry-actions .el-button {
+      flex: 0 0 auto;
     }
 
     .entry-list {
@@ -324,21 +306,8 @@
       min-width: 160px;
     }
 
-    .entry-action.primary {
-      background: var(--text);
-      border-color: var(--text);
-      color: var(--bg);
-    }
-
-    .entry-action.danger {
-      color: var(--danger);
-      border-color: color-mix(in srgb, var(--danger) 24%, transparent);
-      background: color-mix(in srgb, var(--danger) 8%, transparent);
-    }
-
-    .entry-action:disabled {
+    .entry-actions .el-button:disabled {
       cursor: wait;
-      opacity: 0.55;
     }
 
     .empty-state {
@@ -352,6 +321,42 @@
       border-radius: 8px;
       background: var(--panel-soft);
       text-align: center;
+    }
+
+    html[data-inbox-presentation="rail"],
+    html[data-inbox-presentation="rail"] body,
+    html[data-inbox-presentation="rail"] .shell,
+    html[data-inbox-presentation="rail"] .main,
+    html[data-inbox-presentation="rail"] .toolbar {
+      background: var(--el-rail, var(--el-bg));
+    }
+
+    html[data-inbox-presentation="rail"] .shell {
+      grid-template-columns: 1fr;
+    }
+
+    html[data-inbox-presentation="rail"] .sidebar,
+    html[data-inbox-presentation="rail"] #refresh {
+      display: none;
+    }
+
+    html[data-inbox-presentation="rail"] .toolbar {
+      min-height: 0;
+      padding: 10px 12px 8px;
+    }
+
+    html[data-inbox-presentation="rail"] .toolbar-title h1 {
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    html[data-inbox-presentation="rail"] .entry {
+      grid-template-columns: 1fr;
+    }
+
+    html[data-inbox-presentation="rail"] .entry-actions {
+      justify-content: flex-start;
+      min-width: 0;
     }
 
     @media (max-width: 900px) {
@@ -441,7 +446,7 @@
           <h1>Requests</h1>
           <p id="status-text" class="status">Loading...</p>
         </div>
-        <button id="refresh" class="action-secondary" type="button">Refresh</button>
+        <button id="refresh" class="el-button" type="button">Refresh</button>
       </div>
 
       <section id="entry-list" class="entry-list" aria-live="polite"></section>
@@ -457,6 +462,13 @@
     const INBOX_SAFETY_REFRESH_MS = 5 * 60 * 1000;
     const launchParams = new URLSearchParams(window.location.search);
     const homeParentOrigin = launchParams.get("home_origin") || "";
+
+    function applyRailPresentationChrome() {
+      const presentation = launchParams.get("presentation") === "rail" ? "rail" : "window";
+      document.documentElement.dataset.inboxPresentation = presentation;
+    }
+
+    applyRailPresentationChrome();
 
     const state = {
       homeToken: new URLSearchParams(window.location.hash.replace(/^#/, "")).get("home_token") || "",
@@ -517,6 +529,19 @@
       const kind = String(event && event.kind || "");
       const scope = String(event && event.scope || "");
       return scope === "inbox" || scope === "wallet" || kind.startsWith("inbox.") || kind.startsWith("wallet.");
+    }
+
+    function onInboxChromeCommand(event) {
+      if (event.origin !== "null" || event.source !== window.parent) {
+        return;
+      }
+      const message = event.data;
+      if (message?.type !== "elastos:inbox-chrome-command" || typeof message.cmd !== "string") {
+        return;
+      }
+      if (message.cmd === "refresh") {
+        requestInboxRefresh().catch(() => {});
+      }
     }
 
     function onRuntimeEvents(event) {
@@ -738,7 +763,11 @@
     function createButton(label, onClick, className) {
       const button = document.createElement("button");
       button.type = "button";
-      button.className = "entry-action" + (className ? " " + className : "");
+      button.className = className === "primary"
+        ? "el-button el-button-primary"
+        : className === "danger"
+          ? "el-button el-button-danger"
+          : "el-button";
       button.textContent = label;
       button.addEventListener("click", () => {
         Promise.resolve(onClick(button)).catch((error) => {
@@ -980,6 +1009,7 @@
       showInbox();
       requestInboxRefresh().catch(() => {});
       window.addEventListener("message", onRuntimeEvents);
+      window.addEventListener("message", onInboxChromeCommand);
       window.setInterval(() => {
         if (document.hidden) {
           return;

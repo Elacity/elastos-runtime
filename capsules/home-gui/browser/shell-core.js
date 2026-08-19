@@ -477,6 +477,7 @@ export function applyWindowChrome(windowNode, targetId) {
     windowNode.classList.add("window-chrome-continuous");
   }
   windowNode.dataset.windowChromeMode = mode;
+  windowNode.dataset.target = normalizeText(targetId) || windowNode.dataset.target || "";
   return mode;
 }
 

@@ -805,6 +805,10 @@ img {
   margin-top: 2px;
 }
 
+.control-centre-quick-open {
+  display: none;
+}
+
 .control-centre-label {
   padding: 0.2rem 0.85rem 0.15rem;
   color: var(--muted);
@@ -1054,9 +1058,19 @@ img {
   display: none;
 }
 
+.control-centre-row-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .control-centre-row-detail {
+  min-width: 0;
   color: var(--muted);
   font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
 }
 
 .control-centre-row-static {
@@ -1135,7 +1149,7 @@ img {
   border-radius: var(--popover-radius);
   /* Opaque fill — frosted glass was picking up the wallpaper's violet band
      along the bottom edge. Same card shape, no color bleed. */
-  background: var(--frame-fill);
+  background: var(--el-rail, var(--frame-fill));
   border: 1px solid var(--line);
   box-shadow: var(--shadow-soft);
   outline: none;
@@ -1423,6 +1437,139 @@ img {
 
 .connector-sheet-frame[hidden] {
   display: none;
+}
+
+.setup-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 100140;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, #000 28%, transparent);
+}
+
+.setup-sheet[hidden] {
+  display: none;
+}
+
+.setup-sheet-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: min(92vw, 420px);
+  padding: 28px 24px 22px;
+  border-radius: 20px;
+  background: var(--menu-fill, var(--panel-strong));
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28), 0 2px 10px rgba(0, 0, 0, 0.16);
+  animation: setup-sheet-enter var(--shell-motion-enter) var(--shell-motion-enter-ease) both;
+}
+
+.setup-sheet-card > .wallet-rail-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+}
+
+.setup-sheet-title {
+  margin: 0 36px 0 0;
+  color: var(--text);
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+.setup-sheet-lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.setup-sheet-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.setup-sheet-step {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 12px;
+  row-gap: 10px;
+  padding: 14px;
+  border-radius: 12px;
+  background: var(--panel-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #fff 8%, transparent);
+}
+
+.setup-sheet-step-index {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--el-accent, var(--brand)) 18%, transparent);
+  color: var(--text);
+  font-size: 0.78rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.setup-sheet-step-copy {
+  min-width: 0;
+}
+
+.setup-sheet-step-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 650;
+}
+
+.setup-sheet-step-body {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.4;
+  text-wrap: pretty;
+}
+
+.setup-sheet-step .el-button {
+  grid-column: 1 / -1;
+  min-height: 40px;
+}
+
+.setup-sheet-step .el-button:active {
+  transform: scale(0.96);
+}
+
+@keyframes setup-sheet-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .setup-sheet-card {
+    animation: none;
+  }
+
+  .setup-sheet-step .el-button:active {
+    transform: none;
+  }
 }
 
 .nc-cal {
@@ -5114,20 +5261,22 @@ body.dock-bin-sliding .is-dock-bin-sliding .taskbar-icon {
    leading column only (~220px) so Search/main stay clickable. Capsules pad
    with --window-chrome-safe-top (fallback 52px). Fail closed: absent class
    ⇒ standard titlebar.
-   Chat also matches on [data-target] so a stale Home module graph can't leave
-   a full dark titlebar cutting the People column (very visible in dark mode). */
+   Chat and System also match on [data-target] so a stale Home module graph
+   cannot leave a full titlebar over the leading column. */
 .window.window-chrome-unified-sidebar,
 .window[data-target="chat"],
-.window[data-target="chat-room"] {
+.window[data-target="chat-room"],
+.window[data-target="system"] {
   --window-chrome-safe-top: 52px;
   --window-chrome-sidebar-width: 220px;
 }
 
-/* Class is canonical. Chat data-target selectors are tip-lag defense only
-   (same geometry as unified-sidebar) — do not add new targets this way. */
+/* Class is canonical. Chat/System data-target selectors are tip-lag defense
+   (same geometry as unified-sidebar). */
 .window.window-chrome-unified-sidebar .window-head,
 .window[data-target="chat"] .window-head,
-.window[data-target="chat-room"] .window-head {
+.window[data-target="chat-room"] .window-head,
+.window[data-target="system"] .window-head {
   position: absolute;
   top: 0;
   left: 0;
@@ -5147,7 +5296,8 @@ body.dock-bin-sliding .is-dock-bin-sliding .taskbar-icon {
 
 .window.window-chrome-unified-sidebar.window-active .window-head,
 .window[data-target="chat"].window-active .window-head,
-.window[data-target="chat-room"].window-active .window-head {
+.window[data-target="chat-room"].window-active .window-head,
+.window[data-target="system"].window-active .window-head {
   filter: none;
 }
 
@@ -5159,13 +5309,17 @@ body.dock-bin-sliding .is-dock-bin-sliding .taskbar-icon {
 .window[data-target="chat"] .window-head-balance,
 .window[data-target="chat-room"] .window-head-icon,
 .window[data-target="chat-room"] .window-head-title,
-.window[data-target="chat-room"] .window-head-balance {
+.window[data-target="chat-room"] .window-head-balance,
+.window[data-target="system"] .window-head-icon,
+.window[data-target="system"] .window-head-title,
+.window[data-target="system"] .window-head-balance {
   display: none;
 }
 
 .window.window-chrome-unified-sidebar .window-head-draggable,
 .window[data-target="chat"] .window-head-draggable,
-.window[data-target="chat-room"] .window-head-draggable {
+.window[data-target="chat-room"] .window-head-draggable,
+.window[data-target="system"] .window-head-draggable {
   flex: 1 1 auto;
   min-width: 48px;
   min-height: 28px;
@@ -5175,7 +5329,8 @@ body.dock-bin-sliding .is-dock-bin-sliding .taskbar-icon {
 
 .window.window-chrome-unified-sidebar .window-body,
 .window[data-target="chat"] .window-body,
-.window[data-target="chat-room"] .window-body {
+.window[data-target="chat-room"] .window-body,
+.window[data-target="system"] .window-body {
   height: 100% !important;
 }
 
@@ -5190,7 +5345,8 @@ body.dock-bin-sliding .is-dock-bin-sliding .taskbar-icon {
 /* Match Apps left plate under lights before the iframe paints.
    Theme tokens only — never hardcode a dark strip in light mode. */
 .window[data-target="chat"],
-.window[data-target="chat-room"] {
+.window[data-target="chat-room"],
+.window[data-target="system"] {
   background: linear-gradient(
     to right,
     var(--panel-strong) 0 var(--window-chrome-sidebar-width, 220px),
@@ -5532,6 +5688,10 @@ body.dock-bin-sliding .is-dock-bin-sliding .taskbar-icon {
   .toolbar-active-title,
   .toolbar-menubar {
     display: none;
+  }
+
+  .control-centre-quick-open {
+    display: block;
   }
 
   /* Apps Shelf face — phone: still dock-width (JS var); slightly shorter. */

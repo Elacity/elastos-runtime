@@ -3,79 +3,75 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Marketplace - ElastOS</title>
-  <link rel="stylesheet" href="marketplace.css">
+  <title>Apps · ElastOS</title>
+  <script src="elastos-theme.js"></script>
+  <link rel="stylesheet" href="elastos-ui.css">
+  <link rel="stylesheet" href="marketplace.css?v=marketplace-20260819b">
 </head>
 <body>
-  <div class="marketplace-container">
-    <header class="header">
-      <div class="header-top">
-        <h1 class="header-title">Marketplace</h1>
-        <div class="header-actions">
-          <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle theme" title="Toggle theme">
-            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+  <div class="store-shell">
+    <aside id="store-sidebar" class="store-sidebar" aria-label="Apps">
+      <label class="store-search">
+        <span class="store-search-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle>
+            <path d="m21 21-4.35-4.35"></path>
+          </svg>
+        </span>
+        <input
+          id="search-input"
+          class="store-search-input"
+          type="search"
+          placeholder="Search"
+          autocomplete="off"
+        >
+      </label>
+
+      <nav class="store-nav" aria-label="Apps">
+        <button
+          type="button"
+          class="store-nav-item selected"
+          data-destination="discover"
+          aria-current="page"
+        >
+          <span class="store-nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
             </svg>
-            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="12" cy="12" r="4"></circle>
-              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+          </span>
+          <span class="store-nav-label-text">Discover</span>
+        </button>
+        <button type="button" class="store-nav-item" data-destination="installed">
+          <span class="store-nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
             </svg>
-          </button>
-          <label class="search-container">
-            <span class="search-icon-wrapper">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                <circle cx="11" cy="11" r="8"></circle>
-                <path d="m21 21-4.35-4.35"></path>
-              </svg>
-            </span>
-            <input id="search-input" class="search-input" type="search" placeholder="Search apps..." autocomplete="off">
-          </label>
-        </div>
-      </div>
-      <nav class="tabs" aria-label="Marketplace tabs">
-        <button class="tab active" type="button" data-tab="discover">Discover</button>
-        <button class="tab" type="button" data-tab="installed">Installed <span id="installed-badge" class="badge count hidden">0</span></button>
+          </span>
+          <span class="store-nav-label-text">Installed</span>
+          <span id="installed-badge" class="store-nav-badge hidden">0</span>
+        </button>
       </nav>
-    </header>
 
-    <div class="content-wrapper">
-      <aside class="sidebar" aria-label="Categories">
-        <div class="sidebar-title">Categories</div>
-        <nav id="category-list" class="category-list"></nav>
-      </aside>
+      <div class="store-nav-section-label">Categories</div>
+      <nav id="category-list" class="store-nav store-nav-categories" aria-label="Categories"></nav>
+    </aside>
 
-      <main class="main-content">
-        <section id="loading-state" class="loading-container">
-          <div class="spinner" aria-label="Loading"></div>
-        </section>
-
-        <section id="discover-content" class="tab-content active hidden">
-          <section id="all-apps-section" class="section">
-            <div class="section-header">
-              <h2 id="all-apps-title" class="section-title">All</h2>
-            </div>
-            <div id="apps-grid" class="apps-grid"></div>
-          </section>
-        </section>
-
-        <section id="installed-content" class="tab-content hidden">
-          <h2 class="section-title installed-heading">Installed Apps</h2>
-          <div id="installed-list" class="installed-list"></div>
-        </section>
-      </main>
-    </div>
+    <main id="store-main" class="store-main">
+      <h1 id="store-title" class="store-title">Discover</h1>
+      <section id="loading-state" class="store-loading" aria-label="Loading"></section>
+      <section id="load-error" class="store-error hidden" aria-live="polite"></section>
+      <div id="store-sections" class="store-sections"></div>
+    </main>
   </div>
 
   <div id="detail-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="App details">
-    <article id="detail-content" class="app-detail-modal"></article>
-  </div>
-
-  <div id="install-modal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Install status">
-    <article id="install-content" class="install-modal"></article>
+    <article id="detail-content" class="app-detail-modal" tabindex="-1"></article>
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
-  <script src="marketplace.js?v=marketplace-20260711f"></script>
+  <script src="marketplace.js?v=marketplace-20260819c"></script>
 </body>
 </html>

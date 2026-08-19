@@ -1,10 +1,7 @@
-/* Home Studio — Generate + Storyboard + Character via CREATIVE_* jobs.
-   Tip: home-20260814a — P2 Character refs + library delete */
+/* Home Studio — Generate via the model offer (runs.*).
+   Tip: home-20260814a — no retired Home /creative HTTP path */
 
-import { fetchJson, getHomeGuiLaunchToken } from "./shell-core.js?v=home-20260814a";
-import { modelRunCall as modelCall } from "./agent-live.js?v=home-20260814a";
-import { appendArtifactMessage } from "./agent-stream.js?v=home-20260814a";
-import { showViewerRail } from "./shell-viewer-rail.js?v=home-20260814a";
+import { modelRunCall as modelCall, fetchModelOffers } from "./agent-live.js?v=home-20260814a";
 
 const DURATIONS = [2, 3, 5, 10, 15, 30];
 const SCALES = [1, 2, 4];
@@ -23,12 +20,28 @@ let pendingVoice = null;
 /** @type {null | { default: number, options: Array<Record<string, unknown>> }} */
 let scaleCatalog = null;
 
-function creativeUrl(path) {
-  return new URL(path, window.location.href).href;
+const VIDEO_OFFER_ID = "offer:h3-video:2x";
+
+/** Contract-era Studio: readiness and runs go through the model offer.
+ * There is no Home /creative HTTP path on this branch. */
+
+function offerIdOf(offer) {
+  return String(offer?.offer_id || offer?.descriptor?.offer_id || "");
 }
 
-/** Contract-era Studio: all generation runs through the model contract
- * (runs.*). There is no legacy job path on this branch. */
+function videoOfferFrom(offers) {
+  const list = Array.isArray(offers?.offers) ? offers.offers : [];
+  return list.find((entry) => offerIdOf(entry) === VIDEO_OFFER_ID) || null;
+}
+
+async function requireVideoOffer() {
+  const offers = await fetchModelOffers({ force: true });
+  const offer = videoOfferFrom(offers);
+  if (!offer) {
+    throw new Error("Video is not offered on this Home. Open Settings to see what’s installed.");
+  }
+  return offer;
+}
 
 
 function creativeErrorMessage(err, fallback) {
@@ -367,52 +380,8 @@ function readFileAsDataUrl(file, { kind, maxBytes }) {
   });
 }
 
-async function loadVideo(jobId) {
-  const token = getHomeGuiLaunchToken();
-  if (!token) {
-    throw new Error("missing home launch token");
-  }
-  const response = await fetch(creativeUrl(`/api/apps/home/creative/jobs/${jobId}/video`), {
-    headers: { "x-elastos-home-token": token },
-  });
-  if (!response.ok) {
-    throw new Error(`video fetch failed (${response.status})`);
-  }
-  const buf = await response.arrayBuffer();
-  /* Force MIME — opaque sandbox + wrong blob type = blank <video> while QuickLook works. */
-  const blob = new Blob([buf], { type: "video/mp4" });
-  clearVideo();
-  videoObjectUrl = URL.createObjectURL(blob);
-  const video = panelEl()?.querySelector("[data-studio-video]");
-  const dl = panelEl()?.querySelector("[data-studio-download]");
-  if (video) {
-    video.preload = "auto";
-    video.controls = true;
-    video.playsInline = true;
-    video.src = videoObjectUrl;
-    /* The side panel is the player now — keep this element as a hidden buffer
-       (it holds the blob URL) but never surface it inline above the list. */
-    video.hidden = true;
-    const paint = () => {
-      try {
-        if (video.readyState >= 1 && Number.isFinite(video.duration) && video.duration > 0.05) {
-          video.currentTime = Math.min(0.12, video.duration * 0.05);
-        }
-      } catch {
-        /* seek optional */
-      }
-    };
-    video.addEventListener("loadeddata", paint, { once: true });
-    video.addEventListener("loadedmetadata", paint, { once: true });
-    video.load();
-  }
-  if (dl) {
-    dl.href = videoObjectUrl;
-    dl.download = `studio-${jobId.slice(0, 8)}.mp4`;
-    /* Keep the inline "Save clip" link hidden — Save is a hover action on the
-       clip row now. */
-    dl.hidden = true;
-  }
+async function loadVideo(_jobId) {
+  throw new Error("This Home finished the clip. Playing it back is not offered yet.");
 }
 
 function stopPoll() {
@@ -460,64 +429,10 @@ function sleep(ms) {
 }
 
 async function ensurePrepared(mode) {
-  const initial = await fetchJson(creativeUrl("/api/apps/home/creative/status"));
-  const readyNow =
-    mode === "character"
-      ? Boolean(initial?.character?.upstream_reachable)
-      : Boolean(initial?.generate?.upstream_reachable);
-  if (readyNow) {
-    return;
+  if (mode === "character") {
+    throw new Error("Character runs as a model offer in a later phase.");
   }
-  if (!initial?.allocator?.configured) {
-    throw new Error(
-      mode === "character"
-        ? "Character offline — prepare not configured (CREATIVE_PREPARE_CMD)"
-        : "Generate offline — prepare not configured (CREATIVE_PREPARE_CMD)",
-    );
-  }
-
-  const alloc0 = initial?.allocator;
-  if (alloc0?.status !== "preparing") {
-    await fetchJson(creativeUrl("/api/apps/home/creative/prepare"), {
-      method: "POST",
-      body: JSON.stringify({ target: mode }),
-    });
-  }
-
-  setStatus(
-    mode === "character"
-      ? "Preparing 1× Character on the configured backend… (can take several minutes)"
-      : "Preparing 2× Generate on the configured backend… (can take several minutes)",
-    "busy",
-  );
-  setProgress(5, "Preparing", "allocator");
-
-  const deadline = Date.now() + 20 * 60 * 1000;
-  while (Date.now() < deadline) {
-    await sleep(3000);
-    const status = await fetchJson(creativeUrl("/api/apps/home/creative/status"));
-    const alloc = status?.allocator || {};
-    setProgress(
-      alloc.percent ?? 10,
-      alloc.phase || "Preparing",
-      alloc.message || `${alloc.elapsed_s ?? 0}s`,
-    );
-    const up =
-      mode === "character"
-        ? Boolean(status?.character?.upstream_reachable)
-        : Boolean(status?.generate?.upstream_reachable);
-    if (up || alloc.status === "ready") {
-      setStatus(
-        mode === "character" ? "Character ready — locking…" : "Generate ready — starting…",
-        "busy",
-      );
-      return;
-    }
-    if (alloc.status === "error") {
-      throw new Error(alloc.error || alloc.message || "Prepare failed");
-    }
-  }
-  throw new Error("Prepare timed out — check the configured video backend");
+  await requireVideoOffer();
 }
 
 /** Run lifecycle via the model contract (runs.*). */
@@ -571,7 +486,7 @@ async function startJobViaContract(payload) {
   let created;
   try {
     created = await modelCall("runs_create", {
-      offer_id: "offer:h3-video:2x",
+      offer_id: VIDEO_OFFER_ID,
       operation: "generate",
       inputs: {
         prompt: payload.prompt,
@@ -599,20 +514,13 @@ async function startJobViaContract(payload) {
     const { artifactId } = await waitForRun(runId);
     activeJobId = null;
     setBusy(false);
-    setStatus("Done — clip ready on this Home. (contract)", "ok");
+    setStatus(
+      artifactId
+        ? "Done — clip finished on this Home. Playing it back is not offered yet."
+        : "Done — run finished on this Home.",
+      "ok",
+    );
     setProgress(100, "Done", "");
-    if (artifactId) {
-      await loadVideo(artifactId);
-      /* File a clickable artifact card into the active chat (the Studio player
-         already shows the clip, so we don't yank the rail open here). */
-      try {
-        const artifact = clipArtifact(artifactId, payload?.prompt, payload?.duration);
-        const promptText = String(payload?.prompt || "").trim();
-        appendArtifactMessage(promptText ? `Clip — ${promptText}` : "Clip on this Home.", artifact);
-      } catch {
-        /* chat card is best-effort */
-      }
-    }
     refreshLibrary();
   } catch (err) {
     activeJobId = null;
@@ -626,71 +534,13 @@ async function startJob(payload) {
   return startJobViaContract(payload);
 }
 
-/** Storyboard: one contract run per shot → POST /creative/stitch. */
-async function startStoryboardJobs({ shots, duration }) {
+/** Storyboard shots can run as video offers. Joining them is not offered yet. */
+async function startStoryboardJobs() {
   stopPoll();
   clearVideo();
-  setBusy(true);
-  const total = shots.length;
-
-  try {
-    await ensurePrepared("generate");
-  } catch (err) {
-    setBusy(false);
-    hideProgress();
-    setStatus(creativeErrorMessage(err, "Could not prepare Studio"), "error");
-    return;
-  }
-
-  const ids = [];
-  try {
-    for (let i = 0; i < total; i++) {
-      const prompt = composeShotPrompt(shots[i], i, total);
-      setStatus(`Storyboard shot ${i + 1}/${total}…`, "busy");
-      setProgress((i / total) * 85, "Generating", `shot ${i + 1}/${total}`);
-      const created = await modelCall("runs_create", {
-        offer_id: "offer:h3-video:2x",
-        operation: "generate",
-        inputs: {
-          prompt,
-          duration_seconds: duration,
-        },
-      });
-      const runId = String(created?.run_id || "");
-      if (!runId) {
-        throw new Error("Contract returned no run id");
-      }
-      activeJobId = runId;
-      const { artifactId } = await waitForRun(runId);
-      if (!artifactId) {
-        throw new Error(`Shot ${i + 1} finished without an artifact`);
-      }
-      ids.push(artifactId);
-    }
-    activeJobId = null;
-    setStatus(`Stitching ${ids.length} shots…`, "busy");
-    setProgress(92, "Stitching", "ffmpeg");
-    const stitched = await fetchJson(creativeUrl("/api/apps/home/creative/stitch"), {
-      method: "POST",
-      /* Raw shot lines ride along → stored on the stitch sidecar, so the
-         finished video keeps its readable provenance (prompt drop-down). */
-      body: JSON.stringify({ job_ids: ids, shots }),
-    });
-    const stitchId = String(stitched?.id || "");
-    if (!stitchId) {
-      throw new Error("Stitch returned no job id");
-    }
-    setBusy(false);
-    setStatus("Done — storyboard stitched on this Home.", "ok");
-    setProgress(100, "Done", `${ids.length} shots`);
-    await loadVideo(stitchId);
-    refreshLibrary();
-  } catch (err) {
-    activeJobId = null;
-    setBusy(false);
-    hideProgress();
-    setStatus(creativeErrorMessage(err, "Storyboard failed"), "error");
-  }
+  setBusy(false);
+  hideProgress();
+  setStatus("Joining shots is not offered on this Home yet. Generate one clip at a time.", "error");
 }
 
 async function refreshCreativeStatus() {
@@ -699,33 +549,24 @@ async function refreshCreativeStatus() {
     return;
   }
   try {
-    const status = await fetchJson(creativeUrl("/api/apps/home/creative/status"));
-    const profile = status?.profile || "unknown";
-    scaleCatalog = status?.scale || null;
-    const genUp = Boolean(status?.generate?.upstream_reachable);
-    const genWired = Boolean(status?.generate?.wired);
-    const gen = genUp ? "Generate ready" : genWired ? "Generate offline" : "Generate not wired";
-    const charWired = Boolean(status?.character?.wired);
-    const charUp = Boolean(status?.character?.upstream_reachable);
-    let char = "Character not wired";
-    if (charWired && charUp) {
-      char = "Character / Ref2VA ready";
-    } else if (charWired) {
-      char = "Character wired · Comfy down (park 2× first)";
+    const offers = await fetchModelOffers({ force: true });
+    const video = videoOfferFrom(offers);
+    if (video) {
+      scaleCatalog = {
+        default: 2,
+        options: [{ n: 2, generate: { wired: true, reachable: true } }],
+      };
+      el.textContent = "Video ready on this Home · 2×";
+      el.dataset.state = "ready";
+    } else {
+      scaleCatalog = null;
+      el.textContent = "Video is not offered on this Home. Open Settings to see what’s installed.";
+      el.dataset.state = "offline";
     }
-    const def = Number(status?.scale?.default) || 2;
-    const alloc = status?.allocator;
-    let allocNote = "";
-    if (alloc?.status === "preparing") {
-      allocNote = ` · preparing ${alloc.target || ""}`.trimEnd();
-    } else if (alloc?.configured) {
-      allocNote = " · allocator on";
-    }
-    el.textContent = `${profile} · default ${def}× · ${gen} · ${char}${allocNote}`;
-    el.dataset.state = genUp || charUp || alloc?.status === "preparing" ? "ready" : "offline";
     syncScaleUi();
   } catch (err) {
-    el.textContent = err?.message || "Creative status unavailable";
+    scaleCatalog = null;
+    el.textContent = err?.message || "Could not check video on this Home";
     el.dataset.state = "offline";
   }
 }
@@ -816,89 +657,16 @@ async function openLibraryClip(jobId) {
   }
 }
 
-/* Build the canonical artifact object for a clip. */
-function clipArtifact(jobId, prompt, duration) {
-  const promptText = String(prompt || "").trim();
-  return {
-    id: String(jobId),
-    kind: "video",
-    title: promptText ? `Clip · ${duration || 5}s` : "Video clip",
-    subtitle: promptText || "Generated clip",
-    mediaUrl: creativeUrl(`/api/apps/home/creative/jobs/${jobId}/video`),
-    mediaType: "video",
-  };
+function openClipInViewer() {
+  setStatus("Playing a clip is not offered on this Home yet.", "error");
 }
 
-/* "→" on a library row: open the clip in the side panel right now (the feedback
-   the user expects), AND file a card into the active chat so it's saved. */
-function openClipInViewer(jobId, prompt, duration) {
-  const artifact = clipArtifact(jobId, prompt, duration);
-  /* Open the side panel immediately — this is the visible result of the click. */
-  try {
-    showViewerRail({
-      mediaUrl: artifact.mediaUrl,
-      mediaType: "video",
-      title: artifact.title,
-      kind: "video",
-    });
-  } catch {
-    /* rail open is best-effort */
-  }
-  /* Also drop a card into the chat so the clip is a first-class saved result. */
-  try {
-    const promptText = String(prompt || "").trim();
-    appendArtifactMessage(promptText ? `Clip — ${promptText}` : "Clip on this Home.", artifact);
-  } catch {
-    /* chat card is best-effort */
-  }
+async function saveClipToDisk() {
+  setStatus("Saving a clip is not offered on this Home yet.", "error");
 }
 
-/* Save the clip to disk (Downloads) — fetches the bytes and triggers a save. */
-async function saveClipToDisk(jobId) {
-  try {
-    const token = getHomeGuiLaunchToken();
-    const response = await fetch(creativeUrl(`/api/apps/home/creative/jobs/${jobId}/video`), {
-      headers: token ? { "x-elastos-home-token": token } : {},
-    });
-    if (!response.ok) {
-      throw new Error(`fetch failed (${response.status})`);
-    }
-    const buf = await response.arrayBuffer();
-    const url = URL.createObjectURL(new Blob([buf], { type: "video/mp4" }));
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `clip-${jobId.slice(0, 8)}.mp4`;
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-    setStatus("Clip saved.", "ok");
-  } catch (err) {
-    setStatus(creativeErrorMessage(err, "Could not save clip"), "error");
-  }
-}
-
-async function deleteLibraryClip(jobId) {
-  if (!jobId || activeJobId) {
-    return;
-  }
-  if (!window.confirm("Remove this clip from this Home?")) {
-    return;
-  }
-  try {
-    await fetchJson(creativeUrl(`/api/apps/home/creative/jobs/${jobId}`), {
-      method: "DELETE",
-    });
-    const video = panelEl()?.querySelector("[data-studio-video]");
-    const dl = panelEl()?.querySelector("[data-studio-download]");
-    if (video?.src && String(dl?.download || "").includes(jobId.slice(0, 8))) {
-      clearVideo();
-    }
-    setStatus("Clip removed from this Home.", "ok");
-    await refreshLibrary();
-  } catch (err) {
-    setStatus(creativeErrorMessage(err, "Could not remove clip"), "error");
-  }
+async function deleteLibraryClip() {
+  setStatus("Removing a clip is not offered on this Home yet.", "error");
 }
 
 async function refreshLibrary() {
@@ -908,165 +676,10 @@ async function refreshLibrary() {
   if (!list || !empty) {
     return;
   }
-  try {
-    const data = await fetchJson(creativeUrl("/api/apps/home/creative/jobs"));
-    const jobs = Array.isArray(data?.jobs) ? data.jobs : [];
-    const playable = jobs.filter((j) => j?.has_video !== false && String(j?.status) === "done");
-    list.replaceChildren();
-    if (!playable.length) {
-      empty.hidden = false;
-      empty.textContent = "No clips yet — Generate one above.";
-      return;
-    }
-    empty.hidden = true;
-    for (const job of playable) {
-      const id = String(job.id || "");
-      if (!id) {
-        continue;
-      }
-      const row = document.createElement("div");
-      row.className = "agent-studio-library-row";
-      /* Card body: the visible chip + hover icons. Prompt expand lives outside
-         this so absolute-positioned actions stay inside the chip, not under it. */
-      const main = document.createElement("div");
-      main.className = "agent-studio-library-main";
-      /* Main zone: click → open the clip in the side panel (the player lives
-         there now — no big inline preview above the list). */
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "agent-studio-library-item";
-      btn.dataset.studioLibraryItem = "";
-      btn.dataset.jobId = id;
-      const prompt = document.createElement("span");
-      prompt.className = "agent-studio-library-prompt";
-      prompt.textContent = libraryPromptPreview(job);
-      const meta = document.createElement("span");
-      meta.className = "agent-studio-library-meta";
-      const mode = String(job.mode || "generate");
-      const scale =
-        job.scale != null && Number(job.scale) > 0 ? `${job.scale}×` : "";
-      const when = formatLibraryWhen(job.mtime_ms);
-      const size = formatLibraryBytes(job.bytes);
-      meta.textContent = [mode, scale, when, size].filter(Boolean).join(" · ");
-      btn.append(prompt, meta);
-      btn.addEventListener("click", () => {
-        openClipInViewer(id, job.prompt, job.duration_seconds ?? job.duration);
-      });
-
-      /* Hover actions: Prompt · Save · Delete. */
-      const actions = document.createElement("span");
-      actions.className = "agent-studio-library-actions";
-
-      /* Prompt drop-down: every skill surfaces whatever provenance the asset
-         carries. Storyboard stitches prefer the numbered shot list (from the
-         sidecar, or rebuilt from source clips by the list API); everything
-         else shows the exact generation prompt. */
-      const shots = Array.isArray(job.shots)
-        ? job.shots.map((s) => String(s || "").trim()).filter(Boolean)
-        : [];
-      const fullPrompt = String(job.prompt || "").trim();
-      const promptDisplay = shots.length
-        ? shots.map((s, i) => `${i + 1}. ${s}`).join("\n")
-        : fullPrompt;
-      let promptBtn = null;
-      let promptPanel = null;
-      if (promptDisplay) {
-        promptBtn = document.createElement("button");
-        promptBtn.type = "button";
-        promptBtn.className = "agent-studio-library-action";
-        promptBtn.dataset.studioPromptToggle = "";
-        promptBtn.title = shots.length ? "Show shot list" : "Show prompt";
-        promptBtn.setAttribute(
-          "aria-label",
-          shots.length
-            ? `Show shot list for clip ${id.slice(0, 8)}`
-            : `Show prompt for clip ${id.slice(0, 8)}`,
-        );
-        promptBtn.innerHTML =
-          '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.75 4.25h10.5M2.75 8h10.5M2.75 11.75h6.5"/></svg>';
-
-        promptPanel = document.createElement("div");
-        promptPanel.className = "agent-studio-library-prompt-full";
-        const promptInner = document.createElement("div");
-        promptInner.className = "agent-studio-library-prompt-inner";
-        const promptText = document.createElement("p");
-        promptText.textContent = promptDisplay;
-        const copyBtn = document.createElement("button");
-        copyBtn.type = "button";
-        copyBtn.className = "agent-studio-library-prompt-copy";
-        copyBtn.textContent = "Copy";
-        copyBtn.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          navigator.clipboard?.writeText(promptDisplay).then(() => {
-            copyBtn.textContent = "Copied";
-            window.setTimeout(() => {
-              copyBtn.textContent = "Copy";
-            }, 1500);
-          }).catch(() => {});
-        });
-        promptInner.append(promptText, copyBtn);
-        promptPanel.append(promptInner);
-
-        promptBtn.setAttribute("aria-expanded", "false");
-        promptBtn.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          const opening = !promptPanel.classList.contains("open");
-          list.querySelectorAll(".agent-studio-library-prompt-full.open").forEach((p) => {
-            p.classList.remove("open");
-          });
-          list.querySelectorAll("[data-studio-prompt-toggle][aria-expanded='true']").forEach((b) => {
-            b.setAttribute("aria-expanded", "false");
-          });
-          if (opening) {
-            promptPanel.classList.add("open");
-            promptBtn.setAttribute("aria-expanded", "true");
-          }
-        });
-      }
-
-      const save = document.createElement("button");
-      save.type = "button";
-      save.className = "agent-studio-library-action";
-      save.title = "Save clip";
-      save.setAttribute("aria-label", `Save clip ${id.slice(0, 8)}`);
-      save.innerHTML =
-        '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v8M4.75 7.25 8 10.5l3.25-3.25M2.75 13.5h10.5"/></svg>';
-      save.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        saveClipToDisk(id);
-      });
-
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "agent-studio-library-action agent-studio-library-action-danger";
-      remove.title = "Delete clip";
-      remove.setAttribute("aria-label", `Remove clip ${id.slice(0, 8)}`);
-      remove.innerHTML =
-        '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M6.5 4V2.75h3V4M3.5 4l.7 9.5h7.6l.7-9.5"/></svg>';
-      remove.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        deleteLibraryClip(id);
-      });
-
-      if (promptBtn) {
-        actions.append(promptBtn);
-      }
-      actions.append(save, remove);
-      main.append(btn, actions);
-      row.append(main);
-      if (promptPanel) {
-        row.append(promptPanel);
-      }
-      list.append(row);
-    }
-  } catch (err) {
-    empty.hidden = false;
-    empty.textContent = creativeErrorMessage(err, "Could not load clip library");
-  }
+  list.replaceChildren();
+  empty.hidden = false;
+  empty.textContent =
+    "This Home cannot list clips yet. You can still Generate when video is ready above.";
 }
 
 export function bindAgentStudio() {

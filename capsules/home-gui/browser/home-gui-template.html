@@ -179,6 +179,26 @@
   inert
   hidden
 >
+  <div
+    id="control-centre-quick-open"
+    class="control-centre-section control-centre-quick-open"
+    aria-label="Quick open"
+  >
+    <div class="control-centre-label">Quick open</div>
+    <button id="control-centre-spotlight" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Spotlight</span>
+      <span class="control-centre-row-detail">›</span>
+    </button>
+    <button id="control-centre-inbox" class="control-centre-row" type="button">
+      <span class="control-centre-row-label">Inbox</span>
+      <span id="control-centre-inbox-detail" class="control-centre-row-detail">Open</span>
+    </button>
+    <button id="control-centre-quick-wallet" class="control-centre-row" type="button" hidden>
+      <span class="control-centre-row-label">Wallet</span>
+      <span id="control-centre-quick-wallet-detail" class="control-centre-row-detail">Open</span>
+    </button>
+  </div>
+  <div class="control-centre-divider control-centre-quick-open" role="separator"></div>
   <div class="control-centre-section" role="radiogroup" aria-label="Appearance">
     <div class="control-centre-label">Appearance</div>
     <div id="control-centre-theme" class="control-centre-segment">
@@ -274,6 +294,220 @@
     </button>
   </div>
 </aside>
+
+<aside
+  id="wallet-rail"
+  class="wallet-rail"
+  role="complementary"
+  aria-label="Wallet"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="wallet-rail-head">
+    <h2 class="wallet-rail-title">Wallet</h2>
+    <div class="wallet-rail-head-actions">
+      <!-- Chrome only — clicks post into the Wallet frame; authority stays in-capsule. -->
+      <button
+        id="wallet-rail-approvals"
+        class="wallet-rail-head-btn wallet-rail-text-btn"
+        type="button"
+        aria-label="Activity"
+        title="Activity"
+      >
+        <svg class="wallet-rail-icon-svg" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3.25" y="2.5" width="9.5" height="11" rx="1.5" />
+          <path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" />
+        </svg>
+        <span>Activity</span>
+        <span id="wallet-rail-approvals-badge" class="wallet-rail-badge" hidden></span>
+      </button>
+      <button
+        id="wallet-rail-settings"
+        class="wallet-rail-head-btn wallet-rail-icon-btn"
+        type="button"
+        aria-label="Settings"
+        title="Settings"
+      >
+        <svg class="wallet-rail-icon-svg" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+        </svg>
+      </button>
+      <button
+        id="wallet-rail-privacy"
+        class="wallet-rail-head-btn wallet-rail-icon-btn"
+        type="button"
+        aria-label="Hide balances"
+        aria-pressed="false"
+        title="Hide balances"
+      >
+        <svg class="wallet-rail-icon-svg" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1.75 8s2.5-3.75 6.25-3.75S14.25 8 14.25 8s-2.5 3.75-6.25 3.75S1.75 8 1.75 8Z" />
+          <circle cx="8" cy="8" r="1.75" />
+        </svg>
+      </button>
+      <button
+        id="wallet-rail-open-window"
+        class="wallet-rail-head-btn wallet-rail-text-btn"
+        type="button"
+        aria-label="Open as a window"
+        title="Open as a window"
+      >
+        Open
+      </button>
+      <button
+        id="wallet-rail-close"
+        class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"
+        type="button"
+        aria-label="Close wallet"
+      >
+        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+      </button>
+    </div>
+  </div>
+  <iframe id="wallet-rail-frame" class="wallet-rail-frame" title="Wallet" hidden></iframe>
+  <div id="wallet-rail-error" class="wallet-rail-error" hidden>
+    <h3 class="wallet-rail-error-title">Could not open Wallet</h3>
+    <p class="wallet-rail-error-copy">
+      Home asked the runtime to open Wallet, but the launch did not complete. It may be
+      momentary — trying again is safe.
+    </p>
+    <p id="wallet-rail-error-detail" class="wallet-rail-error-detail"></p>
+    <button id="wallet-rail-retry" class="window-error-retry" type="button">Try Again</button>
+  </div>
+</aside>
+
+<aside
+  id="inbox-rail"
+  class="wallet-rail inbox-rail"
+  role="complementary"
+  aria-label="Inbox"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="wallet-rail-head">
+    <h2 class="wallet-rail-title">Inbox</h2>
+    <div class="wallet-rail-head-actions">
+      <button
+        id="inbox-rail-refresh"
+        class="wallet-rail-head-btn wallet-rail-icon-btn"
+        type="button"
+        aria-label="Refresh inbox"
+        title="Refresh"
+      >
+        <svg class="wallet-rail-icon-svg" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+          <path d="M21 3v6h-6" />
+        </svg>
+      </button>
+      <button
+        id="inbox-rail-open-window"
+        class="wallet-rail-head-btn wallet-rail-text-btn"
+        type="button"
+        aria-label="Open as a window"
+        title="Open as a window"
+      >
+        Open
+      </button>
+      <button
+        id="inbox-rail-close"
+        class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"
+        type="button"
+        aria-label="Close inbox"
+      >
+        <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+      </button>
+    </div>
+  </div>
+  <iframe id="inbox-rail-frame" class="wallet-rail-frame" title="Inbox" hidden></iframe>
+  <div id="inbox-rail-error" class="wallet-rail-error" hidden>
+    <h3 class="wallet-rail-error-title">Could not open Inbox</h3>
+    <p class="wallet-rail-error-copy">
+      Home asked the runtime to open Inbox, but the launch did not complete. It may be
+      momentary — trying again is safe.
+    </p>
+    <p id="inbox-rail-error-detail" class="wallet-rail-error-detail"></p>
+    <button id="inbox-rail-retry" class="window-error-retry" type="button">Try Again</button>
+  </div>
+</aside>
+
+<aside
+  id="connector-sheet"
+  class="connector-sheet"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="connector-sheet-title"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="connector-sheet-head">
+    <h2 id="connector-sheet-title" class="connector-sheet-title">Connect wallet</h2>
+    <button
+      id="connector-sheet-close"
+      class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"
+      type="button"
+      aria-label="Close connector"
+    >
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+  </div>
+  <iframe id="connector-sheet-frame" class="connector-sheet-frame" title="Wallet connector" hidden></iframe>
+</aside>
+
+<section
+  id="setup-sheet"
+  class="setup-sheet"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="setup-sheet-title"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="setup-sheet-card">
+    <button
+      id="setup-sheet-close"
+      class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"
+      type="button"
+      aria-label="Close setup"
+    >
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+    <h2 id="setup-sheet-title" class="setup-sheet-title">Finish setting up Home</h2>
+    <p id="setup-sheet-lead" class="setup-sheet-lead">
+      Chat and People need a Recovery Kit and a signed Profile. Stay here until both are done.
+    </p>
+    <ol class="setup-sheet-steps">
+      <li class="setup-sheet-step">
+        <span class="setup-sheet-step-index" aria-hidden="true">1</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Download Recovery Kit</h3>
+          <p class="setup-sheet-step-body">Save a Recovery Kit from Security so you can get back into this Home.</p>
+        </div>
+        <button id="setup-sheet-recovery" class="el-button el-button-primary" type="button">
+          Open Security
+        </button>
+      </li>
+      <li class="setup-sheet-step">
+        <span class="setup-sheet-step-index" aria-hidden="true">2</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Create your Profile</h3>
+          <p class="setup-sheet-step-body">Choose the name people see. Home signs it after Recovery is in place.</p>
+        </div>
+        <button id="setup-sheet-profile" class="el-button" type="button">
+          Open People
+        </button>
+      </li>
+    </ol>
+  </div>
+</section>
 
 <main class="desktop-workspace" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
@@ -749,10 +983,10 @@
 
           <div data-configure-panel="tools" hidden>
             <ul class="agent-tools-list agent-tools-list-manage" data-page-tools></ul>
-            <button type="button" class="agent-tools-demo" data-tools-demo-grant>
-              Demo Library grant card
+            <button type="button" class="agent-tools-demo" data-tools-manage="library.read">
+              Request Library access
             </button>
-            <p class="agent-harness-page-foot">Preview · Inbox grammar · UI ≠ authority</p>
+            <p class="agent-harness-page-foot">Inbox · UI ≠ authority</p>
           </div>
 
           <div data-configure-panel="runtime" hidden>
@@ -782,7 +1016,7 @@
         <div class="agent-harness-page-section" data-page-section="studio" hidden>
           <div class="agent-studio" data-studio-page>
             <p class="agent-studio-profile" data-studio-profile data-state="offline">
-              Checking creative backend…
+              Checking video on this Home…
             </p>
             <form class="agent-studio-form" data-studio-form method="post" action="#" onsubmit="return false;">
               <div class="agent-studio-row">
@@ -1386,6 +1620,133 @@
 
 
 <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
+
+<aside id="spotlight" class="spotlight" aria-hidden="true" inert hidden>
+  <div class="spotlight-panel" role="dialog" aria-modal="true" aria-label="Search">
+    <div class="spotlight-bar">
+      <input
+        id="spotlight-input"
+        class="spotlight-field"
+        type="search"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Search"
+        role="combobox"
+        aria-expanded="false"
+        aria-controls="spotlight-results"
+        aria-activedescendant=""
+        aria-label="Search"
+      />
+    </div>
+    <div
+      id="spotlight-results"
+      class="spotlight-results hide-scrollbar"
+      role="listbox"
+      aria-label="Search results"
+      hidden
+    ></div>
+  </div>
+</aside>
+
+<div id="window-switcher" class="window-switcher" aria-hidden="true" inert hidden>
+  <div
+    id="window-switcher-list"
+    class="window-switcher-list"
+    role="listbox"
+    aria-label="Open windows"
+  ></div>
+</div>
+
+<aside
+  id="quick-look"
+  class="quick-look"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Peek"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="quick-look-panel">
+    <header class="quick-look-head">
+      <div class="quick-look-head-copy">
+        <h2 id="quick-look-title" class="quick-look-title">Preview</h2>
+        <p id="quick-look-meta" class="quick-look-meta"></p>
+      </div>
+      <div class="quick-look-actions">
+        <button id="quick-look-open" class="quick-look-open" type="button">Open</button>
+        <button id="quick-look-close" class="quick-look-close" type="button" aria-label="Close Peek">
+          <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+        </button>
+      </div>
+    </header>
+    <div id="quick-look-stage" class="quick-look-stage"></div>
+  </div>
+</aside>
+
+<section
+  id="shortcuts-overlay"
+  class="shortcuts-overlay"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="shortcuts-card" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
+    <button id="shortcuts-close" class="launcher-close" type="button" aria-label="Close shortcuts">
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+    <h1 id="shortcuts-title" class="shortcuts-title">Keyboard shortcuts</h1>
+    <dl class="shortcuts-list">
+      <div class="shortcuts-row"><dt>Search (Find)</dt><dd><kbd>⌘</kbd><kbd>Space</kbd> or <kbd>Ctrl</kbd><kbd>Space</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Peek</dt><dd><kbd>Space</kbd> on a desktop icon</dd></div>
+      <div class="shortcuts-row"><dt>Overview</dt><dd><kbd>F3</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Switch Space</dt><dd><kbd>⌃←</kbd><kbd>⌃→</kbd> · left edge peek</dd></div>
+      <div class="shortcuts-row"><dt>Wallet</dt><dd>Right screen edge</dd></div>
+      <div class="shortcuts-row"><dt>Enter / Exit Fullscreen</dt><dd>Orange expand tool (left of title)</dd></div>
+      <div class="shortcuts-row"><dt>Exit Fullscreen</dt><dd>Middle window tool while fullscreen</dd></div>
+      <div class="shortcuts-row"><dt>Switch windows</dt><dd><kbd>Alt</kbd><kbd>Tab</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Cycle windows</dt><dd><kbd>⌘</kbd><kbd>`</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Close window</dt><dd><kbd>⌘</kbd><kbd>W</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Minimize window</dt><dd><kbd>⌘</kbd><kbd>M</kbd> or <kbd>Ctrl</kbd><kbd>M</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Snap window</dt><dd><kbd>⌘</kbd><kbd>⌥</kbd><kbd>←</kbd><kbd>→</kbd><kbd>↑</kbd><kbd>↓</kbd> or <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>arrows</kbd></dd></div>
+      <div class="shortcuts-row"><dt>Navigate desktop</dt><dd><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> then <kbd>Enter</kbd></dd></div>
+      <div class="shortcuts-row"><dt>App actions</dt><dd><kbd>Shift</kbd><kbd>F10</kbd> on an icon</dd></div>
+      <div class="shortcuts-row"><dt>This overlay</dt><dd><kbd>⌘</kbd><kbd>/</kbd></dd></div>
+    </dl>
+  </div>
+</section>
+
+<section
+  id="about-overlay"
+  class="about-overlay"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
+    <div class="about-traffic-lights window-traffic-lights">
+      <button
+        id="about-close"
+        class="window-action-btn"
+        data-action="close"
+        type="button"
+        aria-label="Close About ElastOS"
+      >
+        <img src="./close.svg" alt="" draggable="false" />
+      </button>
+    </div>
+    <img class="about-logo" src="./elastos-logo.svg" alt="" draggable="false" />
+    <h1 id="about-title" class="about-title">ElastOS</h1>
+    <p class="about-line">ElastOS desktop</p>
+    <p id="about-version" class="about-line about-version" hidden></p>
+    <p id="about-identity" class="about-line about-identity"></p>
+    <p id="about-update" class="about-line about-update" hidden></p>
+    <div class="about-actions">
+      <button id="about-more" class="about-more" type="button">More Info…</button>
+      <button id="about-software-update" class="about-more" type="button">Software Update…</button>
+    </div>
+  </div>
+</section>
 
 <section
   id="home-notification-toast"
