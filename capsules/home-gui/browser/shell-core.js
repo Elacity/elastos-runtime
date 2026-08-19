@@ -966,6 +966,17 @@ export function trapTabWithin(container, event) {
 }
 
 export function mountGlyph(container, targetId, forcedTone) {
+  if (!container) {
+    return;
+  }
+  /* Trash is shell-owned chrome (no capsule to declare an icon) — same
+     shell-local art precedent as the Apps launcher button. */
+  if (targetId === "trash" || targetId === "trash-full") {
+    container.dataset.tone = "raster";
+    container.dataset.icon = "bin";
+    container.innerHTML = "";
+    return;
+  }
   const tone = forcedTone || glyphTone(targetId);
   container.dataset.tone = tone;
   const capsuleIcon = capsuleIconMarkup(targetId);

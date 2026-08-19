@@ -3498,6 +3498,17 @@ body.dock-autohide::after {
   display: none;
 }
 
+.taskbar-item-icon[data-icon="bin"] {
+  background:
+    url("./icons/bin/icon-64.png?v=home-20260814a")
+      center / contain no-repeat;
+}
+
+.taskbar-item-icon[data-icon="bin"]::before {
+  content: none;
+  display: none;
+}
+
 /* Shelf running indicator — short capsule in the air under the tile (not glued,
    not sitting on the dock lip). Tracks the live system accent. */
 .active-taskbar-indicator {
