@@ -30,6 +30,7 @@ import {
   desktopSpaceLabel,
   desktopStageId,
   getActiveStageId,
+  isAgentSpace,
   isDesktopSpace,
   moveSpaceInRing,
   promoteWindowToFullscreenSpace,
@@ -158,7 +159,19 @@ function windowPlacementBounds(entry) {
 function paintSpacePreview(previewEl, spaceId) {
   previewEl.replaceChildren();
   previewEl.style.backgroundImage = "";
-  previewEl.classList.remove("mission-space-preview-desktop");
+  previewEl.classList.remove("mission-space-preview-desktop", "mission-space-preview-agent");
+  delete previewEl.dataset.liveThumb;
+  if (isAgentSpace(spaceId)) {
+    previewEl.classList.add("mission-space-preview-agent");
+    const mark = document.createElement("span");
+    mark.className = "mission-space-agent-mark";
+    mark.setAttribute("aria-hidden", "true");
+    const caption = document.createElement("span");
+    caption.className = "mission-space-agent-caption";
+    caption.textContent = "Agent";
+    previewEl.append(mark, caption);
+    return;
+  }
   if (isDesktopSpace(spaceId)) {
     previewEl.classList.add("mission-space-preview-desktop");
     const wallpaper =

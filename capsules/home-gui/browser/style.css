@@ -1799,6 +1799,61 @@ img {
   -webkit-user-select: none;
 }
 
+/* In-dock reorder: icon-sized ghost that rides above the Shelf. */
+.dock-reorder-ghost {
+  position: fixed;
+  z-index: 100160;
+  margin: 0;
+  padding: 0;
+  pointer-events: none;
+  border-radius: 14px;
+  overflow: visible;
+  filter: drop-shadow(0 12px 22px rgba(0, 0, 0, 0.38));
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dock-reorder-ghost .taskbar-icon {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+}
+
+.dock-reorder-spacer {
+  flex: 0 0 auto;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.taskbar-entry.dock-reorder-parked {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+  width: 0;
+  min-width: 0;
+  height: 0;
+  margin: 0;
+  overflow: hidden;
+  order: 0;
+}
+
+body.dock-reordering .taskbar-sortable {
+  /* Spacer + flex order do the nudge — drop plate would fight the live gap. */
+  background: transparent;
+  box-shadow: none;
+}
+
+body.dock-reordering .taskbar-entry:not(.dock-reorder-parked) {
+  transition: transform 160ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.dock-reordering .taskbar-entry:not(.dock-reorder-parked) {
+    transition: none;
+  }
+}
+
 /* Quick Look: frameless centered preview over the desktop. No dim overlay —
    same restraint as Spotlight; the panel's shadow does the separation. */
 .quick-look {
@@ -2508,6 +2563,38 @@ body.mission-reorder-space .mission-space-thumb:focus-visible .mission-space-pre
   background-color: #1a2332;
 }
 
+.mission-space-preview-agent {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background:
+    radial-gradient(
+      ellipse 80% 60% at 50% 28%,
+      color-mix(in srgb, var(--el-accent, #ff6a3d) 34%, transparent),
+      transparent 62%
+    ),
+    linear-gradient(165deg, #16161a 0%, #0e0e10 55%, #080809 100%);
+}
+
+.mission-space-agent-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background:
+    url("./icons/intelligence/icon-64.png?v=home-20260814a") center / 86% no-repeat,
+    color-mix(in srgb, var(--el-accent, #ff6a3d) 22%, #1a1a1c);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+
+.mission-space-agent-caption {
+  color: color-mix(in srgb, #fff 78%, transparent);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
 .mission-space-desk-windows {
   position: absolute;
   inset: 0;
@@ -3149,6 +3236,8 @@ body.dock-autohide::after {
   gap: 6px;
   min-width: 0;
   max-width: 100%;
+  /* Dock-mag icons must paint above the pill. */
+  overflow: visible;
 }
 
 /* Coarse-pointer Space pager (fine pointer uses left-edge peek). */
@@ -3285,6 +3374,13 @@ body.dock-autohide::after {
   max-width: 100%;
 }
 
+.taskbar-system {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 2px;
+}
+
 .taskbar-sortable {
   display: flex;
   align-items: center;
@@ -3307,6 +3403,12 @@ body.dock-autohide::after {
 .taskbar-sortable.drop-active {
   background: var(--lift);
   box-shadow: inset 0 0 0 1px var(--hairline);
+}
+
+/* Drag pinned icon into the running/Bin side — unpin (leave core). */
+.taskbar-sortable.drop-unpin-active {
+  background: color-mix(in srgb, var(--el-accent, #4f7fff) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--el-accent, #4f7fff) 45%, transparent);
 }
 
 .taskbar-item {
@@ -3598,19 +3700,25 @@ body.dock-autohide::after {
   display: none;
 }
 
-.launcher {
-  position: fixed;
+/* Apps launcher lives as a Shelf face (morph from dock). Not a floating overlay. */
+.shelf-face-launcher.launcher {
+  position: absolute;
   inset: 0;
-  z-index: 100110;
-  display: grid;
-  place-items: center;
-  padding: calc(56px + env(safe-area-inset-top, 0px)) 18px calc(88px + env(safe-area-inset-bottom, 0px));
-  /* Apps-panel surface (macOS style): the overlay only catches clicks; the
-     modal card below carries the one blurred material — no nested blurs. */
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
   background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
 }
 
-.launcher[hidden] {
+.shelf-face-launcher.launcher[hidden] {
   display: none;
 }
 
@@ -3961,38 +4069,345 @@ body.dragging-target {
   position: relative;
   display: flex;
   flex-direction: column;
-  width: min(680px, 100%);
-  /* Fixed panel size (macOS Apps panel): switching grid/list or filtering
-     changes what's inside, never the box itself. Sized so the icon grid
-     fills it (~4 ranks); longer content scrolls. */
-  height: min(64dvh, 512px);
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
   padding: 0;
   overflow: hidden;
   color: var(--text);
-  border-radius: 20px;
-  background: var(--menu-fill);
-  border: 0.5px solid var(--line);
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  animation: launcher-enter 160ms cubic-bezier(0.2, 0, 0, 1) both;
+  /* Material is the Shelf dock glass — panel itself is transparent. */
+  border-radius: inherit;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  animation: none;
 }
 
-@keyframes launcher-enter {
-  0% {
-    opacity: 0;
-    transform: scale(0.97) translateY(6px);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
+/*
+  Apps Shelf face — height grows up from the floor.
+  justify-content:flex-end is mandatory: default .taskbar align-items:center
+  would vertically center the dock mid-shrink (the jump-up bug).
+*/
+.taskbar.is-launcher-face,
+.taskbar.is-launcher-closing,
+.taskbar[data-launcher-morphing] {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-end;
+}
+
+.taskbar.is-launcher-face {
+  /* Pixel width set in JS (inline) so width can interpolate — CSS vars jump. */
+  width: var(--shelf-launcher-w, max-content);
+  max-width: calc(100vw - 20px);
+  height: min(64dvh, 512px);
+  min-height: min(64dvh, 512px);
+  max-height: min(64dvh, 512px);
+  /* Settled: visible so dock-mag can lift above the pill. */
+  overflow: visible;
+  left: 0;
+  right: 0;
+  margin-inline: auto;
+  /* Same horizontal padding as idle dock — padding FLIP was the side-nudge. */
+  padding-left: 14px;
+  padding-right: 14px;
+  border-radius: 20px;
+  background-color: var(--dock-fill);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+}
+
+/* Liquid dock width — keep in sync with DOCK_WIDTH_MS in shell-surface.js. */
+:root {
+  --dock-width-ms: 780ms;
+}
+
+.taskbar.is-launcher-face.is-launcher-width-easing,
+.taskbar.is-dock-width-easing {
+  transition: width var(--dock-width-ms) var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+}
+
+.launcher-fly-icon {
+  position: fixed;
+  z-index: 100200;
+  margin: 0;
+  padding: 0;
+  pointer-events: none;
+  border-radius: 14px;
+  transform: translate(0, 0) scale(1);
+  opacity: 1;
+  transition:
+    transform var(--dock-width-ms) var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    opacity var(--dock-width-ms) var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+  will-change: transform, opacity;
+  filter: drop-shadow(0 12px 22px rgba(0, 0, 0, 0.3));
+}
+
+/* Soft companion fly — fade in the dock slot owns the land. */
+.launcher-fly-icon.launcher-fly-icon-soft {
+  transition:
+    transform 520ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    opacity 520ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+}
+
+.launcher-card.is-flying-to-dock {
+  opacity: 0.2;
+  transform: scale(0.9);
+  filter: blur(2px);
+  transition:
+    opacity 280ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    transform 280ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    filter 280ms ease;
+  pointer-events: none;
+}
+
+/*
+  Reserved dock slot: invisible while width opens + Bin rides apart,
+  then fades/scales into the gap (is-dock-arrived).
+*/
+.taskbar-item.is-receiving-fly,
+.taskbar-item.is-dock-arriving {
+  opacity: 0 !important;
+  pointer-events: none;
+  transform: scale(0.86);
+  will-change: opacity, transform;
+}
+
+.taskbar-item.is-receiving-fly:not(.is-dock-arriving) {
+  transform: none;
+}
+
+/* Bin (+ divider) only — never FLIP the AI/Apps/pin strip. */
+.taskbar-entry[data-dock-bin="true"].is-dock-bin-sliding,
+.taskbar-separator[data-dock-bin-sep="true"].is-dock-bin-sliding {
+  will-change: transform;
+  z-index: 2;
+}
+
+/* Only the riding Bin — never kill mag transitions on the rest of the strip. */
+body.dock-bin-sliding .is-dock-bin-sliding .taskbar-icon {
+  transition: none !important;
+}
+
+.taskbar-item.is-dock-arriving.is-dock-arrived,
+.taskbar-item.is-receiving-fly.is-fly-landed {
+  opacity: 1 !important;
+  transform: scale(1);
+  transition:
+    opacity 360ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1)),
+    transform 420ms var(--shelf-morph-ease, cubic-bezier(0.42, 0, 0.58, 1));
+}
+
+.taskbar-item.is-receiving-fly .taskbar-icon,
+.taskbar-item.is-dock-arriving .taskbar-icon {
+  transform: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .launcher-popover {
-    animation: none;
+  .taskbar.is-launcher-face.is-launcher-width-easing,
+  .taskbar.is-dock-width-easing {
+    transition: none;
   }
+
+  .launcher-fly-icon,
+  .launcher-fly-icon.launcher-fly-icon-soft,
+  .launcher-card.is-flying-to-dock,
+  .taskbar-item.is-receiving-fly .taskbar-icon,
+  .taskbar-item.is-receiving-fly.is-fly-landed,
+  .taskbar-item.is-dock-arriving,
+  .taskbar-item.is-dock-arriving.is-dock-arrived,
+  .taskbar-entry[data-dock-bin="true"].is-dock-bin-sliding,
+  .taskbar-separator[data-dock-bin-sep="true"].is-dock-bin-sliding {
+    transition: none;
+  }
+}
+
+/* Clip only while height FLIPs — settled face stays overflow:visible for mag. */
+.taskbar.is-launcher-face[data-agent-morph="grow"],
+.taskbar.is-launcher-face[data-agent-morph="shrink"],
+.taskbar.is-launcher-face.is-launcher-closing,
+.taskbar[data-launcher-morphing] {
+  overflow: hidden;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="grow"]::after,
+.taskbar.is-launcher-face[data-agent-morph="shrink"]::after {
+  animation: shelf-liquid-sheen var(--shelf-morph-duration) var(--shelf-morph-ease) both;
+}
+
+.taskbar.is-launcher-face #space-pager {
+  display: none !important;
+}
+
+.taskbar.is-launcher-face .taskbar-inner,
+.taskbar.is-launcher-face .shelf-morph-stage,
+.taskbar[data-launcher-morphing] .taskbar-inner,
+.taskbar[data-launcher-morphing] .shelf-morph-stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  position: relative;
+  overflow: visible;
+}
+
+.taskbar.is-launcher-face .shelf-face-agent {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/*
+  Planted on the Shelf floor. Left-aligned so width growth opens on the Bin
+  side — AI/Apps/pins stay put (centering was sliding the whole strip).
+*/
+.taskbar.is-launcher-face .shelf-face-apps,
+.taskbar.is-launcher-closing .shelf-face-apps,
+.taskbar[data-launcher-morphing] .shelf-face-apps {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: auto;
+  z-index: 4;
+  width: 100%;
+  max-width: 100%;
+  height: var(--taskbar-h);
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  transform: none;
+  overflow: visible;
+  pointer-events: auto;
+  opacity: 1;
+  visibility: visible;
+  filter: none;
+  border-top: 0.5px solid color-mix(in srgb, var(--text) 10%, transparent);
+  box-sizing: border-box;
+}
+
+.taskbar.is-launcher-face .shelf-face-apps .taskbar-primary,
+.taskbar.is-launcher-face .shelf-face-apps .taskbar-sortable {
+  max-width: none;
+}
+
+.taskbar.is-launcher-face .shelf-face-apps .taskbar-primary {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.taskbar.is-launcher-face .shelf-face-launcher {
+  position: relative;
+  inset: auto;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  /* Clear the planted dock row so the grid never sits under icons. */
+  padding-bottom: var(--taskbar-h);
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/*
+  Close path: keep is-launcher-face + add this — collapses height to dock
+  while flex-end keeps icons on the floor for the whole FLIP (no mid jump).
+*/
+.taskbar.is-launcher-face.is-launcher-closing {
+  height: var(--taskbar-h);
+  min-height: var(--taskbar-h);
+  max-height: var(--taskbar-h);
+  border-radius: 22px;
+}
+
+.taskbar.is-launcher-face.is-launcher-closing .shelf-face-launcher {
+  display: none;
+}
+
+.taskbar.is-launcher-face.is-launcher-closing .shelf-face-apps {
+  border-top: 0;
+}
+
+/* Beat .is-launcher-face flex:1 so the dock row stays floor-sized while height FLIPs. */
+.taskbar.is-launcher-face.is-launcher-closing .taskbar-inner,
+.taskbar.is-launcher-face.is-launcher-closing .shelf-morph-stage {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+  width: 100%;
+  height: var(--taskbar-h);
+  min-height: var(--taskbar-h);
+  max-height: var(--taskbar-h);
+  overflow: hidden;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="grow"] .shelf-face-launcher {
+  pointer-events: none;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="grow"] .shelf-morph-enter,
+.taskbar.is-launcher-face[data-agent-morph="leave"] .shelf-morph-enter {
+  opacity: 0;
+  transform: translateY(12px) scale(0.97);
+  filter: blur(6px);
+  transition-delay: 0ms;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="enter"] .shelf-face-launcher,
+.taskbar.is-launcher-face:not([data-agent-morph]) .shelf-face-launcher {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="enter"] .shelf-morph-enter,
+.taskbar.is-launcher-face:not([data-agent-morph]) .shelf-morph-enter {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+}
+
+.taskbar.is-launcher-face[data-agent-morph="enter"] .shelf-morph-enter[data-morph-enter="0"] {
+  transition-delay: 0ms;
+  transition-duration: 320ms;
+}
+
+.taskbar.is-launcher-face[data-agent-morph="enter"] .shelf-morph-enter[data-morph-enter="1"] {
+  transition-delay: 70ms;
+  transition-duration: 360ms;
+}
+
+/*
+  Apps face: no dissolve/blur on the dock row — but DO allow transform so
+  dock magnification still works while expanded.
+*/
+.taskbar[data-launcher-morphing] .shelf-morph-exit,
+.taskbar.is-launcher-face .shelf-morph-exit,
+.taskbar.is-launcher-closing .shelf-morph-exit {
+  opacity: 1;
+  filter: none;
+  pointer-events: auto;
+}
+
+.taskbar[data-launcher-morphing] .shelf-morph-exit .taskbar-icon,
+.taskbar.is-launcher-closing .shelf-morph-exit .taskbar-icon {
+  /* Only kill morph chrome during the FLIP — never settled-face mag. */
+  filter: none;
+  animation: none !important;
+}
+
+/* Dock-width panels are often narrower than the old 680 popup — denser tiles. */
+.taskbar.is-launcher-face .launcher-group-grid {
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 8px 4px;
 }
 
 /* Header: borderless inline search (macOS Apps panel) with the view toggle
@@ -4695,6 +5110,94 @@ body.dragging-target {
   height: 100% !important;
 }
 
+/* Unified-sidebar chrome: split-view grammar. Traffic lights sit over the
+   leading column only (~220px) so Search/main stay clickable. Capsules pad
+   with --window-chrome-safe-top (fallback 52px). Fail closed: absent class
+   ⇒ standard titlebar.
+   Chat also matches on [data-target] so a stale Home module graph can't leave
+   a full dark titlebar cutting the People column (very visible in dark mode). */
+.window.window-chrome-unified-sidebar,
+.window[data-target="chat"],
+.window[data-target="chat-room"] {
+  --window-chrome-safe-top: 52px;
+  --window-chrome-sidebar-width: 220px;
+}
+
+/* Class is canonical. Chat data-target selectors are tip-lag defense only
+   (same geometry as unified-sidebar) — do not add new targets this way. */
+.window.window-chrome-unified-sidebar .window-head,
+.window[data-target="chat"] .window-head,
+.window[data-target="chat-room"] .window-head {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 6;
+  width: var(--window-chrome-sidebar-width, 220px);
+  height: 52px;
+  min-height: 52px;
+  margin-bottom: 0;
+  padding: 14px 10px 0 12px;
+  align-items: flex-start;
+  border-radius: 12px 0 0 0;
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+  filter: none;
+}
+
+.window.window-chrome-unified-sidebar.window-active .window-head,
+.window[data-target="chat"].window-active .window-head,
+.window[data-target="chat-room"].window-active .window-head {
+  filter: none;
+}
+
+.window.window-chrome-unified-sidebar .window-head-icon,
+.window.window-chrome-unified-sidebar .window-head-title,
+.window.window-chrome-unified-sidebar .window-head-balance,
+.window[data-target="chat"] .window-head-icon,
+.window[data-target="chat"] .window-head-title,
+.window[data-target="chat"] .window-head-balance,
+.window[data-target="chat-room"] .window-head-icon,
+.window[data-target="chat-room"] .window-head-title,
+.window[data-target="chat-room"] .window-head-balance {
+  display: none;
+}
+
+.window.window-chrome-unified-sidebar .window-head-draggable,
+.window[data-target="chat"] .window-head-draggable,
+.window[data-target="chat-room"] .window-head-draggable {
+  flex: 1 1 auto;
+  min-width: 48px;
+  min-height: 28px;
+  justify-content: flex-start;
+  align-self: stretch;
+}
+
+.window.window-chrome-unified-sidebar .window-body,
+.window[data-target="chat"] .window-body,
+.window[data-target="chat-room"] .window-body {
+  height: 100% !important;
+}
+
+/* Continuous must not paint a full black bar over Chat (dark-mode seam). */
+.window[data-target="chat"].window-chrome-continuous .window-head,
+.window[data-target="chat-room"].window-chrome-continuous .window-head {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+
+/* Match Apps left plate under lights before the iframe paints.
+   Theme tokens only — never hardcode a dark strip in light mode. */
+.window[data-target="chat"],
+.window[data-target="chat-room"] {
+  background: linear-gradient(
+    to right,
+    var(--panel-strong) 0 var(--window-chrome-sidebar-width, 220px),
+    var(--frame-fill) var(--window-chrome-sidebar-width, 220px) 100%
+  );
+}
+
 /* Unified-toolbar chrome (Browser): no window title — menubar owns the name.
    Traffic lights sit in the tool-row band; capsule pads
    --window-chrome-safe-leading. */
@@ -5031,9 +5534,38 @@ body.dragging-target {
     display: none;
   }
 
-  .launcher-popover {
-    width: calc(100vw - 24px);
-    height: calc(100dvh - 92px);
+  /* Apps Shelf face — phone: still dock-width (JS var); slightly shorter. */
+  .taskbar.is-launcher-face {
+    height: min(58dvh, 440px);
+    min-height: min(58dvh, 440px);
+    max-height: min(58dvh, 440px);
+    border-radius: 18px;
+  }
+
+  .launcher-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  /* Denser 4-up grid — 2-col + 1fr stretched icons left a dead middle gutter. */
+  .launcher[data-view="grid"] .launcher-group-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px 4px;
+  }
+
+  .launcher[data-view="grid"] .launcher-card-body {
+    grid-template-rows: 48px auto;
+    padding: 0.4rem 0.15rem 0.28rem;
+    gap: 0.35rem;
+  }
+
+  .launcher[data-view="grid"] .launcher-item-icon {
+    width: 48px;
+    height: 48px;
+  }
+
+  .launcher[data-view="grid"] .launcher-card-title {
+    font-size: 11px;
   }
 
   /* Windows fill the stage between bar and dock — apps read as full-screen. */
