@@ -72,7 +72,7 @@ cargo_target_root_for_manifest() {
         else
             printf '%s\n' "${ROOT}/${CARGO_TARGET_DIR}"
         fi
-    elif [[ "${manifest_dir}" == "${ROOT}/elastos"* ]]; then
+    elif [[ "${manifest_dir}" == "${ROOT}/elastos"* ]] && ! grep -q '^\[workspace\]' "${manifest_path}"; then
         printf '%s\n' "${ROOT}/elastos/target"
     else
         printf '%s\n' "${manifest_dir}/target"
