@@ -102,6 +102,7 @@ import {
 } from "./shell-quicklook.js?v=home-20260814a";
 import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-20260814a";
 import {
+  bindMobilePlaneSwipe,
   bindSpaceEdgePeek,
   bindSpacePager,
   toggleActiveFullscreenStage,
@@ -160,6 +161,7 @@ bindQuickLook();
 bindExpose();
 bindSpacePager();
 bindSpaceEdgePeek();
+bindMobilePlaneSwipe();
 bindShellKeyboard();
 bindMenubar({ closeWindow, openTarget, supportsNewWindow: supportsMenuNewWindow });
 bindControlCentre();
