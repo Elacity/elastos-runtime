@@ -149,29 +149,28 @@ APIs, provider routes, network locations, or credentials.
 
 The dependency order for this work is strict:
 
-A. review the canonical v1 source-only contract and operational contract
-   surface, including the exact EVM `has_access_by_content_id`
-   policy/evidence contract, recipient-key authorization, immutable custody
-   epochs, and the authenticated replay-pending Runtime-to-release-node
-   envelope;
-B. build source-only custody-node operations and durable node state on top of
-   that contract. The published custody branch covers the node-local durable
-   dual-key claim, claim-gated release, exact encrypted-result persistence, and
-   exact retry replay. Remaining work is issuer lifecycle, node admission,
-   rotation, recovery, operational review, and recovery from a durable claim
-   that has no durable result;
-C. replace the provisional DTO/provider surface atomically and wire
-   Runtime/Wallet/provider integration to the reviewed contract, with one
-   source allow flow and one source deny flow; and
-D. prove the installed end-to-end open/decrypt/render path.
+A. define and review the canonical source contracts and custody crypto
+   boundary;
+B. define source-only provider protocols and custody-node state without making
+   them active product paths;
+C. add Wallet-rights, typed Chain evidence, and Runtime-owned durable
+   coordination as source-only prerequisites;
+D. implement inactive Runtime provider lifecycle, registration, routing, and
+   durable reconciliation before or with a typed rights-provider adapter;
+E. implement producer minting, three-node custody provisioning, recipient
+   possession, private decrypt output, and a full inactive end-to-end proof; and
+F. only then atomically replace the provisional DTO/provider surface and prove
+   the installed mint -> buy -> open -> play path.
 
-The published source-only stack currently ends at
-`origin/feat/protected-content-key-reconstruction` (`a8d0a9a6`). The local
-custody-pool work is unpublished policy-contract source only. PR #15 /
-`feat/dkms-esp-port` is research evidence for threshold crypto, node-local
-custody, lifecycle scenarios, and UX shape; its public `shares[]` metadata,
-raw-CEK/reference operations, old DRM orchestration, direct TCP/IP topology,
-and standalone harness must not become the product path.
+The published protected-content review line now reaches
+`origin/feat/protected-content-custody-provider` (`f7cd6c3d`), which is still
+source-only and unregistered. Local descendants add Wallet-rights, a private
+Runtime coordinator, typed Chain evidence, and a typed rights evaluator; those
+remain unpublished source work. PR #15 / `feat/dkms-esp-port` is research
+evidence for threshold crypto, node-local custody, lifecycle scenarios, and UX
+shape; its public `shares[]` metadata, raw-CEK/reference operations, old DRM
+orchestration, direct TCP/IP topology, and standalone harness must not become
+the product path.
 
 Carrier remains transport only throughout that sequence. It carries
 Runtime-selected traffic, but it does not define rights authority, custody
@@ -182,17 +181,19 @@ algorithm metadata, provenance, availability receipts, declared viewer
 interface, CEK commitment, and object-bound pool/epoch/committee-authorization
 identities. Public metadata must not carry custody shares. `CustodyEnvelopeV1`
 remains a private ephemeral provisioning bundle; durable custody storage is one
-node-sealed share per selected custody node. Cryptographic upgrades use
-versioned envelopes and migration rules. A permissioned key service can precede
-a public network, but
-production claims require independent review and operational evidence.
+node-sealed share per selected custody node. The first product proof must use
+three distinct custody provider identities and state roots for a 2-of-3
+committee. Cryptographic upgrades use versioned envelopes and migration rules.
+A permissioned key service can precede a public network, but production claims
+require independent review and operational evidence.
 
-The repository now has a canonical source-only v1 review candidate in
-[Protected-content v1 contracts](docs/PROTECTED_CONTENT_CONTRACTS_V1.md). The
-current installed/provider path still uses the older provisional
-`elastos_common::protected_content` DTOs plus fail-closed provider stubs, so
-see [Protected content](docs/PROTECTED_CONTENT.md) and the provider-specific
-contracts as the current integration surface, not as proof that v1 is wired.
+The repository now has a canonical source-only v1 review line in
+[Protected-content v1 contracts](docs/PROTECTED_CONTENT_CONTRACTS_V1.md) and
+[Protected content](docs/PROTECTED_CONTENT.md). The current installed/provider
+path still uses the older provisional `elastos_common::protected_content` DTOs
+plus fail-closed provider stubs. The canonical source line is not product proof
+until Runtime, providers, Library, Wallet, Chain, custody, decrypt output, and
+viewer are connected in one no-fallback path.
 
 ### 4. Add wallet, DID, and node proofs behind Runtime authority
 
