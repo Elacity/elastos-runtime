@@ -157,8 +157,8 @@ jobs:
       - name: cargo test
         working-directory: elastos
         run: cargo test --workspace
-          - name: host tools from MAC.md
-            run: brew install e2fsprogs coturn
+      - name: host tools from MAC.md
+        run: brew install e2fsprogs coturn
       - name: source-home into isolated MAC_TEST_HOME
         env:
           ELASTOS_COLLABORATION_STARTUP_MODE: isolated
