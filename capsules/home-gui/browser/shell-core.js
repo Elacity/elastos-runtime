@@ -506,12 +506,21 @@ function sortedDesktopTargets(summary) {
 export function initializeShellLayout(summary) {
   syncHomeBrowserState(summary);
   const stored = shellState.homeBrowserState.layout;
+  /* Desktop philosophy (macOS): the desktop belongs to the user's objects —
+     files, folders, Trash. Apps live in the dock and the launcher; an app
+     icon appears on the desktop only when the user explicitly adds it. The
+     model stays opt-out (desktopHidden + reversible remove/add), so first
+     run hides every app target and seeds the core dock pins exactly once —
+     the saved layout owns both from the first change onward. */
   const normalizedDesktopHidden = normalizeDesktopHiddenTargets(
-    stored ? stored.desktopHidden : null,
+    stored ? stored.desktopHidden : defaultHiddenDesktopTargets(summary),
     summary,
   );
   shellState.shellLayoutState = {
-    taskbar: normalizeTaskbarLayout(stored ? stored.taskbar : null, summary),
+    taskbar: normalizeTaskbarLayout(
+      stored ? stored.taskbar : defaultTaskbarPins(summary),
+      summary,
+    ),
     desktop: {},
     desktopLabels: normalizeDesktopLabels(stored ? stored.desktopLabels : null, summary),
     desktopHidden: normalizedDesktopHidden,
@@ -681,6 +690,25 @@ function normalizeDesktopLabels(labels, summary) {
     normalized[targetId] = nextLabel;
   }
   return normalized;
+}
+
+/* First-run dock pins: the core app surfaces in a fixed order. Purely a
+   first-run default — the saved layout owns the dock from the first change. */
+const DEFAULT_TASKBAR_PINS = ["browser", "library", "wallet", "documents", "chat-room", "system"];
+
+function defaultTaskbarPins(summary) {
+  const knownTargets = new Set(allVisibleTargets(summary).map((target) => target.target));
+  return DEFAULT_TASKBAR_PINS.filter((targetId) => knownTargets.has(targetId));
+}
+
+/* First-run desktop membership: object-kind targets (content projections)
+   belong on the desktop; app targets do not — they live in the dock and the
+   launcher until the user explicitly adds them. Under the opt-out model that
+   means every app target starts hidden. */
+function defaultHiddenDesktopTargets(summary) {
+  return allVisibleTargets(summary)
+    .filter((target) => target.target_kind !== "object")
+    .map((target) => target.target);
 }
 
 function normalizeDesktopHiddenTargets(targetIds, summary) {
