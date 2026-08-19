@@ -601,8 +601,11 @@ export function forkSession(sessionId) {
   }
   stopMockStream({ keepPartial: true });
   const baseTitle = String(source.title || "Chat").replace(/\s*\(fork\)\s*$/i, "");
+  const forkBytes = new Uint8Array(3);
+  globalThis.crypto.getRandomValues(forkBytes);
+  const forkSuffix = Array.from(forkBytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
   const forked = {
-    id: `s-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    id: `s-${Date.now()}-${forkSuffix}`,
     title: `${baseTitle.slice(0, 54)} (fork)`.slice(0, 64),
     group: "Today",
     pinned: false,

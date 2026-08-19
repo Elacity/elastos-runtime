@@ -92,7 +92,7 @@
  * [ ] Bold renders without visible ** markers
  * [ ] Markdown tables stream without Page Unresponsive; final paint is a real table
  * [ ] Stream paint is plain text; final paint is a real table
- * [ ] Chats survive refresh via host session.agent (no localStorage); replies flush on turn complete
+ * [ ] Chats survive refresh via host session.agent (no browser storage); replies flush on turn complete
  *
  * Thinking markdown (§BB):
  * [ ] Thinking block renders bold/lists/fences (not raw **)

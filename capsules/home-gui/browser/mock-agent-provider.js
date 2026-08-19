@@ -7,8 +7,8 @@ import { fetchJson } from "./shell-core.js?v=home-20260814a";
 
 let planMarkdown = `### To-dos
 - [ ] Clarify what to build
-- [/] Sketch capsule surface
-- [ ] Declare capabilities
+- [/] Sketch app surface
+- [ ] Declare permissions
 - [ ] Local install (later)`;
 
 /** Selected mock model id — presentation only until w1. */
@@ -988,7 +988,7 @@ export function getUsageSnapshot() {
 
 /**
  * In-memory project list. Durable store is host session.agent via harness snapshot
- * (opaque sandbox has no localStorage — Principle 10: one canonical path).
+ * (opaque sandbox has no browser storage — Principle 10: one canonical path).
  */
 let projectStore = [];
 
@@ -1009,8 +1009,11 @@ export function createProject(title) {
   if (!name) {
     return null;
   }
+  const projectBytes = new Uint8Array(4);
+  globalThis.crypto.getRandomValues(projectBytes);
+  const projectSuffix = Array.from(projectBytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
   const project = {
-    id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    id: `proj-${Date.now()}-${projectSuffix}`,
     title: name,
     rootRef: null,
     createdAt: Date.now(),

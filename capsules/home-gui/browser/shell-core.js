@@ -80,28 +80,7 @@ export function setHomeGuiLaunchToken(token) {
 }
 
 export function getHomeGuiLaunchToken() {
-  if (homeGuiLaunchToken) {
-    return homeGuiLaunchToken;
-  }
-  try {
-    const fromGlobal = globalThis.__elastosHomeGuiLaunchToken;
-    if (typeof fromGlobal === "string" && fromGlobal.trim()) {
-      homeGuiLaunchToken = fromGlobal.trim();
-      return homeGuiLaunchToken;
-    }
-  } catch {
-    /* ignore */
-  }
-  try {
-    const fromSession = sessionStorage.getItem("elastos.home-gui.launch-token");
-    if (typeof fromSession === "string" && fromSession.trim()) {
-      homeGuiLaunchToken = fromSession.trim();
-      return homeGuiLaunchToken;
-    }
-  } catch {
-    /* ignore */
-  }
-  return "";
+  return homeGuiLaunchToken;
 }
 
 export const shellState = {

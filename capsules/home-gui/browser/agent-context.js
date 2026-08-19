@@ -185,11 +185,17 @@ export const TurnState = {
   INTERRUPTED: "interrupted",
 };
 
+function randomHexSuffix(byteCount) {
+  const bytes = new Uint8Array(byteCount);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export function newTurnId() {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
   }
-  return `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  return `turn-${Date.now().toString(36)}-${randomHexSuffix(5)}`;
 }
 
 const turnStore = new Map();
@@ -271,7 +277,7 @@ export function stampMessageNode(msg, { session = null, parent = null } = {}) {
   const body = sourceBody(msg);
   return {
     ...msg,
-    id: msg.id || `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    id: msg.id || `m-${Date.now().toString(36)}-${randomHexSuffix(4)}`,
     parentId: msg.parentId || prev?.id,
     branchId: msg.branchId || prev?.branchId || session?.id || "main",
     contentHash: msg.contentHash || contentHash(body),

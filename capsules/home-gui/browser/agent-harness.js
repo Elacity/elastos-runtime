@@ -1314,15 +1314,24 @@ function runParticleDrop(durationMs) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   /* Soft mist — drifts and dissolves; not a shatter fall. */
+  /* Deterministic PRNG: visual-only particles, no security input. */
+  let mistSeed = 0x2f6e2b1;
+  const mistNext = () => {
+    mistSeed |= 0;
+    mistSeed = (mistSeed + 0x6d2b79f5) | 0;
+    let t = Math.imul(mistSeed ^ (mistSeed >>> 15), 1 | mistSeed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
   const colors = ["#9aa3b2", "#c9d0dc", "#6e7684", "#dde3ec"];
   const particles = Array.from({ length: PARTICLE_COUNT }, () => ({
-    x: Math.random() * w,
-    y: Math.random() * h,
-    vx: (Math.random() - 0.5) * 0.35,
-    vy: -0.15 - Math.random() * 0.45,
-    size: 0.8 + Math.random() * 1.8,
-    alpha: 0.08 + Math.random() * 0.18,
-    color: colors[(Math.random() * colors.length) | 0],
+    x: mistNext() * w,
+    y: mistNext() * h,
+    vx: (mistNext() - 0.5) * 0.35,
+    vy: -0.15 - mistNext() * 0.45,
+    size: 0.8 + mistNext() * 1.8,
+    alpha: 0.08 + mistNext() * 0.18,
+    color: colors[(mistNext() * colors.length) | 0],
   }));
 
   const started = performance.now();
