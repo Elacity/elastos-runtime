@@ -1891,6 +1891,16 @@ export async function restoreShellSession() {
     return;
   }
 
+  /* One liquid dock intro (width + Bin ride + fade runners) — not N breathes. */
+  const intro = requireWindowHooks().introduceDockAfterSessionRestore;
+  if (typeof intro === "function") {
+    try {
+      await intro();
+    } catch (_error) {
+      renderWindowTaskbar();
+    }
+  }
+
   const activeEntry = restoredEntries.find(
     ({ restoredWindow }) => restoredWindow.active && !restoredWindow.hidden,
   );

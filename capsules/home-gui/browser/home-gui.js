@@ -42,6 +42,7 @@ import {
   handleContextAction,
   hideDesktopContextMenu,
   hideLauncher,
+  introduceDockAfterSessionRestore,
   moveLauncherSelection,
   maybeShowWalletApprovalToast,
   openDesktopContextMenu,
@@ -208,6 +209,7 @@ export const homeGuiWindowHooks = Object.freeze({
   updateClock,
   renderDesktop,
   renderTaskbar,
+  introduceDockAfterSessionRestore,
   updateTaskbarState,
 });
 
@@ -224,6 +226,7 @@ configureWindowHooks({
   refreshLauncherIfVisible,
   renderDesktop,
   renderTaskbar,
+  introduceDockAfterSessionRestore,
   syncMenubar,
   updateTaskbarState,
   // Host-mediated launches: GUI never fetch-launches; shell-windows and the
