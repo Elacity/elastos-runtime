@@ -3,7 +3,8 @@ import { openTarget } from "./shell-windows.js?v=home-20260814a";
 
 /* First-run setup is Home chrome, not a new authority path.
    Host summary `identity.profile_readiness` decides whether the sheet exists.
-   Recovery Kit stays in System Security. Signed Profile stays in People.
+   Profile first. Recovery Kit is an offer on this sheet — skippable.
+   Recovery ceremony stays in System Security. Signed Profile stays in People.
    Chat may fail closed; Home holds the next act so the user never hunts. */
 
 const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";
@@ -13,6 +14,7 @@ let sheet = null;
 let titleNode = null;
 let leadNode = null;
 let recoveryButton = null;
+let skipRecoveryButton = null;
 let profileButton = null;
 let closeButton = null;
 let bound = false;
@@ -26,6 +28,7 @@ export function bindSetupSheet() {
   titleNode = document.querySelector("#setup-sheet-title");
   leadNode = document.querySelector("#setup-sheet-lead");
   recoveryButton = document.querySelector("#setup-sheet-recovery");
+  skipRecoveryButton = document.querySelector("#setup-sheet-skip-recovery");
   profileButton = document.querySelector("#setup-sheet-profile");
   closeButton = document.querySelector("#setup-sheet-close");
   if (!sheet) {
@@ -33,6 +36,7 @@ export function bindSetupSheet() {
   }
   bound = true;
   closeButton?.addEventListener("click", () => hideSetupSheet());
+  skipRecoveryButton?.addEventListener("click", () => hideSetupSheet());
   recoveryButton?.addEventListener("click", () => openRecoveryAct());
   profileButton?.addEventListener("click", () => openProfileAct());
   sheet.addEventListener("keydown", (event) => {
@@ -115,19 +119,24 @@ export function showSetupSheet() {
   sheet.hidden = false;
   sheet.inert = false;
   sheet.setAttribute("aria-hidden", "false");
-  (recoveryButton && !recoveryButton.disabled ? recoveryButton : closeButton)?.focus();
+  (profileButton && !profileButton.disabled ? profileButton : closeButton)?.focus();
   return true;
 }
 
 function renderSetupSheet(summary) {
   const unavailable = homeSetupStatus(summary) === "unavailable";
+  const setupName = typeof summary?.identity?.profile_setup_display_name === "string"
+    ? summary.identity.profile_setup_display_name.trim()
+    : "";
   if (titleNode) {
-    titleNode.textContent = "Finish setting up Home";
+    titleNode.textContent = "Welcome to Home";
   }
   if (leadNode) {
     leadNode.textContent = unavailable
-      ? "Profile could not be verified. Download a Recovery Kit, then create your Profile."
-      : "Chat and People need a Recovery Kit and a signed Profile. Stay here until both are done.";
+      ? "Profile could not be verified. Save a Recovery Kit, then create your Profile."
+      : (setupName
+        ? `Create your Profile as ${setupName}. A Recovery Kit is optional — save one now or skip.`
+        : "Create your Profile. A Recovery Kit is optional — save one now or skip.");
   }
   if (recoveryButton) {
     recoveryButton.disabled = !targetById(summary, "system");

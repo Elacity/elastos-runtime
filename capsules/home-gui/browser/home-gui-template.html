@@ -480,29 +480,32 @@
     >
       <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
     </button>
-    <h2 id="setup-sheet-title" class="setup-sheet-title">Finish setting up Home</h2>
+    <h2 id="setup-sheet-title" class="setup-sheet-title">Welcome to Home</h2>
     <p id="setup-sheet-lead" class="setup-sheet-lead">
-      Chat and People need a Recovery Kit and a signed Profile. Stay here until both are done.
+      Create your Profile. A Recovery Kit is optional — save one now or skip.
     </p>
     <ol class="setup-sheet-steps">
       <li class="setup-sheet-step">
         <span class="setup-sheet-step-index" aria-hidden="true">1</span>
         <div class="setup-sheet-step-copy">
-          <h3 class="setup-sheet-step-title">Download Recovery Kit</h3>
-          <p class="setup-sheet-step-body">Save a Recovery Kit from Security so you can get back into this Home.</p>
+          <h3 class="setup-sheet-step-title">Create your Profile</h3>
+          <p class="setup-sheet-step-body">The name people see. Chat stays closed until this exists.</p>
         </div>
-        <button id="setup-sheet-recovery" class="el-button el-button-primary" type="button">
-          Open Security
+        <button id="setup-sheet-profile" class="el-button el-button-primary" type="button">
+          Create Profile
         </button>
       </li>
       <li class="setup-sheet-step">
         <span class="setup-sheet-step-index" aria-hidden="true">2</span>
         <div class="setup-sheet-step-copy">
-          <h3 class="setup-sheet-step-title">Create your Profile</h3>
-          <p class="setup-sheet-step-body">Choose the name people see. Home signs it after Recovery is in place.</p>
+          <h3 class="setup-sheet-step-title">Recovery Kit</h3>
+          <p class="setup-sheet-step-body">Optional. Save a kit so you can get back into this Home.</p>
         </div>
-        <button id="setup-sheet-profile" class="el-button" type="button">
-          Open People
+        <button id="setup-sheet-recovery" class="el-button" type="button">
+          Save kit
+        </button>
+        <button id="setup-sheet-skip-recovery" class="el-button" type="button">
+          Skip
         </button>
       </li>
     </ol>

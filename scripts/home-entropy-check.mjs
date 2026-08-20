@@ -1832,6 +1832,7 @@ assert(
 assert(
   homeGuiTemplateHtml.includes('id="setup-sheet"') &&
     homeGuiTemplateHtml.includes('id="setup-sheet-recovery"') &&
+    homeGuiTemplateHtml.includes('id="setup-sheet-skip-recovery"') &&
     homeGuiTemplateHtml.includes('id="setup-sheet-profile"') &&
     homeGuiJs.includes("bindSetupSheet()") &&
     homeGuiJs.includes("holdHomeSetupAct") &&
@@ -1852,11 +1853,14 @@ assert(
     read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
       'const SETUP_HOLD_TARGETS = new Set(["chat-room"])',
     ) &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
+      "A Recovery Kit is optional",
+    ) &&
     !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("localStorage") &&
     !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("Math.random") &&
     !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("/api/auth/recovery") &&
     !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("/api/apps/people/profile"),
-  "First-run setup is Home chrome over host profile_readiness; Recovery and Profile stay on System and People; Chat is held until that fact is ready",
+  "First-run setup is Home chrome over host profile_readiness; Profile first; Recovery is skippable; ceremony stays on System and People; Chat is held until the Profile fact is ready",
 );
 assert(
   !homeGuiJs.includes('"#agent-harness"') &&
