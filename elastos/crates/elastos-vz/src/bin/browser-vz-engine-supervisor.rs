@@ -3105,7 +3105,8 @@ fn spawn_control_proxy(
 fn join_control_proxy_bounded(handle: thread::JoinHandle<bool>, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while !handle.is_finished() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(25));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(25)));
     }
     if !handle.is_finished() {
         return false;
@@ -3999,12 +4000,12 @@ mod tests {
         ));
         assert!(!join_control_proxy_bounded(
             thread::spawn(|| {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_secs(2));
                 true
             }),
             Duration::from_millis(1),
         ));
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(Duration::from_millis(2100));
     }
 
     #[test]
