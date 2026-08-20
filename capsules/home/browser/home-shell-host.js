@@ -197,7 +197,13 @@ function readUnlockPersonName() {
   const setupName = typeof identity?.profile_setup_display_name === "string"
     ? identity.profile_setup_display_name.trim()
     : "";
-  return setupName;
+  if (setupName) {
+    return setupName;
+  }
+  const handle = typeof identity?.profile?.handle === "string"
+    ? identity.profile.handle.trim()
+    : (typeof identity?.handle === "string" ? identity.handle.trim() : "");
+  return handle;
 }
 
 async function showHostAuthGate(options = {}) {

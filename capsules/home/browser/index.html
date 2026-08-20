@@ -62,16 +62,28 @@
 
       <section id="home-unlock" class="home-unlock" aria-labelledby="home-unlock-title" aria-hidden="true" data-surface="neutral" hidden>
         <div class="home-unlock-face" hidden>
-          <div class="home-unlock-brand">
-            <img class="home-unlock-brand-mark" src="./elastos-logo.svg" alt="" draggable="false" />
-            <span class="home-unlock-brand-word">ELASTOS</span>
+          <div class="home-unlock-ground" aria-hidden="true"></div>
+          <div class="home-unlock-vignette" aria-hidden="true"></div>
+          <div class="home-unlock-picker">
+            <div class="home-unlock-brand">
+              <span class="home-unlock-brand-mark" aria-hidden="true">
+                <img src="./elastos-logo.svg" alt="" draggable="false" />
+              </span>
+              <span class="home-unlock-brand-word">ELASTOS</span>
+            </div>
+            <div id="home-unlock-clock" class="home-unlock-clock">
+              <p id="home-unlock-date" class="home-unlock-date"></p>
+              <p id="home-unlock-time" class="home-unlock-time"></p>
+            </div>
+            <div class="home-unlock-users">
+              <button id="home-unlock-person" class="home-unlock-account" type="button" aria-label="Unlock with passkey">
+                <span class="home-unlock-avatar" aria-hidden="true">
+                  <span id="home-unlock-monogram" class="home-unlock-avatar-monogram">e</span>
+                </span>
+                <span id="home-unlock-person-name" class="home-unlock-account-name"></span>
+              </button>
+            </div>
           </div>
-          <p id="home-unlock-date" class="home-unlock-date"></p>
-          <p id="home-unlock-clock" class="home-unlock-clock"></p>
-          <button id="home-unlock-person" class="home-unlock-person" type="button" aria-label="Unlock with passkey">
-            <img id="home-unlock-avatar" class="home-unlock-avatar" src="./elastos-home-icon.svg" alt="" draggable="false" />
-            <span id="home-unlock-person-name" class="home-unlock-person-name"></span>
-          </button>
         </div>
         <div class="home-unlock-card" role="dialog" aria-modal="true">
           <img class="home-unlock-logo" src="./elastos-logo.svg" alt="ElastOS" draggable="false" />

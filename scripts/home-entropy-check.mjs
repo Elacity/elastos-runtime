@@ -7540,6 +7540,22 @@ assert(
     !shellAuth.includes("startAutomaticPasskeySignIn"),
   "Home lock face starts the passkey ceremony on click; the OS dialog is not the first surface",
 );
+const passkeyLoginAccountStruct = authGatewayApi.match(
+  /pub struct PasskeyLoginAccount \{[\s\S]*?\n\}/,
+)?.[0] || "";
+assert(
+  authGatewayApi.includes("pub accounts: Vec<PasskeyLoginAccount>") &&
+    authGatewayApi.includes("fn passkey_login_accounts(") &&
+    authGatewayApi.includes("passkey_login_accounts_are_sorted_and_omit_roots") &&
+    passkeyLoginAccountStruct.includes("display_name") &&
+    !passkeyLoginAccountStruct.includes("localhost_root") &&
+    !passkeyLoginAccountStruct.includes("proof_binding") &&
+    shellAuth.includes("status.accounts") &&
+    shellAuth.includes("accounts[0].display_name") &&
+    !shellJs.includes("sessionStorage") &&
+    !shellHostStyle.includes("wallpaper.webp"),
+  "Home lock name comes from the unsigned passkey account directory; no browser identity cache and no host wallpaper ownership",
+);
 const renderUnlockCheckingBody = shellAuth.match(
   /function renderUnlockChecking\(\) \{[\s\S]*?\n\}/,
 )?.[0] || "";

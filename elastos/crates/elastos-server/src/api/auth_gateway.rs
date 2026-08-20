@@ -156,6 +156,19 @@ pub struct AuthRevokeResponse {
 pub struct PasskeyStatusResponse {
     pub registered: bool,
     pub guest_registration_enabled: bool,
+    /// Minimal local account directory for the unsigned Home front door.
+    /// Never includes principal roots, grants, or recovery material.
+    #[serde(default)]
+    pub accounts: Vec<PasskeyLoginAccount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PasskeyLoginAccount {
+    pub principal_id: String,
+    pub display_name: String,
+    pub role: String,
+    pub credential_id: String,
+    pub last_used_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -409,12 +422,60 @@ pub async fn passkey_status(State(state): State<GatewayState>) -> Response {
         Err(err) => return auth_error_response(err),
     };
     let manager = manager.lock().await;
+    let registered = manager.status().registered;
+    drop(manager);
+    let accounts = match passkey_login_accounts(&state.data_dir) {
+        Ok(accounts) => accounts,
+        Err(err) => return auth_error_response(err),
+    };
     Json(PasskeyStatusResponse {
-        registered: manager.status().registered,
+        registered,
         guest_registration_enabled: crate::auth::guest_registration_enabled(&state.data_dir)
             .unwrap_or(false),
+        accounts,
     })
     .into_response()
+}
+
+fn passkey_login_accounts(data_dir: &std::path::Path) -> anyhow::Result<Vec<PasskeyLoginAccount>> {
+    let mut accounts = crate::auth::active_passkey_principals(data_dir)?
+        .into_iter()
+        .filter_map(|principal| {
+            let passkey = principal.proof_binding.passkey.as_ref()?;
+            let display_name = if principal.display_name.trim().is_empty() {
+                "Account".to_string()
+            } else {
+                principal.display_name.clone()
+            };
+            let role = match principal.role {
+                crate::auth::RuntimePrincipalRole::Admin => "admin",
+                crate::auth::RuntimePrincipalRole::Guest => "guest",
+            };
+            Some(PasskeyLoginAccount {
+                principal_id: principal.principal_id,
+                display_name,
+                role: role.to_string(),
+                credential_id: passkey.credential_id.clone(),
+                last_used_at: passkey.last_used_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    accounts.sort_by(|left, right| {
+        right
+            .last_used_at
+            .cmp(&left.last_used_at)
+            .then_with(|| {
+                let left_admin = left.role == "admin";
+                let right_admin = right.role == "admin";
+                right_admin.cmp(&left_admin)
+            })
+            .then_with(|| {
+                left.display_name
+                    .to_lowercase()
+                    .cmp(&right.display_name.to_lowercase())
+            })
+    });
+    Ok(accounts)
 }
 
 pub async fn passkey_list(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
@@ -4207,6 +4268,49 @@ mod tests {
             first_principal.localhost_root,
             second_principal.localhost_root
         );
+    }
+
+    #[test]
+    fn passkey_login_accounts_are_sorted_and_omit_roots() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(passkey_login_accounts(empty.path()).unwrap().is_empty());
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_gateway_state(temp.path());
+        let admin = issue_named_passkey_session_grant(
+            &state,
+            "identity-test",
+            &test_credential(),
+            "https://elastos.elacitylabs.com",
+            true,
+            "admin passkey",
+            Some("Zed Admin"),
+        )
+        .unwrap();
+        let guest = issue_named_passkey_session_grant(
+            &state,
+            "identity-test",
+            &test_credential_2(),
+            "https://elastos.elacitylabs.com",
+            true,
+            "guest passkey",
+            Some("Ada Guest"),
+        )
+        .unwrap();
+
+        let accounts = passkey_login_accounts(temp.path()).unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].principal_id, admin.principal_id);
+        assert_eq!(accounts[0].display_name, "Zed Admin");
+        assert_eq!(accounts[0].role, "admin");
+        assert_eq!(accounts[0].credential_id, "credential-1");
+        assert_eq!(accounts[1].principal_id, guest.principal_id);
+        assert_eq!(accounts[1].display_name, "Ada Guest");
+        assert_eq!(accounts[1].role, "guest");
+        assert_eq!(accounts[1].credential_id, "credential-2");
+        let encoded = serde_json::to_value(&accounts).unwrap();
+        assert!(encoded[0].get("localhost_root").is_none());
+        assert!(encoded[0].get("proof_binding_id").is_none());
     }
 
     #[tokio::test]

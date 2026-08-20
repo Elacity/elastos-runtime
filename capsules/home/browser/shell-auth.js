@@ -15,8 +15,10 @@ const unlockStatus = document.querySelector("#home-unlock-status");
 const unlockName = document.querySelector("#home-unlock-name");
 const unlockDate = document.querySelector("#home-unlock-date");
 const unlockClock = document.querySelector("#home-unlock-clock");
+const unlockTime = document.querySelector("#home-unlock-time");
 const unlockPerson = document.querySelector("#home-unlock-person");
 const unlockPersonName = document.querySelector("#home-unlock-person-name");
+const unlockMonogram = document.querySelector("#home-unlock-monogram");
 
 let unlockMode = "signin";
 let unlockPresentation = "modal";
@@ -45,6 +47,11 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
   unlockPanel.dataset.surface = forceNeutralSurface
     ? "neutral"
     : "lock-face";
+  if (!forceNeutralSurface) {
+    unlockPanel.dataset.flow = "picker";
+  } else {
+    delete unlockPanel.dataset.flow;
+  }
   unlockPanel.style.setProperty(
     "--home-unlock-ground",
     'url("/apps/home-gui/wallpaper.webp")',
@@ -66,6 +73,13 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
     const status = await fetchJson("/api/auth/passkey/status");
     const registered = status.registered === true;
     const guestRegistrationEnabled = status.guest_registration_enabled === true;
+    const accounts = Array.isArray(status.accounts) ? status.accounts : [];
+    const accountName = typeof accounts[0]?.display_name === "string"
+      ? accounts[0].display_name.trim()
+      : "";
+    if (accountName) {
+      unlockPersonLabel = accountName;
+    }
     unlockMode = registered
       ? (guestRegistrationEnabled ? "signin_guest_enabled" : "signin")
       : "create";
@@ -86,6 +100,7 @@ export function hideHomeUnlock() {
   unlockPanel.setAttribute("aria-hidden", "true");
   delete unlockPanel.dataset.mode;
   delete unlockPanel.dataset.surface;
+  delete unlockPanel.dataset.flow;
   setUnlockNameVisible(false);
   setUnlockStatus("", "muted");
   stopUnlockClock();
@@ -258,6 +273,11 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
   const showFace = registered && !creatingGuest && unlockMode !== "unsupported";
   if (unlockPanel && !unlockPanel.hidden) {
     unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";
+    if (showFace) {
+      unlockPanel.dataset.flow = "picker";
+    } else {
+      delete unlockPanel.dataset.flow;
+    }
   }
   if (unlockFace) {
     unlockFace.hidden = !showFace;
@@ -267,6 +287,15 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
   }
   if (unlockPersonName) {
     unlockPersonName.textContent = unlockPersonLabel;
+  }
+  if (unlockMonogram) {
+    unlockMonogram.textContent = "e";
+  }
+  if (unlockPerson) {
+    unlockPerson.setAttribute(
+      "aria-label",
+      unlockPersonLabel ? `Unlock ${unlockPersonLabel}` : "Unlock with passkey",
+    );
   }
   if (showFace) {
     startUnlockClock();
@@ -285,24 +314,31 @@ function unlockStatusCopy(registered, guestRegistrationEnabled) {
   return "";
 }
 
+function formatUnlockDate(now) {
+  const weekday = new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(now);
+  const day = new Intl.DateTimeFormat(undefined, { day: "numeric" }).format(now);
+  const month = new Intl.DateTimeFormat(undefined, { month: "short" }).format(now);
+  return `${weekday} ${day} ${month}`;
+}
+
+function formatUnlockTime(now) {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(now);
+}
+
 function startUnlockClock() {
-  if (!unlockDate && !unlockClock) {
+  if (!unlockDate && !unlockTime) {
     return;
   }
   const tick = () => {
     const now = new Date();
     if (unlockDate) {
-      unlockDate.textContent = now.toLocaleDateString("en-GB", {
-        weekday: "short",
-        day: "numeric",
-        month: "short",
-      }).replace(/,/g, "");
+      unlockDate.textContent = formatUnlockDate(now);
     }
-    if (unlockClock) {
-      unlockClock.textContent = now.toLocaleTimeString("en-US", {
-        hour: "numeric",
-        minute: "2-digit",
-      });
+    if (unlockTime) {
+      unlockTime.textContent = formatUnlockTime(now);
     }
   };
   tick();

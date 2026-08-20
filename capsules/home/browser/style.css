@@ -118,25 +118,18 @@ img {
 }
 
 .home-unlock[data-surface="lock-face"],
-.home-unlock[data-surface="lock-face"][data-mode="prompt"] {
+.home-unlock[data-surface="lock-face"][data-mode="prompt"],
+.home-unlock[data-flow="picker"] {
   display: block;
   padding: 0;
-  background:
-    linear-gradient(180deg, rgba(8, 10, 14, 0.32) 0%, rgba(8, 10, 14, 0.1) 42%, rgba(8, 10, 14, 0.5) 100%),
-    var(--home-unlock-ground, none) center / cover no-repeat #1a2a22;
+  background: #050608;
   backdrop-filter: none;
 }
 
 .home-unlock-face {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+  position: relative;
   min-height: 100dvh;
-  padding:
-    max(28px, env(safe-area-inset-top, 0))
-    24px
-    max(36px, env(safe-area-inset-bottom, 0));
-  color: #fff;
+  color: #f5f5f7;
   text-align: center;
 }
 
@@ -144,84 +137,158 @@ img {
   display: none;
 }
 
-.home-unlock-brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
+.home-unlock-ground,
+.home-unlock-vignette {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
 }
 
-.home-unlock-brand-mark {
-  width: 22px;
-  height: auto;
+.home-unlock-ground {
+  background: var(--home-unlock-ground, none) center / cover no-repeat #050608;
 }
 
-.home-unlock-brand-word {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.18em;
+.home-unlock-vignette {
+  background:
+    linear-gradient(to bottom, rgba(0, 0, 0, 0.28), transparent 22%, transparent 72%, rgba(0, 0, 0, 0.34)),
+    radial-gradient(ellipse at 50% 42%, rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.48) 58%, rgba(0, 0, 0, 0.68));
 }
 
-.home-unlock-date {
-  margin: 28px 0 0;
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 1.05rem;
-  font-weight: 500;
-  letter-spacing: 0.01em;
-  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.35);
-}
-
-.home-unlock-clock {
-  margin: 4px 0 0;
-  font-size: clamp(4.2rem, 13vw, 7.4rem);
-  font-weight: 500;
-  letter-spacing: -0.045em;
-  line-height: 0.92;
-  font-variant-numeric: tabular-nums;
-  text-shadow: 0 2px 28px rgba(0, 0, 0, 0.35);
-}
-
-.home-unlock-person {
-  margin-top: auto;
+.home-unlock-picker {
+  position: relative;
+  z-index: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
+  min-height: 100dvh;
+  padding:
+    max(20px, env(safe-area-inset-top, 0px))
+    24px
+    max(28px, env(safe-area-inset-bottom, 0px));
+}
+
+.home-unlock-brand {
+  display: flex;
+  align-items: center;
   gap: 10px;
-  padding: 0;
+  padding-top: 1.5vh;
+}
+
+.home-unlock-brand-mark {
+  display: block;
+  width: 30px;
+  height: 20px;
+  overflow: hidden;
+  flex: 0 0 30px;
+}
+
+.home-unlock-brand-mark img {
+  display: block;
+  height: 20px;
+  width: auto;
+  max-width: none;
+}
+
+.home-unlock-brand-word {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+}
+
+.home-unlock .home-unlock-clock {
+  flex: 0 0 auto;
+  margin-top: clamp(28px, 7vh, 72px);
+  user-select: none;
+}
+
+.home-unlock .home-unlock-date {
+  margin: 0;
+  color: rgba(245, 245, 247, 0.94);
+  font-size: clamp(22px, 3.2vw, 28px);
+  font-weight: 500;
+  letter-spacing: -0.015em;
+  line-height: 1.15;
+  text-shadow: 0 1px 18px rgba(0, 0, 0, 0.4);
+}
+
+.home-unlock .home-unlock-time {
+  margin: 6px 0 0;
+  color: #f5f5f7;
+  font-size: clamp(72px, 12.5vw, 112px);
+  font-weight: 500;
+  letter-spacing: -0.035em;
+  line-height: 0.94;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 3px 28px rgba(0, 0, 0, 0.38);
+}
+
+.home-unlock-users {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-top: auto;
+  padding-top: clamp(32px, 8vh, 80px);
+  padding-bottom: clamp(12px, 4vh, 40px);
+}
+
+.home-unlock-account {
+  appearance: none;
+  width: 88px;
+  padding: 8px 4px 4px;
   border: 0;
   background: transparent;
-  color: #fff;
+  color: inherit;
   cursor: pointer;
 }
 
-.home-unlock-person:disabled {
+.home-unlock-account:disabled {
   cursor: default;
   opacity: 0.55;
 }
 
-.home-unlock-person:active {
-  transform: scale(0.96);
+.home-unlock-account:active {
+  transform: scale(0.98);
 }
 
 .home-unlock-avatar {
   width: 72px;
   height: 72px;
+  margin: 0 auto;
   border-radius: 999px;
-  background: rgba(8, 10, 14, 0.55);
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: #101820;
+  color: #fff;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.04em;
+  box-shadow:
+    0 0 0 1.5px rgba(96, 165, 250, 0.88),
+    0 8px 28px rgba(0, 0, 0, 0.28);
 }
 
-.home-unlock-person-name {
-  font-size: 0.92rem;
-  font-weight: 550;
-  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.4);
+.home-unlock-avatar-monogram {
+  font-weight: 650;
+  line-height: 1;
+  text-transform: lowercase;
+}
+
+.home-unlock-account-name {
+  display: block;
+  margin-top: 10px;
+  color: #f5f5f7;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.35);
 }
 
 .home-unlock-card[hidden] {
   display: none;
 }
 
-.home-unlock[data-mode="prompt"] {
+.home-unlock[data-mode="prompt"]:not([data-surface="lock-face"]) {
   inset: 0;
   display: grid;
   width: auto;
