@@ -1,2 +1,17 @@
+# Working trees stay LF so vendor-ui and entropy compare the same bytes on Windows.
+# Do not loosen those gates for CRLF. Binaries stay binary.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.wasm binary
+*.mp4 binary
+*.bin binary
+
 capsules/gba-emulator/browser/mgba.js -diff linguist-generated=true
 capsules/gba-emulator/browser/mgba.wasm -diff linguist-generated=true
