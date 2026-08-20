@@ -187,3 +187,59 @@ jobs:
           path: ${{ runner.temp }}/source-home-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+  # Experimental: windows-latest cargo + principle gates.
+  # Same promotion rule as Elacity/pc2.net: continue-on-error until 5
+  # consecutive greens, then drop continue-on-error and require the job.
+  # setup-source-home.sh is not run here — detect_platform / default_data_dir
+  # only accept Linux and Darwin. Do not fake a Windows Home install path.
+  source-windows:
+    name: source-windows (experimental)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: elastos
+          prefix-key: ${{ runner.os }}-elastos
+      - name: Environment baseline
+        run: |
+          echo "OS: $(uname -s) $(uname -r) $(uname -m)"
+          echo "Node: $(node --version)"
+          echo "Cargo: $(cargo --version)"
+      - name: cargo fmt
+        working-directory: elastos
+        run: cargo fmt --all -- --check
+      - name: architecture entropy checks
+        run: |
+          ./scripts/vendor-ui-tokens.sh --check
+          bash scripts/check-wci-alignment.sh
+          node scripts/home-entropy-check.mjs
+          node scripts/browser-entropy-check.mjs
+          node scripts/home-clipboard-source-gate.mjs
+      - name: product UI source proofs
+        run: |
+          node scripts/home-shell-regression-smoke.mjs
+          node scripts/people-discovery-smoke.mjs
+      - name: Browser close handshake
+        run: node --test scripts/browser-window-close-handshake.test.mjs
+      - name: cargo clippy
+        working-directory: elastos
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo check
+        working-directory: elastos
+        run: cargo check --workspace
+      - name: cargo test
+        working-directory: elastos
+        run: cargo test --workspace
