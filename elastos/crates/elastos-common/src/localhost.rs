@@ -115,6 +115,7 @@ pub fn file_backed_prefixes() -> Vec<String> {
 /// anyone else can read, so these must be owner-only from the moment they
 /// exist — and healed if an earlier boot created them with the process umask,
 /// or no one on that Home can ever save protected state.
+#[cfg(unix)]
 const OWNER_ONLY_ROOTS: &[&str] = &["Users", "UsersAI"];
 
 pub fn ensure_file_backed_roots(base_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
