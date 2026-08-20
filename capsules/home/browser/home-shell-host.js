@@ -163,6 +163,8 @@ function clearLaunchedAppContexts() {
   launchedAppContexts.clear();
 }
 
+let retireShellTimer = 0;
+
 function enterHostAuthGate() {
   stopHomePresenceHeartbeat();
   shellState.activeShellRootLaunchSeq += 1;
@@ -172,6 +174,27 @@ function enterHostAuthGate() {
   document.body.dataset.homeShell = "resolving";
   document.body.dataset.homeGui = "dormant";
   clearLaunchedAppContexts();
+  hideShellHostRecovery();
+  stopHomeEventChannel();
+  if (retireShellTimer) {
+    window.clearTimeout(retireShellTimer);
+  }
+  retireShellTimer = window.setTimeout(retireActiveShellUnderLock, 320);
+}
+
+function cancelRetireActiveShellUnderLock() {
+  if (retireShellTimer) {
+    window.clearTimeout(retireShellTimer);
+    retireShellTimer = 0;
+  }
+}
+
+function retireActiveShellUnderLock() {
+  retireShellTimer = 0;
+  const panel = document.querySelector("#home-unlock");
+  if (!panel || panel.hidden || panel.classList.contains("home-unlock-leaving")) {
+    return;
+  }
   if (activeShellRoot) {
     activeShellRoot.hidden = true;
     activeShellRoot.dataset.target = "";
@@ -182,8 +205,6 @@ function enterHostAuthGate() {
     activeShellFrame.dataset.route = "";
     activeShellFrame.title = "Active Home shell";
   }
-  hideShellHostRecovery();
-  stopHomeEventChannel();
 }
 
 function readUnlockPersonName() {
@@ -1714,7 +1735,12 @@ async function boot() {
       return null;
     });
   document.body.dataset.homeStatus = "ready";
-  hideHomeUnlock();
+  cancelRetireActiveShellUnderLock();
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      hideHomeUnlock();
+    });
+  });
   runtimeReady.then(() => refreshShellSummary()).catch((error) => {
     console.error("home summary refresh failed after runtime ensure", error);
   });

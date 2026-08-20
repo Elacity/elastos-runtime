@@ -27,6 +27,7 @@ let busy = false;
 let sessionRefreshInFlight = null;
 let autoSignInAttempted = false;
 let unlockClockTimer = 0;
+let unlockLeaveTimer = 0;
 let unlockPersonLabel = "";
 
 export function isHomeAuthError(error) {
@@ -42,6 +43,7 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
     throw new Error("Home unlock surface is missing");
   }
   unlockPersonLabel = typeof options.personName === "string" ? options.personName.trim() : "";
+  cancelUnlockLeave();
   document.body.dataset.homeStatus = unlockPresentation === "prompt" ? "ready" : "locked";
   unlockPanel.dataset.mode = unlockPresentation;
   unlockPanel.dataset.surface = forceNeutralSurface
@@ -96,6 +98,33 @@ export function hideHomeUnlock() {
   if (!unlockPanel) {
     return;
   }
+  const reducedMotion = typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!unlockPanel.hidden && !reducedMotion) {
+    unlockPanel.classList.add("home-unlock-leaving");
+    if (unlockLeaveTimer) {
+      window.clearTimeout(unlockLeaveTimer);
+    }
+    unlockLeaveTimer = window.setTimeout(finishHideHomeUnlock, 320);
+    return;
+  }
+  finishHideHomeUnlock();
+}
+
+function cancelUnlockLeave() {
+  if (unlockLeaveTimer) {
+    window.clearTimeout(unlockLeaveTimer);
+    unlockLeaveTimer = 0;
+  }
+  unlockPanel?.classList.remove("home-unlock-leaving");
+}
+
+function finishHideHomeUnlock() {
+  unlockLeaveTimer = 0;
+  if (!unlockPanel) {
+    return;
+  }
+  unlockPanel.classList.remove("home-unlock-leaving");
   unlockPanel.hidden = true;
   unlockPanel.setAttribute("aria-hidden", "true");
   delete unlockPanel.dataset.mode;
@@ -241,6 +270,15 @@ function renderUnlockChecking() {
   }
   setUnlockNameVisible(false);
   setUnlockStatus("One moment.", "muted");
+  if (unlockPanel?.dataset.surface === "lock-face") {
+    if (unlockFace) {
+      unlockFace.hidden = false;
+    }
+    if (unlockCard) {
+      unlockCard.hidden = true;
+    }
+    startUnlockClock();
+  }
 }
 
 function renderUnlockMode({ registered, guestRegistrationEnabled }) {
