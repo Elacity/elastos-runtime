@@ -7533,22 +7533,25 @@ assert(
   "Home must present guest enrollment as self-registration",
 );
 assert(
-  shellAuth.includes("startAutomaticPasskeySignIn") &&
-    shellAuth.includes("Choose your passkey."),
-  "Home sign-in must automatically ask for a passkey instead of requiring a duplicate continue click",
+  shellIndex.includes('id="home-unlock-person"') &&
+    shellIndex.includes('id="home-unlock-clock"') &&
+    shellAuth.includes("unlockPerson?.addEventListener") &&
+    shellAuth.includes("Choose your passkey.") &&
+    !shellAuth.includes("startAutomaticPasskeySignIn"),
+  "Home lock face starts the passkey ceremony on click; the OS dialog is not the first surface",
 );
 const renderUnlockCheckingBody = shellAuth.match(
   /function renderUnlockChecking\(\) \{[\s\S]*?\n\}/,
 )?.[0] || "";
 assert(
-  shellAuth.includes("if (registered) {\n      startAutomaticPasskeySignIn") &&
-    renderUnlockCheckingBody.includes("autoSignInAttempted = false") &&
+  renderUnlockCheckingBody.includes("autoSignInAttempted = false") &&
     !shellAuth.includes("AbortController") &&
     !shellAuth.includes('name === "AbortError"') &&
     !shellAuth.includes("guestRegistrationAvailable") &&
     !shellAuth.includes('registered && unlockPresentation === "modal"') &&
-    shellAuth.includes('unlockMode === "signin_guest_enabled" && guestRegistrationEnabled'),
-  "Home unsigned desktop unlock must stay aligned with the main passkey prompt behavior",
+    shellAuth.includes('unlockMode === "signin_guest_enabled"') &&
+    shellAuth.includes('unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral"'),
+  "Home signed unlock is the lock face; first-run create stays the passkey card",
 );
 assert(
   shellAuth.includes('unlockMode === "create_guest"') &&

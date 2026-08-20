@@ -117,6 +117,110 @@ img {
   display: none;
 }
 
+.home-unlock[data-surface="lock-face"],
+.home-unlock[data-surface="lock-face"][data-mode="prompt"] {
+  display: block;
+  padding: 0;
+  background:
+    linear-gradient(180deg, rgba(8, 10, 14, 0.32) 0%, rgba(8, 10, 14, 0.1) 42%, rgba(8, 10, 14, 0.5) 100%),
+    var(--home-unlock-ground, none) center / cover no-repeat #1a2a22;
+  backdrop-filter: none;
+}
+
+.home-unlock-face {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-height: 100dvh;
+  padding:
+    max(28px, env(safe-area-inset-top, 0))
+    24px
+    max(36px, env(safe-area-inset-bottom, 0));
+  color: #fff;
+  text-align: center;
+}
+
+.home-unlock-face[hidden] {
+  display: none;
+}
+
+.home-unlock-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.home-unlock-brand-mark {
+  width: 22px;
+  height: auto;
+}
+
+.home-unlock-brand-word {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+}
+
+.home-unlock-date {
+  margin: 28px 0 0;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 1.05rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.35);
+}
+
+.home-unlock-clock {
+  margin: 4px 0 0;
+  font-size: clamp(4.2rem, 13vw, 7.4rem);
+  font-weight: 500;
+  letter-spacing: -0.045em;
+  line-height: 0.92;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 2px 28px rgba(0, 0, 0, 0.35);
+}
+
+.home-unlock-person {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #fff;
+  cursor: pointer;
+}
+
+.home-unlock-person:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.home-unlock-person:active {
+  transform: scale(0.96);
+}
+
+.home-unlock-avatar {
+  width: 72px;
+  height: 72px;
+  border-radius: 999px;
+  background: rgba(8, 10, 14, 0.55);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+}
+
+.home-unlock-person-name {
+  font-size: 0.92rem;
+  font-weight: 550;
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.4);
+}
+
+.home-unlock-card[hidden] {
+  display: none;
+}
+
 .home-unlock[data-mode="prompt"] {
   inset: 0;
   display: grid;

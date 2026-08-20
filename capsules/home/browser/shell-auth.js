@@ -5,6 +5,7 @@ import {
 } from "./shell-core.js?v=home-20260802a";
 
 const unlockPanel = document.querySelector("#home-unlock");
+const unlockFace = document.querySelector(".home-unlock-face");
 const unlockCard = document.querySelector(".home-unlock-card");
 const unlockTitle = document.querySelector("#home-unlock-title");
 const unlockCopy = document.querySelector("#home-unlock-copy");
@@ -12,6 +13,10 @@ const unlockPrimary = document.querySelector("#home-unlock-primary");
 const unlockSecondary = document.querySelector("#home-unlock-secondary");
 const unlockStatus = document.querySelector("#home-unlock-status");
 const unlockName = document.querySelector("#home-unlock-name");
+const unlockDate = document.querySelector("#home-unlock-date");
+const unlockClock = document.querySelector("#home-unlock-clock");
+const unlockPerson = document.querySelector("#home-unlock-person");
+const unlockPersonName = document.querySelector("#home-unlock-person-name");
 
 let unlockMode = "signin";
 let unlockPresentation = "modal";
@@ -19,6 +24,8 @@ let unlockCallback = null;
 let busy = false;
 let sessionRefreshInFlight = null;
 let autoSignInAttempted = false;
+let unlockClockTimer = 0;
+let unlockPersonLabel = "";
 
 export function isHomeAuthError(error) {
   const status = Number(error && error.status);
@@ -32,15 +39,21 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
   if (!unlockPanel) {
     throw new Error("Home unlock surface is missing");
   }
+  unlockPersonLabel = typeof options.personName === "string" ? options.personName.trim() : "";
   document.body.dataset.homeStatus = unlockPresentation === "prompt" ? "ready" : "locked";
   unlockPanel.dataset.mode = unlockPresentation;
-  unlockPanel.dataset.surface = !forceNeutralSurface && document.body.dataset.homeShell === "desktop"
-    ? "desktop"
-    : "neutral";
+  unlockPanel.dataset.surface = forceNeutralSurface
+    ? "neutral"
+    : "lock-face";
+  unlockPanel.style.setProperty(
+    "--home-unlock-ground",
+    'url("/apps/home-gui/wallpaper.webp")',
+  );
   renderUnlockChecking();
   unlockPanel.hidden = false;
   unlockPanel.setAttribute("aria-hidden", "false");
   unlockCard?.setAttribute("aria-modal", "true");
+  startUnlockClock();
 
   if (!window.PublicKeyCredential) {
     unlockMode = "unsupported";
@@ -58,9 +71,6 @@ export async function showHomeUnlock(onUnlocked, options = {}) {
       : "create";
     renderUnlockMode({ registered, guestRegistrationEnabled });
     setUnlockStatus(unlockStatusCopy(registered, guestRegistrationEnabled), "muted");
-    if (registered) {
-      startAutomaticPasskeySignIn({ guestRegistrationEnabled });
-    }
   } catch (error) {
     unlockMode = "signin";
     renderUnlockMode({ registered: true, guestRegistrationEnabled: false });
@@ -78,16 +88,19 @@ export function hideHomeUnlock() {
   delete unlockPanel.dataset.surface;
   setUnlockNameVisible(false);
   setUnlockStatus("", "muted");
+  stopUnlockClock();
 }
 
 export function bindHomeUnlock() {
-  unlockPrimary?.addEventListener("click", () => {
+  const startUnlock = () => {
     if (unlockMode === "create" || unlockMode === "create_guest") {
       runPasskeyCreate().catch(reportUnlockError);
       return;
     }
     runPasskeySignIn().catch(reportUnlockError);
-  });
+  };
+  unlockPrimary?.addEventListener("click", startUnlock);
+  unlockPerson?.addEventListener("click", startUnlock);
   unlockSecondary?.addEventListener("click", () => {
     if (unlockMode === "signin_guest_enabled") {
       unlockMode = "create_guest";
@@ -98,7 +111,6 @@ export function bindHomeUnlock() {
       unlockMode = "signin_guest_enabled";
       autoSignInAttempted = false;
       renderUnlockMode({ registered: true, guestRegistrationEnabled: true });
-      startAutomaticPasskeySignIn({ guestRegistrationEnabled: true });
       return;
     }
     runPasskeySignIn().catch(reportUnlockError);
@@ -243,6 +255,24 @@ function renderUnlockMode({ registered, guestRegistrationEnabled }) {
     unlockSecondary.textContent = creatingGuest ? "Back to sign in" : "Create guest account";
   }
   setUnlockNameVisible(canCreate);
+  const showFace = registered && !creatingGuest && unlockMode !== "unsupported";
+  if (unlockPanel && !unlockPanel.hidden) {
+    unlockPanel.dataset.surface = showFace ? "lock-face" : "neutral";
+  }
+  if (unlockFace) {
+    unlockFace.hidden = !showFace;
+  }
+  if (unlockCard) {
+    unlockCard.hidden = showFace;
+  }
+  if (unlockPersonName) {
+    unlockPersonName.textContent = unlockPersonLabel;
+  }
+  if (showFace) {
+    startUnlockClock();
+  } else {
+    stopUnlockClock();
+  }
 }
 
 function unlockStatusCopy(registered, guestRegistrationEnabled) {
@@ -255,20 +285,36 @@ function unlockStatusCopy(registered, guestRegistrationEnabled) {
   return "";
 }
 
-async function startAutomaticPasskeySignIn({ guestRegistrationEnabled }) {
-  if (autoSignInAttempted || busy || unlockMode === "unsupported") {
+function startUnlockClock() {
+  if (!unlockDate && !unlockClock) {
     return;
   }
-  autoSignInAttempted = true;
-  try {
-    await runPasskeySignIn({ automatic: true });
-  } catch (error) {
-    if (unlockMode === "signin_guest_enabled" && guestRegistrationEnabled) {
-      renderUnlockMode({ registered: true, guestRegistrationEnabled: true });
-      setUnlockStatus("No passkey selected.", "muted");
-      return;
+  const tick = () => {
+    const now = new Date();
+    if (unlockDate) {
+      unlockDate.textContent = now.toLocaleDateString("en-GB", {
+        weekday: "short",
+        day: "numeric",
+        month: "short",
+      }).replace(/,/g, "");
     }
-    reportUnlockError(error);
+    if (unlockClock) {
+      unlockClock.textContent = now.toLocaleTimeString("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    }
+  };
+  tick();
+  if (!unlockClockTimer) {
+    unlockClockTimer = window.setInterval(tick, 15_000);
+  }
+}
+
+function stopUnlockClock() {
+  if (unlockClockTimer) {
+    window.clearInterval(unlockClockTimer);
+    unlockClockTimer = 0;
   }
 }
 
@@ -372,6 +418,9 @@ function reportUnlockError(error) {
 function setButtonsDisabled(disabled) {
   if (unlockPrimary) {
     unlockPrimary.disabled = disabled || unlockMode === "unsupported";
+  }
+  if (unlockPerson) {
+    unlockPerson.disabled = disabled || unlockMode === "unsupported";
   }
   if (unlockSecondary) {
     unlockSecondary.disabled = disabled && unlockMode !== "signin_guest_enabled";

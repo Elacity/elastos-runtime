@@ -186,6 +186,20 @@ function enterHostAuthGate() {
   stopHomeEventChannel();
 }
 
+function readUnlockPersonName() {
+  const identity = shellState.currentSummary?.identity;
+  const profileName = typeof identity?.profile?.display_name === "string"
+    ? identity.profile.display_name.trim()
+    : "";
+  if (profileName) {
+    return profileName;
+  }
+  const setupName = typeof identity?.profile_setup_display_name === "string"
+    ? identity.profile_setup_display_name.trim()
+    : "";
+  return setupName;
+}
+
 async function showHostAuthGate(options = {}) {
   enterHostAuthGate();
   const unlockReady = showHomeUnlock(async (response) => {
@@ -197,7 +211,7 @@ async function showHostAuthGate(options = {}) {
     }
   }, {
     ...options,
-    surface: "neutral",
+    personName: readUnlockPersonName(),
   });
   hideHostBootMask();
   await unlockReady;
@@ -1237,7 +1251,7 @@ window.addEventListener("message", (event) => {
       return;
     }
     replyToShellRequest(event, requestId, true);
-    showHostAuthGate({ presentation: "prompt", surface: "neutral" }).catch((error) => {
+    showHostAuthGate({ presentation: "prompt" }).catch((error) => {
       console.error("home unlock failed", error);
     });
     return;
