@@ -198,6 +198,10 @@ jobs:
     runs-on: windows-latest
     continue-on-error: true
     timeout-minutes: 90
+    env:
+      # Git Bash otherwise rewrites /api/... alignment patterns into C:\... paths.
+      MSYS_NO_PATHCONV: 1
+      MSYS2_ARG_CONV_EXCL: "*"
     defaults:
       run:
         shell: bash
