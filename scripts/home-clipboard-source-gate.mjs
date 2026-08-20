@@ -68,7 +68,7 @@ for (const capsuleName of readdirSync(capsulesRoot)) {
   }
   for (const file of productionBrowserFiles(browserRoot)) {
     const source = readFileSync(file, "utf8");
-    const path = relative(repoRoot, file);
+    const path = relative(repoRoot, file).replaceAll("\\", "/");
     if (directClipboardPattern.test(source)) {
       directAccess.push(path);
     }
