@@ -242,6 +242,7 @@ async fn setup_server_infrastructure_impl(
     };
 
     ensure_file_backed_roots(&data_dir).ok();
+    elastos_server::protected_content_runtime::log_unresolved_runtime_releases(&data_dir);
     let provider_registry = Arc::new(provider::ProviderRegistry::new());
     let mut managed_host_processes = Vec::new();
     let mut external_availability_registered = false;
@@ -946,6 +947,31 @@ async fn setup_server_infrastructure_impl(
                 }
                 Err(e) => tracing::warn!("Failed to spawn decrypt-provider: {}", e),
             }
+        }
+    }
+
+    if let Some(path) = crate::find_installed_provider_binary("custody-provider") {
+        if let Err(e) = verify_provider_binary("custody-provider", &path) {
+            tracing::warn!(
+                "Skipping custody-provider due to verification failure: {}",
+                e
+            );
+        } else if let Err(e) =
+            elastos_server::protected_content_runtime::register_inactive_custody_provider(
+                &provider_registry,
+                &path,
+                &data_dir,
+            )
+            .await
+        {
+            tracing::warn!(
+                "Failed to register inactive elastos://custody sub-provider: {}",
+                e
+            );
+        } else {
+            tracing::info!(
+                "custody-provider registered as inactive Runtime custody route; provisional key-provider remains the product path"
+            );
         }
     }
 

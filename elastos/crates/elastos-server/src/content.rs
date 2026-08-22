@@ -8203,9 +8203,8 @@ fn directory_object_manifest(
 
 fn validate_content_object_kind(kind: &str) -> Result<String, ProviderError> {
     match kind {
-        "capsule" | "directory" | "document" | "release" | "sealed" | "share" | "site" => {
-            Ok(kind.to_string())
-        }
+        "capsule" | "directory" | "document" | "protected-content" | "release" | "sealed"
+        | "share" | "site" => Ok(kind.to_string()),
         _ => Err(ProviderError::Provider(format!(
             "unsupported content object kind: {kind}"
         ))),

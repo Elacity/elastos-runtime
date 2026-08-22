@@ -19,6 +19,10 @@ elastos-tls = { path = "../elastos-tls" }
 elastos-identity = { path = "../elastos-identity" }
 elastos-crosvm = { path = "../elastos-crosvm" }
 elastos-wallet-contract = { path = "../elastos-wallet-contract" }
+elastos-protected-content-runtime = { path = "../elastos-protected-content-runtime" }
+elastos-protected-content-rights = { path = "../elastos-protected-content-rights" }
+elastos-protected-content-provider-contracts = { path = "../elastos-protected-content-provider-contracts" }
+elastos-protected-content-contracts = { path = "../elastos-protected-content-contracts" }
 
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }
@@ -115,6 +119,10 @@ tokio = { version = "1.0", features = ["full", "test-util"] }
 tempfile = "3.10"
 tower = { version = "0.5", features = ["util"] }
 wasm-encoder = "=0.236.1"
+elastos-auth = { path = "../elastos-auth" }
+elastos-protected-content-custody = { path = "../elastos-protected-content-custody" }
+x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
+custody-provider = { path = "../../../capsules/custody-provider" }
 
 [features]
 default = []

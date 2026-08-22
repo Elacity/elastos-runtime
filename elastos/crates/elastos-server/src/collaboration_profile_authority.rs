@@ -3,7 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, Context};
+use ed25519_dalek::Signer as _;
 use elastos_common::localhost::rooted_localhost_fs_path;
+use elastos_protected_content_contracts::{
+    CanonicalContract, ProfileIdentityV1, RecipientKeyAuthorizationContextV1,
+    RecipientKeyAuthorizationStatementV1, SignedRecipientKeyAuthorizationV1,
+};
 use elastos_runtime::signature::SigningKey;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -399,6 +404,58 @@ pub(crate) fn require_profile_authority_passkey_binding(
         anyhow::bail!("proof binding does not match the active principal");
     }
     Ok(())
+}
+
+/// Sign the sole protected-content authorization that may use a Profile key.
+///
+/// This deliberately exposes only the signed canonical authorization. The
+/// Profile signing key remains inside the protected authority bundle, and
+/// replay ownership stays with the Runtime release journal.
+pub(crate) fn sign_protected_content_recipient_key_authorization(
+    data_dir: &Path,
+    principal_id: &str,
+    localhost_root: &str,
+    proof_binding_id: &str,
+    statement: RecipientKeyAuthorizationStatementV1,
+    now_unix_seconds: u64,
+) -> anyhow::Result<SignedRecipientKeyAuthorizationV1> {
+    require_profile_authority_passkey_binding(data_dir, principal_id, Some(proof_binding_id))?;
+    if crate::auth::load_principal_root_protection(data_dir, principal_id, localhost_root)?
+        .is_none()
+    {
+        anyhow::bail!("protected principal root is required for profile authority");
+    }
+    let state = load_bundle_state(data_dir, principal_id, localhost_root)?
+        .ok_or_else(|| anyhow!("protected Profile authority bundle is missing"))?;
+    let profile_did = crate::crypto::encode_signing_key_did(&state.signing_key);
+    if state.verified.document().profile_did != profile_did {
+        anyhow::bail!("protected Profile authority DID does not match its signing key");
+    }
+    let profile_identity =
+        ProfileIdentityV1::from_public_key_bytes(state.signing_key.verifying_key().to_bytes())
+            .context("protected Profile authority key is invalid")?;
+    if statement.binding().profile() != profile_identity {
+        anyhow::bail!("recipient authorization Profile does not match active principal");
+    }
+    let canonical = statement
+        .canonical_bytes()
+        .context("recipient authorization statement is not canonical")?;
+    let context = RecipientKeyAuthorizationContextV1::new(
+        statement.binding().clone(),
+        statement.action(),
+        statement.recipient_public_key(),
+        statement.runtime_operation_issuer(),
+        now_unix_seconds,
+    );
+    let signed = SignedRecipientKeyAuthorizationV1::new(
+        statement,
+        state.signing_key.sign(&canonical).to_bytes().to_vec(),
+    )
+    .context("recipient authorization signature is invalid")?;
+    signed
+        .verify(&context)
+        .context("recipient authorization verification failed")?;
+    Ok(signed)
 }
 
 fn decode_profile_authority_bundle(

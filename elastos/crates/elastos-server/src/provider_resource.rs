@@ -844,6 +844,15 @@ mod tests {
             "the active provisional rights-provider mapping is preserved until product cutover"
         );
         assert!(
+            build_capability_resource("custody", "release_contribution", &serde_json::json!({}))
+                .is_err(),
+            "inactive custody registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource("custody", "status", &serde_json::json!({})).is_err(),
+            "inactive custody registration is Runtime-internal until product cutover"
+        );
+        assert!(
             build_capability_resource(
                 "chain",
                 "protected_content_rights_evidence",
