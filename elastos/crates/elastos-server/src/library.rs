@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -9,12 +9,13 @@ use anyhow::{anyhow, bail, Context as _};
 use base64::Engine as _;
 use elastos_common::localhost::rooted_localhost_fs_path;
 use elastos_common::protected_content::{
-    DecryptSessionRequestV1, KeyEnvelopeAlgorithmsV1, KeyEnvelopeV1, KeyReleaseRequestV1,
-    ReleaseReceiptV1, RightsDecisionReceiptV1, SealedObjectV1, ViewerRequirementV1,
-    DECRYPT_SESSION_REQUEST_SCHEMA, DECRYPT_SESSION_SCHEMA, DEFAULT_PROTECTED_CONTENT_CIPHER,
-    DEFAULT_PROTECTED_CONTENT_KEMS, DEFAULT_PROTECTED_CONTENT_SHARE_SCHEME,
-    DEFAULT_PROTECTED_CONTENT_SIGNATURES, KEY_RELEASE_REQUEST_SCHEMA, RELEASE_RECEIPT_SCHEMA,
-    RIGHTS_DECISION_RECEIPT_SCHEMA, SEALED_OBJECT_SCHEMA,
+    DecryptSessionRequestV1, KeyReleaseRequestV1, ReleaseReceiptV1, RightsDecisionReceiptV1,
+    SealedObjectV1, DECRYPT_SESSION_REQUEST_SCHEMA, DECRYPT_SESSION_SCHEMA,
+    KEY_RELEASE_REQUEST_SCHEMA, RELEASE_RECEIPT_SCHEMA, RIGHTS_DECISION_RECEIPT_SCHEMA,
+};
+use elastos_protected_content_provider_contracts::{
+    ValidatedClearFmp4MediaSessionLayoutV1, MAX_PROTECT_MEDIA_PART_BYTES_V1,
+    MAX_PROTECT_MEDIA_SEGMENTS_V1,
 };
 use elastos_runtime::provider::{
     Provider, ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderRegistry,
@@ -37,6 +38,10 @@ const LIBRARY_TRASH_RECORD_SCHEMA: &str = "elastos.library.trash-record/v1";
 const MAX_LIBRARY_EVENTS: usize = 256;
 const MAX_ARCHIVE_LIST_ENTRIES: usize = 512;
 const MAX_ARCHIVE_PREVIEW_BYTES: usize = 64 * 1024;
+const MAX_LIBRARY_PROTECTED_MEDIA_DECLARATION_BYTES: usize = 255;
+const RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE: &str = "Runtime custody publish input invalid";
+const RUNTIME_CUSTODY_PUBLISH_INACTIVE_MESSAGE: &str =
+    "Runtime custody publishing is not active yet";
 
 static LIBRARY_EVENT_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 
@@ -291,7 +296,7 @@ enum ObjectProviderRequest {
         #[serde(default)]
         if_revision: Option<String>,
         #[serde(default)]
-        protected_content_fixture: bool,
+        protection: Option<LibraryPublishProtectionRequest>,
     },
     Unpublish {
         principal_id: String,
@@ -320,6 +325,19 @@ enum ObjectProviderRequest {
         #[serde(default)]
         recipient_proof: Option<Value>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum LibraryPublishProtectionRequest {
+    RuntimeCustody { mime_type: String, codecs: String },
+}
+
+struct LoadedRuntimeCustodyPublishInput {
+    mime_type: String,
+    codecs: String,
+    clear_init_segment: Vec<u8>,
+    clear_segments: Vec<Vec<u8>>,
 }
 
 pub struct ObjectProvider {
@@ -361,7 +379,7 @@ impl Provider for ObjectProvider {
                 principal_id,
                 uri,
                 if_revision,
-                protected_content_fixture,
+                protection,
             } => {
                 let Some(registry) = self.registry.upgrade() else {
                     return Ok(provider_error(
@@ -375,7 +393,7 @@ impl Provider for ObjectProvider {
                     &principal_id,
                     &uri,
                     if_revision.as_deref(),
-                    protected_content_fixture,
+                    protection,
                 )
                 .await
             }
@@ -627,7 +645,7 @@ pub async fn handle_object_provider_runtime_request(
             principal_id,
             uri,
             if_revision,
-            protected_content_fixture,
+            protection,
         } => {
             library_publish(
                 &data_dir,
@@ -635,7 +653,7 @@ pub async fn handle_object_provider_runtime_request(
                 &principal_id,
                 &uri,
                 if_revision.as_deref(),
-                protected_content_fixture,
+                protection,
             )
             .await
         }
@@ -1746,10 +1764,21 @@ async fn library_publish(
     principal_id: &str,
     uri: &str,
     if_revision: Option<&str>,
-    protected_content_fixture: bool,
+    protection: Option<LibraryPublishProtectionRequest>,
 ) -> anyhow::Result<Value> {
     let target = library_target(data_dir, principal_id, uri)?;
     check_revision(data_dir, principal_id, &target.uri, if_revision)?;
+    if let Some(protection) = protection {
+        let _loaded_input =
+            validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
+        let LoadedRuntimeCustodyPublishInput {
+            mime_type: _,
+            codecs: _,
+            clear_init_segment: _,
+            clear_segments: _,
+        } = _loaded_input;
+        bail!(RUNTIME_CUSTODY_PUBLISH_INACTIVE_MESSAGE);
+    }
     if !target.path.is_file() {
         bail!("library publish currently supports files only");
     }
@@ -1790,65 +1819,16 @@ async fn library_publish(
         .filter(|cid| !cid.trim().is_empty())
         .ok_or_else(|| anyhow!("content publish response missing cid"))?
         .to_string();
-    let (cid, receipt, availability, content_security) = if protected_content_fixture {
-        let content_security =
-            protected_content_fixture_security(data_dir, principal_id, &target, &payload_cid)?;
-        let sealed = protected_content_sealed_object_from_security(&content_security)?;
-        let sealed_publish_request = protected_content_fixture_publish_request(
-            principal_id,
-            &target,
-            &sealed,
-            data.get("availability"),
-        )?;
-        let sealed_response = registry
-            .send_raw("content", &sealed_publish_request)
-            .await
-            .map_err(|err| anyhow!("content provider unavailable: {err}"))?;
-        if sealed_response.get("status").and_then(Value::as_str) == Some("error") {
-            let message = sealed_response
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("sealed content publish failed");
-            bail!("sealed content publish failed: {message}");
-        }
-        let sealed_data = sealed_response
-            .get("data")
-            .cloned()
-            .ok_or_else(|| anyhow!("sealed content publish response missing data"))?;
-        let sealed_cid = sealed_data
-            .get("cid")
-            .and_then(Value::as_str)
-            .filter(|cid| !cid.trim().is_empty())
-            .ok_or_else(|| anyhow!("sealed content publish response missing cid"))?
-            .to_string();
-        let mut content_security = content_security;
-        if let Some(object) = content_security.as_object_mut() {
-            object.insert("sealed_cid".to_string(), Value::String(sealed_cid.clone()));
-        }
-        (
-            sealed_cid,
-            sealed_data
-                .get("receipt")
-                .cloned()
-                .unwrap_or_else(|| json!({"status": "not_provided"})),
-            sealed_data
-                .get("availability")
-                .cloned()
-                .unwrap_or_else(|| json!({"status": "unknown"})),
-            content_security,
-        )
-    } else {
-        (
-            payload_cid,
-            data.get("receipt")
-                .cloned()
-                .unwrap_or_else(|| json!({"status": "not_provided"})),
-            data.get("availability")
-                .cloned()
-                .unwrap_or_else(|| json!({"status": "unknown"})),
-            published_content_security(data_dir, principal_id, &target)?,
-        )
-    };
+    let cid = payload_cid;
+    let receipt = data
+        .get("receipt")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "not_provided"}));
+    let availability = data
+        .get("availability")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "unknown"}));
+    let content_security = published_content_security(data_dir, principal_id, &target)?;
     let record = LibraryPublishRecord {
         schema: "elastos.library.publish-record/v1".to_string(),
         object_uri: target.uri.clone(),
@@ -5567,7 +5547,6 @@ async fn protected_content_provider_status(registry: &ProviderRegistry) -> Value
         "encrypted_recipient_sharing": {
             "schema": "elastos.library.encrypted-recipient-sharing-readiness/v1",
             "providers_ready": provider_chain_ready,
-            "protected_content_fixture_ready": true,
             "production_encrypted_publish_mode_ready": false,
             "status": if provider_chain_ready {
                 "provider_chain_ready"
@@ -5576,9 +5555,9 @@ async fn protected_content_provider_status(registry: &ProviderRegistry) -> Value
             },
             "required_published_payload": "encrypted_recipient_content",
             "next": if provider_chain_ready {
-                "Use protected_content_fixture for non-production receipt-chain tests. Production encrypted_recipient_content still requires real dDRM/dKMS payload encryption."
+                "Protected-content provider chain is configured. Runtime custody publish mode remains inactive until the protected publish path is activated."
             } else {
-                "Configure drm/rights/key/decrypt providers before encrypted recipient sharing can release keys."
+                "Configure drm/rights/key/decrypt providers before protected-content key release can proceed."
             }
         }
     })
@@ -5685,118 +5664,160 @@ fn published_content_security(
     }))
 }
 
-fn protected_content_fixture_security(
+fn validate_runtime_custody_publish_input(
     data_dir: &Path,
     principal_id: &str,
     target: &LibraryTarget,
-    payload_cid: &str,
-) -> anyhow::Result<Value> {
-    let source_storage = if crate::auth::load_principal_root_protection(
-        data_dir,
-        principal_id,
-        &target.localhost_root,
-    )?
-    .is_some()
+    protection: LibraryPublishProtectionRequest,
+) -> anyhow::Result<LoadedRuntimeCustodyPublishInput> {
+    let LibraryPublishProtectionRequest::RuntimeCustody { mime_type, codecs } = protection;
+    validate_runtime_custody_media_declaration(&mime_type, "mime_type")?;
+    validate_runtime_custody_media_declaration(&codecs, "codecs")?;
+
+    let target_metadata = fs::symlink_metadata(&target.path)
+        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+
+    let mut saw_init = false;
+    let mut saw_segments = false;
+    for entry in fs::read_dir(&target.path)
+        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?
     {
-        "protected_principal_root"
-    } else {
-        "plain_localhost_root"
-    };
-    let policy_hash = format!(
-        "sha256:{}",
-        hex::encode(Sha256::digest(format!("{}:{payload_cid}:view", target.uri)))
-    );
-    let sealed_object = SealedObjectV1 {
-        schema: SEALED_OBJECT_SCHEMA.to_string(),
-        payload_cid: payload_cid.to_string(),
-        rights_policy_cid: payload_cid.to_string(),
-        availability_receipt_cid: payload_cid.to_string(),
-        key_envelope: KeyEnvelopeV1 {
-            scheme: "elastos-pq-hybrid-threshold-v0".to_string(),
-            kid: format!("kid:library:{}", &policy_hash["sha256:".len()..24]),
-            wrapped_cek: format!(
-                "fixture-wrapped:{}",
-                hex::encode(Sha256::digest(payload_cid.as_bytes()))
-            ),
-            policy_hash,
-            algorithms: KeyEnvelopeAlgorithmsV1 {
-                cipher: DEFAULT_PROTECTED_CONTENT_CIPHER.to_string(),
-                signature: DEFAULT_PROTECTED_CONTENT_SIGNATURES
-                    .iter()
-                    .map(|algorithm| algorithm.to_string())
-                    .collect(),
-                kem: DEFAULT_PROTECTED_CONTENT_KEMS
-                    .iter()
-                    .map(|algorithm| algorithm.to_string())
-                    .collect(),
-                share_scheme: DEFAULT_PROTECTED_CONTENT_SHARE_SCHEME.to_string(),
-            },
-        },
-        viewer: ViewerRequirementV1 {
-            required_interface: "elastos.viewer/document@1".to_string(),
-        },
-    };
-    Ok(json!({
-        "schema": "elastos.library.published-content-security/v1",
-        "object_uri": target.uri,
-        "source_storage": source_storage,
-        "published_payload": "protected_content_fixture",
-        "payload_cid": payload_cid,
-        "sealed_cid": null,
-        "sealed_object": sealed_object,
-        "key_release_required": true,
-        "status": "protected_content_fixture_requires_provider_receipt_chain",
-        "production_encryption": false,
-        "required_providers": protected_content_provider_requirements(true),
-        "authority_boundary": "This fixture proves the Runtime protected-content receipt chain. It does not claim production dDRM/dKMS encryption.",
-        "next": "Replace protected_content_fixture with production encrypted_recipient_content once real rights, dKMS, decrypt, and storage policies are configured."
-    }))
+        let entry = entry.map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+        if metadata.file_type().is_symlink() {
+            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+        }
+        match name.as_str() {
+            "init.mp4" if metadata.is_file() => saw_init = true,
+            "segments" if metadata.is_dir() => saw_segments = true,
+            _ => bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE),
+        }
+    }
+    if !saw_init || !saw_segments {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+
+    let init_target = library_target(data_dir, principal_id, &format!("{}/init.mp4", target.uri))?;
+    let clear_init =
+        read_runtime_custody_publish_part(data_dir, principal_id, &init_target, false)?;
+    let session = ValidatedClearFmp4MediaSessionLayoutV1::new(&clear_init)
+        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+
+    let segments_target =
+        library_target(data_dir, principal_id, &format!("{}/segments", target.uri))?;
+    let segments_metadata = fs::symlink_metadata(&segments_target.path)
+        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+    if segments_metadata.file_type().is_symlink() || !segments_metadata.is_dir() {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+
+    let mut segment_bytes = BTreeMap::new();
+    for entry in fs::read_dir(&segments_target.path)
+        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?
+    {
+        let entry = entry.map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+        }
+        let index = parse_runtime_custody_segment_name(&name)?;
+        let segment_target = library_target(
+            data_dir,
+            principal_id,
+            &format!("{}/segments/{name}", target.uri),
+        )?;
+        let clear_segment =
+            read_runtime_custody_publish_part(data_dir, principal_id, &segment_target, true)?;
+        session
+            .validate_segment(&clear_segment)
+            .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+        if segment_bytes.insert(index, clear_segment).is_some() {
+            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+        }
+    }
+    if segment_bytes.is_empty() || segment_bytes.len() > MAX_PROTECT_MEDIA_SEGMENTS_V1 as usize {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+    let mut clear_segments = Vec::with_capacity(segment_bytes.len());
+    for (expected, (actual, bytes)) in segment_bytes.into_iter().enumerate() {
+        if actual != expected as u32 {
+            bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+        }
+        clear_segments.push(bytes);
+    }
+    Ok(LoadedRuntimeCustodyPublishInput {
+        mime_type,
+        codecs,
+        clear_init_segment: clear_init,
+        clear_segments,
+    })
 }
 
-fn protected_content_fixture_publish_request(
+fn validate_runtime_custody_media_declaration(
+    value: &str,
+    field: &'static str,
+) -> anyhow::Result<()> {
+    let valid = !value.is_empty()
+        && value.len() <= MAX_LIBRARY_PROTECTED_MEDIA_DECLARATION_BYTES
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| matches!(*byte, 0x21..=0x7e));
+    if !valid {
+        bail!("invalid protected publish {field}");
+    }
+    Ok(())
+}
+
+fn read_runtime_custody_publish_part(
+    data_dir: &Path,
     principal_id: &str,
     target: &LibraryTarget,
-    sealed_object: &SealedObjectV1,
-    availability: Option<&Value>,
-) -> anyhow::Result<Value> {
-    let sealed_data =
-        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(sealed_object)?);
-    Ok(json!({
-        "op": "publish",
-        "kind": "directory",
-        "object_kind": "sealed",
-        "files": [
-            {
-                "path": "sealed.json",
-                "data": sealed_data
-            }
-        ],
-        "links": [
-            {
-                "rel": "availability.receipt",
-                "cid": sealed_object.availability_receipt_cid
-            },
-            {
-                "rel": "payload",
-                "cid": sealed_object.payload_cid
-            },
-            {
-                "rel": "provenance",
-                "cid": sealed_object.payload_cid
-            },
-            {
-                "rel": "rights.policy",
-                "cid": sealed_object.rights_policy_cid
-            }
-        ],
-        "pin": true,
-        "publisher_did": principal_id,
-        "metadata": {
-            "source_uri": target.uri,
-            "availability": availability.cloned().unwrap_or_else(|| json!({"status": "unknown"})),
-            "fixture": "protected-content-receipt-chain"
-        }
-    }))
+    require_non_empty: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let metadata = fs::metadata(&target.path)
+        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+    if metadata.len() > MAX_PROTECT_MEDIA_PART_BYTES_V1 as u64
+        || (require_non_empty && metadata.len() == 0)
+    {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+    let bytes = read_library_file_bytes(data_dir, principal_id, target)
+        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+    if bytes.len() > MAX_PROTECT_MEDIA_PART_BYTES_V1 || (require_non_empty && bytes.is_empty()) {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+    Ok(bytes)
+}
+
+fn parse_runtime_custody_segment_name(name: &str) -> anyhow::Result<u32> {
+    if name.len() != "00000000.m4s".len() || !name.ends_with(".m4s") {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+    let digits = &name[..8];
+    if !digits.as_bytes().iter().all(u8::is_ascii_digit) {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+    let index = digits
+        .parse::<u32>()
+        .map_err(|_| anyhow!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE))?;
+    if index >= MAX_PROTECT_MEDIA_SEGMENTS_V1 {
+        bail!(RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE);
+    }
+    Ok(index)
 }
 
 fn protected_content_sealed_object_from_security(

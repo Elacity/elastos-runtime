@@ -29,9 +29,286 @@ async fn post_library(
     let payload = if bytes.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::from_slice(&bytes).unwrap()
+        serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            panic!(
+                "invalid json response (status={status}): {err}; body={}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
     };
     (status, payload)
+}
+
+fn make_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
+    let size = (8 + content.len()) as u32;
+    let mut out = Vec::with_capacity(size as usize);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(box_type);
+    out.extend_from_slice(content);
+    out
+}
+
+fn make_fullbox(box_type: &[u8; 4], flags: u32, payload: &[u8]) -> Vec<u8> {
+    let mut content = vec![0u8];
+    content.extend_from_slice(&flags.to_be_bytes()[1..]);
+    content.extend_from_slice(payload);
+    make_box(box_type, &content)
+}
+
+fn make_clear_track(track_id: u32, handler_type: &[u8; 4]) -> Vec<u8> {
+    let mut tkhd_payload = vec![0u8; 12];
+    tkhd_payload[8..12].copy_from_slice(&track_id.to_be_bytes());
+    let tkhd = make_fullbox(b"tkhd", 0, &tkhd_payload);
+    let mut hdlr_payload = vec![0u8; 4];
+    hdlr_payload.extend_from_slice(handler_type);
+    let hdlr = make_fullbox(b"hdlr", 0, &hdlr_payload);
+    let (entry_type, fixed) = match handler_type {
+        b"vide" => (b"avc1", 78usize),
+        b"soun" => (b"mp4a", 28usize),
+        _ => panic!("unsupported handler"),
+    };
+    let entry = make_box(entry_type, &vec![0u8; fixed]);
+    let mut stsd_payload = vec![0u8; 4];
+    stsd_payload.extend_from_slice(&1u32.to_be_bytes());
+    stsd_payload.extend_from_slice(&entry);
+    let stsd = make_box(b"stsd", &stsd_payload);
+    let stbl = make_box(b"stbl", &stsd);
+    let minf = make_box(b"minf", &stbl);
+    let mut mdia_content = Vec::new();
+    mdia_content.extend_from_slice(&hdlr);
+    mdia_content.extend_from_slice(&minf);
+    let mdia = make_box(b"mdia", &mdia_content);
+    let mut trak_content = Vec::new();
+    trak_content.extend_from_slice(&tkhd);
+    trak_content.extend_from_slice(&mdia);
+    make_box(b"trak", &trak_content)
+}
+
+fn make_clear_segment(track_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut tfhd_payload = Vec::new();
+    tfhd_payload.extend_from_slice(&track_id.to_be_bytes());
+    tfhd_payload.extend_from_slice(&1u32.to_be_bytes());
+    tfhd_payload.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    tfhd_payload.extend_from_slice(&0u32.to_be_bytes());
+    let tfhd = make_fullbox(b"tfhd", 0x020038, &tfhd_payload);
+    let tfdt = make_fullbox(b"tfdt", 0, &1u32.to_be_bytes());
+    let mut trun_payload = Vec::new();
+    trun_payload.extend_from_slice(&1u32.to_be_bytes());
+    trun_payload.extend_from_slice(&0i32.to_be_bytes());
+    trun_payload.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    let trun = make_fullbox(b"trun", 0x000201, &trun_payload);
+    let mut traf_content = Vec::new();
+    traf_content.extend_from_slice(&tfhd);
+    traf_content.extend_from_slice(&tfdt);
+    traf_content.extend_from_slice(&trun);
+    let traf = make_box(b"traf", &traf_content);
+    let mfhd = make_fullbox(b"mfhd", 0, &1u32.to_be_bytes());
+    let mut moof_content = Vec::new();
+    moof_content.extend_from_slice(&mfhd);
+    moof_content.extend_from_slice(&traf);
+    let mut moof = make_box(b"moof", &moof_content);
+    let data_offset = (moof.len() + 8) as i32;
+    let trun_offset = moof
+        .windows(4)
+        .position(|window| window == b"trun")
+        .expect("trun box present")
+        - 4;
+    let trun_data_offset_at = trun_offset + 16;
+    moof[trun_data_offset_at..trun_data_offset_at + 4].copy_from_slice(&data_offset.to_be_bytes());
+    let mdat = make_box(b"mdat", payload);
+    let mut out = moof;
+    out.extend_from_slice(&mdat);
+    out
+}
+
+fn clear_runtime_custody_media(seed: u8) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let ftyp = make_box(b"ftyp", b"isom\0\0\0\0isomiso6");
+    let trak_video = make_clear_track(1, b"vide");
+    let trak_audio = make_clear_track(2, b"soun");
+    let trex_video = make_fullbox(
+        b"trex",
+        0,
+        &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let trex_audio = make_fullbox(
+        b"trex",
+        0,
+        &[0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let mut mvex_content = Vec::new();
+    mvex_content.extend_from_slice(&trex_video);
+    mvex_content.extend_from_slice(&trex_audio);
+    let mvex = make_box(b"mvex", &mvex_content);
+    let mvhd = make_box(b"mvhd", &[0u8; 4]);
+    let mut moov_content = Vec::new();
+    moov_content.extend_from_slice(&mvhd);
+    moov_content.extend_from_slice(&trak_video);
+    moov_content.extend_from_slice(&trak_audio);
+    moov_content.extend_from_slice(&mvex);
+    let moov = make_box(b"moov", &moov_content);
+    let clear_segments = [0usize, 1]
+        .into_iter()
+        .map(|index| {
+            let track_id = if index % 2 == 0 { 1 } else { 2 };
+            let payload = vec![
+                seed,
+                track_id as u8,
+                (index & 0xff) as u8,
+                ((index >> 8) & 0xff) as u8,
+                b's',
+                b'e',
+                b'g',
+                b'x',
+            ];
+            make_clear_segment(track_id, &payload)
+        })
+        .collect();
+    ([ftyp, moov].concat(), clear_segments)
+}
+
+fn library_object_path(data_dir: &std::path::Path, uri: &str) -> std::path::PathBuf {
+    elastos_common::localhost::rooted_localhost_fs_path(data_dir, uri).unwrap()
+}
+
+fn library_publish_records_dir(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+) -> std::path::PathBuf {
+    let root = crate::auth::principal_localhost_root(principal_id);
+    library_object_path(
+        data_dir,
+        &format!("{root}/.AppData/LocalHost/.Runtime/Library/Published"),
+    )
+}
+
+fn assert_no_publish_records(data_dir: &std::path::Path, principal_id: &str) {
+    let records_dir = library_publish_records_dir(data_dir, principal_id);
+    if records_dir.exists() {
+        assert!(std::fs::read_dir(records_dir).unwrap().next().is_none());
+    }
+}
+
+async fn write_library_bytes(app: &axum::Router, token: &str, uri: &str, bytes: &[u8]) {
+    let (status, payload) = post_library(
+        app.clone(),
+        token,
+        "write",
+        json!({
+            "uri": uri,
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+}
+
+async fn create_runtime_custody_publish_directory(
+    data_dir: &std::path::Path,
+    app: &axum::Router,
+    token: &str,
+    directory_uri: &str,
+    seed: u8,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let directory_path = library_object_path(data_dir, directory_uri);
+    std::fs::create_dir_all(directory_path.join("segments")).unwrap();
+    let (init, segments) = clear_runtime_custody_media(seed);
+    write_library_bytes(app, token, &format!("{directory_uri}/init.mp4"), &init).await;
+    for (index, segment) in segments.iter().enumerate() {
+        write_library_bytes(
+            app,
+            token,
+            &format!("{directory_uri}/segments/{index:08}.m4s"),
+            segment,
+        )
+        .await;
+    }
+    (init, segments)
+}
+
+async fn publish_runtime_custody(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+) -> (StatusCode, serde_json::Value) {
+    post_library(
+        app.clone(),
+        token,
+        "publish",
+        json!({
+            "uri": uri,
+            "protection": {
+                "mode": "runtime_custody",
+                "mime_type": "video/mp4",
+                "codecs": "avc1.64001f,mp4a.40.2"
+            }
+        }),
+    )
+    .await
+}
+
+async fn assert_invalid_runtime_custody_media_declaration(
+    data_dir: &std::path::Path,
+    app: &axum::Router,
+    token: &str,
+    principal_id: &str,
+    uri: &str,
+    field: &str,
+    value: &str,
+    expected_message: &str,
+) {
+    let mut protection = serde_json::Map::new();
+    protection.insert(
+        "mode".into(),
+        serde_json::Value::String("runtime_custody".into()),
+    );
+    protection.insert(
+        "mime_type".into(),
+        serde_json::Value::String("video/mp4".into()),
+    );
+    protection.insert(
+        "codecs".into(),
+        serde_json::Value::String("avc1.64001f,mp4a.40.2".into()),
+    );
+    protection.insert(field.into(), serde_json::Value::String(value.to_string()));
+    let (publish_status, publish) = post_library(
+        app.clone(),
+        token,
+        "publish",
+        json!({
+            "uri": uri,
+            "protection": serde_json::Value::Object(protection),
+        }),
+    )
+    .await;
+    assert_eq!(publish_status, StatusCode::OK);
+    assert_eq!(publish["status"], "error");
+    let message = publish["message"].as_str().unwrap();
+    assert_eq!(message, expected_message);
+    assert!(!message.contains(uri));
+    assert!(!message.contains(&data_dir.display().to_string()));
+    assert_no_publish_records(data_dir, principal_id);
+}
+
+async fn assert_runtime_custody_publish_error(
+    data_dir: &std::path::Path,
+    app: &axum::Router,
+    token: &str,
+    principal_id: &str,
+    uri: &str,
+    expected_message: &str,
+) -> serde_json::Value {
+    let (status, payload) = publish_runtime_custody(app, token, uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    let message = payload["message"].as_str().unwrap();
+    assert_eq!(message, expected_message);
+    let payload_text = payload.to_string();
+    assert!(!payload_text.contains(uri));
+    assert!(!payload_text.contains(&data_dir.display().to_string()));
+    assert!(!payload_text.contains("segx"));
+    assert_no_publish_records(data_dir, principal_id);
+    payload
 }
 
 async fn put_library_upload(
@@ -5388,206 +5665,423 @@ async fn test_library_provider_rejects_key_release_policy_until_provider_exists(
 }
 
 #[tokio::test]
-async fn test_library_provider_runs_protected_content_receipt_chain_for_recipient() {
+async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_protection_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(library_protected_content_test_state(dir.path()).await);
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
     let root = crate::auth::principal_localhost_root(&authority.principal_id);
-    let uri = format!("{root}/Documents/protected-fixture.txt");
+    let uri = format!("{root}/Documents/rejected-protected-input");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &uri, 0x40).await;
 
-    let (write_status, _) = post_library(
-        app.clone(),
-        &token,
-        "write",
-        json!({
-            "uri": uri,
-            "data": base64::engine::general_purpose::STANDARD.encode(b"protected fixture"),
-        }),
-    )
-    .await;
-    assert_eq!(write_status, StatusCode::OK);
+    let rejection_cases = [
+        (
+            json!({
+                "uri": uri,
+                "protected_content_fixture": true,
+            }),
+            "protected_content_fixture",
+        ),
+        (
+            json!({
+                "uri": uri,
+                "protection": {
+                    "mode": "fixture",
+                    "mime_type": "video/mp4",
+                    "codecs": "avc1.64001f,mp4a.40.2"
+                }
+            }),
+            "unknown variant `fixture`",
+        ),
+        (
+            json!({
+                "uri": uri,
+                "protection": {
+                    "mode": "runtime_custody",
+                    "mime_type": "video/mp4",
+                    "codecs": "avc1.64001f,mp4a.40.2",
+                    "extra": true
+                }
+            }),
+            "unknown field `extra`",
+        ),
+    ];
 
-    let (publish_status, publish) = post_library(
-        app.clone(),
-        &token,
-        "publish",
-        json!({
-            "uri": uri,
-            "protected_content_fixture": true,
-        }),
-    )
-    .await;
-    assert_eq!(publish_status, StatusCode::OK);
-    assert_eq!(publish["status"], "ok");
-    assert_eq!(
-        publish["data"]["content_security"]["published_payload"],
-        "protected_content_fixture"
-    );
-    assert_eq!(
-        publish["data"]["content_security"]["key_release_required"],
-        true
-    );
-    assert_eq!(
-        publish["data"]["content_security"]["production_encryption"],
-        false
-    );
-    assert_eq!(
-        publish["data"]["content_security"]["sealed_object"]["schema"],
-        "elastos.sealed.object/v1"
-    );
+    for (body, expected_fragment) in rejection_cases {
+        let (publish_status, publish) = post_library(app.clone(), &token, "publish", body).await;
+        assert_eq!(publish_status, StatusCode::OK);
+        assert_eq!(publish["status"], "error");
+        let message = publish["message"].as_str().unwrap();
+        assert!(message.contains(expected_fragment), "{publish}");
+        assert!(!message.contains(&uri));
+        assert!(!message.contains(&dir.path().display().to_string()));
+        assert_no_publish_records(dir.path(), &authority.principal_id);
+    }
 
-    let (share_status, share) = post_library(
-        app.clone(),
-        &token,
-        "share",
-        json!({
-            "uri": uri,
-            "recipients": [authority.principal_id],
-            "key_release_policy": "recipient_key_release",
-        }),
-    )
-    .await;
-    assert_eq!(share_status, StatusCode::OK);
-    assert_eq!(share["status"], "ok");
-    assert_eq!(share["data"]["policy"], "recipient_scoped");
-    assert_eq!(share["data"]["key_release"]["required"], true);
-    assert_eq!(
-        share["data"]["key_release"]["status"],
-        "provider_receipt_chain_required"
-    );
-    assert_eq!(
-        share["data"]["protected_content"]["configured_provider_count"],
-        4
-    );
-    assert_eq!(
-        share["data"]["protected_content"]["encrypted_recipient_sharing"]["status"],
-        "provider_chain_ready"
-    );
-
-    let (access_status, access) = post_library(
-        app.clone(),
-        &token,
-        "shared_access",
-        json!({
-            "uri": uri,
-            "recipient": authority.principal_id,
-        }),
-    )
-    .await;
-    assert_eq!(access_status, StatusCode::OK);
-    assert_eq!(
-        access["status"], "ok",
-        "protected access response: {access}"
-    );
-    assert_eq!(
-        access["data"]["access"]["open"]["status"],
-        "ready_for_protected_viewer_session"
-    );
-    assert_eq!(
-        access["data"]["access"]["open"]["provider"],
-        "decrypt-provider"
-    );
-    assert_eq!(
-        access["data"]["access"]["open"]["transport"],
-        "runtime-protected-provider-chain"
-    );
-    let protected = &access["data"]["access"]["open"]["protected_content"];
-    assert_eq!(protected["schema"], "elastos.library.protected-open/v1");
-    assert_eq!(
-        protected["drm_receipt"]["schema"],
-        "elastos.drm.open.receipt/v1"
-    );
-    assert_eq!(
-        protected["rights_receipt"]["schema"],
-        "elastos.rights.decision.receipt/v1"
-    );
-    assert_eq!(protected["rights_receipt"]["allowed"], true);
-    assert_eq!(
-        protected["key_release_receipt"]["schema"],
-        "elastos.release.receipt/v1"
-    );
-    assert_eq!(protected["key_release_receipt"]["provider"], "key-provider");
-    assert_eq!(
-        protected["decrypt_session"]["schema"],
-        "elastos.decrypt.session/v1"
-    );
-    assert_eq!(
-        protected["viewer"]["required_interface"],
-        "elastos.viewer/document@1"
-    );
-    assert_eq!(protected["raw_cek_exposed"], false);
-    assert_eq!(protected["raw_plaintext_exposed"], false);
-    let protected_text = protected.to_string();
-    assert!(!protected_text.contains("fixture-wrapped"));
-    assert!(!protected_text.contains("provider_credentials"));
+    let overlong = "x".repeat(256);
+    for (field, value, expected_message) in [
+        ("mime_type", "", "invalid protected publish mime_type"),
+        (
+            "mime_type",
+            "video/mp4 ",
+            "invalid protected publish mime_type",
+        ),
+        (
+            "mime_type",
+            overlong.as_str(),
+            "invalid protected publish mime_type",
+        ),
+        ("codecs", "", "invalid protected publish codecs"),
+        (
+            "codecs",
+            "avc1.64001f, mp4a.40.2",
+            "invalid protected publish codecs",
+        ),
+        (
+            "codecs",
+            overlong.as_str(),
+            "invalid protected publish codecs",
+        ),
+    ] {
+        assert_invalid_runtime_custody_media_declaration(
+            dir.path(),
+            &app,
+            &token,
+            &authority.principal_id,
+            &uri,
+            field,
+            value,
+            expected_message,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
-async fn test_library_protected_shared_access_fails_closed_without_providers() {
+async fn test_library_provider_runtime_custody_publish_reaches_inactive_boundary_without_dispatch_or_record(
+) {
     let dir = tempfile::tempdir().unwrap();
-    let app = gateway_router(library_test_state(dir.path()).await);
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
     let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
     let root = crate::auth::principal_localhost_root(&authority.principal_id);
-    let uri = format!("{root}/Documents/protected-missing-providers.txt");
+    let uri = format!("{root}/Documents/protected-clear-media");
+    let directory_path = library_object_path(dir.path(), &uri);
+    std::fs::create_dir_all(directory_path.join("segments")).unwrap();
 
-    let (write_status, _) = post_library(
-        app.clone(),
+    let (init, segments) = clear_runtime_custody_media(0x41);
+    write_library_bytes(&app, &token, &format!("{uri}/init.mp4"), &init).await;
+    for index in (0..segments.len()).rev() {
+        write_library_bytes(
+            &app,
+            &token,
+            &format!("{uri}/segments/{index:08}.m4s"),
+            &segments[index],
+        )
+        .await;
+    }
+
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
         &token,
-        "write",
-        json!({
-            "uri": uri,
-            "data": base64::engine::general_purpose::STANDARD.encode(b"protected fixture"),
-        }),
+        &authority.principal_id,
+        &uri,
+        "Runtime custody publishing is not active yet",
     )
     .await;
-    assert_eq!(write_status, StatusCode::OK);
+    assert!(!dir.path().join("protected-content/runtime-mint").exists());
+}
 
-    let (publish_status, publish) = post_library(
-        app.clone(),
+#[tokio::test]
+async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_layouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let root = crate::auth::principal_localhost_root(&authority.principal_id);
+    let invalid_message = "Runtime custody publish input invalid";
+
+    let file_uri = format!("{root}/Documents/protected-file-target.mp4");
+    write_library_bytes(&app, &token, &file_uri, b"not a directory").await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
         &token,
-        "publish",
-        json!({
-            "uri": uri,
-            "protected_content_fixture": true,
-        }),
+        &authority.principal_id,
+        &file_uri,
+        invalid_message,
     )
     .await;
-    assert_eq!(publish_status, StatusCode::OK);
-    assert_eq!(publish["status"], "ok");
 
-    let (share_status, share) = post_library(
-        app.clone(),
+    let missing_init_uri = format!("{root}/Documents/protected-missing-init");
+    let missing_init_path = library_object_path(dir.path(), &missing_init_uri);
+    std::fs::create_dir_all(missing_init_path.join("segments")).unwrap();
+    let (_, missing_init_segments) = clear_runtime_custody_media(0x52);
+    write_library_bytes(
+        &app,
         &token,
-        "share",
-        json!({
-            "uri": uri,
-            "recipients": [authority.principal_id],
-            "key_release_policy": "recipient_key_release",
-        }),
+        &format!("{missing_init_uri}/segments/00000000.m4s"),
+        &missing_init_segments[0],
     )
     .await;
-    assert_eq!(share_status, StatusCode::OK);
-    assert_eq!(share["status"], "ok");
-    assert_eq!(share["data"]["key_release"]["required"], true);
-
-    let (access_status, access) = post_library(
-        app,
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
         &token,
-        "shared_access",
-        json!({
-            "uri": uri,
-            "recipient": authority.principal_id,
-        }),
+        &authority.principal_id,
+        &missing_init_uri,
+        invalid_message,
     )
     .await;
-    assert_eq!(access_status, StatusCode::OK);
-    assert_eq!(access["status"], "error");
-    assert!(access["message"]
-        .as_str()
-        .unwrap()
-        .contains("drm provider unavailable"));
+
+    let missing_segments_uri = format!("{root}/Documents/protected-missing-segments");
+    let (missing_segments_init, _) = clear_runtime_custody_media(0x52);
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{missing_segments_uri}/init.mp4"),
+        &missing_segments_init,
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &missing_segments_uri,
+        invalid_message,
+    )
+    .await;
+
+    let empty_segments_uri = format!("{root}/Documents/protected-empty-segments");
+    let empty_segments_path = library_object_path(dir.path(), &empty_segments_uri);
+    std::fs::create_dir_all(empty_segments_path.join("segments")).unwrap();
+    let (empty_segments_init, _) = clear_runtime_custody_media(0x53);
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{empty_segments_uri}/init.mp4"),
+        &empty_segments_init,
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &empty_segments_uri,
+        invalid_message,
+    )
+    .await;
+
+    let empty_segment_uri = format!("{root}/Documents/protected-empty-segment");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &empty_segment_uri, 0x54)
+        .await;
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{empty_segment_uri}/segments/00000000.m4s"),
+        &[],
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &empty_segment_uri,
+        invalid_message,
+    )
+    .await;
+
+    let gap_uri = format!("{root}/Documents/protected-gap");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &gap_uri, 0x55).await;
+    std::fs::remove_file(library_object_path(
+        dir.path(),
+        &format!("{gap_uri}/segments/00000000.m4s"),
+    ))
+    .unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &gap_uri,
+        invalid_message,
+    )
+    .await;
+
+    let wrong_name_uri = format!("{root}/Documents/protected-wrong-name");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &wrong_name_uri, 0x56).await;
+    std::fs::rename(
+        library_object_path(
+            dir.path(),
+            &format!("{wrong_name_uri}/segments/00000000.m4s"),
+        ),
+        library_object_path(
+            dir.path(),
+            &format!("{wrong_name_uri}/segments/segment0.m4s"),
+        ),
+    )
+    .unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &wrong_name_uri,
+        invalid_message,
+    )
+    .await;
+
+    let extra_root_uri = format!("{root}/Documents/protected-extra-root-entry");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &extra_root_uri, 0x57).await;
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{extra_root_uri}/notes.txt"),
+        b"extra root entry",
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &extra_root_uri,
+        invalid_message,
+    )
+    .await;
+
+    let symlink_uri = format!("{root}/Documents/protected-symlink");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &symlink_uri, 0x58).await;
+    let symlink_path =
+        library_object_path(dir.path(), &format!("{symlink_uri}/segments/00000000.m4s"));
+    std::fs::remove_file(&symlink_path).unwrap();
+    let symlink_target = dir.path().join("symlink-target.bin");
+    std::fs::write(&symlink_target, b"symlink-target").unwrap();
+    std::os::unix::fs::symlink(&symlink_target, &symlink_path).unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &symlink_uri,
+        invalid_message,
+    )
+    .await;
+
+    let non_file_uri = format!("{root}/Documents/protected-non-file");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &non_file_uri, 0x59).await;
+    let non_file_path =
+        library_object_path(dir.path(), &format!("{non_file_uri}/segments/00000000.m4s"));
+    std::fs::remove_file(&non_file_path).unwrap();
+    std::fs::create_dir_all(&non_file_path).unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &non_file_uri,
+        invalid_message,
+    )
+    .await;
+
+    let oversize_uri = format!("{root}/Documents/protected-oversize");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &oversize_uri, 0x5a).await;
+    let oversize_segment_path =
+        library_object_path(dir.path(), &format!("{oversize_uri}/segments/00000000.m4s"));
+    let oversize_file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&oversize_segment_path)
+        .unwrap();
+    oversize_file
+        .set_len(
+            elastos_protected_content_provider_contracts::MAX_PROTECT_MEDIA_PART_BYTES_V1 as u64
+                + 1,
+        )
+        .unwrap();
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &oversize_uri,
+        invalid_message,
+    )
+    .await;
+
+    let malformed_init_uri = format!("{root}/Documents/protected-malformed-init");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &malformed_init_uri, 0x5b)
+        .await;
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{malformed_init_uri}/init.mp4"),
+        b"not an mp4 init",
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &malformed_init_uri,
+        invalid_message,
+    )
+    .await;
+
+    let malformed_segment_uri = format!("{root}/Documents/protected-malformed-segment");
+    create_runtime_custody_publish_directory(
+        dir.path(),
+        &app,
+        &token,
+        &malformed_segment_uri,
+        0x5c,
+    )
+    .await;
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{malformed_segment_uri}/segments/00000000.m4s"),
+        b"not a valid segment",
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &malformed_segment_uri,
+        invalid_message,
+    )
+    .await;
+
+    let unknown_track_uri = format!("{root}/Documents/protected-unknown-track");
+    create_runtime_custody_publish_directory(dir.path(), &app, &token, &unknown_track_uri, 0x5d)
+        .await;
+    let unknown_track_segment = make_clear_segment(99, b"badsegxx");
+    write_library_bytes(
+        &app,
+        &token,
+        &format!("{unknown_track_uri}/segments/00000000.m4s"),
+        &unknown_track_segment,
+    )
+    .await;
+    assert_runtime_custody_publish_error(
+        dir.path(),
+        &app,
+        &token,
+        &authority.principal_id,
+        &unknown_track_uri,
+        invalid_message,
+    )
+    .await;
 }
 
 #[tokio::test]
