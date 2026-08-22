@@ -3695,10 +3695,10 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         finalized.status(),
         ProtectProviderResponseStatusV1::ProtectionSessionFinalized
     );
-    let media_identity = finalized.media_identity().unwrap().unwrap();
+    let protected_media_identity = finalized.media_identity().unwrap().unwrap();
     let envelope = finalized.custody_envelope().unwrap().unwrap();
     assert_eq!(
-        media_identity,
+        protected_media_identity,
         CencFmp4MediaIdentityV1::new_from_bytes(
             &protected_init_segment,
             &encrypted_segments,
@@ -3709,7 +3709,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     );
     assert_eq!(
         envelope.manifest().encrypted_content(),
-        media_identity.encrypted_content()
+        protected_media_identity.encrypted_content()
     );
     assert_eq!(
         envelope.manifest().custody_pool(),
@@ -3823,7 +3823,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     let content_directory = protected_content_directory_from_parts(
         &protected_init_segment,
         &encrypted_segments,
-        &media_identity,
+        &protected_media_identity,
     );
     let availability_evidence = super::publish_and_verify_protected_content_availability(
         content_registry.as_ref(),
@@ -4032,6 +4032,52 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     assert_eq!(chain1.requests().await.len(), 1);
     assert_eq!(chain2.requests().await.len(), 1);
     assert_eq!(chain3.requests().await.len(), 0);
+    let expected_terminal = RuntimeReleaseCoordinatorOutcome::Terminal(
+        RuntimeReleaseTerminalResult::ContributionsReady {
+            signed_node_contributions: signed_node_contributions.clone(),
+        },
+    );
+    let replay_coordinator = RuntimeReleaseCoordinator::new(
+        RuntimeReleaseJournal::new(runtime_data_dir.clone()),
+        runtime_operation_issuer_for_seed(0x21),
+        vec![
+            RuntimeSelectedProvider::new(
+                ordered_fixtures[0].provisioned.node_public_key,
+                &ordered_fixtures[0].adapter,
+                &ordered_fixtures[0].adapter,
+            ),
+            RuntimeSelectedProvider::new(
+                ordered_fixtures[1].provisioned.node_public_key,
+                &ordered_fixtures[1].adapter,
+                &ordered_fixtures[1].adapter,
+            ),
+            RuntimeSelectedProvider::new(
+                ordered_fixtures[2].provisioned.node_public_key,
+                &ordered_fixtures[2].adapter,
+                &ordered_fixtures[2].adapter,
+            ),
+        ],
+    )
+    .unwrap();
+    let replay_outcome = replay_coordinator
+        .release(
+            &wallet_request,
+            &wallet_response,
+            operation.clone(),
+            crate::auth::now_ts(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay_outcome, expected_terminal);
+    assert_eq!(chain1.requests().await.len(), 1);
+    assert_eq!(chain2.requests().await.len(), 1);
+    assert_eq!(chain3.requests().await.len(), 0);
+    assert!(list_unresolved_runtime_releases(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
+    assert!(unresolved_release_audit_records(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
 
     let terminal_receipt = make_signed_terminal_receipt_at(
         &operation,
@@ -4048,7 +4094,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer: terminal_receipt.statement().issuer(),
             custody_envelope: &envelope,
-            media_identity: &media_identity,
+            media_identity: &protected_media_identity,
             protected_init_segment: &protected_init_segment,
             signed_node_contributions: &signed_node_contributions,
             signed_terminal_receipt: &terminal_receipt,
@@ -4063,6 +4109,24 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     cancel_prepared_recipient(&decrypt, &prepared_b)
         .await
         .unwrap();
+    let wrong_media_identity = media_identity(0x41);
+    let wrong_object_open = open_viewer_session(
+        &decrypt,
+        &RuntimeOpenViewerSessionInput {
+            buy: &buy,
+            prepared_recipient: &prepared_a,
+            signed_runtime_release_operation: &operation,
+            expected_terminal_issuer: terminal_receipt.statement().issuer(),
+            custody_envelope: &envelope,
+            media_identity: &wrong_media_identity,
+            protected_init_segment: &protected_init_segment,
+            signed_node_contributions: &signed_node_contributions,
+            signed_terminal_receipt: &terminal_receipt,
+            now_unix_seconds: crate::auth::now_ts(),
+        },
+    )
+    .await;
+    assert_eq!(wrong_object_open, Err(RuntimeOpenError::DecryptResult));
 
     let session = open_viewer_session(
         &decrypt,
@@ -4072,7 +4136,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
             signed_runtime_release_operation: &operation,
             expected_terminal_issuer: terminal_receipt.statement().issuer(),
             custody_envelope: &envelope,
-            media_identity: &media_identity,
+            media_identity: &protected_media_identity,
             protected_init_segment: &protected_init_segment,
             signed_node_contributions: &signed_node_contributions,
             signed_terminal_receipt: &terminal_receipt,

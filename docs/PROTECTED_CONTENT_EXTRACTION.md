@@ -174,9 +174,20 @@ tests prove the passkey-bound Profile authorization/signing seam and Runtime
 release-operation assembly. It does not itself prove a live Profile -> Wallet
 -> Runtime process chain or a real Chain provider process. Provisional
 `rights` stays until atomic cutover. The next source task is narrower: extend
-that process-backed proof to the remaining combined-path two-principal
-negative/restart/crash matrix beyond the now-proven success + denial paths.
-Only after that passes: atomic cutover. Do not import `coordinator-v1`.
+that process-backed proof only for the remaining combined-path wrong-object/
+media-binding rejection and exact durable release replay from the same
+Runtime journal. Restart/crash/cleanup are already covered by
+`capsules/custody-provider/tests/process.rs::custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down`,
+`capsules/protected-content-decrypt-provider/tests/process.rs::process_prepare_open_read_close_replay_and_restart_absence_flow`,
+`elastos/crates/elastos-protected-content-runtime/src/journal.rs::durable_state_replays_only_persisted_terminal_result`,
+`elastos/crates/elastos-protected-content-runtime/src/coordinator.rs::runtime_coordination_replays_terminal_without_dispatch`,
+`elastos/crates/elastos-protected-content-runtime/src/mint.rs::restart_after_effect_started_stays_nonterminal`,
+and `elastos/crates/elastos-protected-content-runtime/src/mint.rs::custody_provisioned_replays_without_redispatch`.
+There is no separate pre-cutover live Profile/Wallet/Chain process harness:
+focused Profile signing, Wallet binding, Chain evidence, and the integrated
+deterministic process path already cover the remaining source seams. Installed
+two-principal acceptance after atomic cutover is the product proof. Only after
+that passes: atomic cutover. Do not import `coordinator-v1`.
 
 ### 1. PQ-hybrid envelope — before any mint
 
@@ -289,10 +300,11 @@ registry, supervisor, or transport contract.
 Next, keep the current Runtime-selected rights/custody/protect/decrypt path
 and deterministic Chain evidence, then extend the combined process proof only
 for the remaining matrix that is not already owned by focused lower-layer
-tests: full two-principal coverage beyond the now-proven success + denial
-paths, wrong object, and restart/crash/cleanup. If a later gate needs a live
-Profile/Wallet/Chain process proof, add it explicitly rather than inferring it
-from the current fixture-led success path. The configured
+tests: wrong-object/media binding and exact durable release replay from the
+same Runtime journal. Lower-level process and journal tests already own
+restart/crash/cleanup. No separate pre-cutover live Profile/Wallet/Chain
+process harness is required; installed two-principal acceptance after cutover
+is the product proof. The configured
 operator/failure-domain claims do not prove physical independence; the process
 proof must establish distinct processes, provider identities, and owner-only
 state roots. The first permissioned proof pins one local Runtime device
@@ -308,8 +320,10 @@ decrypt-provider process path with PQ-hybrid reconstruction and CENC reads,
 restart/replay semantics, a real producer-side CENC protection process path,
 one process-backed inactive Runtime success path, and a separate second-
 principal denial proof through the same real custody-provider processes. What
-remains is the rest of the combined two-principal negative/restart/crash
-matrix and atomic cutover. Live `decrypt` is unchanged.
+remains is the combined wrong-object/media-binding rejection, exact durable
+release replay from the same Runtime journal, and atomic cutover. Installed
+two-principal acceptance after cutover is the product proof. Live `decrypt` is
+unchanged.
 
 ### 6. Minimum UI and installed two-principal proof
 

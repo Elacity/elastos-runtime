@@ -135,10 +135,20 @@ repository.
   separate real custody-provider process proof now covers alpha terminal
   2-of-3 success plus beta terminal denial through the same node-local rights
   boundary. Still open before cutover: the remaining combined process-backed
-  matrix beyond those now-proven paths (wrong object plus
-  restart/crash/cleanup), and any future live Profile/Wallet/Chain process
-  integration proof if product requirements still need it. The new path
-  remains inactive, not installed, not cut over, and not product-ready.
+  wrong-object/media-binding rejection and exact durable release replay from
+  the same Runtime journal. Restart/crash/cleanup are already covered by
+  `capsules/custody-provider/tests/process.rs::custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down`,
+  `capsules/protected-content-decrypt-provider/tests/process.rs::process_prepare_open_read_close_replay_and_restart_absence_flow`,
+  `elastos/crates/elastos-protected-content-runtime/src/journal.rs::durable_state_replays_only_persisted_terminal_result`,
+  `elastos/crates/elastos-protected-content-runtime/src/coordinator.rs::runtime_coordination_replays_terminal_without_dispatch`,
+  `elastos/crates/elastos-protected-content-runtime/src/mint.rs::restart_after_effect_started_stays_nonterminal`,
+  and `elastos/crates/elastos-protected-content-runtime/src/mint.rs::custody_provisioned_replays_without_redispatch`.
+  There is no separate pre-cutover live Profile/Wallet/Chain process harness:
+  focused Profile signing, Wallet binding, Chain evidence, and the integrated
+  deterministic process path already cover the remaining source seams.
+  Installed two-principal acceptance after atomic cutover is the product proof.
+  The new path remains inactive, not installed, not cut over, and not
+  product-ready.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
