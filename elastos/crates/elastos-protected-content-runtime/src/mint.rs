@@ -32,6 +32,7 @@ use crate::{
 const PROVISIONING_ID_DOMAIN: &[u8] =
     b"elastos.protected-content.runtime-mint-node-provisioning-id/v1";
 const REQUIRED_NODES: usize = 3;
+type RuntimeMintSigner = dyn Fn(&[u8]) -> [u8; 64] + Send + Sync + 'static;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RuntimeMintCoordinatorError {
@@ -270,7 +271,7 @@ impl fmt::Debug for RuntimeMintSelectedNode<'_> {
 pub struct RuntimeMintCoordinator<'a> {
     journal: RuntimeMintJournal,
     expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
-    sign_statement: fn(&[u8]) -> [u8; 64],
+    sign_statement: Box<RuntimeMintSigner>,
     selected: Vec<RuntimeMintSelectedNode<'a>>,
 }
 
@@ -287,12 +288,15 @@ impl fmt::Debug for RuntimeMintCoordinator<'_> {
 }
 
 impl<'a> RuntimeMintCoordinator<'a> {
-    pub fn new(
+    pub fn new<F>(
         journal: RuntimeMintJournal,
         expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
-        sign_statement: fn(&[u8]) -> [u8; 64],
+        sign_statement: F,
         selected: Vec<RuntimeMintSelectedNode<'a>>,
-    ) -> Result<Self, RuntimeMintCoordinatorError> {
+    ) -> Result<Self, RuntimeMintCoordinatorError>
+    where
+        F: Fn(&[u8]) -> [u8; 64] + Send + Sync + 'static,
+    {
         if selected.len() != REQUIRED_NODES {
             return Err(RuntimeMintCoordinatorError::ProviderSelection);
         }
@@ -312,7 +316,7 @@ impl<'a> RuntimeMintCoordinator<'a> {
         Ok(Self {
             journal,
             expected_runtime_issuer,
-            sign_statement,
+            sign_statement: Box::new(sign_statement),
             selected,
         })
     }
@@ -347,7 +351,7 @@ impl<'a> RuntimeMintCoordinator<'a> {
                 envelope,
                 node,
                 self.expected_runtime_issuer,
-                self.sign_statement,
+                self.sign_statement.as_ref(),
                 now_unix_seconds,
             )?;
             match selected.custody.provision_node_share(&request).await {
@@ -498,7 +502,7 @@ fn signed_provision_request(
     envelope: &CustodyEnvelopeV1,
     node: &RuntimeMintNodeBinding,
     issuer: RuntimeOperationIssuerKeyV1,
-    sign_statement: fn(&[u8]) -> [u8; 64],
+    sign_statement: &RuntimeMintSigner,
     now_unix_seconds: u64,
 ) -> Result<CustodyProviderRequestV1, RuntimeMintCoordinatorError> {
     let sealed_share = envelope
@@ -691,6 +695,42 @@ mod tests {
 
     fn sign_statement(bytes: &[u8]) -> [u8; 64] {
         runtime_key().sign(bytes).to_bytes()
+    }
+
+    #[test]
+    fn captured_signer_closure_verifies_against_exact_runtime_issuer() {
+        let signing_key = SigningKey::from_bytes(&[0x7a; 32]);
+        let issuer =
+            RuntimeOperationIssuerKeyV1::new(signing_key.verifying_key().to_bytes()).unwrap();
+        let envelope = envelope();
+        let draft = draft_for(&envelope);
+        let node = binding(1);
+        let request = signed_provision_request(
+            &draft,
+            &envelope,
+            &node,
+            issuer,
+            &move |bytes| signing_key.sign(bytes).to_bytes(),
+            NOW + 10,
+        )
+        .unwrap();
+        let bytes = request.to_json_vec().unwrap();
+        let validated = ValidatedCustodyProviderRequestV1::decode_and_validate_at(
+            &bytes,
+            issuer,
+            node.node_public_key(),
+            NOW + 10,
+        )
+        .unwrap();
+        let provision = validated.provision_node_share().unwrap();
+        assert_eq!(
+            provision
+                .signed_runtime_custody_provisioning()
+                .statement()
+                .runtime_operation_issuer(),
+            issuer
+        );
+        assert_eq!(provision.selected_node_public_key(), node.node_public_key());
     }
 
     fn binding(seed: u8) -> RuntimeMintNodeBinding {
