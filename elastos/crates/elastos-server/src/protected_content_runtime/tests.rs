@@ -9,28 +9,28 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use custody_provider::{
-    ProvisionedCustodyProviderPublicKeys, parse_and_verify_provisioning_output,
+    parse_and_verify_provisioning_output, ProvisionedCustodyProviderPublicKeys,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use elastos_protected_content_custody::provision_custody_envelope;
 use elastos_protected_content_rights::{
-    CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP, chain_rights_evidence_request,
+    chain_rights_evidence_request, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
 };
 use elastos_protected_content_runtime::{
+    bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
+    prepare_recipient, read_viewer_media_part, resolve_runtime_mint_selected_nodes,
     PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeCustodyProvider,
     RuntimeDecryptProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome,
     RuntimeMintDraft, RuntimeMintJournal, RuntimeMintNodeBinding, RuntimeMintSelectedNode,
     RuntimeOpenError, RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent,
     RuntimeProviderCallError, RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator,
     RuntimeReleaseCoordinatorOutcome, RuntimeReleaseJournal, RuntimeReleaseTerminalResult,
-    RuntimeRightsProvider, RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect, bind_buy,
-    cancel_prepared_recipient, close_viewer_session, open_viewer_session, prepare_recipient,
-    read_viewer_media_part,
+    RuntimeRightsProvider, RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect,
 };
 use elastos_runtime::provider::{
-    CapsuleProvider, Provider, ProviderBridge, ProviderCarrierRoute, ProviderError,
-    ProviderInvocationTransport, ProviderRegistry, ResourceRequest, ResourceResponse,
-    bridge::ProviderConfig,
+    bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderCarrierRoute,
+    ProviderError, ProviderInvocationTransport, ProviderRegistry, ResourceRequest,
+    ResourceResponse,
 };
 use elastos_wallet_contract::{
     ProtectedContentRightsSignatureResultV1, ValidatedChainOutcomeBindingV1,
@@ -38,31 +38,31 @@ use elastos_wallet_contract::{
     WalletProviderResponseV2, WalletResultV2,
 };
 use k256::ecdsa::SigningKey as WalletSigningKey;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::Digest as _;
 use sha3::Keccak256;
 use tokio::sync::Mutex;
-use x_wing::TryKeyInit as _;
 use x_wing::kem::{Decapsulator as _, KeyExport as _};
+use x_wing::TryKeyInit as _;
 
 use super::{
-    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, InactiveCustodyProvider,
-    RUNTIME_PROVIDER_ID, RuntimeCustodyCompositionConfigFile, RuntimeCustodyRegistryAdapter,
-    RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
-    RuntimeDecryptRegistryAdapter, invoke_json_provider, list_unresolved_runtime_releases,
+    invoke_json_provider, list_unresolved_runtime_releases, load_runtime_custody_composition,
     load_runtime_custody_composition_config, register_inactive_custody_provider,
-    register_inactive_custody_sub_provider, unresolved_release_audit_records,
+    register_inactive_custody_sub_provider, runtime_mint_journal, unresolved_release_audit_records,
+    InactiveCustodyProvider, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
+    RuntimeCustodyRegistryAdapter, RuntimeCustodyRouteBindingConfig,
+    RuntimeCustodyRouteTransportConfig, RuntimeDecryptRegistryAdapter,
+    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, RUNTIME_PROVIDER_ID,
 };
 use elastos_protected_content_contracts::{
-    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, CanonicalContract, CustodyApprovedSuitesV1,
-    CustodyCommitteeAuthorizationIdentityV1, CustodyCommitteeAuthorizationStatementV1,
-    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
-    CustodyNodeProvisioningRecordV1, CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1,
-    CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1, CustodyPoolStatementV1,
-    Digest32, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
-    KeyReleaseOutcomeV1, KeyReleaseRequestV1, MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
-    NodeContributionRefV1, NodeContributionStatementV1, NodeCustodyPublicKeyV1, NodePublicKey,
-    PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES, PqHybridSealedShareV1, ProfileIdentityV1,
+    CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
+    CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
+    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyNodeProvisioningRecordV1,
+    CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1, CustodyPoolMemberStateV1,
+    CustodyPoolMemberV1, CustodyPoolOperatorIdV1, CustodyPoolStatementV1, Digest32,
+    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1,
+    KeyReleaseRequestV1, NodeContributionRefV1, NodeContributionStatementV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, PqHybridSealedShareV1, ProfileIdentityV1,
     ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
     RecipientPublicKeyBytesV1, RecipientSealedContributionV1, ReplayNonce16, RightsActionV1,
     RightsDecisionV1, RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1,
@@ -73,15 +73,17 @@ use elastos_protected_content_contracts::{
     SignedNodeContributionV1, SignedNodeRightsDecisionV1, SignedRecipientKeyAuthorizationV1,
     SignedRuntimeCustodyProvisioningV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
     TerminalReceiptIssuerKey, TerminalReceiptStatementV1, ThresholdV1, ValidatedCustodyCommitteeV1,
-    WalletAddress, WalletSignedRightsRequestV1, X_WING_DRAFT06_CIPHERTEXT_BYTES,
+    WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+    MAX_RIGHTS_EVIDENCE_LIFETIME_SECS, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
+    X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, CustodyProviderRequestV1, CustodyProviderResponseV1,
     DecryptProviderRequestV1, DecryptProviderResponseStatusV1, DecryptProviderResponseV1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
-    ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
-    RightsProviderResponseV1, ValidatedCustodyProviderRequestV1, ValidatedRightsProviderRequestV1,
-    ViewerMediaPartSelectorV1,
+    ProtectProviderRequestV1, ProtectProviderResponseStatusV1, ProtectProviderResponseV1,
+    ProtectionSessionNodeV1, RightsProviderRequestV1, RightsProviderResponseV1,
+    ValidatedCustodyProviderRequestV1, ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 
 struct RecordingProvider {
@@ -2472,6 +2474,58 @@ fn write_owner_only_custody_composition_config(
 }
 
 #[cfg(unix)]
+fn assert_runtime_custody_transports(
+    composition: &RuntimeCustodyComposition,
+    expected: &[ProviderInvocationTransport],
+) {
+    assert_eq!(composition.nodes.len(), expected.len());
+    for (node, expected_transport) in composition.nodes.iter().zip(expected.iter()) {
+        assert_eq!(&node.adapter.transport, expected_transport);
+    }
+    for window in composition.nodes.windows(2) {
+        assert!(Arc::ptr_eq(
+            &window[0].adapter.registry,
+            &window[1].adapter.registry
+        ));
+    }
+}
+
+#[cfg(unix)]
+fn mint_draft_for_composition_journal_test() -> RuntimeMintDraft {
+    let epoch = signed_custody_epoch();
+    let envelope = custody_envelope_for_media_with_epoch(0x41, &epoch);
+    let (init_segment, encrypted_segments) = media_components(0x41);
+    let mint_nodes = epoch
+        .statement()
+        .nodes()
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            let node_seed = u8::try_from(index + 1).unwrap();
+            RuntimeMintNodeBinding::new(
+                node.node_public_key(),
+                CustodyPoolOperatorIdV1::new([0x80 + node_seed; 32]),
+                CustodyPoolFailureDomainIdV1::new([0x90 + node_seed; 32]),
+                Digest32::new([0x50 + node_seed; 32]),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    RuntimeMintDraft::new(
+        &init_segment,
+        &encrypted_segments,
+        MEDIA_MIME_TYPE_V1,
+        MEDIA_CODECS_V1,
+        envelope.key_envelope_identity().unwrap(),
+        policy_body().policy_identity().unwrap(),
+        envelope.manifest().content_key_commitment(),
+        envelope.manifest().threshold(),
+        mint_nodes,
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
 fn inactive_custody_state_root(data_dir: &Path) -> PathBuf {
     data_dir.join("protected-content/custody-provider/inactive")
 }
@@ -2567,6 +2621,51 @@ fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carr
             timeout_ms: None,
         }) if peer_did == &peer_did_2
     ));
+
+    let registry = Arc::new(ProviderRegistry::new());
+    let composition = load_runtime_custody_composition(&data_dir, registry)
+        .unwrap()
+        .unwrap();
+    assert_runtime_custody_transports(
+        &composition,
+        &[
+            ProviderInvocationTransport::Local,
+            ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peer_did_1.clone(),
+                timeout_ms: None,
+            }),
+            ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peer_did_2.clone(),
+                timeout_ms: None,
+            }),
+        ],
+    );
+    let configured = composition.configured_nodes().unwrap();
+    assert_eq!(
+        resolve_runtime_mint_selected_nodes(
+            composition.expected_policy_authority,
+            composition.expected_authorization_identity,
+            &composition.signed_pool,
+            &composition.signed_epoch,
+            &composition.signed_committee_authorization,
+            now,
+            &configured,
+        )
+        .unwrap()
+        .len(),
+        3
+    );
+    assert!(!std::ptr::eq(
+        &composition.nodes[0].adapter,
+        &composition.nodes[1].adapter
+    ));
+
+    let debug = format!("{composition:?}");
+    assert!(!debug.contains(&peer_did_1));
+    assert!(!debug.contains(&peer_did_2));
+    assert!(!debug.contains(&config.signed_pool_base64));
+    assert!(!debug.contains(&config.signed_epoch_base64));
+    assert!(!debug.contains(&config.signed_committee_authorization_base64));
 }
 
 #[cfg(unix)]
@@ -2613,6 +2712,28 @@ fn runtime_custody_composition_accepts_three_remote_routes() {
             }) if actual == peer_did
         ));
     }
+
+    let composition =
+        load_runtime_custody_composition(&data_dir, Arc::new(ProviderRegistry::new()))
+            .unwrap()
+            .unwrap();
+    assert_runtime_custody_transports(
+        &composition,
+        &[
+            ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peers[0].clone(),
+                timeout_ms: None,
+            }),
+            ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peers[1].clone(),
+                timeout_ms: None,
+            }),
+            ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: peers[2].clone(),
+                timeout_ms: None,
+            }),
+        ],
+    );
 }
 
 #[cfg(unix)]
@@ -2930,11 +3051,13 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
         custody_composition_config_path(&symlink_file_data_dir),
     )
     .unwrap();
-    assert!(load_runtime_custody_composition_config(&symlink_file_data_dir)
-        .err()
-        .expect("expected symlink-file rejection")
-        .to_string()
-        .contains("unavailable"));
+    assert!(
+        load_runtime_custody_composition_config(&symlink_file_data_dir)
+            .err()
+            .expect("expected symlink-file rejection")
+            .to_string()
+            .contains("unavailable")
+    );
 
     let directory_path_data_dir = temp.path().join("directory-path-data");
     owner_only_dir(&directory_path_data_dir);
@@ -2945,11 +3068,13 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    assert!(load_runtime_custody_composition_config(&directory_path_data_dir)
-        .err()
-        .expect("expected non-regular-file rejection")
-        .to_string()
-        .contains("regular file"));
+    assert!(
+        load_runtime_custody_composition_config(&directory_path_data_dir)
+            .err()
+            .expect("expected non-regular-file rejection")
+            .to_string()
+            .contains("regular file")
+    );
 
     let hard_link_data_dir = temp.path().join("hard-link-data");
     owner_only_dir(&hard_link_data_dir);
@@ -2973,6 +3098,78 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
         .expect("expected hard-link rejection")
         .to_string()
         .contains("hard-linked"));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_mint_journal_uses_exact_owner_only_root_and_contains_no_route_or_signed_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    owner_only_dir(&protected_content_root(&data_dir));
+    let config = custody_composition_config(
+        crate::auth::now_ts(),
+        custody_route_bindings(
+            &signed_custody_epoch(),
+            [
+                RuntimeCustodyRouteTransportConfig::Local,
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xee),
+                },
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xef),
+                },
+            ],
+        ),
+    );
+    write_owner_only_custody_composition_config(&data_dir, &config);
+    let loaded = load_runtime_custody_composition_config(&data_dir)
+        .unwrap()
+        .unwrap();
+    let configured_peer_did = match &loaded.routes[1].transport {
+        ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+            peer_did, ..
+        }) => peer_did.clone(),
+        _ => panic!("expected carrier route"),
+    };
+
+    let journal = runtime_mint_journal(&data_dir);
+    let draft = mint_draft_for_composition_journal_test();
+    let persisted = journal.persist_bound(&draft).unwrap();
+    assert_eq!(persisted.draft().mint_id(), draft.mint_id());
+
+    let mint_root = protected_content_root(&data_dir).join("runtime-mint");
+    assert!(mint_root.is_dir());
+    assert_eq!(
+        fs::metadata(&mint_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    assert!(!any_file_contains(
+        &mint_root,
+        base64::engine::general_purpose::STANDARD
+            .decode(&config.signed_pool_base64)
+            .unwrap()
+            .as_slice()
+    ));
+    assert!(!any_file_contains(
+        &mint_root,
+        base64::engine::general_purpose::STANDARD
+            .decode(&config.signed_epoch_base64)
+            .unwrap()
+            .as_slice()
+    ));
+    assert!(!any_file_contains(
+        &mint_root,
+        base64::engine::general_purpose::STANDARD
+            .decode(&config.signed_committee_authorization_base64)
+            .unwrap()
+            .as_slice()
+    ));
+    assert!(!any_file_contains(
+        &mint_root,
+        configured_peer_did.as_bytes()
+    ));
 }
 
 #[cfg(unix)]

@@ -19,14 +19,14 @@ use std::sync::{Arc, Weak};
 use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 use elastos_protected_content_contracts::{
-    CanonicalContract, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIssuerKeyV1, Digest32,
-    KeyReleaseRequestV1, NodePublicKey,
+    validate_custody_epoch_against_pool_at, CanonicalContract,
+    CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIssuerKeyV1, Digest32,
+    KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey,
     RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
     RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RuntimeOperationIssuerKeyV1,
     RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
     SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
     SignedRuntimeReleaseOperationV1, WalletSignedRightsRequestV1,
-    validate_custody_epoch_against_pool_at,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, RightsProviderRequestV1, RightsProviderResponseV1,
@@ -36,15 +36,16 @@ use elastos_protected_content_provider_contracts::{
     DecryptProviderRequestOpV1, DecryptProviderRequestV1, DecryptProviderResponseV1,
 };
 use elastos_protected_content_rights::{
-    CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP, PrivateCustodyRightsRequestV1,
+    PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
 };
 #[cfg(test)]
 use elastos_protected_content_runtime::RuntimeDecryptProvider;
 use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
-    PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
-    RuntimeReleaseAuditRecord, RuntimeReleaseJournal, RuntimeReleaseJournalError,
-    RuntimeVerifiedContentAvailability,
+    resolve_runtime_mint_selected_nodes, PersistedRuntimeReleaseOperation,
+    RuntimeContentAvailabilityRequirement, RuntimeMintConfiguredCustodyProvider,
+    RuntimeMintCoordinatorError, RuntimeMintJournal, RuntimeReleaseAuditRecord,
+    RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeVerifiedContentAvailability,
 };
 use elastos_runtime::provider::bridge::{ProviderBridge, ProviderConfig};
 use elastos_runtime::provider::{
@@ -52,7 +53,7 @@ use elastos_runtime::provider::{
     ProviderRegistry, ProviderTransfer, ResourceRequest, ResourceResponse,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::Digest as _;
 
 pub(crate) const CUSTODY_PROVIDER_ID: &str = "custody";
@@ -60,6 +61,7 @@ pub(crate) const RUNTIME_PROVIDER_ID: &str = "runtime";
 const CONTENT_PROVIDER_ID: &str = "content";
 const PROTECTED_CONTENT_ROOT: &str = "protected-content";
 const CUSTODY_COMPOSITION_CONFIG_FILE: &str = "protected-content/custody-composition.json";
+const RUNTIME_MINT_JOURNAL_ROOT: &str = "protected-content/runtime-mint";
 const CUSTODY_COMPOSITION_SCHEMA_V1: &str = "elastos.protected-content.custody-composition/v1";
 const MAX_CUSTODY_COMPOSITION_BYTES: usize = 64 * 1024;
 const MAX_CUSTODY_COMPOSITION_BLOB_BYTES: usize = 16 * 1024;
@@ -116,6 +118,63 @@ struct RuntimeValidatedCustodyCompositionConfig {
     signed_epoch: SignedCustodyEpochV1,
     signed_committee_authorization: SignedCustodyCommitteeAuthorizationV1,
     routes: [RuntimeValidatedCustodyRouteBinding; 3],
+}
+
+struct RuntimeCustodyCompositionNode {
+    node_public_key: NodePublicKey,
+    custody_public_key: NodeCustodyPublicKeyV1,
+    owner_state_root: Digest32,
+    adapter: RuntimeCustodyRegistryAdapter,
+}
+
+pub(crate) struct RuntimeCustodyComposition {
+    expected_policy_authority: CustodyEpochIssuerKeyV1,
+    expected_authorization_identity: CustodyCommitteeAuthorizationIdentityV1,
+    signed_pool: SignedCustodyPoolV1,
+    signed_epoch: SignedCustodyEpochV1,
+    signed_committee_authorization: SignedCustodyCommitteeAuthorizationV1,
+    nodes: [RuntimeCustodyCompositionNode; 3],
+}
+
+impl std::fmt::Debug for RuntimeCustodyComposition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeCustodyComposition")
+            .field("expected_policy_authority", &"[redacted]")
+            .field("expected_authorization_identity", &"[redacted]")
+            .field("signed_pool", &"[redacted]")
+            .field("signed_epoch", &"[redacted]")
+            .field("signed_committee_authorization", &"[redacted]")
+            .field("node_count", &self.nodes.len())
+            .finish()
+    }
+}
+
+impl RuntimeCustodyComposition {
+    pub(crate) fn configured_nodes(
+        &self,
+    ) -> Result<[RuntimeMintConfiguredCustodyProvider<'_>; 3], RuntimeMintCoordinatorError> {
+        Ok([
+            RuntimeMintConfiguredCustodyProvider::new(
+                self.nodes[0].node_public_key,
+                self.nodes[0].custody_public_key,
+                self.nodes[0].owner_state_root,
+                &self.nodes[0].adapter,
+            )?,
+            RuntimeMintConfiguredCustodyProvider::new(
+                self.nodes[1].node_public_key,
+                self.nodes[1].custody_public_key,
+                self.nodes[1].owner_state_root,
+                &self.nodes[1].adapter,
+            )?,
+            RuntimeMintConfiguredCustodyProvider::new(
+                self.nodes[2].node_public_key,
+                self.nodes[2].custody_public_key,
+                self.nodes[2].owner_state_root,
+                &self.nodes[2].adapter,
+            )?,
+        ])
+    }
 }
 
 struct InactiveCustodyProvider {
@@ -653,6 +712,10 @@ pub fn runtime_release_journal(data_dir: &Path) -> RuntimeReleaseJournal {
     RuntimeReleaseJournal::new(data_dir.join("protected-content").join("runtime-release"))
 }
 
+pub(crate) fn runtime_mint_journal(data_dir: &Path) -> RuntimeMintJournal {
+    RuntimeMintJournal::new(data_dir.join(RUNTIME_MINT_JOURNAL_ROOT))
+}
+
 pub fn list_unresolved_runtime_releases(
     data_dir: &Path,
 ) -> Result<Vec<PersistedRuntimeReleaseOperation>, RuntimeReleaseJournalError> {
@@ -1125,6 +1188,68 @@ fn load_runtime_custody_composition_config(
             )
         })?,
     }))
+}
+
+pub(crate) fn load_runtime_custody_composition(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+) -> anyhow::Result<Option<RuntimeCustodyComposition>> {
+    let Some(config) = load_runtime_custody_composition_config(data_dir)? else {
+        return Ok(None);
+    };
+    let now = crate::auth::now_ts();
+    let validated = validate_custody_epoch_against_pool_at(
+        config.expected_policy_authority,
+        config.expected_authorization_identity,
+        &config.signed_pool,
+        &config.signed_epoch,
+        &config.signed_committee_authorization,
+        now,
+    )
+    .map_err(|_| {
+        invalid_custody_composition_config(
+            "signed pool/epoch/committee authorization does not validate against trust anchors",
+        )
+    })?;
+    let nodes = validated
+        .committee()
+        .nodes()
+        .iter()
+        .zip(config.routes.iter())
+        .map(|(node, route)| RuntimeCustodyCompositionNode {
+            node_public_key: node.node_public_key(),
+            custody_public_key: node.custody_public_key(),
+            owner_state_root: route.owner_state_root,
+            adapter: RuntimeCustodyRegistryAdapter::new(registry.clone(), route.transport.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    let composition = RuntimeCustodyComposition {
+        expected_policy_authority: config.expected_policy_authority,
+        expected_authorization_identity: config.expected_authorization_identity,
+        signed_pool: config.signed_pool,
+        signed_epoch: config.signed_epoch,
+        signed_committee_authorization: config.signed_committee_authorization,
+        nodes: nodes.try_into().map_err(|_| {
+            invalid_custody_composition_config(
+                "custody-composition routes must cover exactly three selected nodes",
+            )
+        })?,
+    };
+    let configured = composition
+        .configured_nodes()
+        .map_err(|_| invalid_custody_composition_config("configured custody linkage is invalid"))?;
+    resolve_runtime_mint_selected_nodes(
+        composition.expected_policy_authority,
+        composition.expected_authorization_identity,
+        &composition.signed_pool,
+        &composition.signed_epoch,
+        &composition.signed_committee_authorization,
+        now,
+        &configured,
+    )
+    .map_err(|_| invalid_custody_composition_config("configured custody linkage is invalid"))?;
+    Ok(Some(composition))
 }
 
 pub fn log_unresolved_runtime_releases(data_dir: &Path) {
