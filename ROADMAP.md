@@ -179,16 +179,35 @@ E. PQ-hybrid share wrap, recipient possession, decrypt-session wrap, and the
    its secret private; the authenticated Profile must authorize that exact
    public key. Separate focused tests now prove the passkey-bound Profile
    signing adapter and Runtime release-operation assembly seams.
-   Separate lower-level Runtime lifecycle tests and decrypt-provider process tests prove PQ-hybrid
-   reconstruction, CENC media reads, close replay, restart, and old-handle
-   absence. The current process-backed inactive proof now uses production
-   rights wiring, three independently addressed custody-provider processes, one
-   protect-provider process, and the decrypt-provider process. What remains in
-   that combined path is the wrong-object plus restart/crash/cleanup matrix,
-   and any future live Profile/Wallet/Chain process proof only if explicitly
-   required before atomic cutover; and
-F. only then atomically replace the provisional DTO/provider surface and prove
-   the installed mint -> buy -> open -> play path.
+   Separate lower-level Runtime lifecycle tests and decrypt-provider process
+   tests prove PQ-hybrid reconstruction, CENC media reads, close replay,
+   restart, and old-handle absence. The current process-backed inactive proof
+   now uses production rights wiring, three independently addressed
+   custody-provider processes, one protect-provider process, and the
+   decrypt-provider process, and already covers the combined wrong-object/media
+   binding and durable replay cases. The remaining ordered product gates are:
+   A. package and provision the new protect provider, three custody instances,
+      and decrypt provider through the existing component/install/supervisor
+      model, internal and inactive only;
+   B. make protect and decrypt production-callable through the existing
+      `ProviderRegistry`, and add one Runtime-owned protected-content product
+      service for mint/buy/open/read/close orchestration and journals, still
+      inactive;
+   C. wire the existing Library creator import/mint/list flow to
+      protect -> custody -> content availability with identity-only Runtime
+      state;
+   D. wire the existing Marketplace buy flow and Library open/viewer flow to
+      the existing Wallet/transaction/Chain and release/decrypt path;
+   E. land one atomic cutover commit that activates the new route and removes
+      the provisional `drm` / `rights` / `key` / old `decrypt` startup, DTO,
+      provider-resource/catalog, build/install/component/WCI/test/doc surface,
+      with no fallback or dual path; and
+   F. prove the minimum installed one-Runtime/two-principal product acceptance.
+
+The first honest product proof is one installed Runtime with two human
+principals. Current source pins one local Runtime device issuer; multi-Runtime
+issuer admission and cross-Runtime protected-content exchange are later
+explicit pre-public-network gates.
 
 Share wrap on this unpublished tree is PQ-hybrid. It is still not a product
 mint path. First minted objects must stay PQ-hybrid; do not add a classical

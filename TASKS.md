@@ -718,18 +718,59 @@ Do not continue or merge `feat/protected-content-runtime-coordinator-v1`
 (`18c266a2`, merge-base `3b07fd4d` with rights). Keep it as evidence only. Do
 not continue that abandoned line.
 
-Next remaining slice after packaging this branch is narrow: extend the existing
-inactive process-backed Runtime proof from one principal to the full
-two-principal and negative matrix beyond the now-proven success + denial
-paths. Only after that passes: atomic cutover. After cutover: minimum UI and installed
-two-principal acceptance. Do not open a third D branch.
+The final combined inactive proof is now complete on
+`feat/protected-content-runtime-integration` `8eff416e`. The current source
+line proves:
 
-Protected-content work stays source-only until the complete inactive
-process-backed two-principal path and its fail-closed negative/restart/crash
-coverage are proven through Runtime with exact producer-side CENC protection.
-Carrier remains transport only, Home launch tokens remain HTTP-edge
-credentials, and capsules never receive CEKs, raw shares, provider routes,
-host/IP/port data, credentials, or transferable playback URLs.
+- exact fixed-layout content availability publish/status/refetch/verify at
+  `elastos/crates/elastos-server/src/protected_content_runtime/tests.rs::
+  protected_content_availability_publishes_status_refetches_and_verifies_exact_media`
+  plus its negative companions;
+- real one-node custody-provider process provisioning and public provisioning
+  receipt parsing at
+  `elastos/crates/elastos-server/src/protected_content_runtime/tests.rs::
+  runtime_custody_registry_adapter_process_happy_path_uses_public_provision_receipt`;
+- real three-node 2-of-3 release with the third node not invoked at
+  `elastos/crates/elastos-server/src/protected_content_runtime/tests.rs::
+  runtime_release_coordinator_process_two_of_three_success_stops_before_third_node`;
+- real alpha success plus beta terminal denial through the same node-local
+  rights/custody processes;
+- real protect -> mint -> availability -> buy -> release -> decrypt ->
+  init/segment read -> close, wrong-recipient rejection, wrong-object/media
+  binding rejection, encrypted-segment tamper rejection, exact durable replay
+  from the same Runtime release journal, explicit unregister/absence cleanup,
+  byte-exact clear recovery, and zero unresolved release state at
+  `elastos/crates/elastos-server/src/protected_content_runtime/tests.rs::
+  runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_recipient_and_closes_cleanly`.
+
+Combined restart/crash/cleanup are already owned by lower-layer tests and are
+not a remaining combined-path gate:
+
+- `capsules/custody-provider/tests/process.rs::
+  custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down`
+- `capsules/protected-content-decrypt-provider/tests/process.rs::
+  process_prepare_open_read_close_replay_and_restart_absence_flow`
+- `elastos/crates/elastos-protected-content-runtime/src/journal.rs::
+  durable_state_replays_only_persisted_terminal_result`
+- `elastos/crates/elastos-protected-content-runtime/src/coordinator.rs::
+  runtime_coordination_replays_terminal_without_dispatch`
+- `elastos/crates/elastos-protected-content-runtime/src/mint.rs::
+  restart_after_effect_started_stays_nonterminal`
+- `elastos/crates/elastos-protected-content-runtime/src/mint.rs::
+  custody_provisioned_replays_without_redispatch`
+
+There is no separate pre-cutover live Profile/Wallet/Chain harness remaining in
+source planning. Focused Profile-signing, Wallet binding, Chain evidence, and
+the integrated deterministic process path already cover the source seams they
+own. The first honest product proof is one installed Runtime with two human
+principals. Current custody state still pins one local Runtime device issuer;
+multi-Runtime issuer admission and cross-Runtime protected-content exchange are
+later explicit pre-public-network gates, not first cutover requirements.
+
+Protected-content work stays source-only until the inactive adapters/routes are
+cut over atomically. Carrier remains transport only, Home launch tokens remain
+HTTP-edge credentials, and capsules never receive CEKs, raw shares, provider
+routes, host/IP/port data, credentials, or transferable playback URLs.
 
 Source prerequisites already present in this branch ancestry:
 
@@ -880,35 +921,112 @@ Chain evidence and does not register a second `rights` name.
   terminal `RightsDenied`, beta replay is exact, contribution count stays 0,
   node 2/3 are never contacted after denial is known, and the Runtime release
   journal remains terminal with zero unresolved state.
-- [ ] Extend the combined process-backed inactive Runtime proof before removing
-  the provisional path: keep the now-proven producer-side CENC success path
-  and second-principal denial, then add only the remaining combined-path
-  wrong-object/media-binding rejection and exact durable release replay from
-  the same Runtime journal. Restart/crash/cleanup are already covered by
-  `capsules/custody-provider/tests/process.rs::custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down`,
-  `capsules/protected-content-decrypt-provider/tests/process.rs::process_prepare_open_read_close_replay_and_restart_absence_flow`,
-  `elastos/crates/elastos-protected-content-runtime/src/journal.rs::durable_state_replays_only_persisted_terminal_result`,
-  `elastos/crates/elastos-protected-content-runtime/src/coordinator.rs::runtime_coordination_replays_terminal_without_dispatch`,
-  `elastos/crates/elastos-protected-content-runtime/src/mint.rs::restart_after_effect_started_stays_nonterminal`,
-  and `elastos/crates/elastos-protected-content-runtime/src/mint.rs::custody_provisioned_replays_without_redispatch`.
-  There is no separate pre-cutover live Profile/Wallet/Chain process harness:
-  focused Profile signing, Wallet binding, Chain evidence, and the integrated
-  deterministic process path already cover the remaining source seams.
-  Installed two-principal acceptance after atomic cutover is the product proof.
-  The first permissioned proof still pins one local Runtime device operation
-  issuer; multi-Runtime issuer admission remains a later pre-public-network
-  gate.
-- [ ] Atomically replace the provisional `elastos_common::protected_content`,
-  `drm-provider`, `key-provider`, and provisional decrypt authority only after
-  the complete inactive replacement path is proven. Delete the superseded
-  authority surface in that cutover slice; do not keep compatibility decoders,
-  fallbacks, dual writes, dual authority, or a second journal.
-- [ ] Update the minimum UI only after the authority path is green, then prove
-  installed two-principal acceptance: Create for one media asset, Store
-  listing/detail/buy, Library open, Wallet/Home approval, and one
-  Runtime-selected viewer. Documents, Store consolidation, broad UI redesign,
-  extra formats, migration, compatibility, Iroh upgrades, deployment, and
-  release remain later work unless the first flow proves they are required.
+- [ ] Installed prerequisite: provision one signed permissioned custody profile
+  before product cutover. It must define the exact pool, epoch, committee
+  authorization, three distinct node/provider identities, three owner-only
+  state roots, 2-of-3 threshold, expected Runtime issuer, and lifecycle config.
+  This is signed policy and process identity only; do not claim physical or
+  operator independence from it.
+- [ ] Installed prerequisite: configure one test Chain network and rights /
+  purchase contract binding before product cutover. That includes exact chain
+  identity, contract identity, method/selector, two funded test accounts, and
+  the existing Wallet approval/transaction coordinator plus Chain evidence
+  path. Do not upgrade deterministic fixtures into a product claim.
+- [ ] Pre-Slice-A checklist: remove the current wall-clock coupling in
+  `capsules/custody-provider/tests/process.rs`, where signed release
+  operations with `expires_at = issued_at + 45` can expire during the full
+  process test on slower hardware. The eventual code repair must use either a
+  validity window safely above the observed process-test runtime or a
+  controlled test clock, must keep separate explicit expiry-negative tests,
+  must add no sleeps or retries, and must rerun the exact process test plus
+  focused expiry tests before CI/cutover work proceeds.
+- [ ] Slice A — package and provision the new protect provider, three custody
+  instances, and decrypt provider through the existing component/install/
+  supervisor model while keeping the full protected-content route inactive.
+  Entry: current source proof at `8eff416e`, no live route changes, disk stays
+  above 15%. Exit: build/package metadata and supervisor wiring can package and
+  provision the new providers internally, with built/staged artifact identity
+  for Runtime, `components.json`, and provider binaries, but no
+  capsule-visible activation.
+  Likely files: `components.json`, provider manifests/lockfiles, install and
+  source-home scripts, `elastos/crates/elastos-server/src/server_infra.rs`,
+  `elastos/crates/elastos-server/src/publish.rs`, focused install/provider
+  tests. Verification: focused packaging/startup tests, built/staged artifact
+  identity and metadata checks, and leak scans.
+- [ ] Slice B — make protect and decrypt production-callable through the
+  existing `ProviderRegistry` and add one Runtime-owned protected-content
+  product service that owns mint/buy/open/read/close orchestration and
+  journals, still inactive. Entry: Slice A packaged and provisionable. Exit:
+  authenticated principal/Profile, existing Wallet/Chain adapters, and the
+  existing Runtime journals are callable through one internal product service;
+  routes remain inactive. Likely files:
+  `elastos/crates/elastos-server/src/protected_content_runtime.rs` plus direct
+  startup/import fallout only. Verification: focused inactive server adapter
+  tests with real provider processes; no second registry, supervisor,
+  coordinator, or journal.
+- [ ] Slice C — wire Library creator import/mint/list to
+  protect -> custody -> content availability through that service. Entry:
+  inactive production-callable service exists. Exit: creator import/mint/list
+  uses the real protect provider, real custody provisioning, and verified
+  availability; Runtime persists identity-only mint state and no CEK/raw share/
+  sealed-share/ciphertext/clear-media bytes. Do not invent Create or Store
+  capsules. Minimum creator UI stays in the existing Library capsule. Likely
+  files: Library/content protected-content surfaces, Runtime/server product
+  service glue, install/runtime tests, affected docs. Verification: focused
+  creator mint/list tests, availability assertions, and journal leak scans.
+- [ ] Slice D — wire Marketplace buy plus Library open/viewer to the existing
+  Wallet approval/transaction/Chain path and the existing release/decrypt path.
+  Entry: creator path is green but inactive. Exit: buyer is denied before
+  purchase, buy binds through the real Wallet/Chain path, listing becomes
+  buyer-owned/available, and Library open drives Runtime release/decrypt/viewer
+  through the canonical service. Minimum buyer/open UI stays in existing
+  Marketplace, Library, Wallet, and Inbox surfaces. Likely files: Marketplace /
+  Library protected-content surfaces, Runtime/server product service glue,
+  transaction-effect lookups, focused viewer tests. Verification: focused buy /
+  open tests against inactive routes, no second authority path.
+- [ ] Slice E — one atomic cutover commit. Entry: Slices A-D are green while
+  still inactive. Exit: activate the new product routes and remove the old
+  provisional startup, DTO, provider-resource/catalog, build/install/component/
+  WCI/test/doc surfaces for `drm`, `rights`, `key`, and the provisional
+  decrypt path in the same commit. No old/new route stays active together. No
+  fallback, no compatibility decoder, no dual write, no dual authority, and no
+  second journal/registry/supervisor/coordinator. Likely files:
+  `elastos/crates/elastos-server/src/server_infra.rs`,
+  `elastos/crates/elastos-server/src/provider_resource.rs`,
+  `elastos/crates/elastos-server/src/library.rs`,
+  `elastos/crates/elastos-server/src/content.rs`,
+  `elastos/crates/elastos-server/src/api/gateway_capsule_catalog/read_model.rs`,
+  `elastos/crates/elastos-common/src/protected_content.rs`,
+  component/install/publish surfaces, old provider tests/docs. Verification:
+  focused absence/search checks, route/resource tests, and installed artifact
+  parity on the cutover set.
+- [ ] Slice F — minimum UI and installed one-Runtime/two-principal acceptance.
+  Entry: atomic cutover commit is source-green. Exit: one installed Runtime
+  proves creator import/mint/list, buyer deny-before-purchase, real Wallet
+  approval, real Chain result, buyer open -> 2-of-3 release -> viewer
+  init/segment read -> close, wrong-object rejection, tampered-segment
+  rejection, exact replay, Runtime restart, provider cleanup, zero unresolved
+  journals/sessions, and no CEK/raw share/clear-media/topology/credential/
+  bearer-play-URL leakage. Minimum UI stays in existing Library, Marketplace,
+  Wallet/Inbox, and one Runtime-selected viewer. Verification: installed
+  artifact parity, two-principal acceptance script, focused negative checks,
+  and source/installed truth audit.
+- [ ] Hard stop if any cutover slice requires:
+  1. changing a frozen public protected-content contract merely for routing;
+  2. exposing Carrier/topology in a capsule or public contract;
+  3. migration, fallback, dual authority, or dual write to keep the old path
+     alive;
+  4. a second provider registry, supervisor, coordinator, or journal;
+  5. proceeding without the signed custody profile or Chain contract config; or
+  6. running below 15% free disk.
+- [ ] Planning estimate: budget 4-7 focused working days plus review and the
+  installed proof cycle. Do not describe the remaining work as “two small
+  tasks.”
+
+Minimum UI after cutover must use the existing Library capsule for creator
+import/mint/list and open, the existing Marketplace for listing/detail/buy, the
+existing Wallet/Inbox approval flow, and one Runtime-selected viewer. Do not
+invent Create or Store capsules, a second viewer, or a separate product route.
 
 Still mine from PR #15 / `feat/dkms-esp-port`, then reimplement at the canonical
 boundaries above: PQ-hybrid `ddrm-envelope` crypto, threshold/negative tests,
