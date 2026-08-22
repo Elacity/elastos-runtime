@@ -9,27 +9,28 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use custody_provider::{
-    parse_and_verify_provisioning_output, ProvisionedCustodyProviderPublicKeys,
+    ProvisionedCustodyProviderPublicKeys, parse_and_verify_provisioning_output,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use elastos_protected_content_custody::provision_custody_envelope;
 use elastos_protected_content_rights::{
-    chain_rights_evidence_request, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
+    CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP, chain_rights_evidence_request,
 };
 use elastos_protected_content_runtime::{
-    bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
-    prepare_recipient, read_viewer_media_part, PersistedRuntimeMint,
-    RuntimeContentAvailabilityRequirement, RuntimeCustodyProvider, RuntimeDecryptProvider,
-    RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome, RuntimeMintDraft, RuntimeMintJournal,
-    RuntimeMintNodeBinding, RuntimeMintSelectedNode, RuntimeOpenError,
-    RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent, RuntimeProviderCallError,
-    RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
-    RuntimeReleaseJournal, RuntimeReleaseTerminalResult, RuntimeRightsProvider,
-    RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect,
+    PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeCustodyProvider,
+    RuntimeDecryptProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome,
+    RuntimeMintDraft, RuntimeMintJournal, RuntimeMintNodeBinding, RuntimeMintSelectedNode,
+    RuntimeOpenError, RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent,
+    RuntimeProviderCallError, RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator,
+    RuntimeReleaseCoordinatorOutcome, RuntimeReleaseJournal, RuntimeReleaseTerminalResult,
+    RuntimeRightsProvider, RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect, bind_buy,
+    cancel_prepared_recipient, close_viewer_session, open_viewer_session, prepare_recipient,
+    read_viewer_media_part,
 };
 use elastos_runtime::provider::{
-    bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderError,
-    ProviderRegistry, ResourceRequest, ResourceResponse,
+    CapsuleProvider, Provider, ProviderBridge, ProviderCarrierRoute, ProviderError,
+    ProviderInvocationTransport, ProviderRegistry, ResourceRequest, ResourceResponse,
+    bridge::ProviderConfig,
 };
 use elastos_wallet_contract::{
     ProtectedContentRightsSignatureResultV1, ValidatedChainOutcomeBindingV1,
@@ -37,28 +38,31 @@ use elastos_wallet_contract::{
     WalletProviderResponseV2, WalletResultV2,
 };
 use k256::ecdsa::SigningKey as WalletSigningKey;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Digest as _;
 use sha3::Keccak256;
 use tokio::sync::Mutex;
-use x_wing::kem::{Decapsulator as _, KeyExport as _};
 use x_wing::TryKeyInit as _;
+use x_wing::kem::{Decapsulator as _, KeyExport as _};
 
 use super::{
-    invoke_json_provider, list_unresolved_runtime_releases, register_inactive_custody_provider,
+    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, InactiveCustodyProvider,
+    RUNTIME_PROVIDER_ID, RuntimeCustodyCompositionConfigFile, RuntimeCustodyRegistryAdapter,
+    RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
+    RuntimeDecryptRegistryAdapter, invoke_json_provider, list_unresolved_runtime_releases,
+    load_runtime_custody_composition_config, register_inactive_custody_provider,
     register_inactive_custody_sub_provider, unresolved_release_audit_records,
-    InactiveCustodyProvider, RuntimeCustodyRegistryAdapter, RuntimeDecryptRegistryAdapter,
-    CUSTODY_PROVIDER_ID, RUNTIME_PROVIDER_ID,
 };
 use elastos_protected_content_contracts::{
-    CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
-    CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
-    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyNodeProvisioningRecordV1,
-    CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1, CustodyPoolMemberStateV1,
-    CustodyPoolMemberV1, CustodyPoolOperatorIdV1, CustodyPoolStatementV1, Digest32,
-    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1,
-    KeyReleaseRequestV1, NodeContributionRefV1, NodeContributionStatementV1,
-    NodeCustodyPublicKeyV1, NodePublicKey, PqHybridSealedShareV1, ProfileIdentityV1,
+    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, CanonicalContract, CustodyApprovedSuitesV1,
+    CustodyCommitteeAuthorizationIdentityV1, CustodyCommitteeAuthorizationStatementV1,
+    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
+    CustodyNodeProvisioningRecordV1, CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1,
+    CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1, CustodyPoolStatementV1,
+    Digest32, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
+    KeyReleaseOutcomeV1, KeyReleaseRequestV1, MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
+    NodeContributionRefV1, NodeContributionStatementV1, NodeCustodyPublicKeyV1, NodePublicKey,
+    PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES, PqHybridSealedShareV1, ProfileIdentityV1,
     ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
     RecipientPublicKeyBytesV1, RecipientSealedContributionV1, ReplayNonce16, RightsActionV1,
     RightsDecisionV1, RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1,
@@ -69,17 +73,15 @@ use elastos_protected_content_contracts::{
     SignedNodeContributionV1, SignedNodeRightsDecisionV1, SignedRecipientKeyAuthorizationV1,
     SignedRuntimeCustodyProvisioningV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
     TerminalReceiptIssuerKey, TerminalReceiptStatementV1, ThresholdV1, ValidatedCustodyCommitteeV1,
-    WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
-    MAX_RIGHTS_EVIDENCE_LIFETIME_SECS, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
-    X_WING_DRAFT06_CIPHERTEXT_BYTES,
+    WalletAddress, WalletSignedRightsRequestV1, X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, CustodyProviderRequestV1, CustodyProviderResponseV1,
     DecryptProviderRequestV1, DecryptProviderResponseStatusV1, DecryptProviderResponseV1,
-    ProtectProviderRequestV1, ProtectProviderResponseStatusV1, ProtectProviderResponseV1,
-    ProtectionSessionNodeV1, RightsProviderRequestV1, RightsProviderResponseV1,
-    ValidatedCustodyProviderRequestV1, ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
+    ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
+    RightsProviderResponseV1, ValidatedCustodyProviderRequestV1, ValidatedRightsProviderRequestV1,
+    ViewerMediaPartSelectorV1,
 };
 
 struct RecordingProvider {
@@ -2382,6 +2384,94 @@ fn owner_only_dir(path: &Path) {
 }
 
 #[cfg(unix)]
+fn protected_content_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("protected-content")
+}
+
+#[cfg(unix)]
+fn custody_composition_config_path(data_dir: &Path) -> PathBuf {
+    protected_content_root(data_dir).join("custody-composition.json")
+}
+
+#[cfg(unix)]
+fn canonical_b64<T: CanonicalContract>(value: &T) -> String {
+    base64::engine::general_purpose::STANDARD.encode(value.canonical_bytes().unwrap())
+}
+
+#[cfg(unix)]
+fn raw_b64_32(bytes: [u8; 32]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(unix)]
+fn peer_did_for_seed(seed: u8) -> String {
+    crate::crypto::encode_signing_key_did(&SigningKey::from_bytes(&[seed; 32]))
+}
+
+#[cfg(unix)]
+fn custody_composition_config(
+    now: u64,
+    routes: Vec<RuntimeCustodyRouteBindingConfig>,
+) -> RuntimeCustodyCompositionConfigFile {
+    let epoch = signed_custody_epoch();
+    let pool = signed_custody_pool_for_epoch(&epoch, (now.saturating_sub(10), now + 10));
+    let authorization =
+        signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), &epoch);
+    RuntimeCustodyCompositionConfigFile {
+        schema: CUSTODY_COMPOSITION_SCHEMA_V1.to_string(),
+        expected_policy_authority_base64: raw_b64_32(
+            SigningKey::from_bytes(&[0x71; 32])
+                .verifying_key()
+                .to_bytes(),
+        ),
+        expected_committee_authorization_identity_base64: canonical_b64(
+            &authorization.authorization_identity().unwrap(),
+        ),
+        signed_pool_base64: canonical_b64(&pool),
+        signed_epoch_base64: canonical_b64(&epoch),
+        signed_committee_authorization_base64: canonical_b64(&authorization),
+        routes,
+    }
+}
+
+#[cfg(unix)]
+fn custody_route_bindings(
+    epoch: &SignedCustodyEpochV1,
+    transports: [RuntimeCustodyRouteTransportConfig; 3],
+) -> Vec<RuntimeCustodyRouteBindingConfig> {
+    epoch
+        .statement()
+        .nodes()
+        .iter()
+        .zip(transports)
+        .enumerate()
+        .map(
+            |(index, (node, transport))| RuntimeCustodyRouteBindingConfig {
+                node_public_key_base64: raw_b64_32(*node.node_public_key().as_bytes()),
+                owner_state_root_base64: raw_b64_32([0x40 + u8::try_from(index).unwrap(); 32]),
+                transport,
+            },
+        )
+        .collect()
+}
+
+#[cfg(unix)]
+fn write_owner_only_custody_composition_config(
+    data_dir: &Path,
+    config: &RuntimeCustodyCompositionConfigFile,
+) {
+    let root = protected_content_root(data_dir);
+    owner_only_dir(&root);
+    let path = custody_composition_config_path(data_dir);
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::to_value(config).unwrap()).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(unix)]
 fn inactive_custody_state_root(data_dir: &Path) -> PathBuf {
     data_dir.join("protected-content/custody-provider/inactive")
 }
@@ -2411,6 +2501,478 @@ fn read_pid(path: &Path) -> u32 {
         .trim()
         .parse()
         .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carrier_routes() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    let peer_did_1 = peer_did_for_seed(0xa1);
+    let peer_did_2 = peer_did_for_seed(0xa2);
+    let config = custody_composition_config(
+        now,
+        custody_route_bindings(
+            &epoch,
+            [
+                RuntimeCustodyRouteTransportConfig::Local,
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_1.clone(),
+                },
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_2.clone(),
+                },
+            ],
+        ),
+    );
+    write_owner_only_custody_composition_config(&data_dir, &config);
+
+    let config_text =
+        String::from_utf8(fs::read(custody_composition_config_path(&data_dir)).unwrap()).unwrap();
+    assert!(config_text.contains(&peer_did_1));
+    assert!(config_text.contains(&peer_did_2));
+    assert!(config_text.contains(&config.signed_pool_base64));
+
+    let loaded = load_runtime_custody_composition_config(&data_dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.expected_policy_authority,
+        signed_custody_epoch().statement().issuer()
+    );
+    assert_eq!(
+        loaded.signed_pool.canonical_bytes().unwrap(),
+        base64::engine::general_purpose::STANDARD
+            .decode(&config.signed_pool_base64)
+            .unwrap()
+    );
+    assert!(matches!(
+        loaded.routes[0].transport,
+        ProviderInvocationTransport::Local
+    ));
+    assert!(matches!(
+        &loaded.routes[1].transport,
+        ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+            peer_did,
+            timeout_ms: None,
+        }) if peer_did == &peer_did_1
+    ));
+    assert!(matches!(
+        &loaded.routes[2].transport,
+        ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+            peer_did,
+            timeout_ms: None,
+        }) if peer_did == &peer_did_2
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_composition_accepts_three_remote_routes() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    let peers = [
+        peer_did_for_seed(0xb1),
+        peer_did_for_seed(0xb2),
+        peer_did_for_seed(0xb3),
+    ];
+    let config = custody_composition_config(
+        now,
+        custody_route_bindings(
+            &epoch,
+            [
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peers[0].clone(),
+                },
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peers[1].clone(),
+                },
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peers[2].clone(),
+                },
+            ],
+        ),
+    );
+    write_owner_only_custody_composition_config(&data_dir, &config);
+
+    let loaded = load_runtime_custody_composition_config(&data_dir)
+        .unwrap()
+        .unwrap();
+    for (route, peer_did) in loaded.routes.iter().zip(peers.iter()) {
+        assert!(matches!(
+            &route.transport,
+            ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                peer_did: actual,
+                timeout_ms: None,
+            }) if actual == peer_did
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_composition_absent_returns_none_without_creating_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+
+    let config = load_runtime_custody_composition_config(&data_dir).unwrap();
+    assert!(config.is_none());
+    assert!(!protected_content_root(&data_dir).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_composition_rejects_trust_anchor_and_route_mismatches() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    let peer_did_1 = peer_did_for_seed(0xc1);
+    let peer_did_2 = peer_did_for_seed(0xc2);
+    let base_routes = custody_route_bindings(
+        &epoch,
+        [
+            RuntimeCustodyRouteTransportConfig::Local,
+            RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                peer_did: peer_did_1.clone(),
+            },
+            RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                peer_did: peer_did_2.clone(),
+            },
+        ],
+    );
+
+    let mut wrong_policy = custody_composition_config(now, base_routes.clone());
+    wrong_policy.expected_policy_authority_base64 = raw_b64_32(
+        SigningKey::from_bytes(&[0x72; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    write_owner_only_custody_composition_config(&data_dir, &wrong_policy);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected trust-anchor rejection")
+        .to_string()
+        .contains("trust anchors"));
+
+    let mut wrong_auth = custody_composition_config(now, base_routes.clone());
+    wrong_auth.expected_committee_authorization_identity_base64 =
+        canonical_b64(&CustodyCommitteeAuthorizationIdentityV1::new(digest(0xfe), 1).unwrap());
+    write_owner_only_custody_composition_config(&data_dir, &wrong_auth);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected authorization-identity rejection")
+        .to_string()
+        .contains("trust anchors"));
+
+    let mut missing_route = custody_composition_config(now, base_routes.clone());
+    missing_route.routes.pop();
+    write_owner_only_custody_composition_config(&data_dir, &missing_route);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected missing-route rejection")
+        .to_string()
+        .contains("exactly three selected nodes"));
+
+    let mut extra_route = custody_composition_config(now, base_routes.clone());
+    extra_route.routes.push(RuntimeCustodyRouteBindingConfig {
+        node_public_key_base64: raw_b64_32(*node_public_key(9).as_bytes()),
+        owner_state_root_base64: raw_b64_32([0x99; 32]),
+        transport: RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+            peer_did: peer_did_for_seed(0xc9),
+        },
+    });
+    write_owner_only_custody_composition_config(&data_dir, &extra_route);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected extra-route rejection")
+        .to_string()
+        .contains("exactly three selected nodes"));
+
+    let mut duplicate_route = custody_composition_config(now, base_routes.clone());
+    duplicate_route.routes[1].node_public_key_base64 =
+        duplicate_route.routes[0].node_public_key_base64.clone();
+    write_owner_only_custody_composition_config(&data_dir, &duplicate_route);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected duplicate-node rejection")
+        .to_string()
+        .contains("duplicated or invalid"));
+
+    let mut duplicate_root = custody_composition_config(now, base_routes.clone());
+    duplicate_root.routes[1].owner_state_root_base64 =
+        duplicate_root.routes[0].owner_state_root_base64.clone();
+    write_owner_only_custody_composition_config(&data_dir, &duplicate_root);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected duplicate-root rejection")
+        .to_string()
+        .contains("duplicated or invalid"));
+
+    let mut two_local = custody_composition_config(now, base_routes.clone());
+    two_local.routes[1].transport = RuntimeCustodyRouteTransportConfig::Local;
+    write_owner_only_custody_composition_config(&data_dir, &two_local);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected multi-local rejection")
+        .to_string()
+        .contains("at most one local"));
+
+    let mut duplicate_peer = custody_composition_config(now, base_routes);
+    duplicate_peer.routes[2].transport = RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+        peer_did: peer_did_1,
+    };
+    write_owner_only_custody_composition_config(&data_dir, &duplicate_peer);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected duplicate-peer rejection")
+        .to_string()
+        .contains("carrier peer DIDs must be distinct"));
+
+    let mut foreign_node = custody_composition_config(
+        now,
+        custody_route_bindings(
+            &epoch,
+            [
+                RuntimeCustodyRouteTransportConfig::Local,
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xca),
+                },
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xcb),
+                },
+            ],
+        ),
+    );
+    foreign_node.routes[2].node_public_key_base64 = raw_b64_32(*node_public_key(9).as_bytes());
+    write_owner_only_custody_composition_config(&data_dir, &foreign_node);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected foreign-node rejection")
+        .to_string()
+        .contains("signed node set"));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_composition_rejects_noncanonical_json_and_base64_and_bad_peer_did() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    let mut config = custody_composition_config(
+        now,
+        custody_route_bindings(
+            &epoch,
+            [
+                RuntimeCustodyRouteTransportConfig::Local,
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xdb),
+                },
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xdc),
+                },
+            ],
+        ),
+    );
+    owner_only_dir(&protected_content_root(&data_dir));
+    let path = custody_composition_config_path(&data_dir);
+
+    fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected noncanonical-json rejection")
+        .to_string()
+        .contains("not canonical"));
+
+    write_owner_only_custody_composition_config(&data_dir, &config);
+    config.signed_pool_base64.push('\n');
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::to_value(&config).unwrap()).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected base64 rejection")
+        .to_string()
+        .contains("base64"));
+
+    let mut bad_peer = custody_composition_config(
+        now,
+        custody_route_bindings(
+            &epoch,
+            [
+                RuntimeCustodyRouteTransportConfig::Local,
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: "not-a-did".to_string(),
+                },
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xdd),
+                },
+            ],
+        ),
+    );
+    write_owner_only_custody_composition_config(&data_dir, &bad_peer);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected invalid did:key rejection")
+        .to_string()
+        .contains("did:key"));
+
+    bad_peer.routes[1].transport = RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+        peer_did: format!("{} ", peer_did_for_seed(0xde)),
+    };
+    write_owner_only_custody_composition_config(&data_dir, &bad_peer);
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected noncanonical did:key rejection")
+        .to_string()
+        .contains("did:key"));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    let config = custody_composition_config(
+        now,
+        custody_route_bindings(
+            &epoch,
+            [
+                RuntimeCustodyRouteTransportConfig::Local,
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xd1),
+                },
+                RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                    peer_did: peer_did_for_seed(0xd2),
+                },
+            ],
+        ),
+    );
+
+    write_owner_only_custody_composition_config(&data_dir, &config);
+    fs::set_permissions(
+        custody_composition_config_path(&data_dir),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected unsafe-file-mode rejection")
+        .to_string()
+        .contains("owner-only"));
+
+    write_owner_only_custody_composition_config(&data_dir, &config);
+    fs::set_permissions(
+        protected_content_root(&data_dir),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected unsafe-parent-mode rejection")
+        .to_string()
+        .contains("owner-only"));
+
+    write_owner_only_custody_composition_config(&data_dir, &config);
+    let symlink_data_dir = temp.path().join("symlink-data");
+    owner_only_dir(&symlink_data_dir);
+    let symlink_root_target = symlink_data_dir.join("protected-root-target");
+    owner_only_dir(&symlink_root_target);
+    std::os::unix::fs::symlink(
+        &symlink_root_target,
+        protected_content_root(&symlink_data_dir),
+    )
+    .unwrap();
+    let symlink_config_path = symlink_root_target.join("custody-composition.json");
+    fs::write(
+        &symlink_config_path,
+        serde_json::to_vec(&serde_json::to_value(&config).unwrap()).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&symlink_config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(load_runtime_custody_composition_config(&symlink_data_dir)
+        .err()
+        .expect("expected symlink-parent rejection")
+        .to_string()
+        .contains("owner-only directory"));
+
+    let symlink_file_data_dir = temp.path().join("symlink-file-data");
+    owner_only_dir(&symlink_file_data_dir);
+    owner_only_dir(&protected_content_root(&symlink_file_data_dir));
+    let real_config_dir = temp.path().join("real-config");
+    owner_only_dir(&real_config_dir);
+    let real_config_path = real_config_dir.join("custody-composition.json");
+    fs::write(
+        &real_config_path,
+        serde_json::to_vec(&serde_json::to_value(&config).unwrap()).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&real_config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(
+        &real_config_path,
+        custody_composition_config_path(&symlink_file_data_dir),
+    )
+    .unwrap();
+    assert!(load_runtime_custody_composition_config(&symlink_file_data_dir)
+        .err()
+        .expect("expected symlink-file rejection")
+        .to_string()
+        .contains("unavailable"));
+
+    let directory_path_data_dir = temp.path().join("directory-path-data");
+    owner_only_dir(&directory_path_data_dir);
+    owner_only_dir(&protected_content_root(&directory_path_data_dir));
+    std::fs::create_dir(custody_composition_config_path(&directory_path_data_dir)).unwrap();
+    fs::set_permissions(
+        custody_composition_config_path(&directory_path_data_dir),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert!(load_runtime_custody_composition_config(&directory_path_data_dir)
+        .err()
+        .expect("expected non-regular-file rejection")
+        .to_string()
+        .contains("regular file"));
+
+    let hard_link_data_dir = temp.path().join("hard-link-data");
+    owner_only_dir(&hard_link_data_dir);
+    owner_only_dir(&protected_content_root(&hard_link_data_dir));
+    let hard_link_source_dir = temp.path().join("hard-link-source");
+    owner_only_dir(&hard_link_source_dir);
+    let hard_link_source = hard_link_source_dir.join("custody-composition.json");
+    fs::write(
+        &hard_link_source,
+        serde_json::to_vec(&serde_json::to_value(&config).unwrap()).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&hard_link_source, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(
+        &hard_link_source,
+        custody_composition_config_path(&hard_link_data_dir),
+    )
+    .unwrap();
+    assert!(load_runtime_custody_composition_config(&hard_link_data_dir)
+        .err()
+        .expect("expected hard-link rejection")
+        .to_string()
+        .contains("hard-linked"));
 }
 
 #[cfg(unix)]

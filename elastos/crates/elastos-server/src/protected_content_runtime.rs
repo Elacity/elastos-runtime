@@ -10,16 +10,23 @@
 mod tests;
 
 use std::fs;
-use std::path::Path;
+use std::io::Read as _;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
+use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 use elastos_protected_content_contracts::{
-    CanonicalContract, Digest32, KeyReleaseRequestV1, RecipientKeyAuthorizationStatementV1,
-    RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, RightsEvaluationEvidenceRequestV1,
-    RightsPolicyBodyV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
-    RuntimeReleaseOperationStatementV1, SignedCustodyEpochV1, SignedRuntimeReleaseOperationV1,
-    WalletSignedRightsRequestV1,
+    CanonicalContract, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIssuerKeyV1, Digest32,
+    KeyReleaseRequestV1, NodePublicKey,
+    RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
+    RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RuntimeOperationIssuerKeyV1,
+    RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
+    SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
+    SignedRuntimeReleaseOperationV1, WalletSignedRightsRequestV1,
+    validate_custody_epoch_against_pool_at,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, RightsProviderRequestV1, RightsProviderResponseV1,
@@ -29,7 +36,7 @@ use elastos_protected_content_provider_contracts::{
     DecryptProviderRequestOpV1, DecryptProviderRequestV1, DecryptProviderResponseV1,
 };
 use elastos_protected_content_rights::{
-    PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
+    CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP, PrivateCustodyRightsRequestV1,
 };
 #[cfg(test)]
 use elastos_protected_content_runtime::RuntimeDecryptProvider;
@@ -41,15 +48,22 @@ use elastos_protected_content_runtime::{
 };
 use elastos_runtime::provider::bridge::{ProviderBridge, ProviderConfig};
 use elastos_runtime::provider::{
-    Provider, ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderRegistry,
-    ProviderTransfer, ResourceRequest, ResourceResponse,
+    Provider, ProviderCarrierRoute, ProviderError, ProviderInvocation, ProviderInvocationTransport,
+    ProviderRegistry, ProviderTransfer, ResourceRequest, ResourceResponse,
 };
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::Digest as _;
 
 pub(crate) const CUSTODY_PROVIDER_ID: &str = "custody";
 pub(crate) const RUNTIME_PROVIDER_ID: &str = "runtime";
 const CONTENT_PROVIDER_ID: &str = "content";
+const PROTECTED_CONTENT_ROOT: &str = "protected-content";
+const CUSTODY_COMPOSITION_CONFIG_FILE: &str = "protected-content/custody-composition.json";
+const CUSTODY_COMPOSITION_SCHEMA_V1: &str = "elastos.protected-content.custody-composition/v1";
+const MAX_CUSTODY_COMPOSITION_BYTES: usize = 64 * 1024;
+const MAX_CUSTODY_COMPOSITION_BLOB_BYTES: usize = 16 * 1024;
+const MAX_CUSTODY_COMPOSITION_PEER_DID_BYTES: usize = 256;
 const PROTECTED_CONTENT_OBJECT_KIND: &str = "protected-content";
 const PROTECTED_CONTENT_IDENTITY_PATH: &str = "protected-content/v1/identity.bin";
 const PROTECTED_CONTENT_INIT_PATH: &str = "protected-content/v1/init.mp4";
@@ -62,6 +76,47 @@ const CONTENT_AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.
 const DECRYPT_PROVIDER_ID: &str = "decrypt";
 const INACTIVE_CUSTODY_ROOT: &str = "protected-content/custody-provider/inactive";
 const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RuntimeCustodyRouteTransportConfig {
+    Local,
+    CarrierPeerDid { peer_did: String },
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCustodyRouteBindingConfig {
+    node_public_key_base64: String,
+    owner_state_root_base64: String,
+    transport: RuntimeCustodyRouteTransportConfig,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCustodyCompositionConfigFile {
+    schema: String,
+    expected_policy_authority_base64: String,
+    expected_committee_authorization_identity_base64: String,
+    signed_pool_base64: String,
+    signed_epoch_base64: String,
+    signed_committee_authorization_base64: String,
+    routes: Vec<RuntimeCustodyRouteBindingConfig>,
+}
+
+struct RuntimeValidatedCustodyRouteBinding {
+    owner_state_root: Digest32,
+    transport: ProviderInvocationTransport,
+}
+
+struct RuntimeValidatedCustodyCompositionConfig {
+    expected_policy_authority: CustodyEpochIssuerKeyV1,
+    expected_authorization_identity: CustodyCommitteeAuthorizationIdentityV1,
+    signed_pool: SignedCustodyPoolV1,
+    signed_epoch: SignedCustodyEpochV1,
+    signed_committee_authorization: SignedCustodyCommitteeAuthorizationV1,
+    routes: [RuntimeValidatedCustodyRouteBinding; 3],
+}
 
 struct InactiveCustodyProvider {
     bridge: Arc<ProviderBridge>,
@@ -663,6 +718,14 @@ fn inactive_custody_state_root(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join(INACTIVE_CUSTODY_ROOT)
 }
 
+fn protected_content_root(data_dir: &Path) -> PathBuf {
+    data_dir.join(PROTECTED_CONTENT_ROOT)
+}
+
+fn runtime_custody_composition_config_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(CUSTODY_COMPOSITION_CONFIG_FILE)
+}
+
 fn validate_inactive_custody_state_root(root: &Path) -> anyhow::Result<()> {
     validate_owner_only_directory(root, "inactive custody provider root")
 }
@@ -682,54 +745,386 @@ fn validate_owner_only_directory(path: &Path, label: &str) -> anyhow::Result<()>
             invalid_inactive_custody_config(format!("{label} must be an owner-only directory"))
         );
     }
-    validate_owner_only_metadata(label, &metadata, false)
+    validate_owner_only_metadata_with_error(
+        label,
+        &metadata,
+        false,
+        invalid_inactive_custody_config,
+    )
 }
 
 #[cfg(unix)]
-fn validate_owner_only_metadata(
+fn validate_owner_only_metadata_with_error(
     label: &str,
     metadata: &fs::Metadata,
     require_single_link: bool,
+    error_fn: fn(String) -> anyhow::Error,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let mode = metadata.permissions().mode() & 0o777;
     let expected_mask = if metadata.is_dir() { 0o700 } else { 0o600 };
     if metadata.uid() != unsafe { libc::geteuid() } || mode & 0o077 != 0 {
-        anyhow::bail!(
-            "{}",
-            invalid_inactive_custody_config(format!("{label} must be owner-only"))
-        );
+        anyhow::bail!("{}", error_fn(format!("{label} must be owner-only")));
     }
     if require_single_link && metadata.nlink() != 1 {
-        anyhow::bail!(
-            "{}",
-            invalid_inactive_custody_config(format!("{label} must not be hard-linked"))
-        );
+        anyhow::bail!("{}", error_fn(format!("{label} must not be hard-linked")));
     }
     if mode == 0 {
-        anyhow::bail!(
-            "{}",
-            invalid_inactive_custody_config(format!("{label} must not be inaccessible"))
-        );
+        anyhow::bail!("{}", error_fn(format!("{label} must not be inaccessible")));
     }
     if mode & expected_mask != mode {
         anyhow::bail!(
             "{}",
-            invalid_inactive_custody_config(format!("{label} has an unsupported owner mode"))
+            error_fn(format!("{label} has an unsupported owner mode"))
         );
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn validate_owner_only_metadata(
-    _path: &Path,
+fn validate_owner_only_metadata_with_error(
     _label: &str,
     _metadata: &fs::Metadata,
     _require_single_link: bool,
+    _error_fn: fn(String) -> anyhow::Error,
 ) -> anyhow::Result<()> {
-    Ok(())
+    anyhow::bail!("owner-only protected-content config validation is unsupported on this platform")
+}
+
+fn invalid_custody_composition_config(reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("protected-content custody composition config is missing or unsafe: {reason}")
+}
+
+fn validate_owner_only_protected_content_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let root = protected_content_root(data_dir);
+    let metadata = fs::symlink_metadata(&root).map_err(|_| {
+        invalid_custody_composition_config("protected-content parent is unavailable")
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config(
+                "protected-content parent must be an owner-only directory"
+            )
+        );
+    }
+    validate_owner_only_metadata_with_error(
+        "protected-content parent",
+        &metadata,
+        false,
+        invalid_custody_composition_config,
+    )?;
+    Ok(root)
+}
+
+#[cfg(unix)]
+fn read_owner_only_config_bytes(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|_| {
+        invalid_custody_composition_config("custody-composition file is unavailable")
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        invalid_custody_composition_config("custody-composition file metadata is unavailable")
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config("custody-composition file must be a regular file")
+        );
+    }
+    validate_owner_only_metadata_with_error(
+        "custody-composition file",
+        &metadata,
+        true,
+        invalid_custody_composition_config,
+    )?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    file.by_ref()
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config("custody-composition file exceeds bounds")
+        );
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_owner_only_config_bytes(path: &Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let _ = (path, max_bytes);
+    anyhow::bail!("owner-only protected-content config validation is unsupported on this platform")
+}
+
+fn canonical_custody_composition_config_bytes(
+    config: &RuntimeCustodyCompositionConfigFile,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::to_value(config)?)?)
+}
+
+fn decode_canonical_base64_bytes(
+    encoded: &str,
+    max_decoded_bytes: usize,
+    field: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let max_encoded_bytes = max_decoded_bytes.div_ceil(3) * 4;
+    if encoded.is_empty() || encoded.len() > max_encoded_bytes {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config(format!("{field} base64 has invalid length"))
+        );
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid_custody_composition_config(format!("{field} base64 is invalid")))?;
+    if decoded.is_empty()
+        || decoded.len() > max_decoded_bytes
+        || base64::engine::general_purpose::STANDARD.encode(&decoded) != encoded
+    {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config(format!("{field} base64 is not canonical"))
+        );
+    }
+    Ok(decoded)
+}
+
+fn decode_canonical_contract_base64<T: CanonicalContract>(
+    encoded: &str,
+    max_decoded_bytes: usize,
+    field: &str,
+) -> anyhow::Result<T> {
+    let bytes = decode_canonical_base64_bytes(encoded, max_decoded_bytes, field)?;
+    T::from_canonical_bytes(&bytes).map_err(|error| {
+        invalid_custody_composition_config(format!("{field} canonical bytes are invalid: {error}"))
+    })
+}
+
+fn decode_digest32_base64(encoded: &str, field: &str) -> anyhow::Result<Digest32> {
+    let bytes = decode_canonical_base64_bytes(encoded, 32, field)?;
+    let digest: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| invalid_custody_composition_config(format!("{field} must be 32 bytes")))?;
+    Ok(Digest32::new(digest))
+}
+
+fn decode_custody_epoch_issuer_base64(
+    encoded: &str,
+    field: &str,
+) -> anyhow::Result<CustodyEpochIssuerKeyV1> {
+    let bytes = decode_canonical_base64_bytes(encoded, 32, field)?;
+    let issuer: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| invalid_custody_composition_config(format!("{field} must be 32 bytes")))?;
+    CustodyEpochIssuerKeyV1::new(issuer).map_err(|error| {
+        invalid_custody_composition_config(format!("{field} bytes are invalid: {error}"))
+    })
+}
+
+fn decode_node_public_key_base64(encoded: &str, field: &str) -> anyhow::Result<NodePublicKey> {
+    let bytes = decode_canonical_base64_bytes(encoded, 32, field)?;
+    let public_key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| invalid_custody_composition_config(format!("{field} must be 32 bytes")))?;
+    NodePublicKey::new(public_key).map_err(|error| {
+        invalid_custody_composition_config(format!("{field} bytes are invalid: {error}"))
+    })
+}
+
+fn decode_canonical_peer_did(peer_did: &str) -> anyhow::Result<String> {
+    if peer_did.is_empty() || peer_did.len() > MAX_CUSTODY_COMPOSITION_PEER_DID_BYTES {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config("carrier peer DID is out of bounds")
+        );
+    }
+    let verifying_key = crate::crypto::decode_did_key(peer_did).map_err(|_| {
+        invalid_custody_composition_config("carrier peer DID is not a valid canonical did:key")
+    })?;
+    let canonical = crate::crypto::encode_did_key(&verifying_key).map_err(|_| {
+        invalid_custody_composition_config("carrier peer DID cannot be canonicalized")
+    })?;
+    if canonical != peer_did {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config("carrier peer DID is not canonical")
+        );
+    }
+    Ok(canonical)
+}
+
+fn load_runtime_custody_composition_config(
+    data_dir: &Path,
+) -> anyhow::Result<Option<RuntimeValidatedCustodyCompositionConfig>> {
+    let config_path = runtime_custody_composition_config_path(data_dir);
+    match fs::symlink_metadata(&config_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            anyhow::bail!(
+                "{}",
+                invalid_custody_composition_config("custody-composition file is unavailable")
+            )
+        }
+    }
+    let _protected_root = validate_owner_only_protected_content_dir(data_dir)?;
+    let bytes = read_owner_only_config_bytes(&config_path, MAX_CUSTODY_COMPOSITION_BYTES)?;
+    let config: RuntimeCustodyCompositionConfigFile =
+        serde_json::from_slice(&bytes).map_err(|_| {
+            invalid_custody_composition_config(
+                "custody-composition file is not valid canonical JSON",
+            )
+        })?;
+    if config.schema != CUSTODY_COMPOSITION_SCHEMA_V1
+        || canonical_custody_composition_config_bytes(&config)? != bytes
+    {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config("custody-composition file is not canonical")
+        );
+    }
+
+    let expected_policy_authority = decode_custody_epoch_issuer_base64(
+        &config.expected_policy_authority_base64,
+        "expected_policy_authority",
+    )?;
+    let expected_authorization_identity = decode_canonical_contract_base64(
+        &config.expected_committee_authorization_identity_base64,
+        MAX_CUSTODY_COMPOSITION_BLOB_BYTES,
+        "expected_committee_authorization_identity",
+    )?;
+    let signed_pool = decode_canonical_contract_base64(
+        &config.signed_pool_base64,
+        MAX_CUSTODY_COMPOSITION_BLOB_BYTES,
+        "signed_pool",
+    )?;
+    let signed_epoch = decode_canonical_contract_base64(
+        &config.signed_epoch_base64,
+        MAX_CUSTODY_COMPOSITION_BLOB_BYTES,
+        "signed_epoch",
+    )?;
+    let signed_committee_authorization = decode_canonical_contract_base64(
+        &config.signed_committee_authorization_base64,
+        MAX_CUSTODY_COMPOSITION_BLOB_BYTES,
+        "signed_committee_authorization",
+    )?;
+
+    let now = crate::auth::now_ts();
+    let validated = validate_custody_epoch_against_pool_at(
+        expected_policy_authority,
+        expected_authorization_identity,
+        &signed_pool,
+        &signed_epoch,
+        &signed_committee_authorization,
+        now,
+    )
+    .map_err(|_| {
+        invalid_custody_composition_config(
+            "signed pool/epoch/committee authorization does not validate against trust anchors",
+        )
+    })?;
+    let committee_nodes = validated.committee().nodes();
+    if committee_nodes.len() != 3 || config.routes.len() != 3 {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config(
+                "custody-composition routes must cover exactly three selected nodes"
+            )
+        );
+    }
+
+    let mut configured_node_keys = std::collections::BTreeSet::new();
+    let mut configured_roots = std::collections::BTreeSet::new();
+    let mut configured_peer_dids = std::collections::BTreeSet::new();
+    let mut local_count = 0usize;
+    let mut route_bindings =
+        std::collections::BTreeMap::<NodePublicKey, (Digest32, ProviderInvocationTransport)>::new();
+
+    for route in &config.routes {
+        let node_public_key =
+            decode_node_public_key_base64(&route.node_public_key_base64, "route.node_public_key")?;
+        let owner_state_root =
+            decode_digest32_base64(&route.owner_state_root_base64, "route.owner_state_root")?;
+        if owner_state_root == Digest32::new([0; 32])
+            || !configured_node_keys.insert(node_public_key)
+            || !configured_roots.insert(owner_state_root)
+        {
+            anyhow::bail!(
+                "{}",
+                invalid_custody_composition_config(
+                    "custody-composition routes are duplicated or invalid"
+                )
+            );
+        }
+        let transport = match &route.transport {
+            RuntimeCustodyRouteTransportConfig::Local => {
+                local_count += 1;
+                ProviderInvocationTransport::Local
+            }
+            RuntimeCustodyRouteTransportConfig::CarrierPeerDid { peer_did } => {
+                let canonical_peer_did = decode_canonical_peer_did(peer_did)?;
+                if !configured_peer_dids.insert(canonical_peer_did.clone()) {
+                    anyhow::bail!(
+                        "{}",
+                        invalid_custody_composition_config("carrier peer DIDs must be distinct")
+                    );
+                }
+                ProviderInvocationTransport::Carrier(ProviderCarrierRoute::PeerDid {
+                    peer_did: canonical_peer_did,
+                    timeout_ms: None,
+                })
+            }
+        };
+        route_bindings.insert(node_public_key, (owner_state_root, transport));
+    }
+
+    if local_count > 1 {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config("at most one local custody route is allowed")
+        );
+    }
+
+    let routes = committee_nodes
+        .iter()
+        .map(|node| {
+            let (owner_state_root, transport) = route_bindings
+                .remove(&node.node_public_key())
+                .ok_or_else(|| {
+                    invalid_custody_composition_config(
+                        "custody-composition routes do not exactly cover the signed node set",
+                    )
+                })?;
+            Ok(RuntimeValidatedCustodyRouteBinding {
+                owner_state_root,
+                transport,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if !route_bindings.is_empty() {
+        anyhow::bail!(
+            "{}",
+            invalid_custody_composition_config(
+                "custody-composition routes do not exactly cover the signed node set",
+            )
+        );
+    }
+
+    Ok(Some(RuntimeValidatedCustodyCompositionConfig {
+        expected_policy_authority,
+        expected_authorization_identity,
+        signed_pool,
+        signed_epoch,
+        signed_committee_authorization,
+        routes: routes.try_into().map_err(|_| {
+            invalid_custody_composition_config(
+                "custody-composition routes must cover exactly three selected nodes",
+            )
+        })?,
+    }))
 }
 
 pub fn log_unresolved_runtime_releases(data_dir: &Path) {
