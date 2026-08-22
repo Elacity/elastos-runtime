@@ -1,12 +1,12 @@
 # State
 
-Last updated: 2026-08-19 UTC
+Last updated: 2026-08-22 UTC
 
 This file records public-safe current truth for released 0.6.0 and active
 unpublished work. Historical
 local proof logs, private SSH aliases, tunnel ports, operator usernames, key
-paths, worktree paths, and target backup paths are intentionally not tracked in
-the public repository.
+paths, and target backup paths are intentionally not tracked in the public
+repository.
 
 ## Release Posture
 
@@ -104,16 +104,41 @@ the public repository.
   `escrow.json` is historical dev evidence only because it aggregates wrapped
   shares. The producer smoke writes and reloads `cek_commitment_b64`; the older
   Creator path carried the missing-commitment writer/reloader inconsistency.
-- Current protected-content source proof covers canonical contracts,
-  authenticated payload sealing, one-node custody-provider storage and release,
-  Wallet rights signing, typed chain-rights evidence, typed Runtime internal
-  coordination, exact-threshold reconstruction inside the decrypt boundary,
-  tamper/expiry/wrong-binding rejection, commitment checking, and CEK
-  zeroization. PR #15 adds provider/dev-harness encryption and decryption
-  evidence. No accepted or installed test yet proves
-  `mint -> Runtime authority/provider selection/audit -> per-node custody
-  release -> private reconstruction/decryption -> plaintext/playback` through
-  the real Runtime product path with three custody nodes.
+- Current protected-content source proof is layered, not product-complete.
+  Runtime tests prove durable 2-of-3 custody provisioning. A private server
+  adapter test publishes the fixed protected-content directory through the
+  existing content provider, reads its signed status receipt, refetches the
+  generic manifest/files, and returns only identity evidence pinned to the
+  Runtime-selected provider, object, publisher, and exact CENC media identity
+  before buy/open. Separate focused server/runtime tests prove the
+  passkey-bound Profile signing seam, signed Runtime release-operation
+  assembly, node-local rights evaluation behind the inactive `custody` route,
+  and a real three-node 2-of-3 release with the third node not invoked after
+  threshold success. A separate inactive process-backed Runtime success path
+  now combines real Runtime mint/release coordination, three distinct
+  custody-provider processes, and one decrypt-provider process through
+  mint -> availability -> buy -> open -> viewer init/segment read -> close,
+  with wrong-recipient rejection, close replay, and zero unresolved release
+  state. That process path uses `ContentAvailabilityTestProvider`,
+  deterministic Wallet request/response and purchase-effect fixtures,
+  `ProcessChainEvidenceProvider` fixtures, and a directly constructed signed
+  release operation; it does not itself prove a live Profile -> Wallet ->
+  Runtime process chain or a real Chain provider process. Lower-level Runtime
+  lifecycle and decrypt-provider process tests still separately prove
+  PQ-hybrid contribution reconstruction, exact CENC media reads, close replay,
+  process restart, and old-handle absence. Separate Runtime restart/replay
+  tests prove persisted terminal replay and retained nonterminal state after
+  effect start. The decrypt provider generates each operation-scoped recipient
+  key and retains its secret behind an opaque handle; Runtime receives only the
+  public key/identity, and a Profile signature authorizes that exact key. No
+  Profile seed enters Runtime, custody, or decrypt-provider contracts. A
+  separate real custody-provider process proof now covers alpha terminal
+  2-of-3 success plus beta terminal denial through the same node-local rights
+  boundary. Still open before cutover: the remaining combined process-backed
+  matrix beyond those now-proven paths (wrong object plus
+  restart/crash/cleanup), and any future live Profile/Wallet/Chain process
+  integration proof if product requirements still need it. The new path
+  remains inactive, not installed, not cut over, and not product-ready.
 - Released 0.6 and the published collaboration review stack retain the older
   provisional `elastos_common::protected_content` DTOs plus fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -172,7 +197,7 @@ the public repository.
   missing descriptions, missing authors, and scaffold placeholder authors.
 - Target proof is operator-supplied. It must name target roles and exact command
   lines without committing private host aliases, SSH keys, tunnel ports, local
-  data roots, or local worktree paths.
+  data roots, or other private operator paths.
 - Private proof logs stay outside this repo. Public release notes should claim
   only proof that can be reproduced from the reviewed source or from
   explicitly supplied target evidence.

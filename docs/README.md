@@ -57,6 +57,8 @@ Each top-level ledger has one job:
 - [Chain provider](CHAIN_PROVIDER.md): typed chain reads, proofs, and transactions
 - [Wallet provider](WALLET_PROVIDER.md): account, proof, approval, and signing authority
 - [Protected content](PROTECTED_CONTENT.md): sealed object access sequence
+- [Protected-content extraction](PROTECTED_CONTENT_EXTRACTION.md): remaining
+  dKMS/protected-content slices, banned branches, and next-slice gates
 - [Protected-content v1 contracts](PROTECTED_CONTENT_CONTRACTS_V1.md): canonical
   source-only review candidate
 - [Rights provider](RIGHTS_PROVIDER.md): canonical role and provisional capsule

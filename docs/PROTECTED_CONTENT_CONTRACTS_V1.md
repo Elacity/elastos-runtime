@@ -58,11 +58,13 @@ methods, alternate spellings, noncanonical Edwards encodings, and weak
 Ed25519 public keys fail. Node and receipt-issuer authority uses that same
 shared validator at construction.
 
-The custody helper also applies a stricter local canonical-identity rule for
-X25519 contract bytes than RFC 7748 requires at the primitive boundary.
-Contract node custody keys, recipient public keys, and HPKE encapped keys must
-use one exact canonical byte encoding and must reject low-order points before
-HPKE runs.
+The custody helper applies a stricter local canonical-identity rule to the
+final X25519 component embedded in X-Wing draft-06 public-key bytes than RFC
+7748 requires at the primitive boundary. Contract node custody keys and
+recipient public keys use X-Wing draft-06 (ML-KEM-768 followed by X25519), and
+the embedded X25519 component must use one exact canonical encoding and reject
+low-order points. Frozen HPKE field/domain names retain their existing meaning
+only where that separate recipient-release surface still uses them.
 
 ## Canonical wire form
 
@@ -101,8 +103,10 @@ seconds in UTC.
 recipient key identity, issue and expiry times, and a 16-byte replay nonce. The
 Wallet recovered from the signature must equal the Wallet in the protected
 content binding. Runtime must also compare the signed recipient with the key it
-selected for the authenticated Profile and session. A caller cannot replace
-either the owner Wallet or recipient after the signature.
+received from the decrypt provider for the authenticated Profile/session. That
+operation-scoped key is generated fresh by the provider; Runtime receives only
+its public key and identity, and a caller cannot replace either the owner Wallet
+or recipient after the signature.
 
 Runtime must create the session binding, request time window, and fresh replay
 nonce, then ask Wallet Provider to sign those exact canonical bytes. A capsule
@@ -188,7 +192,7 @@ authorization. It binds all of the following:
 
 - the exact `ProtectedContentBindingV1`;
 - the exact requested action;
-- the exact recipient X25519 public-key bytes;
+- the exact X-Wing draft-06 PQ-hybrid recipient public-key bytes;
 - the exact `RecipientKeyIdentityV1`;
 - the exact Runtime application-operation issuer key;
 - the shared opaque Runtime session binding;
@@ -197,9 +201,13 @@ authorization. It binds all of the following:
 Verification compares the recipient bytes to `RecipientKeyIdentityV1`, the
 Profile signer to the binding Profile, the Runtime issuer to the signed issuer,
 and the window to the parent binding/action/session context. This object proves
-authorization only. It does not prove that the recipient holds the X25519
-secret key. Actual recipient-key possession remains a later Runtime-owned
-invariant.
+authorization only. It does not prove that the decrypt provider retains the
+matching secret behind its opaque handle. The provider generates that fresh
+operation-scoped X-Wing draft-06 key; no Profile seed enters protected-content
+contracts or provider calls. Holder-only possession is a PQ-hybrid
+challenge/response against that exact authorized public key, and the
+crate-public reconstruct path returns the CEK only inside a decrypt-session
+wrap.
 
 ## Custody epoch and Runtime release operation
 
@@ -211,7 +219,7 @@ binds:
 - the exact threshold;
 - the exact ordered node list of:
   - Ed25519 node signing key,
-  - X25519 node custody public key,
+  - X-Wing draft-06 node custody public key (ML-KEM-768 followed by X25519),
   - deterministic share coordinate.
 
 The node list is canonicalized by node signing key, and the coordinates are
@@ -277,13 +285,14 @@ The contribution payload is provider-private
 opaque bytes. The contract requires that recipient to equal the signed release
 recipient and authenticates the bytes and commitment. The contract type itself
 does not implement encryption. The companion source-only
-`elastos-protected-content-custody` crate implements a pinned HPKE + GF256
-Shamir helper for new-content share release and threshold reconstruction,
-including a manifest-bound reconstructed-key commitment check that detects a
-wrong reconstructed key. It does not identify the malicious node, it is not
-verifiable secret sharing, it is not yet wired into Runtime/provider/product
-flows, and it has not received an external cryptographic audit. No production
-confidentiality claim follows from this contract type alone.
+`elastos-protected-content-custody` crate implements X-Wing draft-06 PQ-hybrid
+recipient-sealed contributions and threshold reconstruction, including a
+manifest-bound reconstructed-key commitment check that detects a wrong
+reconstructed key. It strictly validates the embedded X25519 component. It
+does not identify the malicious node, it is not verifiable secret sharing, it
+is not yet wired into Runtime/provider/product flows, and it has not received
+an external cryptographic audit. No production confidentiality claim follows
+from this contract type alone.
 
 ## Terminal result
 
@@ -321,12 +330,16 @@ store to one node, privately gates release on the exact claim, persists the
 exact recipient-encrypted contribution, and replays only that result. They do
 not solve malicious custody nodes, rights-policy correctness, Runtime durable
 replay storage, full operational custody state, recovery from a durable claim
-without a result, issuer-key lifecycle, recipient key-possession proof, node
-admission/rotation/recovery, availability, decryption, rendering, or product
-workflow safety. The custody helper uses `hpke` 0.13, whose upstream
-documentation says it has not been formally audited. These source-only crates
-provide bounded statements and helper operations for later systems to audit and
-integrate. Remaining custody and product work is tracked in `TASKS.md`.
+without a result, issuer-key lifecycle, node admission/rotation/recovery,
+Library list/open/play, rendering, or product workflow safety. Share wrap on
+this unpublished tree is `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`:
+X-Wing draft-06 with X25519 + ML-KEM-768, HKDF-SHA256, and AES-256-GCM.
+This is PQ-hybrid confidentiality only; authority signatures remain
+Ed25519/classical and full PQ authorization is a pre-activation decision. The
+Runtime mint journal can commit 2-of-3 PQ-hybrid envelopes without claiming
+content availability or a catalog path. Buy/open remains blocked until Runtime
+verifies the existing content provider's exact signed availability receipt.
+Remaining inactive e2e and cutover work is tracked in `TASKS.md`.
 
 The parent branch's provisional `elastos_common::protected_content` DTOs are
 not this canonical contract. Integration must replace that surface atomically
