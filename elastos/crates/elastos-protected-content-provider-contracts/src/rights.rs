@@ -73,7 +73,7 @@ impl RightsProviderRequestV1 {
         }
     }
 
-    fn signed_runtime_release_operation(
+    pub fn signed_runtime_release_operation(
         &self,
     ) -> Result<SignedRuntimeReleaseOperationV1, ContractError> {
         match &self.0 {

@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::canonical::{validate_ascii_identifier, CanonicalBody, ContractError, Decoder, Encoder};
 use crate::{
     CanonicalContract, CustodyNodeIdentityV1, Digest32, KeyEnvelopeIdentityV1, NodePublicKey,
-    NodeSetV1, ShareCoordinateV1, ThresholdV1, CUSTODY_HPKE_SUITE_ID_V1,
+    NodeSetV1, ShareCoordinateV1, ThresholdV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
     MAX_RECIPIENT_ENCRYPTION_SUITE_ID_BYTES, MAX_THRESHOLD_NODES,
 };
 
@@ -80,13 +80,13 @@ impl CanonicalBody for CustodyApprovedSuitesV1 {
             "released_share_hpke_suite_id",
             MAX_RECIPIENT_ENCRYPTION_SUITE_ID_BYTES,
         )?;
-        if self.recipient_encryption_suite_id != CUSTODY_HPKE_SUITE_ID_V1 {
+        if self.recipient_encryption_suite_id != CUSTODY_X_WING_AES256GCM_SUITE_ID_V1 {
             return Err(ContractError::InvalidField("recipient_encryption_suite_id"));
         }
-        if self.stored_share_hpke_suite_id != CUSTODY_HPKE_SUITE_ID_V1 {
+        if self.stored_share_hpke_suite_id != CUSTODY_X_WING_AES256GCM_SUITE_ID_V1 {
             return Err(ContractError::InvalidField("stored_share_hpke_suite_id"));
         }
-        if self.released_share_hpke_suite_id != CUSTODY_HPKE_SUITE_ID_V1 {
+        if self.released_share_hpke_suite_id != CUSTODY_X_WING_AES256GCM_SUITE_ID_V1 {
             return Err(ContractError::InvalidField("released_share_hpke_suite_id"));
         }
         Ok(())
@@ -449,21 +449,19 @@ pub(crate) fn validate_custody_node_set(
 
 #[cfg(test)]
 mod tests {
-    use curve25519_dalek::montgomery::MontgomeryPoint;
     use ed25519_dalek::{Signer as _, SigningKey};
     use hex::encode;
 
     use super::*;
-    use crate::NodeCustodyPublicKeyV1;
+    use crate::test_support::node_custody_public_key;
 
     fn node_public_key(seed: u8) -> NodePublicKey {
         let key = SigningKey::from_bytes(&[seed; 32]);
         NodePublicKey::new(key.verifying_key().to_bytes()).unwrap()
     }
 
-    fn custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
-        NodeCustodyPublicKeyV1::new(MontgomeryPoint::mul_base_clamped([seed; 32]).to_bytes())
-            .unwrap()
+    fn custody_public_key(seed: u8) -> crate::NodeCustodyPublicKeyV1 {
+        node_custody_public_key(seed)
     }
 
     fn node(seed: u8, coordinate: u8) -> CustodyNodeIdentityV1 {
@@ -480,9 +478,9 @@ mod tests {
         let statement = CustodyEpochStatementV1::new(
             CustodyEpochIssuerKeyV1::new(issuer_key.verifying_key().to_bytes()).unwrap(),
             CustodyApprovedSuitesV1::new(
-                CUSTODY_HPKE_SUITE_ID_V1,
-                CUSTODY_HPKE_SUITE_ID_V1,
-                CUSTODY_HPKE_SUITE_ID_V1,
+                CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
             )
             .unwrap(),
             ThresholdV1::new(2, 3).unwrap(),
@@ -506,7 +504,7 @@ mod tests {
         assert_eq!(verified.threshold(), ThresholdV1::new(2, 3).unwrap());
         assert_eq!(
             encode(epoch.epoch_identity().unwrap().epoch_sha256().as_bytes()),
-            "47d878494bd64d3b73ea851fe3319e0c6dc6971feba0f3243079c259c51f9deb"
+            "7823e0c872453b579a0c71c99bf94cdbc15fa0dcb1aff70d68dd7ab6c7d2692f"
         );
     }
 
@@ -524,8 +522,8 @@ mod tests {
         assert_eq!(
             CustodyApprovedSuitesV1::new(
                 "wrong",
-                CUSTODY_HPKE_SUITE_ID_V1,
-                CUSTODY_HPKE_SUITE_ID_V1
+                CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                CUSTODY_X_WING_AES256GCM_SUITE_ID_V1
             ),
             Err(ContractError::InvalidField("recipient_encryption_suite_id"))
         );
@@ -535,9 +533,9 @@ mod tests {
             CustodyEpochStatementV1::new(
                 CustodyEpochIssuerKeyV1::new(issuer_key.verifying_key().to_bytes()).unwrap(),
                 CustodyApprovedSuitesV1::new(
-                    CUSTODY_HPKE_SUITE_ID_V1,
-                    CUSTODY_HPKE_SUITE_ID_V1,
-                    CUSTODY_HPKE_SUITE_ID_V1,
+                    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
                 )
                 .unwrap(),
                 ThresholdV1::new(2, 3).unwrap(),

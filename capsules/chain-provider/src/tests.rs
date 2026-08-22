@@ -5,8 +5,8 @@ use elastos_protected_content_contracts::{
     CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
     CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1,
     CustodyEpochStatementV1, CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1,
-    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, HpkeCiphertextV1,
-    KeyEnvelopeIdentityV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey,
+    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyEnvelopeIdentityV1,
+    KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey, PqHybridSealedShareV1,
     ProfileIdentityV1, ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1,
     RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
     RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1, RightsObservationFinalityV1,
@@ -14,7 +14,8 @@ use elastos_protected_content_contracts::{
     RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1,
     ShareCoordinateV1, SignedCustodyEpochV1, SignedRecipientKeyAuthorizationV1,
     SignedRuntimeReleaseOperationV1, ThresholdV1, WalletAddress, WalletSignedRightsRequestV1,
-    CUSTODY_HPKE_SUITE_ID_V1, HPKE_ENCAPPED_KEY_BYTES, HPKE_SEALED_SHARE_BYTES,
+    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
+    X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -22,10 +23,15 @@ use std::path::Path;
 
 use k256::ecdsa::SigningKey as WalletSigningKey;
 use sha3::Digest as _;
+use x_wing::kem::{Decapsulator as _, KeyExport as _};
+use x_wing::TryKeyInit as _;
 
 mod support;
 
 use support::*;
+
+const PQ_HYBRID_AEAD_NONCE_BYTES: usize = 12;
+const PQ_HYBRID_WRAPPED_SHARE_BYTES: usize = 48;
 
 fn ok_data(response: Response) -> Value {
     match response {
@@ -268,15 +274,36 @@ fn wallet_address(seed: u8) -> WalletAddress {
 }
 
 fn recipient_public_key(seed: u8) -> RecipientPublicKeyBytesV1 {
-    let mut bytes = [0u8; 32];
-    bytes[0] = seed.max(9);
-    RecipientPublicKeyBytesV1::new(bytes).unwrap()
+    RecipientPublicKeyBytesV1::new(xwing_public_key_bytes(seed.max(9))).unwrap()
 }
 
 fn recipient_identity(seed: u8) -> RecipientKeyIdentityV1 {
     recipient_public_key(seed)
-        .key_identity(CUSTODY_HPKE_SUITE_ID_V1)
+        .key_identity(CUSTODY_X_WING_AES256GCM_SUITE_ID_V1)
         .unwrap()
+}
+
+fn xwing_public_key_bytes(
+    seed: u8,
+) -> [u8; elastos_protected_content_contracts::PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES] {
+    let secret = x_wing::DecapsulationKey::from([seed; x_wing::DECAPSULATION_KEY_SIZE]);
+    secret.encapsulation_key().to_bytes().into()
+}
+
+fn node_custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
+    NodeCustodyPublicKeyV1::new(xwing_public_key_bytes(seed)).unwrap()
+}
+
+fn sealed_share(seed: u8) -> PqHybridSealedShareV1 {
+    let public = x_wing::EncapsulationKey::new_from_slice(&xwing_public_key_bytes(seed)).unwrap();
+    let (ciphertext, _) =
+        public.encapsulate_deterministic(&[seed; x_wing::ENCAPSULATION_RANDOMNESS_SIZE].into());
+    let ciphertext: [u8; X_WING_DRAFT06_CIPHERTEXT_BYTES] = ciphertext.into();
+    let mut envelope = Vec::with_capacity(PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES);
+    envelope.extend_from_slice(&ciphertext);
+    envelope.extend_from_slice(&[seed; PQ_HYBRID_AEAD_NONCE_BYTES]);
+    envelope.extend_from_slice(&[seed ^ 0x5a; PQ_HYBRID_WRAPPED_SHARE_BYTES]);
+    PqHybridSealedShareV1::new(envelope).unwrap()
 }
 
 fn signed_custody_epoch() -> SignedCustodyEpochV1 {
@@ -284,19 +311,19 @@ fn signed_custody_epoch() -> SignedCustodyEpochV1 {
     let nodes = vec![
         elastos_protected_content_contracts::CustodyNodeIdentityV1::new(
             node_public_key(1),
-            NodeCustodyPublicKeyV1::new([0x31; 32]).unwrap(),
+            node_custody_public_key(0x31),
             ShareCoordinateV1::new(1).unwrap(),
         )
         .unwrap(),
         elastos_protected_content_contracts::CustodyNodeIdentityV1::new(
             node_public_key(2),
-            NodeCustodyPublicKeyV1::new([0x32; 32]).unwrap(),
+            node_custody_public_key(0x32),
             ShareCoordinateV1::new(2).unwrap(),
         )
         .unwrap(),
         elastos_protected_content_contracts::CustodyNodeIdentityV1::new(
             node_public_key(3),
-            NodeCustodyPublicKeyV1::new([0x33; 32]).unwrap(),
+            node_custody_public_key(0x33),
             ShareCoordinateV1::new(3).unwrap(),
         )
         .unwrap(),
@@ -304,9 +331,9 @@ fn signed_custody_epoch() -> SignedCustodyEpochV1 {
     let statement = CustodyEpochStatementV1::new(
         CustodyEpochIssuerKeyV1::new(issuer_key.verifying_key().to_bytes()).unwrap(),
         CustodyApprovedSuitesV1::new(
-            CUSTODY_HPKE_SUITE_ID_V1,
-            CUSTODY_HPKE_SUITE_ID_V1,
-            CUSTODY_HPKE_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
         )
         .unwrap(),
         ThresholdV1::new(2, 3).unwrap(),
@@ -335,16 +362,7 @@ fn custody_envelope_for_policy(policy: &RightsPolicyBodyV1) -> CustodyEnvelopeV1
         epoch.statement().nodes().to_vec(),
     )
     .unwrap();
-    let shares = [0x50, 0x51, 0x52]
-        .into_iter()
-        .map(|seed| {
-            let mut encapped_key = [0u8; HPKE_ENCAPPED_KEY_BYTES];
-            encapped_key[0] = seed;
-            let mut ciphertext = [0u8; HPKE_SEALED_SHARE_BYTES];
-            ciphertext.fill(seed);
-            HpkeCiphertextV1::new(encapped_key, ciphertext).unwrap()
-        })
-        .collect();
+    let shares = [0x50, 0x51, 0x52].into_iter().map(sealed_share).collect();
     let envelope = CustodyEnvelopeV1::new(manifest, shares).unwrap();
     let binding = binding_for_policy_and_envelope(policy, &envelope);
     assert_eq!(binding.rights_policy(), &policy.policy_identity().unwrap());

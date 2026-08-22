@@ -13,7 +13,7 @@ use elastos_protected_content_contracts::{
     AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, Digest32, NodePublicKey, NodeSetV1,
     ReplayClaimEntryV1, ReplayClaimError, ReplayClaimKeyV1, ReplayNonce16, RightsDecisionV1,
     RuntimeReleaseAuditIdV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
-    VerifiedNodeContributionV1, VerifiedNodeRightsDecisionV1, CUSTODY_HPKE_SUITE_ID_V1,
+    VerifiedNodeContributionV1, VerifiedNodeRightsDecisionV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
     MAX_RECIPIENT_SEALED_CONTRIBUTION_BYTES,
 };
 
@@ -301,7 +301,7 @@ impl DurableReplayClaimStoreV1 {
             return Err(CustodyError::BindingMismatch("store_node_public_key"));
         }
         node_share.validate_release_claim_context(&operation, selected_node_public_key, now)?;
-        if operation.recipient().encryption_suite_id() != CUSTODY_HPKE_SUITE_ID_V1 {
+        if operation.recipient().encryption_suite_id() != CUSTODY_X_WING_AES256GCM_SUITE_ID_V1 {
             return Err(CustodyError::BindingMismatch(
                 "recipient_encryption_suite_id",
             ));

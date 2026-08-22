@@ -776,7 +776,7 @@ mod tests {
         SignedNodeContributionV1, SignedRecipientKeyAuthorizationV1,
         SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
         TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1, WalletAddress,
-        WalletSignedRightsRequestV1, CUSTODY_HPKE_SUITE_ID_V1,
+        WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
     };
     use k256::ecdsa::SigningKey as WalletSigningKey;
     use rand09::rngs::StdRng;
@@ -841,7 +841,7 @@ mod tests {
     fn recipient_identity_for_tests(seed: u8) -> RecipientKeyIdentityV1 {
         let recipient_public_key = crate::test_support::recipient_public_key(seed);
         RecipientKeyIdentityV1::new(
-            CUSTODY_HPKE_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
             Digest32::new(sha2::Sha256::digest(recipient_public_key.as_bytes()).into()),
         )
         .unwrap()

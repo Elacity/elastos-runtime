@@ -633,7 +633,6 @@ fn map_runtime_release_key_release_error(error: RuntimeReleaseOperationError) ->
 
 #[cfg(test)]
 mod tests {
-    use curve25519_dalek::montgomery::MontgomeryPoint;
     use ed25519_dalek::{Signer as _, SigningKey};
     use hex::encode;
     use k256::ecdsa::SigningKey as WalletSigningKey;
@@ -664,8 +663,7 @@ mod tests {
     }
 
     fn custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
-        NodeCustodyPublicKeyV1::new(MontgomeryPoint::mul_base_clamped([seed; 32]).to_bytes())
-            .unwrap()
+        crate::test_support::node_custody_public_key(seed)
     }
 
     fn signed_epoch() -> SignedCustodyEpochV1 {
@@ -673,9 +671,9 @@ mod tests {
         let statement = CustodyEpochStatementV1::new(
             CustodyEpochIssuerKeyV1::new(issuer_key.verifying_key().to_bytes()).unwrap(),
             CustodyApprovedSuitesV1::new(
-                crate::CUSTODY_HPKE_SUITE_ID_V1,
-                crate::CUSTODY_HPKE_SUITE_ID_V1,
-                crate::CUSTODY_HPKE_SUITE_ID_V1,
+                crate::CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                crate::CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                crate::CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
             )
             .unwrap(),
             ThresholdV1::new(2, 3).unwrap(),
@@ -741,7 +739,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let stored_share = crate::HpkeCiphertextV1::new([0x31; 32], [0x41; 48]).unwrap();
+        let stored_share = crate::test_support::sealed_share(0x31);
         CustodyEnvelopeV1::new(
             manifest,
             vec![
@@ -788,14 +786,14 @@ mod tests {
 
     fn signed_operation() -> SignedRuntimeReleaseOperationV1 {
         let runtime_key = SigningKey::from_bytes(&[0x42; 32]);
-        let recipient_public_key = RecipientPublicKeyBytesV1::new([9; 32]).unwrap();
+        let recipient_public_key = crate::test_support::recipient_public_key_bytes(9);
         let binding = binding();
         let policy_body = policy_body();
         let rights_request = crate::RightsRequestV1::new(
             binding.clone(),
             RightsActionV1::View,
             recipient_public_key
-                .key_identity(crate::CUSTODY_HPKE_SUITE_ID_V1)
+                .key_identity(crate::CUSTODY_X_WING_AES256GCM_SUITE_ID_V1)
                 .unwrap(),
             NOW,
             NOW + 180,
@@ -874,7 +872,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             encode(authenticated.operation_hash().as_bytes()),
-            "71ee173d7a811fff30ac32bd1e6920378462119477bad9c233dd6e40c73e0e84"
+            "09890dce7b49bc4625a3fee68251ba76887831502522bd375f084a2df04e7b5b"
         );
         assert_eq!(
             authenticated.rights_request_hash(),
@@ -1139,7 +1137,7 @@ mod tests {
     #[test]
     fn runtime_release_operation_rejects_wrong_recipient_authorization_and_epoch_suite() {
         let operation = signed_operation();
-        let wrong_recipient_public_key = RecipientPublicKeyBytesV1::new([0x21; 32]).unwrap();
+        let wrong_recipient_public_key = crate::test_support::recipient_public_key_bytes(0x21);
         assert_eq!(
             RuntimeReleaseOperationStatementV1::new(
                 operation.statement().runtime_operation_issuer(),

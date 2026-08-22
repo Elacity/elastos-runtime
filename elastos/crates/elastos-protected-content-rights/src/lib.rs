@@ -3,9 +3,17 @@
 //! Source-only protected-content rights evaluation boundary.
 //!
 //! Runtime selects the provider outside this crate. This crate consumes one
-//! already authenticated Runtime release request plus a trusted evidence-source
-//! handle and returns the existing signed node decision response. It does not
-//! carry routes, topology, CEKs, or custody shares.
+//! already authenticated Runtime release request and returns the existing signed
+//! node decision response. Chain evidence is acquired through a Runtime-owned
+//! invoke callback; this crate does not dial RPC, accept caller-supplied
+//! evidence, or carry routes, topology, CEKs, or custody shares.
+
+mod chain;
+
+pub use chain::{
+    chain_rights_evidence_request, evaluate_rights_via_chain, parse_chain_rights_evidence_data,
+    CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
+};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use elastos_protected_content_contracts::{
@@ -16,8 +24,51 @@ use elastos_protected_content_contracts::{
 use elastos_protected_content_provider_contracts::{
     RightsProviderResponseV1, ValidatedRightsProviderRequestV1,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{future::Future, pin::Pin};
 use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PrivateCustodyRightsRequestV1 {
+    PrepareEvidence { request: Value },
+    SettleEvidence { request: Value, chain_data: Value },
+}
+
+impl PrivateCustodyRightsRequestV1 {
+    pub fn new_prepare(request: Value) -> Self {
+        Self::PrepareEvidence { request }
+    }
+
+    pub fn new_settle(request: Value, chain_data: Value) -> Self {
+        Self::SettleEvidence {
+            request,
+            chain_data,
+        }
+    }
+
+    pub fn to_json_vec(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+
+    pub fn request_json(&self) -> &Value {
+        match self {
+            Self::PrepareEvidence { request } | Self::SettleEvidence { request, .. } => request,
+        }
+    }
+
+    pub fn chain_data(&self) -> Option<&Value> {
+        match self {
+            Self::PrepareEvidence { .. } => None,
+            Self::SettleEvidence { chain_data, .. } => Some(chain_data),
+        }
+    }
+}
 
 pub type RightsEvidenceFutureV1<'a> = Pin<
     Box<
@@ -76,57 +127,76 @@ impl<S: TrustedRightsEvidenceSourceV1> ProtectedContentRightsEvaluatorV1<S> {
         if request.selected_node_public_key() != self.node_public_key {
             return Err(RightsEvaluationErrorV1::WrongSelectedNode);
         }
-        let authenticated = request.authenticated_runtime_release_operation();
-        let statement = authenticated.statement();
         let evidence = self
             .evidence_source
             .acquire_evidence_at(request, now_unix_seconds)
             .await?;
-        evidence
-            .validate_against_runtime_release_at(authenticated, now_unix_seconds)
-            .map_err(|_| RightsEvaluationErrorV1::EvidenceBinding)?;
-        let max_expires_at = now_unix_seconds
-            .checked_add(MAX_NODE_DECISION_LIFETIME_SECS)
-            .ok_or(RightsEvaluationErrorV1::DecisionWindow)?;
-        let expires_at = max_expires_at
-            .min(statement.expires_at())
-            .min(statement.release_request().expires_at());
-        if expires_at <= now_unix_seconds {
-            return Err(RightsEvaluationErrorV1::DecisionWindow);
-        }
-        let decision = if evidence.has_access() {
-            RightsDecisionV1::Allowed
-        } else {
-            RightsDecisionV1::Denied
-        };
-        let decision_statement = NodeRightsDecisionStatementV1::new(
-            authenticated.release_request_hash(),
-            authenticated.rights_request_hash(),
-            authenticated.binding().clone(),
-            authenticated.action(),
-            self.node_public_key,
-            decision,
-            evidence.canonical_hash()?,
+        evaluate_validated_rights_with_evidence_at(
+            &self.node_signing_key,
+            request,
+            evidence,
             now_unix_seconds,
-            expires_at,
-        )?;
-        let signed_decision = SignedNodeRightsDecisionV1::new(
-            decision_statement.clone(),
-            self.node_signing_key
-                .sign(&decision_statement.canonical_bytes()?)
-                .to_bytes()
-                .to_vec(),
-        )?;
-        let node_set = statement
-            .custody_epoch()
-            .statement()
-            .node_set()
-            .map_err(|_| RightsEvaluationErrorV1::DecisionBinding)?;
-        authenticated
-            .verify_node_rights_decision(&signed_decision, &node_set, now_unix_seconds)
-            .map_err(RightsEvaluationErrorV1::from)?;
-        RightsProviderResponseV1::new_decision(&signed_decision).map_err(Into::into)
+        )
     }
+}
+
+pub fn evaluate_validated_rights_with_evidence_at(
+    node_signing_key: &SigningKey,
+    request: &ValidatedRightsProviderRequestV1,
+    evidence: RightsEvaluationEvidenceV1,
+    now_unix_seconds: u64,
+) -> Result<RightsProviderResponseV1, RightsEvaluationErrorV1> {
+    let node_public_key = NodePublicKey::new(node_signing_key.verifying_key().to_bytes())
+        .map_err(|_| RightsEvaluationErrorV1::InvalidNodeSigningKey)?;
+    if request.selected_node_public_key() != node_public_key {
+        return Err(RightsEvaluationErrorV1::WrongSelectedNode);
+    }
+    let authenticated = request.authenticated_runtime_release_operation();
+    let statement = authenticated.statement();
+    evidence
+        .validate_against_runtime_release_at(authenticated, now_unix_seconds)
+        .map_err(|_| RightsEvaluationErrorV1::EvidenceBinding)?;
+    let max_expires_at = now_unix_seconds
+        .checked_add(MAX_NODE_DECISION_LIFETIME_SECS)
+        .ok_or(RightsEvaluationErrorV1::DecisionWindow)?;
+    let expires_at = max_expires_at
+        .min(statement.expires_at())
+        .min(statement.release_request().expires_at());
+    if expires_at <= now_unix_seconds {
+        return Err(RightsEvaluationErrorV1::DecisionWindow);
+    }
+    let decision = if evidence.has_access() {
+        RightsDecisionV1::Allowed
+    } else {
+        RightsDecisionV1::Denied
+    };
+    let decision_statement = NodeRightsDecisionStatementV1::new(
+        authenticated.release_request_hash(),
+        authenticated.rights_request_hash(),
+        authenticated.binding().clone(),
+        authenticated.action(),
+        node_public_key,
+        decision,
+        evidence.canonical_hash()?,
+        now_unix_seconds,
+        expires_at,
+    )?;
+    let signed_decision = SignedNodeRightsDecisionV1::new(
+        decision_statement.clone(),
+        node_signing_key
+            .sign(&decision_statement.canonical_bytes()?)
+            .to_bytes()
+            .to_vec(),
+    )?;
+    let node_set = statement
+        .custody_epoch()
+        .statement()
+        .node_set()
+        .map_err(|_| RightsEvaluationErrorV1::DecisionBinding)?;
+    authenticated
+        .verify_node_rights_decision(&signed_decision, &node_set, now_unix_seconds)
+        .map_err(RightsEvaluationErrorV1::from)?;
+    RightsProviderResponseV1::new_decision(&signed_decision).map_err(Into::into)
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -143,6 +213,8 @@ pub enum RightsEvaluationErrorV1 {
     DecisionBinding,
     #[error("rights evidence source failed")]
     EvidenceSource,
+    #[error("chain rights evidence is invalid")]
+    ChainEvidence,
     #[error("protected-content contract error")]
     Contract,
     #[error("protected-content release binding error")]
@@ -167,19 +239,19 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use elastos_auth::ethereum_signed_message_hash;
     use elastos_protected_content_contracts::{
-        CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
+        CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
         CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1,
         CustodyEpochStatementV1, CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1,
-        EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, HpkeCiphertextV1,
-        KeyReleaseRequestV1, NodeCustodyPublicKeyV1, ProtectedContentBindingV1,
+        EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseRequestV1,
+        NodeCustodyPublicKeyV1, PqHybridSealedShareV1, ProtectedContentBindingV1,
         RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
         ReplayNonce16, RightsActionV1, RightsEvaluationEvidenceRequestV1,
         RightsObservationFinalityV1, RightsPolicyBodyV1, RightsSubjectSourceV1,
         RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
         RuntimeSessionBindingV1, ShareCoordinateV1, SignedCustodyEpochV1,
         SignedRecipientKeyAuthorizationV1, SignedRuntimeReleaseOperationV1, ThresholdV1,
-        WalletAddress, WalletSignedRightsRequestV1, CUSTODY_HPKE_SUITE_ID_V1,
-        HPKE_ENCAPPED_KEY_BYTES, HPKE_SEALED_SHARE_BYTES,
+        WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+        PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES, X_WING_DRAFT06_CIPHERTEXT_BYTES,
     };
     use elastos_protected_content_provider_contracts::{
         RightsProviderRequestV1, RightsProviderResponseStatusV1, ValidatedRightsProviderRequestV1,
@@ -190,12 +262,16 @@ mod tests {
         future::Future,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         task::{Context, Poll, Waker},
     };
+    use x_wing::kem::{Decapsulator as _, KeyExport as _};
+    use x_wing::TryKeyInit as _;
 
     const NOW: u64 = 2_000_000_000;
+    const PQ_HYBRID_AEAD_NONCE_BYTES: usize = 12;
+    const PQ_HYBRID_WRAPPED_SHARE_BYTES: usize = 48;
 
     fn digest(seed: u8) -> Digest32 {
         Digest32::new([seed; 32])
@@ -217,15 +293,37 @@ mod tests {
     }
 
     fn recipient_public_key(seed: u8) -> RecipientPublicKeyBytesV1 {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed.max(9);
-        RecipientPublicKeyBytesV1::new(bytes).unwrap()
+        RecipientPublicKeyBytesV1::new(xwing_public_key_bytes(seed.max(9))).unwrap()
     }
 
     fn recipient_identity(seed: u8) -> RecipientKeyIdentityV1 {
         recipient_public_key(seed)
-            .key_identity(CUSTODY_HPKE_SUITE_ID_V1)
+            .key_identity(CUSTODY_X_WING_AES256GCM_SUITE_ID_V1)
             .unwrap()
+    }
+
+    fn xwing_public_key_bytes(
+        seed: u8,
+    ) -> [u8; elastos_protected_content_contracts::PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES] {
+        let secret = x_wing::DecapsulationKey::from([seed; x_wing::DECAPSULATION_KEY_SIZE]);
+        secret.encapsulation_key().to_bytes().into()
+    }
+
+    fn node_custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
+        NodeCustodyPublicKeyV1::new(xwing_public_key_bytes(seed)).unwrap()
+    }
+
+    fn sealed_share(seed: u8) -> PqHybridSealedShareV1 {
+        let public =
+            x_wing::EncapsulationKey::new_from_slice(&xwing_public_key_bytes(seed)).unwrap();
+        let (ciphertext, _) =
+            public.encapsulate_deterministic(&[seed; x_wing::ENCAPSULATION_RANDOMNESS_SIZE].into());
+        let ciphertext: [u8; X_WING_DRAFT06_CIPHERTEXT_BYTES] = ciphertext.into();
+        let mut envelope = Vec::with_capacity(PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES);
+        envelope.extend_from_slice(&ciphertext);
+        envelope.extend_from_slice(&[seed; PQ_HYBRID_AEAD_NONCE_BYTES]);
+        envelope.extend_from_slice(&[seed ^ 0x5a; PQ_HYBRID_WRAPPED_SHARE_BYTES]);
+        PqHybridSealedShareV1::new(envelope).unwrap()
     }
 
     fn policy_body() -> RightsPolicyBodyV1 {
@@ -248,19 +346,19 @@ mod tests {
         let nodes = vec![
             elastos_protected_content_contracts::CustodyNodeIdentityV1::new(
                 node_public_key(1),
-                NodeCustodyPublicKeyV1::new([0x31; 32]).unwrap(),
+                node_custody_public_key(0x31),
                 ShareCoordinateV1::new(1).unwrap(),
             )
             .unwrap(),
             elastos_protected_content_contracts::CustodyNodeIdentityV1::new(
                 node_public_key(2),
-                NodeCustodyPublicKeyV1::new([0x32; 32]).unwrap(),
+                node_custody_public_key(0x32),
                 ShareCoordinateV1::new(2).unwrap(),
             )
             .unwrap(),
             elastos_protected_content_contracts::CustodyNodeIdentityV1::new(
                 node_public_key(3),
-                NodeCustodyPublicKeyV1::new([0x33; 32]).unwrap(),
+                node_custody_public_key(0x33),
                 ShareCoordinateV1::new(3).unwrap(),
             )
             .unwrap(),
@@ -268,9 +366,9 @@ mod tests {
         let statement = CustodyEpochStatementV1::new(
             CustodyEpochIssuerKeyV1::new(issuer_key.verifying_key().to_bytes()).unwrap(),
             CustodyApprovedSuitesV1::new(
-                CUSTODY_HPKE_SUITE_ID_V1,
-                CUSTODY_HPKE_SUITE_ID_V1,
-                CUSTODY_HPKE_SUITE_ID_V1,
+                CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+                CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
             )
             .unwrap(),
             ThresholdV1::new(2, 3).unwrap(),
@@ -301,13 +399,7 @@ mod tests {
         .unwrap();
         let shares = [seed ^ 0x50, seed ^ 0x51, seed ^ 0x52]
             .into_iter()
-            .map(|seed| {
-                let mut encapped_key = [0u8; HPKE_ENCAPPED_KEY_BYTES];
-                encapped_key[0] = seed.max(9);
-                let mut ciphertext = [0u8; HPKE_SEALED_SHARE_BYTES];
-                ciphertext.fill(seed);
-                HpkeCiphertextV1::new(encapped_key, ciphertext).unwrap()
-            })
+            .map(sealed_share)
             .collect();
         CustodyEnvelopeV1::new(manifest, shares).unwrap()
     }
@@ -775,5 +867,248 @@ mod tests {
             NOW + 3,
         )
         .is_err());
+    }
+
+    fn rights_request(
+        operation: &SignedRuntimeReleaseOperationV1,
+        node_seed: u8,
+    ) -> RightsProviderRequestV1 {
+        RightsProviderRequestV1::new_evaluate(node_public_key(node_seed), operation).unwrap()
+    }
+
+    fn chain_data_for(evidence: &RightsEvaluationEvidenceV1) -> serde_json::Value {
+        let bytes = evidence.canonical_bytes().unwrap();
+        serde_json::json!({
+            "schema": "elastos.chain.protected-content-rights-evidence/v1",
+            "chain_id": evidence.observed_chain_id(),
+            "observed_block_number": evidence.observed_block_number(),
+            "head_block_number": evidence.head_block_number(),
+            "observed_block_hash": format!(
+                "0x{}",
+                hex::encode(evidence.observed_block_hash().as_bytes())
+            ),
+            "rights_evaluation_evidence": format!("0x{}", hex::encode(&bytes)),
+            "rights_evaluation_evidence_hash": format!(
+                "0x{}",
+                hex::encode(evidence.canonical_hash().unwrap().as_bytes())
+            ),
+        })
+    }
+
+    #[test]
+    fn chain_rights_request_is_op_and_signed_operation_only() {
+        let operation = signed_operation(0x42);
+        let request = chain_rights_evidence_request(&operation).unwrap();
+        let object = request.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        assert_eq!(
+            object.get("op").and_then(|value| value.as_str()),
+            Some(CHAIN_RIGHTS_EVIDENCE_OP)
+        );
+        let hex = object
+            .get("signed_runtime_release_operation")
+            .and_then(|value| value.as_str())
+            .unwrap();
+        assert!(hex.starts_with("0x"));
+        for forbidden in [
+            "network",
+            "rpc_url",
+            "host",
+            "ip",
+            "port",
+            "url",
+            "endpoint",
+            "has_access",
+            "rights_evaluation_evidence",
+        ] {
+            assert!(!object.contains_key(forbidden));
+        }
+    }
+
+    #[test]
+    fn chain_evidence_parser_rejects_topology_injection_and_missing_evidence() {
+        let operation = signed_operation(0x42);
+        let request = validated_request(&operation, 1);
+        let evidence = evidence_for(&request, true);
+        let mut with_network = chain_data_for(&evidence);
+        with_network["network"] = serde_json::json!("esc-mainnet");
+        assert_eq!(
+            parse_chain_rights_evidence_data(&with_network).unwrap_err(),
+            RightsEvaluationErrorV1::ChainEvidence
+        );
+
+        let mut with_rpc = chain_data_for(&evidence);
+        with_rpc["rpc_url"] = serde_json::json!("http://127.0.0.1:8545");
+        assert_eq!(
+            parse_chain_rights_evidence_data(&with_rpc).unwrap_err(),
+            RightsEvaluationErrorV1::ChainEvidence
+        );
+
+        let mut with_host = chain_data_for(&evidence);
+        with_host["host"] = serde_json::json!("127.0.0.1");
+        assert_eq!(
+            parse_chain_rights_evidence_data(&with_host).unwrap_err(),
+            RightsEvaluationErrorV1::ChainEvidence
+        );
+
+        let mut with_has_access = chain_data_for(&evidence);
+        with_has_access["has_access"] = serde_json::json!(true);
+        assert_eq!(
+            parse_chain_rights_evidence_data(&with_has_access).unwrap_err(),
+            RightsEvaluationErrorV1::ChainEvidence
+        );
+
+        let mut missing = chain_data_for(&evidence);
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("rights_evaluation_evidence");
+        assert_eq!(
+            parse_chain_rights_evidence_data(&missing).unwrap_err(),
+            RightsEvaluationErrorV1::ChainEvidence
+        );
+
+        let mut hash_mismatch = chain_data_for(&evidence);
+        hash_mismatch["rights_evaluation_evidence_hash"] =
+            serde_json::json!(format!("0x{}", hex::encode([0xab; 32])));
+        assert_eq!(
+            parse_chain_rights_evidence_data(&hash_mismatch).unwrap_err(),
+            RightsEvaluationErrorV1::ChainEvidence
+        );
+
+        let bytes = evidence.canonical_bytes().unwrap();
+        let minimal = serde_json::json!({
+            "schema": "elastos.chain.protected-content-rights-evidence/v1",
+            "rights_evaluation_evidence": format!("0x{}", hex::encode(&bytes)),
+        });
+        assert_eq!(
+            parse_chain_rights_evidence_data(&minimal).unwrap(),
+            evidence
+        );
+    }
+
+    #[test]
+    fn evaluate_rights_via_chain_signs_allow_and_deny_from_chain_json() {
+        let operation = signed_operation(0x42);
+        let request = rights_request(&operation, 1);
+        let validated = validated_request(&operation, 1);
+        let issuer = operation.statement().runtime_operation_issuer();
+        let allow_data = chain_data_for(&evidence_for(&validated, true));
+        let deny_data = chain_data_for(&evidence_for(&validated, false));
+
+        let allow = block_on(evaluate_rights_via_chain(
+            node_signing_key(1),
+            issuer,
+            &request,
+            NOW + 4,
+            |chain_request| async move {
+                assert_eq!(
+                    chain_request.get("op").and_then(|value| value.as_str()),
+                    Some(CHAIN_RIGHTS_EVIDENCE_OP)
+                );
+                Ok(allow_data)
+            },
+        ))
+        .unwrap();
+        assert_eq!(allow.status(), RightsProviderResponseStatusV1::Decision);
+        assert_eq!(
+            allow
+                .signed_node_rights_decision()
+                .unwrap()
+                .statement()
+                .decision(),
+            RightsDecisionV1::Allowed
+        );
+
+        let deny = block_on(evaluate_rights_via_chain(
+            node_signing_key(1),
+            issuer,
+            &request,
+            NOW + 4,
+            |_| async move { Ok(deny_data) },
+        ))
+        .unwrap();
+        assert_eq!(
+            deny.signed_node_rights_decision()
+                .unwrap()
+                .statement()
+                .decision(),
+            RightsDecisionV1::Denied
+        );
+    }
+
+    #[test]
+    fn evaluate_rights_via_chain_does_not_invoke_on_invalid_request_or_wrong_node() {
+        let operation = signed_operation(0x42);
+        let request = rights_request(&operation, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let wrong_issuer = RuntimeOperationIssuerKeyV1::new(
+            SigningKey::from_bytes(&[0x24; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap();
+        let issuer_calls = Arc::clone(&calls);
+        assert_eq!(
+            block_on(evaluate_rights_via_chain(
+                node_signing_key(1),
+                wrong_issuer,
+                &request,
+                NOW + 4,
+                move |_| {
+                    issuer_calls.fetch_add(1, Ordering::SeqCst);
+                    async { panic!("chain must not be invoked") }
+                },
+            ))
+            .unwrap_err(),
+            RightsEvaluationErrorV1::Contract
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let node_calls = Arc::clone(&calls);
+        assert_eq!(
+            block_on(evaluate_rights_via_chain(
+                node_signing_key(2),
+                operation.statement().runtime_operation_issuer(),
+                &request,
+                NOW + 4,
+                move |_| {
+                    node_calls.fetch_add(1, Ordering::SeqCst);
+                    async { panic!("chain must not be invoked") }
+                },
+            ))
+            .unwrap_err(),
+            RightsEvaluationErrorV1::WrongSelectedNode
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn evaluate_rights_via_chain_fails_closed_on_injected_chain_topology() {
+        let operation = signed_operation(0x42);
+        let request = rights_request(&operation, 1);
+        let validated = validated_request(&operation, 1);
+        let last_request = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&last_request);
+        let mut poisoned = chain_data_for(&evidence_for(&validated, true));
+        poisoned["rpc_url"] = serde_json::json!("http://127.0.0.1:8545");
+        assert_eq!(
+            block_on(evaluate_rights_via_chain(
+                node_signing_key(1),
+                operation.statement().runtime_operation_issuer(),
+                &request,
+                NOW + 4,
+                move |chain_request| {
+                    *captured.lock().unwrap() = Some(chain_request);
+                    async move { Ok(poisoned) }
+                },
+            ))
+            .unwrap_err(),
+            RightsEvaluationErrorV1::ChainEvidence
+        );
+        let sent = last_request.lock().unwrap().clone().unwrap();
+        assert_eq!(sent.as_object().unwrap().len(), 2);
+        assert!(!sent.as_object().unwrap().contains_key("rpc_url"));
     }
 }

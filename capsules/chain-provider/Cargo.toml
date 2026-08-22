@@ -22,6 +22,7 @@ elastos-auth = { path = "../../elastos/crates/elastos-auth" }
 ed25519-dalek = "2.1"
 k256 = { version = "0.13", features = ["ecdsa"] }
 sha3 = "0.10"
+x-wing = { version = "=0.1.0", features = ["hazmat", "zeroize"] }
 
 [profile.release]
 opt-level = "s"

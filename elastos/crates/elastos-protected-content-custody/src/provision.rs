@@ -1,6 +1,8 @@
 use elastos_protected_content_contracts::{
-    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, EncryptedContentIdentityV1, ThresholdV1,
-    ValidatedCustodyCommitteeV1,
+    ContractError, CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeManifestV1,
+    CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyNodeIdentityV1, CustodyPoolIdentityV1,
+    EncryptedContentIdentityV1, NodeCustodyPublicKeyV1, NodePublicKey, ShareCoordinateV1,
+    ThresholdV1, ValidatedCustodyCommitteeV1,
 };
 use hpke::rand_core::{CryptoRng as HpkeCryptoRng, RngCore as HpkeRngCore};
 use rand09::{rngs::StdRng as HpkeStdRng, SeedableRng as _};
@@ -11,8 +13,34 @@ use rand10::{
 use vsss_rs::Gf256;
 
 use crate::{
-    hpke_helpers::seal_share, secrets::ContentEncryptionKeyV1, CustodyError, CONTENT_KEY_BYTES,
+    secrets::ContentEncryptionKeyV1, share_wrap::seal_share, CustodyError, CONTENT_KEY_BYTES,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactCustodyEnvelopeNodeV1 {
+    node_public_key: NodePublicKey,
+    node_custody_public_key: NodeCustodyPublicKeyV1,
+}
+
+impl ExactCustodyEnvelopeNodeV1 {
+    pub const fn new(
+        node_public_key: NodePublicKey,
+        node_custody_public_key: NodeCustodyPublicKeyV1,
+    ) -> Self {
+        Self {
+            node_public_key,
+            node_custody_public_key,
+        }
+    }
+
+    pub const fn node_public_key(&self) -> NodePublicKey {
+        self.node_public_key
+    }
+
+    pub const fn node_custody_public_key(&self) -> NodeCustodyPublicKeyV1 {
+        self.node_custody_public_key
+    }
+}
 
 pub fn provision_custody_envelope(
     encrypted_content: EncryptedContentIdentityV1,
@@ -32,6 +60,30 @@ pub fn provision_custody_envelope(
     )
 }
 
+pub fn provision_custody_envelope_for_exact_nodes(
+    encrypted_content: EncryptedContentIdentityV1,
+    content_key: &ContentEncryptionKeyV1,
+    custody_pool: CustodyPoolIdentityV1,
+    custody_epoch: CustodyEpochIdentityV1,
+    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+    nodes: &[ExactCustodyEnvelopeNodeV1],
+) -> Result<CustodyEnvelopeV1, CustodyError> {
+    let mut hpke_rng =
+        HpkeStdRng::try_from_os_rng().map_err(|_| CustodyError::RandomnessUnavailable)?;
+    let mut shamir_rng = ShamirStdRng::try_from_rng(&mut ShamirSysRng)
+        .map_err(|_| CustodyError::RandomnessUnavailable)?;
+    provision_custody_envelope_for_exact_nodes_with_rng(
+        encrypted_content,
+        content_key,
+        custody_pool,
+        custody_epoch,
+        custody_committee_authorization,
+        nodes,
+        &mut hpke_rng,
+        &mut shamir_rng,
+    )
+}
+
 pub(crate) fn provision_custody_envelope_with_rng<RHpke, RShamir>(
     encrypted_content: EncryptedContentIdentityV1,
     content_key: &ContentEncryptionKeyV1,
@@ -44,14 +96,90 @@ where
     RShamir: CryptoRng10,
 {
     let verified_epoch = committee.committee();
-    let manifest = CustodyEnvelopeManifestV1::new(
+    provision_custody_envelope_from_manifest_nodes_with_rng(
         encrypted_content,
+        content_key,
         committee.pool_identity(),
         verified_epoch.epoch_identity(),
         committee.authorization_identity(),
         verified_epoch.threshold(),
-        content_key.commitment(),
         verified_epoch.nodes().to_vec(),
+        hpke_rng,
+        shamir_rng,
+    )
+}
+
+pub(crate) fn provision_custody_envelope_for_exact_nodes_with_rng<RHpke, RShamir>(
+    encrypted_content: EncryptedContentIdentityV1,
+    content_key: &ContentEncryptionKeyV1,
+    custody_pool: CustodyPoolIdentityV1,
+    custody_epoch: CustodyEpochIdentityV1,
+    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+    nodes: &[ExactCustodyEnvelopeNodeV1],
+    hpke_rng: &mut RHpke,
+    shamir_rng: &mut RShamir,
+) -> Result<CustodyEnvelopeV1, CustodyError>
+where
+    RHpke: HpkeCryptoRng + HpkeRngCore,
+    RShamir: CryptoRng10,
+{
+    if nodes.len() != 3 {
+        return Err(CustodyError::BindingMismatch("custody_nodes"));
+    }
+    let mut node_keys = std::collections::BTreeSet::new();
+    let mut custody_keys = std::collections::BTreeSet::new();
+    let mut manifest_nodes = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        if !node_keys.insert(node.node_public_key())
+            || !custody_keys.insert(node.node_custody_public_key())
+        {
+            return Err(CustodyError::BindingMismatch("custody_nodes"));
+        }
+        manifest_nodes.push(CustodyNodeIdentityV1::new(
+            node.node_public_key(),
+            node.node_custody_public_key(),
+            ShareCoordinateV1::new(
+                u8::try_from(index + 1)
+                    .map_err(|_| ContractError::InvalidField("share_coordinate"))?,
+            )?,
+        )?);
+    }
+    provision_custody_envelope_from_manifest_nodes_with_rng(
+        encrypted_content,
+        content_key,
+        custody_pool,
+        custody_epoch,
+        custody_committee_authorization,
+        ThresholdV1::new(2, 3)?,
+        manifest_nodes,
+        hpke_rng,
+        shamir_rng,
+    )
+}
+
+fn provision_custody_envelope_from_manifest_nodes_with_rng<RHpke, RShamir>(
+    encrypted_content: EncryptedContentIdentityV1,
+    content_key: &ContentEncryptionKeyV1,
+    custody_pool: CustodyPoolIdentityV1,
+    custody_epoch: CustodyEpochIdentityV1,
+    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+    threshold: ThresholdV1,
+    nodes: Vec<CustodyNodeIdentityV1>,
+    hpke_rng: &mut RHpke,
+    shamir_rng: &mut RShamir,
+) -> Result<CustodyEnvelopeV1, CustodyError>
+where
+    RHpke: HpkeCryptoRng + HpkeRngCore,
+    RShamir: CryptoRng10,
+{
+    let manifest = CustodyEnvelopeManifestV1::new(
+        encrypted_content,
+        custody_pool,
+        custody_epoch,
+        custody_committee_authorization,
+        threshold,
+        content_key.commitment(),
+        nodes,
     )?;
     let manifest_hash = manifest.manifest_hash()?;
     let share_values = split_content_key(content_key, manifest.threshold(), shamir_rng)?;
@@ -122,7 +250,9 @@ mod tests {
     use elastos_protected_content_contracts::NodeCustodyPublicKeyV1;
 
     use super::*;
-    use crate::test_support::{content_key, digest, validated_custody_committee};
+    use crate::test_support::{
+        content_key, digest, node_custody_secret, validated_custody_committee,
+    };
 
     #[test]
     fn provision_is_deterministic_under_test_rng_and_binds_identity() {
@@ -182,8 +312,10 @@ mod tests {
 
     #[test]
     fn contract_rejects_low_order_node_custody_public_key_before_provision() {
-        let mut low_order = [0u8; 32];
-        low_order[0] = 1;
+        let mut low_order = *node_custody_secret(1).public_key().unwrap().as_bytes();
+        let x25519_offset = low_order.len() - 32;
+        low_order[x25519_offset..].fill(0);
+        low_order[x25519_offset] = 1;
         assert_eq!(
             NodeCustodyPublicKeyV1::new(low_order),
             Err(

@@ -4,24 +4,31 @@ use sha2::Digest as _;
 use thiserror::Error;
 
 use crate::canonical::{CanonicalBody, ContractError, Decoder, Encoder};
-use crate::custody_envelope::validate_canonical_x25519_public_key;
+use crate::custody_envelope::{
+    validate_pq_hybrid_wrap_public_key, PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
+};
 use crate::rights::{validate_active, validate_time_window, RightsActionV1, RightsError};
 use crate::{CanonicalContract, Digest32, ProtectedContentBindingV1, RecipientKeyIdentityV1};
 
 pub const MAX_RECIPIENT_KEY_AUTHORIZATION_LIFETIME_SECS: u64 = 5 * 60;
 const ED25519_SIGNATURE_BYTES: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(transparent)]
-pub struct RecipientPublicKeyBytesV1([u8; 32]);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecipientPublicKeyBytesV1([u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]);
+
+impl Serialize for RecipientPublicKeyBytesV1 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0.as_slice())
+    }
+}
 
 impl RecipientPublicKeyBytesV1 {
-    pub fn new(bytes: [u8; 32]) -> Result<Self, ContractError> {
-        validate_canonical_x25519_public_key(bytes, "recipient_public_key")?;
+    pub fn new(bytes: [u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES]) -> Result<Self, ContractError> {
+        validate_pq_hybrid_wrap_public_key(&bytes, "recipient_public_key")?;
         Ok(Self(bytes))
     }
 
-    pub const fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES] {
         &self.0
     }
 
@@ -384,7 +391,9 @@ mod tests {
     use hex::encode;
 
     use super::*;
-    use crate::test_support::{binding_for_wallet, digest, wallet, NOW};
+    use crate::test_support::{
+        binding_for_wallet, digest, recipient_public_key_bytes, wallet, NOW,
+    };
 
     fn runtime_issuer(seed: u8) -> RuntimeOperationIssuerKeyV1 {
         let key = SigningKey::from_bytes(&[seed; 32]);
@@ -392,9 +401,7 @@ mod tests {
     }
 
     fn recipient_public_key(seed: u8) -> RecipientPublicKeyBytesV1 {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed.max(9);
-        RecipientPublicKeyBytesV1::new(bytes).unwrap()
+        recipient_public_key_bytes(seed.max(9))
     }
 
     fn signed_authorization(seed: u8) -> SignedRecipientKeyAuthorizationV1 {
@@ -433,7 +440,7 @@ mod tests {
         let verified = signed.verify(&context).unwrap();
         assert_eq!(
             encode(verified.statement_hash().as_bytes()),
-            "741d092465bb9b16a16e62b7ad521ae54d56b14e5b25c6af6855a3f810b8dabd"
+            "b91e64fa7aab13c60746ba3065c9f655a0b976a410a2dd411e159e74e17ebeac"
         );
     }
 

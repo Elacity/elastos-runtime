@@ -790,12 +790,16 @@ fn validate_pool_member_active_at(
 
 #[cfg(test)]
 mod tests {
-    use curve25519_dalek::montgomery::MontgomeryPoint;
     use ed25519_dalek::{Signer as _, SigningKey};
 
     use super::*;
-    use crate::test_support::{digest, node_public_key as shared_node_public_key, NOW};
-    use crate::{CustodyNodeIdentityV1, ShareCoordinateV1, ThresholdV1, CUSTODY_HPKE_SUITE_ID_V1};
+    use crate::test_support::{
+        digest, node_custody_public_key as shared_node_custody_public_key,
+        node_public_key as shared_node_public_key, NOW,
+    };
+    use crate::{
+        CustodyNodeIdentityV1, ShareCoordinateV1, ThresholdV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+    };
 
     fn node_signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -806,8 +810,7 @@ mod tests {
     }
 
     fn node_custody_public_key(seed: u8) -> NodeCustodyPublicKeyV1 {
-        NodeCustodyPublicKeyV1::new(MontgomeryPoint::mul_base_clamped([seed; 32]).to_bytes())
-            .unwrap()
+        shared_node_custody_public_key(seed)
     }
 
     fn operator_id(seed: u8) -> CustodyPoolOperatorIdV1 {
@@ -820,9 +823,9 @@ mod tests {
 
     fn suites() -> CustodyApprovedSuitesV1 {
         CustodyApprovedSuitesV1::new(
-            CUSTODY_HPKE_SUITE_ID_V1,
-            CUSTODY_HPKE_SUITE_ID_V1,
-            CUSTODY_HPKE_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+            CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
         )
         .unwrap()
     }
@@ -1488,7 +1491,7 @@ mod tests {
         );
 
         let mut wrong_suites_pool_bytes = pool.canonical_bytes().unwrap();
-        let suite = CUSTODY_HPKE_SUITE_ID_V1.as_bytes();
+        let suite = CUSTODY_X_WING_AES256GCM_SUITE_ID_V1.as_bytes();
         let suite_index = wrong_suites_pool_bytes
             .windows(suite.len())
             .position(|window| window == suite)

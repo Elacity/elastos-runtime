@@ -8,6 +8,8 @@
 
 mod custody;
 mod decrypt;
+mod media;
+mod protect;
 mod rights;
 #[cfg(test)]
 mod test_support;
@@ -21,8 +23,23 @@ pub use custody::{
 };
 pub use decrypt::{
     DecryptProviderRequestOpV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,
-    DecryptProviderResponseV1, ValidatedDecryptProviderRequestV1,
+    DecryptProviderResponseV1, ValidatedDecryptProviderRequestV1, ViewerMediaPartSelectorV1,
     DECRYPT_PROVIDER_REQUEST_SCHEMA_V1, DECRYPT_PROVIDER_RESPONSE_SCHEMA_V1,
+    MAX_VIEWER_MEDIA_PART_BYTES_V1,
+};
+pub use media::{
+    CencFmp4MediaIdentityV1, CencFmp4SegmentIdentityV1, ValidatedCencFmp4MediaLayoutV1,
+    ValidatedCencFmp4MediaSessionLayoutV1, ValidatedCencFmp4SampleLayoutV1,
+    ValidatedCencFmp4SegmentLayoutV1, ValidatedCencFmp4SubsampleV1,
+    ValidatedClearFmp4MediaSessionLayoutV1, ValidatedClearFmp4SampleLayoutV1,
+    ValidatedClearFmp4SegmentLayoutV1, CENC_FMP4_MEDIA_SUITE_ID_V1,
+    MAX_CENC_FMP4_MEDIA_IDENTITY_BYTES_V1,
+};
+pub use protect::{
+    ProtectProviderRequestOpV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
+    ProtectProviderResponseV1, ProtectionSessionNodeV1, MAX_PROTECT_MEDIA_PART_BYTES_V1,
+    MAX_PROTECT_MEDIA_SEGMENTS_V1, PROTECT_PROVIDER_REQUEST_SCHEMA_V1,
+    PROTECT_PROVIDER_RESPONSE_SCHEMA_V1,
 };
 pub use rights::{
     RightsProviderRequestOpV1, RightsProviderRequestV1, RightsProviderResponseStatusV1,
@@ -48,9 +65,11 @@ mod tests {
         MAX_PROVIDER_FRAME_BYTES_V1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
     };
     use crate::test_support::{
-        custody_envelope, make_signed_node_contribution, make_signed_node_rights_decision,
-        make_signed_runtime_release_operation, make_signed_terminal_receipt, recipient_identity,
-        recipient_public_key, runtime_operation_issuer_for_seed, NOW,
+        custody_envelope_for_media, make_signed_node_contribution,
+        make_signed_node_rights_decision, make_signed_runtime_release_operation,
+        make_signed_runtime_release_operation_for_envelope_and_seed, make_signed_terminal_receipt,
+        media_components, media_identity, recipient_identity, recipient_public_key,
+        runtime_operation_issuer_for_seed, NOW,
     };
 
     fn handle(seed: u8) -> [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1] {
@@ -100,7 +119,11 @@ mod tests {
 
     #[test]
     fn provider_protocols_reject_wrong_schema_and_request_response_confusion() {
-        let operation = make_signed_runtime_release_operation();
+        let media_identity = media_identity(0x11);
+        let (init_segment, _, _, _) = media_components(0x11);
+        let custody_envelope = custody_envelope_for_media(0x11);
+        let operation =
+            make_signed_runtime_release_operation_for_envelope_and_seed(0x42, &custody_envelope);
         let decision = make_signed_node_rights_decision(
             &operation,
             1,
@@ -127,7 +150,9 @@ mod tests {
             handle(0x21),
             &operation,
             terminal.statement().issuer(),
-            &custody_envelope(),
+            &custody_envelope,
+            &media_identity,
+            &init_segment,
             &[
                 contribution.clone(),
                 make_signed_node_contribution(&operation, 2),
@@ -238,7 +263,11 @@ mod tests {
 
     #[test]
     fn serialized_messages_do_not_contain_forbidden_transport_or_secret_fields() {
-        let operation = make_signed_runtime_release_operation();
+        let media_identity = media_identity(0x11);
+        let (init_segment, _, _, _) = media_components(0x11);
+        let custody_envelope = custody_envelope_for_media(0x11);
+        let operation =
+            make_signed_runtime_release_operation_for_envelope_and_seed(0x42, &custody_envelope);
         let decision = make_signed_node_rights_decision(
             &operation,
             1,
@@ -275,7 +304,9 @@ mod tests {
                 handle(0x21),
                 &operation,
                 terminal.statement().issuer(),
-                &custody_envelope(),
+                &custody_envelope,
+                &media_identity,
+                &init_segment,
                 &[
                     contribution.clone(),
                     make_signed_node_contribution(&operation, 2),
