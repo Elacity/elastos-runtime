@@ -948,8 +948,8 @@ Chain evidence and does not register a second `rights` name.
 - [x] Slice A — package one binary per protected-content provider kind
   (protect, custody, decrypt) through the existing component/install/source-home
   packaging path while keeping the full protected-content route inactive.
-  Custody node instances remain process state/config selected in Slice B, not
-  separate packaged components.
+  Custody node instances remain process state/config selected by later inactive
+  Runtime-owned call sites, not separate packaged components.
   Entry: current source proof at `8eff416e`, no live route changes, disk stays
   above 15%. Exit: build/package metadata can stage the new provider binaries
   and preserve the existing custody `provision --base-path ... --trusted-runtime-issuer ...`
@@ -965,37 +965,67 @@ Chain evidence and does not register a second `rights` name.
   This slice changed no `server_infra.rs`, `publish.rs`, frozen contracts, or
   old provisional provider surfaces, and it does not claim installation or
   signed custody profile provisioning.
-- [ ] Slice B — make protect and decrypt production-callable through the
-  existing `ProviderRegistry` and add one Runtime-owned protected-content
-  product service that owns mint/buy/open/read/close orchestration and
-  journals, still inactive. Entry: Slice A packaged and provisionable. Exit:
-  authenticated principal/Profile, existing Wallet/Chain adapters, and the
-  existing Runtime journals are callable through one internal product service;
-  routes remain inactive. Likely files:
-  `elastos/crates/elastos-server/src/protected_content_runtime.rs` plus direct
-  startup/import fallout only. Verification: focused inactive server adapter
-  tests with real provider processes; no second registry, supervisor,
-  coordinator, or journal.
+- [x] No separate Slice B product service/facade. The reviewed path rejects a
+  new protected-content service, trait, DTO, registry, supervisor,
+  coordinator, journal, or leaf-adapter-only production commit. Protect
+  invocation lands with its first real inactive Library creator mint/list
+  caller; decrypt invocation lands with its first real inactive Library
+  open/viewer caller. Existing `RuntimeMintCoordinator`, `bind_buy`,
+  `RuntimeReleaseCoordinator`, `prepare_recipient`, `open_viewer_session`,
+  `read_viewer_media_part`, `close_viewer_session`, `ProviderRegistry`,
+  Wallet/Chain adapters, Profile authority, and the existing journals remain
+  the composition seams. The decrypt fixture decision-window repair is complete
+  at `0a01ec3d`; it changed tests only and proved the signed node-decision
+  window must stay inside the exact release-operation/request window.
+- [ ] Pre-C0 — add Runtime-owned custody composition, not a product facade.
+  Load and validate an operator-provided signed custody pool, epoch, and
+  committee authorization; keep `NodePublicKey -> provider adapter/transport +
+  owner-state-root` mapping private to Runtime; require exactly three distinct
+  node keys, custody keys, operators, failure domains, owner-state roots, and
+  provider adapter identities; use one Runtime `ProviderRegistry` with at most
+  one local `custody` route and Runtime-selected per-node
+  `ProviderInvocationTransport`; provide an owner-only Runtime mint journal
+  root; and adapt `RuntimeMintCoordinator` signing to the live device signing
+  key. Do not add a second service, facade, coordinator, registry type,
+  supervisor, journal type, route, or app.
+- [ ] Pre-C1 — define the accepted clear-media input boundary. Protected mint
+  accepts only a Library directory containing one validated clear fMP4 init and
+  ordered clear fMP4 segments in one exact local layout. Validation must reuse
+  the existing clear fMP4 parser surfaces. No arbitrary-file claim, no
+  transcoding, and no clear bytes sent to the content provider. Plain `Publish`
+  stays plain and separate. Replace and delete `protected_content_fixture`; the
+  existing `Publish` operation gets one canonical explicit protection mode such
+  as `protection: "runtime_custody"`, while absence remains ordinary plain
+  publish. No legacy boolean, fallback, or dual write.
 - [ ] Slice C — wire Library creator import/mint/list to
-  protect -> custody -> content availability through that service. Entry:
-  inactive production-callable service exists. Exit: creator import/mint/list
-  uses the real protect provider, real custody provisioning, and verified
-  availability; Runtime persists identity-only mint state and no CEK/raw share/
-  sealed-share/ciphertext/clear-media bytes. Do not invent Create or Store
-  capsules. Minimum creator UI stays in the existing Library capsule. Likely
-  files: Library/content protected-content surfaces, Runtime/server product
-  service glue, install/runtime tests, affected docs. Verification: focused
-  creator mint/list tests, availability assertions, and journal leak scans.
+  protect -> mint coordinator -> verified availability on the existing Library
+  creator publish/mint/list path, still inactive, using Pre-C0 and Pre-C1.
+  Entry: Slice A packaged/provisionable; inactive source proof plus
+  deterministic signed custody / Chain fixture seams are green; routes remain
+  inactive; and Pre-C0 / Pre-C1 are implemented without test-only authority in
+  production. Exit: the protected path branches before any content publish;
+  only encrypted fixed-layout output is published; creator import/mint/list
+  uses the real protect provider, Runtime mint coordinator, and verified
+  availability; Library records/list/status expose identity and availability
+  facts only; and Runtime persists identity-only mint state with no
+  CEK/raw share/sealed-share/ciphertext/clear-media bytes. Real signed operator
+  config is required for product execution; deterministic fixtures remain
+  test-only. Do not invent Create or Store capsules. Minimum creator UI stays
+  in the existing Library capsule. Likely files: Library/content
+  protected-content surfaces plus the direct existing Runtime/protected-content
+  composition seam they call. Verification: focused creator mint/list tests,
+  availability assertions, and journal leak scans.
 - [ ] Slice D — wire Marketplace buy plus Library open/viewer to the existing
-  Wallet approval/transaction/Chain path and the existing release/decrypt path.
-  Entry: creator path is green but inactive. Exit: buyer is denied before
-  purchase, buy binds through the real Wallet/Chain path, listing becomes
-  buyer-owned/available, and Library open drives Runtime release/decrypt/viewer
-  through the canonical service. Minimum buyer/open UI stays in existing
-  Marketplace, Library, Wallet, and Inbox surfaces. Likely files: Marketplace /
-  Library protected-content surfaces, Runtime/server product service glue,
-  transaction-effect lookups, focused viewer tests. Verification: focused buy /
-  open tests against inactive routes, no second authority path.
+  Wallet approval/transaction/Chain path and the existing release/decrypt path,
+  still inactive. Entry: creator path is green but inactive. Exit: buyer is
+  denied before purchase, buy binds through the real Wallet/Chain path,
+  listing becomes buyer-owned/available, and Library open drives Runtime
+  release/decrypt/viewer through the existing composition seams. Minimum
+  buyer/open UI stays in existing Marketplace, Library, Wallet, and Inbox
+  surfaces. Likely files: Marketplace / Library protected-content surfaces,
+  transaction-effect lookups, and the direct existing Runtime/protected-content
+  composition seam they call. Verification: focused buy / open tests against
+  inactive routes, no second authority path.
 - [ ] Slice E — one atomic cutover commit. Entry: Slices A-D are green while
   still inactive. Exit: activate the new product routes and remove the old
   provisional startup, DTO, provider-resource/catalog, build/install/component/
@@ -1024,13 +1054,21 @@ Chain evidence and does not register a second `rights` name.
   artifact parity, two-principal acceptance script, focused negative checks,
   and source/installed truth audit.
 - [ ] Hard stop if any cutover slice requires:
-  1. changing a frozen public protected-content contract merely for routing;
-  2. exposing Carrier/topology in a capsule or public contract;
-  3. migration, fallback, dual authority, or dual write to keep the old path
+  1. clear media being published before protection or sent to the content
+     provider on the protected path;
+  2. a fixture field or fixture authority remaining in the production creator
+     path;
+  3. a single node or single route masquerading as a real 2-of-3 custody set;
+  4. test keys or deterministic signed fixtures entering production code;
+  5. changing a frozen public protected-content contract merely for routing;
+  6. exposing Carrier/topology in a capsule or public contract;
+  7. migration, fallback, dual authority, or dual write to keep the old path
      alive;
-  4. a second provider registry, supervisor, coordinator, or journal;
-  5. proceeding without the signed custody profile or Chain contract config; or
-  6. running below 15% free disk.
+  8. a second provider registry, supervisor, coordinator, or journal;
+  9. route/path/host/port/credential, CEK, share, ciphertext, or clear-media
+     bytes entering Runtime or Library journals; or
+  10. proceeding without the signed custody profile or Chain contract config,
+      or starting Slice E cutover work early, or running below 15% free disk.
 - [ ] Planning estimate: budget 4-7 focused working days plus review and the
   installed proof cycle. Do not describe the remaining work as “two small
   tasks.”

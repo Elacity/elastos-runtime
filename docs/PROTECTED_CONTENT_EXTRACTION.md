@@ -176,7 +176,8 @@ Bounded work and file groups:
   custody, decrypt) to the existing component/install/source-home packaging
   path;
 - keep custody node instances as owner-only process state/config selected by
-  the inactive Runtime path in Slice B, not as separate packaged components;
+  later inactive Runtime-owned call sites, not as separate packaged
+  components;
 - stage built-artifact identity and package metadata for those binaries without
   implying a live install, signed custody profile installation, or cutover;
 - update provider manifests/lockfiles and install/source-home scripts; and
@@ -198,7 +199,7 @@ Exact exit:
 - the new protected-content provider set is internal and inactive only; and
 - built/staged artifact identity plus package metadata are provable for Runtime,
   `components.json`, and the provider binaries, while custody instance
-  startup/selection remains deferred to Slice B.
+  startup/selection remains deferred to later inactive creator/open call sites.
 
 Focused verification:
 
@@ -206,54 +207,111 @@ Focused verification:
 - staged-artifact identity and metadata checks; and
 - leak scans showing no CEK/share/topology/path/credential exposure.
 
-### Slice B — make the new path production-callable while still inactive
+### No separate Slice B service/facade
+
+The reviewed minimal path rejects a standalone protected-content product
+service/facade. Do not add a new service, trait, DTO, registry, supervisor,
+coordinator, journal, or a leaf-adapter-only production commit with no real
+caller.
+
+Instead:
+
+- protect invocation lands with its first real inactive Library creator
+  publish/mint/list caller;
+- decrypt invocation lands with its first real inactive Library open/viewer
+  caller; and
+- existing `RuntimeMintCoordinator`, `bind_buy`,
+  `RuntimeReleaseCoordinator`, `prepare_recipient`, `open_viewer_session`,
+  `read_viewer_media_part`, `close_viewer_session`, `ProviderRegistry`,
+  Wallet/Chain adapters, Profile authority, and the existing journals remain
+  the composition seams that those call sites invoke directly.
+
+The decrypt fixture decision-window repair is complete at `0a01ec3d`. It
+changed tests only and proved the signed node-decision window must stay inside
+the exact release-operation/request window.
+
+### Pre-C0 — Runtime-owned custody composition
 
 Entry:
 
-- Slice A packages and provisions the new provider set.
+- Slice A is complete/packageable;
+- current inactive source proof is green; and
+- routes remain inactive.
 
 Bounded work and file groups:
 
-- make protect and decrypt callable through the existing `ProviderRegistry`;
-- add one Runtime-owned protected-content product service that owns
-  mint/buy/open/read/close orchestration by composing the existing mint,
-  release, and open journals/coordinators rather than duplicating them;
-- keep authenticated principal/Profile plus the existing Wallet/Chain adapters
-  inside that one service; and
-- do not activate Library/Marketplace routes yet.
-
-Likely files:
-
-- `elastos/crates/elastos-server/src/protected_content_runtime.rs`;
-- direct startup/import fallout only; and
-- focused server/runtime tests around inactive adapters.
+- load and validate an operator-provided signed custody pool, epoch, and
+  committee authorization;
+- keep `NodePublicKey -> provider adapter/transport + owner-state-root`
+  mapping private to Runtime;
+- require exactly three distinct node keys, custody keys, operators, failure
+  domains, owner-state roots, and provider adapter identities;
+- use one Runtime `ProviderRegistry` with at most one local `custody` route and
+  Runtime-selected per-node `ProviderInvocationTransport`;
+- provide an owner-only Runtime mint journal root; and
+- adapt `RuntimeMintCoordinator` signing so the live device signing key signs
+  exact statements.
 
 Exact exit:
 
-- protect and decrypt are production-callable through the existing
-  `ProviderRegistry`;
-- one Runtime-owned protected-content product service owns
-  mint/buy/open/read/close orchestration by composing the existing mint,
-  release, and open journals/coordinators, with authenticated principal/
-  Profile plus the existing Wallet/Chain adapters; and
-- the route remains inactive and internal.
+- Runtime-owned custody composition exists without a second service, facade,
+  coordinator, registry type, supervisor, journal type, route, or app; and
+- capsules and signed custody contracts still see no route/topology.
 
 Focused verification:
 
-- inactive adapter tests using real provider processes;
-- no second registry, supervisor, coordinator, or journal; and
-- no capsule-visible provider/topology/credential leakage.
+- focused Runtime custody-composition tests;
+- identity-only journal assertions; and
+- leak scans for route/topology/secret persistence.
+
+### Pre-C1 — accepted clear-media input
+
+Entry:
+
+- Pre-C0 is green; and
+- routes remain inactive.
+
+Bounded work and file groups:
+
+- define the protected creator input as one Library directory containing one
+  validated clear fMP4 init and ordered clear fMP4 segments in one exact local
+  layout;
+- reuse the existing clear fMP4 parser surfaces for validation;
+- keep plain `Publish` plain and separate; and
+- replace/delete `protected_content_fixture` by giving the existing `Publish`
+  operation one canonical explicit protection mode such as
+  `protection: "runtime_custody"`, where absence remains ordinary plain
+  publish.
+
+Exact exit:
+
+- protected mint makes no arbitrary-file claim;
+- no transcoding is introduced;
+- no clear bytes are sent to the content provider; and
+- no legacy boolean, fallback, fixture field, or dual write remains.
+
+Focused verification:
+
+- focused Library/content protected-input tests;
+- clear-layout validation assertions; and
+- searches proving the fixture switch is gone from the production path.
 
 ### Slice C — wire Library creator import/mint/list
 
 Entry:
 
-- Slice B service exists and remains inactive.
+- Slice A is complete/packageable;
+- current inactive source proof plus deterministic signed custody / Chain
+  fixture seams are green;
+- Pre-C0 and Pre-C1 are green; and
+- routes remain inactive.
 
 Bounded work and file groups:
 
+- branch the protected creator path before any content publish;
 - wire the existing Library capsule creator import/mint/list flow to
-  protect -> custody -> content availability;
+  protect -> RuntimeMintCoordinator -> verified availability;
+- publish only encrypted fixed-layout output;
 - persist only identity-bound Runtime mint state and availability facts; and
 - avoid inventing Create or Store capsules or a parallel creator route.
 
@@ -261,15 +319,18 @@ Likely files:
 
 - `elastos/crates/elastos-server/src/library.rs`;
 - `elastos/crates/elastos-server/src/content.rs`;
-- protected-content service glue in server/runtime;
+- direct existing protected-content composition seams in server/runtime; and
 - focused creator tests.
 
 Exact exit:
 
 - the existing Library capsule drives creator import/mint/list through
-  protect -> custody -> content availability;
+  protect -> RuntimeMintCoordinator -> verified availability;
+- only encrypted fixed-layout output is published;
+- Library records/list/status expose identity and availability facts only;
 - Runtime persists identity-only mint state and no CEK/raw share/sealed-share/
-  ciphertext/clear-media bytes; and
+  ciphertext/clear-media bytes; real signed operator config is required for
+  product execution and deterministic fixtures remain test-only; and
 - no Create or Store capsule is introduced.
 
 Focused verification:
@@ -295,7 +356,7 @@ Bounded work and file groups:
 Likely files:
 
 - Marketplace and Library protected-content route surfaces;
-- server protected-content service glue;
+- direct existing protected-content composition seams in server/runtime;
 - transaction-effect lookups and viewer open/read/close surfaces; and
 - focused buy/open tests.
 
@@ -304,7 +365,7 @@ Exact exit:
 - buyer is denied before purchase;
 - the exact buy uses the real Wallet approval flow and real Chain result;
 - the existing Marketplace listing/detail/buy flow and Library open/viewer
-  flow use the canonical protected-content service; and
+  flow compose the canonical protected-content seams directly; and
 - no second authority path, route, or viewer is introduced.
 
 Focused verification:
@@ -482,12 +543,20 @@ Later gates, not first cutover blockers:
 
 Stop rather than inventing around the problem if cutover work requires:
 
-1. changing a frozen public contract merely for routing;
-2. exposing Carrier/topology in a capsule or public contract;
-3. migration, fallback, dual authority, or dual write;
-4. a second provider registry, supervisor, coordinator, or journal;
-5. proceeding without the signed custody profile or Chain contract config; or
-6. continuing below 15% free disk.
+1. publishing clear media before protection or sending clear bytes to the
+   content provider on the protected path;
+2. keeping a fixture field or fixture authority in the production creator path;
+3. letting a single node or single route masquerade as a real 2-of-3 custody
+   set;
+4. using test keys or deterministic signed fixtures in production;
+5. changing a frozen public contract merely for routing;
+6. exposing Carrier/topology in a capsule or public contract;
+7. migration, fallback, dual authority, or dual write;
+8. a second provider registry, supervisor, coordinator, or journal;
+9. route/path/host/port/credential, CEK, share, ciphertext, or clear-media
+   bytes entering Runtime or Library journals; or
+10. proceeding without the signed custody profile or Chain contract config,
+    starting Slice E cutover work early, or continuing below 15% free disk.
 
 ### Estimate
 
