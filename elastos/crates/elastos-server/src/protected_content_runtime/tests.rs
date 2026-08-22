@@ -1974,7 +1974,7 @@ fn make_signed_node_rights_decision(
         decision,
         digest(0x80 ^ node_seed),
         NOW + 4,
-        NOW + 50,
+        NOW + 40,
     )
     .unwrap();
     SignedNodeRightsDecisionV1::new(
