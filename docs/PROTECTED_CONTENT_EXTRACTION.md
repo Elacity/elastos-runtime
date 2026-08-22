@@ -436,14 +436,19 @@ The first likely implementation boundaries on this line are:
   authorities must not be parallel-registered under the live route; the new
   adapter is tested inactive first, then the old registration is swapped out
   atomically in Slice E;
-- the current custody-provider full process proof has a test-only wall-clock
-  coupling: `capsules/custody-provider/tests/process.rs` creates signed release
-  operations with `expires_at = issued_at + 45`, while the full process test
-  can take about 50 seconds on slower hardware and has reproduced `Expired`;
-  resolve this before CI/cutover work with either a validity window safely
-  above the process-test runtime or a controlled test clock, keep separate
-  explicit expiry-negative tests, add no sleeps or retries, and rerun the
-  exact process test plus focused expiry tests;
+- the custody-provider process-test wall-clock coupling is closed:
+  `capsules/custody-provider/tests/process.rs` now uses the canonical
+  60-second release-request maximum for valid operations, creates the
+  success-path release request immediately before the
+  contribution/replay/restart-replay phase, and creates a fresh exact request
+  for the later wrong-signing phase instead of carrying one request across
+  unrelated work. Verified evidence:
+  `custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down`,
+  `elastos-protected-content-contracts::authority_tests::release_stays_inside_wallet_authority_window`,
+  and
+  `elastos-protected-content-contracts::rights::wrong_policy_and_expiry_fail_before_replay_claim`
+  all passed, with separate expiry-negative coverage preserved and no sleeps,
+  retries, or production clock changes;
 - `Library` / `content` still depend deeply on the old protected-content DTO
   path and are the largest replacement surface; and
 - installed acceptance is blocked unless the signed custody profile and the

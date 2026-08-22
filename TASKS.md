@@ -932,14 +932,19 @@ Chain evidence and does not register a second `rights` name.
   identity, contract identity, method/selector, two funded test accounts, and
   the existing Wallet approval/transaction coordinator plus Chain evidence
   path. Do not upgrade deterministic fixtures into a product claim.
-- [ ] Pre-Slice-A checklist: remove the current wall-clock coupling in
-  `capsules/custody-provider/tests/process.rs`, where signed release
-  operations with `expires_at = issued_at + 45` can expire during the full
-  process test on slower hardware. The eventual code repair must use either a
-  validity window safely above the observed process-test runtime or a
-  controlled test clock, must keep separate explicit expiry-negative tests,
-  must add no sleeps or retries, and must rerun the exact process test plus
-  focused expiry tests before CI/cutover work proceeds.
+- [x] Pre-Slice-A wall-clock coupling removed in
+  `capsules/custody-provider/tests/process.rs`. Valid process operations now
+  use the canonical 60-second release-request maximum
+  (`MAX_RELEASE_REQUEST_LIFETIME_SECS`), the success-path release request is
+  created immediately before the contribution/replay/restart-replay phase, and
+  the later wrong-signing phase creates a fresh exact request instead of
+  reusing the earlier one across unrelated work. Verified evidence:
+  `custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down`,
+  `elastos-protected-content-contracts::authority_tests::release_stays_inside_wallet_authority_window`,
+  and
+  `elastos-protected-content-contracts::rights::wrong_policy_and_expiry_fail_before_replay_claim`
+  all passed. No sleeps, retries, production clocks, or production behavior
+  changed.
 - [ ] Slice A — package and provision the new protect provider, three custody
   instances, and decrypt provider through the existing component/install/
   supervisor model while keeping the full protected-content route inactive.

@@ -5,8 +5,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use custody_provider::{
-    load_state_from_root, parse_runtime_issuer_hex, provision_state_root,
-    PROVISIONING_PROVIDER_ID, PROVISIONING_SCHEMA_V1,
+    load_state_from_root, parse_runtime_issuer_hex, provision_state_root, PROVISIONING_PROVIDER_ID,
+    PROVISIONING_SCHEMA_V1,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use elastos_auth::ethereum_signed_message_hash;
@@ -53,6 +53,9 @@ fn issued_unix_seconds() -> u64 {
 fn expires_unix_seconds() -> u64 {
     now_unix_seconds() + 40
 }
+
+const PROCESS_TEST_VALID_RELEASE_LIFETIME_SECS: u64 =
+    elastos_protected_content_contracts::MAX_RELEASE_REQUEST_LIFETIME_SECS;
 
 struct ProviderProcess {
     child: Child,
@@ -366,7 +369,7 @@ fn signed_release_operation_with_runtime_seed_and_epoch(
     let runtime_key = node_signing_key(runtime_seed);
     let policy = policy_body();
     let issued_at = issued_unix_seconds();
-    let expires_at = issued_at + 45;
+    let expires_at = issued_at + PROCESS_TEST_VALID_RELEASE_LIFETIME_SECS;
     let binding = ProtectedContentBindingV1::new(
         record.manifest().encrypted_content().clone(),
         record.key_envelope_identity().clone(),
@@ -661,7 +664,10 @@ fn custody_provider_provision_command_returns_both_public_keys_and_redacts_priva
         "0x{}",
         hex_bytes(loaded.node_custody_secret.public_key().unwrap().as_bytes())
     );
-    assert_eq!(response["data"]["node_public_key"], expected_node_public_key);
+    assert_eq!(
+        response["data"]["node_public_key"],
+        expected_node_public_key
+    );
     assert_eq!(
         response["data"]["node_custody_public_key"],
         expected_node_custody_public_key
@@ -700,7 +706,10 @@ fn custody_provider_provision_command_is_idempotent_for_public_identities() {
         sorted_object_keys(&first["data"]),
         sorted_object_keys(&second["data"])
     );
-    assert_eq!(first["data"]["node_public_key"], second["data"]["node_public_key"]);
+    assert_eq!(
+        first["data"]["node_public_key"],
+        second["data"]["node_public_key"]
+    );
     assert_eq!(
         first["data"]["node_custody_public_key"],
         second["data"]["node_custody_public_key"]
@@ -718,14 +727,6 @@ fn custody_provider_process_provisions_releases_replays_after_restart_and_shuts_
     let provisioning = signed_provisioning(&record);
     let provision_request =
         CustodyProviderRequestV1::new_provision_node_share(&record, &provisioning).unwrap();
-    let release_operation = signed_release_operation_with_provider(&record, &provider_node);
-    let decision = signed_decision_with_provider(
-        &release_operation,
-        &provider_node,
-        RightsDecisionV1::Allowed,
-    );
-    let release_request =
-        CustodyProviderRequestV1::new_release_contribution(&release_operation, &decision).unwrap();
     let mut provider = ProviderProcess::start();
     let init = provider.request(init_request);
     assert_eq!(init["status"], "ok", "{init}");
@@ -747,6 +748,15 @@ fn custody_provider_process_provisions_releases_replays_after_restart_and_shuts_
 
     let duplicate = provider.request(request_value(&provision_request));
     assert_eq!(duplicate["data"], provisioned["data"]);
+
+    let release_operation = signed_release_operation_with_provider(&record, &provider_node);
+    let decision = signed_decision_with_provider(
+        &release_operation,
+        &provider_node,
+        RightsDecisionV1::Allowed,
+    );
+    let release_request =
+        CustodyProviderRequestV1::new_release_contribution(&release_operation, &decision).unwrap();
 
     let contribution = provider.request(request_value(&release_request));
     assert_eq!(contribution["status"], "ok", "{contribution}");
@@ -795,13 +805,25 @@ fn custody_provider_process_provisions_releases_replays_after_restart_and_shuts_
     assert!(!wrong_secret_response.contains("0x02"));
     wrong_secret.stop();
 
+    let wrong_signing_operation = signed_release_operation_with_provider(&record, &provider_node);
+    let wrong_signing_decision = signed_decision_with_provider(
+        &wrong_signing_operation,
+        &provider_node,
+        RightsDecisionV1::Allowed,
+    );
+    let wrong_signing_request = CustodyProviderRequestV1::new_release_contribution(
+        &wrong_signing_operation,
+        &wrong_signing_decision,
+    )
+    .unwrap();
     let mut wrong_signing = ProviderProcess::start();
     assert_eq!(
         wrong_signing.request(prepare_config_with_seeds(temp.path(), 1, 2))["status"],
         "ok"
     );
     let wrong_signing_response =
-        serde_json::to_string(&wrong_signing.request(request_value(&release_request))).unwrap();
+        serde_json::to_string(&wrong_signing.request(request_value(&wrong_signing_request)))
+            .unwrap();
     assert!(wrong_signing_response.contains("invalid_request"));
     assert!(!wrong_signing_response.contains("0x02"));
     wrong_signing.stop();
