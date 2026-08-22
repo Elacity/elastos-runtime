@@ -172,36 +172,37 @@ Entry:
 
 Bounded work and file groups:
 
-- add the new protect provider, three custody instances, and the new decrypt
-  provider to the existing component/install/supervisor model;
+- add one packaged binary per protected-content provider kind (protect,
+  custody, decrypt) to the existing component/install/source-home packaging
+  path;
+- keep custody node instances as owner-only process state/config selected by
+  the inactive Runtime path in Slice B, not as separate packaged components;
 - stage built-artifact identity and package metadata for those binaries without
-  implying a live install or cutover;
-- update provider manifests/lockfiles and install/source-home/supervisor
-  scripts; and
-- touch only the packaging/startup surfaces that must know these internal
-  providers exist.
+  implying a live install, signed custody profile installation, or cutover;
+- update provider manifests/lockfiles and install/source-home scripts; and
+- touch only the packaging surfaces that must know these internal providers
+  exist.
 
 Likely files:
 
 - `components.json`;
 - provider manifests and lockfiles;
-- install/source-home/supervisor scripts;
-- `elastos/crates/elastos-server/src/server_infra.rs`;
-- `elastos/crates/elastos-server/src/publish.rs`; and
+- install/source-home scripts; and
 - focused provider/install tests.
 
 Exact exit:
 
 - `protected-content-protect-provider`, three custody-provider instances, and
   `protected-content-decrypt-provider` are packageable/provisionable through the
-  existing component/install/supervisor model;
+  existing component/install/source-home packaging path;
 - the new protected-content provider set is internal and inactive only; and
 - built/staged artifact identity plus package metadata are provable for Runtime,
-  `components.json`, and the provider binaries.
+  `components.json`, and the provider binaries, while custody instance
+  startup/selection remains deferred to Slice B.
 
 Focused verification:
 
-- provider packaging/startup tests;
+- provider packaging tests;
 - staged-artifact identity and metadata checks; and
 - leak scans showing no CEK/share/topology/path/credential exposure.
 

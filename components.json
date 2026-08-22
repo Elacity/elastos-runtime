@@ -650,6 +650,87 @@
         }
       }
     },
+    "custody-provider": {
+      "install_path": "bin/custody-provider",
+      "description": "Host protected-content custody node provider binary for owner-only node provisioning and inactive Runtime-selected custody routes",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-linux-amd64",
+          "install_path": "bin/custody-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-linux-arm64",
+          "install_path": "bin/custody-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "custody-provider-darwin-arm64",
+          "install_path": "bin/custody-provider"
+        }
+      }
+    },
+    "protected-content-protect-provider": {
+      "install_path": "bin/protected-content-protect-provider",
+      "description": "Host protected-content protect provider binary for inactive Runtime-selected CENC origin packaging",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-linux-amd64",
+          "install_path": "bin/protected-content-protect-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-linux-arm64",
+          "install_path": "bin/protected-content-protect-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-protect-provider-darwin-arm64",
+          "install_path": "bin/protected-content-protect-provider"
+        }
+      }
+    },
+    "protected-content-decrypt-provider": {
+      "install_path": "bin/protected-content-decrypt-provider",
+      "description": "Host protected-content decrypt provider binary for inactive Runtime-selected scoped viewer sessions",
+      "platforms": {
+        "linux-amd64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-linux-amd64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        },
+        "linux-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-linux-arm64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        },
+        "darwin-arm64": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "protected-content-decrypt-provider-darwin-arm64",
+          "install_path": "bin/protected-content-decrypt-provider"
+        }
+      }
+    },
     "webspace-provider": {
       "install_path": "bin/webspace-provider",
       "description": "Host WebSpace resolver binary for mounted localhost://WebSpaces/<moniker>/... handles",

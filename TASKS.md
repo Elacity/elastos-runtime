@@ -945,19 +945,26 @@ Chain evidence and does not register a second `rights` name.
   `elastos-protected-content-contracts::rights::wrong_policy_and_expiry_fail_before_replay_claim`
   all passed. No sleeps, retries, production clocks, or production behavior
   changed.
-- [ ] Slice A — package and provision the new protect provider, three custody
-  instances, and decrypt provider through the existing component/install/
-  supervisor model while keeping the full protected-content route inactive.
+- [x] Slice A — package one binary per protected-content provider kind
+  (protect, custody, decrypt) through the existing component/install/source-home
+  packaging path while keeping the full protected-content route inactive.
+  Custody node instances remain process state/config selected in Slice B, not
+  separate packaged components.
   Entry: current source proof at `8eff416e`, no live route changes, disk stays
-  above 15%. Exit: build/package metadata and supervisor wiring can package and
-  provision the new providers internally, with built/staged artifact identity
-  for Runtime, `components.json`, and provider binaries, but no
-  capsule-visible activation.
+  above 15%. Exit: build/package metadata can stage the new provider binaries
+  and preserve the existing custody `provision --base-path ... --trusted-runtime-issuer ...`
+  command, with built/staged artifact identity for Runtime, `components.json`,
+  and provider binaries, but no capsule-visible activation or startup wiring.
   Likely files: `components.json`, provider manifests/lockfiles, install and
-  source-home scripts, `elastos/crates/elastos-server/src/server_infra.rs`,
-  `elastos/crates/elastos-server/src/publish.rs`, focused install/provider
-  tests. Verification: focused packaging/startup tests, built/staged artifact
-  identity and metadata checks, and leak scans.
+  source-home scripts, focused install/provider tests. Verification: focused
+  packaging/provision tests, built/staged artifact identity and metadata
+  checks, and leak scans.
+  Evidence: `scripts/source-home-provider-inventory-smoke.py`,
+  `components-release-integrity-check.py` through that smoke, and
+  `runtime_release_coordinator_process_two_of_three_success_stops_before_third_node`.
+  This slice changed no `server_infra.rs`, `publish.rs`, frozen contracts, or
+  old provisional provider surfaces, and it does not claim installation or
+  signed custody profile provisioning.
 - [ ] Slice B — make protect and decrypt production-callable through the
   existing `ProviderRegistry` and add one Runtime-owned protected-content
   product service that owns mint/buy/open/read/close orchestration and
