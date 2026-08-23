@@ -5853,6 +5853,11 @@ async fn test_library_provider_runtime_custody_open_is_denied_before_purchase() 
         "open_viewer",
         json!({
             "mint_id": "00".repeat(32),
+            "proof_binding_id": "caller-selected-proof",
+            "session_id": "caller-selected-session",
+            "grant_id": "caller-selected-grant",
+            "wallet_request_hex": "00",
+            "wallet_response_hex": "00",
         }),
     )
     .await;

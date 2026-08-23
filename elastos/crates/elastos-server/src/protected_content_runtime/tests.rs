@@ -58,7 +58,7 @@ use super::{
     CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID,
     RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE, RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE, RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE,
-    RUNTIME_PROVIDER_ID,
+    RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE, RUNTIME_PROVIDER_ID,
 };
 use elastos_protected_content_contracts::{
     CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
@@ -1394,6 +1394,31 @@ fn store_profile_signing_passkey(
 }
 
 #[cfg(unix)]
+fn install_profile_authority_keeping_device_key(
+    data_dir: &Path,
+    principal_id: &str,
+) -> (String, ProfileIdentityV1) {
+    let proof_binding_id =
+        store_profile_signing_passkey(data_dir, principal_id, "credential-protected-content");
+    crate::auth::store_test_principal_root_protection(data_dir, principal_id);
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    let profile = crate::collaboration_profile_authority::update_profile_authority(
+        data_dir,
+        principal_id,
+        &localhost_root,
+        &proof_binding_id,
+        "Protected Content Test",
+        None,
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    let profile_key = crate::crypto::decode_did_key(&profile.document().profile_did).unwrap();
+    let profile_identity =
+        ProfileIdentityV1::from_public_key_bytes(profile_key.to_bytes()).unwrap();
+    (proof_binding_id, profile_identity)
+}
+
+#[cfg(unix)]
 fn install_profile_authority_for_release_test(
     data_dir: &Path,
     principal_id: &str,
@@ -2205,6 +2230,60 @@ struct ProcessCustodyNodeFixture {
     adapter: RuntimeCustodyRegistryAdapter,
     provisioned: ProvisionedCustodyProviderPublicKeys,
     owner_state_root: Digest32,
+}
+
+#[cfg(unix)]
+fn provisioned_process_custody_node_for_issuer(
+    binary: &Path,
+    temp_root: &Path,
+    dir_name: &str,
+    runtime_issuer: RuntimeOperationIssuerKeyV1,
+    owner_state_root: Digest32,
+) -> ProcessCustodyNodeFixture {
+    let data_dir = temp_root.join(dir_name);
+    owner_only_dir(&data_dir);
+    let state_root = inactive_custody_state_root(&data_dir);
+    owner_only_dir(state_root.parent().unwrap());
+    let provisioned =
+        provision_custody_node_public_receipt_for_issuer(binary, &state_root, runtime_issuer);
+    let registry = Arc::new(ProviderRegistry::new());
+    ProcessCustodyNodeFixture {
+        adapter: RuntimeCustodyRegistryAdapter::new(
+            registry.clone(),
+            elastos_runtime::provider::ProviderInvocationTransport::Local,
+        ),
+        registry,
+        provisioned,
+        owner_state_root,
+    }
+}
+
+#[cfg(unix)]
+fn provision_custody_node_public_receipt_for_issuer(
+    binary: &Path,
+    state_root: &Path,
+    runtime_issuer: RuntimeOperationIssuerKeyV1,
+) -> ProvisionedCustodyProviderPublicKeys {
+    let issuer_hex = format!("0x{}", hex::encode(runtime_issuer.as_bytes()));
+    let output = Command::new(binary)
+        .args([
+            "provision",
+            "--base-path",
+            state_root.to_str().unwrap(),
+            "--trusted-runtime-issuer",
+            &issuer_hex,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status={:?} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    parse_and_verify_provisioning_output(&response, runtime_issuer).unwrap()
 }
 
 #[cfg(unix)]
@@ -5832,6 +5911,251 @@ impl ProviderCarrierInvoker for LoopbackCustodyCarrierInvoker {
     }
 }
 
+struct AllowingProcessChainEvidenceProvider;
+
+#[async_trait::async_trait]
+impl Provider for AllowingProcessChainEvidenceProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "allowing process chain evidence provider is invoke-only".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![CHAIN_PROVIDER_ID]
+    }
+
+    fn name(&self) -> &'static str {
+        CHAIN_PROVIDER_ID
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        if request["_runtime_invocation"]["source"]
+            != Value::String(RUNTIME_PROVIDER_ID.to_string())
+            || request["_runtime_invocation"]["target"]
+                != Value::String(CHAIN_PROVIDER_ID.to_string())
+            || request["_runtime_invocation"]["op"]
+                != Value::String(CHAIN_RIGHTS_EVIDENCE_OP.to_string())
+            || request["_runtime_invocation"]["transport"]
+                != Value::String("runtime-local-provider-plane".to_string())
+            || request["_runtime_invocation"]["carrier"] != Value::Null
+        {
+            return Err(ProviderError::Provider(
+                "chain evidence runtime envelope did not match the expected invocation".to_string(),
+            ));
+        }
+        let mut inner_request = request.clone();
+        let Some(inner_object) = inner_request.as_object_mut() else {
+            return Err(ProviderError::Provider(
+                "chain evidence request was not an object".to_string(),
+            ));
+        };
+        inner_object.remove("_runtime_invocation");
+        let signed_hex = inner_request
+            .get("signed_runtime_release_operation")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Provider(
+                    "chain evidence request is missing the signed release operation".to_string(),
+                )
+            })?;
+        let signed_bytes = hex::decode(signed_hex.strip_prefix("0x").unwrap_or(signed_hex))
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let operation = SignedRuntimeReleaseOperationV1::from_canonical_bytes(&signed_bytes)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let selected = operation
+            .statement()
+            .custody_epoch()
+            .statement()
+            .nodes()
+            .first()
+            .ok_or_else(|| {
+                ProviderError::Provider("signed release operation has no custody nodes".to_string())
+            })?
+            .node_public_key();
+        let expected = RightsProviderRequestV1::new_evaluate(selected, &operation)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let evidence_now = crate::auth::now_ts();
+        Ok(ok_provider_response(chain_evidence_for_request_at(
+            &expected,
+            evidence_now,
+            evidence_now,
+            true,
+        )))
+    }
+}
+
+struct LibraryProcessCustodyDispatcher {
+    expected_issuer: RuntimeOperationIssuerKeyV1,
+    nodes: Vec<(NodePublicKey, Arc<ProviderRegistry>)>,
+}
+
+impl LibraryProcessCustodyDispatcher {
+    fn strip_envelope(request: &Value) -> Result<Value, ProviderError> {
+        let mut inner = request.clone();
+        if let Some(object) = inner.as_object_mut() {
+            object.remove("_runtime_invocation");
+        }
+        Ok(inner)
+    }
+
+    fn node_registry(&self, request: &Value) -> Result<Arc<ProviderRegistry>, ProviderError> {
+        let inner = Self::strip_envelope(request)?;
+        let op = inner
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let bytes = serde_json::to_vec(&inner)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let now = crate::auth::now_ts();
+        match op.as_str() {
+            "status" => self
+                .nodes
+                .first()
+                .map(|(_, registry)| registry.clone())
+                .ok_or_else(|| {
+                    ProviderError::Provider(
+                        "library process custody dispatcher has no nodes".to_string(),
+                    )
+                }),
+            "evaluate" => {
+                let validated = ValidatedRightsProviderRequestV1::decode_and_validate_at(
+                    &bytes,
+                    self.expected_issuer,
+                    now,
+                )
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                self.nodes
+                    .iter()
+                    .find(|(node, _)| *node == validated.selected_node_public_key())
+                    .map(|(_, registry)| registry.clone())
+                    .ok_or_else(|| {
+                        ProviderError::Provider(
+                            "library process custody evaluate did not match a selected node"
+                                .to_string(),
+                        )
+                    })
+            }
+            "provision_node_share" | "release_contribution" => {
+                for (node, registry) in &self.nodes {
+                    if ValidatedCustodyProviderRequestV1::decode_and_validate_at(
+                        &bytes,
+                        self.expected_issuer,
+                        *node,
+                        now,
+                    )
+                    .is_ok()
+                    {
+                        return Ok(registry.clone());
+                    }
+                }
+                Err(ProviderError::Provider(
+                    "library process custody request did not match a selected node".to_string(),
+                ))
+            }
+            _ => Err(ProviderError::Provider(format!(
+                "library process custody dispatcher rejected op {op}"
+            ))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for LibraryProcessCustodyDispatcher {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "library process custody dispatcher is invoke-only".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![CUSTODY_PROVIDER_ID]
+    }
+
+    fn name(&self) -> &'static str {
+        CUSTODY_PROVIDER_ID
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let registry = self.node_registry(request)?;
+        registry.send_raw(CUSTODY_PROVIDER_ID, request).await
+    }
+}
+
+struct LibraryReleaseWalletProvider;
+
+#[async_trait::async_trait]
+impl Provider for LibraryReleaseWalletProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "library release wallet provider is invoke-only".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["wallet"]
+    }
+
+    fn name(&self) -> &'static str {
+        "wallet"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let inner = request.get("request").cloned().ok_or_else(|| {
+            ProviderError::Provider("wallet request is missing the v2 envelope".to_string())
+        })?;
+        let bytes = serde_json::to_vec(&inner)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let now = crate::auth::now_ts();
+        let wallet_request = WalletProviderRequestV2::decode_at(&bytes, now)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let (account_id, canonical_rights_request_hex) = match &wallet_request.operation {
+            WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+                account_id,
+                canonical_rights_request_hex,
+                ..
+            } => (account_id.clone(), canonical_rights_request_hex.clone()),
+            _ => {
+                return Err(ProviderError::Provider(
+                    "library release wallet expected a protected-content rights signature"
+                        .to_string(),
+                ))
+            }
+        };
+        let rights_bytes = hex::decode(&canonical_rights_request_hex)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let rights_request = RightsRequestV1::from_canonical_bytes(&rights_bytes)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let key = WalletSigningKey::from_slice(&[7; 32])
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let (signature, recovery_id) = key
+            .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(&rights_bytes))
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let mut signature_bytes = signature.to_bytes().to_vec();
+        signature_bytes.push(recovery_id.to_byte());
+        let signed = WalletSignedRightsRequestV1::new(rights_request, signature_bytes)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let result = ProtectedContentRightsSignatureResultV1::new(
+            account_id,
+            wallet_address_hex(wallet(7)),
+            hex::encode(signed.canonical_bytes().unwrap()),
+        )
+        .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let wallet_response = WalletProviderResponseV2::for_request(
+            &wallet_request,
+            WalletResultV2::Ok {
+                data: serde_json::to_value(result)
+                    .map_err(|error| ProviderError::Provider(error.to_string()))?,
+            },
+        );
+        Ok(ok_provider_response(
+            serde_json::to_value(wallet_response)
+                .map_err(|error| ProviderError::Provider(error.to_string()))?,
+        ))
+    }
+}
+
 #[cfg(unix)]
 fn write_device_key(data_dir: &Path, seed: u8) {
     let identity = data_dir.join("identity");
@@ -6095,6 +6419,7 @@ async fn runtime_custody_library_publish_protects_mints_and_records_identity_onl
 #[cfg(unix)]
 struct LibraryRuntimeCustodyHarness {
     _temp: tempfile::TempDir,
+    _nodes_temp: Option<tempfile::TempDir>,
     data_dir: PathBuf,
     registry: Arc<ProviderRegistry>,
     creator: String,
@@ -6224,6 +6549,7 @@ async fn publish_library_runtime_custody_harness() -> LibraryRuntimeCustodyHarne
     assert_eq!(publish["status"], "ok", "{publish}");
     LibraryRuntimeCustodyHarness {
         _temp: temp,
+        _nodes_temp: None,
         data_dir,
         registry,
         creator: creator.to_string(),
@@ -6248,16 +6574,31 @@ fn wallet_buy_bundle_for_mint(
     principal_id: &str,
     now: u64,
 ) -> (String, String, Value) {
-    let binding = ProtectedContentBindingV1::new(
-        mint.draft().encrypted_content().clone(),
-        mint.draft().key_envelope().clone(),
-        mint.draft().policy().clone(),
+    wallet_buy_bundle_for_mint_with_profile(
+        mint,
+        principal_id,
+        now,
         ProfileIdentityV1::from_public_key_bytes(
             SigningKey::from_bytes(&[0x26; 32])
                 .verifying_key()
                 .to_bytes(),
         )
         .unwrap(),
+    )
+}
+
+#[cfg(unix)]
+fn wallet_buy_bundle_for_mint_with_profile(
+    mint: &PersistedRuntimeMint,
+    principal_id: &str,
+    now: u64,
+    profile: ProfileIdentityV1,
+) -> (String, String, Value) {
+    let binding = ProtectedContentBindingV1::new(
+        mint.draft().encrypted_content().clone(),
+        mint.draft().key_envelope().clone(),
+        mint.draft().policy().clone(),
+        profile,
         wallet(7),
         RuntimeSessionBindingV1::new(digest(0x66)).unwrap(),
     )
@@ -6558,4 +6899,529 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
             .contains(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
         "{open}"
     );
+}
+
+#[cfg(unix)]
+fn derived_device_runtime_issuer_hex(seed: u8) -> String {
+    format!(
+        "0x{}",
+        hex::encode(derived_device_runtime_issuer(seed).as_bytes())
+    )
+}
+
+#[cfg(unix)]
+fn process_custody_play_routes(
+    epoch: &SignedCustodyEpochV1,
+    owner_state_roots: [Digest32; 3],
+) -> Vec<RuntimeCustodyRouteBindingConfig> {
+    epoch
+        .statement()
+        .nodes()
+        .iter()
+        .zip(owner_state_roots)
+        .zip([
+            RuntimeCustodyRouteTransportConfig::Local,
+            RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                peer_did: peer_did_for_seed(0xa1),
+            },
+            RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                peer_did: peer_did_for_seed(0xa2),
+            },
+        ])
+        .map(
+            |((node, owner_state_root), transport)| RuntimeCustodyRouteBindingConfig {
+                node_public_key_base64: raw_b64_32(*node.node_public_key().as_bytes()),
+                owner_state_root_base64: raw_b64_32(*owner_state_root.as_bytes()),
+                transport,
+            },
+        )
+        .collect()
+}
+
+#[cfg(unix)]
+async fn register_test_decrypt_provider(registry: &Arc<ProviderRegistry>, issuer_hex: &str) {
+    let decrypt_binary = required_test_binary_path(TEST_DECRYPT_PROVIDER_BIN_ENV);
+    let decrypt_bridge = ProviderBridge::spawn(
+        &decrypt_binary,
+        ProviderConfig {
+            extra: json!({
+                "trusted_runtime_issuer": issuer_hex,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let decrypt_provider: Arc<dyn Provider> = Arc::new(CapsuleProvider::with_scheme(
+        Arc::new(decrypt_bridge),
+        "decrypt",
+    ));
+    registry
+        .register_sub_provider("decrypt", decrypt_provider)
+        .await
+        .unwrap();
+}
+
+#[cfg(unix)]
+async fn publish_library_runtime_custody_play_harness() -> LibraryRuntimeCustodyHarness {
+    let protect_binary = required_test_binary_path(TEST_PROTECT_PROVIDER_BIN_ENV);
+    let custody_binary = required_test_binary_path(TEST_CUSTODY_PROVIDER_BIN_ENV);
+    let temp = tempfile::tempdir().unwrap();
+    let nodes_temp = tempfile::tempdir().unwrap();
+    let nodes_root = fs::canonicalize(nodes_temp.path()).unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    let runtime_issuer = derived_device_runtime_issuer(0x21);
+    let node1 = provisioned_process_custody_node_for_issuer(
+        &custody_binary,
+        &nodes_root,
+        "node-1",
+        runtime_issuer,
+        digest(0xa1),
+    );
+    let node2 = provisioned_process_custody_node_for_issuer(
+        &custody_binary,
+        &nodes_root,
+        "node-2",
+        runtime_issuer,
+        digest(0xa2),
+    );
+    let node3 = provisioned_process_custody_node_for_issuer(
+        &custody_binary,
+        &nodes_root,
+        "node-3",
+        runtime_issuer,
+        digest(0xa3),
+    );
+    for fixture in [&node1, &node2, &node3] {
+        fixture
+            .registry
+            .register_sub_provider(
+                CHAIN_PROVIDER_ID,
+                Arc::new(AllowingProcessChainEvidenceProvider),
+            )
+            .await
+            .unwrap();
+    }
+    register_inactive_custody_provider(
+        &node1.registry,
+        &custody_binary,
+        &nodes_root.join("node-1"),
+    )
+    .await
+    .unwrap();
+    register_inactive_custody_provider(
+        &node2.registry,
+        &custody_binary,
+        &nodes_root.join("node-2"),
+    )
+    .await
+    .unwrap();
+    register_inactive_custody_provider(
+        &node3.registry,
+        &custody_binary,
+        &nodes_root.join("node-3"),
+    )
+    .await
+    .unwrap();
+
+    let epoch = signed_custody_epoch_for_node_keys([
+        (
+            node1.provisioned.node_public_key,
+            node1.provisioned.node_custody_public_key,
+        ),
+        (
+            node2.provisioned.node_public_key,
+            node2.provisioned.node_custody_public_key,
+        ),
+        (
+            node3.provisioned.node_public_key,
+            node3.provisioned.node_custody_public_key,
+        ),
+    ]);
+    let fixtures_by_node = BTreeMap::from([
+        (node1.provisioned.node_public_key, node1),
+        (node2.provisioned.node_public_key, node2),
+        (node3.provisioned.node_public_key, node3),
+    ]);
+    let ordered_fixtures = epoch
+        .statement()
+        .nodes()
+        .iter()
+        .map(|node| fixtures_by_node.get(&node.node_public_key()).unwrap())
+        .collect::<Vec<_>>();
+    let owner_state_roots = [
+        ordered_fixtures[0].owner_state_root,
+        ordered_fixtures[1].owner_state_root,
+        ordered_fixtures[2].owner_state_root,
+    ];
+    let now = crate::auth::now_ts();
+    let pool = signed_custody_pool_for_epoch(&epoch, (now.saturating_sub(60), now + 3_600));
+    let authorization =
+        signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), &epoch);
+    write_owner_only_custody_composition_config(
+        &data_dir,
+        &RuntimeCustodyCompositionConfigFile {
+            schema: CUSTODY_COMPOSITION_SCHEMA_V1.to_string(),
+            expected_policy_authority_base64: raw_b64_32(
+                SigningKey::from_bytes(&[0x71; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            ),
+            expected_committee_authorization_identity_base64: canonical_b64(
+                &authorization.authorization_identity().unwrap(),
+            ),
+            signed_pool_base64: canonical_b64(&pool),
+            signed_epoch_base64: canonical_b64(&epoch),
+            signed_committee_authorization_base64: canonical_b64(&authorization),
+            routes: process_custody_play_routes(&epoch, owner_state_roots),
+        },
+    );
+
+    let registry = Arc::new(ProviderRegistry::new());
+    register_protect_provider(&registry, &protect_binary)
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            CUSTODY_PROVIDER_ID,
+            Arc::new(LibraryProcessCustodyDispatcher {
+                expected_issuer: runtime_issuer,
+                nodes: ordered_fixtures
+                    .iter()
+                    .map(|fixture| {
+                        (
+                            fixture.provisioned.node_public_key,
+                            fixture.registry.clone(),
+                        )
+                    })
+                    .collect(),
+            }),
+        )
+        .await
+        .unwrap();
+    registry
+        .set_carrier_invoker(Arc::new(LoopbackCustodyCarrierInvoker {
+            registry: Arc::downgrade(&registry),
+        }))
+        .await;
+    registry
+        .register_sub_provider(CHAIN_PROVIDER_ID, Arc::new(LibraryMintChainPolicyProvider))
+        .await
+        .unwrap();
+    register_test_decrypt_provider(&registry, &derived_device_runtime_issuer_hex(0x21)).await;
+    registry
+        .register_sub_provider("wallet", Arc::new(LibraryReleaseWalletProvider))
+        .await
+        .unwrap();
+    let (device_key, _) = derived_device_key_for_seed(0x21);
+    let content = ContentAvailabilityTestProvider::with_signing_key(
+        device_key,
+        ContentAvailabilityTestConfig {
+            checked_at: crate::auth::now_ts(),
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+    );
+    registry
+        .register_sub_provider("content", content)
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            Arc::new(crate::library::ObjectProvider::new(
+                data_dir.clone(),
+                Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+
+    let creator = "person:local:runtime-custody-slice-d-creator";
+    let buyer = "person:local:runtime-custody-slice-d-buyer";
+    crate::auth::store_test_principal_root_protection(&data_dir, creator);
+    crate::auth::store_test_principal_root_protection(&data_dir, buyer);
+    let root = crate::auth::principal_localhost_root(creator);
+    let uri = format!("{root}/Documents/protected-clear-media");
+    let (clear_init, clear_segments) = clear_media_components(0x41);
+    write_library_object_bytes(&registry, creator, &format!("{uri}/init.mp4"), &clear_init).await;
+    for (index, segment) in clear_segments.iter().enumerate() {
+        write_library_object_bytes(
+            &registry,
+            creator,
+            &format!("{uri}/segments/{index:08}.m4s"),
+            segment,
+        )
+        .await;
+    }
+    let publish = registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "publish",
+                "principal_id": creator,
+                "uri": uri,
+                "protection": {
+                    "mode": "runtime_custody",
+                    "mime_type": MEDIA_MIME_TYPE_V1,
+                    "codecs": MEDIA_CODECS_V1,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(publish["status"], "ok", "{publish}");
+    LibraryRuntimeCustodyHarness {
+        _temp: temp,
+        _nodes_temp: Some(nodes_temp),
+        data_dir,
+        registry,
+        creator: creator.to_string(),
+        buyer: buyer.to_string(),
+        mint_id: publish["data"]["content_security"]["mint_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        cid: publish["data"]["cid"].as_str().unwrap().to_string(),
+        content_id: publish["data"]["content_security"]["content_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        clear_init,
+        clear_segments,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_token() {
+    let harness = publish_library_runtime_custody_harness().await;
+    register_test_decrypt_provider(&harness.registry, &derived_device_runtime_issuer_hex(0x21))
+        .await;
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(Digest32::new(
+            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
+        ))
+        .unwrap();
+    let now = crate::auth::now_ts();
+    let (wallet_request_hex, wallet_response_hex, purchase) =
+        wallet_buy_bundle_for_mint(&mint, &harness.buyer, now);
+    let buy = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "buy",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "wallet_request_hex": wallet_request_hex,
+                "wallet_response_hex": wallet_response_hex,
+                "purchase": purchase,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(buy["status"], "ok", "{buy}");
+    let open = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "open_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open["status"], "error", "{open}");
+    assert!(
+        open["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
+        "{open}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wallet() {
+    let harness = publish_library_runtime_custody_harness().await;
+    register_test_decrypt_provider(&harness.registry, &derived_device_runtime_issuer_hex(0x21))
+        .await;
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(Digest32::new(
+            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
+        ))
+        .unwrap();
+    let now = crate::auth::now_ts();
+    let (wallet_request_hex, wallet_response_hex, purchase) =
+        wallet_buy_bundle_for_mint(&mint, &harness.buyer, now);
+    let buy = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "buy",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "wallet_request_hex": wallet_request_hex,
+                "wallet_response_hex": wallet_response_hex,
+                "purchase": purchase,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(buy["status"], "ok", "{buy}");
+    let open = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "open_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "proof_binding_id": "proof:passkey:missing-wallet",
+                "session_id": "runtime-session:alpha",
+                "grant_id": "grant:alpha",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open["status"], "error", "{open}");
+    assert!(
+        open["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
+        "{open}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_after_buy_reads_clear_media_and_closes() {
+    let harness = publish_library_runtime_custody_play_harness().await;
+    let (proof_binding_id, profile) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(Digest32::new(
+            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
+        ))
+        .unwrap();
+    let now = crate::auth::now_ts();
+    let (wallet_request_hex, wallet_response_hex, purchase) =
+        wallet_buy_bundle_for_mint_with_profile(&mint, &harness.buyer, now, profile);
+    let buy = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "buy",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "wallet_request_hex": wallet_request_hex,
+                "wallet_response_hex": wallet_response_hex,
+                "purchase": purchase,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(buy["status"], "ok", "{buy}");
+    let open = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "open_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "proof_binding_id": proof_binding_id,
+                "session_id": "runtime-session:alpha",
+                "grant_id": "grant:alpha",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open["status"], "ok", "{open}");
+    assert_eq!(
+        open["data"]["schema"],
+        "elastos.library.runtime-custody-viewer/v1"
+    );
+    let handle = open["data"]["viewer_session_handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let init = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "read_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "viewer_session_handle": handle,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(init["status"], "ok", "{init}");
+    assert_eq!(init["data"]["encoding"], "base64");
+    let init_bytes = base64::engine::general_purpose::STANDARD
+        .decode(init["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(init_bytes, harness.clear_init);
+    let segment = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "read_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "viewer_session_handle": handle,
+                "segment_index": 0,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(segment["status"], "ok", "{segment}");
+    let segment_bytes = base64::engine::general_purpose::STANDARD
+        .decode(segment["data"]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(segment_bytes, harness.clear_segments[0]);
+    let closed = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "close_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "viewer_session_handle": handle,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(closed["status"], "ok", "{closed}");
+    assert!(!open.to_string().contains("cek"));
+    assert!(!open.to_string().contains("play_url"));
+    assert!(!init.to_string().contains(&hex::encode(&harness.clear_init)));
+    let mint_root = harness.data_dir.join("protected-content/runtime-mint");
+    assert!(!any_file_contains(&mint_root, &harness.clear_init));
+    assert!(!any_file_contains(&mint_root, &harness.clear_segments[0]));
+    let purchases_root = harness.data_dir.join("protected-content/runtime-purchases");
+    if purchases_root.exists() {
+        assert!(!any_file_contains(&purchases_root, &harness.clear_init));
+        assert!(!any_file_contains(
+            &purchases_root,
+            &harness.clear_segments[0]
+        ));
+    }
+    let listings_root = harness.data_dir.join("protected-content/runtime-listings");
+    if listings_root.exists() {
+        assert!(!any_file_contains(&listings_root, &harness.clear_init));
+    }
 }

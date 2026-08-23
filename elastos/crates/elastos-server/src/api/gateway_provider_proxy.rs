@@ -1405,6 +1405,38 @@ pub(super) async fn gateway_provider_proxy(
     if scheme == "documents" || scheme == "object" || scheme == "net" {
         request["principal_id"] = serde_json::Value::String(principal_id.clone());
     }
+    if scheme == "object" && op == "open_viewer" {
+        if let Some(object) = request.as_object_mut() {
+            object.remove("proof_binding_id");
+            object.remove("session_id");
+            object.remove("grant_id");
+            object.remove("wallet_request_hex");
+            object.remove("wallet_response_hex");
+            if let Some(proof) = context
+                .proof_binding_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                object.insert(
+                    "proof_binding_id".to_string(),
+                    serde_json::Value::String(proof.to_string()),
+                );
+            }
+            if !context.session_id.trim().is_empty() {
+                object.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(context.session_id.clone()),
+                );
+            }
+            if !context.grant_id.trim().is_empty() {
+                object.insert(
+                    "grant_id".to_string(),
+                    serde_json::Value::String(context.grant_id.clone()),
+                );
+            }
+        }
+    }
     if scheme == "object" && op == "shared_access" {
         if let Some(object) = request.as_object_mut() {
             object.remove("recipient_proof");

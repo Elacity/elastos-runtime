@@ -85,21 +85,26 @@ repository.
   remains source-only and unregistered.
 - The local `feat/protected-content-runtime-lifecycle` child branch is the
   current integration line stacked on `feat/protected-content-rights`
-  `43a83e5b`. Slice C mint is `35ea84cc`. This commit implements Slice D
-  buy plus fail-closed open on the existing object resource:
-  `object.list_runtime_custody` / `object.buy` / `object.open_viewer` /
-  `read_viewer` / `close_viewer`. Buyer is denied without Wallet
+  `43a83e5b`. Slice C mint is `35ea84cc`. Slice D buy is `5856d6a9`. Tip
+  `79821d5c` completes remaining Slice D Library play on the existing object
+  resource: `object.list_runtime_custody` / `object.buy` /
+  `object.open_viewer` / `read_viewer` / `close_viewer`. It adds Home
+  launch-token proof/session/grant injection, Runtime Wallet invoke after
+  `prepare_recipient` so the release signature matches that recipient
+  (caller wallet hex is not an open authority), 2-of-3 custody release,
+  terminal-receipt nesting inside contribution windows, and decrypt
+  `open_viewer` / `read_viewer` / `close_viewer` with exact clear
+  init/segment bytes. Buyer is denied without Wallet
   request/response plus Chain purchase evidence; an exact buy binds through
   `bind_buy` and marks the listing buyer-owned. Sold listings stay visible
-  only to the publisher and buyer. Open requires that purchase, then fails
-  closed when the new decrypt provider or a second release Wallet approval
-  is absent. Live `decrypt` is unchanged. Owner-only Runtime open material
-  may persist the exact `CustodyEnvelopeV1` under
+  only to the publisher and buyer. Open without purchase, without the new
+  decrypt provider on the test registry, or without a release Wallet
+  approval still fails closed. Live `decrypt` is unchanged. Owner-only
+  Runtime open material may persist the exact `CustodyEnvelopeV1` under
   `protected-content/runtime-open/` so reconstruct can match envelope
   identity; mint journal and Library records stay identity-only. `protect`
   stays capsule-denied. Provisional `drm` / `rights` / `key` / `decrypt`
-  remain the live product open/share path. Slice D play and Slice E have
-  not started.
+  remain the live product open/share path. Slice E has not started.
 - `CustodyEnvelopeV1` is current source-only provisioning authority, not public
   asset metadata. Future durable custody storage must keep exactly one
   node-sealed share at each selected custody node. Public metadata contains no

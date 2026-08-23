@@ -888,37 +888,31 @@ existing Runtime-to-rights seam; the server adapter still maps that seam to
 Chain evidence and does not register a second `rights` name.
 
 Completed protected-content packaging, composition, clear-media import,
-chain policy, Library mint, and Slice D buy / fail-closed open are
-recorded in `state.md`. Open work starts at the installed prerequisites
-and remaining Slice D Library open/play. Do not start Slice E while live
-`decrypt` is still the only working open path.
+chain policy, Library mint, and Slice D buy / Library open/play on the
+test registry are recorded in `state.md`. Open work starts at the
+installed prerequisites. Do not start Slice E while live `decrypt` is
+still the only working product open path.
 
 - [ ] Installed prerequisite: provision one signed permissioned custody profile
-  before product cutover. It must define the exact pool, epoch, committee
-  authorization, three distinct node/provider identities, three owner-only
-  state roots, 2-of-3 threshold, expected Runtime issuer, and lifecycle config.
-  This is signed policy and process identity only; do not claim physical or
-  operator independence from it.
-- [ ] Installed prerequisite: configure one test Chain network and rights /
-  purchase contract binding before product cutover. That includes exact chain
-  identity, contract identity, method/selector, two funded test accounts, and
-  the existing Wallet approval/transaction coordinator plus Chain evidence
-  path. Do not upgrade deterministic fixtures into a product claim.
-- [ ] Slice D — wire Marketplace buy plus Library open/viewer to the existing
-  Wallet approval/transaction/Chain path and the existing release/decrypt path.
-  Entry: creator mint is green on Library; Slice E has not cut over. Buy is
-  now on `object.buy` / `object.list_runtime_custody` for Library and
-  Marketplace: denied without Wallet/Chain evidence, exact `bind_buy` marks
-  the listing buyer-owned. Open/read/close are Library-only object ops.
-  Open still fails closed without the new decrypt provider or a second
-  release Wallet approval for the prepared recipient; do not treat that as
-  play-ready and do not register the new decrypt as live `decrypt`. Exit:
-  buyer is denied before purchase, buy binds through the real Wallet/Chain
-  path, listing becomes buyer-owned/available, and Library open drives
-  Runtime release/decrypt/viewer through the existing composition seams.
-  Minimum buyer/open UI stays in existing Marketplace, Library, Wallet, and
-  Inbox surfaces. Verification: focused buy / open tests against inactive
-  routes, no second authority path.
+  before product cutover. Persist it owner-only as
+  `{data_dir}/protected-content/custody-composition.json` with schema
+  `elastos.protected-content.custody-composition/v1`: signed pool, epoch,
+  committee authorization, expected policy authority, expected committee
+  identity, and exactly three node routes (node public key, owner-state
+  root, local or Carrier transport). Threshold stays 2-of-3. This is signed
+  policy and process identity only; do not claim physical or operator
+  independence, and do not generate it from test keys. Source already
+  fail-closes mint/open when the file is absent or invalid
+  (`runtime_custody_library_publish_fails_closed_without_composition`).
+- [ ] Installed prerequisite: configure one test Chain network on the existing
+  chain-provider config before product cutover. That is one EVM
+  `rights_methods` entry `has_access_by_content_id` with contract, selector,
+  and one `protected_content_policies` source per action (View at minimum),
+  plus two funded test accounts on the existing Wallet approval/transaction
+  coordinator and Chain evidence path. Source already fail-closes mint
+  without that policy
+  (`runtime_custody_library_publish_fails_closed_without_chain_policy`).
+  Do not upgrade deterministic fixtures into a product claim.
 - [ ] Slice E — one atomic cutover commit. Entry: Slices A-D are green while
   still inactive. Exit: activate the new product routes and remove the old
   provisional startup, DTO, provider-resource/catalog, build/install/component/

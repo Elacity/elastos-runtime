@@ -25,7 +25,7 @@ use elastos_protected_content_contracts::{
     EncryptedContentIdentityV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1,
     NodeCustodyPublicKeyV1, NodePublicKey, RecipientKeyAuthorizationStatementV1,
     RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
-    RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1,
+    RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1, RightsRequestV1,
     RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
     SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
     SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
@@ -59,7 +59,11 @@ use elastos_runtime::provider::{
     Provider, ProviderCarrierRoute, ProviderError, ProviderInvocation, ProviderInvocationTransport,
     ProviderRegistry, ProviderTransfer, ResourceRequest, ResourceResponse,
 };
-use elastos_wallet_contract::ValidatedChainOutcomeBindingV1;
+use elastos_wallet_contract::{
+    ValidatedChainOutcomeBindingV1, VerifiedWalletInvocationContext, WalletProviderOperationV2,
+    WalletProviderRequestV2, MAX_INVOCATION_TTL_SECS, WALLET_BUS_OPERATION,
+};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest as _;
@@ -107,6 +111,7 @@ const PROTECTED_CONTENT_AVAILABLE_STATUS: &str = "network_available";
 const CONTENT_AVAILABILITY_RECEIPT_SCHEMA: &str = "elastos.content.availability.receipt/v1";
 const CONTENT_AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.receipt.v1";
 const DECRYPT_PROVIDER_ID: &str = "decrypt";
+const WALLET_PROVIDER_ID: &str = "wallet";
 const INACTIVE_CUSTODY_ROOT: &str = "protected-content/custody-provider/inactive";
 const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
 const CHAIN_PROTECTED_CONTENT_POLICY_OP: &str = "resolve_protected_content_policy";
@@ -2303,8 +2308,8 @@ pub(crate) struct RuntimeCustodyViewerOpenInput {
     pub principal_id: String,
     pub mint_id: String,
     pub proof_binding_id: Option<String>,
-    pub wallet_request_hex: Option<String>,
-    pub wallet_response_hex: Option<String>,
+    pub session_id: Option<String>,
+    pub grant_id: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -2553,31 +2558,40 @@ pub(crate) async fn open_runtime_custody_viewer(
         Ok(prepared) => prepared,
         Err(_) => anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
     };
-    let release_wallet_request = input
-        .wallet_request_hex
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .and_then(|value| decode_hex_bytes(value).ok());
-    let release_wallet_response = input
-        .wallet_response_hex
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .and_then(|value| decode_hex_bytes(value).ok());
     let proof_binding_id = input
         .proof_binding_id
         .as_deref()
         .filter(|value| !value.is_empty());
-    let (Some(release_wallet_request), Some(release_wallet_response), Some(proof_binding_id)) = (
-        release_wallet_request,
-        release_wallet_response,
-        proof_binding_id,
-    ) else {
+    let session_id = input
+        .session_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let grant_id = input.grant_id.as_deref().filter(|value| !value.is_empty());
+    let (Some(proof_binding_id), Some(session_id), Some(grant_id)) =
+        (proof_binding_id, session_id, grant_id)
+    else {
         let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
         anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
     };
-    let signed_rights =
-        wallet_signed_rights_from_bytes(&release_wallet_request, &release_wallet_response)
-            .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let (release_wallet_request, release_wallet_response, signed_rights) =
+        match invoke_runtime_release_wallet(
+            registry.as_ref(),
+            &purchase,
+            prepared.recipient_identity(),
+            proof_binding_id,
+            session_id,
+            grant_id,
+            mint_id,
+            now,
+        )
+        .await
+        {
+            Ok(bundle) => bundle,
+            Err(_) => {
+                let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
+                anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+            }
+        };
     let policy = resolve_runtime_rights_policy(
         registry.as_ref(),
         mint.draft().encrypted_content(),
@@ -2593,8 +2607,8 @@ pub(crate) async fn open_runtime_custody_viewer(
             .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?,
         RightsActionV1::View,
         prepared.recipient_identity().clone(),
-        now.saturating_sub(4),
-        now + 45,
+        now.saturating_sub(5),
+        now + 55,
         ReplayNonce16::new(audit_nonce_bytes(audit_request_id)),
     )
     .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
@@ -2668,12 +2682,13 @@ pub(crate) async fn open_runtime_custody_viewer(
             anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
         }
     };
+    let receipt_now = crate::auth::now_ts();
     let terminal_receipt = match sign_runtime_terminal_receipt(
         &device_key,
         &operation,
         &contributions,
         &composition.signed_epoch,
-        now,
+        receipt_now,
     ) {
         Ok(receipt) => receipt,
         Err(_) => {
@@ -2960,6 +2975,92 @@ fn reconstructed_buy_receipt(
     .map_err(runtime_open_error)
 }
 
+async fn invoke_runtime_release_wallet(
+    registry: &ProviderRegistry,
+    purchase: &RuntimeCustodyPurchaseRecord,
+    recipient: &RecipientKeyIdentityV1,
+    proof_binding_id: &str,
+    session_id: &str,
+    grant_id: &str,
+    mint_id: Digest32,
+    now: u64,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>, WalletSignedRightsRequestV1)> {
+    let buy_request = decode_hex_bytes(&purchase.wallet_request_hex)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let buy_response = decode_hex_bytes(&purchase.wallet_response_hex)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let buy_signed = wallet_signed_rights_from_bytes(&buy_request, &buy_response)
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let mut replay_nonce = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut replay_nonce);
+    let rights_request = RightsRequestV1::new(
+        buy_signed.request().binding().clone(),
+        buy_signed.request().action(),
+        recipient.clone(),
+        now.saturating_sub(5),
+        now + 180,
+        ReplayNonce16::new(replay_nonce),
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let mut request_entropy = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut request_entropy);
+    let context = VerifiedWalletInvocationContext::new(
+        purchase.principal_id.clone(),
+        session_id,
+        Some(proof_binding_id.to_string()),
+        grant_id,
+        "runtime",
+        format!("runtime-open-{}", hex::encode(mint_id.as_bytes())),
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let wallet_request = WalletProviderRequestV2::new(
+        &context,
+        format!("wallet-request:{}", hex::encode(request_entropy)),
+        now,
+        now.saturating_add(MAX_INVOCATION_TTL_SECS),
+        WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+            account_id: purchase.account_id.clone(),
+            canonical_rights_request_hex: hex::encode(rights_request.canonical_bytes().map_err(
+                |_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
+            )?),
+            reason: "Open protected content".to_string(),
+        },
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let response = registry
+        .invoke_provider(ProviderInvocation {
+            source: RUNTIME_PROVIDER_ID.to_string(),
+            target: WALLET_PROVIDER_ID.to_string(),
+            op: WALLET_BUS_OPERATION.to_string(),
+            request: serde_json::json!({
+                "op": WALLET_BUS_OPERATION,
+                "request": wallet_request,
+            }),
+            transfer: ProviderTransfer::Json,
+            range: None,
+            progress: None,
+            transport: ProviderInvocationTransport::Local,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    if response.get("status").and_then(Value::as_str) != Some("ok") {
+        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+    }
+    let data = response
+        .get("data")
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let request_bytes = serde_json::to_vec(&wallet_request)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let response_bytes = serde_json::to_vec(data)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let signed_rights = wallet_signed_rights_from_bytes(&request_bytes, &response_bytes)
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    if signed_rights.request() != &rights_request {
+        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+    }
+    Ok((request_bytes, response_bytes, signed_rights))
+}
+
 fn wallet_signed_rights_from_bytes(
     wallet_request_bytes: &[u8],
     wallet_response_bytes: &[u8],
@@ -3005,6 +3106,24 @@ fn sign_runtime_terminal_receipt(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let contribution_issued_at = contributions
+        .iter()
+        .map(|contribution| contribution.statement().issued_at())
+        .max()
+        .unwrap_or(now);
+    let contribution_expires_at = contributions
+        .iter()
+        .map(|contribution| contribution.statement().expires_at())
+        .min()
+        .unwrap_or(now.saturating_add(30));
+    let release = operation.statement().release_request();
+    let issued_at = now.max(contribution_issued_at).max(release.issued_at());
+    let expires_at = contribution_expires_at
+        .min(release.expires_at())
+        .min(issued_at.saturating_add(30));
+    if expires_at <= issued_at {
+        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+    }
     let statement = TerminalReceiptStatementV1::new(
         authenticated.release_request_hash(),
         authenticated.binding().clone(),
@@ -3012,8 +3131,8 @@ fn sign_runtime_terminal_receipt(
             .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?,
         KeyReleaseOutcomeV1::Released,
         refs,
-        now,
-        now + 30,
+        issued_at,
+        expires_at,
     )
     .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
     SignedTerminalReceiptV1::new(

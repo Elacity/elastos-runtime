@@ -7,7 +7,8 @@ This is not installed product truth. Released 0.6 still uses the provisional
 Dirty `main` `TASKS.md` 0.7 text is unreviewed operator planning. Canonical
 remaining work for this extraction is this document plus `TASKS.md` on
 `feat/protected-content-runtime-lifecycle` (Slice C `35ea84cc` plus Slice D
-buy / fail-closed open), stacked on `feat/protected-content-rights`.
+buy / Library open/play on the test registry), stacked on
+`feat/protected-content-rights`.
 
 ## Why this shape
 
@@ -60,9 +61,11 @@ layers already own restart/crash/cleanup. Packaging, Runtime custody
 composition, the clear-media import boundary, the Runtime-internal chain
 policy resolver, and Library mint/list are complete on this line. Marketplace
 buy now binds Wallet/Chain evidence on the existing object resource; Library
-open is wired but fail-closed until decrypt cutover and a release Wallet
-approval exist. Remaining work is finishing that open/play path, atomic
-cutover, and the installed one-Runtime/two-principal acceptance proof.
+open/play is source-green on the test registry after Runtime-invoked release
+Wallet approval, 2-of-3 custody release, and decrypt viewer
+open/read/close. Remaining work is the installed custody/Chain
+prerequisites, atomic cutover, and the installed one-Runtime/two-principal
+acceptance proof. Live `decrypt` is unchanged.
 
 ## Evidence only — do not continue or merge
 
@@ -157,15 +160,24 @@ source seams.
 
 Before cutover work can honestly pass installed proof, the operator must supply:
 
-1. one signed permissioned custody profile with the exact pool, epoch,
-   committee authorization, three distinct node/provider identities, three
-   owner-only state roots, 2-of-3 threshold, expected Runtime issuer, and
-   lifecycle config; this is signed policy and process identity only, not a
-   physical/operator-independence claim; and
-2. one configured test Chain network plus the rights/purchase contract binding,
-   exact method/selector, two funded test accounts, and the existing Wallet
+1. one signed permissioned custody profile persisted owner-only as
+   `{data_dir}/protected-content/custody-composition.json` with schema
+   `elastos.protected-content.custody-composition/v1`: signed pool, epoch,
+   committee authorization, expected policy authority, expected committee
+   identity, and exactly three node routes (node public key, owner-state
+   root, local or Carrier transport). Threshold stays 2-of-3. This is signed
+   policy and process identity only, not a physical/operator-independence
+   claim, and must not be generated from test keys; and
+2. one configured test Chain network on the existing chain-provider config:
+   one EVM `rights_methods` entry `has_access_by_content_id` with contract,
+   selector, and one `protected_content_policies` source per action (View at
+   minimum), plus two funded test accounts on the existing Wallet
    approval/transaction coordinator and Chain evidence path. Deterministic
    fixtures in source tests are not a product claim for this prerequisite.
+
+Source already fail-closes mint/open when those bindings are absent
+(`runtime_custody_library_publish_fails_closed_without_composition`,
+`runtime_custody_library_publish_fails_closed_without_chain_policy`).
 
 ### Slice A — package and provision internal providers
 
@@ -425,13 +437,17 @@ Focused verification:
 - no carrier/topology/public-secret exposure.
 
 Source proof: buyer deny-before-purchase, exact `bind_buy` marking the
-listing buyer-owned, sold listings hidden from other principals, and
-Library open denied before purchase or fail-closed without decrypt /
-release approval. Named tests live with the Library runtime-custody suite.
-Owner-only `protected-content/runtime-open/{mint}/envelope.bin` holds the
-exact mint envelope so reconstruct can match identity; it is not a journal
-and is not returned to capsules. Slice E has still not cut over. Full
-viewer play is not green.
+listing buyer-owned, sold listings hidden from other principals, Library
+open denied before purchase or fail-closed without decrypt, launch
+token, or release Wallet approval, and Library open after buy reading
+exact clear init/segment bytes then closing. Open approval is
+Runtime-invoked Wallet after `prepare_recipient`; caller wallet hex is
+stripped at the gateway and is not an open field. Named tests live with the Library runtime-custody
+suite. Owner-only `protected-content/runtime-open/{mint}/envelope.bin`
+holds the exact mint envelope so reconstruct can match identity; it is
+not a journal and is not returned to capsules. The new decrypt provider
+is registered as `"decrypt"` on the test registry only. Live `decrypt`
+is unchanged. Slice E has still not cut over.
 
 ### Slice E — atomic cutover
 

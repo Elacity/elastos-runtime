@@ -42,11 +42,12 @@ Library/open path:
   and `custody`, evaluates policy through existing `chain`, and lets Library
   mint when `protection.mode = "runtime_custody"` and signed operator
   composition is present. Marketplace and Library call
-  `object.list_runtime_custody` and `object.buy` on that minted listing;
-  Library `object.open_viewer` / `read_viewer` / `close_viewer` require a
-  stored purchase and then fail closed without the new decrypt provider or a
-  release Wallet approval. It does not replace the installed provisional
-  open/share path until Slice E.
+  `object.list_runtime_custody` and `object.buy` on that minted listing.
+  After purchase, Library `object.open_viewer` / `read_viewer` /
+  `close_viewer` drive Runtime Wallet approval, 2-of-3 custody release, and
+  decrypt on the test registry, and fail closed without a purchase, the new
+  decrypt provider, or a release Wallet approval. It does not replace the
+  installed provisional open/share path until Slice E.
 - The older installed/provider surface is the provisional
   `elastos_common::protected_content` DTO set plus the fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`

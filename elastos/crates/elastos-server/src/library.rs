@@ -345,9 +345,9 @@ enum ObjectProviderRequest {
         #[serde(default)]
         proof_binding_id: Option<String>,
         #[serde(default)]
-        wallet_request_hex: Option<String>,
+        session_id: Option<String>,
         #[serde(default)]
-        wallet_response_hex: Option<String>,
+        grant_id: Option<String>,
     },
     ReadViewer {
         principal_id: String,
@@ -1862,8 +1862,8 @@ async fn handle_runtime_custody_library_request(
             principal_id,
             mint_id,
             proof_binding_id,
-            wallet_request_hex,
-            wallet_response_hex,
+            session_id,
+            grant_id,
         } => {
             crate::protected_content_runtime::open_runtime_custody_viewer(
                 &data_dir,
@@ -1872,8 +1872,8 @@ async fn handle_runtime_custody_library_request(
                     principal_id,
                     mint_id,
                     proof_binding_id,
-                    wallet_request_hex,
-                    wallet_response_hex,
+                    session_id,
+                    grant_id,
                 },
             )
             .await
