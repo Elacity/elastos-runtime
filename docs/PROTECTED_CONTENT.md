@@ -38,9 +38,10 @@ Library/open path:
   planning commit is `a32ae85a`. The relevant local code commits are
   Wallet-rights at `2c69d0c2`, Runtime coordinator at `b00bfeeb`, Chain
   evidence at `7c747253`, and rights evaluator at `a32ae85a`. The local child
-  `feat/protected-content-runtime-integration` registers inactive `custody` and
-  evaluates rights through existing `chain`; it does not alter Library or
-  replace the installed provisional path.
+  `feat/protected-content-runtime-lifecycle` registers inactive `custody` and
+  evaluates rights through existing `chain`; it does not replace the
+  installed provisional path. Library only validates clear-media import and
+  then fails closed at the inactive boundary.
 - The older installed/provider surface is the provisional
   `elastos_common::protected_content` DTO set plus the fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -324,7 +325,7 @@ contract layer that later Runtime and custody-node integrations must consume:
   provider contracts. It persists before provider effects, records
   effect-started state before the first effectful call, stores exact terminal
   results for replay, and leaves ambiguous post-dispatch outcomes durable and
-  nonterminal. `feat/protected-content-runtime-integration` registers inactive
+  nonterminal. `feat/protected-content-runtime-lifecycle` registers inactive
   `custody` through `ProviderRegistry` / `ProviderBridge`, derives one stable
   owner-only inactive custody state root under the Runtime data root, rejects
   missing or unsafe custody paths before spawn, scans unresolved journal ids,
@@ -372,11 +373,12 @@ order is:
 
 1. Implement the inactive Runtime provider lifecycle, registration, routing,
    audit, and exact identity-bound reconciliation after provider effects
-   (`feat/protected-content-runtime-integration` from rights `43a83e5b`). Do not
+   (`feat/protected-content-runtime-lifecycle` from rights `43a83e5b`). Do not
    continue `feat/protected-content-runtime-coordinator-v1`. Keep journal and
-   reconciliation in `elastos-protected-content-runtime`. The typed
-   rights-provider process adapter may share this slice only if it stays on the
-   same Runtime-owned/provider-registry seam. Runtime must own provider selection,
+   reconciliation in `elastos-protected-content-runtime`. Rights evaluation
+   stays node-local inside each custody provider; Runtime selects nodes and
+   asks existing `chain` for evidence and policy. Do not add a rights-provider
+   process. Runtime must own provider selection,
    readiness, registration, durable journal, audit, retry, terminal settlement,
    and exact identity-bound recovery for durable claims or operations that
    survive a crash after provider effects but before terminal result. Retirement

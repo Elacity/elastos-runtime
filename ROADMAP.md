@@ -157,7 +157,7 @@ C. add Wallet-rights, typed Chain evidence, and Runtime-owned durable
    coordination as source-only prerequisites;
 D. implement inactive Runtime provider lifecycle, registration, routing, audit,
    and exact identity-bound reconciliation
-   (`feat/protected-content-runtime-integration` from rights `43a83e5b`); do not
+   (`feat/protected-content-runtime-lifecycle` from rights `43a83e5b`); do not
    continue `feat/protected-content-runtime-coordinator-v1`;
 E. PQ-hybrid share wrap, recipient possession, decrypt-session wrap, and the
    Runtime mint journal/2-of-3 provision are on the unpublished integration
@@ -223,7 +223,7 @@ source-only and unregistered. Local descendants add Wallet-rights, a private
 Runtime coordinator, typed Chain evidence, and a typed rights evaluator; those
 remain unpublished source work. Do not continue
 `feat/protected-content-runtime-coordinator-v1`. Local
-`feat/protected-content-runtime-integration` continues D without replacing the
+`feat/protected-content-runtime-lifecycle` continues D without replacing the
 provisional `key` or `rights` routes. Rights evaluation invokes existing `chain`
 evidence through the Runtime registry. The remaining-work plan is
 [Protected-content extraction](docs/PROTECTED_CONTENT_EXTRACTION.md).

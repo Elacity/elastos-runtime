@@ -6,7 +6,8 @@ This is not installed product truth. Released 0.6 still uses the provisional
 
 Dirty `main` `TASKS.md` 0.7 text is unreviewed operator planning. Canonical
 remaining work for this extraction is this document plus `TASKS.md` on
-`origin/feat/protected-content-rights` and its children.
+`feat/protected-content-runtime-lifecycle` (`c81ad819`), stacked on
+`origin/feat/protected-content-rights`.
 
 ## Why this shape
 
@@ -55,8 +56,10 @@ alpha success plus beta terminal denial, wrong-recipient rejection,
 wrong-object/media-binding rejection, encrypted-segment tamper rejection,
 exact durable replay, explicit provider unregister/absence cleanup, and zero
 unresolved release state through the inactive Runtime/provider path. Lower
-layers already own restart/crash/cleanup. The remaining work is packaging,
-production-callable inactive adapters/routes, atomic cutover, and the
+layers already own restart/crash/cleanup. Packaging, Runtime custody
+composition, the clear-media import boundary, and the Runtime-internal chain
+policy resolver are complete on this line. The remaining work is Library
+mint/list wiring, Marketplace buy / Library open, atomic cutover, and the
 installed one-Runtime/two-principal acceptance proof.
 
 ## Evidence only — do not continue or merge
@@ -96,7 +99,7 @@ protected-content path. Wait.
 ## Ordered slices
 
 The remaining A-F slices are coherent commit slices on the current working line
-`feat/protected-content-runtime-integration`, building forward from the
+`feat/protected-content-runtime-lifecycle`, building forward from the
 inactive proof at `8eff416e`. Do not reopen a third D branch or require a new
 child branch per slice. Publication, repacking, or branch reshaping can be
 decided only after the source line is accepted. Do not stack new work on
@@ -105,7 +108,7 @@ decided only after the source line is accepted. Do not stack new work on
 ### Current inactive proof coverage
 
 The combined inactive source proof is complete at
-`feat/protected-content-runtime-integration` `8eff416e`:
+`feat/protected-content-runtime-lifecycle` `8eff416e`:
 
 - exact fixed-layout content availability publish/status/refetch/verify is
   covered by
@@ -232,6 +235,8 @@ the exact release-operation/request window.
 
 ### Pre-C0 — Runtime-owned custody composition
 
+Status: complete at `554058cc`, `2064b556`, and `d9c4bef3`.
+
 Entry:
 
 - Slice A is complete/packageable;
@@ -266,6 +271,10 @@ Focused verification:
 
 ### Pre-C1 — accepted clear-media input
 
+Status: complete at `5fae54a2`. Library validates the directory and then
+fails closed with the inactive-boundary error. Protect/mint dispatch is
+Slice C.
+
 Entry:
 
 - Pre-C0 is green; and
@@ -296,6 +305,27 @@ Focused verification:
 - clear-layout validation assertions; and
 - searches proving the fixture switch is gone from the production path.
 
+### Pre-C2 — Runtime-internal chain policy resolver
+
+Status: complete at `c81ad819`.
+
+Runtime asks the existing `chain` provider for the exact configured
+`RightsPolicyBodyV1` for one content identity and action. The operation is
+denied as a capsule capability. There is no rights-provider process and no
+caller-supplied policy body.
+
+Exact exit:
+
+- one configured policy source per action;
+- Runtime recomputes the policy identity and rejects mismatch; and
+- later Library mint can use this seam instead of a fixture policy.
+
+Focused verification:
+
+- `capsules/chain-provider` `resolve_protected_content_policy_*`;
+- `runtime_resolve_rights_policy_recomputes_identity_and_rejects_mismatch`; and
+- `provider_resource` denial of `chain.resolve_protected_content_policy`.
+
 ### Slice C — wire Library creator import/mint/list
 
 Entry:
@@ -303,7 +333,7 @@ Entry:
 - Slice A is complete/packageable;
 - current inactive source proof plus deterministic signed custody / Chain
   fixture seams are green;
-- Pre-C0 and Pre-C1 are green; and
+- Pre-C0, Pre-C1, and Pre-C2 are green; and
 - routes remain inactive.
 
 Bounded work and file groups:
@@ -512,7 +542,12 @@ The first likely implementation boundaries on this line are:
   all passed, with separate expiry-negative coverage preserved and no sleeps,
   retries, or production clock changes;
 - `Library` / `content` still depend deeply on the old protected-content DTO
-  path and are the largest replacement surface; and
+  path and are the largest replacement surface;
+- elastos-server process proofs require
+  `ELASTOS_TEST_CUSTODY_PROVIDER_BIN`,
+  `ELASTOS_TEST_PROTECT_PROVIDER_BIN`, and
+  `ELASTOS_TEST_DECRYPT_PROVIDER_BIN` pointed at binaries built from this
+  tree; stale local `target/` copies fail `InvalidOutput`; and
 - installed acceptance is blocked unless the signed custody profile and the
   configured Chain contract plus two funded test accounts already exist.
 

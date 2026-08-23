@@ -83,6 +83,14 @@ repository.
   binding, binds contract/method selector, has bounded freshness, redacts
   upstream failures, and does not accept caller-supplied rights facts. It
   remains source-only and unregistered.
+- The local unpublished `feat/protected-content-runtime-lifecycle` child
+  branch is the current integration line stacked on
+  `feat/protected-content-rights` `43a83e5b`. Tip `c81ad819` adds the inactive
+  protect/custody/decrypt processes, 2-of-3 mint/release proof, packaged
+  provider set, Runtime custody composition, clear-media import boundary, and
+  Runtime-internal chain policy resolver. Protect and the new decrypt path
+  are not product-registered. Provisional `drm` / `rights` / `key` /
+  `decrypt` remain the live product path. This branch is not pushed.
 - `CustodyEnvelopeV1` is current source-only provisioning authority, not public
   asset metadata. Future durable custody storage must keep exactly one
   node-sealed share at each selected custody node. Public metadata contains no

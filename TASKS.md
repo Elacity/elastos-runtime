@@ -719,7 +719,7 @@ Do not continue or merge `feat/protected-content-runtime-coordinator-v1`
 not continue that abandoned line.
 
 The final combined inactive proof is now complete on
-`feat/protected-content-runtime-integration` `8eff416e`. The current source
+`feat/protected-content-runtime-lifecycle` `c81ad819`. The current source
 line proves:
 
 - exact fixed-layout content availability publish/status/refetch/verify at
@@ -977,33 +977,32 @@ Chain evidence and does not register a second `rights` name.
   the composition seams. The decrypt fixture decision-window repair is complete
   at `0a01ec3d`; it changed tests only and proved the signed node-decision
   window must stay inside the exact release-operation/request window.
-- [ ] Pre-C0 — add Runtime-owned custody composition, not a product facade.
-  Load and validate an operator-provided signed custody pool, epoch, and
-  committee authorization; keep `NodePublicKey -> provider adapter/transport +
-  owner-state-root` mapping private to Runtime; require exactly three distinct
-  node keys, custody keys, operators, failure domains, owner-state roots, and
-  provider adapter identities; use one Runtime `ProviderRegistry` with at most
-  one local `custody` route and Runtime-selected per-node
-  `ProviderInvocationTransport`; provide an owner-only Runtime mint journal
-  root; and adapt `RuntimeMintCoordinator` signing to the live device signing
-  key. Do not add a second service, facade, coordinator, registry type,
-  supervisor, journal type, route, or app.
-- [ ] Pre-C1 — define the accepted clear-media input boundary. Protected mint
-  accepts only a Library directory containing one validated clear fMP4 init and
-  ordered clear fMP4 segments in one exact local layout. Validation must reuse
-  the existing clear fMP4 parser surfaces. No arbitrary-file claim, no
-  transcoding, and no clear bytes sent to the content provider. Plain `Publish`
-  stays plain and separate. Replace and delete `protected_content_fixture`; the
-  existing `Publish` operation gets one canonical explicit protection mode such
-  as `protection: "runtime_custody"`, while absence remains ordinary plain
-  publish. No legacy boolean, fallback, or dual write.
+- [x] Pre-C0 — Runtime-owned custody composition, not a product facade.
+  `554058cc` captures the live mint signer, `2064b556` validates the signed
+  pool/epoch/committee file, and `d9c4bef3` maps those three node identities to
+  Runtime-selected transports. Evidence:
+  `runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carrier_routes`
+  and `runtime_mint_journal_uses_exact_owner_only_root_and_contains_no_route_or_signed_config`.
+- [x] Pre-C1 — accepted clear-media input boundary. `5fae54a2` accepts only
+  `protection.mode = "runtime_custody"` with one validated clear fMP4 init and
+  ordered segments, then fails closed at the inactive boundary. No protect or
+  content dispatch yet. Evidence:
+  `test_library_provider_runtime_custody_publish_reaches_inactive_boundary_without_dispatch_or_record`
+  and `test_library_provider_runtime_custody_publish_rejects_invalid_input_layouts`.
+- [x] Pre-C2 — Runtime-internal chain policy resolver. `c81ad819` lets Runtime
+  ask the existing `chain` provider for the exact configured
+  `RightsPolicyBodyV1`. Capsules cannot invoke
+  `resolve_protected_content_policy`. No rights-provider process. Evidence:
+  `resolve_protected_content_policy_returns_canonical_policy_and_evidence_accepts_it`
+  and `runtime_resolve_rights_policy_recomputes_identity_and_rejects_mismatch`.
 - [ ] Slice C — wire Library creator import/mint/list to
   protect -> mint coordinator -> verified availability on the existing Library
-  creator publish/mint/list path, still inactive, using Pre-C0 and Pre-C1.
+  creator publish/mint/list path, still inactive, using Pre-C0, Pre-C1, and
+  Pre-C2.
   Entry: Slice A packaged/provisionable; inactive source proof plus
   deterministic signed custody / Chain fixture seams are green; routes remain
-  inactive; and Pre-C0 / Pre-C1 are implemented without test-only authority in
-  production. Exit: the protected path branches before any content publish;
+  inactive; and Pre-C0 / Pre-C1 / Pre-C2 are implemented without test-only
+  authority in production. Exit: the protected path branches before any content publish;
   only encrypted fixed-layout output is published; creator import/mint/list
   uses the real protect provider, Runtime mint coordinator, and verified
   availability; Library records/list/status expose identity and availability
