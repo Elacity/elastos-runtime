@@ -5,7 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use base64::Engine as _;
 use custody_provider::{
@@ -28,9 +28,9 @@ use elastos_protected_content_runtime::{
     RuntimeRightsProvider, RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect,
 };
 use elastos_runtime::provider::{
-    bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderCarrierRoute,
-    ProviderError, ProviderInvocationTransport, ProviderRegistry, ResourceRequest,
-    ResourceResponse,
+    bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderCarrierInvoker,
+    ProviderCarrierRoute, ProviderError, ProviderInvocation, ProviderInvocationTransport,
+    ProviderRegistry, ResourceRequest, ResourceResponse,
 };
 use elastos_wallet_contract::{
     ProtectedContentRightsSignatureResultV1, ValidatedChainOutcomeBindingV1,
@@ -47,13 +47,16 @@ use x_wing::TryKeyInit as _;
 
 use super::{
     invoke_json_provider, list_unresolved_runtime_releases, load_runtime_custody_composition,
-    load_runtime_custody_composition_config, register_inactive_custody_provider,
-    register_inactive_custody_sub_provider, resolve_runtime_rights_policy, runtime_mint_journal,
+    load_runtime_custody_composition_config, publish_runtime_custody_library_object,
+    register_inactive_custody_provider, register_inactive_custody_sub_provider,
+    register_protect_provider, resolve_runtime_rights_policy, runtime_mint_journal,
     runtime_protected_content_id, unresolved_release_audit_records, InactiveCustodyProvider,
-    RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile, RuntimeCustodyRegistryAdapter,
+    RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
+    RuntimeCustodyLibraryPublishInput, RuntimeCustodyRegistryAdapter,
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeDecryptRegistryAdapter, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
-    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, RUNTIME_PROVIDER_ID,
+    CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID,
+    RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE, RUNTIME_PROVIDER_ID,
 };
 use elastos_protected_content_contracts::{
     CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
@@ -147,8 +150,15 @@ impl ContentAvailabilityTestProvider {
     const CID: &'static str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
     fn new(seed: u8, config: ContentAvailabilityTestConfig) -> Arc<Self> {
+        Self::with_signing_key(SigningKey::from_bytes(&[seed; 32]), config)
+    }
+
+    fn with_signing_key(
+        signing_key: SigningKey,
+        config: ContentAvailabilityTestConfig,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            signing_key: SigningKey::from_bytes(&[seed; 32]),
+            signing_key,
             config,
             files: Mutex::new(BTreeMap::new()),
             manifest: Mutex::new(None),
@@ -5513,5 +5523,568 @@ async fn runtime_resolve_rights_policy_recomputes_identity_and_rejects_mismatch(
         )
         .await
         .is_err());
+    }
+}
+
+#[tokio::test]
+async fn runtime_custody_library_publish_fails_closed_without_composition() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let (clear_init_segment, clear_segments) = clear_media_components(0x41);
+    let error = publish_runtime_custody_library_object(
+        &data_dir,
+        Arc::new(ProviderRegistry::new()),
+        RuntimeCustodyLibraryPublishInput {
+            object_uri: "localhost://Users/test/Documents/media".to_string(),
+            principal_id: "person:local:runtime-custody-missing-composition".to_string(),
+            mime_type: MEDIA_MIME_TYPE_V1.to_string(),
+            codecs: MEDIA_CODECS_V1.to_string(),
+            clear_init_segment,
+            clear_segments,
+            source_storage: "plain_localhost_root".to_string(),
+        },
+    )
+    .await
+    .expect_err("missing composition must fail closed");
+    assert_eq!(
+        error.to_string(),
+        RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE
+    );
+    assert!(!data_dir.join("protected-content/runtime-mint").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_fails_closed_without_device_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    write_owner_only_custody_composition_config(
+        &data_dir,
+        &custody_composition_config(
+            now,
+            custody_route_bindings(
+                &epoch,
+                [
+                    RuntimeCustodyRouteTransportConfig::Local,
+                    RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                        peer_did: peer_did_for_seed(0xa1),
+                    },
+                    RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                        peer_did: peer_did_for_seed(0xa2),
+                    },
+                ],
+            ),
+        ),
+    );
+    let (clear_init_segment, clear_segments) = clear_media_components(0x41);
+    let error = publish_runtime_custody_library_object(
+        &data_dir,
+        Arc::new(ProviderRegistry::new()),
+        RuntimeCustodyLibraryPublishInput {
+            object_uri: "localhost://Users/test/Documents/media".to_string(),
+            principal_id: "person:local:runtime-custody-missing-device-key".to_string(),
+            mime_type: MEDIA_MIME_TYPE_V1.to_string(),
+            codecs: MEDIA_CODECS_V1.to_string(),
+            clear_init_segment,
+            clear_segments,
+            source_storage: "plain_localhost_root".to_string(),
+        },
+    )
+    .await
+    .expect_err("missing device key must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("local Runtime device signing key is missing"),
+        "{error}"
+    );
+    assert!(!data_dir.join("protected-content/runtime-mint").exists());
+}
+
+#[cfg(unix)]
+fn library_publish_test_routes(
+    epoch: &SignedCustodyEpochV1,
+) -> Vec<RuntimeCustodyRouteBindingConfig> {
+    custody_route_bindings(
+        epoch,
+        [
+            RuntimeCustodyRouteTransportConfig::Local,
+            RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                peer_did: peer_did_for_seed(0xa1),
+            },
+            RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                peer_did: peer_did_for_seed(0xa2),
+            },
+        ],
+    )
+}
+
+#[cfg(unix)]
+fn library_publish_test_input(principal_id: &str) -> RuntimeCustodyLibraryPublishInput {
+    let (clear_init_segment, clear_segments) = clear_media_components(0x41);
+    RuntimeCustodyLibraryPublishInput {
+        object_uri: "localhost://Users/test/Documents/media".to_string(),
+        principal_id: principal_id.to_string(),
+        mime_type: MEDIA_MIME_TYPE_V1.to_string(),
+        codecs: MEDIA_CODECS_V1.to_string(),
+        clear_init_segment,
+        clear_segments,
+        source_storage: "plain_localhost_root".to_string(),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_fails_closed_without_protect_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    write_owner_only_custody_composition_config(
+        &data_dir,
+        &custody_composition_config(now, library_publish_test_routes(&epoch)),
+    );
+    let error = publish_runtime_custody_library_object(
+        &data_dir,
+        Arc::new(ProviderRegistry::new()),
+        library_publish_test_input("person:local:runtime-custody-missing-protect"),
+    )
+    .await
+    .expect_err("missing protect provider must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("Runtime custody protect provider is unavailable"),
+        "{error}"
+    );
+    assert!(!data_dir.join("protected-content/runtime-mint").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_fails_closed_without_chain_policy() {
+    let protect_binary = required_test_binary_path(TEST_PROTECT_PROVIDER_BIN_ENV);
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    write_owner_only_custody_composition_config(
+        &data_dir,
+        &custody_composition_config(now, library_publish_test_routes(&epoch)),
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+    register_protect_provider(&registry, &protect_binary)
+        .await
+        .unwrap();
+    let error = publish_runtime_custody_library_object(
+        &data_dir,
+        registry,
+        library_publish_test_input("person:local:runtime-custody-missing-policy"),
+    )
+    .await
+    .expect_err("missing chain policy must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("Runtime custody rights policy is unavailable"),
+        "{error}"
+    );
+    assert!(!data_dir.join("protected-content/runtime-mint").exists());
+}
+
+struct LibraryMintCustodyProvider {
+    expected_issuer: RuntimeOperationIssuerKeyV1,
+    nodes: Vec<NodePublicKey>,
+}
+
+#[async_trait::async_trait]
+impl Provider for LibraryMintCustodyProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "library mint custody provider is invoke-only".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![CUSTODY_PROVIDER_ID]
+    }
+
+    fn name(&self) -> &'static str {
+        CUSTODY_PROVIDER_ID
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let mut request = request.clone();
+        if let Some(object) = request.as_object_mut() {
+            object.remove("_runtime_invocation");
+        }
+        if request.get("op").and_then(Value::as_str) != Some("provision_node_share") {
+            return Err(ProviderError::Provider(
+                "library mint custody provider expected provision_node_share".to_string(),
+            ));
+        }
+        let bytes = serde_json::to_vec(&request)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+        let now = crate::auth::now_ts();
+        for node in &self.nodes {
+            let Ok(validated) = ValidatedCustodyProviderRequestV1::decode_and_validate_at(
+                &bytes,
+                self.expected_issuer,
+                *node,
+                now,
+            ) else {
+                continue;
+            };
+            let provision = validated.provision_node_share().map_err(|_| {
+                ProviderError::Provider("library mint provision request is invalid".to_string())
+            })?;
+            let response = CustodyProviderResponseV1::new_provisioned(provision).map_err(|_| {
+                ProviderError::Provider("library mint provision response is invalid".to_string())
+            })?;
+            let response = serde_json::from_slice(
+                &response
+                    .to_json_vec()
+                    .map_err(|error| ProviderError::Provider(error.to_string()))?,
+            )
+            .map_err(|error| ProviderError::Provider(error.to_string()))?;
+            return Ok(ok_provider_response(response));
+        }
+        Err(ProviderError::Provider(
+            "library mint custody provision did not match a selected node".to_string(),
+        ))
+    }
+}
+
+struct LibraryMintChainPolicyProvider;
+
+#[async_trait::async_trait]
+impl Provider for LibraryMintChainPolicyProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "library mint chain policy provider is invoke-only".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec![CHAIN_PROVIDER_ID]
+    }
+
+    fn name(&self) -> &'static str {
+        CHAIN_PROVIDER_ID
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        let content_id = request
+            .get("content_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Provider("missing content_id".to_string()))?;
+        if request.get("action").and_then(Value::as_str) != Some("view") {
+            return Err(ProviderError::Provider(
+                "unexpected policy action".to_string(),
+            ));
+        }
+        let policy = RightsPolicyBodyV1::new(
+            content_id,
+            RightsActionV1::View,
+            "view",
+            elastos_protected_content_contracts::RightsSubjectSourceV1::WalletAddress,
+            11155111,
+            EvmContractAddressV1::new([0x11; 20]).unwrap(),
+            EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
+            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
+            RightsObservationFinalityV1::new(12),
+        )
+        .map_err(|_| ProviderError::Provider("library mint policy is invalid".to_string()))?;
+        Ok(ok_provider_response(json!({
+            "schema": CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
+            "policy_body": format!("0x{}", hex::encode(policy.canonical_bytes().unwrap())),
+        })))
+    }
+}
+
+struct LoopbackCustodyCarrierInvoker {
+    registry: Weak<ProviderRegistry>,
+}
+
+#[async_trait::async_trait]
+impl ProviderCarrierInvoker for LoopbackCustodyCarrierInvoker {
+    async fn invoke_carrier_provider(
+        &self,
+        _route: &ProviderCarrierRoute,
+        invocation: &ProviderInvocation,
+        request: Value,
+    ) -> Result<Value, ProviderError> {
+        let registry = self.registry.upgrade().ok_or_else(|| {
+            ProviderError::Provider("library mint carrier loopback registry is gone".to_string())
+        })?;
+        registry.send_raw(&invocation.target, &request).await
+    }
+}
+
+#[cfg(unix)]
+fn write_device_key(data_dir: &Path, seed: u8) {
+    let identity = data_dir.join("identity");
+    fs::create_dir_all(&identity).unwrap();
+    let path = identity.join("device.key");
+    fs::write(&path, [seed; 32]).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(unix)]
+fn derived_device_key_for_seed(seed: u8) -> (SigningKey, String) {
+    elastos_identity::derive_did(&[seed; 32])
+}
+
+#[cfg(unix)]
+fn derived_device_runtime_issuer(seed: u8) -> RuntimeOperationIssuerKeyV1 {
+    let (key, _) = derived_device_key_for_seed(seed);
+    RuntimeOperationIssuerKeyV1::new(key.verifying_key().to_bytes()).unwrap()
+}
+
+#[cfg(unix)]
+async fn write_library_object_bytes(
+    registry: &ProviderRegistry,
+    principal_id: &str,
+    uri: &str,
+    bytes: &[u8],
+) {
+    let response = registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "write",
+                "principal_id": principal_id,
+                "uri": uri,
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response["status"], "ok", "{response}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_publish_protects_mints_and_records_identity_only_facts() {
+    let protect_binary = required_test_binary_path(TEST_PROTECT_PROVIDER_BIN_ENV);
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    let pool = signed_custody_pool_for_epoch(&epoch, (now.saturating_sub(60), now + 3_600));
+    let authorization =
+        signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), &epoch);
+    write_owner_only_custody_composition_config(
+        &data_dir,
+        &RuntimeCustodyCompositionConfigFile {
+            schema: CUSTODY_COMPOSITION_SCHEMA_V1.to_string(),
+            expected_policy_authority_base64: raw_b64_32(
+                SigningKey::from_bytes(&[0x71; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            ),
+            expected_committee_authorization_identity_base64: canonical_b64(
+                &authorization.authorization_identity().unwrap(),
+            ),
+            signed_pool_base64: canonical_b64(&pool),
+            signed_epoch_base64: canonical_b64(&epoch),
+            signed_committee_authorization_base64: canonical_b64(&authorization),
+            routes: custody_route_bindings(
+                &epoch,
+                [
+                    RuntimeCustodyRouteTransportConfig::Local,
+                    RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                        peer_did: peer_did_for_seed(0xa1),
+                    },
+                    RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
+                        peer_did: peer_did_for_seed(0xa2),
+                    },
+                ],
+            ),
+        },
+    );
+
+    let registry = Arc::new(ProviderRegistry::new());
+    register_protect_provider(&registry, &protect_binary)
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            CUSTODY_PROVIDER_ID,
+            Arc::new(LibraryMintCustodyProvider {
+                expected_issuer: derived_device_runtime_issuer(0x21),
+                nodes: epoch
+                    .statement()
+                    .nodes()
+                    .iter()
+                    .map(|node| node.node_public_key())
+                    .collect(),
+            }),
+        )
+        .await
+        .unwrap();
+    registry
+        .set_carrier_invoker(Arc::new(LoopbackCustodyCarrierInvoker {
+            registry: Arc::downgrade(&registry),
+        }))
+        .await;
+    registry
+        .register_sub_provider(CHAIN_PROVIDER_ID, Arc::new(LibraryMintChainPolicyProvider))
+        .await
+        .unwrap();
+    let (device_key, _) = derived_device_key_for_seed(0x21);
+    let content = ContentAvailabilityTestProvider::with_signing_key(
+        device_key,
+        ContentAvailabilityTestConfig {
+            checked_at: crate::auth::now_ts(),
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+    );
+    registry
+        .register_sub_provider("content", content)
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            Arc::new(crate::library::ObjectProvider::new(
+                data_dir.clone(),
+                Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+
+    let principal_id = "person:local:runtime-custody-slice-c";
+    crate::auth::store_test_principal_root_protection(&data_dir, principal_id);
+    let root = crate::auth::principal_localhost_root(principal_id);
+    let uri = format!("{root}/Documents/protected-clear-media");
+    let (clear_init, clear_segments) = clear_media_components(0x41);
+    write_library_object_bytes(
+        &registry,
+        principal_id,
+        &format!("{uri}/init.mp4"),
+        &clear_init,
+    )
+    .await;
+    for (index, segment) in clear_segments.iter().enumerate() {
+        write_library_object_bytes(
+            &registry,
+            principal_id,
+            &format!("{uri}/segments/{index:08}.m4s"),
+            segment,
+        )
+        .await;
+    }
+
+    let publish = registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "publish",
+                "principal_id": principal_id,
+                "uri": uri,
+                "protection": {
+                    "mode": "runtime_custody",
+                    "mime_type": MEDIA_MIME_TYPE_V1,
+                    "codecs": MEDIA_CODECS_V1,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(publish["status"], "ok", "{publish}");
+    let cid = publish["data"]["cid"].as_str().unwrap().to_string();
+    let content_id = publish["data"]["content_security"]["content_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mint_id = publish["data"]["content_security"]["mint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        publish["data"]["content_security"]["published_payload"],
+        "runtime_custody_encrypted"
+    );
+    assert_eq!(publish["data"]["object"]["published_cid"], cid);
+    assert_eq!(
+        publish["data"]["object"]["metadata"]["protected_content"]["content_id"],
+        content_id
+    );
+    assert!(!publish.to_string().contains("sealed"));
+    assert!(!publish.to_string().contains("cek"));
+
+    let status = registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "status",
+                "principal_id": principal_id,
+                "uri": uri,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status["status"], "ok", "{status}");
+    assert_eq!(status["data"]["object"]["published_cid"], cid);
+    assert_eq!(
+        status["data"]["published"]["content_security"]["content_id"],
+        content_id
+    );
+    assert_eq!(
+        status["data"]["published"]["content_security"]["mint_id"],
+        mint_id
+    );
+    assert!(status["data"]["published"]["content_security"]
+        .get("sealed_object")
+        .is_none());
+
+    let share = registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "share",
+                "principal_id": principal_id,
+                "uri": uri,
+                "recipients": ["did:key:zShare"],
+                "policy": "public",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(share["status"], "error");
+    assert!(
+        share["message"]
+            .as_str()
+            .unwrap()
+            .contains("Runtime custody sharing is not available yet"),
+        "{share}"
+    );
+
+    let mint_root = data_dir.join("protected-content/runtime-mint");
+    assert!(mint_root.is_dir());
+    assert!(!any_file_contains(&mint_root, &clear_init));
+    assert!(!any_file_contains(&mint_root, &clear_segments[0]));
+    let records_root = elastos_common::localhost::rooted_localhost_fs_path(
+        &data_dir,
+        &format!("{root}/.AppData/LocalHost/.Runtime/Library/Published")
+            .strip_prefix("localhost://")
+            .unwrap(),
+    )
+    .unwrap();
+    if records_root.exists() {
+        assert!(!any_file_contains(&records_root, &clear_init));
+        assert!(!any_file_contains(&records_root, &clear_segments[0]));
     }
 }

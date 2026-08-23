@@ -5759,8 +5759,8 @@ async fn test_library_provider_publish_rejects_removed_fixture_and_unknown_prote
 }
 
 #[tokio::test]
-async fn test_library_provider_runtime_custody_publish_reaches_inactive_boundary_without_dispatch_or_record(
-) {
+async fn test_library_provider_runtime_custody_publish_fails_closed_without_composition_or_record()
+{
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(library_test_state_without_content(dir.path()).await);
     let authority = passkey_authority_with_name(dir.path(), Some("admin"));
@@ -5789,7 +5789,7 @@ async fn test_library_provider_runtime_custody_publish_reaches_inactive_boundary
         &token,
         &authority.principal_id,
         &uri,
-        "Runtime custody publishing is not active yet",
+        crate::protected_content_runtime::RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
     )
     .await;
     assert!(!dir.path().join("protected-content/runtime-mint").exists());

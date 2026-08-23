@@ -40,8 +40,9 @@ const MAX_ARCHIVE_LIST_ENTRIES: usize = 512;
 const MAX_ARCHIVE_PREVIEW_BYTES: usize = 64 * 1024;
 const MAX_LIBRARY_PROTECTED_MEDIA_DECLARATION_BYTES: usize = 255;
 const RUNTIME_CUSTODY_PUBLISH_INPUT_INVALID_MESSAGE: &str = "Runtime custody publish input invalid";
-const RUNTIME_CUSTODY_PUBLISH_INACTIVE_MESSAGE: &str =
-    "Runtime custody publishing is not active yet";
+const RUNTIME_CUSTODY_SHARE_UNAVAILABLE_MESSAGE: &str =
+    "Runtime custody sharing is not available yet";
+const RUNTIME_CUSTODY_PUBLISHED_PAYLOAD: &str = "runtime_custody_encrypted";
 
 static LIBRARY_EVENT_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 
@@ -1640,6 +1641,9 @@ fn handle_library_request(
             if !record_is_published(&record) {
                 bail!("library share requires an actively published object");
             }
+            if record_is_runtime_custody(&record) {
+                bail!(RUNTIME_CUSTODY_SHARE_UNAVAILABLE_MESSAGE);
+            }
             let shared_at = now_ts();
             let recipients = normalized_share_recipients(&recipients)?;
             let share_policy = normalized_share_policy(policy.as_deref(), recipients.is_empty())?;
@@ -1706,6 +1710,9 @@ fn handle_library_request(
             if !record_is_published(&record) || record.shared_at.is_none() {
                 bail!("library shared_access requires an actively shared object");
             }
+            if record_is_runtime_custody(&record) {
+                bail!(RUNTIME_CUSTODY_SHARE_UNAVAILABLE_MESSAGE);
+            }
             let access = match shared_access_receipt(&record, &recipient, recipient_proof.as_ref())
             {
                 Ok(access) => access,
@@ -1769,15 +1776,60 @@ async fn library_publish(
     let target = library_target(data_dir, principal_id, uri)?;
     check_revision(data_dir, principal_id, &target.uri, if_revision)?;
     if let Some(protection) = protection {
-        let _loaded_input =
+        let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
-        let LoadedRuntimeCustodyPublishInput {
-            mime_type: _,
-            codecs: _,
-            clear_init_segment: _,
-            clear_segments: _,
-        } = _loaded_input;
-        bail!(RUNTIME_CUSTODY_PUBLISH_INACTIVE_MESSAGE);
+        let facts = crate::protected_content_runtime::publish_runtime_custody_library_object(
+            data_dir,
+            registry,
+            crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
+                object_uri: target.uri.clone(),
+                principal_id: principal_id.to_string(),
+                mime_type: loaded.mime_type,
+                codecs: loaded.codecs,
+                clear_init_segment: loaded.clear_init_segment,
+                clear_segments: loaded.clear_segments,
+                source_storage: published_source_storage(data_dir, principal_id, &target)?
+                    .to_string(),
+            },
+        )
+        .await?;
+        let record = LibraryPublishRecord {
+            schema: "elastos.library.publish-record/v1".to_string(),
+            object_uri: target.uri.clone(),
+            cid: facts.content_cid.clone(),
+            published_at: now_ts(),
+            unpublished_at: None,
+            shared_at: None,
+            share_policy: None,
+            share_grants: Vec::new(),
+            content_security: facts.content_security,
+            receipt: facts.receipt,
+            availability: facts.availability,
+        };
+        write_publish_record(data_dir, principal_id, &record)?;
+        let object = library_object(data_dir, principal_id, &target.uri)?;
+        append_library_event(
+            data_dir,
+            principal_id,
+            "publish",
+            &target.uri,
+            json!({
+                "cid": facts.content_cid,
+                "content_id": facts.content_id,
+                "mint_id": hex::encode(facts.mint_id.as_bytes()),
+                "availability": record.availability,
+                "object": object,
+            }),
+        )?;
+        return Ok(json!({
+            "object": object,
+            "uri": format!("elastos://{}", record.cid),
+            "cid": record.cid,
+            "receipt": record.receipt,
+            "availability": record.availability,
+            "content_security": record.content_security,
+            "published_at": record.published_at,
+        }));
     }
     if !target.path.is_file() {
         bail!("library publish currently supports files only");
@@ -3206,6 +3258,11 @@ fn library_object(data_dir: &Path, principal_id: &str, uri: &str) -> anyhow::Res
         }
         metadata
     };
+    if let Some(protected_content) =
+        active_record.and_then(runtime_custody_library_identity_metadata)
+    {
+        local_metadata["protected_content"] = protected_content;
+    }
     if in_trash && !is_trash_root {
         if let Ok(record) = read_trash_record(data_dir, principal_id, &target.uri) {
             local_metadata["trash"] = json!({
@@ -5636,26 +5693,49 @@ async fn protected_content_provider_runtime_status(
     }
 }
 
+fn published_source_storage(
+    data_dir: &Path,
+    principal_id: &str,
+    target: &LibraryTarget,
+) -> anyhow::Result<&'static str> {
+    if crate::auth::load_principal_root_protection(data_dir, principal_id, &target.localhost_root)?
+        .is_some()
+    {
+        Ok("protected_principal_root")
+    } else {
+        Ok("plain_localhost_root")
+    }
+}
+
+fn record_is_runtime_custody(record: &LibraryPublishRecord) -> bool {
+    record
+        .content_security
+        .get("published_payload")
+        .and_then(Value::as_str)
+        == Some(RUNTIME_CUSTODY_PUBLISHED_PAYLOAD)
+}
+
+fn runtime_custody_library_identity_metadata(record: &LibraryPublishRecord) -> Option<Value> {
+    record_is_runtime_custody(record).then(|| {
+        json!({
+            "schema": "elastos.library.protected-content-identity/v1",
+            "content_id": record.content_security.get("content_id"),
+            "mint_id": record.content_security.get("mint_id"),
+            "published_cid": record.cid,
+            "availability": record.availability,
+        })
+    })
+}
+
 fn published_content_security(
     data_dir: &Path,
     principal_id: &str,
     target: &LibraryTarget,
 ) -> anyhow::Result<Value> {
-    let source_storage = if crate::auth::load_principal_root_protection(
-        data_dir,
-        principal_id,
-        &target.localhost_root,
-    )?
-    .is_some()
-    {
-        "protected_principal_root"
-    } else {
-        "plain_localhost_root"
-    };
     Ok(json!({
         "schema": "elastos.library.published-content-security/v1",
         "object_uri": target.uri,
-        "source_storage": source_storage,
+        "source_storage": published_source_storage(data_dir, principal_id, target)?,
         "published_payload": "plain_content",
         "key_release_required": false,
         "status": "not_required_for_plain_published_content",

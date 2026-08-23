@@ -38,10 +38,11 @@ Library/open path:
   planning commit is `a32ae85a`. The relevant local code commits are
   Wallet-rights at `2c69d0c2`, Runtime coordinator at `b00bfeeb`, Chain
   evidence at `7c747253`, and rights evaluator at `a32ae85a`. The local child
-  `feat/protected-content-runtime-lifecycle` registers inactive `custody` and
-  evaluates rights through existing `chain`; it does not replace the
-  installed provisional path. Library only validates clear-media import and
-  then fails closed at the inactive boundary.
+  `feat/protected-content-runtime-lifecycle` registers Runtime-owned `protect`
+  and `custody`, evaluates policy through existing `chain`, and lets Library
+  mint when `protection.mode = "runtime_custody"` and signed operator
+  composition is present. It does not replace the installed provisional
+  open/share path until Slice E.
 - The older installed/provider surface is the provisional
   `elastos_common::protected_content` DTO set plus the fail-closed
   `drm-provider`, `rights-provider`, `key-provider`, and `decrypt-provider`
@@ -57,15 +58,16 @@ Library/open path:
 
 The intended protected-content path is:
 
-`capsule -> Runtime coordinator -> rights-provider -> custody providers -> decrypt-provider`
+`capsule -> Runtime coordinator -> chain policy/evidence -> custody providers -> decrypt-provider`
 
 - Capsules own user workflow and request an action. They do not select
   providers, custody nodes, routes, or network locations.
 - Runtime derives authority from the authenticated Profile, exact Wallet
   approval, session, object, and action. It selects providers, owns durable
   orchestration, and audits the result.
-- `rights-provider` evaluates the exact approved policy through typed Chain
-  evidence. It does not release content keys.
+- Rights evaluation is node-local inside each selected custody provider.
+  Runtime asks the existing `chain` provider for the configured policy body
+  and later evidence. There is no rights-provider process.
 - Each selected custody provider independently verifies the exact Runtime
   operation and rights evidence, then returns only a recipient-encrypted
   contribution and an authenticated receipt.

@@ -1,10 +1,10 @@
-//! Inactive protected-content Runtime provider plane.
+//! Protected-content Runtime provider plane.
 //!
-//! This module registers the canonical `custody` registry route as Runtime-owned
-//! and inactive, scans the durable Runtime release journal on startup, and
-//! evaluates rights through the existing `chain` registry route. It does not
-//! replace the provisional `key`/`rights`/`drm`/`decrypt` product path or expose
-//! provider topology.
+//! This module registers Runtime-owned `protect` and `custody` routes, scans
+//! the durable Runtime release journal on startup, and evaluates policy through
+//! the existing `chain` registry route. Library mint uses these seams. It does
+//! not replace the provisional `key`/`rights`/`drm`/`decrypt` open/share path
+//! or expose provider topology to capsules.
 
 #[cfg(test)]
 mod tests;
@@ -20,7 +20,7 @@ use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 use elastos_protected_content_contracts::{
     validate_custody_epoch_against_pool_at, CanonicalContract,
-    CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIssuerKeyV1, Digest32,
+    CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, Digest32,
     EncryptedContentIdentityV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey,
     RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
     RightsActionV1, RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1,
@@ -29,7 +29,9 @@ use elastos_protected_content_contracts::{
     SignedRuntimeReleaseOperationV1, WalletSignedRightsRequestV1,
 };
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, RightsProviderRequestV1, RightsProviderResponseV1,
+    CencFmp4MediaIdentityV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
+    ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
+    RightsProviderResponseV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 #[cfg(test)]
 use elastos_protected_content_provider_contracts::{
@@ -44,8 +46,9 @@ use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
     resolve_runtime_mint_selected_nodes, PersistedRuntimeReleaseOperation,
     RuntimeContentAvailabilityRequirement, RuntimeMintConfiguredCustodyProvider,
-    RuntimeMintCoordinatorError, RuntimeMintJournal, RuntimeReleaseAuditRecord,
-    RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeVerifiedContentAvailability,
+    RuntimeMintCoordinator, RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome,
+    RuntimeMintDraft, RuntimeMintJournal, RuntimeReleaseAuditRecord, RuntimeReleaseJournal,
+    RuntimeReleaseJournalError, RuntimeVerifiedContentAvailability,
 };
 use elastos_runtime::provider::bridge::{ProviderBridge, ProviderConfig};
 use elastos_runtime::provider::{
@@ -57,8 +60,17 @@ use serde_json::{json, Value};
 use sha2::Digest as _;
 
 pub(crate) const CUSTODY_PROVIDER_ID: &str = "custody";
+pub(crate) const PROTECT_PROVIDER_ID: &str = "protect";
 pub(crate) const RUNTIME_PROVIDER_ID: &str = "runtime";
 const CONTENT_PROVIDER_ID: &str = "content";
+const PROTECTION_SESSION_REQUEST_DOMAIN: &[u8] =
+    b"elastos.protected-content.protection-session-request.v1";
+const PROTECTED_CONTENT_REPLICATION_POLICY: &str = "protected-content-replication/v1";
+const PROTECTED_CONTENT_MIN_REPLICAS: u32 = 3;
+const PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS: u64 = 60;
+const PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS: u64 = 5;
+pub(crate) const RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE: &str =
+    "Runtime custody composition is not configured";
 const PROTECTED_CONTENT_ROOT: &str = "protected-content";
 const CUSTODY_COMPOSITION_CONFIG_FILE: &str = "protected-content/custody-composition.json";
 const RUNTIME_MINT_JOURNAL_ROOT: &str = "protected-content/runtime-mint";
@@ -789,6 +801,31 @@ pub async fn register_inactive_custody_provider(
             "failed to register inactive custody route: {error}"
         ));
     }
+    Ok(())
+}
+
+pub async fn register_protect_provider(
+    registry: &Arc<ProviderRegistry>,
+    binary_path: &Path,
+) -> anyhow::Result<()> {
+    let bridge = elastos_runtime::provider::ProviderBridge::spawn(
+        binary_path,
+        ProviderConfig {
+            extra: json!({}),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to spawn protect provider: {error}"))?;
+    let provider: Arc<dyn Provider> =
+        Arc::new(elastos_runtime::provider::CapsuleProvider::with_scheme(
+            Arc::new(bridge),
+            PROTECT_PROVIDER_ID,
+        ));
+    registry
+        .register_sub_provider(PROTECT_PROVIDER_ID, provider)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to register protect provider: {error}"))?;
     Ok(())
 }
 
@@ -1748,4 +1785,423 @@ fn verify_protected_content_receipt(
         media_identity.media_manifest_root(),
     )
     .map_err(|_| anyhow::anyhow!("protected content availability evidence is invalid"))
+}
+
+pub(crate) struct RuntimeCustodyLibraryPublishInput {
+    pub object_uri: String,
+    pub principal_id: String,
+    pub mime_type: String,
+    pub codecs: String,
+    pub clear_init_segment: Vec<u8>,
+    pub clear_segments: Vec<Vec<u8>>,
+    pub source_storage: String,
+}
+
+impl std::fmt::Debug for RuntimeCustodyLibraryPublishInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeCustodyLibraryPublishInput")
+            .field("object_uri", &self.object_uri)
+            .field("principal_id", &self.principal_id)
+            .field("mime_type", &self.mime_type)
+            .field("codecs", &self.codecs)
+            .field("clear_init_segment_bytes", &self.clear_init_segment.len())
+            .field("clear_segment_count", &self.clear_segments.len())
+            .field("source_storage", &self.source_storage)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeCustodyLibraryPublishFacts {
+    pub content_cid: String,
+    pub mint_id: Digest32,
+    pub content_id: String,
+    pub availability: Value,
+    pub receipt: Value,
+    pub content_security: Value,
+}
+
+pub(crate) async fn publish_runtime_custody_library_object(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    input: RuntimeCustodyLibraryPublishInput,
+) -> anyhow::Result<RuntimeCustodyLibraryPublishFacts> {
+    let composition = load_runtime_custody_composition(data_dir, registry.clone())?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
+    let (device_key, device_did) =
+        crate::collaboration_profile_authority::load_existing_device_signing_key(data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
+    let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
+        .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
+    let now = crate::auth::now_ts();
+    let protected = protect_runtime_custody_media(&registry, &composition, &input, now).await?;
+    let policy = resolve_runtime_rights_policy(
+        registry.as_ref(),
+        protected.media_identity.encrypted_content(),
+        RightsActionV1::View,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Runtime custody rights policy is unavailable"))?;
+    let configured = composition
+        .configured_nodes()
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let selected = resolve_runtime_mint_selected_nodes(
+        composition.expected_policy_authority,
+        composition.expected_authorization_identity,
+        &composition.signed_pool,
+        &composition.signed_epoch,
+        &composition.signed_committee_authorization,
+        now,
+        &configured,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let mint_nodes = selected
+        .iter()
+        .map(|node| node.binding().clone())
+        .collect::<Vec<_>>();
+    let mint_draft = RuntimeMintDraft::new(
+        &protected.init_segment,
+        &protected.encrypted_segments,
+        input.mime_type.clone(),
+        input.codecs.clone(),
+        protected
+            .envelope
+            .key_envelope_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?,
+        policy.identity().clone(),
+        protected.envelope.manifest().content_key_commitment(),
+        protected.envelope.manifest().threshold(),
+        mint_nodes,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint draft is invalid"))?;
+    let sign_key = device_key.clone();
+    let coordinator = RuntimeMintCoordinator::new(
+        runtime_mint_journal(data_dir),
+        runtime_issuer,
+        move |bytes| sign_key.sign(bytes).to_bytes(),
+        selected,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint coordinator is invalid"))?;
+    match coordinator
+        .provision(&mint_draft, &protected.envelope, now)
+        .await
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint failed"))?
+    {
+        RuntimeMintCoordinatorOutcome::CustodyProvisioned { mint_id }
+            if mint_id == mint_draft.mint_id() => {}
+        RuntimeMintCoordinatorOutcome::ContentAvailable { mint_id }
+            if mint_id == mint_draft.mint_id() => {}
+        _ => anyhow::bail!("Runtime custody mint failed"),
+    }
+    let content_id = runtime_protected_content_id(mint_draft.encrypted_content())?;
+    let requirement = RuntimeContentAvailabilityRequirement::new(
+        device_did,
+        content_id.clone(),
+        input.principal_id.clone(),
+        PROTECTED_CONTENT_REPLICATION_POLICY,
+        PROTECTED_CONTENT_MIN_REPLICAS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody availability requirement is invalid"))?;
+    let staging = write_protected_content_staging_directory(data_dir, &protected)?;
+    let evidence = publish_and_verify_protected_content_availability(
+        registry.as_ref(),
+        staging.path(),
+        mint_draft.media_identity(),
+        &requirement,
+        crate::auth::now_ts(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    match coordinator
+        .record_content_availability(&mint_draft, &requirement, evidence.clone())
+        .map_err(|_| anyhow::anyhow!("Runtime custody availability record failed"))?
+    {
+        RuntimeMintCoordinatorOutcome::ContentAvailable { mint_id }
+            if mint_id == mint_draft.mint_id() => {}
+        _ => anyhow::bail!("Runtime custody availability record failed"),
+    }
+    Ok(runtime_custody_library_publish_facts(
+        &input,
+        &mint_draft,
+        &content_id,
+        &evidence,
+    ))
+}
+
+struct ProtectedRuntimeCustodyMedia {
+    init_segment: Vec<u8>,
+    encrypted_segments: Vec<Vec<u8>>,
+    media_identity: CencFmp4MediaIdentityV1,
+    envelope: CustodyEnvelopeV1,
+}
+
+async fn protect_runtime_custody_media(
+    registry: &ProviderRegistry,
+    composition: &RuntimeCustodyComposition,
+    input: &RuntimeCustodyLibraryPublishInput,
+    now_unix_seconds: u64,
+) -> anyhow::Result<ProtectedRuntimeCustodyMedia> {
+    let nodes = composition
+        .nodes
+        .iter()
+        .map(|node| {
+            ProtectionSessionNodeV1::new(node.node_public_key, node.custody_public_key)
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let segment_count = u32::try_from(input.clear_segments.len())
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect input is invalid"))?;
+    let opened = invoke_typed_protect_provider(
+        registry,
+        "open_protection_session",
+        &ProtectProviderRequestV1::new_open_protection_session(
+            protection_session_request_id(input, now_unix_seconds),
+            composition
+                .signed_pool
+                .pool_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+            composition
+                .signed_epoch
+                .epoch_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+            composition
+                .signed_committee_authorization
+                .authorization_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+            input.mime_type.clone(),
+            input.codecs.clone(),
+            segment_count,
+            &input.clear_init_segment,
+            nodes,
+        )
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+    )
+    .await?;
+    if opened.status() != ProtectProviderResponseStatusV1::ProtectionSessionOpened {
+        anyhow::bail!("Runtime custody protect provider is unavailable");
+    }
+    let handle = opened
+        .protection_session_handle()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let protect_result =
+        protect_opened_runtime_custody_session(registry, handle, &opened, input, composition).await;
+    let _ = invoke_typed_protect_provider(
+        registry,
+        "close_protection_session",
+        &ProtectProviderRequestV1::new_close_protection_session(handle)
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+    )
+    .await;
+    protect_result
+}
+
+async fn protect_opened_runtime_custody_session(
+    registry: &ProviderRegistry,
+    handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    opened: &ProtectProviderResponseV1,
+    input: &RuntimeCustodyLibraryPublishInput,
+    composition: &RuntimeCustodyComposition,
+) -> anyhow::Result<ProtectedRuntimeCustodyMedia> {
+    let init_segment = opened
+        .protected_init_segment()
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+        .to_vec();
+    let mut encrypted_segments = Vec::with_capacity(input.clear_segments.len());
+    for (segment_index, clear_segment) in input.clear_segments.iter().enumerate() {
+        let protected = invoke_typed_protect_provider(
+            registry,
+            "protect_media_segment",
+            &ProtectProviderRequestV1::new_protect_media_segment(
+                handle,
+                u32::try_from(segment_index)
+                    .map_err(|_| anyhow::anyhow!("Runtime custody protect input is invalid"))?,
+                clear_segment,
+            )
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+        )
+        .await?;
+        if protected.status() != ProtectProviderResponseStatusV1::MediaSegmentProtected
+            || protected.segment_index()
+                != Some(
+                    u32::try_from(segment_index)
+                        .map_err(|_| anyhow::anyhow!("Runtime custody protect input is invalid"))?,
+                )
+        {
+            anyhow::bail!("Runtime custody protect provider is unavailable");
+        }
+        encrypted_segments.push(
+            protected
+                .protected_segment()
+                .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+                .to_vec(),
+        );
+    }
+    let finalized = invoke_typed_protect_provider(
+        registry,
+        "finalize_protection_session",
+        &ProtectProviderRequestV1::new_finalize_protection_session(handle)
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+    )
+    .await?;
+    if finalized.status() != ProtectProviderResponseStatusV1::ProtectionSessionFinalized {
+        anyhow::bail!("Runtime custody protect provider is unavailable");
+    }
+    let media_identity = finalized
+        .media_identity()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let envelope = finalized
+        .custody_envelope()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let expected_media = CencFmp4MediaIdentityV1::new_from_bytes(
+        &init_segment,
+        &encrypted_segments,
+        input.mime_type.clone(),
+        input.codecs.clone(),
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    if media_identity != expected_media
+        || envelope.manifest().encrypted_content() != media_identity.encrypted_content()
+        || envelope.manifest().custody_pool()
+            != composition
+                .signed_pool
+                .pool_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
+        || envelope.manifest().custody_epoch()
+            != composition
+                .signed_epoch
+                .epoch_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
+        || envelope.manifest().custody_committee_authorization()
+            != composition
+                .signed_committee_authorization
+                .authorization_identity()
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?
+    {
+        anyhow::bail!("Runtime custody protect output is invalid");
+    }
+    Ok(ProtectedRuntimeCustodyMedia {
+        init_segment,
+        encrypted_segments,
+        media_identity,
+        envelope,
+    })
+}
+
+fn protection_session_request_id(
+    input: &RuntimeCustodyLibraryPublishInput,
+    now_unix_seconds: u64,
+) -> Digest32 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(PROTECTION_SESSION_REQUEST_DOMAIN);
+    hasher.update(input.principal_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(input.object_uri.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(now_unix_seconds.to_be_bytes());
+    hasher.update(sha2::Sha256::digest(&input.clear_init_segment));
+    Digest32::new(hasher.finalize().into())
+}
+
+async fn invoke_typed_protect_provider(
+    registry: &ProviderRegistry,
+    op: &str,
+    request: &ProtectProviderRequestV1,
+) -> anyhow::Result<ProtectProviderResponseV1> {
+    let request_value = serde_json::from_slice(
+        &request
+            .to_json_vec()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?;
+    let data = invoke_json_provider(registry, PROTECT_PROVIDER_ID, op, request_value)
+        .await
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect provider is unavailable"))?;
+    ProtectProviderResponseV1::from_json_slice(
+        &serde_json::to_vec(&data)
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))
+}
+
+fn write_protected_content_staging_directory(
+    data_dir: &Path,
+    protected: &ProtectedRuntimeCustodyMedia,
+) -> anyhow::Result<tempfile::TempDir> {
+    let parent = protected_content_root(data_dir);
+    fs::create_dir_all(&parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix("publish-")
+        .tempdir_in(&parent)
+        .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    let tree = staging.path().join("protected-content/v1/segments");
+    fs::create_dir_all(&tree)
+        .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    fs::write(
+        staging.path().join(PROTECTED_CONTENT_IDENTITY_PATH),
+        protected
+            .media_identity
+            .canonical_bytes()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    fs::write(
+        staging.path().join(PROTECTED_CONTENT_INIT_PATH),
+        &protected.init_segment,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    for (index, segment) in protected.encrypted_segments.iter().enumerate() {
+        fs::write(
+            staging.path().join(protected_content_segment_path(index)),
+            segment,
+        )
+        .map_err(|_| anyhow::anyhow!("Runtime custody publish staging is unavailable"))?;
+    }
+    Ok(staging)
+}
+
+fn runtime_custody_library_publish_facts(
+    input: &RuntimeCustodyLibraryPublishInput,
+    draft: &RuntimeMintDraft,
+    content_id: &str,
+    evidence: &RuntimeVerifiedContentAvailability,
+) -> RuntimeCustodyLibraryPublishFacts {
+    let mint_id_hex = hex::encode(draft.mint_id().as_bytes());
+    let receipt_digest_hex = hex::encode(evidence.receipt_digest().as_bytes());
+    let availability = json!({
+        "schema": "elastos.library.runtime-custody-availability/v1",
+        "cid": evidence.content_cid(),
+        "content_id": content_id,
+        "mint_id": mint_id_hex,
+        "status": PROTECTED_CONTENT_AVAILABLE_STATUS,
+        "replicas": evidence.observed_replicas(),
+        "checked_at": evidence.checked_at(),
+        "receipt_digest": receipt_digest_hex,
+    });
+    RuntimeCustodyLibraryPublishFacts {
+        content_cid: evidence.content_cid().to_string(),
+        mint_id: draft.mint_id(),
+        content_id: content_id.to_string(),
+        availability: availability.clone(),
+        receipt: json!({
+            "schema": "elastos.library.runtime-custody-receipt/v1",
+            "receipt_digest": receipt_digest_hex,
+        }),
+        content_security: json!({
+            "schema": "elastos.library.published-content-security/v1",
+            "object_uri": input.object_uri,
+            "source_storage": input.source_storage,
+            "published_payload": "runtime_custody_encrypted",
+            "key_release_required": false,
+            "status": "runtime_custody_available",
+            "content_id": content_id,
+            "mint_id": mint_id_hex,
+            "required_providers": [],
+        }),
+    }
 }

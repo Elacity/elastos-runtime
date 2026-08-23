@@ -334,22 +334,36 @@ Entry:
 - current inactive source proof plus deterministic signed custody / Chain
   fixture seams are green;
 - Pre-C0, Pre-C1, and Pre-C2 are green; and
-- routes remain inactive.
+- Slice E has not cut over. Provisional `drm` / `rights` / `key` / `decrypt`
+  remain the live open/share path.
+
+"Inactive" here means no product cutover: do not remove the provisional
+surface, do not expose `protect` as a capsule capability, and do not accept
+fixture authority. It does **not** mean Library keeps the Pre-C1 bail.
+`protection.mode = "runtime_custody"` must actually run protect → mint →
+verified availability and fail closed when operator composition, the device
+key, protect, chain policy, or content availability is missing.
 
 Bounded work and file groups:
 
-- branch the protected creator path before any content publish;
-- wire the existing Library capsule creator import/mint/list flow to
-  protect -> RuntimeMintCoordinator -> verified availability;
-- publish only encrypted fixed-layout output;
-- persist only identity-bound Runtime mint state and availability facts; and
-- avoid inventing Create or Store capsules or a parallel creator route.
+- register `protect` on the same `ProviderRegistry` Library already uses;
+- deny `protect` as a capsule capability, same as `custody` and
+  `chain.resolve_protected_content_policy`;
+- after `validate_runtime_custody_publish_input`, load Pre-C0 composition
+  (fail closed if absent), protect the clear init/segments, resolve the
+  Pre-C2 View policy for the new encrypted content identity, mint through
+  `RuntimeMintCoordinator`, publish only the encrypted fixed-layout tree,
+  and persist identity-only Library/mint facts;
+- keep plain `Publish` plain;
+- do not invent a second registry, coordinator, journal, facade, Create, or
+  Store capsule.
 
 Likely files:
 
+- `elastos/crates/elastos-server/src/server_infra.rs`;
+- `elastos/crates/elastos-server/src/provider_resource.rs`;
 - `elastos/crates/elastos-server/src/library.rs`;
-- `elastos/crates/elastos-server/src/content.rs`;
-- direct existing protected-content composition seams in server/runtime; and
+- `elastos/crates/elastos-server/src/protected_content_runtime.rs`; and
 - focused creator tests.
 
 Exact exit:
@@ -365,15 +379,19 @@ Exact exit:
 
 Focused verification:
 
-- creator mint/list tests through inactive routes;
+- creator mint/list tests through the existing Library publish/status path;
+- fail-closed tests without composition, device key, protect, or policy;
 - availability/object-identity assertions; and
-- journal leak assertions.
+- journal and publish-record leak assertions.
+
+Source proof is on this local branch. Named tests live with the Library
+publish suite. Slice E has still not cut over.
 
 ### Slice D — wire Marketplace buy and Library open/viewer
 
 Entry:
 
-- creator path is green but still inactive.
+- creator mint is green on Library; Slice E has not cut over.
 
 Bounded work and file groups:
 

@@ -853,6 +853,15 @@ mod tests {
             "inactive custody registration is Runtime-internal until product cutover"
         );
         assert!(
+            build_capability_resource("protect", "open_protection_session", &serde_json::json!({}))
+                .is_err(),
+            "protect registration is Runtime-internal until product cutover"
+        );
+        assert!(
+            build_capability_resource("protect", "status", &serde_json::json!({})).is_err(),
+            "protect registration is Runtime-internal until product cutover"
+        );
+        assert!(
             build_capability_resource(
                 "chain",
                 "protected_content_rights_evidence",

@@ -29,7 +29,7 @@ pub enum RuntimeProviderCallError {
 }
 
 #[async_trait::async_trait]
-pub trait RuntimeRightsProvider {
+pub trait RuntimeRightsProvider: Send + Sync {
     async fn evaluate_rights(
         &self,
         request: &RightsProviderRequestV1,
@@ -37,7 +37,7 @@ pub trait RuntimeRightsProvider {
 }
 
 #[async_trait::async_trait]
-pub trait RuntimeCustodyProvider {
+pub trait RuntimeCustodyProvider: Send + Sync {
     async fn release_contribution(
         &self,
         request: &CustodyProviderRequestV1,

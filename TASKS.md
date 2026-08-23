@@ -887,40 +887,10 @@ absence. Live `decrypt` is unchanged. Rights evaluation at open stays on the
 existing Runtime-to-rights seam; the server adapter still maps that seam to
 Chain evidence and does not register a second `rights` name.
 
-- [x] Runtime now validates one pinned signed pool, epoch, and committee with
-  `validate_custody_epoch_against_pool_at`, then resolves exactly those three
-  approved node identities to Runtime-selected provider instances in canonical
-  committee order. Provider candidates supply only node/custody keys, an opaque
-  owner-state-root commitment, and an in-memory provider reference; pool
-  operator/failure-domain claims remain signed policy. There is no election,
-  random or "latest" selection, topology, or caller-supplied node list.
-- [x] Rights evaluation is now node-local on the inactive path. Each selected
-  custody node retains its own signing key, uses its own provider/chain context
-  to evaluate the immutable rights request, and returns only its exact signed
-  decision. The requesting Runtime selects nodes through the ProviderRegistry
-  and never loads, receives, or passes a node signing key.
-- [x] One process-backed inactive Runtime success path now exists with real
-  Runtime mint/release coordination, three distinct custody-provider
-  processes, one protect-provider process, and one decrypt-provider process.
-  That proof now includes producer-side CENC protection from direct clear fMP4
-  input, signed availability evidence, buy binding, wrong-recipient rejection,
-  bit-mutated encrypted-segment rejection, open -> init/segment read -> close,
-  close/cancel replay, explicit provider unregister, byte-exact clear
-  init/segment recovery, and zero unresolved release state. Its Wallet
-  request/response and purchase-effect inputs are deterministic fixtures, its
-  rights evidence is supplied by `ProcessChainEvidenceProvider` fixtures, and
-  its release operation is directly constructed in the test. Separate focused
-  tests prove the passkey-bound Profile authorization/signing seam, Runtime
-  release-operation assembly, missing/duplicate/malicious contribution
-  handling, decrypt restart/old-handle absence, partial-mint abort,
-  availability tamper, and release journal recovery. This success path does
-  not itself prove a live Profile -> Wallet -> Runtime process chain or a real
-  Chain provider process.
-- [x] Extend the real custody-provider process path to a second principal
-  denial: alpha reaches terminal 2-of-3 `ContributionsReady`, beta reaches
-  terminal `RightsDenied`, beta replay is exact, contribution count stays 0,
-  node 2/3 are never contacted after denial is known, and the Runtime release
-  journal remains terminal with zero unresolved state.
+Completed protected-content packaging, composition, clear-media import,
+chain policy, and Library mint (Slices A–C / Pre-C0–C2) are recorded in
+`state.md`. Open work starts at the installed prerequisites and Slice D.
+
 - [ ] Installed prerequisite: provision one signed permissioned custody profile
   before product cutover. It must define the exact pool, epoch, committee
   authorization, three distinct node/provider identities, three owner-only
@@ -932,91 +902,9 @@ Chain evidence and does not register a second `rights` name.
   identity, contract identity, method/selector, two funded test accounts, and
   the existing Wallet approval/transaction coordinator plus Chain evidence
   path. Do not upgrade deterministic fixtures into a product claim.
-- [x] Pre-Slice-A wall-clock coupling removed in
-  `capsules/custody-provider/tests/process.rs`. Valid process operations now
-  use the canonical 60-second release-request maximum
-  (`MAX_RELEASE_REQUEST_LIFETIME_SECS`), the success-path release request is
-  created immediately before the contribution/replay/restart-replay phase, and
-  the later wrong-signing phase creates a fresh exact request instead of
-  reusing the earlier one across unrelated work. Verified evidence:
-  `custody_provider_process_provisions_releases_replays_after_restart_and_shuts_down`,
-  `elastos-protected-content-contracts::authority_tests::release_stays_inside_wallet_authority_window`,
-  and
-  `elastos-protected-content-contracts::rights::wrong_policy_and_expiry_fail_before_replay_claim`
-  all passed. No sleeps, retries, production clocks, or production behavior
-  changed.
-- [x] Slice A — package one binary per protected-content provider kind
-  (protect, custody, decrypt) through the existing component/install/source-home
-  packaging path while keeping the full protected-content route inactive.
-  Custody node instances remain process state/config selected by later inactive
-  Runtime-owned call sites, not separate packaged components.
-  Entry: current source proof at `8eff416e`, no live route changes, disk stays
-  above 15%. Exit: build/package metadata can stage the new provider binaries
-  and preserve the existing custody `provision --base-path ... --trusted-runtime-issuer ...`
-  command, with built/staged artifact identity for Runtime, `components.json`,
-  and provider binaries, but no capsule-visible activation or startup wiring.
-  Likely files: `components.json`, provider manifests/lockfiles, install and
-  source-home scripts, focused install/provider tests. Verification: focused
-  packaging/provision tests, built/staged artifact identity and metadata
-  checks, and leak scans.
-  Evidence: `scripts/source-home-provider-inventory-smoke.py`,
-  `components-release-integrity-check.py` through that smoke, and
-  `runtime_release_coordinator_process_two_of_three_success_stops_before_third_node`.
-  This slice changed no `server_infra.rs`, `publish.rs`, frozen contracts, or
-  old provisional provider surfaces, and it does not claim installation or
-  signed custody profile provisioning.
-- [x] No separate Slice B product service/facade. The reviewed path rejects a
-  new protected-content service, trait, DTO, registry, supervisor,
-  coordinator, journal, or leaf-adapter-only production commit. Protect
-  invocation lands with its first real inactive Library creator mint/list
-  caller; decrypt invocation lands with its first real inactive Library
-  open/viewer caller. Existing `RuntimeMintCoordinator`, `bind_buy`,
-  `RuntimeReleaseCoordinator`, `prepare_recipient`, `open_viewer_session`,
-  `read_viewer_media_part`, `close_viewer_session`, `ProviderRegistry`,
-  Wallet/Chain adapters, Profile authority, and the existing journals remain
-  the composition seams. The decrypt fixture decision-window repair is complete
-  at `0a01ec3d`; it changed tests only and proved the signed node-decision
-  window must stay inside the exact release-operation/request window.
-- [x] Pre-C0 — Runtime-owned custody composition, not a product facade.
-  `554058cc` captures the live mint signer, `2064b556` validates the signed
-  pool/epoch/committee file, and `d9c4bef3` maps those three node identities to
-  Runtime-selected transports. Evidence:
-  `runtime_custody_composition_loads_valid_owner_only_config_with_local_and_carrier_routes`
-  and `runtime_mint_journal_uses_exact_owner_only_root_and_contains_no_route_or_signed_config`.
-- [x] Pre-C1 — accepted clear-media input boundary. `5fae54a2` accepts only
-  `protection.mode = "runtime_custody"` with one validated clear fMP4 init and
-  ordered segments, then fails closed at the inactive boundary. No protect or
-  content dispatch yet. Evidence:
-  `test_library_provider_runtime_custody_publish_reaches_inactive_boundary_without_dispatch_or_record`
-  and `test_library_provider_runtime_custody_publish_rejects_invalid_input_layouts`.
-- [x] Pre-C2 — Runtime-internal chain policy resolver. `c81ad819` lets Runtime
-  ask the existing `chain` provider for the exact configured
-  `RightsPolicyBodyV1`. Capsules cannot invoke
-  `resolve_protected_content_policy`. No rights-provider process. Evidence:
-  `resolve_protected_content_policy_returns_canonical_policy_and_evidence_accepts_it`
-  and `runtime_resolve_rights_policy_recomputes_identity_and_rejects_mismatch`.
-- [ ] Slice C — wire Library creator import/mint/list to
-  protect -> mint coordinator -> verified availability on the existing Library
-  creator publish/mint/list path, still inactive, using Pre-C0, Pre-C1, and
-  Pre-C2.
-  Entry: Slice A packaged/provisionable; inactive source proof plus
-  deterministic signed custody / Chain fixture seams are green; routes remain
-  inactive; and Pre-C0 / Pre-C1 / Pre-C2 are implemented without test-only
-  authority in production. Exit: the protected path branches before any content publish;
-  only encrypted fixed-layout output is published; creator import/mint/list
-  uses the real protect provider, Runtime mint coordinator, and verified
-  availability; Library records/list/status expose identity and availability
-  facts only; and Runtime persists identity-only mint state with no
-  CEK/raw share/sealed-share/ciphertext/clear-media bytes. Real signed operator
-  config is required for product execution; deterministic fixtures remain
-  test-only. Do not invent Create or Store capsules. Minimum creator UI stays
-  in the existing Library capsule. Likely files: Library/content
-  protected-content surfaces plus the direct existing Runtime/protected-content
-  composition seam they call. Verification: focused creator mint/list tests,
-  availability assertions, and journal leak scans.
 - [ ] Slice D — wire Marketplace buy plus Library open/viewer to the existing
-  Wallet approval/transaction/Chain path and the existing release/decrypt path,
-  still inactive. Entry: creator path is green but inactive. Exit: buyer is
+  Wallet approval/transaction/Chain path and the existing release/decrypt path.
+  Entry: creator mint is green on Library; Slice E has not cut over. Exit: buyer is
   denied before purchase, buy binds through the real Wallet/Chain path,
   listing becomes buyer-owned/available, and Library open drives Runtime
   release/decrypt/viewer through the existing composition seams. Minimum

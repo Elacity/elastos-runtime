@@ -950,6 +950,28 @@ async fn setup_server_infrastructure_impl(
         }
     }
 
+    if let Some(path) = crate::find_installed_provider_binary("protected-content-protect-provider")
+    {
+        if let Err(e) = verify_provider_binary("protected-content-protect-provider", &path) {
+            tracing::warn!(
+                "Skipping protected-content-protect-provider due to verification failure: {}",
+                e
+            );
+        } else if let Err(e) = elastos_server::protected_content_runtime::register_protect_provider(
+            &provider_registry,
+            &path,
+        )
+        .await
+        {
+            tracing::warn!("Failed to register elastos://protect sub-provider: {}", e);
+        } else {
+            tracing::info!(
+                "protected-content-protect-provider capsule from {}",
+                path.display()
+            );
+        }
+    }
+
     if let Some(path) = crate::find_installed_provider_binary("custody-provider") {
         if let Err(e) = verify_provider_binary("custody-provider", &path) {
             tracing::warn!(
