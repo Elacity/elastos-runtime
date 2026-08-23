@@ -6,8 +6,8 @@ This is not installed product truth. Released 0.6 still uses the provisional
 
 Dirty `main` `TASKS.md` 0.7 text is unreviewed operator planning. Canonical
 remaining work for this extraction is this document plus `TASKS.md` on
-`feat/protected-content-runtime-lifecycle` (`c81ad819`), stacked on
-`origin/feat/protected-content-rights`.
+`feat/protected-content-runtime-lifecycle` (Slice C `35ea84cc` plus Slice D
+buy / fail-closed open), stacked on `feat/protected-content-rights`.
 
 ## Why this shape
 
@@ -57,10 +57,12 @@ wrong-object/media-binding rejection, encrypted-segment tamper rejection,
 exact durable replay, explicit provider unregister/absence cleanup, and zero
 unresolved release state through the inactive Runtime/provider path. Lower
 layers already own restart/crash/cleanup. Packaging, Runtime custody
-composition, the clear-media import boundary, and the Runtime-internal chain
-policy resolver are complete on this line. The remaining work is Library
-mint/list wiring, Marketplace buy / Library open, atomic cutover, and the
-installed one-Runtime/two-principal acceptance proof.
+composition, the clear-media import boundary, the Runtime-internal chain
+policy resolver, and Library mint/list are complete on this line. Marketplace
+buy now binds Wallet/Chain evidence on the existing object resource; Library
+open is wired but fail-closed until decrypt cutover and a release Wallet
+approval exist. Remaining work is finishing that open/play path, atomic
+cutover, and the installed one-Runtime/two-principal acceptance proof.
 
 ## Evidence only — do not continue or merge
 
@@ -421,6 +423,15 @@ Focused verification:
 - inactive buyer/open tests using the real product adapters;
 - denial-before-purchase, replay, and leak assertions; and
 - no carrier/topology/public-secret exposure.
+
+Source proof: buyer deny-before-purchase, exact `bind_buy` marking the
+listing buyer-owned, sold listings hidden from other principals, and
+Library open denied before purchase or fail-closed without decrypt /
+release approval. Named tests live with the Library runtime-custody suite.
+Owner-only `protected-content/runtime-open/{mint}/envelope.bin` holds the
+exact mint envelope so reconstruct can match identity; it is not a journal
+and is not returned to capsules. Slice E has still not cut over. Full
+viewer play is not green.
 
 ### Slice E — atomic cutover
 

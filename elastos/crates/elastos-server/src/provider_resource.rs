@@ -279,9 +279,19 @@ fn ipfs_op_required_action(op: &str) -> Option<Action> {
 
 fn object_op_required_action(op: &str) -> Option<Action> {
     match op {
-        "roots" | "list" | "stat" | "read" | "download" | "status" | "events" => Some(Action::Read),
+        "roots"
+        | "list"
+        | "stat"
+        | "read"
+        | "download"
+        | "status"
+        | "events"
+        | "list_runtime_custody"
+        | "open_viewer"
+        | "read_viewer"
+        | "close_viewer" => Some(Action::Read),
         "write" | "mkdir" | "rename" | "move" | "copy" | "trash" | "restore" | "publish"
-        | "unpublish" | "repair" | "share" => Some(Action::Write),
+        | "unpublish" | "repair" | "share" | "buy" => Some(Action::Write),
         "delete_permanently" | "empty_trash" => Some(Action::Delete),
         _ => None,
     }
@@ -412,6 +422,11 @@ fn object_resource(op: &str) -> Result<String, String> {
             "unpublish",
             "repair",
             "share",
+            "list_runtime_custody",
+            "buy",
+            "open_viewer",
+            "read_viewer",
+            "close_viewer",
         ],
     )
 }

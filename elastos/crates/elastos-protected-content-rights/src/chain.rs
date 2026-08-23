@@ -10,9 +10,7 @@ use elastos_protected_content_provider_contracts::{
 };
 use serde_json::Value;
 
-use crate::{
-    evaluate_validated_rights_with_evidence_at, RightsEvaluationErrorV1,
-};
+use crate::{evaluate_validated_rights_with_evidence_at, RightsEvaluationErrorV1};
 
 pub const CHAIN_PROVIDER_ID: &str = "chain";
 pub const CHAIN_RIGHTS_EVIDENCE_OP: &str = "protected_content_rights_evidence";

@@ -1315,7 +1315,11 @@ pub(super) async fn gateway_provider_proxy(
             | "repair"
             | "share"
             | "shared_access"
-            | "events" => &[LIBRARY_CAPSULE_ID],
+            | "events"
+            | "open_viewer"
+            | "read_viewer"
+            | "close_viewer" => &[LIBRARY_CAPSULE_ID],
+            "list_runtime_custody" | "buy" => &[LIBRARY_CAPSULE_ID, MARKETPLACE_CAPSULE_ID],
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1621,7 +1625,18 @@ fn library_operation_emits_events(op: &str) -> bool {
 }
 
 fn library_operation_needs_runtime_coordinator(op: &str) -> bool {
-    matches!(op, "publish" | "unpublish" | "repair" | "sync")
+    matches!(
+        op,
+        "publish"
+            | "unpublish"
+            | "repair"
+            | "sync"
+            | "list_runtime_custody"
+            | "buy"
+            | "open_viewer"
+            | "read_viewer"
+            | "close_viewer"
+    )
 }
 
 fn library_request_targets_webspace(request: &serde_json::Value) -> bool {

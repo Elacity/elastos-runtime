@@ -151,10 +151,10 @@ pub fn parse_and_verify_provisioning_output(
     value: &serde_json::Value,
     expected_runtime_issuer: RuntimeOperationIssuerKeyV1,
 ) -> Result<ProvisionedCustodyProviderPublicKeys, ProvisioningOutputError> {
-    let object = value.as_object().ok_or(ProvisioningOutputError::InvalidOutput)?;
-    if object.len() != 2
-        || object.get("status").and_then(serde_json::Value::as_str) != Some("ok")
-    {
+    let object = value
+        .as_object()
+        .ok_or(ProvisioningOutputError::InvalidOutput)?;
+    if object.len() != 2 || object.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
         return Err(ProvisioningOutputError::InvalidOutput);
     }
     let data = object
@@ -162,8 +162,7 @@ pub fn parse_and_verify_provisioning_output(
         .and_then(serde_json::Value::as_object)
         .ok_or(ProvisioningOutputError::InvalidOutput)?;
     if data.len() != 5
-        || data.get("schema").and_then(serde_json::Value::as_str)
-            != Some(PROVISIONING_SCHEMA_V1)
+        || data.get("schema").and_then(serde_json::Value::as_str) != Some(PROVISIONING_SCHEMA_V1)
         || data.get("provider").and_then(serde_json::Value::as_str)
             != Some(PROVISIONING_PROVIDER_ID)
     {
@@ -175,14 +174,13 @@ pub fn parse_and_verify_provisioning_output(
             .ok_or(ProvisioningOutputError::InvalidOutput)?,
     )?)
     .map_err(|_| ProvisioningOutputError::InvalidOutput)?;
-    let node_custody_public_key = NodeCustodyPublicKeyV1::new(parse_exact_hex_bytes::<
-        PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
-    >(
-        data.get("node_custody_public_key")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(ProvisioningOutputError::InvalidOutput)?,
-    )?)
-    .map_err(|_| ProvisioningOutputError::InvalidOutput)?;
+    let node_custody_public_key =
+        NodeCustodyPublicKeyV1::new(parse_exact_hex_bytes::<PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES>(
+            data.get("node_custody_public_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProvisioningOutputError::InvalidOutput)?,
+        )?)
+        .map_err(|_| ProvisioningOutputError::InvalidOutput)?;
     let receipt = parse_exact_hex_bytes::<32>(
         data.get("receipt")
             .and_then(serde_json::Value::as_str)
@@ -354,9 +352,9 @@ fn parse_exact_hex_bytes<const N: usize>(value: &str) -> Result<[u8; N], Provisi
     }
     let mut decoded = [0u8; N];
     for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-        decoded[index] = (hex_nibble(pair[0]).map_err(|_| ProvisioningOutputError::InvalidOutput)?
-            << 4)
-            | hex_nibble(pair[1]).map_err(|_| ProvisioningOutputError::InvalidOutput)?;
+        decoded[index] =
+            (hex_nibble(pair[0]).map_err(|_| ProvisioningOutputError::InvalidOutput)? << 4)
+                | hex_nibble(pair[1]).map_err(|_| ProvisioningOutputError::InvalidOutput)?;
     }
     Ok(decoded)
 }
@@ -722,7 +720,8 @@ mod tests {
     }
 
     fn hex_string(bytes: &[u8]) -> String {
-        bytes.iter()
+        bytes
+            .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     }

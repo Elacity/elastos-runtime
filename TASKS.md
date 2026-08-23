@@ -888,8 +888,10 @@ existing Runtime-to-rights seam; the server adapter still maps that seam to
 Chain evidence and does not register a second `rights` name.
 
 Completed protected-content packaging, composition, clear-media import,
-chain policy, and Library mint (Slices A–C / Pre-C0–C2) are recorded in
-`state.md`. Open work starts at the installed prerequisites and Slice D.
+chain policy, Library mint, and Slice D buy / fail-closed open are
+recorded in `state.md`. Open work starts at the installed prerequisites
+and remaining Slice D Library open/play. Do not start Slice E while live
+`decrypt` is still the only working open path.
 
 - [ ] Installed prerequisite: provision one signed permissioned custody profile
   before product cutover. It must define the exact pool, epoch, committee
@@ -904,15 +906,19 @@ chain policy, and Library mint (Slices A–C / Pre-C0–C2) are recorded in
   path. Do not upgrade deterministic fixtures into a product claim.
 - [ ] Slice D — wire Marketplace buy plus Library open/viewer to the existing
   Wallet approval/transaction/Chain path and the existing release/decrypt path.
-  Entry: creator mint is green on Library; Slice E has not cut over. Exit: buyer is
-  denied before purchase, buy binds through the real Wallet/Chain path,
-  listing becomes buyer-owned/available, and Library open drives Runtime
-  release/decrypt/viewer through the existing composition seams. Minimum
-  buyer/open UI stays in existing Marketplace, Library, Wallet, and Inbox
-  surfaces. Likely files: Marketplace / Library protected-content surfaces,
-  transaction-effect lookups, and the direct existing Runtime/protected-content
-  composition seam they call. Verification: focused buy / open tests against
-  inactive routes, no second authority path.
+  Entry: creator mint is green on Library; Slice E has not cut over. Buy is
+  now on `object.buy` / `object.list_runtime_custody` for Library and
+  Marketplace: denied without Wallet/Chain evidence, exact `bind_buy` marks
+  the listing buyer-owned. Open/read/close are Library-only object ops.
+  Open still fails closed without the new decrypt provider or a second
+  release Wallet approval for the prepared recipient; do not treat that as
+  play-ready and do not register the new decrypt as live `decrypt`. Exit:
+  buyer is denied before purchase, buy binds through the real Wallet/Chain
+  path, listing becomes buyer-owned/available, and Library open drives
+  Runtime release/decrypt/viewer through the existing composition seams.
+  Minimum buyer/open UI stays in existing Marketplace, Library, Wallet, and
+  Inbox surfaces. Verification: focused buy / open tests against inactive
+  routes, no second authority path.
 - [ ] Slice E — one atomic cutover commit. Entry: Slices A-D are green while
   still inactive. Exit: activate the new product routes and remove the old
   provisional startup, DTO, provider-resource/catalog, build/install/component/

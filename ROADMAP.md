@@ -223,7 +223,8 @@ source-only and unregistered. Local descendants add Wallet-rights, a private
 Runtime coordinator, typed Chain evidence, and a typed rights evaluator; those
 remain unpublished source work. Do not continue
 `feat/protected-content-runtime-coordinator-v1`. Local
-`feat/protected-content-runtime-lifecycle` continues D without replacing the
+`feat/protected-content-runtime-lifecycle` implements Slice D buy plus
+fail-closed Library open without replacing the
 provisional `key` or `rights` routes. Rights evaluation invokes existing `chain`
 evidence through the Runtime registry. The remaining-work plan is
 [Protected-content extraction](docs/PROTECTED_CONTENT_EXTRACTION.md).

@@ -242,12 +242,10 @@ impl CustodyProvider {
                         typed_response(CustodyProviderResponseV1::new_contribution(&contribution))
                     }
                     Err(CustodyError::Release(KeyReleaseError::RightsDenied)) => rights_denied(),
-                    Err(_) => {
-                        typed_response(CustodyProviderResponseV1::new_failure(
-                            release,
-                            ProviderFailureCodeV1::BackendUnavailable,
-                        ))
-                    }
+                    Err(_) => typed_response(CustodyProviderResponseV1::new_failure(
+                        release,
+                        ProviderFailureCodeV1::BackendUnavailable,
+                    )),
                 }
             }
         }
@@ -291,9 +289,10 @@ impl CustodyProvider {
                 }
             }
             PrivateCustodyRightsRequestV1::SettleEvidence { .. } => {
-                let evidence = match frame.chain_data().and_then(|data| {
-                    parse_chain_rights_evidence_data(data).ok()
-                }) {
+                let evidence = match frame
+                    .chain_data()
+                    .and_then(|data| parse_chain_rights_evidence_data(data).ok())
+                {
                     Some(evidence) => evidence,
                     None => return invalid_request(),
                 };
@@ -410,11 +409,10 @@ fn chain_rights_evidence_request_from_validated_request(request: &Value) -> Resu
         .cloned()
         .ok_or(())
         .and_then(|value| serde_json::from_value::<Vec<u8>>(value).map_err(|_| ()))?;
-    let signed_runtime_release_operation =
-        SignedRuntimeReleaseOperationV1::from_canonical_bytes(
-            &signed_runtime_release_operation_bytes,
-        )
-        .map_err(|_| ())?;
+    let signed_runtime_release_operation = SignedRuntimeReleaseOperationV1::from_canonical_bytes(
+        &signed_runtime_release_operation_bytes,
+    )
+    .map_err(|_| ())?;
     chain_rights_evidence_request(&signed_runtime_release_operation).map_err(|_| ())
 }
 
@@ -856,8 +854,7 @@ mod tests {
             "op": "evaluate",
             "signed_runtime_release_operation": "0xdeadbeef",
         });
-        request_value["signed_runtime_release_operation"] =
-            Value::String("0xdeadbeef".to_string());
+        request_value["signed_runtime_release_operation"] = Value::String("0xdeadbeef".to_string());
         assert!(chain_rights_evidence_request_from_validated_request(&request_value).is_err());
     }
 

@@ -326,6 +326,41 @@ enum ObjectProviderRequest {
         #[serde(default)]
         recipient_proof: Option<Value>,
     },
+    ListRuntimeCustody {
+        principal_id: String,
+    },
+    Buy {
+        principal_id: String,
+        mint_id: String,
+        #[serde(default)]
+        wallet_request_hex: Option<String>,
+        #[serde(default)]
+        wallet_response_hex: Option<String>,
+        #[serde(default)]
+        purchase: Option<crate::protected_content_runtime::RuntimeCustodyPurchaseEvidence>,
+    },
+    OpenViewer {
+        principal_id: String,
+        mint_id: String,
+        #[serde(default)]
+        proof_binding_id: Option<String>,
+        #[serde(default)]
+        wallet_request_hex: Option<String>,
+        #[serde(default)]
+        wallet_response_hex: Option<String>,
+    },
+    ReadViewer {
+        principal_id: String,
+        mint_id: String,
+        viewer_session_handle: String,
+        #[serde(default)]
+        segment_index: Option<u32>,
+    },
+    CloseViewer {
+        principal_id: String,
+        mint_id: String,
+        viewer_session_handle: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,6 +472,19 @@ impl Provider for ObjectProvider {
                 )
                 .await
             }
+            request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
+            | ObjectProviderRequest::Buy { .. }
+            | ObjectProviderRequest::OpenViewer { .. }
+            | ObjectProviderRequest::ReadViewer { .. }
+            | ObjectProviderRequest::CloseViewer { .. }) => {
+                let Some(registry) = self.registry.upgrade() else {
+                    return Ok(provider_error(
+                        "library_error",
+                        "object provider registry unavailable",
+                    ));
+                };
+                handle_runtime_custody_library_request(data_dir, registry, request).await
+            }
             request => {
                 tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
                     .await
@@ -467,7 +515,12 @@ pub fn handle_object_provider_raw_request(data_dir: &Path, request: &Value) -> V
     let result = match request {
         ObjectProviderRequest::Publish { .. }
         | ObjectProviderRequest::Unpublish { .. }
-        | ObjectProviderRequest::Repair { .. } => Err(anyhow!(
+        | ObjectProviderRequest::Repair { .. }
+        | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::OpenViewer { .. }
+        | ObjectProviderRequest::ReadViewer { .. }
+        | ObjectProviderRequest::CloseViewer { .. } => Err(anyhow!(
             "library content operation requires Runtime content coordinator"
         )),
         request => handle_library_request(data_dir, request),
@@ -674,6 +727,13 @@ pub async fn handle_object_provider_runtime_request(
         }
         ObjectProviderRequest::Repair { principal_id, uri } => {
             library_repair(&data_dir, registry, &principal_id, &uri).await
+        }
+        request @ (ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::OpenViewer { .. }
+        | ObjectProviderRequest::ReadViewer { .. }
+        | ObjectProviderRequest::CloseViewer { .. }) => {
+            handle_runtime_custody_library_request(data_dir, registry, request).await
         }
         request @ (ObjectProviderRequest::Status { .. }
         | ObjectProviderRequest::Share { .. }
@@ -1759,9 +1819,96 @@ fn handle_library_request(
         }
         ObjectProviderRequest::Publish { .. }
         | ObjectProviderRequest::Unpublish { .. }
-        | ObjectProviderRequest::Repair { .. } => {
-            unreachable!("publish/unpublish/repair handled asynchronously")
+        | ObjectProviderRequest::Repair { .. }
+        | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::OpenViewer { .. }
+        | ObjectProviderRequest::ReadViewer { .. }
+        | ObjectProviderRequest::CloseViewer { .. } => {
+            unreachable!("runtime custody library operations are handled asynchronously")
         }
+    }
+}
+
+async fn handle_runtime_custody_library_request(
+    data_dir: PathBuf,
+    registry: Arc<ProviderRegistry>,
+    request: ObjectProviderRequest,
+) -> anyhow::Result<Value> {
+    match request {
+        ObjectProviderRequest::ListRuntimeCustody { principal_id } => {
+            crate::protected_content_runtime::list_runtime_custody_listings(
+                &data_dir,
+                &principal_id,
+            )
+        }
+        ObjectProviderRequest::Buy {
+            principal_id,
+            mint_id,
+            wallet_request_hex,
+            wallet_response_hex,
+            purchase,
+        } => crate::protected_content_runtime::buy_runtime_custody_listing(
+            &data_dir,
+            crate::protected_content_runtime::RuntimeCustodyBuyInput {
+                principal_id,
+                mint_id,
+                wallet_request_hex,
+                wallet_response_hex,
+                purchase,
+            },
+        ),
+        ObjectProviderRequest::OpenViewer {
+            principal_id,
+            mint_id,
+            proof_binding_id,
+            wallet_request_hex,
+            wallet_response_hex,
+        } => {
+            crate::protected_content_runtime::open_runtime_custody_viewer(
+                &data_dir,
+                registry,
+                crate::protected_content_runtime::RuntimeCustodyViewerOpenInput {
+                    principal_id,
+                    mint_id,
+                    proof_binding_id,
+                    wallet_request_hex,
+                    wallet_response_hex,
+                },
+            )
+            .await
+        }
+        ObjectProviderRequest::ReadViewer {
+            principal_id,
+            mint_id,
+            viewer_session_handle,
+            segment_index,
+        } => {
+            crate::protected_content_runtime::read_runtime_custody_viewer(
+                &data_dir,
+                registry,
+                &principal_id,
+                &mint_id,
+                &viewer_session_handle,
+                segment_index,
+            )
+            .await
+        }
+        ObjectProviderRequest::CloseViewer {
+            principal_id,
+            mint_id,
+            viewer_session_handle,
+        } => {
+            crate::protected_content_runtime::close_runtime_custody_viewer(
+                &data_dir,
+                registry,
+                &principal_id,
+                &mint_id,
+                &viewer_session_handle,
+            )
+            .await
+        }
+        _ => anyhow::bail!("runtime custody library operation is invalid"),
     }
 }
 
@@ -3128,7 +3275,12 @@ fn library_request_touches_webspace(request: &ObjectProviderRequest) -> bool {
         ObjectProviderRequest::Roots { .. }
         | ObjectProviderRequest::List { uri: None, .. }
         | ObjectProviderRequest::EmptyTrash { .. }
-        | ObjectProviderRequest::Events { .. } => false,
+        | ObjectProviderRequest::Events { .. }
+        | ObjectProviderRequest::ListRuntimeCustody { .. }
+        | ObjectProviderRequest::Buy { .. }
+        | ObjectProviderRequest::OpenViewer { .. }
+        | ObjectProviderRequest::ReadViewer { .. }
+        | ObjectProviderRequest::CloseViewer { .. } => false,
     }
 }
 

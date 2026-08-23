@@ -2,59 +2,64 @@
 //!
 //! This module registers Runtime-owned `protect` and `custody` routes, scans
 //! the durable Runtime release journal on startup, and evaluates policy through
-//! the existing `chain` registry route. Library mint uses these seams. It does
-//! not replace the provisional `key`/`rights`/`drm`/`decrypt` open/share path
-//! or expose provider topology to capsules.
+//! the existing `chain` registry route. Library mint and buy use these seams.
+//! It does not replace the provisional `key`/`rights`/`drm`/`decrypt`
+//! open/share path or expose provider topology to capsules.
 
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 use elastos_protected_content_contracts::{
     validate_custody_epoch_against_pool_at, CanonicalContract,
     CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, Digest32,
-    EncryptedContentIdentityV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey,
-    RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
-    RightsActionV1, RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1,
+    EncryptedContentIdentityV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, RecipientKeyAuthorizationStatementV1,
+    RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
+    RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1,
     RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
     SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
-    SignedRuntimeReleaseOperationV1, WalletSignedRightsRequestV1,
+    SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
+    TerminalReceiptStatementV1, WalletSignedRightsRequestV1,
 };
 use elastos_protected_content_provider_contracts::{
-    CencFmp4MediaIdentityV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
+    CencFmp4MediaIdentityV1, DecryptProviderRequestOpV1, DecryptProviderRequestV1,
+    DecryptProviderResponseV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
     ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
-    RightsProviderResponseV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
-};
-#[cfg(test)]
-use elastos_protected_content_provider_contracts::{
-    DecryptProviderRequestOpV1, DecryptProviderRequestV1, DecryptProviderResponseV1,
+    RightsProviderResponseV1, ViewerMediaPartSelectorV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 use elastos_protected_content_rights::{
     PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
 };
-#[cfg(test)]
-use elastos_protected_content_runtime::RuntimeDecryptProvider;
 use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
-    resolve_runtime_mint_selected_nodes, PersistedRuntimeReleaseOperation,
-    RuntimeContentAvailabilityRequirement, RuntimeMintConfiguredCustodyProvider,
+    bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
+    prepare_recipient, read_viewer_media_part, resolve_runtime_mint_selected_nodes,
+    PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
+    RuntimeCustodyTerminalKind, RuntimeDecryptProvider, RuntimeMintConfiguredCustodyProvider,
     RuntimeMintCoordinator, RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome,
-    RuntimeMintDraft, RuntimeMintJournal, RuntimeReleaseAuditRecord, RuntimeReleaseJournal,
-    RuntimeReleaseJournalError, RuntimeVerifiedContentAvailability,
+    RuntimeMintDraft, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
+    RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
+    RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
+    RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeReleaseTerminalResult,
+    RuntimeSelectedProvider, RuntimeVerifiedContentAvailability, RuntimeVerifiedPurchaseEffect,
+    RuntimeViewerSession,
 };
 use elastos_runtime::provider::bridge::{ProviderBridge, ProviderConfig};
 use elastos_runtime::provider::{
     Provider, ProviderCarrierRoute, ProviderError, ProviderInvocation, ProviderInvocationTransport,
     ProviderRegistry, ProviderTransfer, ResourceRequest, ResourceResponse,
 };
+use elastos_wallet_contract::ValidatedChainOutcomeBindingV1;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest as _;
@@ -71,9 +76,24 @@ const PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS: u64 = 60;
 const PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS: u64 = 5;
 pub(crate) const RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE: &str =
     "Runtime custody composition is not configured";
+pub(crate) const RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE: &str =
+    "Runtime custody purchase is denied before buy";
+pub(crate) const RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE: &str =
+    "Runtime custody open is denied before purchase";
+pub(crate) const RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE: &str =
+    "Runtime custody decrypt provider is unavailable";
+pub(crate) const RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE: &str =
+    "Runtime custody viewer envelope is unavailable";
+pub(crate) const RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE: &str =
+    "Runtime custody viewer release approval is unavailable";
 const PROTECTED_CONTENT_ROOT: &str = "protected-content";
 const CUSTODY_COMPOSITION_CONFIG_FILE: &str = "protected-content/custody-composition.json";
 const RUNTIME_MINT_JOURNAL_ROOT: &str = "protected-content/runtime-mint";
+const RUNTIME_OPEN_MATERIAL_ROOT: &str = "protected-content/runtime-open";
+const RUNTIME_LISTING_ROOT: &str = "protected-content/runtime-listings";
+const RUNTIME_PURCHASE_ROOT: &str = "protected-content/runtime-purchases";
+const RUNTIME_LISTING_SCHEMA_V1: &str = "elastos.library.runtime-custody-listing/v1";
+const RUNTIME_PURCHASE_SCHEMA_V1: &str = "elastos.library.runtime-custody-purchase/v1";
 const CUSTODY_COMPOSITION_SCHEMA_V1: &str = "elastos.protected-content.custody-composition/v1";
 const MAX_CUSTODY_COMPOSITION_BYTES: usize = 64 * 1024;
 const MAX_CUSTODY_COMPOSITION_BLOB_BYTES: usize = 16 * 1024;
@@ -86,7 +106,6 @@ const PROTECTED_CONTENT_SEGMENTS_SUFFIX: &str = ".m4s";
 const PROTECTED_CONTENT_AVAILABLE_STATUS: &str = "network_available";
 const CONTENT_AVAILABILITY_RECEIPT_SCHEMA: &str = "elastos.content.availability.receipt/v1";
 const CONTENT_AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.receipt.v1";
-#[cfg(test)]
 const DECRYPT_PROVIDER_ID: &str = "decrypt";
 const INACTIVE_CUSTODY_ROOT: &str = "protected-content/custody-provider/inactive";
 const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
@@ -658,19 +677,16 @@ pub(crate) fn assemble_protected_content_runtime_release_operation(
     Ok(signed)
 }
 
-#[cfg(test)]
 struct RuntimeDecryptRegistryAdapter {
     registry: Arc<ProviderRegistry>,
 }
 
-#[cfg(test)]
 impl RuntimeDecryptRegistryAdapter {
     fn new(registry: Arc<ProviderRegistry>) -> Self {
         Self { registry }
     }
 }
 
-#[cfg(test)]
 fn decrypt_provider_op(request: &DecryptProviderRequestV1) -> &'static str {
     match request.op() {
         DecryptProviderRequestOpV1::PrepareRecipient => "prepare_recipient",
@@ -681,7 +697,6 @@ fn decrypt_provider_op(request: &DecryptProviderRequestV1) -> &'static str {
     }
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl RuntimeDecryptProvider for RuntimeDecryptRegistryAdapter {
     async fn prepare_recipient(
@@ -720,7 +735,6 @@ impl RuntimeDecryptProvider for RuntimeDecryptRegistryAdapter {
     }
 }
 
-#[cfg(test)]
 async fn invoke_decrypt_provider(
     registry: &ProviderRegistry,
     request: &DecryptProviderRequestV1,
@@ -965,7 +979,7 @@ fn read_owner_only_config_bytes(path: &Path, max_bytes: usize) -> anyhow::Result
         invalid_custody_composition_config,
     )?;
     let mut bytes = Vec::with_capacity(max_bytes.min(4096));
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take((max_bytes + 1) as u64)
         .read_to_end(&mut bytes)?;
     if bytes.is_empty() || bytes.len() > max_bytes {
@@ -1923,6 +1937,20 @@ pub(crate) async fn publish_runtime_custody_library_object(
             if mint_id == mint_draft.mint_id() => {}
         _ => anyhow::bail!("Runtime custody availability record failed"),
     }
+    persist_runtime_open_envelope(data_dir, mint_draft.mint_id(), &protected.envelope)?;
+    persist_runtime_custody_listing(
+        data_dir,
+        &RuntimeCustodyListingRecord {
+            schema: RUNTIME_LISTING_SCHEMA_V1.to_string(),
+            mint_id: hex::encode(mint_draft.mint_id().as_bytes()),
+            content_id: content_id.clone(),
+            cid: evidence.content_cid().to_string(),
+            publisher_principal_id: input.principal_id.clone(),
+            buyer_principal_id: None,
+            published_at: crate::auth::now_ts(),
+            bought_at: None,
+        },
+    )?;
     Ok(runtime_custody_library_publish_facts(
         &input,
         &mint_draft,
@@ -2204,4 +2232,920 @@ fn runtime_custody_library_publish_facts(
             "required_providers": [],
         }),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCustodyListingRecord {
+    schema: String,
+    mint_id: String,
+    content_id: String,
+    cid: String,
+    publisher_principal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    buyer_principal_id: Option<String>,
+    published_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bought_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeCustodyPurchaseRecord {
+    schema: String,
+    principal_id: String,
+    mint_id: String,
+    content_id: String,
+    cid: String,
+    chain_transaction: String,
+    bought_at: u64,
+    wallet_request_hex: String,
+    wallet_response_hex: String,
+    account_id: String,
+    address: String,
+    approval_request_id: String,
+    chain_namespace: String,
+    network: String,
+    to: String,
+    value: String,
+    data: String,
+    wallet_binding: ValidatedChainOutcomeBindingV1,
+    chain_observation: Value,
+    confirmed_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeCustodyPurchaseEvidence {
+    pub account_id: String,
+    pub address: String,
+    pub approval_request_id: String,
+    pub chain_namespace: String,
+    pub network: String,
+    pub to: String,
+    pub value: String,
+    pub data: String,
+    pub wallet_binding: ValidatedChainOutcomeBindingV1,
+    pub transaction_hash: String,
+    pub chain_observation: Value,
+    pub confirmed_at: u64,
+}
+
+pub(crate) struct RuntimeCustodyBuyInput {
+    pub principal_id: String,
+    pub mint_id: String,
+    pub wallet_request_hex: Option<String>,
+    pub wallet_response_hex: Option<String>,
+    pub purchase: Option<RuntimeCustodyPurchaseEvidence>,
+}
+
+pub(crate) struct RuntimeCustodyViewerOpenInput {
+    pub principal_id: String,
+    pub mint_id: String,
+    pub proof_binding_id: Option<String>,
+    pub wallet_request_hex: Option<String>,
+    pub wallet_response_hex: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RuntimeCustodyViewerKey {
+    data_dir: PathBuf,
+    mint_id: Digest32,
+    handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+}
+
+struct RuntimeCustodyViewerState {
+    principal_id: String,
+    session: RuntimeViewerSession,
+    cid: String,
+}
+
+fn runtime_custody_viewer_sessions(
+) -> &'static Mutex<HashMap<RuntimeCustodyViewerKey, RuntimeCustodyViewerState>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<RuntimeCustodyViewerKey, RuntimeCustodyViewerState>>> =
+        OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn list_runtime_custody_listings(
+    data_dir: &Path,
+    principal_id: &str,
+) -> anyhow::Result<Value> {
+    if principal_id.trim().is_empty() {
+        anyhow::bail!("Runtime custody listing principal is invalid");
+    }
+    let root = data_dir.join(RUNTIME_LISTING_ROOT);
+    let mut listings = Vec::new();
+    if root.is_dir() {
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let record: RuntimeCustodyListingRecord =
+                serde_json::from_slice(&fs::read(entry.path())?)?;
+            if record.schema != RUNTIME_LISTING_SCHEMA_V1 {
+                anyhow::bail!("Runtime custody listing is invalid");
+            }
+            let is_publisher = record.publisher_principal_id == principal_id;
+            let is_buyer = record.buyer_principal_id.as_deref() == Some(principal_id);
+            if record.buyer_principal_id.is_some() && !is_publisher && !is_buyer {
+                continue;
+            }
+            listings.push(json!({
+                "schema": RUNTIME_LISTING_SCHEMA_V1,
+                "mint_id": record.mint_id,
+                "content_id": record.content_id,
+                "cid": record.cid,
+                "publisher_principal_id": record.publisher_principal_id,
+                "buyer_principal_id": if is_publisher || is_buyer {
+                    record.buyer_principal_id.clone()
+                } else {
+                    None
+                },
+                "published_at": record.published_at,
+                "bought_at": if is_publisher || is_buyer {
+                    record.bought_at
+                } else {
+                    None
+                },
+                "availability": {
+                    "schema": "elastos.library.runtime-custody-availability/v1",
+                    "status": if record.buyer_principal_id.is_some() {
+                        "buyer_owned"
+                    } else {
+                        PROTECTED_CONTENT_AVAILABLE_STATUS
+                    },
+                    "cid": record.cid,
+                    "content_id": record.content_id,
+                    "mint_id": record.mint_id,
+                },
+            }));
+        }
+    }
+    listings.sort_by(|left, right| {
+        left.get("mint_id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("mint_id").and_then(Value::as_str))
+    });
+    Ok(json!({
+        "schema": "elastos.library.runtime-custody-listings/v1",
+        "listings": listings,
+    }))
+}
+
+pub(crate) fn buy_runtime_custody_listing(
+    data_dir: &Path,
+    input: RuntimeCustodyBuyInput,
+) -> anyhow::Result<Value> {
+    let wallet_request_hex = input.wallet_request_hex.filter(|value| !value.is_empty());
+    let wallet_response_hex = input.wallet_response_hex.filter(|value| !value.is_empty());
+    let (Some(wallet_request_hex), Some(wallet_response_hex), Some(purchase)) =
+        (wallet_request_hex, wallet_response_hex, input.purchase)
+    else {
+        anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+    };
+    let mint_id = parse_mint_id_hex(&input.mint_id)?;
+    let listing = load_runtime_custody_listing(data_dir, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is unavailable"))?;
+    if listing
+        .buyer_principal_id
+        .as_deref()
+        .is_some_and(|buyer| buyer != input.principal_id)
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+    }
+    let mint = runtime_mint_journal(data_dir)
+        .load(mint_id)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    if mint.custody_terminal() != Some(RuntimeCustodyTerminalKind::CustodyProvisioned)
+        || mint.content_availability().is_none()
+    {
+        anyhow::bail!("Runtime custody mint selection is invalid");
+    }
+    let wallet_request = decode_hex_bytes(&wallet_request_hex)
+        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?;
+    let wallet_response = decode_hex_bytes(&wallet_response_hex)
+        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?;
+    let effect = RuntimeVerifiedPurchaseEffect::new(
+        RuntimeProtectedContentPurchaseIntent::new(
+            mint_id,
+            mint.draft().encrypted_content().clone(),
+            mint.draft().key_envelope().clone(),
+            mint.draft().policy().clone(),
+            RightsActionV1::View,
+            purchase.chain_namespace.clone(),
+            purchase.network.clone(),
+            purchase.to.clone(),
+            purchase.value.clone(),
+            purchase.data.clone(),
+        )
+        .map_err(|_| anyhow::anyhow!("Runtime custody chain evidence is invalid"))?,
+        RuntimePurchaseEffectAuthority::new(
+            input.principal_id.clone(),
+            purchase.account_id.clone(),
+            purchase.address.clone(),
+            purchase.approval_request_id.clone(),
+        )
+        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?,
+        purchase.wallet_binding.clone(),
+        purchase.transaction_hash.clone(),
+        purchase.chain_observation.clone(),
+        purchase.confirmed_at,
+    )
+    .map_err(runtime_open_error)?;
+    let receipt = bind_buy(
+        &mint,
+        &wallet_request,
+        &wallet_response,
+        &effect,
+        crate::auth::now_ts(),
+    )
+    .map_err(runtime_open_error)?;
+    let bought_at = crate::auth::now_ts();
+    let chain_transaction = format!("0x{}", hex::encode(receipt.chain_transaction().as_bytes()));
+    persist_runtime_custody_purchase(
+        data_dir,
+        &RuntimeCustodyPurchaseRecord {
+            schema: RUNTIME_PURCHASE_SCHEMA_V1.to_string(),
+            principal_id: input.principal_id.clone(),
+            mint_id: listing.mint_id.clone(),
+            content_id: listing.content_id.clone(),
+            cid: listing.cid.clone(),
+            chain_transaction: chain_transaction.clone(),
+            bought_at,
+            wallet_request_hex,
+            wallet_response_hex,
+            account_id: purchase.account_id,
+            address: purchase.address,
+            approval_request_id: purchase.approval_request_id,
+            chain_namespace: purchase.chain_namespace,
+            network: purchase.network,
+            to: purchase.to,
+            value: purchase.value,
+            data: purchase.data,
+            wallet_binding: purchase.wallet_binding,
+            chain_observation: purchase.chain_observation,
+            confirmed_at: purchase.confirmed_at,
+        },
+    )?;
+    let mut listing = listing;
+    listing.buyer_principal_id = Some(input.principal_id);
+    listing.bought_at = Some(bought_at);
+    persist_runtime_custody_listing(data_dir, &listing)?;
+    Ok(json!({
+        "schema": RUNTIME_PURCHASE_SCHEMA_V1,
+        "mint_id": listing.mint_id,
+        "content_id": listing.content_id,
+        "cid": listing.cid,
+        "chain_transaction": chain_transaction,
+        "bought_at": bought_at,
+        "availability": {
+            "schema": "elastos.library.runtime-custody-availability/v1",
+            "status": "buyer_owned",
+            "cid": listing.cid,
+            "content_id": listing.content_id,
+            "mint_id": listing.mint_id,
+        },
+    }))
+}
+
+pub(crate) async fn open_runtime_custody_viewer(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    input: RuntimeCustodyViewerOpenInput,
+) -> anyhow::Result<Value> {
+    let mint_id = parse_mint_id_hex(&input.mint_id)?;
+    let purchase = load_runtime_custody_purchase(data_dir, &input.principal_id, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE))?;
+    let composition = load_runtime_custody_composition(data_dir, registry.clone())?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
+    let (device_key, _) =
+        crate::collaboration_profile_authority::load_existing_device_signing_key(data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
+    let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
+        .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
+    let envelope = load_runtime_open_envelope(data_dir, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?;
+    let mint = runtime_mint_journal(data_dir)
+        .load(mint_id)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let (media_identity, protected_init) = fetch_runtime_custody_open_media(
+        registry.as_ref(),
+        &purchase.cid,
+        mint.draft().media_identity(),
+    )
+    .await?;
+    let buy = reconstructed_buy_receipt(&mint, &purchase)?;
+    let now = crate::auth::now_ts();
+    let audit_request_id = runtime_open_audit_id(&input.principal_id, mint_id, now);
+    let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
+    let prepared = match prepare_recipient(
+        &decrypt,
+        &buy,
+        audit_request_id,
+        runtime_issuer,
+        now.saturating_sub(5),
+        now + 60,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(_) => anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
+    };
+    let release_wallet_request = input
+        .wallet_request_hex
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| decode_hex_bytes(value).ok());
+    let release_wallet_response = input
+        .wallet_response_hex
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| decode_hex_bytes(value).ok());
+    let proof_binding_id = input
+        .proof_binding_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let (Some(release_wallet_request), Some(release_wallet_response), Some(proof_binding_id)) = (
+        release_wallet_request,
+        release_wallet_response,
+        proof_binding_id,
+    ) else {
+        let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
+        anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+    };
+    let signed_rights =
+        wallet_signed_rights_from_bytes(&release_wallet_request, &release_wallet_response)
+            .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let policy = resolve_runtime_rights_policy(
+        registry.as_ref(),
+        mint.draft().encrypted_content(),
+        RightsActionV1::View,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Runtime custody rights policy is unavailable"))?;
+    let release_request = KeyReleaseRequestV1::new(
+        signed_rights.request().binding().clone(),
+        signed_rights
+            .request()
+            .request_hash()
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?,
+        RightsActionV1::View,
+        prepared.recipient_identity().clone(),
+        now.saturating_sub(4),
+        now + 45,
+        ReplayNonce16::new(audit_nonce_bytes(audit_request_id)),
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let evidence_request = RightsEvaluationEvidenceRequestV1::new(
+        signed_rights.request().binding().clone(),
+        policy.identity().clone(),
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let localhost_root = crate::auth::principal_localhost_root(&input.principal_id);
+    let operation = match assemble_protected_content_runtime_release_operation(
+        data_dir,
+        &input.principal_id,
+        &localhost_root,
+        proof_binding_id,
+        RuntimeReleaseOperationAssemblyInput {
+            rights_request: signed_rights,
+            release_request,
+            recipient_public_key: prepared.recipient_public_key().clone(),
+            recipient_identity: prepared.recipient_identity().clone(),
+            policy_body: policy.body().clone(),
+            evidence_request,
+            custody_epoch: composition.signed_epoch.clone(),
+            audit_request_id,
+            issued_at: now.saturating_sub(3),
+            expires_at: now + 50,
+        },
+        now,
+    ) {
+        Ok(operation) => operation,
+        Err(_) => {
+            let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
+            anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+        }
+    };
+    let selected = vec![
+        RuntimeSelectedProvider::new(
+            composition.nodes[0].node_public_key,
+            &composition.nodes[0].adapter,
+            &composition.nodes[0].adapter,
+        ),
+        RuntimeSelectedProvider::new(
+            composition.nodes[1].node_public_key,
+            &composition.nodes[1].adapter,
+            &composition.nodes[1].adapter,
+        ),
+        RuntimeSelectedProvider::new(
+            composition.nodes[2].node_public_key,
+            &composition.nodes[2].adapter,
+            &composition.nodes[2].adapter,
+        ),
+    ];
+    let coordinator =
+        RuntimeReleaseCoordinator::new(runtime_release_journal(data_dir), runtime_issuer, selected)
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let contributions = match coordinator
+        .release(
+            &release_wallet_request,
+            &release_wallet_response,
+            operation.clone(),
+            now,
+        )
+        .await
+    {
+        Ok(RuntimeReleaseCoordinatorOutcome::Terminal(
+            RuntimeReleaseTerminalResult::ContributionsReady {
+                signed_node_contributions,
+            },
+        )) => signed_node_contributions,
+        _ => {
+            let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
+            anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+        }
+    };
+    let terminal_receipt = match sign_runtime_terminal_receipt(
+        &device_key,
+        &operation,
+        &contributions,
+        &composition.signed_epoch,
+        now,
+    ) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
+            anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+        }
+    };
+    let session = match open_viewer_session(
+        &decrypt,
+        &RuntimeOpenViewerSessionInput {
+            buy: &buy,
+            prepared_recipient: &prepared,
+            signed_runtime_release_operation: &operation,
+            expected_terminal_issuer: TerminalReceiptIssuerKey::new(
+                device_key.verifying_key().to_bytes(),
+            )
+            .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?,
+            custody_envelope: &envelope,
+            media_identity: &media_identity,
+            protected_init_segment: &protected_init,
+            signed_node_contributions: &contributions,
+            signed_terminal_receipt: &terminal_receipt,
+            now_unix_seconds: crate::auth::now_ts(),
+        },
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(_) => {
+            let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
+            anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE);
+        }
+    };
+    let handle = *session.viewer_session_handle();
+    let expires_at = session.expires_at();
+    runtime_custody_viewer_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?
+        .insert(
+            RuntimeCustodyViewerKey {
+                data_dir: data_dir.to_path_buf(),
+                mint_id,
+                handle,
+            },
+            RuntimeCustodyViewerState {
+                principal_id: input.principal_id,
+                session,
+                cid: purchase.cid,
+            },
+        );
+    Ok(json!({
+        "schema": "elastos.library.runtime-custody-viewer/v1",
+        "mint_id": hex::encode(mint_id.as_bytes()),
+        "viewer_session_handle": hex::encode(handle),
+        "expires_at": expires_at,
+    }))
+}
+
+pub(crate) async fn read_runtime_custody_viewer(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    principal_id: &str,
+    mint_id_hex: &str,
+    handle_hex: &str,
+    segment_index: Option<u32>,
+) -> anyhow::Result<Value> {
+    let mint_id = parse_mint_id_hex(mint_id_hex)?;
+    let handle = parse_viewer_handle_hex(handle_hex)?;
+    let state = {
+        let sessions = runtime_custody_viewer_sessions()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
+        sessions
+            .get(&RuntimeCustodyViewerKey {
+                data_dir: data_dir.to_path_buf(),
+                mint_id,
+                handle,
+            })
+            .filter(|state| state.principal_id == principal_id)
+            .map(|state| (state.session.clone(), state.cid.clone()))
+            .ok_or_else(|| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?
+    };
+    let (session, cid) = state;
+    let selector = if let Some(segment_index) = segment_index {
+        let mint = runtime_mint_journal(data_dir)
+            .load(mint_id)
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+        let path = protected_content_segment_path(
+            usize::try_from(segment_index)
+                .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?,
+        );
+        if usize::try_from(segment_index).ok()
+            >= Some(mint.draft().media_identity().encrypted_segments().len())
+        {
+            anyhow::bail!("Runtime custody viewer media part is invalid");
+        }
+        let encrypted =
+            crate::content::fetch_bytes_via_provider(registry.as_ref(), &cid, Some(&path))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("Runtime custody content availability is unavailable")
+                })?;
+        ViewerMediaPartSelectorV1::segment(segment_index, encrypted)
+            .map_err(|_| anyhow::anyhow!("Runtime custody viewer media part is invalid"))?
+    } else {
+        ViewerMediaPartSelectorV1::init()
+    };
+    let part = read_viewer_media_part(
+        &RuntimeDecryptRegistryAdapter::new(registry),
+        &session,
+        selector,
+        crate::auth::now_ts(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE))?;
+    Ok(json!({
+        "schema": "elastos.library.runtime-custody-viewer-part/v1",
+        "mint_id": hex::encode(mint_id.as_bytes()),
+        "viewer_session_handle": handle_hex,
+        "encoding": "base64",
+        "data": base64::engine::general_purpose::STANDARD.encode(part.clear_media_part()),
+    }))
+}
+
+pub(crate) async fn close_runtime_custody_viewer(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    principal_id: &str,
+    mint_id_hex: &str,
+    handle_hex: &str,
+) -> anyhow::Result<Value> {
+    let mint_id = parse_mint_id_hex(mint_id_hex)?;
+    let handle = parse_viewer_handle_hex(handle_hex)?;
+    let key = RuntimeCustodyViewerKey {
+        data_dir: data_dir.to_path_buf(),
+        mint_id,
+        handle,
+    };
+    let state = runtime_custody_viewer_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?
+        .remove(&key)
+        .filter(|state| state.principal_id == principal_id)
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
+    let _ = close_viewer_session(
+        &RuntimeDecryptRegistryAdapter::new(registry),
+        &state.session,
+    )
+    .await;
+    Ok(json!({
+        "schema": "elastos.library.runtime-custody-viewer/v1",
+        "mint_id": hex::encode(mint_id.as_bytes()),
+        "closed": true,
+    }))
+}
+
+fn persist_runtime_open_envelope(
+    data_dir: &Path,
+    mint_id: Digest32,
+    envelope: &CustodyEnvelopeV1,
+) -> anyhow::Result<()> {
+    // Owner-only Runtime open material, not a mint journal or Library record.
+    // Reconstruct still needs the exact envelope identity until custody-node
+    // reassembly exists. Never return these bytes to capsules.
+    let bytes = envelope
+        .canonical_bytes()
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?;
+    write_owner_only_bytes(&runtime_open_envelope_path(data_dir, mint_id), &bytes)
+}
+
+fn load_runtime_open_envelope(
+    data_dir: &Path,
+    mint_id: Digest32,
+) -> anyhow::Result<Option<CustodyEnvelopeV1>> {
+    let path = runtime_open_envelope_path(data_dir, mint_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?;
+    Ok(Some(
+        CustodyEnvelopeV1::from_canonical_bytes(&bytes)
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?,
+    ))
+}
+
+fn persist_runtime_custody_listing(
+    data_dir: &Path,
+    record: &RuntimeCustodyListingRecord,
+) -> anyhow::Result<()> {
+    write_owner_only_bytes(
+        &runtime_listing_path(data_dir, parse_mint_id_hex(&record.mint_id)?),
+        &serde_json::to_vec(record)?,
+    )
+}
+
+fn load_runtime_custody_listing(
+    data_dir: &Path,
+    mint_id: Digest32,
+) -> anyhow::Result<Option<RuntimeCustodyListingRecord>> {
+    let path = runtime_listing_path(data_dir, mint_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let record: RuntimeCustodyListingRecord = serde_json::from_slice(&fs::read(path)?)?;
+    if record.schema != RUNTIME_LISTING_SCHEMA_V1 {
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    Ok(Some(record))
+}
+
+fn persist_runtime_custody_purchase(
+    data_dir: &Path,
+    record: &RuntimeCustodyPurchaseRecord,
+) -> anyhow::Result<()> {
+    write_owner_only_bytes(
+        &runtime_purchase_path(
+            data_dir,
+            &record.principal_id,
+            parse_mint_id_hex(&record.mint_id)?,
+        ),
+        &serde_json::to_vec(record)?,
+    )
+}
+
+fn load_runtime_custody_purchase(
+    data_dir: &Path,
+    principal_id: &str,
+    mint_id: Digest32,
+) -> anyhow::Result<Option<RuntimeCustodyPurchaseRecord>> {
+    let path = runtime_purchase_path(data_dir, principal_id, mint_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let record: RuntimeCustodyPurchaseRecord = serde_json::from_slice(&fs::read(path)?)?;
+    if record.schema != RUNTIME_PURCHASE_SCHEMA_V1 || record.principal_id != principal_id {
+        anyhow::bail!("Runtime custody purchase is invalid");
+    }
+    Ok(Some(record))
+}
+
+fn reconstructed_buy_receipt(
+    mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
+    purchase: &RuntimeCustodyPurchaseRecord,
+) -> anyhow::Result<elastos_protected_content_runtime::RuntimeBuyReceipt> {
+    let wallet_request = decode_hex_bytes(&purchase.wallet_request_hex)
+        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?;
+    let wallet_response = decode_hex_bytes(&purchase.wallet_response_hex)
+        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?;
+    let effect = RuntimeVerifiedPurchaseEffect::new(
+        RuntimeProtectedContentPurchaseIntent::new(
+            mint.draft().mint_id(),
+            mint.draft().encrypted_content().clone(),
+            mint.draft().key_envelope().clone(),
+            mint.draft().policy().clone(),
+            RightsActionV1::View,
+            purchase.chain_namespace.clone(),
+            purchase.network.clone(),
+            purchase.to.clone(),
+            purchase.value.clone(),
+            purchase.data.clone(),
+        )
+        .map_err(|_| anyhow::anyhow!("Runtime custody chain evidence is invalid"))?,
+        RuntimePurchaseEffectAuthority::new(
+            purchase.principal_id.clone(),
+            purchase.account_id.clone(),
+            purchase.address.clone(),
+            purchase.approval_request_id.clone(),
+        )
+        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?,
+        purchase.wallet_binding.clone(),
+        purchase.chain_transaction.clone(),
+        purchase.chain_observation.clone(),
+        purchase.confirmed_at,
+    )
+    .map_err(runtime_open_error)?;
+    bind_buy(
+        mint,
+        &wallet_request,
+        &wallet_response,
+        &effect,
+        crate::auth::now_ts(),
+    )
+    .map_err(runtime_open_error)
+}
+
+fn wallet_signed_rights_from_bytes(
+    wallet_request_bytes: &[u8],
+    wallet_response_bytes: &[u8],
+) -> Option<WalletSignedRightsRequestV1> {
+    let now = crate::auth::now_ts();
+    let request =
+        elastos_wallet_contract::WalletProviderRequestV2::decode_at(wallet_request_bytes, now)
+            .ok()?;
+    let response = elastos_wallet_contract::WalletProviderResponseV2::decode_for_request(
+        wallet_response_bytes,
+        &request,
+    )
+    .ok()?;
+    let data = match response.result {
+        elastos_wallet_contract::WalletResultV2::Ok { data } => data,
+        _ => return None,
+    };
+    let hex_value = data.get("wallet_signed_rights_request_hex")?.as_str()?;
+    let bytes = decode_hex_bytes(hex_value).ok()?;
+    WalletSignedRightsRequestV1::from_canonical_bytes(&bytes).ok()
+}
+
+fn sign_runtime_terminal_receipt(
+    device_key: &ed25519_dalek::SigningKey,
+    operation: &SignedRuntimeReleaseOperationV1,
+    contributions: &[elastos_protected_content_contracts::SignedNodeContributionV1],
+    epoch: &SignedCustodyEpochV1,
+    now: u64,
+) -> anyhow::Result<SignedTerminalReceiptV1> {
+    let authenticated = operation
+        .verify(operation.statement().runtime_operation_issuer(), now)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let node_set = epoch
+        .statement()
+        .node_set()
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let refs = contributions
+        .iter()
+        .map(|contribution| {
+            authenticated
+                .verify_node_contribution(contribution, &node_set, now)
+                .map(|verified| NodeContributionRefV1::from(&verified))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    let statement = TerminalReceiptStatementV1::new(
+        authenticated.release_request_hash(),
+        authenticated.binding().clone(),
+        TerminalReceiptIssuerKey::new(device_key.verifying_key().to_bytes())
+            .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?,
+        KeyReleaseOutcomeV1::Released,
+        refs,
+        now,
+        now + 30,
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    SignedTerminalReceiptV1::new(
+        statement.clone(),
+        device_key
+            .sign(&statement.canonical_bytes().map_err(|_| {
+                anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE)
+            })?)
+            .to_bytes()
+            .to_vec(),
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))
+}
+
+async fn fetch_runtime_custody_open_media(
+    registry: &ProviderRegistry,
+    cid: &str,
+    expected: &CencFmp4MediaIdentityV1,
+) -> anyhow::Result<(CencFmp4MediaIdentityV1, Vec<u8>)> {
+    let identity_bytes = crate::content::fetch_bytes_via_provider(
+        registry,
+        cid,
+        Some(PROTECTED_CONTENT_IDENTITY_PATH),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    let media = CencFmp4MediaIdentityV1::from_canonical_bytes(&identity_bytes)
+        .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    if &media != expected {
+        anyhow::bail!("Runtime custody content availability is unavailable");
+    }
+    let init =
+        crate::content::fetch_bytes_via_provider(registry, cid, Some(PROTECTED_CONTENT_INIT_PATH))
+            .await
+            .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    Ok((media, init))
+}
+
+fn runtime_open_error(error: elastos_protected_content_runtime::RuntimeOpenError) -> anyhow::Error {
+    match error {
+        elastos_protected_content_runtime::RuntimeOpenError::WalletAuthority => {
+            anyhow::anyhow!("Runtime custody wallet authority is invalid")
+        }
+        elastos_protected_content_runtime::RuntimeOpenError::MintSelection => {
+            anyhow::anyhow!("Runtime custody mint selection is invalid")
+        }
+        elastos_protected_content_runtime::RuntimeOpenError::DecryptResult => {
+            anyhow::anyhow!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE)
+        }
+        _ => anyhow::anyhow!("Runtime custody chain evidence is invalid"),
+    }
+}
+
+fn parse_mint_id_hex(value: &str) -> anyhow::Result<Digest32> {
+    let bytes = decode_hex_bytes(value)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint identity is invalid"))?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint identity is invalid"))?;
+    Ok(Digest32::new(bytes))
+}
+
+fn parse_viewer_handle_hex(
+    value: &str,
+) -> anyhow::Result<[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]> {
+    let bytes = decode_hex_bytes(value)
+        .map_err(|_| anyhow::anyhow!("Runtime custody viewer session is unavailable"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Runtime custody viewer session is unavailable"))
+}
+
+fn decode_hex_bytes(value: &str) -> Result<Vec<u8>, hex::FromHexError> {
+    hex::decode(value.strip_prefix("0x").unwrap_or(value))
+}
+
+fn runtime_open_audit_id(
+    principal_id: &str,
+    mint_id: Digest32,
+    now: u64,
+) -> RuntimeReleaseAuditIdV1 {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"elastos.protected-content.runtime-open-audit.v1");
+    hasher.update(principal_id.as_bytes());
+    hasher.update(mint_id.as_bytes());
+    hasher.update(now.to_be_bytes());
+    RuntimeReleaseAuditIdV1::new(Digest32::new(hasher.finalize().into())).unwrap_or_else(|_| {
+        RuntimeReleaseAuditIdV1::new(Digest32::new([1; 32])).expect("nonzero audit id")
+    })
+}
+
+fn audit_nonce_bytes(audit_request_id: RuntimeReleaseAuditIdV1) -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    nonce.copy_from_slice(&audit_request_id.digest().as_bytes()[..16]);
+    nonce
+}
+
+fn runtime_open_envelope_path(data_dir: &Path, mint_id: Digest32) -> PathBuf {
+    data_dir
+        .join(RUNTIME_OPEN_MATERIAL_ROOT)
+        .join(hex::encode(mint_id.as_bytes()))
+        .join("envelope.bin")
+}
+
+fn runtime_listing_path(data_dir: &Path, mint_id: Digest32) -> PathBuf {
+    data_dir
+        .join(RUNTIME_LISTING_ROOT)
+        .join(format!("{}.json", hex::encode(mint_id.as_bytes())))
+}
+
+fn runtime_purchase_path(data_dir: &Path, principal_id: &str, mint_id: Digest32) -> PathBuf {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(principal_id.as_bytes());
+    data_dir
+        .join(RUNTIME_PURCHASE_ROOT)
+        .join(hex::encode(hasher.finalize()))
+        .join(format!("{}.json", hex::encode(mint_id.as_bytes())))
+}
+
+fn write_owner_only_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true).mode(0o600);
+        options.open(path)?.write_all(bytes)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)?;
+    }
+    Ok(())
 }

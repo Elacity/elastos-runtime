@@ -5796,6 +5796,75 @@ async fn test_library_provider_runtime_custody_publish_fails_closed_without_comp
 }
 
 #[tokio::test]
+async fn test_library_provider_runtime_custody_buy_is_denied_before_purchase() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "buy",
+        json!({
+            "mint_id": "00".repeat(32),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_marketplace_buy_is_denied_before_purchase() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), MARKETPLACE_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "buy",
+        json!({
+            "mint_id": "00".repeat(32),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
+async fn test_library_provider_runtime_custody_open_is_denied_before_purchase() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(library_test_state_without_content(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("admin"));
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "open_viewer",
+        json!({
+            "mint_id": "00".repeat(32),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
 async fn test_library_provider_runtime_custody_publish_rejects_invalid_input_layouts() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(library_test_state_without_content(dir.path()).await);

@@ -41,7 +41,11 @@ Library/open path:
   `feat/protected-content-runtime-lifecycle` registers Runtime-owned `protect`
   and `custody`, evaluates policy through existing `chain`, and lets Library
   mint when `protection.mode = "runtime_custody"` and signed operator
-  composition is present. It does not replace the installed provisional
+  composition is present. Marketplace and Library call
+  `object.list_runtime_custody` and `object.buy` on that minted listing;
+  Library `object.open_viewer` / `read_viewer` / `close_viewer` require a
+  stored purchase and then fail closed without the new decrypt provider or a
+  release Wallet approval. It does not replace the installed provisional
   open/share path until Slice E.
 - The older installed/provider surface is the provisional
   `elastos_common::protected_content` DTO set plus the fail-closed

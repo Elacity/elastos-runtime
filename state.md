@@ -85,17 +85,21 @@ repository.
   remains source-only and unregistered.
 - The local `feat/protected-content-runtime-lifecycle` child branch is the
   current integration line stacked on `feat/protected-content-rights`
-  `43a83e5b`. Tip `34465959` adds the inactive protect/custody/decrypt
-  processes, 2-of-3 mint/release proof, packaged provider set, Runtime
-  custody composition, clear-media import boundary, and Runtime-internal
-  chain policy resolver. This local branch implements Slice C on those
-  seams: Library `protection.mode=runtime_custody` runs protect → chain
-  View policy → mint → verified availability, records identity-only
-  Library/mint facts, and fails closed without signed composition, the
-  live device key, protect, or chain policy. `protect` stays
-  capsule-denied. Provisional `drm` / `rights` / `key` / `decrypt` remain
-  the live product open/share path. Runtime custody sharing stays denied
-  until Slice D. The Slice C commit is local-only until it is pushed.
+  `43a83e5b`. Slice C mint is `35ea84cc`. This commit implements Slice D
+  buy plus fail-closed open on the existing object resource:
+  `object.list_runtime_custody` / `object.buy` / `object.open_viewer` /
+  `read_viewer` / `close_viewer`. Buyer is denied without Wallet
+  request/response plus Chain purchase evidence; an exact buy binds through
+  `bind_buy` and marks the listing buyer-owned. Sold listings stay visible
+  only to the publisher and buyer. Open requires that purchase, then fails
+  closed when the new decrypt provider or a second release Wallet approval
+  is absent. Live `decrypt` is unchanged. Owner-only Runtime open material
+  may persist the exact `CustodyEnvelopeV1` under
+  `protected-content/runtime-open/` so reconstruct can match envelope
+  identity; mint journal and Library records stay identity-only. `protect`
+  stays capsule-denied. Provisional `drm` / `rights` / `key` / `decrypt`
+  remain the live product open/share path. Slice D play and Slice E have
+  not started.
 - `CustodyEnvelopeV1` is current source-only provisioning authority, not public
   asset metadata. Future durable custody storage must keep exactly one
   node-sealed share at each selected custody node. Public metadata contains no

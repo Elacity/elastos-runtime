@@ -56,7 +56,9 @@ use super::{
     RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
     RuntimeDecryptRegistryAdapter, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
     CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID,
-    RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE, RUNTIME_PROVIDER_ID,
+    RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE, RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
+    RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE, RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE,
+    RUNTIME_PROVIDER_ID,
 };
 use elastos_protected_content_contracts::{
     CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
@@ -70,11 +72,12 @@ use elastos_protected_content_contracts::{
     ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
     RecipientPublicKeyBytesV1, RecipientSealedContributionV1, ReplayNonce16, RightsActionV1,
     RightsDecisionV1, RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1,
-    RightsObservationFinalityV1, RightsPolicyBodyV1, RuntimeCustodyProvisioningIdV1,
-    RuntimeCustodyProvisioningStatementV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
-    RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1, ShareCoordinateV1,
-    SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
-    SignedNodeContributionV1, SignedNodeRightsDecisionV1, SignedRecipientKeyAuthorizationV1,
+    RightsObservationFinalityV1, RightsPolicyBodyV1, RightsRequestV1,
+    RuntimeCustodyProvisioningIdV1, RuntimeCustodyProvisioningStatementV1,
+    RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
+    RuntimeSessionBindingV1, ShareCoordinateV1, SignedCustodyCommitteeAuthorizationV1,
+    SignedCustodyEpochV1, SignedCustodyPoolV1, SignedNodeContributionV1,
+    SignedNodeRightsDecisionV1, SignedRecipientKeyAuthorizationV1,
     SignedRuntimeCustodyProvisioningV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
     TerminalReceiptIssuerKey, TerminalReceiptStatementV1, ThresholdV1, ValidatedCustodyCommitteeV1,
     WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
@@ -6087,4 +6090,472 @@ async fn runtime_custody_library_publish_protects_mints_and_records_identity_onl
         assert!(!any_file_contains(&records_root, &clear_init));
         assert!(!any_file_contains(&records_root, &clear_segments[0]));
     }
+}
+
+#[cfg(unix)]
+struct LibraryRuntimeCustodyHarness {
+    _temp: tempfile::TempDir,
+    data_dir: PathBuf,
+    registry: Arc<ProviderRegistry>,
+    creator: String,
+    buyer: String,
+    mint_id: String,
+    cid: String,
+    content_id: String,
+    clear_init: Vec<u8>,
+    clear_segments: Vec<Vec<u8>>,
+}
+
+#[cfg(unix)]
+async fn publish_library_runtime_custody_harness() -> LibraryRuntimeCustodyHarness {
+    let protect_binary = required_test_binary_path(TEST_PROTECT_PROVIDER_BIN_ENV);
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    write_device_key(&data_dir, 0x21);
+    let now = crate::auth::now_ts();
+    let epoch = signed_custody_epoch();
+    let pool = signed_custody_pool_for_epoch(&epoch, (now.saturating_sub(60), now + 3_600));
+    let authorization =
+        signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), &epoch);
+    write_owner_only_custody_composition_config(
+        &data_dir,
+        &RuntimeCustodyCompositionConfigFile {
+            schema: CUSTODY_COMPOSITION_SCHEMA_V1.to_string(),
+            expected_policy_authority_base64: raw_b64_32(
+                SigningKey::from_bytes(&[0x71; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            ),
+            expected_committee_authorization_identity_base64: canonical_b64(
+                &authorization.authorization_identity().unwrap(),
+            ),
+            signed_pool_base64: canonical_b64(&pool),
+            signed_epoch_base64: canonical_b64(&epoch),
+            signed_committee_authorization_base64: canonical_b64(&authorization),
+            routes: library_publish_test_routes(&epoch),
+        },
+    );
+
+    let registry = Arc::new(ProviderRegistry::new());
+    register_protect_provider(&registry, &protect_binary)
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            CUSTODY_PROVIDER_ID,
+            Arc::new(LibraryMintCustodyProvider {
+                expected_issuer: derived_device_runtime_issuer(0x21),
+                nodes: epoch
+                    .statement()
+                    .nodes()
+                    .iter()
+                    .map(|node| node.node_public_key())
+                    .collect(),
+            }),
+        )
+        .await
+        .unwrap();
+    registry
+        .set_carrier_invoker(Arc::new(LoopbackCustodyCarrierInvoker {
+            registry: Arc::downgrade(&registry),
+        }))
+        .await;
+    registry
+        .register_sub_provider(CHAIN_PROVIDER_ID, Arc::new(LibraryMintChainPolicyProvider))
+        .await
+        .unwrap();
+    let (device_key, _) = derived_device_key_for_seed(0x21);
+    let content = ContentAvailabilityTestProvider::with_signing_key(
+        device_key,
+        ContentAvailabilityTestConfig {
+            checked_at: crate::auth::now_ts(),
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+    );
+    registry
+        .register_sub_provider("content", content)
+        .await
+        .unwrap();
+    registry
+        .register_sub_provider(
+            "object",
+            Arc::new(crate::library::ObjectProvider::new(
+                data_dir.clone(),
+                Arc::downgrade(&registry),
+            )),
+        )
+        .await
+        .unwrap();
+
+    let creator = "person:local:runtime-custody-slice-d-creator";
+    let buyer = "person:local:runtime-custody-slice-d-buyer";
+    crate::auth::store_test_principal_root_protection(&data_dir, creator);
+    crate::auth::store_test_principal_root_protection(&data_dir, buyer);
+    let root = crate::auth::principal_localhost_root(creator);
+    let uri = format!("{root}/Documents/protected-clear-media");
+    let (clear_init, clear_segments) = clear_media_components(0x41);
+    write_library_object_bytes(&registry, creator, &format!("{uri}/init.mp4"), &clear_init).await;
+    for (index, segment) in clear_segments.iter().enumerate() {
+        write_library_object_bytes(
+            &registry,
+            creator,
+            &format!("{uri}/segments/{index:08}.m4s"),
+            segment,
+        )
+        .await;
+    }
+    let publish = registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "publish",
+                "principal_id": creator,
+                "uri": uri,
+                "protection": {
+                    "mode": "runtime_custody",
+                    "mime_type": MEDIA_MIME_TYPE_V1,
+                    "codecs": MEDIA_CODECS_V1,
+                },
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(publish["status"], "ok", "{publish}");
+    LibraryRuntimeCustodyHarness {
+        _temp: temp,
+        data_dir,
+        registry,
+        creator: creator.to_string(),
+        buyer: buyer.to_string(),
+        mint_id: publish["data"]["content_security"]["mint_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        cid: publish["data"]["cid"].as_str().unwrap().to_string(),
+        content_id: publish["data"]["content_security"]["content_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        clear_init,
+        clear_segments,
+    }
+}
+
+#[cfg(unix)]
+fn wallet_buy_bundle_for_mint(
+    mint: &PersistedRuntimeMint,
+    principal_id: &str,
+    now: u64,
+) -> (String, String, Value) {
+    let binding = ProtectedContentBindingV1::new(
+        mint.draft().encrypted_content().clone(),
+        mint.draft().key_envelope().clone(),
+        mint.draft().policy().clone(),
+        ProfileIdentityV1::from_public_key_bytes(
+            SigningKey::from_bytes(&[0x26; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap(),
+        wallet(7),
+        RuntimeSessionBindingV1::new(digest(0x66)).unwrap(),
+    )
+    .unwrap();
+    let request = RightsRequestV1::new(
+        binding,
+        RightsActionV1::View,
+        recipient_identity(0x30),
+        now.saturating_sub(5),
+        now + 180,
+        ReplayNonce16::new([0x55; 16]),
+    )
+    .unwrap();
+    let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
+    let (signature, recovery_id) = key
+        .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
+            &request.canonical_bytes().unwrap(),
+        ))
+        .unwrap();
+    let mut signature_bytes = signature.to_bytes().to_vec();
+    signature_bytes.push(recovery_id.to_byte());
+    let signed = WalletSignedRightsRequestV1::new(request.clone(), signature_bytes).unwrap();
+    let context = VerifiedWalletInvocationContext::new(
+        principal_id,
+        "runtime-session:alpha",
+        Some("proof:alpha".to_string()),
+        "grant:alpha",
+        "runtime",
+        "launch:alpha",
+    )
+    .unwrap();
+    let account_id = "wallet-account-alpha";
+    let approval_request_id = "wallet-request:11111111111111111111111111111111";
+    let wallet_request = WalletProviderRequestV2::new(
+        &context,
+        approval_request_id,
+        now,
+        now + 120,
+        WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+            account_id: account_id.to_string(),
+            canonical_rights_request_hex: hex::encode(request.canonical_bytes().unwrap()),
+            reason: "Buy protected content".to_string(),
+        },
+    )
+    .unwrap();
+    let result = ProtectedContentRightsSignatureResultV1::new(
+        account_id,
+        wallet_address_hex(wallet(7)),
+        hex::encode(signed.canonical_bytes().unwrap()),
+    )
+    .unwrap();
+    let wallet_response = WalletProviderResponseV2::for_request(
+        &wallet_request,
+        WalletResultV2::Ok {
+            data: serde_json::to_value(result).unwrap(),
+        },
+    );
+    (
+        hex::encode(serde_json::to_vec(&wallet_request).unwrap()),
+        hex::encode(serde_json::to_vec(&wallet_response).unwrap()),
+        json!({
+            "account_id": account_id,
+            "address": wallet_address_hex(wallet(7)),
+            "approval_request_id": approval_request_id,
+            "chain_namespace": "eip155:20",
+            "network": "esc-mainnet",
+            "to": "0x2222222222222222222222222222222222222222",
+            "value": "0x1",
+            "data": "0x",
+            "wallet_binding": {
+                "kind": "managed_signed",
+                "signed_transaction_sha256": format!("sha256:{}", hex::encode([0xab; 32])),
+            },
+            "transaction_hash": format!("0x{}", hex::encode([0xaa; 32])),
+            "chain_observation": {
+                "schema": "elastos.chain.broadcast_receipt/v1",
+                "network": "esc-mainnet",
+            },
+            "confirmed_at": now,
+        }),
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_buy_is_denied_before_purchase() {
+    let harness = publish_library_runtime_custody_harness().await;
+    let denied = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "buy",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied["status"], "error", "{denied}");
+    assert!(
+        denied["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE),
+        "{denied}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_buy_binds_wallet_chain_and_marks_listing_buyer_owned() {
+    let harness = publish_library_runtime_custody_harness().await;
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(Digest32::new(
+            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
+        ))
+        .unwrap();
+    let now = crate::auth::now_ts();
+    let (wallet_request_hex, wallet_response_hex, purchase) =
+        wallet_buy_bundle_for_mint(&mint, &harness.buyer, now);
+    let buy = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "buy",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "wallet_request_hex": wallet_request_hex,
+                "wallet_response_hex": wallet_response_hex,
+                "purchase": purchase,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(buy["status"], "ok", "{buy}");
+    assert_eq!(buy["data"]["mint_id"], harness.mint_id);
+    assert_eq!(buy["data"]["content_id"], harness.content_id);
+    assert_eq!(buy["data"]["cid"], harness.cid);
+    assert_eq!(buy["data"]["availability"]["status"], "buyer_owned");
+    assert!(!buy.to_string().contains("sealed"));
+    assert!(!buy.to_string().contains("cek"));
+    assert!(!buy.to_string().contains("play_url"));
+
+    let listings = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "list_runtime_custody",
+                "principal_id": harness.buyer,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listings["status"], "ok", "{listings}");
+    let listing = listings["data"]["listings"]
+        .as_array()
+        .and_then(|items| items.first())
+        .expect("published listing");
+    assert_eq!(listing["mint_id"], harness.mint_id);
+    assert_eq!(listing["publisher_principal_id"], harness.creator);
+    assert_eq!(listing["buyer_principal_id"], harness.buyer);
+    assert_eq!(listing["availability"]["status"], "buyer_owned");
+    assert!(!listings.to_string().contains("sealed"));
+    assert!(!listings
+        .to_string()
+        .contains(&hex::encode(&harness.clear_init)));
+
+    let stranger_listings = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "list_runtime_custody",
+                "principal_id": "person:local:runtime-custody-slice-d-stranger",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stranger_listings["status"], "ok", "{stranger_listings}");
+    assert!(
+        stranger_listings["data"]["listings"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(false),
+        "{stranger_listings}"
+    );
+
+    let second_buy = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "buy",
+                "principal_id": "person:local:runtime-custody-slice-d-stranger",
+                "mint_id": harness.mint_id,
+                "wallet_request_hex": wallet_request_hex,
+                "wallet_response_hex": wallet_response_hex,
+                "purchase": purchase,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_buy["status"], "error", "{second_buy}");
+    assert!(
+        second_buy["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE),
+        "{second_buy}"
+    );
+
+    let purchases_root = harness.data_dir.join("protected-content/runtime-purchases");
+    if purchases_root.exists() {
+        assert!(!any_file_contains(&purchases_root, &harness.clear_init));
+        assert!(!any_file_contains(
+            &purchases_root,
+            &harness.clear_segments[0]
+        ));
+    }
+    let mint_root = harness.data_dir.join("protected-content/runtime-mint");
+    assert!(!any_file_contains(&mint_root, &harness.clear_init));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_is_denied_before_purchase() {
+    let harness = publish_library_runtime_custody_harness().await;
+    let denied = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "open_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied["status"], "error", "{denied}");
+    assert!(
+        denied["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE),
+        "{denied}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
+    let harness = publish_library_runtime_custody_harness().await;
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(Digest32::new(
+            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
+        ))
+        .unwrap();
+    let now = crate::auth::now_ts();
+    let (wallet_request_hex, wallet_response_hex, purchase) =
+        wallet_buy_bundle_for_mint(&mint, &harness.buyer, now);
+    let buy = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "buy",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "wallet_request_hex": wallet_request_hex,
+                "wallet_response_hex": wallet_response_hex,
+                "purchase": purchase,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(buy["status"], "ok", "{buy}");
+    let open = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "open_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open["status"], "error", "{open}");
+    assert!(
+        open["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
+        "{open}"
+    );
 }

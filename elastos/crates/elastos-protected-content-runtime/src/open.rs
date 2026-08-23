@@ -62,7 +62,7 @@ impl From<ContractError> for RuntimeOpenError {
 }
 
 #[async_trait::async_trait]
-pub trait RuntimeDecryptProvider {
+pub trait RuntimeDecryptProvider: Send + Sync {
     async fn prepare_recipient(
         &self,
         request: &DecryptProviderRequestV1,
