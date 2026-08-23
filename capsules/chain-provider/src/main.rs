@@ -5,7 +5,8 @@
 
 use elastos_guest::prelude::*;
 use elastos_protected_content_contracts::{
-    CanonicalContract, EvmRightsMethodAbiV1, RightsEvaluationEvidenceV1, RightsPolicyBodyV1,
+    CanonicalContract, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
+    RightsEvaluationEvidenceV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
     RightsSubjectSourceV1, RuntimeOperationIssuerKeyV1, SignedRuntimeReleaseOperationV1,
     MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
 };
@@ -135,6 +136,9 @@ impl ChainProvider {
             Request::ProtectedContentRightsEvidence {
                 signed_runtime_release_operation,
             } => self.protected_content_rights_evidence(&signed_runtime_release_operation),
+            Request::ResolveProtectedContentPolicy { content_id, action } => {
+                self.resolve_protected_content_policy(&content_id, action)
+            }
             Request::Proof {
                 network,
                 proof_kind,
@@ -941,6 +945,64 @@ impl ChainProvider {
         }))
     }
 
+    fn resolve_protected_content_policy(
+        &self,
+        content_id: &str,
+        action: ProtectedContentPolicyAction,
+    ) -> Response {
+        let (network, method, policy_source) =
+            match self.configured_protected_content_policy_source(action) {
+                Ok(source) => source,
+                Err(response) => return response,
+            };
+        let Some(chain_id) = network.chain_id else {
+            return Response::error(
+                "rights_policy_not_configured",
+                "no configured protected-content rights policy source matches action",
+            );
+        };
+        let contract = match parse_evm_contract_address(&method.contract) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let selector = match parse_evm_function_selector(&method.selector) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let policy = match RightsPolicyBodyV1::new(
+            content_id,
+            action.to_contract_action(),
+            policy_source.right_argument.as_str(),
+            RightsSubjectSourceV1::WalletAddress,
+            chain_id,
+            contract,
+            selector,
+            method.abi.to_contract_abi(),
+            RightsObservationFinalityV1::new(policy_source.min_confirmations),
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                return Response::error(
+                    "invalid_rights_policy_request",
+                    "protected-content rights policy request is invalid",
+                )
+            }
+        };
+        let policy_bytes = match policy.canonical_bytes() {
+            Ok(value) => value,
+            Err(_) => {
+                return Response::error(
+                    "invalid_rights_policy_request",
+                    "protected-content rights policy request is invalid",
+                )
+            }
+        };
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_POLICY_SCHEMA,
+            "policy_body": format!("0x{}", encode_hex(&policy_bytes)),
+        }))
+    }
+
     fn evm_network_for_protected_content_policy(
         &self,
         policy: &RightsPolicyBodyV1,
@@ -967,6 +1029,38 @@ impl ChainProvider {
             ));
         }
         Ok(network)
+    }
+
+    fn configured_protected_content_policy_source(
+        &self,
+        action: ProtectedContentPolicyAction,
+    ) -> Result<(&ChainNetwork, &RightsMethod, &ProtectedContentPolicySource), Response> {
+        let mut matches = self
+            .networks
+            .iter()
+            .filter(|network| network.kind == ChainKind::EvmJsonRpc)
+            .flat_map(|network| {
+                network.rights_methods.iter().flat_map(move |method| {
+                    method
+                        .protected_content_policies
+                        .iter()
+                        .filter(move |policy| policy.action == action)
+                        .map(move |policy| (network, method, policy))
+                })
+            });
+        let Some(source) = matches.next() else {
+            return Err(Response::error(
+                "rights_policy_not_configured",
+                "no configured protected-content rights policy source matches action",
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(Response::error(
+                "ambiguous_rights_policy_source",
+                "multiple protected-content rights policy sources match action",
+            ));
+        }
+        Ok(source)
     }
 
     fn proof(&self, network_id: &str, proof_kind: ChainProofKind, subject: &str) -> Response {
@@ -1243,6 +1337,48 @@ impl ChainProvider {
         .map_err(|err| Response::error("node_lifecycle_state_unavailable", &err))?;
         Ok(entry)
     }
+}
+
+fn parse_evm_contract_address(value: &str) -> Result<EvmContractAddressV1, Response> {
+    let bytes = decode_hex(value, Some(20), "EVM address").map_err(|_| {
+        Response::error(
+            "invalid_configured_policy_source",
+            "configured protected-content rights policy source is invalid",
+        )
+    })?;
+    let bytes: [u8; 20] = bytes.try_into().map_err(|_| {
+        Response::error(
+            "invalid_configured_policy_source",
+            "configured protected-content rights policy source is invalid",
+        )
+    })?;
+    EvmContractAddressV1::new(bytes).map_err(|_| {
+        Response::error(
+            "invalid_configured_policy_source",
+            "configured protected-content rights policy source is invalid",
+        )
+    })
+}
+
+fn parse_evm_function_selector(value: &str) -> Result<EvmFunctionSelectorV1, Response> {
+    let bytes = decode_hex(value, Some(4), "EVM function selector").map_err(|_| {
+        Response::error(
+            "invalid_configured_policy_source",
+            "configured protected-content rights policy source is invalid",
+        )
+    })?;
+    let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+        Response::error(
+            "invalid_configured_policy_source",
+            "configured protected-content rights policy source is invalid",
+        )
+    })?;
+    EvmFunctionSelectorV1::new(bytes).map_err(|_| {
+        Response::error(
+            "invalid_configured_policy_source",
+            "configured protected-content rights policy source is invalid",
+        )
+    })
 }
 
 fn main() {

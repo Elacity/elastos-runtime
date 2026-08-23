@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+use elastos_protected_content_contracts::{EvmRightsMethodAbiV1, RightsActionV1};
+
 pub(super) const NODE_LIFECYCLE_STATE_SCHEMA: &str = "elastos.chain.node_lifecycle_state/v1";
+pub(super) const PROTECTED_CONTENT_POLICY_SCHEMA: &str =
+    "elastos.chain.protected-content-policy/v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +57,8 @@ pub(super) struct RightsMethod {
     pub(super) contract: String,
     pub(super) abi: RightsMethodAbi,
     pub(super) selector: String,
+    #[serde(default)]
+    pub(super) protected_content_policies: Vec<ProtectedContentPolicySource>,
 }
 
 impl RightsMethod {
@@ -63,6 +69,73 @@ impl RightsMethod {
             "configured": true,
         })
     }
+}
+
+impl RightsMethodAbi {
+    pub(super) const fn to_contract_abi(self) -> EvmRightsMethodAbiV1 {
+        match self {
+            Self::HasAccessByContentIdStringAddressString => {
+                EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProtectedContentPolicyAction {
+    View,
+    Stream,
+    Download,
+    Execute,
+}
+
+impl ProtectedContentPolicyAction {
+    pub(super) const fn to_contract_action(self) -> RightsActionV1 {
+        match self {
+            Self::View => RightsActionV1::View,
+            Self::Stream => RightsActionV1::Stream,
+            Self::Download => RightsActionV1::Download,
+            Self::Execute => RightsActionV1::Execute,
+        }
+    }
+
+    pub(super) const fn expected_right_argument(self) -> ProtectedContentRightArgument {
+        match self {
+            Self::View => ProtectedContentRightArgument::View,
+            Self::Stream => ProtectedContentRightArgument::Stream,
+            Self::Download => ProtectedContentRightArgument::Download,
+            Self::Execute => ProtectedContentRightArgument::Execute,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProtectedContentRightArgument {
+    View,
+    Stream,
+    Download,
+    Execute,
+}
+
+impl ProtectedContentRightArgument {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Stream => "stream",
+            Self::Download => "download",
+            Self::Execute => "execute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProtectedContentPolicySource {
+    pub(super) action: ProtectedContentPolicyAction,
+    pub(super) right_argument: ProtectedContentRightArgument,
+    pub(super) min_confirmations: u16,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,6 +219,10 @@ pub(super) enum Request {
     },
     ProtectedContentRightsEvidence {
         signed_runtime_release_operation: String,
+    },
+    ResolveProtectedContentPolicy {
+        content_id: String,
+        action: ProtectedContentPolicyAction,
     },
     Proof {
         network: String,

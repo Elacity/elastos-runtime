@@ -21,10 +21,10 @@ use ed25519_dalek::Signer as _;
 use elastos_protected_content_contracts::{
     validate_custody_epoch_against_pool_at, CanonicalContract,
     CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIssuerKeyV1, Digest32,
-    KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey,
+    EncryptedContentIdentityV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey,
     RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
-    RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RuntimeOperationIssuerKeyV1,
-    RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
+    RightsActionV1, RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1,
+    RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
     SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
     SignedRuntimeReleaseOperationV1, WalletSignedRightsRequestV1,
 };
@@ -78,6 +78,30 @@ const CONTENT_AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.
 const DECRYPT_PROVIDER_ID: &str = "decrypt";
 const INACTIVE_CUSTODY_ROOT: &str = "protected-content/custody-provider/inactive";
 const PROVIDER_INVOCATION_SCHEMA_V1: &str = "elastos.provider.invocation/v1";
+const CHAIN_PROTECTED_CONTENT_POLICY_OP: &str = "resolve_protected_content_policy";
+const CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1: &str = "elastos.chain.protected-content-policy/v1";
+
+pub(crate) struct ResolvedRuntimeRightsPolicy {
+    body: RightsPolicyBodyV1,
+    identity: RightsPolicyIdentityV1,
+}
+
+impl ResolvedRuntimeRightsPolicy {
+    pub(crate) fn body(&self) -> &RightsPolicyBodyV1 {
+        &self.body
+    }
+
+    pub(crate) fn identity(&self) -> &RightsPolicyIdentityV1 {
+        &self.identity
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChainProtectedContentPolicyResponse {
+    schema: String,
+    policy_body: String,
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -1329,6 +1353,48 @@ pub(crate) async fn invoke_json_provider_with_transport(
     }
 }
 
+pub(crate) fn runtime_protected_content_id(
+    encrypted_content: &EncryptedContentIdentityV1,
+) -> anyhow::Result<String> {
+    Ok(format!(
+        "content:{}",
+        hex::encode(encrypted_content.canonical_hash()?.as_bytes())
+    ))
+}
+
+pub(crate) async fn resolve_runtime_rights_policy(
+    registry: &ProviderRegistry,
+    encrypted_content: &EncryptedContentIdentityV1,
+    action: RightsActionV1,
+) -> anyhow::Result<ResolvedRuntimeRightsPolicy> {
+    let content_id = runtime_protected_content_id(encrypted_content)?;
+    let response_value = invoke_json_provider(
+        registry,
+        CHAIN_PROVIDER_ID,
+        CHAIN_PROTECTED_CONTENT_POLICY_OP,
+        json!({
+            "op": CHAIN_PROTECTED_CONTENT_POLICY_OP,
+            "content_id": content_id,
+            "action": runtime_rights_action_name(action),
+        }),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let response = serde_json::from_value::<ChainProtectedContentPolicyResponse>(response_value)?;
+    if response.schema != CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1 {
+        anyhow::bail!("chain provider returned an unsupported protected-content policy schema");
+    }
+    let policy_bytes = decode_0x_hex(&response.policy_body).ok_or_else(|| {
+        anyhow::anyhow!("chain provider returned an invalid protected-content policy body")
+    })?;
+    let body = RightsPolicyBodyV1::from_canonical_bytes(&policy_bytes)?;
+    if body.content_id() != content_id || body.required_action() != action {
+        anyhow::bail!("chain provider returned a protected-content policy that does not match the Runtime request");
+    }
+    let identity = body.policy_identity()?;
+    Ok(ResolvedRuntimeRightsPolicy { body, identity })
+}
+
 /// Publishes and verifies the one immutable CENC/fMP4 object Runtime may later
 /// record as availability evidence. The directory is provider input only: no
 /// file path, bytes, or receipt JSON crosses this boundary into Runtime state.
@@ -1610,6 +1676,20 @@ fn content_object_digest(files: &[crate::content::ContentObjectFile]) -> String 
         hasher.update(b"\0");
     }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn runtime_rights_action_name(action: RightsActionV1) -> &'static str {
+    match action {
+        RightsActionV1::View => "view",
+        RightsActionV1::Stream => "stream",
+        RightsActionV1::Download => "download",
+        RightsActionV1::Execute => "execute",
+    }
+}
+
+fn decode_0x_hex(value: &str) -> Option<Vec<u8>> {
+    let hex = value.strip_prefix("0x")?;
+    hex::decode(hex).ok()
 }
 
 fn verify_protected_content_receipt(

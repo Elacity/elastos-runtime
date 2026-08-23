@@ -864,6 +864,15 @@ mod tests {
         assert!(
             build_capability_resource(
                 "chain",
+                "resolve_protected_content_policy",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content policy resolution must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
                 "has_access_by_content_id",
                 &serde_json::json!({"network": "esc-mainnet"})
             )

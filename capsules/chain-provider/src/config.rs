@@ -81,12 +81,33 @@ pub(super) fn validate_networks(networks: &[ChainNetwork]) -> Result<(), String>
 }
 
 pub(super) fn validate_rights_methods(network: &ChainNetwork) -> Result<(), String> {
+    let mut seen_actions = std::collections::BTreeSet::new();
     for method in &network.rights_methods {
         if method.id != "has_access_by_content_id" {
             return Err(format!("unsupported rights method id: {}", method.id));
         }
         validate_evm_address(&method.contract)?;
         validate_hex(&method.selector, Some(4), "EVM function selector")?;
+        if method.protected_content_policies.len() > 4 {
+            return Err(format!(
+                "network {} configures too many protected-content policy sources",
+                network.id
+            ));
+        }
+        for policy in &method.protected_content_policies {
+            if policy.right_argument != policy.action.expected_right_argument() {
+                return Err(format!(
+                    "network {} configures a mismatched protected-content policy right for {:?}",
+                    network.id, policy.action
+                ));
+            }
+            if !seen_actions.insert(policy.action) {
+                return Err(format!(
+                    "network {} configures duplicate protected-content policy action {:?}",
+                    network.id, policy.action
+                ));
+            }
+        }
     }
     Ok(())
 }

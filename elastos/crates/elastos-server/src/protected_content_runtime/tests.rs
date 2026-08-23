@@ -48,10 +48,11 @@ use x_wing::TryKeyInit as _;
 use super::{
     invoke_json_provider, list_unresolved_runtime_releases, load_runtime_custody_composition,
     load_runtime_custody_composition_config, register_inactive_custody_provider,
-    register_inactive_custody_sub_provider, runtime_mint_journal, unresolved_release_audit_records,
-    InactiveCustodyProvider, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
-    RuntimeCustodyRegistryAdapter, RuntimeCustodyRouteBindingConfig,
-    RuntimeCustodyRouteTransportConfig, RuntimeDecryptRegistryAdapter,
+    register_inactive_custody_sub_provider, resolve_runtime_rights_policy, runtime_mint_journal,
+    runtime_protected_content_id, unresolved_release_audit_records, InactiveCustodyProvider,
+    RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile, RuntimeCustodyRegistryAdapter,
+    RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
+    RuntimeDecryptRegistryAdapter, CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
     CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID, RUNTIME_PROVIDER_ID,
 };
 use elastos_protected_content_contracts::{
@@ -60,8 +61,8 @@ use elastos_protected_content_contracts::{
     CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyNodeProvisioningRecordV1,
     CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1, CustodyPoolMemberStateV1,
     CustodyPoolMemberV1, CustodyPoolOperatorIdV1, CustodyPoolStatementV1, Digest32,
-    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1,
-    KeyReleaseRequestV1, NodeContributionRefV1, NodeContributionStatementV1,
+    EncryptedContentIdentityV1, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
+    KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1, NodeContributionStatementV1,
     NodeCustodyPublicKeyV1, NodePublicKey, PqHybridSealedShareV1, ProfileIdentityV1,
     ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
     RecipientPublicKeyBytesV1, RecipientSealedContributionV1, ReplayNonce16, RightsActionV1,
@@ -5390,4 +5391,127 @@ async fn decrypt_registry_adapter_fails_closed_without_registered_decrypt_provid
         Err(RuntimeProviderCallError::NoExactResult)
     );
     assert!(provisional.requests().await.is_empty());
+}
+
+#[test]
+fn runtime_protected_content_id_is_exact_lowercase_domain_hash_and_changes_for_mutations() {
+    let identity = EncryptedContentIdentityV1::new(digest(0x41), 2048).unwrap();
+    let derived = runtime_protected_content_id(&identity).unwrap();
+    let expected = format!(
+        "content:{}",
+        hex::encode(identity.canonical_hash().unwrap().as_bytes())
+    );
+    assert_eq!(derived, expected);
+    assert!(derived.starts_with("content:"));
+    assert_eq!(derived.len(), "content:".len() + 64);
+    assert!(derived["content:".len()..]
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
+
+    let changed_digest = EncryptedContentIdentityV1::new(digest(0x42), 2048).unwrap();
+    let changed_len = EncryptedContentIdentityV1::new(digest(0x41), 2049).unwrap();
+    assert_ne!(
+        runtime_protected_content_id(&changed_digest).unwrap(),
+        derived
+    );
+    assert_ne!(runtime_protected_content_id(&changed_len).unwrap(), derived);
+}
+
+#[tokio::test]
+async fn runtime_resolve_rights_policy_recomputes_identity_and_rejects_mismatch() {
+    let encrypted_content = EncryptedContentIdentityV1::new(digest(0x51), 4096).unwrap();
+    let content_id = runtime_protected_content_id(&encrypted_content).unwrap();
+    let policy = RightsPolicyBodyV1::new(
+        content_id.clone(),
+        RightsActionV1::View,
+        "view",
+        elastos_protected_content_contracts::RightsSubjectSourceV1::WalletAddress,
+        11155111,
+        EvmContractAddressV1::new([0x11; 20]).unwrap(),
+        EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
+        EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
+        RightsObservationFinalityV1::new(12),
+    )
+    .unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let chain = RecordingProvider::new(
+        CHAIN_PROVIDER_ID,
+        ok_provider_response(json!({
+            "schema": CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
+            "policy_body": format!("0x{}", hex::encode(policy.canonical_bytes().unwrap())),
+        })),
+    );
+    registry
+        .register_sub_provider(CHAIN_PROVIDER_ID, chain.clone())
+        .await
+        .unwrap();
+    let resolved =
+        resolve_runtime_rights_policy(registry.as_ref(), &encrypted_content, RightsActionV1::View)
+            .await
+            .unwrap();
+    assert_eq!(resolved.body(), &policy);
+    assert_eq!(resolved.identity(), &policy.policy_identity().unwrap());
+
+    let invocation = chain.requests().await;
+    assert_eq!(invocation.len(), 1);
+    assert_eq!(
+        invocation[0]["_runtime_invocation"]["target"],
+        Value::String(CHAIN_PROVIDER_ID.to_string())
+    );
+    assert_eq!(
+        invocation[0]["op"],
+        Value::String("resolve_protected_content_policy".to_string())
+    );
+
+    for mismatched_policy in [
+        RightsPolicyBodyV1::new(
+            "content:deadbeef".to_string(),
+            RightsActionV1::View,
+            "view",
+            elastos_protected_content_contracts::RightsSubjectSourceV1::WalletAddress,
+            11155111,
+            EvmContractAddressV1::new([0x11; 20]).unwrap(),
+            EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
+            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
+            RightsObservationFinalityV1::new(12),
+        )
+        .unwrap(),
+        RightsPolicyBodyV1::new(
+            content_id.clone(),
+            RightsActionV1::Download,
+            "download",
+            elastos_protected_content_contracts::RightsSubjectSourceV1::WalletAddress,
+            11155111,
+            EvmContractAddressV1::new([0x11; 20]).unwrap(),
+            EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
+            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
+            RightsObservationFinalityV1::new(12),
+        )
+        .unwrap(),
+    ] {
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider(
+                CHAIN_PROVIDER_ID,
+                RecordingProvider::new(
+                    CHAIN_PROVIDER_ID,
+                    ok_provider_response(json!({
+                        "schema": CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1,
+                        "policy_body": format!(
+                            "0x{}",
+                            hex::encode(mismatched_policy.canonical_bytes().unwrap())
+                        ),
+                    })),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(resolve_runtime_rights_policy(
+            registry.as_ref(),
+            &encrypted_content,
+            RightsActionV1::View
+        )
+        .await
+        .is_err());
+    }
 }

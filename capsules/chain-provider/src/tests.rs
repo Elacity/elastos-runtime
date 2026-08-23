@@ -102,6 +102,14 @@ fn chain_provider_rejects_hidden_node_lifecycle_fields() {
 }
 
 fn provider_with_rights_rpc(rpc_url: String, selector: &str) -> ChainProvider {
+    provider_with_rights_rpc_and_policies(rpc_url, selector, json!([]))
+}
+
+fn provider_with_rights_rpc_and_policies(
+    rpc_url: String,
+    selector: &str,
+    protected_content_policies: Value,
+) -> ChainProvider {
     let mut provider = ChainProvider::new();
     let init = provider.handle(Request::Init {
         config: json!({
@@ -121,7 +129,8 @@ fn provider_with_rights_rpc(rpc_url: String, selector: &str) -> ChainProvider {
                         "id": "has_access_by_content_id",
                         "contract": "0x0000000000000000000000000000000000000001",
                         "abi": "has_access_by_content_id_string_address_string",
-                        "selector": selector
+                        "selector": selector,
+                        "protected_content_policies": protected_content_policies
                     }]
                 }]
             }
@@ -130,6 +139,15 @@ fn provider_with_rights_rpc(rpc_url: String, selector: &str) -> ChainProvider {
     assert!(matches!(init, Response::Ok { .. }));
     provider.now_unix_seconds = || RIGHTS_EVIDENCE_NOW;
     provider
+}
+
+fn resolved_policy_body_from_data(data: &Value) -> RightsPolicyBodyV1 {
+    assert_eq!(data["schema"], PROTECTED_CONTENT_POLICY_SCHEMA);
+    let hex = data["policy_body"]
+        .as_str()
+        .expect("policy response must include canonical bytes");
+    let bytes = decode_hex(hex, None, "policy_body").unwrap();
+    RightsPolicyBodyV1::from_canonical_bytes(&bytes).unwrap()
 }
 
 fn provider_with_rights_rpc_without_runtime_issuer(
@@ -1593,6 +1611,242 @@ fn protected_content_rights_evidence_rejects_reorged_observed_hash() {
         })),
         "upstream_rpc_error"
     );
+}
+
+#[test]
+fn resolve_protected_content_policy_returns_canonical_policy_and_evidence_accepts_it() {
+    let content_id = "content:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let policies = json!([{
+        "action": "view",
+        "right_argument": "view",
+        "min_confirmations": 12
+    }]);
+    let mut resolver = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        policies.clone(),
+    );
+    let data = ok_data(resolver.handle(Request::ResolveProtectedContentPolicy {
+        content_id: content_id.to_string(),
+        action: ProtectedContentPolicyAction::View,
+    }));
+    let rendered = serde_json::to_string(&data).unwrap();
+    assert!(!rendered.contains("http://127.0.0.1:9"));
+    assert!(!rendered.contains("\"contract\""));
+    assert!(!rendered.contains("\"selector\""));
+    let policy = resolved_policy_body_from_data(&data);
+    assert_eq!(policy.content_id(), content_id);
+    assert_eq!(policy.required_action(), RightsActionV1::View);
+    assert_eq!(policy.evm_right_argument(), "view");
+    assert_eq!(
+        policy.observation_finality(),
+        RightsObservationFinalityV1::new(12)
+    );
+
+    let operation = signed_runtime_operation_for_policy(policy);
+    let expected_data = encode_has_access_by_content_id_call(
+        "0x12345678",
+        content_id,
+        &wallet_subject_hex(&operation),
+        "view",
+    )
+    .unwrap();
+    let block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let rpc_url = spawn_rpc_sequence_asserting_server(vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        ("eth_blockNumber", json!([]), json!("0x2a")),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x1e", false]),
+            json!({ "number": "0x1e", "hash": block_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data },
+                { "blockHash": block_hash, "requireCanonical": true }
+            ]),
+            evm_bool_word(true),
+        ),
+    ]);
+    let mut provider = provider_with_rights_rpc_and_policies(rpc_url, "0x12345678", policies);
+    let evidence = ok_data(provider.handle(Request::ProtectedContentRightsEvidence {
+        signed_runtime_release_operation: contract_hex(&operation),
+    }));
+    assert_eq!(
+        evidence["schema"],
+        "elastos.chain.protected-content-rights-evidence/v1"
+    );
+}
+
+#[test]
+fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
+    let content_id = "content:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let mut provider = provider_with_rights_rpc("http://127.0.0.1:9".to_string(), "0x12345678");
+    assert_eq!(
+        error_code(provider.handle(Request::ResolveProtectedContentPolicy {
+            content_id: content_id.to_string(),
+            action: ProtectedContentPolicyAction::View,
+        })),
+        "rights_policy_not_configured"
+    );
+
+    let mut provider = ChainProvider::new();
+    let init = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                "networks": [
+                    {
+                        "id": "esc-a",
+                        "display_name": "ESC A",
+                        "kind": "evm_json_rpc",
+                        "chain_id": 20,
+                        "native_symbol": "ELA",
+                        "provider": "test-a",
+                        "mainnet": false,
+                        "explorer_url": null,
+                        "rpc_url": "http://127.0.0.1:9",
+                        "rights_methods": [{
+                            "id": "has_access_by_content_id",
+                            "contract": "0x0000000000000000000000000000000000000001",
+                            "abi": "has_access_by_content_id_string_address_string",
+                            "selector": "0x12345678",
+                            "protected_content_policies": [{
+                                "action": "view",
+                                "right_argument": "view",
+                                "min_confirmations": 12
+                            }]
+                        }]
+                    },
+                    {
+                        "id": "esc-b",
+                        "display_name": "ESC B",
+                        "kind": "evm_json_rpc",
+                        "chain_id": 21,
+                        "native_symbol": "ELA",
+                        "provider": "test-b",
+                        "mainnet": false,
+                        "explorer_url": null,
+                        "rpc_url": "http://127.0.0.1:9",
+                        "rights_methods": [{
+                            "id": "has_access_by_content_id",
+                            "contract": "0x0000000000000000000000000000000000000001",
+                            "abi": "has_access_by_content_id_string_address_string",
+                            "selector": "0x12345678",
+                            "protected_content_policies": [{
+                                "action": "view",
+                                "right_argument": "view",
+                                "min_confirmations": 12
+                            }]
+                        }]
+                    }
+                ]
+            }
+        }),
+    });
+    assert!(matches!(init, Response::Ok { .. }));
+    assert_eq!(
+        error_code(provider.handle(Request::ResolveProtectedContentPolicy {
+            content_id: content_id.to_string(),
+            action: ProtectedContentPolicyAction::View,
+        })),
+        "ambiguous_rights_policy_source"
+    );
+}
+
+#[test]
+fn init_rejects_invalid_or_duplicate_protected_content_policy_sources() {
+    for invalid_policies in [
+        json!([{
+            "action": "annotate",
+            "right_argument": "view",
+            "min_confirmations": 12
+        }]),
+        json!([{
+            "action": "view",
+            "right_argument": "stream",
+            "min_confirmations": 12
+        }]),
+        json!([{
+            "action": "view",
+            "right_argument": "view",
+            "min_confirmations": 70000
+        }]),
+    ] {
+        let mut provider = ChainProvider::new();
+        let response = provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                    "networks": [{
+                        "id": "esc-local",
+                        "display_name": "ESC Local",
+                        "kind": "evm_json_rpc",
+                        "chain_id": 20,
+                        "native_symbol": "ELA",
+                        "provider": "test",
+                        "mainnet": false,
+                        "explorer_url": null,
+                        "rpc_url": "http://127.0.0.1:9",
+                        "rights_methods": [{
+                            "id": "has_access_by_content_id",
+                            "contract": "0x0000000000000000000000000000000000000001",
+                            "abi": "has_access_by_content_id_string_address_string",
+                            "selector": "0x12345678",
+                            "protected_content_policies": invalid_policies
+                        }]
+                    }]
+                }
+            }),
+        });
+        assert_eq!(error_code(response), "invalid_config");
+    }
+
+    let mut provider = ChainProvider::new();
+    let response = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                "networks": [{
+                    "id": "esc-local",
+                    "display_name": "ESC Local",
+                    "kind": "evm_json_rpc",
+                    "chain_id": 20,
+                    "native_symbol": "ELA",
+                    "provider": "test",
+                    "mainnet": false,
+                    "explorer_url": null,
+                    "rpc_url": "http://127.0.0.1:9",
+                    "rights_methods": [
+                        {
+                            "id": "has_access_by_content_id",
+                            "contract": "0x0000000000000000000000000000000000000001",
+                            "abi": "has_access_by_content_id_string_address_string",
+                            "selector": "0x12345678",
+                            "protected_content_policies": [{
+                                "action": "view",
+                                "right_argument": "view",
+                                "min_confirmations": 12
+                            }]
+                        },
+                        {
+                            "id": "has_access_by_content_id",
+                            "contract": "0x0000000000000000000000000000000000000002",
+                            "abi": "has_access_by_content_id_string_address_string",
+                            "selector": "0x87654321",
+                            "protected_content_policies": [{
+                                "action": "view",
+                                "right_argument": "view",
+                                "min_confirmations": 12
+                            }]
+                        }
+                    ]
+                }]
+            }
+        }),
+    });
+    assert_eq!(error_code(response), "invalid_config");
 }
 
 #[test]
