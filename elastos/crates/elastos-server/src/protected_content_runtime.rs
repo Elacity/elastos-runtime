@@ -20,39 +20,41 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 use elastos_protected_content_contracts::{
-    validate_custody_epoch_against_pool_at, CanonicalContract,
-    CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, Digest32,
-    EncryptedContentIdentityV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1,
-    NodeCustodyPublicKeyV1, NodePublicKey, RecipientKeyAuthorizationStatementV1,
-    RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
-    RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1, RightsRequestV1,
-    RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
+    CanonicalContract, ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1,
+    CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, Digest32, EncryptedContentIdentityV1,
+    KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1, NodeCustodyPublicKeyV1,
+    NodePublicKey, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
+    RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1, RightsEvaluationEvidenceRequestV1,
+    RightsPolicyBodyV1, RightsPolicyIdentityV1, RightsRequestV1, RuntimeOperationIssuerKeyV1,
+    RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
     SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
     SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
     TerminalReceiptStatementV1, WalletSignedRightsRequestV1,
+    validate_custody_epoch_against_pool_at,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, DecryptProviderRequestOpV1, DecryptProviderRequestV1,
-    DecryptProviderResponseV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
-    ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
-    RightsProviderResponseV1, ViewerMediaPartSelectorV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    DecryptProviderResponseV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, ProtectProviderRequestV1,
+    ProtectProviderResponseStatusV1, ProtectProviderResponseV1, ProtectionSessionNodeV1,
+    RightsProviderRequestV1, RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1,
+    ViewerMediaPartSelectorV1,
 };
 use elastos_protected_content_rights::{
-    PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
+    CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP, PrivateCustodyRightsRequestV1,
 };
 use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
-    bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
-    prepare_recipient, read_viewer_media_part, resolve_runtime_mint_selected_nodes,
     PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
     RuntimeCustodyTerminalKind, RuntimeDecryptProvider, RuntimeMintConfiguredCustodyProvider,
     RuntimeMintCoordinator, RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome,
-    RuntimeMintDraft, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
+    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
     RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
     RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeReleaseTerminalResult,
     RuntimeSelectedProvider, RuntimeVerifiedContentAvailability, RuntimeVerifiedPurchaseEffect,
-    RuntimeViewerSession,
+    RuntimeViewerSession, bind_buy, cancel_prepared_recipient, close_viewer_session,
+    open_viewer_session, prepare_recipient, read_viewer_media_part,
+    resolve_runtime_mint_selected_nodes,
 };
 use elastos_runtime::provider::bridge::{ProviderBridge, ProviderConfig};
 use elastos_runtime::provider::{
@@ -60,20 +62,18 @@ use elastos_runtime::provider::{
     ProviderRegistry, ProviderTransfer, ResourceRequest, ResourceResponse,
 };
 use elastos_wallet_contract::{
-    ValidatedChainOutcomeBindingV1, VerifiedWalletInvocationContext, WalletProviderOperationV2,
-    WalletProviderRequestV2, MAX_INVOCATION_TTL_SECS, WALLET_BUS_OPERATION,
+    MAX_INVOCATION_TTL_SECS, ValidatedChainOutcomeBindingV1, VerifiedWalletInvocationContext,
+    WALLET_BUS_OPERATION, WalletProviderOperationV2, WalletProviderRequestV2,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Digest as _;
 
 pub(crate) const CUSTODY_PROVIDER_ID: &str = "custody";
 pub(crate) const PROTECT_PROVIDER_ID: &str = "protect";
 pub(crate) const RUNTIME_PROVIDER_ID: &str = "runtime";
 const CONTENT_PROVIDER_ID: &str = "content";
-const PROTECTION_SESSION_REQUEST_DOMAIN: &[u8] =
-    b"elastos.protected-content.protection-session-request.v1";
 const PROTECTED_CONTENT_REPLICATION_POLICY: &str = "protected-content-replication/v1";
 const PROTECTED_CONTENT_MIN_REPLICAS: u32 = 3;
 const PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS: u64 = 60;
@@ -90,6 +90,10 @@ pub(crate) const RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody viewer envelope is unavailable";
 pub(crate) const RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE: &str =
     "Runtime custody viewer release approval is unavailable";
+pub(crate) const RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE: &str =
+    "Runtime custody mint requires cleanup reconciliation";
+pub(crate) const RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE: &str =
+    "Runtime custody mint was settled before draft persistence";
 const PROTECTED_CONTENT_ROOT: &str = "protected-content";
 const CUSTODY_COMPOSITION_CONFIG_FILE: &str = "protected-content/custody-composition.json";
 const RUNTIME_MINT_JOURNAL_ROOT: &str = "protected-content/runtime-mint";
@@ -771,6 +775,110 @@ pub(crate) fn runtime_mint_journal(data_dir: &Path) -> RuntimeMintJournal {
     RuntimeMintJournal::new(data_dir.join(RUNTIME_MINT_JOURNAL_ROOT))
 }
 
+fn generate_runtime_content_access_id() -> anyhow::Result<ContentAccessIdV1> {
+    loop {
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        if let Ok(value) = ContentAccessIdV1::new(bytes) {
+            return Ok(value);
+        }
+    }
+}
+
+fn runtime_mint_intent_with_access_id(
+    composition: &RuntimeCustodyComposition,
+    input: &RuntimeCustodyLibraryPublishInput,
+    selected_nodes: Vec<elastos_protected_content_runtime::RuntimeMintNodeBinding>,
+    content_access_id: ContentAccessIdV1,
+) -> anyhow::Result<RuntimeMintIntent> {
+    RuntimeMintIntent::new(
+        input.principal_id.clone(),
+        &input.object_uri,
+        &input.source_storage,
+        input.mime_type.clone(),
+        input.codecs.clone(),
+        &input.clear_init_segment,
+        &input.clear_segments,
+        content_access_id,
+        composition
+            .signed_pool
+            .pool_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?,
+        composition
+            .signed_epoch
+            .epoch_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?,
+        composition
+            .signed_committee_authorization
+            .authorization_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?,
+        selected_nodes,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))
+}
+
+fn load_or_persist_runtime_mint_intent(
+    journal: &RuntimeMintJournal,
+    composition: &RuntimeCustodyComposition,
+    input: &RuntimeCustodyLibraryPublishInput,
+    selected_nodes: Vec<elastos_protected_content_runtime::RuntimeMintNodeBinding>,
+) -> anyhow::Result<RuntimeMintIntent> {
+    let request_id = RuntimeMintIntent::request_id_for_source(
+        &input.principal_id,
+        &input.object_uri,
+        &input.source_storage,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is invalid"))?;
+    match journal.load_intent(request_id) {
+        Ok(existing) => {
+            let expected = runtime_mint_intent_with_access_id(
+                composition,
+                input,
+                selected_nodes,
+                existing.content_access_id(),
+            )?;
+            if !existing.same_authority_as(&expected) {
+                anyhow::bail!("Runtime custody mint intent conflicts with existing authority");
+            }
+            Ok(existing)
+        }
+        Err(elastos_protected_content_runtime::RuntimeMintJournalError::NotFound) => {
+            let intent = runtime_mint_intent_with_access_id(
+                composition,
+                input,
+                selected_nodes,
+                generate_runtime_content_access_id()?,
+            )?;
+            journal
+                .persist_intent(&intent)
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))
+        }
+        Err(_) => Err(anyhow::anyhow!(
+            "Runtime custody mint intent is unavailable"
+        )),
+    }
+}
+
+fn load_completed_runtime_mint_facts(
+    journal: &RuntimeMintJournal,
+    input: &RuntimeCustodyLibraryPublishInput,
+    mint_id: Digest32,
+) -> anyhow::Result<RuntimeCustodyLibraryPublishFacts> {
+    let persisted = journal
+        .load(mint_id)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let evidence = persisted
+        .content_availability()
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let content_id = runtime_protected_content_id(persisted.draft().encrypted_content())?;
+    Ok(runtime_custody_library_publish_facts(
+        input,
+        persisted.draft(),
+        &content_id,
+        evidence,
+    ))
+}
+
 pub fn list_unresolved_runtime_releases(
     data_dir: &Path,
 ) -> Result<Vec<PersistedRuntimeReleaseOperation>, RuntimeReleaseJournalError> {
@@ -841,10 +949,7 @@ pub async fn register_protect_provider(
             Arc::new(bridge),
             PROTECT_PROVIDER_ID,
         ));
-    registry
-        .register_sub_provider(PROTECT_PROVIDER_ID, provider)
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to register protect provider: {error}"))?;
+    registry.register(provider).await;
     Ok(())
 }
 
@@ -1418,19 +1523,37 @@ pub(crate) fn runtime_protected_content_id(
     ))
 }
 
+fn runtime_protected_content_identity_hex(
+    encrypted_content: &EncryptedContentIdentityV1,
+) -> anyhow::Result<String> {
+    Ok(format!(
+        "0x{}",
+        hex::encode(
+            encrypted_content
+                .canonical_bytes()
+                .map_err(|_| anyhow::anyhow!("protected content identity is invalid"))?
+        )
+    ))
+}
+
+fn runtime_content_access_id_hex(content_access_id: ContentAccessIdV1) -> String {
+    format!("0x{}", hex::encode(content_access_id.as_bytes()))
+}
+
 pub(crate) async fn resolve_runtime_rights_policy(
     registry: &ProviderRegistry,
     encrypted_content: &EncryptedContentIdentityV1,
+    content_access_id: ContentAccessIdV1,
     action: RightsActionV1,
 ) -> anyhow::Result<ResolvedRuntimeRightsPolicy> {
-    let content_id = runtime_protected_content_id(encrypted_content)?;
     let response_value = invoke_json_provider(
         registry,
         CHAIN_PROVIDER_ID,
         CHAIN_PROTECTED_CONTENT_POLICY_OP,
         json!({
             "op": CHAIN_PROTECTED_CONTENT_POLICY_OP,
-            "content_id": content_id,
+            "encrypted_content": runtime_protected_content_identity_hex(encrypted_content)?,
+            "content_access_id": runtime_content_access_id_hex(content_access_id),
             "action": runtime_rights_action_name(action),
         }),
     )
@@ -1444,8 +1567,13 @@ pub(crate) async fn resolve_runtime_rights_policy(
         anyhow::anyhow!("chain provider returned an invalid protected-content policy body")
     })?;
     let body = RightsPolicyBodyV1::from_canonical_bytes(&policy_bytes)?;
-    if body.content_id() != content_id || body.required_action() != action {
-        anyhow::bail!("chain provider returned a protected-content policy that does not match the Runtime request");
+    if body.encrypted_content() != encrypted_content
+        || body.content_access_id() != content_access_id
+        || body.required_action() != action
+    {
+        anyhow::bail!(
+            "chain provider returned a protected-content policy that does not match the Runtime request"
+        );
     }
     let identity = body.policy_identity()?;
     Ok(ResolvedRuntimeRightsPolicy { body, identity })
@@ -1854,14 +1982,6 @@ pub(crate) async fn publish_runtime_custody_library_object(
     let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
         .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
     let now = crate::auth::now_ts();
-    let protected = protect_runtime_custody_media(&registry, &composition, &input, now).await?;
-    let policy = resolve_runtime_rights_policy(
-        registry.as_ref(),
-        protected.media_identity.encrypted_content(),
-        RightsActionV1::View,
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Runtime custody rights policy is unavailable"))?;
     let configured = composition
         .configured_nodes()
         .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
@@ -1879,11 +1999,33 @@ pub(crate) async fn publish_runtime_custody_library_object(
         .iter()
         .map(|node| node.binding().clone())
         .collect::<Vec<_>>();
+    let mint_journal = runtime_mint_journal(data_dir);
+    let mint_intent = load_or_persist_runtime_mint_intent(
+        &mint_journal,
+        &composition,
+        &input,
+        mint_nodes.clone(),
+    )?;
+    if let Some(mint_id) = mint_intent.completed_mint_id() {
+        return load_completed_runtime_mint_facts(&mint_journal, &input, mint_id);
+    }
+    let protected =
+        protect_runtime_custody_media(&registry, &mint_journal, &composition, &input, &mint_intent)
+            .await?;
+    let policy = resolve_runtime_rights_policy(
+        registry.as_ref(),
+        protected.media_identity.encrypted_content(),
+        mint_intent.content_access_id(),
+        RightsActionV1::View,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Runtime custody rights policy is unavailable"))?;
     let mint_draft = RuntimeMintDraft::new(
         &protected.init_segment,
         &protected.encrypted_segments,
         input.mime_type.clone(),
         input.codecs.clone(),
+        mint_intent.content_access_id(),
         protected
             .envelope
             .key_envelope_identity()
@@ -1956,12 +2098,11 @@ pub(crate) async fn publish_runtime_custody_library_object(
             bought_at: None,
         },
     )?;
-    Ok(runtime_custody_library_publish_facts(
-        &input,
-        &mint_draft,
-        &content_id,
-        &evidence,
-    ))
+    let facts = runtime_custody_library_publish_facts(&input, &mint_draft, &content_id, &evidence);
+    mint_journal
+        .mark_intent_completed(mint_intent.request_id(), mint_draft.mint_id())
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    Ok(facts)
 }
 
 struct ProtectedRuntimeCustodyMedia {
@@ -1971,12 +2112,161 @@ struct ProtectedRuntimeCustodyMedia {
     envelope: CustodyEnvelopeV1,
 }
 
+enum RuntimeProtectRecoveryDisposition {
+    Fresh,
+    ReplayOpenAndSettleCancel,
+    SettleCancel([u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]),
+    SettleClose([u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]),
+    TerminalAbort,
+}
+
 async fn protect_runtime_custody_media(
     registry: &ProviderRegistry,
+    journal: &RuntimeMintJournal,
     composition: &RuntimeCustodyComposition,
     input: &RuntimeCustodyLibraryPublishInput,
-    now_unix_seconds: u64,
+    mint_intent: &RuntimeMintIntent,
 ) -> anyhow::Result<ProtectedRuntimeCustodyMedia> {
+    let open_request =
+        runtime_custody_open_protection_session_request(composition, input, mint_intent)?;
+    match runtime_protect_recovery_disposition(mint_intent) {
+        RuntimeProtectRecoveryDisposition::TerminalAbort => {
+            anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
+        }
+        RuntimeProtectRecoveryDisposition::SettleCancel(handle) => {
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                handle,
+                RuntimeProtectSessionSettlementOp::Cancel,
+            )
+            .await?;
+            anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
+        }
+        RuntimeProtectRecoveryDisposition::SettleClose(handle) => {
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                handle,
+                RuntimeProtectSessionSettlementOp::Close,
+            )
+            .await?;
+            anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
+        }
+        RuntimeProtectRecoveryDisposition::ReplayOpenAndSettleCancel => {
+            if !registry.has_provider(PROTECT_PROVIDER_ID).await {
+                anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
+            }
+            let opened =
+                invoke_typed_protect_provider(registry, "open_protection_session", &open_request)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE)
+                    })?;
+            if opened.status() != ProtectProviderResponseStatusV1::ProtectionSessionOpened {
+                anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE);
+            }
+            let handle = opened
+                .protection_session_handle()
+                .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE)
+                })?;
+            journal
+                .mark_intent_protect_opened(mint_intent.request_id(), handle)
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                handle,
+                RuntimeProtectSessionSettlementOp::Cancel,
+            )
+            .await?;
+            anyhow::bail!(RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE);
+        }
+        RuntimeProtectRecoveryDisposition::Fresh => {}
+    }
+
+    if !registry.has_provider(PROTECT_PROVIDER_ID).await {
+        anyhow::bail!("Runtime custody protect provider is unavailable");
+    }
+    journal
+        .mark_intent_protect_effect_started(mint_intent.request_id())
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let opened =
+        invoke_typed_protect_provider(registry, "open_protection_session", &open_request).await?;
+    if opened.status() != ProtectProviderResponseStatusV1::ProtectionSessionOpened {
+        anyhow::bail!("Runtime custody protect provider is unavailable");
+    }
+    let handle = opened
+        .protection_session_handle()
+        .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?
+        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    journal
+        .mark_intent_protect_opened(mint_intent.request_id(), handle)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+    let protect_result = protect_opened_runtime_custody_session(
+        registry,
+        journal,
+        mint_intent.request_id(),
+        handle,
+        &opened,
+        input,
+        composition,
+        mint_intent.content_access_id(),
+    )
+    .await;
+    match protect_result {
+        Ok(protected) => {
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                handle,
+                RuntimeProtectSessionSettlementOp::Close,
+            )
+            .await?;
+            Ok(protected)
+        }
+        Err(error) => {
+            settle_runtime_custody_protect_session(
+                registry,
+                journal,
+                mint_intent.request_id(),
+                handle,
+                RuntimeProtectSessionSettlementOp::Cancel,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE))?;
+            Err(error)
+        }
+    }
+}
+
+fn runtime_protect_recovery_disposition(
+    mint_intent: &RuntimeMintIntent,
+) -> RuntimeProtectRecoveryDisposition {
+    if let Some(handle) = mint_intent.protect_pending_close_handle() {
+        RuntimeProtectRecoveryDisposition::SettleClose(handle)
+    } else if let Some(handle) = mint_intent.protect_pending_cancel_handle() {
+        RuntimeProtectRecoveryDisposition::SettleCancel(handle)
+    } else if mint_intent.protect_open_request_pending() {
+        RuntimeProtectRecoveryDisposition::ReplayOpenAndSettleCancel
+    } else if mint_intent.protect_terminal_before_draft() {
+        RuntimeProtectRecoveryDisposition::TerminalAbort
+    } else {
+        RuntimeProtectRecoveryDisposition::Fresh
+    }
+}
+
+fn runtime_custody_open_protection_session_request(
+    composition: &RuntimeCustodyComposition,
+    input: &RuntimeCustodyLibraryPublishInput,
+    mint_intent: &RuntimeMintIntent,
+) -> anyhow::Result<ProtectProviderRequestV1> {
     let nodes = composition
         .nodes
         .iter()
@@ -1987,57 +2277,98 @@ async fn protect_runtime_custody_media(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let segment_count = u32::try_from(input.clear_segments.len())
         .map_err(|_| anyhow::anyhow!("Runtime custody protect input is invalid"))?;
-    let opened = invoke_typed_protect_provider(
-        registry,
-        "open_protection_session",
-        &ProtectProviderRequestV1::new_open_protection_session(
-            protection_session_request_id(input, now_unix_seconds),
-            composition
-                .signed_pool
-                .pool_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
-            composition
-                .signed_epoch
-                .epoch_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
-            composition
-                .signed_committee_authorization
-                .authorization_identity()
-                .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
-            input.mime_type.clone(),
-            input.codecs.clone(),
-            segment_count,
-            &input.clear_init_segment,
-            nodes,
-        )
-        .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+    ProtectProviderRequestV1::new_open_protection_session(
+        mint_intent.request_id(),
+        mint_intent.content_access_id(),
+        composition
+            .signed_pool
+            .pool_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+        composition
+            .signed_epoch
+            .epoch_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+        composition
+            .signed_committee_authorization
+            .authorization_identity()
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect committee is invalid"))?,
+        input.mime_type.clone(),
+        input.codecs.clone(),
+        segment_count,
+        &input.clear_init_segment,
+        nodes,
     )
-    .await?;
-    if opened.status() != ProtectProviderResponseStatusV1::ProtectionSessionOpened {
-        anyhow::bail!("Runtime custody protect provider is unavailable");
-    }
-    let handle = opened
-        .protection_session_handle()
-        .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?
-        .ok_or_else(|| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
-    let protect_result =
-        protect_opened_runtime_custody_session(registry, handle, &opened, input, composition).await;
-    let _ = invoke_typed_protect_provider(
-        registry,
-        "close_protection_session",
-        &ProtectProviderRequestV1::new_close_protection_session(handle)
-            .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
-    )
-    .await;
-    protect_result
+    .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))
 }
 
+enum RuntimeProtectSessionSettlementOp {
+    Cancel,
+    Close,
+}
+
+async fn settle_runtime_custody_protect_session(
+    registry: &ProviderRegistry,
+    journal: &RuntimeMintJournal,
+    request_id: Digest32,
+    handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    op: RuntimeProtectSessionSettlementOp,
+) -> anyhow::Result<()> {
+    let (provider_op, request) = match op {
+        RuntimeProtectSessionSettlementOp::Cancel => (
+            "cancel_protection_session",
+            ProtectProviderRequestV1::new_cancel_protection_session(handle)
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+        ),
+        RuntimeProtectSessionSettlementOp::Close => (
+            "close_protection_session",
+            ProtectProviderRequestV1::new_close_protection_session(handle)
+                .map_err(|_| anyhow::anyhow!("Runtime custody protect request is invalid"))?,
+        ),
+    };
+    let response = invoke_typed_protect_provider(registry, provider_op, &request).await?;
+    match (op, response.status()) {
+        (
+            RuntimeProtectSessionSettlementOp::Cancel,
+            ProtectProviderResponseStatusV1::ProtectionSessionCancelled,
+        ) => {
+            journal
+                .mark_intent_protect_cancelled_before_draft(request_id)
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+        }
+        (
+            RuntimeProtectSessionSettlementOp::Close,
+            ProtectProviderResponseStatusV1::ProtectionSessionClosed,
+        ) => {
+            journal
+                .mark_intent_protect_closed_before_draft(request_id)
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+        }
+        (
+            RuntimeProtectSessionSettlementOp::Cancel | RuntimeProtectSessionSettlementOp::Close,
+            ProtectProviderResponseStatusV1::ProtectionSessionAlreadyAbsent,
+        ) => {
+            journal
+                .mark_intent_protect_already_absent_before_draft(request_id)
+                .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
+        }
+        _ => anyhow::bail!(RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE),
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "This operation keeps protect-session authority and settlement inputs explicit at one boundary"
+)]
 async fn protect_opened_runtime_custody_session(
     registry: &ProviderRegistry,
+    journal: &RuntimeMintJournal,
+    request_id: Digest32,
     handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
     opened: &ProtectProviderResponseV1,
     input: &RuntimeCustodyLibraryPublishInput,
     composition: &RuntimeCustodyComposition,
+    content_access_id: ContentAccessIdV1,
 ) -> anyhow::Result<ProtectedRuntimeCustodyMedia> {
     let init_segment = opened
         .protected_init_segment()
@@ -2098,7 +2429,11 @@ async fn protect_opened_runtime_custody_session(
         input.codecs.clone(),
     )
     .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
+    let protected_session =
+        ValidatedCencFmp4MediaSessionLayoutV1::new(&expected_media, &init_segment)
+            .map_err(|_| anyhow::anyhow!("Runtime custody protect output is invalid"))?;
     if media_identity != expected_media
+        || protected_session.content_access_id() != content_access_id
         || envelope.manifest().encrypted_content() != media_identity.encrypted_content()
         || envelope.manifest().custody_pool()
             != composition
@@ -2118,27 +2453,15 @@ async fn protect_opened_runtime_custody_session(
     {
         anyhow::bail!("Runtime custody protect output is invalid");
     }
+    journal
+        .mark_intent_protect_finalized(request_id, handle)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint intent is unavailable"))?;
     Ok(ProtectedRuntimeCustodyMedia {
         init_segment,
         encrypted_segments,
         media_identity,
         envelope,
     })
-}
-
-fn protection_session_request_id(
-    input: &RuntimeCustodyLibraryPublishInput,
-    now_unix_seconds: u64,
-) -> Digest32 {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(PROTECTION_SESSION_REQUEST_DOMAIN);
-    hasher.update(input.principal_id.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(input.object_uri.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(now_unix_seconds.to_be_bytes());
-    hasher.update(sha2::Sha256::digest(&input.clear_init_segment));
-    Digest32::new(hasher.finalize().into())
 }
 
 async fn invoke_typed_protect_provider(
@@ -2325,8 +2648,8 @@ struct RuntimeCustodyViewerState {
     cid: String,
 }
 
-fn runtime_custody_viewer_sessions(
-) -> &'static Mutex<HashMap<RuntimeCustodyViewerKey, RuntimeCustodyViewerState>> {
+fn runtime_custody_viewer_sessions()
+-> &'static Mutex<HashMap<RuntimeCustodyViewerKey, RuntimeCustodyViewerState>> {
     static SESSIONS: OnceLock<Mutex<HashMap<RuntimeCustodyViewerKey, RuntimeCustodyViewerState>>> =
         OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -2595,6 +2918,7 @@ pub(crate) async fn open_runtime_custody_viewer(
     let policy = resolve_runtime_rights_policy(
         registry.as_ref(),
         mint.draft().encrypted_content(),
+        mint.draft().content_access_id(),
         RightsActionV1::View,
     )
     .await

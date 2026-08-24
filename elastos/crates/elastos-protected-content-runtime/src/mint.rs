@@ -554,7 +554,7 @@ mod tests {
 
     use ed25519_dalek::{Signer as _, SigningKey};
     use elastos_protected_content_contracts::{
-        CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
+        ContentAccessIdV1, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
         CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
         CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
         CustodyNodeIdentityV1, CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1,
@@ -651,6 +651,10 @@ mod tests {
 
     fn digest(byte: u8) -> Digest32 {
         Digest32::new([byte; 32])
+    }
+
+    fn content_access_id(seed: u8) -> ContentAccessIdV1 {
+        ContentAccessIdV1::new([seed; 16]).unwrap()
     }
 
     fn node_key(seed: u8) -> SigningKey {
@@ -907,6 +911,7 @@ mod tests {
             &encrypted_segments,
             mime_type,
             codecs,
+            content_access_id(0x41),
             envelope.key_envelope_identity().unwrap(),
             RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
             envelope.manifest().content_key_commitment(),
@@ -954,6 +959,7 @@ mod tests {
                 &encrypted_segments,
                 mime_type,
                 codecs,
+                content_access_id(0x41),
                 KeyEnvelopeIdentityV1::new(
                     media.encrypted_content().clone(),
                     digest(0x22),
@@ -993,6 +999,7 @@ mod tests {
                 &encrypted_segments,
                 mime_type,
                 codecs,
+                content_access_id(0x41),
                 envelope.key_envelope_identity().unwrap(),
                 RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
                 envelope.manifest().content_key_commitment(),

@@ -602,7 +602,7 @@ mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use elastos_auth::ethereum_signed_message_hash;
     use elastos_protected_content_contracts::{
-        CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
+        ContentAccessIdV1, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
         CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1,
         CustodyEpochStatementV1, CustodyNodeIdentityV1, CustodyNodeProvisioningRecordIdentityV1,
         CustodyPoolFailureDomainIdV1, CustodyPoolOperatorIdV1, EncryptedContentIdentityV1,
@@ -790,20 +790,26 @@ mod tests {
     }
 
     fn policy_body() -> RightsPolicyBodyV1 {
-        policy_body_with_content("content:alpha")
+        policy_body_with_media(
+            media_identity(0x21),
+            ContentAccessIdV1::new([0x41; 16]).unwrap(),
+        )
     }
 
-    fn policy_body_with_content(content_id: &str) -> RightsPolicyBodyV1 {
+    fn policy_body_with_media(
+        encrypted_content: EncryptedContentIdentityV1,
+        content_access_id: ContentAccessIdV1,
+    ) -> RightsPolicyBodyV1 {
         RightsPolicyBodyV1::new(
-            content_id,
+            encrypted_content,
+            content_access_id,
             RightsActionV1::View,
-            "view",
             RightsSubjectSourceV1::WalletAddress,
             11155111,
             EvmContractAddressV1::new([0x11; 20]).unwrap(),
             EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-            RightsObservationFinalityV1::new(12),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
         )
         .unwrap()
     }
@@ -819,6 +825,10 @@ mod tests {
 
     fn media_identity(seed: u8) -> EncryptedContentIdentityV1 {
         test_media::media_identity(seed).encrypted_content().clone()
+    }
+
+    fn content_access_id(seed: u8) -> ContentAccessIdV1 {
+        ContentAccessIdV1::new([seed; 16]).unwrap()
     }
 
     fn binding_for_runtime_release(
@@ -2090,6 +2100,7 @@ mod tests {
             &encrypted_segments,
             mime_type,
             codecs,
+            content_access_id(0x41),
             binding.key_envelope().clone(),
             binding.rights_policy().clone(),
             digest(0x19),
@@ -2280,6 +2291,7 @@ mod tests {
             &encrypted_segments,
             mime_type,
             codecs,
+            content_access_id(0x41),
             binding.key_envelope().clone(),
             binding.rights_policy().clone(),
             envelope.manifest().content_key_commitment(),

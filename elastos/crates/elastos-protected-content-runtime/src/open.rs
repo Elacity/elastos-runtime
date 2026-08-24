@@ -1036,14 +1036,14 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use elastos_auth::ethereum_signed_message_hash;
     use elastos_protected_content_contracts::{
-        CanonicalContract, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
-        CustodyNodeProvisioningRecordIdentityV1, CustodyPoolFailureDomainIdV1,
-        CustodyPoolIdentityV1, CustodyPoolOperatorIdV1, KeyEnvelopeIdentityV1, NodeSetV1,
-        ProfileIdentityV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
-        RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1, RightsPolicyIdentityV1,
-        RightsRequestV1, RuntimeCustodyProvisioningIdV1, RuntimeOperationIssuerKeyV1,
-        RuntimeReleaseAuditIdV1, RuntimeSessionBindingV1, ThresholdV1, WalletAddress,
-        WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+        CanonicalContract, ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1,
+        CustodyEpochIdentityV1, CustodyNodeProvisioningRecordIdentityV1,
+        CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1, CustodyPoolOperatorIdV1,
+        KeyEnvelopeIdentityV1, NodeSetV1, ProfileIdentityV1, ProtectedContentBindingV1,
+        RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
+        RightsPolicyIdentityV1, RightsRequestV1, RuntimeCustodyProvisioningIdV1,
+        RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeSessionBindingV1, ThresholdV1,
+        WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
     };
     use elastos_wallet_contract::{
         ProtectedContentRightsSignatureResultV1, ValidatedChainOutcomeBindingV1,
@@ -1069,6 +1069,10 @@ mod tests {
 
     fn digest(byte: u8) -> Digest32 {
         Digest32::new([byte; 32])
+    }
+
+    fn content_access_id(seed: u8) -> ContentAccessIdV1 {
+        ContentAccessIdV1::new([seed; 16]).unwrap()
     }
 
     fn node_public_key(seed: u8) -> elastos_protected_content_contracts::NodePublicKey {
@@ -1141,6 +1145,7 @@ mod tests {
             &encrypted_segments,
             mime_type,
             codecs,
+            content_access_id(0x41),
             key_envelope,
             RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
             digest(0x19),

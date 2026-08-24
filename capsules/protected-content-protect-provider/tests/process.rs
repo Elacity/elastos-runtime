@@ -289,6 +289,7 @@ fn clear_segment(track_id: u32, payload: &[u8]) -> Vec<u8> {
 fn open_request(clear_init: &[u8], segment_count: u32) -> ProtectProviderRequestV1 {
     ProtectProviderRequestV1::new_open_protection_session(
         digest(0x31),
+        elastos_protected_content_contracts::ContentAccessIdV1::new([0x41; 16]).unwrap(),
         CustodyPoolIdentityV1::new(digest(0x41), 32).unwrap(),
         CustodyEpochIdentityV1::new(digest(0x42), 32).unwrap(),
         CustodyCommitteeAuthorizationIdentityV1::new(digest(0x43), 32).unwrap(),

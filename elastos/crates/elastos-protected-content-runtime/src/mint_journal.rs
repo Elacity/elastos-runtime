@@ -13,12 +13,15 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use elastos_protected_content_contracts::{
-    CanonicalContract, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
-    CustodyNodeProvisioningRecordIdentityV1, CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1,
-    CustodyPoolOperatorIdV1, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1,
-    NodePublicKey, NodeSetV1, RightsPolicyIdentityV1, RuntimeCustodyProvisioningIdV1, ThresholdV1,
+    CanonicalContract, ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1,
+    CustodyEpochIdentityV1, CustodyNodeProvisioningRecordIdentityV1, CustodyPoolFailureDomainIdV1,
+    CustodyPoolIdentityV1, CustodyPoolOperatorIdV1, Digest32, EncryptedContentIdentityV1,
+    KeyEnvelopeIdentityV1, NodePublicKey, NodeSetV1, RightsPolicyIdentityV1,
+    RuntimeCustodyProvisioningIdV1, ThresholdV1,
 };
-use elastos_protected_content_provider_contracts::CencFmp4MediaIdentityV1;
+use elastos_protected_content_provider_contracts::{
+    CencFmp4MediaIdentityV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::geteuid;
 use sha2::{Digest as _, Sha256};
@@ -26,8 +29,14 @@ use thiserror::Error;
 
 const STORE_MAGIC: &[u8; 8] = b"epc-mj04";
 const STORE_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-journal/v4";
+const INTENT_MAGIC: &[u8; 8] = b"epc-mi01";
+const INTENT_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-intent/v1";
 const STORE_LOCK_FILE: &str = "runtime-mint-journal.lock";
 const MINT_ID_DOMAIN: &[u8] = b"elastos.protected-content.runtime-mint-id/v4";
+const MINT_INTENT_REQUEST_ID_DOMAIN: &[u8] =
+    b"elastos.protected-content.runtime-mint-intent-request-id/v1";
+const MINT_INTENT_SOURCE_BINDING_DOMAIN: &[u8] =
+    b"elastos.protected-content.runtime-mint-intent-source-binding/v1";
 const MAX_STORE_FILE_BYTES: usize = 64 * 1024;
 const REQUIRED_NODES: usize = 3;
 const MAX_AVAILABILITY_TEXT_BYTES: usize = 256;
@@ -356,6 +365,326 @@ impl RuntimeMintNodeBinding {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeMintIntent {
+    request_id: Digest32,
+    principal_id: String,
+    source_binding_digest: Digest32,
+    mime_type: String,
+    codecs: String,
+    clear_init_sha256: Digest32,
+    clear_segment_sha256: Vec<Digest32>,
+    content_access_id: ContentAccessIdV1,
+    protect_state: RuntimeMintIntentProtectState,
+    custody_pool: CustodyPoolIdentityV1,
+    custody_epoch: CustodyEpochIdentityV1,
+    custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+    nodes: Vec<RuntimeMintNodeBinding>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeMintIntentProtectState {
+    NotStarted,
+    OpenRequestPending,
+    OpenHandlePendingCancel([u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]),
+    OpenHandlePendingClose([u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]),
+    SettledBeforeDraft(RuntimeMintIntentProtectSettlement),
+    Completed(Digest32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeMintIntentProtectSettlement {
+    Cancelled,
+    Closed,
+    AlreadyAbsent,
+}
+
+impl fmt::Debug for RuntimeMintIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeMintIntent")
+            .field("request_id", &self.request_id)
+            .field("principal_id", &"[redacted]")
+            .field("source_binding_digest", &self.source_binding_digest)
+            .field("mime_type", &self.mime_type)
+            .field("codecs", &self.codecs)
+            .field("clear_init_sha256", &self.clear_init_sha256)
+            .field("clear_segment_count", &self.clear_segment_sha256.len())
+            .field("content_access_id", &"[redacted]")
+            .field("protect_state", &self.protect_state_label())
+            .field(
+                "protect_terminal_settlement",
+                &self.protect_terminal_settlement_label(),
+            )
+            .field("protect_completed", &self.completed_mint_id().is_some())
+            .field("custody_pool", &self.custody_pool)
+            .field("custody_epoch", &self.custody_epoch)
+            .field(
+                "custody_committee_authorization",
+                &self.custody_committee_authorization,
+            )
+            .field("node_count", &self.nodes.len())
+            .finish()
+    }
+}
+
+impl RuntimeMintIntent {
+    pub fn request_id_for_source(
+        principal_id: &str,
+        object_uri: &str,
+        source_storage: &str,
+    ) -> Result<Digest32, RuntimeMintJournalError> {
+        validate_intent_text(principal_id)?;
+        Ok(compute_mint_intent_request_id(
+            principal_id,
+            compute_source_binding_digest(object_uri, source_storage),
+        ))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pre-effect intent must bind source digests, declaration, access id, and committee identities exactly once"
+    )]
+    pub fn new(
+        principal_id: impl Into<String>,
+        object_uri: &str,
+        source_storage: &str,
+        mime_type: impl Into<String>,
+        codecs: impl Into<String>,
+        clear_init_segment: &[u8],
+        clear_segments: &[Vec<u8>],
+        content_access_id: ContentAccessIdV1,
+        custody_pool: CustodyPoolIdentityV1,
+        custody_epoch: CustodyEpochIdentityV1,
+        custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
+        nodes: Vec<RuntimeMintNodeBinding>,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        let principal_id = principal_id.into();
+        let mime_type = mime_type.into();
+        let codecs = codecs.into();
+        validate_intent_text(&principal_id)?;
+        validate_intent_text(&mime_type)?;
+        validate_intent_text(&codecs)?;
+        let source_binding_digest = compute_source_binding_digest(object_uri, source_storage);
+        let request_id = compute_mint_intent_request_id(&principal_id, source_binding_digest);
+        let clear_init_sha256 = Digest32::new(Sha256::digest(clear_init_segment).into());
+        let clear_segment_sha256 = clear_segments
+            .iter()
+            .map(|segment| Digest32::new(Sha256::digest(segment).into()))
+            .collect::<Vec<_>>();
+        let value = Self {
+            request_id,
+            principal_id,
+            source_binding_digest,
+            mime_type,
+            codecs,
+            clear_init_sha256,
+            clear_segment_sha256,
+            content_access_id,
+            protect_state: RuntimeMintIntentProtectState::NotStarted,
+            custody_pool,
+            custody_epoch,
+            custody_committee_authorization,
+            nodes,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        validate_intent_text(&self.principal_id)?;
+        validate_intent_text(&self.mime_type)?;
+        validate_intent_text(&self.codecs)?;
+        if self.request_id == Digest32::new([0; 32])
+            || self.source_binding_digest == Digest32::new([0; 32])
+            || self.clear_init_sha256 == Digest32::new([0; 32])
+            || self.clear_segment_sha256.is_empty()
+            || self.nodes.len() != REQUIRED_NODES
+        {
+            return Err(RuntimeMintJournalError::InvalidSelection);
+        }
+        match self.protect_state {
+            RuntimeMintIntentProtectState::OpenHandlePendingCancel(handle)
+            | RuntimeMintIntentProtectState::OpenHandlePendingClose(handle) => {
+                if handle == [0u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1] {
+                    return Err(RuntimeMintJournalError::InvalidSelection);
+                }
+            }
+            RuntimeMintIntentProtectState::Completed(mint_id)
+                if mint_id == Digest32::new([0; 32]) =>
+            {
+                return Err(RuntimeMintJournalError::InvalidSelection);
+            }
+            _ => {}
+        }
+        self.custody_pool
+            .canonical_bytes()
+            .map_err(|_| RuntimeMintJournalError::InvalidSelection)?;
+        self.custody_epoch
+            .canonical_bytes()
+            .map_err(|_| RuntimeMintJournalError::InvalidSelection)?;
+        self.custody_committee_authorization
+            .canonical_bytes()
+            .map_err(|_| RuntimeMintJournalError::InvalidSelection)?;
+        let mut node_keys = std::collections::BTreeSet::new();
+        let mut operators = std::collections::BTreeSet::new();
+        let mut domains = std::collections::BTreeSet::new();
+        let mut roots = std::collections::BTreeSet::new();
+        for digest in &self.clear_segment_sha256 {
+            if *digest == Digest32::new([0; 32]) {
+                return Err(RuntimeMintJournalError::InvalidSelection);
+            }
+        }
+        for node in &self.nodes {
+            if !node_keys.insert(node.node_public_key)
+                || !operators.insert(node.operator_id)
+                || !domains.insert(node.failure_domain_id)
+                || !roots.insert(node.owner_state_root)
+            {
+                return Err(RuntimeMintJournalError::InvalidSelection);
+            }
+        }
+        Ok(())
+    }
+
+    pub const fn request_id(&self) -> Digest32 {
+        self.request_id
+    }
+
+    pub fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+
+    pub const fn source_binding_digest(&self) -> Digest32 {
+        self.source_binding_digest
+    }
+
+    pub fn same_authority_as(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.principal_id == other.principal_id
+            && self.source_binding_digest == other.source_binding_digest
+            && self.mime_type == other.mime_type
+            && self.codecs == other.codecs
+            && self.clear_init_sha256 == other.clear_init_sha256
+            && self.clear_segment_sha256 == other.clear_segment_sha256
+            && self.content_access_id == other.content_access_id
+            && self.custody_pool == other.custody_pool
+            && self.custody_epoch == other.custody_epoch
+            && self.custody_committee_authorization == other.custody_committee_authorization
+            && self.nodes == other.nodes
+    }
+
+    pub const fn provider_effect_started(&self) -> bool {
+        !matches!(
+            self.protect_state,
+            RuntimeMintIntentProtectState::NotStarted
+        )
+    }
+
+    pub const fn protect_open_request_pending(&self) -> bool {
+        matches!(
+            self.protect_state,
+            RuntimeMintIntentProtectState::OpenRequestPending
+        )
+    }
+
+    pub fn protect_pending_cancel_handle(
+        &self,
+    ) -> Option<[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]> {
+        match self.protect_state {
+            RuntimeMintIntentProtectState::OpenHandlePendingCancel(handle) => Some(handle),
+            _ => None,
+        }
+    }
+
+    pub fn protect_pending_close_handle(
+        &self,
+    ) -> Option<[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]> {
+        match self.protect_state {
+            RuntimeMintIntentProtectState::OpenHandlePendingClose(handle) => Some(handle),
+            _ => None,
+        }
+    }
+
+    pub const fn protect_terminal_before_draft(&self) -> bool {
+        matches!(
+            self.protect_state,
+            RuntimeMintIntentProtectState::SettledBeforeDraft(_)
+        )
+    }
+
+    pub const fn completed_mint_id(&self) -> Option<Digest32> {
+        match self.protect_state {
+            RuntimeMintIntentProtectState::Completed(mint_id) => Some(mint_id),
+            _ => None,
+        }
+    }
+
+    pub const fn protect_state_label(&self) -> &'static str {
+        match self.protect_state {
+            RuntimeMintIntentProtectState::NotStarted => "not_started",
+            RuntimeMintIntentProtectState::OpenRequestPending => "open_request_pending",
+            RuntimeMintIntentProtectState::OpenHandlePendingCancel(_) => {
+                "open_handle_pending_cancel"
+            }
+            RuntimeMintIntentProtectState::OpenHandlePendingClose(_) => "open_handle_pending_close",
+            RuntimeMintIntentProtectState::SettledBeforeDraft(_) => "settled_before_draft",
+            RuntimeMintIntentProtectState::Completed(_) => "completed",
+        }
+    }
+
+    pub const fn protect_terminal_settlement_label(&self) -> Option<&'static str> {
+        match self.protect_state {
+            RuntimeMintIntentProtectState::SettledBeforeDraft(
+                RuntimeMintIntentProtectSettlement::Cancelled,
+            ) => Some("cancelled"),
+            RuntimeMintIntentProtectState::SettledBeforeDraft(
+                RuntimeMintIntentProtectSettlement::Closed,
+            ) => Some("closed"),
+            RuntimeMintIntentProtectState::SettledBeforeDraft(
+                RuntimeMintIntentProtectSettlement::AlreadyAbsent,
+            ) => Some("already_absent"),
+            _ => None,
+        }
+    }
+
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    pub fn codecs(&self) -> &str {
+        &self.codecs
+    }
+
+    pub const fn clear_init_sha256(&self) -> Digest32 {
+        self.clear_init_sha256
+    }
+
+    pub fn clear_segment_sha256(&self) -> &[Digest32] {
+        &self.clear_segment_sha256
+    }
+
+    pub const fn content_access_id(&self) -> ContentAccessIdV1 {
+        self.content_access_id
+    }
+
+    pub const fn custody_pool(&self) -> CustodyPoolIdentityV1 {
+        self.custody_pool
+    }
+
+    pub const fn custody_epoch(&self) -> CustodyEpochIdentityV1 {
+        self.custody_epoch
+    }
+
+    pub const fn custody_committee_authorization(&self) -> CustodyCommitteeAuthorizationIdentityV1 {
+        self.custody_committee_authorization
+    }
+
+    pub fn nodes(&self) -> &[RuntimeMintNodeBinding] {
+        &self.nodes
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeMintNodeReceipt {
     node_public_key: NodePublicKey,
     provisioning_id: RuntimeCustodyProvisioningIdV1,
@@ -414,6 +743,7 @@ impl RuntimeMintNodeReceipt {
 pub struct RuntimeMintDraft {
     mint_id: Digest32,
     media_identity: CencFmp4MediaIdentityV1,
+    content_access_id: ContentAccessIdV1,
     key_envelope: KeyEnvelopeIdentityV1,
     policy: RightsPolicyIdentityV1,
     content_key_commitment: Digest32,
@@ -427,6 +757,7 @@ impl fmt::Debug for RuntimeMintDraft {
             .debug_struct("RuntimeMintDraft")
             .field("mint_id", &self.mint_id)
             .field("media_identity", &self.media_identity)
+            .field("content_access_id", &self.content_access_id)
             .field("key_envelope", &self.key_envelope)
             .field("policy", &self.policy)
             .field("content_key_commitment", &self.content_key_commitment)
@@ -443,6 +774,7 @@ impl RuntimeMintDraft {
         encrypted_segments: &[Vec<u8>],
         mime_type: impl Into<String>,
         codecs: impl Into<String>,
+        content_access_id: ContentAccessIdV1,
         key_envelope: KeyEnvelopeIdentityV1,
         policy: RightsPolicyIdentityV1,
         content_key_commitment: Digest32,
@@ -458,6 +790,7 @@ impl RuntimeMintDraft {
         .map_err(|_| RuntimeMintJournalError::InvalidSelection)?;
         Self::new_recorded(
             media_identity,
+            content_access_id,
             key_envelope,
             policy,
             content_key_commitment,
@@ -468,6 +801,7 @@ impl RuntimeMintDraft {
 
     fn new_recorded(
         media_identity: CencFmp4MediaIdentityV1,
+        content_access_id: ContentAccessIdV1,
         key_envelope: KeyEnvelopeIdentityV1,
         policy: RightsPolicyIdentityV1,
         content_key_commitment: Digest32,
@@ -517,6 +851,7 @@ impl RuntimeMintDraft {
         let mut draft = Self {
             mint_id: Digest32::new([0; 32]),
             media_identity,
+            content_access_id,
             key_envelope,
             policy,
             content_key_commitment,
@@ -533,6 +868,10 @@ impl RuntimeMintDraft {
 
     pub fn encrypted_content(&self) -> &EncryptedContentIdentityV1 {
         self.media_identity.encrypted_content()
+    }
+
+    pub const fn content_access_id(&self) -> ContentAccessIdV1 {
+        self.content_access_id
     }
 
     pub const fn media_identity(&self) -> &CencFmp4MediaIdentityV1 {
@@ -580,6 +919,7 @@ impl RuntimeMintDraft {
                 .canonical_bytes()
                 .map_err(|_| RuntimeMintJournalError::Corrupt)?,
         );
+        hasher.update(self.content_access_id.as_bytes());
         hasher.update(
             &self
                 .key_envelope
@@ -711,10 +1051,171 @@ impl RuntimeMintJournal {
         self.write_or_replay(&record)
     }
 
+    pub fn persist_intent(
+        &self,
+        intent: &RuntimeMintIntent,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        self.write_or_replay_intent(intent)
+    }
+
     pub fn load(&self, mint_id: Digest32) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.ensure_root_dir()?;
         self.read_record(mint_id)
+    }
+
+    pub fn load_intent(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        self.read_intent(request_id)
+    }
+
+    pub fn mark_intent_protect_effect_started(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut intent = self.read_intent(request_id)?;
+        match intent.protect_state {
+            RuntimeMintIntentProtectState::NotStarted => {
+                intent.protect_state = RuntimeMintIntentProtectState::OpenRequestPending;
+                self.write_replace_intent(&intent)?;
+                Ok(intent)
+            }
+            RuntimeMintIntentProtectState::OpenRequestPending => Ok(intent),
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_intent_protect_opened(
+        &self,
+        request_id: Digest32,
+        handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut intent = self.read_intent(request_id)?;
+        match intent.protect_state {
+            RuntimeMintIntentProtectState::OpenRequestPending => {
+                intent.protect_state =
+                    RuntimeMintIntentProtectState::OpenHandlePendingCancel(handle);
+                self.write_replace_intent(&intent)?;
+                Ok(intent)
+            }
+            RuntimeMintIntentProtectState::OpenHandlePendingCancel(existing)
+                if existing == handle =>
+            {
+                Ok(intent)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_intent_protect_finalized(
+        &self,
+        request_id: Digest32,
+        handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut intent = self.read_intent(request_id)?;
+        match intent.protect_state {
+            RuntimeMintIntentProtectState::OpenHandlePendingCancel(existing)
+                if existing == handle =>
+            {
+                intent.protect_state =
+                    RuntimeMintIntentProtectState::OpenHandlePendingClose(handle);
+                self.write_replace_intent(&intent)?;
+                Ok(intent)
+            }
+            RuntimeMintIntentProtectState::OpenHandlePendingClose(existing)
+                if existing == handle =>
+            {
+                Ok(intent)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    pub fn mark_intent_protect_cancelled_before_draft(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        self.mark_intent_protect_terminal_before_draft(
+            request_id,
+            RuntimeMintIntentProtectSettlement::Cancelled,
+        )
+    }
+
+    pub fn mark_intent_protect_closed_before_draft(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        self.mark_intent_protect_terminal_before_draft(
+            request_id,
+            RuntimeMintIntentProtectSettlement::Closed,
+        )
+    }
+
+    pub fn mark_intent_protect_already_absent_before_draft(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        self.mark_intent_protect_terminal_before_draft(
+            request_id,
+            RuntimeMintIntentProtectSettlement::AlreadyAbsent,
+        )
+    }
+
+    pub fn mark_intent_completed(
+        &self,
+        request_id: Digest32,
+        mint_id: Digest32,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut intent = self.read_intent(request_id)?;
+        match intent.protect_state {
+            RuntimeMintIntentProtectState::SettledBeforeDraft(_) => {
+                intent.protect_state = RuntimeMintIntentProtectState::Completed(mint_id);
+                self.write_replace_intent(&intent)?;
+                Ok(intent)
+            }
+            RuntimeMintIntentProtectState::Completed(existing) if existing == mint_id => Ok(intent),
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
+    }
+
+    fn mark_intent_protect_terminal_before_draft(
+        &self,
+        request_id: Digest32,
+        settlement: RuntimeMintIntentProtectSettlement,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut intent = self.read_intent(request_id)?;
+        match intent.protect_state {
+            RuntimeMintIntentProtectState::OpenRequestPending
+            | RuntimeMintIntentProtectState::OpenHandlePendingCancel(_)
+            | RuntimeMintIntentProtectState::OpenHandlePendingClose(_) => {
+                intent.protect_state =
+                    RuntimeMintIntentProtectState::SettledBeforeDraft(settlement);
+                self.write_replace_intent(&intent)?;
+                Ok(intent)
+            }
+            RuntimeMintIntentProtectState::SettledBeforeDraft(existing)
+                if existing == settlement =>
+            {
+                Ok(intent)
+            }
+            _ => Err(RuntimeMintJournalError::Conflict),
+        }
     }
 
     pub fn mark_node_effect_started(
@@ -851,6 +1352,16 @@ impl RuntimeMintJournal {
             .join(format!("{}.tmp", hex::encode(mint_id.as_bytes())))
     }
 
+    fn intent_path(&self, request_id: Digest32) -> PathBuf {
+        self.root_dir
+            .join(format!("intent-{}", hex::encode(request_id.as_bytes())))
+    }
+
+    fn intent_temp_path(&self, request_id: Digest32) -> PathBuf {
+        self.root_dir
+            .join(format!("intent-{}.tmp", hex::encode(request_id.as_bytes())))
+    }
+
     fn write_or_replay(
         &self,
         record: &PersistedRuntimeMint,
@@ -883,6 +1394,41 @@ impl RuntimeMintJournal {
         sync_directory(&self.root_dir)
     }
 
+    fn write_or_replay_intent(
+        &self,
+        intent: &RuntimeMintIntent,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let path = self.intent_path(intent.request_id);
+        if path.exists() {
+            let existing = self.read_intent(intent.request_id)?;
+            if existing != *intent {
+                return Err(RuntimeMintJournalError::Conflict);
+            }
+            return Ok(existing);
+        }
+        self.write_replace_intent(intent)?;
+        Ok(intent.clone())
+    }
+
+    fn write_replace_intent(
+        &self,
+        intent: &RuntimeMintIntent,
+    ) -> Result<(), RuntimeMintJournalError> {
+        let bytes = encode_intent(intent)?;
+        let temp_path = self.intent_temp_path(intent.request_id);
+        let _ = fs::remove_file(&temp_path);
+        let mut temp_file = open_owner_only_temp_file_for_write(&temp_path)?;
+        temp_file
+            .write_all(&bytes)
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        temp_file
+            .sync_all()
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        fs::rename(&temp_path, self.intent_path(intent.request_id))
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        sync_directory(&self.root_dir)
+    }
+
     fn read_record(
         &self,
         mint_id: Digest32,
@@ -907,6 +1453,31 @@ impl RuntimeMintJournal {
         }
         Ok(record)
     }
+
+    fn read_intent(
+        &self,
+        request_id: Digest32,
+    ) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+        let path = self.intent_path(request_id);
+        let mut file = open_owner_only_file_for_read(&path).map_err(|error| {
+            if !path.exists() {
+                RuntimeMintJournalError::NotFound
+            } else {
+                error
+            }
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| RuntimeMintJournalError::Unavailable)?;
+        if bytes.len() > MAX_STORE_FILE_BYTES {
+            return Err(RuntimeMintJournalError::Corrupt);
+        }
+        let intent = decode_intent(&bytes)?;
+        if intent.request_id != request_id {
+            return Err(RuntimeMintJournalError::Corrupt);
+        }
+        Ok(intent)
+    }
 }
 
 fn encode_record(record: &PersistedRuntimeMint) -> Result<Vec<u8>, RuntimeMintJournalError> {
@@ -920,6 +1491,7 @@ fn encode_record(record: &PersistedRuntimeMint) -> Result<Vec<u8>, RuntimeMintJo
             .canonical_bytes()
             .map_err(|_| RuntimeMintJournalError::Corrupt)?,
     )?;
+    payload.extend_from_slice(record.draft.content_access_id.as_bytes());
     push_nested(
         &mut payload,
         &record
@@ -1019,6 +1591,8 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
     let media_identity =
         CencFmp4MediaIdentityV1::from_canonical_bytes(&read_nested(payload, &mut off)?)
             .map_err(|_| RuntimeMintJournalError::Corrupt)?;
+    let content_access_id = ContentAccessIdV1::new(read_len16(payload, &mut off)?)
+        .map_err(|_| RuntimeMintJournalError::Corrupt)?;
     let key_envelope =
         KeyEnvelopeIdentityV1::from_canonical_bytes(&read_nested(payload, &mut off)?)
             .map_err(|_| RuntimeMintJournalError::Corrupt)?;
@@ -1114,6 +1688,7 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
     }
     let draft = RuntimeMintDraft::new_recorded(
         media_identity,
+        content_access_id,
         key_envelope,
         policy,
         content_key_commitment,
@@ -1129,6 +1704,195 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
         custody_terminal,
         content_availability,
     })
+}
+
+fn encode_intent(intent: &RuntimeMintIntent) -> Result<Vec<u8>, RuntimeMintJournalError> {
+    let mut payload = Vec::new();
+    push_digest(&mut payload, intent.request_id);
+    push_availability_text(&mut payload, &intent.principal_id)?;
+    push_digest(&mut payload, intent.source_binding_digest);
+    push_availability_text(&mut payload, &intent.mime_type)?;
+    push_availability_text(&mut payload, &intent.codecs)?;
+    push_digest(&mut payload, intent.clear_init_sha256);
+    payload.extend_from_slice(
+        &u32::try_from(intent.clear_segment_sha256.len())
+            .map_err(|_| RuntimeMintJournalError::Corrupt)?
+            .to_be_bytes(),
+    );
+    for digest in &intent.clear_segment_sha256 {
+        push_digest(&mut payload, *digest);
+    }
+    payload.extend_from_slice(intent.content_access_id.as_bytes());
+    match intent.protect_state {
+        RuntimeMintIntentProtectState::NotStarted => payload.push(0),
+        RuntimeMintIntentProtectState::OpenRequestPending => payload.push(1),
+        RuntimeMintIntentProtectState::OpenHandlePendingCancel(handle) => {
+            payload.push(2);
+            payload.extend_from_slice(&handle);
+        }
+        RuntimeMintIntentProtectState::OpenHandlePendingClose(handle) => {
+            payload.push(3);
+            payload.extend_from_slice(&handle);
+        }
+        RuntimeMintIntentProtectState::SettledBeforeDraft(
+            RuntimeMintIntentProtectSettlement::Cancelled,
+        ) => payload.push(4),
+        RuntimeMintIntentProtectState::SettledBeforeDraft(
+            RuntimeMintIntentProtectSettlement::Closed,
+        ) => payload.push(5),
+        RuntimeMintIntentProtectState::SettledBeforeDraft(
+            RuntimeMintIntentProtectSettlement::AlreadyAbsent,
+        ) => payload.push(6),
+        RuntimeMintIntentProtectState::Completed(mint_id) => {
+            payload.push(7);
+            push_digest(&mut payload, mint_id);
+        }
+    }
+    push_nested(
+        &mut payload,
+        &intent
+            .custody_pool
+            .canonical_bytes()
+            .map_err(|_| RuntimeMintJournalError::Corrupt)?,
+    )?;
+    push_nested(
+        &mut payload,
+        &intent
+            .custody_epoch
+            .canonical_bytes()
+            .map_err(|_| RuntimeMintJournalError::Corrupt)?,
+    )?;
+    push_nested(
+        &mut payload,
+        &intent
+            .custody_committee_authorization
+            .canonical_bytes()
+            .map_err(|_| RuntimeMintJournalError::Corrupt)?,
+    )?;
+    payload.push(u8::try_from(intent.nodes.len()).map_err(|_| RuntimeMintJournalError::Corrupt)?);
+    for node in &intent.nodes {
+        payload.extend_from_slice(node.node_public_key.as_bytes());
+        payload.extend_from_slice(node.operator_id.as_bytes());
+        payload.extend_from_slice(node.failure_domain_id.as_bytes());
+        payload.extend_from_slice(node.owner_state_root.as_bytes());
+    }
+    let digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(INTENT_DIGEST_DOMAIN);
+        hasher.update(&payload);
+        hasher.finalize()
+    };
+    let mut out = Vec::with_capacity(8 + 32 + payload.len());
+    out.extend_from_slice(INTENT_MAGIC);
+    out.extend_from_slice(&digest);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+fn decode_intent(bytes: &[u8]) -> Result<RuntimeMintIntent, RuntimeMintJournalError> {
+    if bytes.len() < 8 + 32 {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    if &bytes[..8] != INTENT_MAGIC {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let expected = &bytes[8..40];
+    let payload = &bytes[40..];
+    let mut hasher = Sha256::new();
+    hasher.update(INTENT_DIGEST_DOMAIN);
+    hasher.update(payload);
+    if hasher.finalize().as_slice() != expected {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let mut off = 0;
+    let request_id = read_digest(payload, &mut off)?;
+    let principal_id = read_availability_text(payload, &mut off)?;
+    let source_binding_digest = read_digest(payload, &mut off)?;
+    let mime_type = read_availability_text(payload, &mut off)?;
+    let codecs = read_availability_text(payload, &mut off)?;
+    let clear_init_sha256 = read_digest(payload, &mut off)?;
+    let clear_segment_count = usize::try_from(read_u32(payload, &mut off)?)
+        .map_err(|_| RuntimeMintJournalError::Corrupt)?;
+    let mut clear_segment_sha256 = Vec::with_capacity(clear_segment_count);
+    for _ in 0..clear_segment_count {
+        clear_segment_sha256.push(read_digest(payload, &mut off)?);
+    }
+    let content_access_id = ContentAccessIdV1::new(read_len16(payload, &mut off)?)
+        .map_err(|_| RuntimeMintJournalError::Corrupt)?;
+    let protect_state = match read_u8(payload, &mut off)? {
+        0 => RuntimeMintIntentProtectState::NotStarted,
+        1 => RuntimeMintIntentProtectState::OpenRequestPending,
+        2 => {
+            RuntimeMintIntentProtectState::OpenHandlePendingCancel(read_handle(payload, &mut off)?)
+        }
+        3 => RuntimeMintIntentProtectState::OpenHandlePendingClose(read_handle(payload, &mut off)?),
+        4 => RuntimeMintIntentProtectState::SettledBeforeDraft(
+            RuntimeMintIntentProtectSettlement::Cancelled,
+        ),
+        5 => RuntimeMintIntentProtectState::SettledBeforeDraft(
+            RuntimeMintIntentProtectSettlement::Closed,
+        ),
+        6 => RuntimeMintIntentProtectState::SettledBeforeDraft(
+            RuntimeMintIntentProtectSettlement::AlreadyAbsent,
+        ),
+        7 => RuntimeMintIntentProtectState::Completed(read_digest(payload, &mut off)?),
+        _ => return Err(RuntimeMintJournalError::Corrupt),
+    };
+    let custody_pool =
+        CustodyPoolIdentityV1::from_canonical_bytes(&read_nested(payload, &mut off)?)
+            .map_err(|_| RuntimeMintJournalError::Corrupt)?;
+    let custody_epoch =
+        CustodyEpochIdentityV1::from_canonical_bytes(&read_nested(payload, &mut off)?)
+            .map_err(|_| RuntimeMintJournalError::Corrupt)?;
+    let custody_committee_authorization =
+        CustodyCommitteeAuthorizationIdentityV1::from_canonical_bytes(&read_nested(
+            payload, &mut off,
+        )?)
+        .map_err(|_| RuntimeMintJournalError::Corrupt)?;
+    let node_count = usize::from(read_u8(payload, &mut off)?);
+    let mut nodes = Vec::with_capacity(node_count);
+    for _ in 0..node_count {
+        nodes.push(RuntimeMintNodeBinding::new(
+            NodePublicKey::new(read_fixed(payload, &mut off)?)
+                .map_err(|_| RuntimeMintJournalError::Corrupt)?,
+            CustodyPoolOperatorIdV1::new(read_fixed(payload, &mut off)?),
+            CustodyPoolFailureDomainIdV1::new(read_fixed(payload, &mut off)?),
+            read_digest(payload, &mut off)?,
+        )?);
+    }
+    if off != payload.len() {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let intent = RuntimeMintIntent {
+        request_id,
+        principal_id,
+        source_binding_digest,
+        mime_type,
+        codecs,
+        clear_init_sha256,
+        clear_segment_sha256,
+        content_access_id,
+        protect_state,
+        custody_pool,
+        custody_epoch,
+        custody_committee_authorization,
+        nodes,
+    };
+    intent.validate()?;
+    Ok(intent)
+}
+
+fn read_handle(
+    bytes: &[u8],
+    off: &mut usize,
+) -> Result<[u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1], RuntimeMintJournalError> {
+    if bytes.len().saturating_sub(*off) < MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1 {
+        return Err(RuntimeMintJournalError::Corrupt);
+    }
+    let mut handle = [0u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1];
+    handle.copy_from_slice(&bytes[*off..*off + MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]);
+    *off += MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1;
+    Ok(handle)
 }
 
 fn push_digest(payload: &mut Vec<u8>, digest: Digest32) {
@@ -1218,6 +1982,28 @@ fn validate_availability_text(value: &str) -> Result<(), RuntimeMintJournalError
     Ok(())
 }
 
+fn validate_intent_text(value: &str) -> Result<(), RuntimeMintJournalError> {
+    validate_availability_text(value)
+}
+
+fn compute_source_binding_digest(object_uri: &str, source_storage: &str) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(MINT_INTENT_SOURCE_BINDING_DOMAIN);
+    hasher.update(object_uri.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(source_storage.as_bytes());
+    Digest32::new(hasher.finalize().into())
+}
+
+fn compute_mint_intent_request_id(principal_id: &str, source_binding_digest: Digest32) -> Digest32 {
+    let mut hasher = Sha256::new();
+    hasher.update(MINT_INTENT_REQUEST_ID_DOMAIN);
+    hasher.update(principal_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(source_binding_digest.as_bytes());
+    Digest32::new(hasher.finalize().into())
+}
+
 fn read_fixed(payload: &[u8], off: &mut usize) -> Result<[u8; 32], RuntimeMintJournalError> {
     let end = off
         .checked_add(32)
@@ -1237,6 +2023,19 @@ fn read_digest(payload: &[u8], off: &mut usize) -> Result<Digest32, RuntimeMintJ
 
 fn read_len4(payload: &[u8], off: &mut usize) -> Result<[u8; 4], RuntimeMintJournalError> {
     let end = off.checked_add(4).ok_or(RuntimeMintJournalError::Corrupt)?;
+    let slice = payload
+        .get(*off..end)
+        .ok_or(RuntimeMintJournalError::Corrupt)?;
+    *off = end;
+    slice
+        .try_into()
+        .map_err(|_| RuntimeMintJournalError::Corrupt)
+}
+
+fn read_len16(payload: &[u8], off: &mut usize) -> Result<[u8; 16], RuntimeMintJournalError> {
+    let end = off
+        .checked_add(16)
+        .ok_or(RuntimeMintJournalError::Corrupt)?;
     let slice = payload
         .get(*off..end)
         .ok_or(RuntimeMintJournalError::Corrupt)?;
@@ -1354,9 +2153,9 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use elastos_protected_content_contracts::{
-        CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1, CustodyPoolIdentityV1,
-        EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, NodeSetV1, RightsPolicyIdentityV1,
-        ThresholdV1,
+        ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
+        CustodyPoolIdentityV1, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1, NodeSetV1,
+        RightsPolicyIdentityV1, ThresholdV1,
     };
     use elastos_protected_content_provider_contracts::CencFmp4MediaIdentityV1;
     use tempfile::tempdir;
@@ -1366,6 +2165,10 @@ mod tests {
 
     fn digest(byte: u8) -> Digest32 {
         Digest32::new([byte; 32])
+    }
+
+    fn content_access_id(seed: u8) -> ContentAccessIdV1 {
+        ContentAccessIdV1::new([seed; 16]).unwrap()
     }
 
     fn node_public_key(seed: u8) -> NodePublicKey {
@@ -1425,11 +2228,31 @@ mod tests {
             &encrypted_segments,
             mime_type,
             codecs,
+            content_access_id(0x41),
             key_envelope,
             RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
             digest(0x19),
             threshold,
             nodes,
+        )
+        .unwrap()
+    }
+
+    fn intent() -> RuntimeMintIntent {
+        let (init_segment, clear_segments, mime_type, codecs) = test_media::media_components(0x41);
+        RuntimeMintIntent::new(
+            "person:local:runtime-mint-intent-test",
+            "localhost://Users/test/Documents/protected-clear-media",
+            "plain_localhost_root",
+            mime_type,
+            codecs,
+            &init_segment,
+            &clear_segments,
+            content_access_id(0x52),
+            CustodyPoolIdentityV1::new(digest(0x35), 512).unwrap(),
+            CustodyEpochIdentityV1::new(digest(0x33), 512).unwrap(),
+            CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap(),
+            nodes(),
         )
         .unwrap()
     }
@@ -1509,6 +2332,7 @@ mod tests {
                 &encrypted_segments,
                 mime_type,
                 codecs,
+                content_access_id(0x41),
                 KeyEnvelopeIdentityV1::new(
                     media.encrypted_content().clone(),
                     digest(0x22),
@@ -1544,6 +2368,7 @@ mod tests {
                 &encrypted_segments,
                 mime_type,
                 codecs,
+                content_access_id(0x41),
                 valid.key_envelope().clone(),
                 valid.policy().clone(),
                 valid.content_key_commitment(),
@@ -1565,6 +2390,7 @@ mod tests {
                 &encrypted_segments,
                 mime_type,
                 codecs,
+                content_access_id(0x41),
                 KeyEnvelopeIdentityV1::new(
                     stale_payload_identity,
                     digest(0x22),
@@ -1625,6 +2451,7 @@ mod tests {
             &encrypted_segments,
             mime_type,
             codecs,
+            content_access_id(0x41),
             key_envelope,
             RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
             digest(0x19),
@@ -1644,6 +2471,7 @@ mod tests {
                 &over_limit,
                 mime_type,
                 codecs,
+                draft.content_access_id(),
                 draft.key_envelope().clone(),
                 draft.policy().clone(),
                 draft.content_key_commitment(),
@@ -1697,6 +2525,95 @@ mod tests {
         assert_eq!(reloaded.custody_terminal(), aborted.custody_terminal());
         assert_eq!(reloaded.accepted_orphans().len(), 1);
         assert_eq!(journal.persist_bound(&draft).unwrap(), reloaded);
+    }
+
+    #[test]
+    fn mint_intent_protect_recovery_state_is_durable_and_exact_replay_safe() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let intent = intent();
+        let request_id = intent.request_id();
+        let handle = [0x41; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1];
+        let mint_id = draft().mint_id();
+
+        let persisted = journal.persist_intent(&intent).unwrap();
+        assert_eq!(persisted.protect_state_label(), "not_started");
+        assert!(!persisted.provider_effect_started());
+        assert_eq!(journal.persist_intent(&intent).unwrap(), persisted);
+
+        let pending = journal
+            .mark_intent_protect_effect_started(request_id)
+            .unwrap();
+        assert!(pending.protect_open_request_pending());
+        assert!(pending.provider_effect_started());
+        assert_eq!(
+            journal
+                .mark_intent_protect_effect_started(request_id)
+                .unwrap(),
+            pending
+        );
+
+        let opened = journal
+            .mark_intent_protect_opened(request_id, handle)
+            .unwrap();
+        assert_eq!(opened.protect_pending_cancel_handle(), Some(handle));
+        assert_eq!(
+            journal
+                .mark_intent_protect_opened(request_id, handle)
+                .unwrap(),
+            opened
+        );
+
+        let finalized = journal
+            .mark_intent_protect_finalized(request_id, handle)
+            .unwrap();
+        assert_eq!(finalized.protect_pending_close_handle(), Some(handle));
+        assert_eq!(
+            journal
+                .mark_intent_protect_finalized(request_id, handle)
+                .unwrap(),
+            finalized
+        );
+
+        let settled = journal
+            .mark_intent_protect_closed_before_draft(request_id)
+            .unwrap();
+        assert!(settled.protect_terminal_before_draft());
+        assert_eq!(settled.protect_terminal_settlement_label(), Some("closed"));
+
+        let completed = journal.mark_intent_completed(request_id, mint_id).unwrap();
+        assert_eq!(completed.completed_mint_id(), Some(mint_id));
+        assert_eq!(
+            journal.mark_intent_completed(request_id, mint_id).unwrap(),
+            completed
+        );
+
+        let reloaded = RuntimeMintJournal::new(&root)
+            .load_intent(request_id)
+            .unwrap();
+        assert_eq!(reloaded, completed);
+    }
+
+    #[test]
+    fn mint_intent_rejects_invalid_recovery_transitions() {
+        let temp = tempdir().unwrap();
+        let journal = RuntimeMintJournal::new(owner_only_journal_root(&temp));
+        let intent = intent();
+        journal.persist_intent(&intent).unwrap();
+        let handle = [0x42; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1];
+        assert_eq!(
+            journal.mark_intent_protect_closed_before_draft(intent.request_id()),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        assert_eq!(
+            journal.mark_intent_protect_opened(intent.request_id(), handle),
+            Err(RuntimeMintJournalError::Conflict)
+        );
+        assert_eq!(
+            journal.mark_intent_protect_finalized(intent.request_id(), handle),
+            Err(RuntimeMintJournalError::Conflict)
+        );
     }
 
     #[test]

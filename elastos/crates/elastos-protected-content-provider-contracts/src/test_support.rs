@@ -7,17 +7,18 @@ use x_wing::TryKeyInit as _;
 use crate::CencFmp4MediaIdentityV1;
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
-    CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
-    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
-    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
-    EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1,
-    NodeContributionRefV1, NodeContributionStatementV1, NodeCustodyPublicKeyV1, NodePublicKey,
-    PqHybridSealedShareV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
-    RecipientPublicKeyBytesV1, RecipientSealedContributionV1, ReplayNonce16, RightsActionV1,
-    RightsDecisionV1, RightsEvaluationEvidenceRequestV1, RightsObservationFinalityV1,
-    RightsPolicyBodyV1, RightsRequestV1, RightsSubjectSourceV1, RuntimeOperationIssuerKeyV1,
-    RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1,
-    ShareCoordinateV1, SignedCustodyEpochV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
+    CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
+    CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
+    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyPoolIdentityV1, Digest32,
+    EncryptedContentIdentityV1, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
+    KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1, NodeContributionStatementV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, PqHybridSealedShareV1,
+    RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
+    RecipientSealedContributionV1, ReplayNonce16, RightsActionV1, RightsDecisionV1,
+    RightsEvaluationEvidenceRequestV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
+    RightsRequestV1, RightsSubjectSourceV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
+    RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1, ShareCoordinateV1,
+    SignedCustodyEpochV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
     SignedRecipientKeyAuthorizationV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
     TerminalReceiptIssuerKey, TerminalReceiptStatementV1, ThresholdV1, WalletAddress,
     WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
@@ -246,6 +247,14 @@ pub(crate) fn media_identity(seed: u8) -> CencFmp4MediaIdentityV1 {
         .unwrap()
 }
 
+pub(crate) fn encrypted_content(seed: u8) -> EncryptedContentIdentityV1 {
+    EncryptedContentIdentityV1::new(digest(seed), 4096).unwrap()
+}
+
+pub(crate) fn content_access_id(seed: u8) -> ContentAccessIdV1 {
+    ContentAccessIdV1::new([seed; 16]).unwrap()
+}
+
 pub(crate) fn sealed_share(seed: u8) -> PqHybridSealedShareV1 {
     let public = x_wing::EncapsulationKey::new_from_slice(&xwing_public_key_bytes(seed)).unwrap();
     let (ciphertext, _) =
@@ -260,15 +269,15 @@ pub(crate) fn sealed_share(seed: u8) -> PqHybridSealedShareV1 {
 
 pub(crate) fn policy_body() -> RightsPolicyBodyV1 {
     RightsPolicyBodyV1::new(
-        "content:alpha",
+        encrypted_content(0x11),
+        content_access_id(0x41),
         RightsActionV1::View,
-        "view",
         RightsSubjectSourceV1::WalletAddress,
         11155111,
         EvmContractAddressV1::new([0x11; 20]).unwrap(),
         EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-        EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-        RightsObservationFinalityV1::new(12),
+        EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+        RightsObservationFinalityV1::finalized(),
     )
     .unwrap()
 }

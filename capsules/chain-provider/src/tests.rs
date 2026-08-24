@@ -2,20 +2,20 @@ use super::*;
 use ed25519_dalek::{Signer as _, SigningKey};
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
-    CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
-    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1,
-    CustodyEpochStatementV1, CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1,
-    EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyEnvelopeIdentityV1,
-    KeyReleaseRequestV1, NodeCustodyPublicKeyV1, NodePublicKey, PqHybridSealedShareV1,
-    ProfileIdentityV1, ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1,
-    RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
-    RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1, RightsObservationFinalityV1,
-    RightsPolicyBodyV1, RightsSubjectSourceV1, RuntimeOperationIssuerKeyV1,
-    RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1,
-    ShareCoordinateV1, SignedCustodyEpochV1, SignedRecipientKeyAuthorizationV1,
-    SignedRuntimeReleaseOperationV1, ThresholdV1, WalletAddress, WalletSignedRightsRequestV1,
-    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
-    X_WING_DRAFT06_CIPHERTEXT_BYTES,
+    CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
+    CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
+    CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
+    CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
+    EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyEnvelopeIdentityV1, KeyReleaseRequestV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, PqHybridSealedShareV1, ProfileIdentityV1,
+    ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
+    RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1, RightsEvaluationEvidenceRequestV1,
+    RightsEvaluationEvidenceV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
+    RightsSubjectSourceV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
+    RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1, ShareCoordinateV1,
+    SignedCustodyEpochV1, SignedRecipientKeyAuthorizationV1, SignedRuntimeReleaseOperationV1,
+    ThresholdV1, WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+    PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES, X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -105,6 +105,16 @@ fn provider_with_rights_rpc(rpc_url: String, selector: &str) -> ChainProvider {
     provider_with_rights_rpc_and_policies(rpc_url, selector, json!([]))
 }
 
+fn protected_content_policy_sources(
+    action: &str,
+    evidence_rpc_urls: Vec<String>,
+) -> serde_json::Value {
+    json!([{
+        "action": action,
+        "evidence_rpc_urls": evidence_rpc_urls,
+    }])
+}
+
 fn provider_with_rights_rpc_and_policies(
     rpc_url: String,
     selector: &str,
@@ -128,7 +138,7 @@ fn provider_with_rights_rpc_and_policies(
                     "rights_methods": [{
                         "id": "has_access_by_content_id",
                         "contract": "0x0000000000000000000000000000000000000001",
-                        "abi": "has_access_by_content_id_string_address_string",
+                        "abi": "has_access_by_content_id_address_bytes16",
                         "selector": selector,
                         "protected_content_policies": protected_content_policies
                     }]
@@ -171,7 +181,7 @@ fn provider_with_rights_rpc_without_runtime_issuer(
                     "rights_methods": [{
                         "id": "has_access_by_content_id",
                         "contract": "0x0000000000000000000000000000000000000001",
-                        "abi": "has_access_by_content_id_string_address_string",
+                        "abi": "has_access_by_content_id_address_bytes16",
                         "selector": selector
                     }]
                 }]
@@ -192,28 +202,30 @@ fn provider_with_rights_rpc_at(
     provider
 }
 
-fn protected_content_policy_and_request(
-    min_confirmations: u16,
-) -> (RightsPolicyBodyV1, RightsEvaluationEvidenceRequestV1) {
+fn protected_content_policy_and_request() -> (RightsPolicyBodyV1, RightsEvaluationEvidenceRequestV1)
+{
     let mut contract = [0u8; 20];
     contract[19] = 1;
+    let encrypted_content =
+        EncryptedContentIdentityV1::new(Digest32::new([0x11; 32]), 2048).unwrap();
+    let content_access_id = ContentAccessIdV1::new([0x41; 16]).unwrap();
     let policy = RightsPolicyBodyV1::new(
-        "bafybeigprotectedcontent",
+        encrypted_content.clone(),
+        content_access_id,
         RightsActionV1::View,
-        "view",
         RightsSubjectSourceV1::WalletAddress,
         20,
         EvmContractAddressV1::new(contract).unwrap(),
         EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-        EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-        RightsObservationFinalityV1::new(min_confirmations),
+        EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+        RightsObservationFinalityV1::finalized(),
     )
     .unwrap();
     let profile_key = SigningKey::from_bytes(&[0x43; 32]);
     let binding = ProtectedContentBindingV1::new(
-        EncryptedContentIdentityV1::new(Digest32::new([0x11; 32]), 2048).unwrap(),
+        encrypted_content.clone(),
         KeyEnvelopeIdentityV1::new(
-            EncryptedContentIdentityV1::new(Digest32::new([0x11; 32]), 2048).unwrap(),
+            encrypted_content,
             Digest32::new([0x22; 32]),
             512,
             Digest32::new([0x33; 32]),
@@ -238,10 +250,62 @@ fn contract_hex(contract: &impl CanonicalContract) -> String {
     format!("0x{}", encode_hex(&contract.canonical_bytes().unwrap()))
 }
 
+fn content_access_id(seed: u8) -> ContentAccessIdV1 {
+    ContentAccessIdV1::new([seed; 16]).unwrap()
+}
+
+fn encrypted_content(seed: u8) -> EncryptedContentIdentityV1 {
+    EncryptedContentIdentityV1::new(Digest32::new([seed; 32]), 2048).unwrap()
+}
+
 fn evm_bool_word(value: bool) -> Value {
     let mut bytes = [0u8; 32];
     bytes[31] = u8::from(value);
     json!(format!("0x{}", encode_hex(&bytes)))
+}
+
+#[test]
+fn encode_has_access_by_content_id_call_uses_address_and_bytes16_abi() {
+    let access_id = [0x41; 16];
+    let encoded = encode_has_access_by_content_id_call(
+        "0x12345678",
+        &access_id,
+        "0x00000000000000000000000000000000000000ab",
+    )
+    .unwrap();
+    assert_eq!(
+        encoded,
+        concat!(
+            "0x12345678",
+            "00000000000000000000000000000000000000000000000000000000000000ab",
+            "4141414141414141414141414141414100000000000000000000000000000000"
+        )
+    );
+}
+
+#[test]
+fn decode_evm_bool_requires_exact_32_byte_canonical_word() {
+    assert!(decode_evm_bool(&json!("0x1")).is_err());
+    assert!(decode_evm_bool(&json!(format!(
+        "0x{}",
+        encode_hex(&{
+            let mut bytes = [0u8; 32];
+            bytes[0] = 1;
+            bytes
+        })
+    )))
+    .is_err());
+    assert!(decode_evm_bool(&json!(format!(
+        "0x{}",
+        encode_hex(&{
+            let mut bytes = [0u8; 32];
+            bytes[31] = 2;
+            bytes
+        })
+    )))
+    .is_err());
+    assert!(!decode_evm_bool(&evm_bool_word(false)).unwrap());
+    assert!(decode_evm_bool(&evm_bool_word(true)).unwrap());
 }
 
 const RIGHTS_EVIDENCE_NOW: u64 = 2_000_000_010;
@@ -371,7 +435,7 @@ fn signed_custody_epoch() -> SignedCustodyEpochV1 {
 fn custody_envelope_for_policy(policy: &RightsPolicyBodyV1) -> CustodyEnvelopeV1 {
     let epoch = signed_custody_epoch();
     let manifest = CustodyEnvelopeManifestV1::new(
-        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+        policy.encrypted_content().clone(),
         CustodyPoolIdentityV1::new(digest(0x25), 512).unwrap(),
         epoch.epoch_identity().unwrap(),
         CustodyCommitteeAuthorizationIdentityV1::new(digest(0x26), 512).unwrap(),
@@ -491,8 +555,8 @@ fn signed_runtime_operation_for_policy_and_runtime_seed(
     .unwrap()
 }
 
-fn protected_content_signed_operation(min_confirmations: u16) -> SignedRuntimeReleaseOperationV1 {
-    signed_runtime_operation_for_policy(protected_content_policy_and_request(min_confirmations).0)
+fn protected_content_signed_operation() -> SignedRuntimeReleaseOperationV1 {
+    signed_runtime_operation_for_policy(protected_content_policy_and_request().0)
 }
 
 fn wallet_subject_hex(operation: &SignedRuntimeReleaseOperationV1) -> String {
@@ -1264,7 +1328,7 @@ fn bitcoin_sync_health_reports_initial_block_download() {
 
 #[test]
 fn protected_content_rights_evidence_requires_configured_runtime_issuer_before_backend() {
-    let operation = protected_content_signed_operation(0);
+    let operation = protected_content_signed_operation();
     let mut provider = provider_with_rights_rpc_without_runtime_issuer(
         "http://127.0.0.1:9".to_string(),
         "0x12345678",
@@ -1280,7 +1344,7 @@ fn protected_content_rights_evidence_requires_configured_runtime_issuer_before_b
 
 #[test]
 fn protected_content_rights_evidence_reinit_replaces_runtime_issuer_trust() {
-    let operation = protected_content_signed_operation(0);
+    let operation = protected_content_signed_operation();
     let mut provider = provider_with_rights_rpc("http://127.0.0.1:9".to_string(), "0x12345678");
 
     let malformed = provider.handle(Request::Init {
@@ -1313,11 +1377,11 @@ fn protected_content_rights_evidence_reinit_replaces_runtime_issuer_trust() {
 
 #[test]
 fn protected_content_rights_evidence_rejects_bad_signature_issuer_and_window_before_backend() {
-    let operation = protected_content_signed_operation(0);
+    let operation = protected_content_signed_operation();
     let bad_signature_operation =
         SignedRuntimeReleaseOperationV1::new(operation.statement().clone(), vec![0; 64]).unwrap();
     let wrong_issuer_operation = signed_runtime_operation_for_policy_and_runtime_seed(
-        protected_content_policy_and_request(0).0,
+        protected_content_policy_and_request().0,
         0x43,
     );
 
@@ -1359,24 +1423,22 @@ fn protected_content_rights_evidence_rejects_bad_signature_issuer_and_window_bef
 }
 
 #[test]
-fn protected_content_rights_evidence_returns_canonical_evidence_at_observed_block() {
-    let operation = protected_content_signed_operation(3);
+fn protected_content_rights_evidence_returns_canonical_evidence_at_finalized_block() {
+    let operation = protected_content_signed_operation();
     let policy = operation.statement().policy_body();
     let request = operation.statement().evidence_request();
     let expected_data = encode_has_access_by_content_id_call(
         "0x12345678",
-        policy.content_id(),
+        policy.content_access_id().as_bytes(),
         &wallet_subject_hex(&operation),
-        policy.evm_right_argument(),
     )
     .unwrap();
     let block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let rpc_url = spawn_rpc_sequence_asserting_server(vec![
+    let sequence = vec![
         ("eth_chainId", json!([]), json!("0x14")),
-        ("eth_blockNumber", json!([]), json!("0x2a")),
         (
             "eth_getBlockByNumber",
-            json!(["0x27", false]),
+            json!(["finalized", false]),
             json!({ "number": "0x27", "hash": block_hash }),
         ),
         (
@@ -1387,8 +1449,19 @@ fn protected_content_rights_evidence_returns_canonical_evidence_at_observed_bloc
             ]),
             evm_bool_word(true),
         ),
-    ]);
-    let mut provider = provider_with_rights_rpc_at(rpc_url, "0x12345678", || RIGHTS_EVIDENCE_NOW);
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        ),
+    );
+    provider.now_unix_seconds = || RIGHTS_EVIDENCE_NOW;
 
     let data = ok_data(provider.handle(Request::ProtectedContentRightsEvidence {
         signed_runtime_release_operation: contract_hex(&operation),
@@ -1399,9 +1472,8 @@ fn protected_content_rights_evidence_returns_canonical_evidence_at_observed_bloc
         "elastos.chain.protected-content-rights-evidence/v1"
     );
     assert_eq!(data["chain_id"], 20);
-    assert_eq!(data["observed_block_number"], 39);
-    assert_eq!(data["head_block_number"], 42);
-    assert_eq!(data["observed_block_hash"], block_hash);
+    assert_eq!(data["finalized_block_number"], 39);
+    assert_eq!(data["finalized_block_hash"], block_hash);
     assert!(data.get("network").is_none());
     assert!(data.get("rpc_url").is_none());
     let evidence_hex = data["rights_evaluation_evidence"].as_str().unwrap();
@@ -1423,27 +1495,24 @@ fn protected_content_rights_evidence_returns_canonical_evidence_at_observed_bloc
     assert_eq!(evidence.acquired_at(), RIGHTS_EVIDENCE_NOW);
     assert_eq!(evidence.expires_at(), RIGHTS_EVIDENCE_NOW + 30);
     assert!(evidence.has_access());
-    assert_eq!(evidence.observed_block_number(), 39);
-    assert_eq!(evidence.head_block_number(), 42);
+    assert_eq!(evidence.finalized_block_number(), 39);
 }
 
 #[test]
 fn protected_content_rights_evidence_captures_denial_without_caller_supplied_result() {
-    let operation = protected_content_signed_operation(0);
+    let operation = protected_content_signed_operation();
     let policy = operation.statement().policy_body();
     let expected_data = encode_has_access_by_content_id_call(
         "0x12345678",
-        policy.content_id(),
+        policy.content_access_id().as_bytes(),
         &wallet_subject_hex(&operation),
-        policy.evm_right_argument(),
     )
     .unwrap();
-    let rpc_url = spawn_rpc_sequence_asserting_server(vec![
+    let sequence = vec![
         ("eth_chainId", json!([]), json!("0x14")),
-        ("eth_blockNumber", json!([]), json!("0x2a")),
         (
             "eth_getBlockByNumber",
-            json!(["0x2a", false]),
+            json!(["finalized", false]),
             json!({ "number": "0x2a", "hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
         ),
         (
@@ -1454,8 +1523,19 @@ fn protected_content_rights_evidence_captures_denial_without_caller_supplied_res
             ]),
             evm_bool_word(false),
         ),
-    ]);
-    let mut provider = provider_with_rights_rpc_at(rpc_url, "0x12345678", || RIGHTS_EVIDENCE_NOW);
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        ),
+    );
+    provider.now_unix_seconds = || RIGHTS_EVIDENCE_NOW;
 
     let data = ok_data(provider.handle(Request::ProtectedContentRightsEvidence {
         signed_runtime_release_operation: contract_hex(&operation),
@@ -1471,29 +1551,56 @@ fn protected_content_rights_evidence_captures_denial_without_caller_supplied_res
 }
 
 #[test]
-fn protected_content_rights_evidence_rejects_stale_or_mismatched_authority() {
-    let operation = protected_content_signed_operation(5);
+fn protected_content_rights_evidence_rejects_fewer_than_two_matching_sources() {
+    let operation = protected_content_signed_operation();
     let rpc_url = spawn_rpc_sequence_asserting_server(vec![
         ("eth_chainId", json!([]), json!("0x14")),
-        ("eth_blockNumber", json!([]), json!("0x3")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2a", "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x0000000000000000000000000000000000000001",
+                    "data": encode_has_access_by_content_id_call(
+                        "0x12345678",
+                        operation.statement().policy_body().content_access_id().as_bytes(),
+                        &wallet_subject_hex(&operation),
+                    )
+                    .unwrap()
+                },
+                {
+                    "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "requireCanonical": true
+                }
+            ]),
+            evm_bool_word(true),
+        ),
     ]);
-    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources("view", vec![rpc_url, "http://127.0.0.1:9".to_string()]),
+    );
     assert_eq!(
         error_code(provider.handle(Request::ProtectedContentRightsEvidence {
             signed_runtime_release_operation: contract_hex(&operation),
         })),
-        "insufficient_finality"
+        "insufficient_rights_observations"
     );
 }
 
 #[test]
-fn protected_content_rights_evidence_rejects_wrong_chain_block_and_hash() {
-    let operation = protected_content_signed_operation(0);
+fn protected_content_rights_evidence_rejects_chain_and_finalized_block_mismatches() {
+    let operation = protected_content_signed_operation();
     let policy = operation.statement().policy_body();
     let wrong_chain_policy = RightsPolicyBodyV1::new(
-        policy.content_id(),
+        policy.encrypted_content().clone(),
+        policy.content_access_id(),
         RightsActionV1::View,
-        policy.evm_right_argument(),
         RightsSubjectSourceV1::WalletAddress,
         21,
         policy.contract_address(),
@@ -1511,92 +1618,174 @@ fn protected_content_rights_evidence_rejects_wrong_chain_block_and_hash() {
         "rights_query_not_configured"
     );
 
-    let rpc_url =
-        spawn_rpc_sequence_asserting_server(vec![("eth_chainId", json!([]), json!("0x15"))]);
-    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
-    assert_eq!(
-        error_code(provider.handle(Request::ProtectedContentRightsEvidence {
-            signed_runtime_release_operation: contract_hex(&operation),
-        })),
-        "chain_id_mismatch"
-    );
-
-    let rpc_url = spawn_rpc_sequence_asserting_server(vec![
-        ("eth_chainId", json!([]), json!("0x14")),
-        ("eth_blockNumber", json!([]), json!("not-a-quantity")),
-    ]);
-    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
-    assert_eq!(
-        error_code(provider.handle(Request::ProtectedContentRightsEvidence {
-            signed_runtime_release_operation: contract_hex(&operation),
-        })),
-        "upstream_invalid_head"
-    );
-
-    let rpc_url = spawn_rpc_sequence_asserting_server(vec![
-        ("eth_chainId", json!([]), json!("0x14")),
-        ("eth_blockNumber", json!([]), json!("0x2a")),
+    let expected_data = encode_has_access_by_content_id_call(
+        "0x12345678",
+        policy.content_access_id().as_bytes(),
+        &wallet_subject_hex(&operation),
+    )
+    .unwrap();
+    let wrong_chain_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x15")),
         (
             "eth_getBlockByNumber",
-            json!(["0x2a", false]),
-            json!({ "number": "0x2b", "hash": "0x1234" }),
+            json!(["finalized", false]),
+            json!({ "number": "0x2a", "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }),
         ),
-    ]);
-    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data.clone() },
+                {
+                    "blockHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "requireCanonical": true
+                }
+            ]),
+            evm_bool_word(true),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(wrong_chain_sequence.clone()),
+                spawn_rpc_sequence_asserting_server(wrong_chain_sequence),
+            ],
+        ),
+    );
     assert_eq!(
         error_code(provider.handle(Request::ProtectedContentRightsEvidence {
             signed_runtime_release_operation: contract_hex(&operation),
         })),
-        "upstream_invalid_block"
+        "conflicting_rights_observations"
     );
 
-    let rpc_url = spawn_rpc_sequence_asserting_server(vec![
+    let invalid_chain_sequence = vec![("eth_chainId", json!([]), json!("not-a-quantity"))];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(invalid_chain_sequence.clone()),
+                spawn_rpc_sequence_asserting_server(invalid_chain_sequence),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ProtectedContentRightsEvidence {
+            signed_runtime_release_operation: contract_hex(&operation),
+        })),
+        "insufficient_rights_observations"
+    );
+
+    let bool_mismatch_true = vec![
         ("eth_chainId", json!([]), json!("0x14")),
-        ("eth_blockNumber", json!([]), json!("0x2a")),
         (
             "eth_getBlockByNumber",
-            json!(["0x2a", false]),
+            json!(["finalized", false]),
+            json!({ "number": "0x2a", "hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data.clone() },
+                {
+                    "blockHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "requireCanonical": true
+                }
+            ]),
+            evm_bool_word(true),
+        ),
+    ];
+    let bool_mismatch_false = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2a", "hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data.clone() },
+                {
+                    "blockHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "requireCanonical": true
+                }
+            ]),
+            evm_bool_word(false),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(bool_mismatch_true),
+                spawn_rpc_sequence_asserting_server(bool_mismatch_false),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ProtectedContentRightsEvidence {
+            signed_runtime_release_operation: contract_hex(&operation),
+        })),
+        "conflicting_rights_observations"
+    );
+
+    let invalid_block_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
             json!({ "number": "0x2a", "hash": "0x1234" }),
         ),
-    ]);
-    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(invalid_block_sequence.clone()),
+                spawn_rpc_sequence_asserting_server(invalid_block_sequence),
+            ],
+        ),
+    );
     assert_eq!(
         error_code(provider.handle(Request::ProtectedContentRightsEvidence {
             signed_runtime_release_operation: contract_hex(&operation),
         })),
-        "upstream_invalid_block"
+        "insufficient_rights_observations"
     );
 }
 
 #[test]
-fn protected_content_rights_evidence_rejects_reorged_observed_hash() {
-    let operation = protected_content_signed_operation(0);
+fn protected_content_rights_evidence_rejects_when_eip1898_call_does_not_succeed_twice() {
+    let operation = protected_content_signed_operation();
     let policy = operation.statement().policy_body();
     let expected_data = encode_has_access_by_content_id_call(
         "0x12345678",
-        policy.content_id(),
+        policy.content_access_id().as_bytes(),
         &wallet_subject_hex(&operation),
-        policy.evm_right_argument(),
     )
     .unwrap();
-    let observed_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    let rpc_url = spawn_rpc_sequence_asserting_server_with_replies(vec![
+    let finalized_hash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let failing_rpc_url = spawn_rpc_sequence_asserting_server_with_replies(vec![
         ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
         (
-            "eth_blockNumber",
-            json!([]),
-            RpcReply::Result(json!("0x2a")),
-        ),
-        (
             "eth_getBlockByNumber",
-            json!(["0x2a", false]),
-            RpcReply::Result(json!({ "number": "0x2a", "hash": observed_hash })),
+            json!(["finalized", false]),
+            RpcReply::Result(json!({ "number": "0x2a", "hash": finalized_hash })),
         ),
         (
             "eth_call",
             json!([
                 { "to": "0x0000000000000000000000000000000000000001", "data": expected_data },
-                { "blockHash": observed_hash, "requireCanonical": true }
+                { "blockHash": finalized_hash, "requireCanonical": true }
             ]),
             RpcReply::Error(json!({
                 "code": -32001,
@@ -1604,30 +1793,60 @@ fn protected_content_rights_evidence_rejects_reorged_observed_hash() {
             })),
         ),
     ]);
-    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
+    let success_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2a", "hash": finalized_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data },
+                { "blockHash": finalized_hash, "requireCanonical": true }
+            ]),
+            evm_bool_word(true),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                failing_rpc_url,
+                spawn_rpc_sequence_asserting_server(success_sequence),
+            ],
+        ),
+    );
     assert_eq!(
         error_code(provider.handle(Request::ProtectedContentRightsEvidence {
             signed_runtime_release_operation: contract_hex(&operation),
         })),
-        "upstream_rpc_error"
+        "insufficient_rights_observations"
     );
 }
 
 #[test]
 fn resolve_protected_content_policy_returns_canonical_policy_and_evidence_accepts_it() {
-    let content_id = "content:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-    let policies = json!([{
-        "action": "view",
-        "right_argument": "view",
-        "min_confirmations": 12
-    }]);
+    let encrypted_content = encrypted_content(0x31);
+    let access_id = content_access_id(0x51);
+    let policies = protected_content_policy_sources(
+        "view",
+        vec![
+            "https://rpc-a.example".to_string(),
+            "https://rpc-b.example".to_string(),
+        ],
+    );
     let mut resolver = provider_with_rights_rpc_and_policies(
         "http://127.0.0.1:9".to_string(),
         "0x12345678",
         policies.clone(),
     );
     let data = ok_data(resolver.handle(Request::ResolveProtectedContentPolicy {
-        content_id: content_id.to_string(),
+        encrypted_content: contract_hex(&encrypted_content),
+        content_access_id: format!("0x{}", encode_hex(access_id.as_bytes())),
         action: ProtectedContentPolicyAction::View,
     }));
     let rendered = serde_json::to_string(&data).unwrap();
@@ -1635,29 +1854,27 @@ fn resolve_protected_content_policy_returns_canonical_policy_and_evidence_accept
     assert!(!rendered.contains("\"contract\""));
     assert!(!rendered.contains("\"selector\""));
     let policy = resolved_policy_body_from_data(&data);
-    assert_eq!(policy.content_id(), content_id);
+    assert_eq!(policy.encrypted_content(), &encrypted_content);
+    assert_eq!(policy.content_access_id(), access_id);
     assert_eq!(policy.required_action(), RightsActionV1::View);
-    assert_eq!(policy.evm_right_argument(), "view");
     assert_eq!(
         policy.observation_finality(),
-        RightsObservationFinalityV1::new(12)
+        RightsObservationFinalityV1::finalized()
     );
 
     let operation = signed_runtime_operation_for_policy(policy);
     let expected_data = encode_has_access_by_content_id_call(
         "0x12345678",
-        content_id,
+        access_id.as_bytes(),
         &wallet_subject_hex(&operation),
-        "view",
     )
     .unwrap();
     let block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let rpc_url = spawn_rpc_sequence_asserting_server(vec![
+    let sequence = vec![
         ("eth_chainId", json!([]), json!("0x14")),
-        ("eth_blockNumber", json!([]), json!("0x2a")),
         (
             "eth_getBlockByNumber",
-            json!(["0x1e", false]),
+            json!(["finalized", false]),
             json!({ "number": "0x1e", "hash": block_hash }),
         ),
         (
@@ -1668,8 +1885,18 @@ fn resolve_protected_content_policy_returns_canonical_policy_and_evidence_accept
             ]),
             evm_bool_word(true),
         ),
-    ]);
-    let mut provider = provider_with_rights_rpc_and_policies(rpc_url, "0x12345678", policies);
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        ),
+    );
     let evidence = ok_data(provider.handle(Request::ProtectedContentRightsEvidence {
         signed_runtime_release_operation: contract_hex(&operation),
     }));
@@ -1681,11 +1908,13 @@ fn resolve_protected_content_policy_returns_canonical_policy_and_evidence_accept
 
 #[test]
 fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
-    let content_id = "content:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let encrypted_content = encrypted_content(0x31);
+    let access_id = content_access_id(0x51);
     let mut provider = provider_with_rights_rpc("http://127.0.0.1:9".to_string(), "0x12345678");
     assert_eq!(
         error_code(provider.handle(Request::ResolveProtectedContentPolicy {
-            content_id: content_id.to_string(),
+            encrypted_content: contract_hex(&encrypted_content),
+            content_access_id: format!("0x{}", encode_hex(access_id.as_bytes())),
             action: ProtectedContentPolicyAction::View,
         })),
         "rights_policy_not_configured"
@@ -1710,12 +1939,11 @@ fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
                         "rights_methods": [{
                             "id": "has_access_by_content_id",
                             "contract": "0x0000000000000000000000000000000000000001",
-                            "abi": "has_access_by_content_id_string_address_string",
+                            "abi": "has_access_by_content_id_address_bytes16",
                             "selector": "0x12345678",
                             "protected_content_policies": [{
                                 "action": "view",
-                                "right_argument": "view",
-                                "min_confirmations": 12
+                                "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
                             }]
                         }]
                     },
@@ -1732,12 +1960,11 @@ fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
                         "rights_methods": [{
                             "id": "has_access_by_content_id",
                             "contract": "0x0000000000000000000000000000000000000001",
-                            "abi": "has_access_by_content_id_string_address_string",
+                            "abi": "has_access_by_content_id_address_bytes16",
                             "selector": "0x12345678",
                             "protected_content_policies": [{
                                 "action": "view",
-                                "right_argument": "view",
-                                "min_confirmations": 12
+                                "evidence_rpc_urls": ["https://rpc-c.example", "https://rpc-d.example"]
                             }]
                         }]
                     }
@@ -1748,7 +1975,8 @@ fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
     assert!(matches!(init, Response::Ok { .. }));
     assert_eq!(
         error_code(provider.handle(Request::ResolveProtectedContentPolicy {
-            content_id: content_id.to_string(),
+            encrypted_content: contract_hex(&encrypted_content),
+            content_access_id: format!("0x{}", encode_hex(access_id.as_bytes())),
             action: ProtectedContentPolicyAction::View,
         })),
         "ambiguous_rights_policy_source"
@@ -1760,18 +1988,28 @@ fn init_rejects_invalid_or_duplicate_protected_content_policy_sources() {
     for invalid_policies in [
         json!([{
             "action": "annotate",
-            "right_argument": "view",
-            "min_confirmations": 12
+            "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
         }]),
         json!([{
             "action": "view",
-            "right_argument": "stream",
-            "min_confirmations": 12
+            "evidence_rpc_urls": ["https://rpc-a.example"]
         }]),
         json!([{
             "action": "view",
-            "right_argument": "view",
-            "min_confirmations": 70000
+            "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-a.example"]
+        }]),
+        json!([{
+            "action": "view",
+            "evidence_rpc_urls": ["https://rpc-a.example", " https://rpc-a.example "]
+        }]),
+        json!([{
+            "action": "view",
+            "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-a.example/"]
+        }]),
+        json!([{
+            "action": "view",
+            "min_confirmations": 12,
+            "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
         }]),
     ] {
         let mut provider = ChainProvider::new();
@@ -1792,7 +2030,7 @@ fn init_rejects_invalid_or_duplicate_protected_content_policy_sources() {
                         "rights_methods": [{
                             "id": "has_access_by_content_id",
                             "contract": "0x0000000000000000000000000000000000000001",
-                            "abi": "has_access_by_content_id_string_address_string",
+                            "abi": "has_access_by_content_id_address_bytes16",
                             "selector": "0x12345678",
                             "protected_content_policies": invalid_policies
                         }]
@@ -1822,26 +2060,55 @@ fn init_rejects_invalid_or_duplicate_protected_content_policy_sources() {
                         {
                             "id": "has_access_by_content_id",
                             "contract": "0x0000000000000000000000000000000000000001",
-                            "abi": "has_access_by_content_id_string_address_string",
+                            "abi": "has_access_by_content_id_address_bytes16",
                             "selector": "0x12345678",
                             "protected_content_policies": [{
                                 "action": "view",
-                                "right_argument": "view",
-                                "min_confirmations": 12
+                                "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
                             }]
                         },
                         {
                             "id": "has_access_by_content_id",
                             "contract": "0x0000000000000000000000000000000000000002",
-                            "abi": "has_access_by_content_id_string_address_string",
+                            "abi": "has_access_by_content_id_address_bytes16",
                             "selector": "0x87654321",
                             "protected_content_policies": [{
                                 "action": "view",
-                                "right_argument": "view",
-                                "min_confirmations": 12
+                                "evidence_rpc_urls": ["https://rpc-c.example", "https://rpc-d.example"]
                             }]
                         }
                     ]
+                }]
+            }
+        }),
+    });
+    assert_eq!(error_code(response), "invalid_config");
+
+    let mut provider = ChainProvider::new();
+    let response = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                "networks": [{
+                    "id": "esc-local",
+                    "display_name": "ESC Local",
+                    "kind": "evm_json_rpc",
+                    "chain_id": 20,
+                    "native_symbol": "ELA",
+                    "provider": "test",
+                    "mainnet": false,
+                    "explorer_url": null,
+                    "rpc_url": "http://127.0.0.1:9",
+                    "rights_methods": [{
+                        "id": "has_access_by_content_id",
+                        "contract": "0x0000000000000000000000000000000000000001",
+                        "abi": "has_access_by_content_id_string_address_string",
+                        "selector": "0x12345678",
+                        "protected_content_policies": [{
+                            "action": "view",
+                            "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
+                        }]
+                    }]
                 }]
             }
         }),
@@ -1880,7 +2147,7 @@ fn protected_content_rights_evidence_rejects_malformed_or_oversized_contract_byt
 
 #[test]
 fn protected_content_rights_evidence_rejects_selector_mismatch_without_backend() {
-    let operation = protected_content_signed_operation(0);
+    let operation = protected_content_signed_operation();
     let mut provider = provider_with_rights_rpc("http://127.0.0.1:9".to_string(), "0x87654321");
     assert_eq!(
         error_code(provider.handle(Request::ProtectedContentRightsEvidence {
@@ -1892,7 +2159,7 @@ fn protected_content_rights_evidence_rejects_selector_mismatch_without_backend()
 
 #[test]
 fn protected_content_rights_evidence_rejects_ambiguous_configured_sources() {
-    let operation = protected_content_signed_operation(0);
+    let operation = protected_content_signed_operation();
     let mut provider = ChainProvider::new();
     let init = provider.handle(Request::Init {
         config: json!({
@@ -1913,8 +2180,12 @@ fn protected_content_rights_evidence_rejects_ambiguous_configured_sources() {
                     "rights_methods": [{
                         "id": "has_access_by_content_id",
                         "contract": "0x0000000000000000000000000000000000000001",
-                        "abi": "has_access_by_content_id_string_address_string",
-                        "selector": "0x12345678"
+                        "abi": "has_access_by_content_id_address_bytes16",
+                        "selector": "0x12345678",
+                        "protected_content_policies": [{
+                            "action": "view",
+                            "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
+                        }]
                     }]
                 },
                 {
@@ -1930,8 +2201,12 @@ fn protected_content_rights_evidence_rejects_ambiguous_configured_sources() {
                     "rights_methods": [{
                         "id": "has_access_by_content_id",
                         "contract": "0x0000000000000000000000000000000000000001",
-                        "abi": "has_access_by_content_id_string_address_string",
-                        "selector": "0x12345678"
+                        "abi": "has_access_by_content_id_address_bytes16",
+                        "selector": "0x12345678",
+                        "protected_content_policies": [{
+                            "action": "view",
+                            "evidence_rpc_urls": ["https://rpc-c.example", "https://rpc-d.example"]
+                        }]
                     }]
                 }
             ]
@@ -1949,7 +2224,7 @@ fn protected_content_rights_evidence_rejects_ambiguous_configured_sources() {
 
 #[test]
 fn protected_content_rights_evidence_sanitizes_upstream_rpc_errors() {
-    let operation = protected_content_signed_operation(0);
+    let operation = protected_content_signed_operation();
     let rpc_url = spawn_rpc_sequence_asserting_server_with_replies(vec![(
         "eth_chainId",
         json!([]),
@@ -1958,12 +2233,16 @@ fn protected_content_rights_evidence_sanitizes_upstream_rpc_errors() {
             "message": "http://user:secret@127.0.0.1:8545 leaked upstream body"
         })),
     )]);
-    let mut provider = provider_with_rights_rpc(rpc_url, "0x12345678");
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources("view", vec![rpc_url, "http://127.0.0.1:9".to_string()]),
+    );
     match provider.handle(Request::ProtectedContentRightsEvidence {
         signed_runtime_release_operation: contract_hex(&operation),
     }) {
         Response::Error { code, message } => {
-            assert_eq!(code, "upstream_rpc_error");
+            assert_eq!(code, "insufficient_rights_observations");
             for forbidden in ["secret", "user", "127.0.0.1", "8545", "body"] {
                 assert!(
                     !message.contains(forbidden),
@@ -2016,7 +2295,7 @@ fn init_rejects_rpc_url_userinfo_for_all_rpc_kinds() {
 
 #[test]
 fn protected_content_rights_evidence_rejects_legacy_or_injected_fields() {
-    let operation = protected_content_signed_operation(0);
+    let operation = protected_content_signed_operation();
     for value in [
         json!({
             "op": "protected_content_rights_evidence",
@@ -2071,7 +2350,7 @@ fn init_rejects_rights_methods_on_non_evm_networks() {
                 "rights_methods": [{
                     "id": "has_access_by_content_id",
                     "contract": "0x0000000000000000000000000000000000000001",
-                    "abi": "has_access_by_content_id_string_address_string",
+                    "abi": "has_access_by_content_id_address_bytes16",
                     "selector": "0x12345678"
                 }]
             }]

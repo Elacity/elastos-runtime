@@ -95,48 +95,24 @@ pub(super) fn validate_rights_methods(network: &ChainNetwork) -> Result<(), Stri
             ));
         }
         for policy in &method.protected_content_policies {
-            if policy.right_argument != policy.action.expected_right_argument() {
-                return Err(format!(
-                    "network {} configures a mismatched protected-content policy right for {:?}",
-                    network.id, policy.action
-                ));
-            }
             if !seen_actions.insert(policy.action) {
                 return Err(format!(
                     "network {} configures duplicate protected-content policy action {:?}",
                     network.id, policy.action
                 ));
             }
+            validate_protected_content_policy_sources(network, policy)?;
         }
     }
     Ok(())
 }
 
 pub(super) fn validate_rpc_url(network: &ChainNetwork) -> Result<(), String> {
-    let url = network.rpc_url.trim();
-    if url_has_userinfo(url) {
-        return Err(format!("invalid RPC URL for {}", network.id));
-    }
-    if network.kind == ChainKind::BitcoinCoreRpc {
-        if url.is_empty()
-            || url.starts_with("http://127.0.0.1:")
-            || url.starts_with("http://localhost:")
-        {
-            return Ok(());
-        }
-        return Err(format!(
-            "Bitcoin Core RPC URL for {} must be empty or loopback HTTP",
-            network.id
-        ));
-    }
-    if url.is_empty()
-        || !(url.starts_with("https://")
-            || url.starts_with("http://127.0.0.1:")
-            || url.starts_with("http://localhost:"))
-    {
-        return Err(format!("invalid RPC URL for {}", network.id));
-    }
-    Ok(())
+    validate_rpc_url_value(
+        &network.id,
+        &network.rpc_url,
+        network.kind == ChainKind::BitcoinCoreRpc,
+    )
 }
 
 fn url_has_userinfo(url: &str) -> bool {
@@ -145,4 +121,66 @@ fn url_has_userinfo(url: &str) -> bool {
     };
     let authority = rest.split('/').next().unwrap_or_default();
     authority.contains('@')
+}
+
+fn validate_protected_content_policy_sources(
+    network: &ChainNetwork,
+    policy: &ProtectedContentPolicySource,
+) -> Result<(), String> {
+    if !(2..=5).contains(&policy.evidence_rpc_urls.len()) {
+        return Err(format!(
+            "network {} action {:?} must configure 2-5 protected-content evidence RPC URLs",
+            network.id, policy.action
+        ));
+    }
+    let mut unique_urls = std::collections::BTreeSet::new();
+    for url in &policy.evidence_rpc_urls {
+        let canonical = canonicalize_protected_content_evidence_rpc_url(&network.id, url)?;
+        if !unique_urls.insert(canonical) {
+            return Err(format!(
+                "network {} action {:?} configures duplicate protected-content evidence RPC URLs",
+                network.id, policy.action
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_protected_content_evidence_rpc_url(
+    network_id: &str,
+    url: &str,
+) -> Result<String, String> {
+    let trimmed = url.trim();
+    validate_rpc_url_value(network_id, trimmed, false)?;
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+fn validate_rpc_url_value(
+    network_id: &str,
+    url: &str,
+    allow_empty_loopback_only: bool,
+) -> Result<(), String> {
+    if url_has_userinfo(url) {
+        return Err(format!("invalid RPC URL for {}", network_id));
+    }
+    if allow_empty_loopback_only {
+        if url.is_empty()
+            || url.starts_with("http://127.0.0.1:")
+            || url.starts_with("http://localhost:")
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "Bitcoin Core RPC URL for {} must be empty or loopback HTTP",
+            network_id
+        ));
+    }
+    if url.is_empty()
+        || !(url.starts_with("https://")
+            || url.starts_with("http://127.0.0.1:")
+            || url.starts_with("http://localhost:"))
+    {
+        return Err(format!("invalid RPC URL for {}", network_id));
+    }
+    Ok(())
 }

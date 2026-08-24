@@ -963,7 +963,7 @@ async fn setup_server_infrastructure_impl(
         )
         .await
         {
-            tracing::warn!("Failed to register elastos://protect sub-provider: {}", e);
+            tracing::warn!("Failed to register Runtime-only protect provider: {}", e);
         } else {
             tracing::info!(
                 "protected-content-protect-provider capsule from {}",
@@ -1423,10 +1423,18 @@ fn maybe_spawn_content_repair_scheduler(registry: Arc<provider::ProviderRegistry
                     let data = response.get("data").unwrap_or(&response);
                     tracing::debug!(
                         "content repair scheduler run completed: checked={} repaired={} failed={} skipped={}",
-                        data.get("checked").and_then(|value| value.as_u64()).unwrap_or(0),
-                        data.get("repaired").and_then(|value| value.as_u64()).unwrap_or(0),
-                        data.get("failed").and_then(|value| value.as_u64()).unwrap_or(0),
-                        data.get("skipped").and_then(|value| value.as_u64()).unwrap_or(0),
+                        data.get("checked")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                        data.get("repaired")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                        data.get("failed")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                        data.get("skipped")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
                     );
                 }
                 Err(err) => {

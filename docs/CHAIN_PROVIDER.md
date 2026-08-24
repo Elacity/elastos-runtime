@@ -102,7 +102,7 @@ Current supported ABI:
 {
   "id": "has_access_by_content_id",
   "contract": "0x0000000000000000000000000000000000000001",
-  "abi": "has_access_by_content_id_string_address_string",
+  "abi": "has_access_by_content_id_address_bytes16",
   "selector": "0x12345678"
 }
 ```
@@ -110,13 +110,13 @@ Current supported ABI:
 The provider encodes:
 
 ```text
-hasAccessByContentId(string contentId, address subject, string right) -> bool
+hasAccessByContentId(address subject, bytes16 contentId) -> bool
 ```
 
 The selector is configured explicitly so the provider does not need arbitrary ABI
 loading or contract SDKs. Missing config, mismatched contracts, malformed
-selectors, invalid subjects, invalid rights, and malformed return values all fail
-closed.
+selectors, invalid subjects, invalid `bytes16` content-access IDs, and malformed
+return values all fail closed.
 
 ## Backend Policy
 

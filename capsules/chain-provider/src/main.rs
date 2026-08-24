@@ -5,9 +5,10 @@
 
 use elastos_guest::prelude::*;
 use elastos_protected_content_contracts::{
-    CanonicalContract, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
-    RightsEvaluationEvidenceV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
-    RightsSubjectSourceV1, RuntimeOperationIssuerKeyV1, SignedRuntimeReleaseOperationV1,
+    CanonicalContract, ContentAccessIdV1, Digest32, EncryptedContentIdentityV1,
+    EvmContractAddressV1, EvmFunctionSelectorV1, RightsEvaluationEvidenceV1,
+    RightsObservationFinalityV1, RightsPolicyBodyV1, RightsSubjectSourceV1,
+    RuntimeOperationIssuerKeyV1, SignedRuntimeReleaseOperationV1,
     MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
 };
 use serde_json::{json, Value};
@@ -136,9 +137,15 @@ impl ChainProvider {
             Request::ProtectedContentRightsEvidence {
                 signed_runtime_release_operation,
             } => self.protected_content_rights_evidence(&signed_runtime_release_operation),
-            Request::ResolveProtectedContentPolicy { content_id, action } => {
-                self.resolve_protected_content_policy(&content_id, action)
-            }
+            Request::ResolveProtectedContentPolicy {
+                encrypted_content,
+                content_access_id,
+                action,
+            } => self.resolve_protected_content_policy(
+                &encrypted_content,
+                &content_access_id,
+                action,
+            ),
             Request::Proof {
                 network,
                 proof_kind,
@@ -773,123 +780,47 @@ impl ChainProvider {
         if let Err(err) = request.validate_against_policy(policy) {
             return Response::error("invalid_runtime_operation", &err.to_string());
         }
+        if request.binding().encrypted_content() != policy.encrypted_content() {
+            return Response::error("invalid_runtime_operation", "policy binding mismatch");
+        }
         if policy.subject_source() != RightsSubjectSourceV1::WalletAddress {
             return Response::error(
                 "unsupported_rights_subject_source",
                 "rights subject source is not supported",
             );
         }
-        let network = match self.evm_network_for_protected_content_policy(policy) {
-            Ok(network) => network,
-            Err(response) => return response,
-        };
-        let chain_id = policy.chain_id();
-        let method = match policy.method_abi() {
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString => {
-                let contract = format!("0x{}", encode_hex(policy.contract_address().as_bytes()));
-                match rights_method(network, "has_access_by_content_id", &contract) {
-                    Ok(method)
-                        if method.selector
-                            == format!(
-                                "0x{}",
-                                encode_hex(policy.function_selector().as_bytes())
-                            ) =>
-                    {
-                        method
-                    }
-                    Ok(_) => {
-                        return Response::error(
-                            "rights_selector_mismatch",
-                            "configured rights method selector does not match policy",
-                        )
-                    }
-                    Err(response) => return response,
-                }
-            }
-        };
-        match self.evm_rpc(network, "eth_chainId", json!([])) {
-            Ok(value) => match value.as_str().and_then(|value| parse_hex_u64(value).ok()) {
-                Some(live_chain_id) if live_chain_id == chain_id => {}
-                Some(_) => {
-                    return Response::error(
-                        "chain_id_mismatch",
-                        "live chain id does not match policy chain id",
-                    )
-                }
-                None => {
-                    return Response::error(
-                        "upstream_invalid_chain_id",
-                        "live chain id must be a hex quantity",
-                    )
-                }
-            },
-            Err(response) => return response,
+        let (network, method, policy_source) =
+            match self.configured_protected_content_policy_source_for_policy(policy) {
+                Ok(source) => source,
+                Err(response) => return response,
+            };
+        if method.selector != format!("0x{}", encode_hex(policy.function_selector().as_bytes())) {
+            return Response::error(
+                "rights_selector_mismatch",
+                "configured rights method selector does not match policy",
+            );
         }
-
-        let head = match self.evm_rpc(network, "eth_blockNumber", json!([])) {
-            Ok(value) => match value.as_str().and_then(|value| parse_hex_u64(value).ok()) {
-                Some(head) => head,
-                None => {
-                    return Response::error(
-                        "upstream_invalid_head",
-                        "chain head must be a hex quantity",
-                    )
-                }
-            },
-            Err(response) => return response,
-        };
-        let min_confirmations = u64::from(policy.observation_finality().min_confirmations());
-        let observed = match head.checked_sub(min_confirmations) {
-            Some(observed) => observed,
-            None => {
-                return Response::error(
-                    "insufficient_finality",
-                    "chain head is below required confirmation depth",
-                )
-            }
-        };
-        let observed_tag = format!("0x{observed:x}");
-        let observed_hash = match self.evm_rpc(
-            network,
-            "eth_getBlockByNumber",
-            json!([observed_tag.as_str(), false]),
-        ) {
-            Ok(value) => match evm_observed_block(&value, observed) {
-                Ok(hash) => hash,
-                Err(err) => return Response::error("upstream_invalid_block", &err),
-            },
-            Err(response) => return response,
-        };
-
         let subject = format!("0x{}", encode_hex(request.binding().wallet().as_bytes()));
         let data = match method.abi {
-            RightsMethodAbi::HasAccessByContentIdStringAddressString => {
+            RightsMethodAbi::HasAccessByContentIdAddressBytes16 => {
                 match encode_has_access_by_content_id_call(
                     &method.selector,
-                    policy.content_id(),
+                    policy.content_access_id().as_bytes(),
                     &subject,
-                    policy.evm_right_argument(),
                 ) {
                     Ok(data) => data,
                     Err(err) => return Response::error("invalid_rights_method", &err),
                 }
             }
         };
-        let has_access = match self.evm_rpc(
+        let observation = match self.observe_protected_content_rights(
             network,
-            "eth_call",
-            json!([
-                { "to": method.contract.as_str(), "data": data },
-                {
-                    "blockHash": format!("0x{}", encode_hex(observed_hash.as_bytes())),
-                    "requireCanonical": true
-                }
-            ]),
+            &policy_source.evidence_rpc_urls,
+            policy.chain_id(),
+            &method.contract,
+            &data,
         ) {
-            Ok(result) => match decode_evm_bool(&result) {
-                Ok(has_access) => has_access,
-                Err(err) => return Response::error("upstream_invalid_bool", &err),
-            },
+            Ok(observation) => observation,
             Err(response) => return response,
         };
         let acquired_at = now;
@@ -911,11 +842,10 @@ impl ChainProvider {
             request.binding().clone(),
             request.policy_identity().clone(),
             request.binding().wallet(),
-            chain_id,
-            observed,
-            observed_hash,
-            head,
-            has_access,
+            observation.chain_id,
+            observation.finalized_block_number,
+            observation.finalized_block_hash,
+            observation.has_access,
             acquired_at,
             expires_at,
         )
@@ -936,10 +866,9 @@ impl ChainProvider {
         };
         Response::ok(json!({
             "schema": "elastos.chain.protected-content-rights-evidence/v1",
-            "chain_id": chain_id,
-            "observed_block_number": observed,
-            "head_block_number": head,
-            "observed_block_hash": format!("0x{}", encode_hex(observed_hash.as_bytes())),
+            "chain_id": observation.chain_id,
+            "finalized_block_number": observation.finalized_block_number,
+            "finalized_block_hash": format!("0x{}", encode_hex(observation.finalized_block_hash.as_bytes())),
             "rights_evaluation_evidence": format!("0x{}", encode_hex(&evidence_bytes)),
             "rights_evaluation_evidence_hash": format!("0x{}", encode_hex(evidence_hash.as_bytes())),
         }))
@@ -947,10 +876,11 @@ impl ChainProvider {
 
     fn resolve_protected_content_policy(
         &self,
-        content_id: &str,
+        encrypted_content: &str,
+        content_access_id: &str,
         action: ProtectedContentPolicyAction,
     ) -> Response {
-        let (network, method, policy_source) =
+        let (network, method, _policy_source) =
             match self.configured_protected_content_policy_source(action) {
                 Ok(source) => source,
                 Err(response) => return response,
@@ -969,16 +899,24 @@ impl ChainProvider {
             Ok(value) => value,
             Err(response) => return response,
         };
+        let encrypted_content = match parse_encrypted_content_identity(encrypted_content) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let content_access_id = match parse_content_access_id(content_access_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
         let policy = match RightsPolicyBodyV1::new(
-            content_id,
+            encrypted_content,
+            content_access_id,
             action.to_contract_action(),
-            policy_source.right_argument.as_str(),
             RightsSubjectSourceV1::WalletAddress,
             chain_id,
             contract,
             selector,
             method.abi.to_contract_abi(),
-            RightsObservationFinalityV1::new(policy_source.min_confirmations),
+            RightsObservationFinalityV1::finalized(),
         ) {
             Ok(value) => value,
             Err(_) => {
@@ -1003,20 +941,38 @@ impl ChainProvider {
         }))
     }
 
-    fn evm_network_for_protected_content_policy(
+    fn configured_protected_content_policy_source_for_policy(
         &self,
         policy: &RightsPolicyBodyV1,
-    ) -> Result<&ChainNetwork, Response> {
+    ) -> Result<(&ChainNetwork, &RightsMethod, &ProtectedContentPolicySource), Response> {
         let contract = format!("0x{}", encode_hex(policy.contract_address().as_bytes()));
-        let mut matches = self.networks.iter().filter(|network| {
-            network.kind == ChainKind::EvmJsonRpc
-                && network.chain_id == Some(policy.chain_id())
-                && network.rights_methods.iter().any(|method| {
-                    method.id == "has_access_by_content_id"
-                        && method.contract.eq_ignore_ascii_case(&contract)
+        let selector = format!("0x{}", encode_hex(policy.function_selector().as_bytes()));
+        let required_action = policy.required_action();
+        let mut matches = self
+            .networks
+            .iter()
+            .filter(|network| {
+                network.kind == ChainKind::EvmJsonRpc && network.chain_id == Some(policy.chain_id())
+            })
+            .flat_map(|network| {
+                let contract = contract.clone();
+                let selector = selector.clone();
+                network.rights_methods.iter().flat_map(move |method| {
+                    let contract = contract.clone();
+                    let selector = selector.clone();
+                    method
+                        .protected_content_policies
+                        .iter()
+                        .filter(move |policy_source| {
+                            method.id == "has_access_by_content_id"
+                                && method.contract.eq_ignore_ascii_case(&contract)
+                                && method.selector == selector
+                                && policy_source.action.to_contract_action() == required_action
+                        })
+                        .map(move |policy_source| (network, method, policy_source))
                 })
-        });
-        let Some(network) = matches.next() else {
+            });
+        let Some(source) = matches.next() else {
             return Err(Response::error(
                 "rights_query_not_configured",
                 "no configured protected-content rights evidence source matches policy",
@@ -1028,7 +984,7 @@ impl ChainProvider {
                 "multiple protected-content rights evidence sources match policy",
             ));
         }
-        Ok(network)
+        Ok(source)
     }
 
     fn configured_protected_content_policy_source(
@@ -1061,6 +1017,90 @@ impl ChainProvider {
             ));
         }
         Ok(source)
+    }
+
+    fn observe_protected_content_rights(
+        &self,
+        network: &ChainNetwork,
+        evidence_rpc_urls: &[String],
+        expected_chain_id: u64,
+        contract: &str,
+        data: &str,
+    ) -> Result<ProtectedContentEvidenceObservation, Response> {
+        let mut successful = Vec::new();
+        for rpc_url in evidence_rpc_urls {
+            if let Some(observation) =
+                self.observe_protected_content_rights_source(network, rpc_url, contract, data)
+            {
+                successful.push(observation);
+            }
+        }
+        if successful
+            .iter()
+            .any(|observation| observation.chain_id != expected_chain_id)
+        {
+            return Err(Response::error(
+                "conflicting_rights_observations",
+                "protected-content evidence sources disagree with configured chain policy",
+            ));
+        }
+        if successful.len() < 2 {
+            return Err(Response::error(
+                "insufficient_rights_observations",
+                "protected-content evidence sources produced fewer than two matching finalized observations",
+            ));
+        }
+        let reference = successful[0];
+        if successful[1..]
+            .iter()
+            .any(|observation| *observation != reference)
+        {
+            return Err(Response::error(
+                "conflicting_rights_observations",
+                "protected-content evidence sources disagree on finalized rights observation",
+            ));
+        }
+        Ok(reference)
+    }
+
+    fn observe_protected_content_rights_source(
+        &self,
+        network: &ChainNetwork,
+        rpc_url: &str,
+        contract: &str,
+        data: &str,
+    ) -> Option<ProtectedContentEvidenceObservation> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let chain_id = self
+            .evm_rpc(&source_network, "eth_chainId", json!([]))
+            .ok()
+            .and_then(|value| value.as_str().and_then(|value| parse_hex_u64(value).ok()))?;
+        let mut finalized = self
+            .evm_rpc(
+                &source_network,
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+            )
+            .ok()
+            .and_then(|value| evm_finalized_block(&value).ok())?;
+        let has_access = self
+            .evm_rpc(
+                &source_network,
+                "eth_call",
+                json!([
+                    { "to": contract, "data": data },
+                    {
+                        "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                        "requireCanonical": true
+                    }
+                ]),
+            )
+            .ok()
+            .and_then(|result| decode_evm_bool(&result).ok())?;
+        finalized.chain_id = chain_id;
+        finalized.has_access = has_access;
+        Some(finalized)
     }
 
     fn proof(&self, network_id: &str, proof_kind: ChainProofKind, subject: &str) -> Response {
@@ -1339,6 +1379,39 @@ impl ChainProvider {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProtectedContentEvidenceObservation {
+    chain_id: u64,
+    finalized_block_number: u64,
+    finalized_block_hash: Digest32,
+    has_access: bool,
+}
+
+fn evm_finalized_block(value: &Value) -> Result<ProtectedContentEvidenceObservation, String> {
+    let finalized_block_number = value
+        .get("number")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "EVM block number missing".to_string())
+        .and_then(|value| {
+            parse_hex_u64(value).map_err(|_| "EVM block number must be a hex quantity".to_string())
+        })?;
+    let hash = value
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "EVM block hash missing".to_string())?;
+    let bytes = decode_hex(hash, Some(32), "EVM block hash")?;
+    Ok(ProtectedContentEvidenceObservation {
+        chain_id: 0,
+        finalized_block_number,
+        finalized_block_hash: Digest32::new(
+            bytes
+                .try_into()
+                .map_err(|_| "EVM block hash must be 32 bytes".to_string())?,
+        ),
+        has_access: false,
+    })
+}
+
 fn parse_evm_contract_address(value: &str) -> Result<EvmContractAddressV1, Response> {
     let bytes = decode_hex(value, Some(20), "EVM address").map_err(|_| {
         Response::error(
@@ -1377,6 +1450,42 @@ fn parse_evm_function_selector(value: &str) -> Result<EvmFunctionSelectorV1, Res
         Response::error(
             "invalid_configured_policy_source",
             "configured protected-content rights policy source is invalid",
+        )
+    })
+}
+
+fn parse_encrypted_content_identity(value: &str) -> Result<EncryptedContentIdentityV1, Response> {
+    let bytes = decode_hex(value, None, "encrypted_content").map_err(|_| {
+        Response::error(
+            "invalid_rights_policy_request",
+            "protected-content rights policy request is invalid",
+        )
+    })?;
+    EncryptedContentIdentityV1::from_canonical_bytes(&bytes).map_err(|_| {
+        Response::error(
+            "invalid_rights_policy_request",
+            "protected-content rights policy request is invalid",
+        )
+    })
+}
+
+fn parse_content_access_id(value: &str) -> Result<ContentAccessIdV1, Response> {
+    let bytes = decode_hex(value, Some(16), "content_access_id").map_err(|_| {
+        Response::error(
+            "invalid_rights_policy_request",
+            "protected-content rights policy request is invalid",
+        )
+    })?;
+    let bytes: [u8; 16] = bytes.try_into().map_err(|_| {
+        Response::error(
+            "invalid_rights_policy_request",
+            "protected-content rights policy request is invalid",
+        )
+    })?;
+    ContentAccessIdV1::new(bytes).map_err(|_| {
+        Response::error(
+            "invalid_rights_policy_request",
+            "protected-content rights policy request is invalid",
         )
     })
 }

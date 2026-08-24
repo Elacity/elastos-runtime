@@ -74,8 +74,8 @@ impl RightsMethod {
 impl RightsMethodAbi {
     pub(super) const fn to_contract_abi(self) -> EvmRightsMethodAbiV1 {
         match self {
-            Self::HasAccessByContentIdStringAddressString => {
-                EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString
+            Self::HasAccessByContentIdAddressBytes16 => {
+                EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16
             }
         }
     }
@@ -99,49 +99,19 @@ impl ProtectedContentPolicyAction {
             Self::Execute => RightsActionV1::Execute,
         }
     }
-
-    pub(super) const fn expected_right_argument(self) -> ProtectedContentRightArgument {
-        match self {
-            Self::View => ProtectedContentRightArgument::View,
-            Self::Stream => ProtectedContentRightArgument::Stream,
-            Self::Download => ProtectedContentRightArgument::Download,
-            Self::Execute => ProtectedContentRightArgument::Execute,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum ProtectedContentRightArgument {
-    View,
-    Stream,
-    Download,
-    Execute,
-}
-
-impl ProtectedContentRightArgument {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::View => "view",
-            Self::Stream => "stream",
-            Self::Download => "download",
-            Self::Execute => "execute",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ProtectedContentPolicySource {
     pub(super) action: ProtectedContentPolicyAction,
-    pub(super) right_argument: ProtectedContentRightArgument,
-    pub(super) min_confirmations: u16,
+    pub(super) evidence_rpc_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum RightsMethodAbi {
-    HasAccessByContentIdStringAddressString,
+    HasAccessByContentIdAddressBytes16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,7 +191,8 @@ pub(super) enum Request {
         signed_runtime_release_operation: String,
     },
     ResolveProtectedContentPolicy {
-        content_id: String,
+        encrypted_content: String,
+        content_access_id: String,
         action: ProtectedContentPolicyAction,
     },
     Proof {

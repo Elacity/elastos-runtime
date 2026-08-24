@@ -1,7 +1,5 @@
 use super::*;
-use elastos_protected_content_contracts::{
-    CanonicalContract, Digest32, RuntimeOperationIssuerKeyV1,
-};
+use elastos_protected_content_contracts::{CanonicalContract, RuntimeOperationIssuerKeyV1};
 use sha2::Digest;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -154,27 +152,6 @@ pub(super) fn parse_runtime_issuer(value: &Value) -> Result<RuntimeOperationIssu
             .map_err(|_| "protected-content Runtime issuer must be 32 bytes".to_string())?,
     )
     .map_err(|_| "protected-content Runtime issuer is invalid".to_string())
-}
-
-pub(super) fn evm_observed_block(value: &Value, expected_number: u64) -> Result<Digest32, String> {
-    let number = value
-        .get("number")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "EVM block number missing".to_string())
-        .and_then(|value| {
-            parse_hex_u64(value).map_err(|_| "EVM block number must be a hex quantity".to_string())
-        })?;
-    if number != expected_number {
-        return Err("EVM block number does not match requested observation".to_string());
-    }
-    let hash = value
-        .get("hash")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "EVM block hash missing".to_string())?;
-    let bytes = decode_hex(hash, Some(32), "EVM block hash")?;
-    Ok(Digest32::new(bytes.try_into().map_err(|_| {
-        "EVM block hash must be 32 bytes".to_string()
-    })?))
 }
 
 pub(super) fn hex_value(byte: u8) -> Option<u8> {

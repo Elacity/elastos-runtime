@@ -239,19 +239,20 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use elastos_auth::ethereum_signed_message_hash;
     use elastos_protected_content_contracts::{
-        CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
-        CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1,
-        CustodyEpochStatementV1, CustodyPoolIdentityV1, Digest32, EncryptedContentIdentityV1,
-        EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseRequestV1,
-        NodeCustodyPublicKeyV1, PqHybridSealedShareV1, ProtectedContentBindingV1,
-        RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
-        ReplayNonce16, RightsActionV1, RightsEvaluationEvidenceRequestV1,
-        RightsObservationFinalityV1, RightsPolicyBodyV1, RightsSubjectSourceV1,
-        RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
-        RuntimeSessionBindingV1, ShareCoordinateV1, SignedCustodyEpochV1,
-        SignedRecipientKeyAuthorizationV1, SignedRuntimeReleaseOperationV1, ThresholdV1,
-        WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
-        PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES, X_WING_DRAFT06_CIPHERTEXT_BYTES,
+        CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
+        CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
+        CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyPoolIdentityV1, Digest32,
+        EncryptedContentIdentityV1, EvmContractAddressV1, EvmFunctionSelectorV1,
+        EvmRightsMethodAbiV1, KeyReleaseRequestV1, NodeCustodyPublicKeyV1, PqHybridSealedShareV1,
+        ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
+        RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
+        RightsEvaluationEvidenceRequestV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
+        RightsSubjectSourceV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
+        RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1, ShareCoordinateV1,
+        SignedCustodyEpochV1, SignedRecipientKeyAuthorizationV1, SignedRuntimeReleaseOperationV1,
+        ThresholdV1, WalletAddress, WalletSignedRightsRequestV1,
+        CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
+        X_WING_DRAFT06_CIPHERTEXT_BYTES,
     };
     use elastos_protected_content_provider_contracts::{
         RightsProviderRequestV1, RightsProviderResponseStatusV1, ValidatedRightsProviderRequestV1,
@@ -328,15 +329,15 @@ mod tests {
 
     fn policy_body() -> RightsPolicyBodyV1 {
         RightsPolicyBodyV1::new(
-            "content:alpha",
+            EncryptedContentIdentityV1::new(digest(0x41), 4096).unwrap(),
+            ContentAccessIdV1::new([0x51; 16]).unwrap(),
             RightsActionV1::View,
-            "view",
             RightsSubjectSourceV1::WalletAddress,
             11155111,
             EvmContractAddressV1::new([0x11; 20]).unwrap(),
             EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-            RightsObservationFinalityV1::new(12),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
         )
         .unwrap()
     }
@@ -542,7 +543,6 @@ mod tests {
             policy.chain_id(),
             100,
             digest(0x88),
-            112,
             has_access,
             NOW + 4,
             NOW + 30,
@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_rights_evaluator_rejects_stale_chain_evidence() {
+    fn typed_rights_evaluator_rejects_pre_operation_chain_evidence() {
         let operation = signed_operation(0x42);
         let request = validated_request(&operation, 1);
         let authenticated = request.authenticated_runtime_release_operation();
@@ -718,9 +718,8 @@ mod tests {
             policy.chain_id(),
             100,
             digest(0x88),
-            111,
             true,
-            NOW + 4,
+            NOW + 1,
             NOW + 30,
         )
         .unwrap();
@@ -747,7 +746,6 @@ mod tests {
             policy.chain_id(),
             100,
             digest(0x88),
-            112,
             true,
             NOW + 10,
             NOW + 30,
@@ -772,7 +770,6 @@ mod tests {
             policy.chain_id(),
             100,
             digest(0x88),
-            112,
             true,
             NOW + 4,
             NOW + 6,
@@ -881,11 +878,10 @@ mod tests {
         serde_json::json!({
             "schema": "elastos.chain.protected-content-rights-evidence/v1",
             "chain_id": evidence.observed_chain_id(),
-            "observed_block_number": evidence.observed_block_number(),
-            "head_block_number": evidence.head_block_number(),
-            "observed_block_hash": format!(
+            "finalized_block_number": evidence.finalized_block_number(),
+            "finalized_block_hash": format!(
                 "0x{}",
-                hex::encode(evidence.observed_block_hash().as_bytes())
+                hex::encode(evidence.finalized_block_hash().as_bytes())
             ),
             "rights_evaluation_evidence": format!("0x{}", hex::encode(&bytes)),
             "rights_evaluation_evidence_hash": format!(
@@ -955,6 +951,13 @@ mod tests {
         with_has_access["has_access"] = serde_json::json!(true);
         assert_eq!(
             parse_chain_rights_evidence_data(&with_has_access).unwrap_err(),
+            RightsEvaluationErrorV1::ChainEvidence
+        );
+
+        let mut with_old_finality_shape = chain_data_for(&evidence);
+        with_old_finality_shape["head_block_number"] = serde_json::json!(42);
+        assert_eq!(
+            parse_chain_rights_evidence_data(&with_old_finality_shape).unwrap_err(),
             RightsEvaluationErrorV1::ChainEvidence
         );
 

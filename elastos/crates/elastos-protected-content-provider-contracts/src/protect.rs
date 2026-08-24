@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use elastos_protected_content_contracts::{
-    ContractError, CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1,
+    ContentAccessIdV1, ContractError, CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1,
     CustodyEpochIdentityV1, CustodyPoolIdentityV1, Digest32, NodeCustodyPublicKeyV1, NodePublicKey,
     PQ_HYBRID_WRAP_PUBLIC_KEY_BYTES,
 };
@@ -84,6 +84,7 @@ enum ProtectProviderRequestKindV1 {
     OpenProtectionSession {
         schema: String,
         protection_session_request_id: [u8; 32],
+        content_access_id: IdentityBlobV1,
         custody_pool: IdentityBlobV1,
         custody_epoch: IdentityBlobV1,
         custody_committee_authorization: IdentityBlobV1,
@@ -142,6 +143,7 @@ impl ProtectProviderRequestV1 {
     )]
     pub fn new_open_protection_session(
         protection_session_request_id: Digest32,
+        content_access_id: ContentAccessIdV1,
         custody_pool: CustodyPoolIdentityV1,
         custody_epoch: CustodyEpochIdentityV1,
         custody_committee_authorization: CustodyCommitteeAuthorizationIdentityV1,
@@ -154,6 +156,7 @@ impl ProtectProviderRequestV1 {
         let value = Self(ProtectProviderRequestKindV1::OpenProtectionSession {
             schema: PROTECT_PROVIDER_REQUEST_SCHEMA_V1.to_string(),
             protection_session_request_id: *protection_session_request_id.as_bytes(),
+            content_access_id: CanonicalBlob::from_contract(&content_access_id)?,
             custody_pool: CanonicalBlob::from_contract(&custody_pool)?,
             custody_epoch: CanonicalBlob::from_contract(&custody_epoch)?,
             custody_committee_authorization: CanonicalBlob::from_contract(
@@ -242,6 +245,15 @@ impl ProtectProviderRequestV1 {
             ProtectProviderRequestKindV1::OpenProtectionSession { custody_pool, .. } => {
                 Ok(Some(custody_pool.decode()?))
             }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn content_access_id(&self) -> Result<Option<ContentAccessIdV1>, ContractError> {
+        match &self.0 {
+            ProtectProviderRequestKindV1::OpenProtectionSession {
+                content_access_id, ..
+            } => Ok(Some(content_access_id.decode()?)),
             _ => Ok(None),
         }
     }
@@ -373,6 +385,9 @@ impl ProtectProviderRequestV1 {
                 if *protection_session_request_id == [0u8; 32] {
                     return Err(ContractError::InvalidField("protection_session_request_id"));
                 }
+                let _ = self
+                    .content_access_id()?
+                    .ok_or(ContractError::InvalidField("content_access_id"))?;
                 if *threshold_required != REQUIRED_THRESHOLD_REQUIRED_V1
                     || *threshold_total != REQUIRED_THRESHOLD_TOTAL_V1
                 {
@@ -805,6 +820,10 @@ mod tests {
         CustodyCommitteeAuthorizationIdentityV1::new(digest(0x36), 512).unwrap()
     }
 
+    fn content_access_id() -> ContentAccessIdV1 {
+        ContentAccessIdV1::new([0x41; 16]).unwrap()
+    }
+
     fn open_request_with(
         mime_type: &str,
         codecs: &str,
@@ -813,6 +832,7 @@ mod tests {
     ) -> Result<ProtectProviderRequestV1, ContractError> {
         ProtectProviderRequestV1::new_open_protection_session(
             digest(0xa1),
+            content_access_id(),
             custody_pool_identity(),
             custody_epoch_identity(),
             custody_committee_authorization_identity(),
@@ -835,6 +855,10 @@ mod tests {
         assert_eq!(decoded, request);
         assert_eq!(decoded.segment_count(), Some(2));
         assert_eq!(decoded.clear_init_segment(), Some(init_segment.as_slice()));
+        assert_eq!(
+            decoded.content_access_id().unwrap(),
+            Some(content_access_id())
+        );
     }
 
     #[test]
@@ -903,6 +927,7 @@ mod tests {
         .is_err());
         assert!(ProtectProviderRequestV1::new_open_protection_session(
             Digest32::new([0u8; 32]),
+            content_access_id(),
             custody_pool_identity(),
             custody_epoch_identity(),
             custody_committee_authorization_identity(),

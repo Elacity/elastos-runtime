@@ -8,7 +8,7 @@ use sha3::Keccak256;
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
     AtomicReplayClaimer, AuthenticatedRuntimeReleaseOperationV1, CanonicalContract,
-    CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
+    ContentAccessIdV1, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
     CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeV1, CustodyEpochIdentityV1,
     CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyPoolFailureDomainIdV1,
     CustodyPoolIdentityV1, CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1,
@@ -286,15 +286,15 @@ fn binding_for_wallet_with_envelope(
 
 fn policy_body() -> RightsPolicyBodyV1 {
     RightsPolicyBodyV1::new(
-        "content:alpha",
+        EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+        ContentAccessIdV1::new([0x41; 16]).unwrap(),
         RightsActionV1::View,
-        "view",
         RightsSubjectSourceV1::WalletAddress,
         11155111,
         EvmContractAddressV1::new([0x11; 20]).unwrap(),
         EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-        EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-        RightsObservationFinalityV1::new(12),
+        EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+        RightsObservationFinalityV1::finalized(),
     )
     .unwrap()
 }

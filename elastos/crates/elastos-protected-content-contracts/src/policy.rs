@@ -1,15 +1,49 @@
 use serde::Serialize;
 
-use crate::canonical::{validate_ascii_identifier, CanonicalBody, ContractError, Decoder, Encoder};
+use crate::canonical::{CanonicalBody, ContractError, Decoder, Encoder};
 use crate::rights::{validate_active, validate_time_window};
 use crate::{
-    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, Digest32, ProtectedContentBindingV1,
-    RightsActionV1, RightsPolicyIdentityV1, WalletAddress,
+    AuthenticatedRuntimeReleaseOperationV1, CanonicalContract, Digest32,
+    EncryptedContentIdentityV1, ProtectedContentBindingV1, RightsActionV1, RightsPolicyIdentityV1,
+    WalletAddress,
 };
 
-const MAX_POLICY_IDENTIFIER_BYTES: usize = 256;
-const MAX_EVM_RIGHT_ARGUMENT_BYTES: usize = "download".len();
 pub const MAX_RIGHTS_EVIDENCE_LIFETIME_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ContentAccessIdV1([u8; 16]);
+
+impl ContentAccessIdV1 {
+    pub fn new(bytes: [u8; 16]) -> Result<Self, ContractError> {
+        if bytes == [0; 16] {
+            return Err(ContractError::InvalidField("content_access_id"));
+        }
+        Ok(Self(bytes))
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl CanonicalBody for ContentAccessIdV1 {
+    const DOMAIN: &'static str = "elastos.protected-content.content-access-id/v1";
+
+    fn validate(&self) -> Result<(), ContractError> {
+        ContentAccessIdV1::new(self.0)?;
+        Ok(())
+    }
+
+    fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
+        encoder.fixed(self.as_bytes());
+        Ok(())
+    }
+
+    fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
+        Self::new(decoder.fixed()?)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -48,13 +82,13 @@ impl EvmFunctionSelectorV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[repr(u8)]
 pub enum EvmRightsMethodAbiV1 {
-    HasAccessByContentIdStringAddressString = 1,
+    HasAccessByContentIdAddressBytes16 = 1,
 }
 
 impl EvmRightsMethodAbiV1 {
     fn decode(value: u8) -> Result<Self, ContractError> {
         match value {
-            1 => Ok(Self::HasAccessByContentIdStringAddressString),
+            1 => Ok(Self::HasAccessByContentIdAddressBytes16),
             _ => Err(ContractError::InvalidField("evm_rights_method_abi")),
         }
     }
@@ -76,17 +110,22 @@ impl RightsSubjectSourceV1 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub struct RightsObservationFinalityV1 {
-    min_confirmations: u16,
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum RightsObservationFinalityV1 {
+    Finalized = 1,
 }
 
 impl RightsObservationFinalityV1 {
-    pub const fn new(min_confirmations: u16) -> Self {
-        Self { min_confirmations }
+    pub const fn finalized() -> Self {
+        Self::Finalized
     }
 
-    pub const fn min_confirmations(&self) -> u16 {
-        self.min_confirmations
+    fn decode(value: u8) -> Result<Self, ContractError> {
+        match value {
+            1 => Ok(Self::Finalized),
+            _ => Err(ContractError::InvalidField("rights_observation_finality")),
+        }
     }
 }
 
@@ -98,20 +137,20 @@ impl CanonicalBody for RightsObservationFinalityV1 {
     }
 
     fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
-        encoder.u16(self.min_confirmations);
+        encoder.u8(*self as u8);
         Ok(())
     }
 
     fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
-        Ok(Self::new(decoder.u16()?))
+        Self::decode(decoder.u8()?)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RightsPolicyBodyV1 {
-    content_id: String,
+    encrypted_content: EncryptedContentIdentityV1,
+    content_access_id: ContentAccessIdV1,
     required_action: RightsActionV1,
-    evm_right_argument: String,
     subject_source: RightsSubjectSourceV1,
     chain_id: u64,
     contract_address: EvmContractAddressV1,
@@ -123,9 +162,9 @@ pub struct RightsPolicyBodyV1 {
 impl RightsPolicyBodyV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        content_id: impl Into<String>,
+        encrypted_content: EncryptedContentIdentityV1,
+        content_access_id: ContentAccessIdV1,
         required_action: RightsActionV1,
-        evm_right_argument: impl Into<String>,
         subject_source: RightsSubjectSourceV1,
         chain_id: u64,
         contract_address: EvmContractAddressV1,
@@ -134,9 +173,9 @@ impl RightsPolicyBodyV1 {
         observation_finality: RightsObservationFinalityV1,
     ) -> Result<Self, ContractError> {
         let value = Self {
-            content_id: content_id.into(),
+            encrypted_content,
+            content_access_id,
             required_action,
-            evm_right_argument: evm_right_argument.into(),
             subject_source,
             chain_id,
             contract_address,
@@ -148,16 +187,16 @@ impl RightsPolicyBodyV1 {
         Ok(value)
     }
 
-    pub fn content_id(&self) -> &str {
-        &self.content_id
+    pub fn encrypted_content(&self) -> &EncryptedContentIdentityV1 {
+        &self.encrypted_content
+    }
+
+    pub const fn content_access_id(&self) -> ContentAccessIdV1 {
+        self.content_access_id
     }
 
     pub const fn required_action(&self) -> RightsActionV1 {
         self.required_action
-    }
-
-    pub fn evm_right_argument(&self) -> &str {
-        &self.evm_right_argument
     }
 
     pub const fn subject_source(&self) -> RightsSubjectSourceV1 {
@@ -197,8 +236,8 @@ impl CanonicalBody for RightsPolicyBodyV1 {
     const DOMAIN: &'static str = "elastos.protected-content.rights-policy-body/v1";
 
     fn validate(&self) -> Result<(), ContractError> {
-        validate_policy_identifier(&self.content_id, "content_id")?;
-        validate_evm_right_argument(&self.evm_right_argument)?;
+        self.encrypted_content.canonical_bytes()?;
+        ContentAccessIdV1::new(*self.content_access_id.as_bytes())?;
         if self.chain_id == 0 {
             return Err(ContractError::InvalidField("chain_id"));
         }
@@ -209,9 +248,9 @@ impl CanonicalBody for RightsPolicyBodyV1 {
     }
 
     fn encode_fields(&self, encoder: &mut Encoder) -> Result<(), ContractError> {
-        encoder.string(&self.content_id)?;
+        encoder.nested(&self.encrypted_content)?;
+        encoder.fixed(self.content_access_id.as_bytes());
         encoder.u8(self.required_action as u8);
-        encoder.string(&self.evm_right_argument)?;
         encoder.u8(self.subject_source as u8);
         encoder.u64(self.chain_id);
         encoder.fixed(self.contract_address.as_bytes());
@@ -223,9 +262,9 @@ impl CanonicalBody for RightsPolicyBodyV1 {
 
     fn decode_fields(decoder: &mut Decoder<'_>) -> Result<Self, ContractError> {
         Self::new(
-            decoder.string("content_id", MAX_POLICY_IDENTIFIER_BYTES)?,
+            decoder.nested("encrypted_content")?,
+            ContentAccessIdV1::new(decoder.fixed()?)?,
             RightsActionV1::decode(decoder.u8()?)?,
-            decoder.string("evm_right_argument", MAX_EVM_RIGHT_ARGUMENT_BYTES)?,
             RightsSubjectSourceV1::decode(decoder.u8()?)?,
             decoder.u64()?,
             EvmContractAddressV1::new(decoder.fixed()?)?,
@@ -314,9 +353,8 @@ pub struct RightsEvaluationEvidenceV1 {
     policy_identity: RightsPolicyIdentityV1,
     subject_wallet: WalletAddress,
     observed_chain_id: u64,
-    observed_block_number: u64,
-    observed_block_hash: Digest32,
-    head_block_number: u64,
+    finalized_block_number: u64,
+    finalized_block_hash: Digest32,
     has_access: bool,
     acquired_at: u64,
     expires_at: u64,
@@ -331,9 +369,8 @@ impl RightsEvaluationEvidenceV1 {
         policy_identity: RightsPolicyIdentityV1,
         subject_wallet: WalletAddress,
         observed_chain_id: u64,
-        observed_block_number: u64,
-        observed_block_hash: Digest32,
-        head_block_number: u64,
+        finalized_block_number: u64,
+        finalized_block_hash: Digest32,
         has_access: bool,
         acquired_at: u64,
         expires_at: u64,
@@ -345,9 +382,8 @@ impl RightsEvaluationEvidenceV1 {
             policy_identity,
             subject_wallet,
             observed_chain_id,
-            observed_block_number,
-            observed_block_hash,
-            head_block_number,
+            finalized_block_number,
+            finalized_block_hash,
             has_access,
             acquired_at,
             expires_at,
@@ -380,16 +416,12 @@ impl RightsEvaluationEvidenceV1 {
         self.observed_chain_id
     }
 
-    pub const fn observed_block_number(&self) -> u64 {
-        self.observed_block_number
+    pub const fn finalized_block_number(&self) -> u64 {
+        self.finalized_block_number
     }
 
-    pub const fn observed_block_hash(&self) -> Digest32 {
-        self.observed_block_hash
-    }
-
-    pub const fn head_block_number(&self) -> u64 {
-        self.head_block_number
+    pub const fn finalized_block_hash(&self) -> Digest32 {
+        self.finalized_block_hash
     }
 
     pub const fn has_access(&self) -> bool {
@@ -421,14 +453,6 @@ impl RightsEvaluationEvidenceV1 {
         }
         if self.observed_chain_id != policy.chain_id() {
             return Err(ContractError::InvalidField("evidence.observed_chain_id"));
-        }
-        let required_confirmations = u64::from(policy.observation_finality().min_confirmations());
-        if self
-            .head_block_number
-            .saturating_sub(self.observed_block_number)
-            < required_confirmations
-        {
-            return Err(ContractError::InvalidField("evidence.head_block_number"));
         }
         Ok(())
     }
@@ -481,11 +505,8 @@ impl CanonicalBody for RightsEvaluationEvidenceV1 {
         if self.observed_chain_id == 0 {
             return Err(ContractError::InvalidField("evidence.observed_chain_id"));
         }
-        if self.observed_block_hash == Digest32::new([0; 32]) {
-            return Err(ContractError::InvalidField("evidence.observed_block_hash"));
-        }
-        if self.head_block_number < self.observed_block_number {
-            return Err(ContractError::InvalidField("evidence.head_block_number"));
+        if self.finalized_block_hash == Digest32::new([0; 32]) {
+            return Err(ContractError::InvalidField("evidence.finalized_block_hash"));
         }
         Ok(())
     }
@@ -497,9 +518,8 @@ impl CanonicalBody for RightsEvaluationEvidenceV1 {
         encoder.nested(&self.policy_identity)?;
         encoder.fixed(self.subject_wallet.as_bytes());
         encoder.u64(self.observed_chain_id);
-        encoder.u64(self.observed_block_number);
-        encoder.fixed(self.observed_block_hash.as_bytes());
-        encoder.u64(self.head_block_number);
+        encoder.u64(self.finalized_block_number);
+        encoder.fixed(self.finalized_block_hash.as_bytes());
         encoder.u8(u8::from(self.has_access));
         encoder.u64(self.acquired_at);
         encoder.u64(self.expires_at);
@@ -516,26 +536,10 @@ impl CanonicalBody for RightsEvaluationEvidenceV1 {
             decoder.u64()?,
             decoder.u64()?,
             Digest32::new(decoder.fixed()?),
-            decoder.u64()?,
             decode_bool(decoder, "has_access")?,
             decoder.u64()?,
             decoder.u64()?,
         )
-    }
-}
-
-fn validate_policy_identifier(value: &str, field: &'static str) -> Result<(), ContractError> {
-    validate_ascii_identifier(value, field, MAX_POLICY_IDENTIFIER_BYTES)?;
-    if value.bytes().any(|byte| matches!(byte, b'/' | b'\\')) {
-        return Err(ContractError::InvalidField(field));
-    }
-    Ok(())
-}
-
-fn validate_evm_right_argument(value: &str) -> Result<(), ContractError> {
-    match value {
-        "view" | "stream" | "download" | "execute" => Ok(()),
-        _ => Err(ContractError::InvalidField("evm_right_argument")),
     }
 }
 
@@ -554,17 +558,25 @@ mod tests {
     use super::*;
     use crate::test_support::{binding_for_wallet, digest, wallet};
 
+    fn encrypted_content(seed: u8) -> EncryptedContentIdentityV1 {
+        EncryptedContentIdentityV1::new(digest(seed), 2048).unwrap()
+    }
+
+    fn access_id(seed: u8) -> ContentAccessIdV1 {
+        ContentAccessIdV1::new([seed; 16]).unwrap()
+    }
+
     fn policy() -> RightsPolicyBodyV1 {
         RightsPolicyBodyV1::new(
-            "content:alpha",
+            encrypted_content(0x10),
+            access_id(0x20),
             RightsActionV1::Stream,
-            "stream",
             RightsSubjectSourceV1::WalletAddress,
             11155111,
             EvmContractAddressV1::new([0x11; 20]).unwrap(),
             EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-            RightsObservationFinalityV1::new(12),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
         )
         .unwrap()
     }
@@ -586,19 +598,36 @@ mod tests {
     fn policy_identity_matches_exact_policy_bytes() {
         let policy = policy();
         let identity = policy.policy_identity().unwrap();
+        let canonical = policy.canonical_bytes().unwrap();
+        const EXPECTED_CANONICAL_LEN: usize = 248;
+        const EXPECTED_POLICY_SHA256: &str =
+            "2921fd94863d6f21c378ec930ac6f5f37a4407373411a1139800fcbf6ed300df";
 
-        assert_eq!(
-            identity,
-            RightsPolicyIdentityV1::new(policy.canonical_hash().unwrap(), 167).unwrap()
-        );
+        assert_eq!(canonical.len(), EXPECTED_CANONICAL_LEN);
         assert_eq!(
             encode(policy.canonical_hash().unwrap().as_bytes()),
-            "f9e0147f85ca56d34c2325d5c559d1e464dd4b62e6dc32e46c7531f14438cb67"
+            EXPECTED_POLICY_SHA256
+        );
+        assert_eq!(
+            identity,
+            RightsPolicyIdentityV1::new(
+                policy.canonical_hash().unwrap(),
+                u32::try_from(EXPECTED_CANONICAL_LEN).unwrap(),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            encode(identity.policy_sha256().as_bytes()),
+            EXPECTED_POLICY_SHA256
         );
     }
 
     #[test]
-    fn policy_rejects_invalid_contract_chain_and_selector() {
+    fn policy_rejects_invalid_access_id_contract_chain_and_selector() {
+        assert_eq!(
+            ContentAccessIdV1::new([0; 16]),
+            Err(ContractError::InvalidField("content_access_id"))
+        );
         assert_eq!(
             EvmContractAddressV1::new([0; 20]),
             Err(ContractError::InvalidField("evm_contract_address"))
@@ -609,29 +638,15 @@ mod tests {
         );
         assert_eq!(
             RightsPolicyBodyV1::new(
-                "content:alpha",
+                encrypted_content(0x10),
+                access_id(0x20),
                 RightsActionV1::Stream,
-                "raw_call",
-                RightsSubjectSourceV1::WalletAddress,
-                11155111,
-                EvmContractAddressV1::new([0x11; 20]).unwrap(),
-                EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-                EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-                RightsObservationFinalityV1::new(0),
-            ),
-            Err(ContractError::InvalidField("evm_right_argument"))
-        );
-        assert_eq!(
-            RightsPolicyBodyV1::new(
-                "content:alpha",
-                RightsActionV1::Stream,
-                "stream",
                 RightsSubjectSourceV1::WalletAddress,
                 0,
                 EvmContractAddressV1::new([0x11; 20]).unwrap(),
                 EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-                EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-                RightsObservationFinalityV1::new(0),
+                EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+                RightsObservationFinalityV1::finalized(),
             ),
             Err(ContractError::InvalidField("chain_id"))
         );
@@ -657,7 +672,6 @@ mod tests {
             policy.chain_id(),
             100,
             digest(0x55),
-            112,
             true,
             1_000,
             1_030,
@@ -679,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_rejects_wrong_wallet_chain_and_finality() {
+    fn evidence_rejects_wrong_wallet_and_chain() {
         let policy = policy();
         let binding = policy_binding(&policy);
         let request = RightsEvaluationEvidenceRequestV1::new(
@@ -696,7 +710,6 @@ mod tests {
             policy.chain_id(),
             100,
             digest(0x55),
-            112,
             true,
             1_000,
             1_030,
@@ -716,7 +729,6 @@ mod tests {
             1,
             100,
             digest(0x55),
-            112,
             true,
             1_000,
             1_030,
@@ -725,26 +737,6 @@ mod tests {
         assert_eq!(
             wrong_chain.validate_against_request(&request, &policy),
             Err(ContractError::InvalidField("evidence.observed_chain_id"))
-        );
-
-        let low_finality = RightsEvaluationEvidenceV1::new(
-            digest(0x90),
-            digest(0x91),
-            binding,
-            policy.policy_identity().unwrap(),
-            wallet(7),
-            policy.chain_id(),
-            100,
-            digest(0x55),
-            111,
-            true,
-            1_000,
-            1_030,
-        )
-        .unwrap();
-        assert_eq!(
-            low_finality.validate_against_request(&request, &policy),
-            Err(ContractError::InvalidField("evidence.head_block_number"))
         );
     }
 
@@ -769,24 +761,40 @@ mod tests {
     }
 
     #[test]
-    fn policy_identity_changes_when_exact_contract_right_argument_changes() {
-        let stream = policy();
-        let view = RightsPolicyBodyV1::new(
-            "content:alpha",
+    fn policy_identity_changes_when_exact_content_or_access_id_changes() {
+        let base = policy();
+        let changed_content = RightsPolicyBodyV1::new(
+            encrypted_content(0x11),
+            access_id(0x20),
             RightsActionV1::Stream,
-            "view",
             RightsSubjectSourceV1::WalletAddress,
             11155111,
             EvmContractAddressV1::new([0x11; 20]).unwrap(),
             EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-            RightsObservationFinalityV1::new(12),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
+        )
+        .unwrap();
+        let changed_access = RightsPolicyBodyV1::new(
+            encrypted_content(0x10),
+            access_id(0x21),
+            RightsActionV1::Stream,
+            RightsSubjectSourceV1::WalletAddress,
+            11155111,
+            EvmContractAddressV1::new([0x11; 20]).unwrap(),
+            EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
         )
         .unwrap();
 
         assert_ne!(
-            stream.policy_identity().unwrap(),
-            view.policy_identity().unwrap()
+            base.policy_identity().unwrap(),
+            changed_content.policy_identity().unwrap()
+        );
+        assert_ne!(
+            base.policy_identity().unwrap(),
+            changed_access.policy_identity().unwrap()
         );
     }
 }

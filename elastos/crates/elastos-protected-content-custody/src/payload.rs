@@ -765,15 +765,15 @@ mod tests {
 
     use ed25519_dalek::{Signer as _, SigningKey};
     use elastos_protected_content_contracts::{
-        AtomicReplayClaimer, CanonicalContract, CustodyPoolError, CustodyPoolIdentityV1,
-        CustodyPoolMemberStateV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
-        EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1,
-        NodeContributionRefV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
-        RecipientPublicKeyBytesV1, ReplayClaimError, ReplayClaimKeyV1, ReplayNonce16,
-        RightsActionV1, RightsObservationFinalityV1, RightsPolicyBodyV1, RightsRequestV1,
-        RightsSubjectSourceV1, RightsVerificationContextV1, RuntimeOperationIssuerKeyV1,
-        RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1,
-        SignedNodeContributionV1, SignedRecipientKeyAuthorizationV1,
+        AtomicReplayClaimer, CanonicalContract, ContentAccessIdV1, CustodyPoolError,
+        CustodyPoolIdentityV1, CustodyPoolMemberStateV1, Digest32, EncryptedContentIdentityV1,
+        EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1,
+        KeyReleaseRequestV1, NodeContributionRefV1, ProtectedContentBindingV1,
+        RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayClaimError, ReplayClaimKeyV1,
+        ReplayNonce16, RightsActionV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
+        RightsRequestV1, RightsSubjectSourceV1, RightsVerificationContextV1,
+        RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
+        RuntimeSessionBindingV1, SignedNodeContributionV1, SignedRecipientKeyAuthorizationV1,
         SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
         TerminalReceiptStatementV1, VerifiedKeyReleaseRequestV1, WalletAddress,
         WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
@@ -825,15 +825,15 @@ mod tests {
 
     fn policy_body_for_tests() -> RightsPolicyBodyV1 {
         RightsPolicyBodyV1::new(
-            "content:alpha",
+            EncryptedContentIdentityV1::new(Digest32::new([0x41; 32]), 4096).unwrap(),
+            ContentAccessIdV1::new([0x51; 16]).unwrap(),
             RightsActionV1::View,
-            "view",
             RightsSubjectSourceV1::WalletAddress,
             11155111,
             EvmContractAddressV1::new([0x11; 20]).unwrap(),
             EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-            RightsObservationFinalityV1::new(12),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
         )
         .unwrap()
     }

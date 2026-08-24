@@ -143,28 +143,30 @@ path into release verification.
 `RightsPolicyBodyV1` is the v1 immutable policy body. It is intentionally
 narrow and grounded in the current reviewed rights-provider surface:
 
-- one exact `content_id`;
+- one exact full `EncryptedContentIdentityV1`;
+- one exact 16-byte `ContentAccessIdV1` bound separately from the full
+  encrypted-content identity;
 - one exact required `RightsActionV1`;
-- one exact EVM right argument string sent as the third
-  `has_access_by_content_id(content_id, subject, right)` ABI argument;
 - one exact subject source: the Wallet address from
   `ProtectedContentBindingV1`;
 - one exact EVM `chain_id`;
 - one exact 20-byte EVM contract address;
 - one exact 4-byte function selector;
 - one exact ABI identity:
-  `HasAccessByContentIdStringAddressString`;
-- one exact bounded observation/finality rule:
-  `RightsObservationFinalityV1::min_confirmations`.
+  `HasAccessByContentIdAddressBytes16`;
+- one exact finalized observation/finality rule:
+  `RightsObservationFinalityV1::Finalized`.
 
 This is not a generic policy language, opaque byte blob, or arbitrary map.
 It is the smallest reviewed source-only policy shape that matches the current
-typed `chain-provider` `has_access_by_content_id` path. The signed policy now
-explicitly maps one product `RightsActionV1` to one exact contract right string,
-so two nodes cannot claim the same policy identity while sending different ABI
-right arguments. Production-approved chain ids, contract addresses, selectors,
-ABI fixtures, and right strings remain open review inputs, but they are
-required typed policy fields now, not ambient provider configuration.
+typed `chain-provider` `has_access_by_content_id(address,bytes16)` path. The
+signed policy binds the exact full encrypted-content identity, the exact Base
+access content ID, and the exact `RightsActionV1`; product code must not infer
+action semantics from the boolean on-chain entitlement alone. Production-
+approved chain ids, contract addresses, selectors, and ABI fixtures remain open
+review inputs, but they are required typed policy fields now, not ambient
+provider configuration. The observation finality model itself is fixed to
+`finalized` in this unpublished v1 line.
 
 `RightsEvaluationEvidenceRequestV1` is the matching typed evidence request. It
 pins the exact `ProtectedContentBindingV1` and `RightsPolicyIdentityV1`. A node
@@ -176,16 +178,18 @@ the same exact binding and policy identity plus:
 
 - the exact Wallet subject address derived from the binding;
 - the exact observed chain id;
-- the exact observed block number and block hash;
-- the exact head block number used for the finality rule; and
+- the exact finalized block number and block hash; and
 - the exact `has_access` result.
 
 Verification rejects a different Wallet subject, different chain, or
-insufficient confirmation depth before any provider integration exists. RPC
-URLs, provider labels, transport routes, and endpoint identity remain outside
-the contract. Because the evidence binds the exact `RightsPolicyIdentityV1`, it
-indirectly pins the full reviewed policy body: contract, selector, ABI, exact
-right argument, content id, and finality rule.
+finality mismatch before any provider integration exists. RPC URLs, provider
+labels, transport routes, and endpoint identity remain outside the contract.
+Because the evidence binds the exact `RightsPolicyIdentityV1`, it indirectly
+pins the full reviewed policy body: contract, selector, ABI, full encrypted
+content identity, distinct 16-byte access content ID, required action, and the
+finalized-only observation rule. Node-local corroboration across multiple
+operator-configured RPC sources reduces one-source risk, but it is not
+consensus proof.
 
 `SignedRecipientKeyAuthorizationV1` is a Profile-signed recipient-key
 authorization. It binds all of the following:

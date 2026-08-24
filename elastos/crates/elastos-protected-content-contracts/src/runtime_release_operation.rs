@@ -753,15 +753,15 @@ mod tests {
 
     fn policy_body() -> RightsPolicyBodyV1 {
         RightsPolicyBodyV1::new(
-            "content:alpha",
+            crate::EncryptedContentIdentityV1::new(digest(0x11), 4096).unwrap(),
+            crate::ContentAccessIdV1::new([0x41; 16]).unwrap(),
             RightsActionV1::View,
-            "view",
             RightsSubjectSourceV1::WalletAddress,
             11155111,
             EvmContractAddressV1::new([0x11; 20]).unwrap(),
             EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-            RightsObservationFinalityV1::new(12),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
         )
         .unwrap()
     }
@@ -872,7 +872,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             encode(authenticated.operation_hash().as_bytes()),
-            "09890dce7b49bc4625a3fee68251ba76887831502522bd375f084a2df04e7b5b"
+            "6ec73c02497537d7acc571a76a903455e01b5b134edf22464a66daae04a93fec"
         );
         assert_eq!(
             authenticated.rights_request_hash(),
@@ -1033,15 +1033,15 @@ mod tests {
     fn runtime_release_operation_rejects_wrong_policy_runtime_issuer_and_binding_mutations() {
         let operation = signed_operation();
         let wrong_policy = RightsPolicyBodyV1::new(
-            "content:beta",
+            crate::EncryptedContentIdentityV1::new(digest(0x22), 4096).unwrap(),
+            crate::ContentAccessIdV1::new([0x42; 16]).unwrap(),
             RightsActionV1::View,
-            "view",
             RightsSubjectSourceV1::WalletAddress,
             11155111,
             EvmContractAddressV1::new([0x11; 20]).unwrap(),
             EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-            EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-            RightsObservationFinalityV1::new(12),
+            EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+            RightsObservationFinalityV1::finalized(),
         )
         .unwrap();
         assert_eq!(

@@ -1,46 +1,13 @@
 use super::*;
 
-pub(super) fn rights_method<'a>(
-    network: &'a ChainNetwork,
-    id: &str,
-    contract: &str,
-) -> Result<&'a RightsMethod, Response> {
-    let configured = network
-        .rights_methods
-        .iter()
-        .find(|method| method.id == id)
-        .ok_or_else(|| {
-            Response::error(
-                "rights_query_not_configured",
-                &format!("typed {id} ABI is not configured for {}", network.id),
-            )
-        })?;
-    if !configured.contract.eq_ignore_ascii_case(contract) {
-        return Err(Response::error(
-            "rights_contract_not_allowed",
-            "requested rights contract is not configured for this network",
-        ));
-    }
-    Ok(configured)
-}
-
 pub(super) fn encode_has_access_by_content_id_call(
     selector: &str,
-    content_id: &str,
+    content_access_id: &[u8; 16],
     subject: &str,
-    right: &str,
 ) -> Result<String, String> {
     let mut bytes = decode_hex(selector, Some(4), "EVM function selector")?;
-    let content = abi_encode_string(content_id.as_bytes());
-    let right = abi_encode_string(right.as_bytes());
-    let content_offset = 32 * 3;
-    let right_offset = content_offset + content.len();
-
-    bytes.extend_from_slice(&abi_word_usize(content_offset));
     bytes.extend_from_slice(&abi_word_address(subject)?);
-    bytes.extend_from_slice(&abi_word_usize(right_offset));
-    bytes.extend_from_slice(&content);
-    bytes.extend_from_slice(&right);
+    bytes.extend_from_slice(&abi_word_bytes16(content_access_id));
 
     Ok(format!("0x{}", encode_hex(&bytes)))
 }
@@ -64,14 +31,6 @@ pub(super) fn abi_encode_bytes(value: &[u8]) -> Vec<u8> {
     encoded
 }
 
-pub(super) fn abi_encode_string(value: &[u8]) -> Vec<u8> {
-    let mut encoded = abi_word_usize(value.len());
-    encoded.extend_from_slice(value);
-    let padding = (32 - (value.len() % 32)) % 32;
-    encoded.extend(std::iter::repeat_n(0, padding));
-    encoded
-}
-
 pub(super) fn abi_word_usize(value: usize) -> Vec<u8> {
     let mut word = vec![0u8; 32];
     word[24..32].copy_from_slice(&(value as u64).to_be_bytes());
@@ -83,6 +42,12 @@ pub(super) fn abi_word_address(address: &str) -> Result<Vec<u8>, String> {
     let mut word = vec![0u8; 32];
     word[12..32].copy_from_slice(&address);
     Ok(word)
+}
+
+pub(super) fn abi_word_bytes16(value: &[u8; 16]) -> Vec<u8> {
+    let mut word = vec![0u8; 32];
+    word[..16].copy_from_slice(value);
+    word
 }
 
 pub(super) fn decode_evm_bool(value: &Value) -> Result<bool, String> {

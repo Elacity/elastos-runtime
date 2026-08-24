@@ -258,7 +258,10 @@ protected content:
   does not sign service IDs, routes, URLs, hostnames, sockets, ports,
   WireGuard, ALPN, or other topology. The source policy is fixed 2-of-3 across
   distinct operators and failure domains, with no fallback or silent
-  substitution. A protected object must later commit the exact pool identity,
+  substitution. For protected-content release, `failure_domain_id` must include
+  the chain-observation backend as well as the custody operator lane; two
+  committee members that depend on one RPC operator/backend are not distinct
+  failure domains. A protected object must later commit the exact pool identity,
   exact epoch identity, and exact committee-authorization identity it was
   minted against; Runtime open must use those object-bound identities rather
   than any "latest pool" view. The pool authority is permissioned, not a
@@ -286,16 +289,22 @@ contract layer that later Runtime and custody-node integrations must consume:
   `RightsEvaluationEvidenceV1` provide one narrow typed EVM policy/evidence
   shape grounded in the current `chain-provider`
   `has_access_by_content_id` method only: exact Wallet-derived subject,
-  `chain_id`, contract bytes, selector, ABI identity, `content_id`, one exact
-  contract right string, the product action that policy maps to that right,
-  one bounded confirmation rule, and exact observed block/result evidence.
-  They do not carry RPC URLs, provider labels, or routes.
+  exact full encrypted-content identity, one distinct 16-byte Base access
+  content ID, signed `RightsActionV1`, `chain_id`, contract bytes, selector,
+  ABI identity, one finalized-only observation rule, and exact finalized
+  block/result evidence. There is no free-form contract right string, and these
+  contracts do not carry RPC URLs, provider labels, or routes.
 - The local chain-rights/evaluator branch tightens this into a source-only
   typed evidence path: evidence is acquired for the exact Runtime release
-  operation, verifies live chain id, uses exact block hash plus block number,
-  rejects selector/method mismatches, applies bounded freshness, and redacts
-  upstream provider failures. The evaluator obtains evidence through a trusted
-  source handle rather than accepting arbitrary caller-supplied rights facts.
+  operation, verifies live chain id, uses exact finalized block hash plus
+  finalized block number, rejects selector/method mismatches, applies bounded
+  freshness, and redacts upstream provider failures. Each custody node resolves
+  that evidence on its own node-host Runtime through 2-5 explicit
+  protected-content RPC sources, requiring two exact finalized matches with no
+  fallback to the general network RPC URL. This corroboration reduces one-source
+  risk but is not consensus proof. The evaluator obtains evidence through a
+  trusted source handle rather than accepting arbitrary caller-supplied rights
+  facts.
 - The local Wallet-rights branch adds one dedicated Wallet operation that signs
   exact canonical `RightsRequestV1` bytes for the selected active EVM account
   through the existing verified Wallet invocation context. It carries no

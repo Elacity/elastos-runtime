@@ -19,9 +19,8 @@ const CHAIN_RIGHTS_EVIDENCE_SCHEMA: &str = "elastos.chain.protected-content-righ
 const ALLOWED_CHAIN_EVIDENCE_FIELDS: &[&str] = &[
     "schema",
     "chain_id",
-    "observed_block_number",
-    "head_block_number",
-    "observed_block_hash",
+    "finalized_block_number",
+    "finalized_block_hash",
     "rights_evaluation_evidence",
     "rights_evaluation_evidence_hash",
 ];
@@ -68,18 +67,13 @@ pub fn parse_chain_rights_evidence_data(
             return Err(RightsEvaluationErrorV1::ChainEvidence);
         }
     }
-    if let Some(observed_block_number) = optional_u64(object.get("observed_block_number"))? {
-        if observed_block_number != evidence.observed_block_number() {
+    if let Some(finalized_block_number) = optional_u64(object.get("finalized_block_number"))? {
+        if finalized_block_number != evidence.finalized_block_number() {
             return Err(RightsEvaluationErrorV1::ChainEvidence);
         }
     }
-    if let Some(head_block_number) = optional_u64(object.get("head_block_number"))? {
-        if head_block_number != evidence.head_block_number() {
-            return Err(RightsEvaluationErrorV1::ChainEvidence);
-        }
-    }
-    if let Some(observed_block_hash) = optional_digest32(object.get("observed_block_hash"))? {
-        if observed_block_hash != evidence.observed_block_hash() {
+    if let Some(finalized_block_hash) = optional_digest32(object.get("finalized_block_hash"))? {
+        if finalized_block_hash != evidence.finalized_block_hash() {
             return Err(RightsEvaluationErrorV1::ChainEvidence);
         }
     }

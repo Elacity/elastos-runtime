@@ -1,5 +1,5 @@
 use elastos_protected_content_contracts::{
-    CanonicalContract, ContractError, Digest32, EncryptedContentIdentityV1,
+    CanonicalContract, ContentAccessIdV1, ContractError, Digest32, EncryptedContentIdentityV1,
     MAX_ENCRYPTED_CONTENT_BYTES,
 };
 use sha2::{Digest as _, Sha256};
@@ -49,6 +49,7 @@ struct BoxResizeTargetV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedCencFmp4TrackRewriteV1 {
     track_id: u32,
+    content_access_id: ContentAccessIdV1,
     sample_entry_off: usize,
     original_fourcc: [u8; 4],
     sinf_off: usize,
@@ -299,6 +300,13 @@ impl ValidatedCencFmp4MediaSessionLayoutV1 {
 
     pub fn protected_track_ids(&self) -> &[u32] {
         &self.protected_track_ids
+    }
+
+    pub fn content_access_id(&self) -> ContentAccessIdV1 {
+        self.track_rewrites
+            .first()
+            .expect("validated protected media session has at least one track")
+            .content_access_id
     }
 
     pub fn rewrite_clear_init(
@@ -1287,6 +1295,16 @@ fn validate_init_segment_v1(bytes: &[u8]) -> Result<ValidatedCencFmp4InitRewrite
     if protected_track_ids.is_empty() || protected_track_ids.len() > MAX_MEDIA_TRACKS_V1 {
         return Err(ContractError::InvalidField("init_segment_bytes"));
     }
+    let expected_access_id = track_rewrites
+        .first()
+        .ok_or(ContractError::InvalidField("init_segment_bytes"))?
+        .content_access_id;
+    if track_rewrites
+        .iter()
+        .any(|rewrite| rewrite.content_access_id != expected_access_id)
+    {
+        return Err(ContractError::InvalidField("init_segment_bytes"));
+    }
     validate_mvex_v1(
         bytes,
         mvex_off + mvex_h.header_size,
@@ -1577,9 +1595,10 @@ fn validate_stsd_v1(
         }
     }
     let (sinf_off, sinf_h) = sinf.ok_or(ContractError::InvalidField("init_segment_bytes"))?;
-    validate_sinf_v1(data, sinf_off, sinf_h, expected_original_fourcc)?;
+    let content_access_id = validate_sinf_v1(data, sinf_off, sinf_h, expected_original_fourcc)?;
     Ok(ValidatedCencFmp4TrackRewriteV1 {
         track_id: 0,
+        content_access_id,
         sample_entry_off: entry_off,
         original_fourcc: expected_original_fourcc,
         sinf_off,
@@ -1593,7 +1612,7 @@ fn validate_sinf_v1(
     sinf_off: usize,
     sinf_h: BoxHeader,
     expected_original_fourcc: [u8; 4],
-) -> Result<(), ContractError> {
+) -> Result<ContentAccessIdV1, ContractError> {
     let mut frma = None;
     let mut schm = None;
     let mut schi = None;
@@ -1647,7 +1666,11 @@ fn validate_sinf_v1(
     if data[content + 6] != 1 || data[content + 7] != SUPPORTED_COMMON_IV_SIZE_V1 {
         return Err(ContractError::InvalidField("init_segment_bytes"));
     }
-    Ok(())
+    ContentAccessIdV1::new(
+        slice_at(data, content + 8, 16)?
+            .try_into()
+            .map_err(|_| ContractError::InvalidField("init_segment_bytes"))?,
+    )
 }
 
 fn validate_clear_stsd_v1(

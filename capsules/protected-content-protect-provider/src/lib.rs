@@ -283,11 +283,11 @@ impl ProtectProvider {
                         ));
                     }
                 };
-                let key_id = match random_bytes::<16>() {
-                    Ok(value) => value,
-                    Err(_) => {
+                let key_id = match request.content_access_id() {
+                    Ok(Some(value)) => *value.as_bytes(),
+                    _ => {
                         return typed_response(ProtectProviderResponseV1::new_failure(
-                            ProviderFailureCodeV1::InternalFailure,
+                            ProviderFailureCodeV1::InvalidRequest,
                         ));
                     }
                 };
@@ -1118,6 +1118,7 @@ mod tests {
     ) -> ProtectProviderRequestV1 {
         ProtectProviderRequestV1::new_open_protection_session(
             digest(request_id_seed),
+            elastos_protected_content_contracts::ContentAccessIdV1::new([0x41; 16]).unwrap(),
             CustodyPoolIdentityV1::new(digest(0x41), 32).unwrap(),
             CustodyEpochIdentityV1::new(digest(0x42), 32).unwrap(),
             CustodyCommitteeAuthorizationIdentityV1::new(digest(0x43), 32).unwrap(),

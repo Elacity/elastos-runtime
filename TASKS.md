@@ -15,12 +15,20 @@ Do not add new product surface area until the `Now` section is materially tighte
 Read this section as strict priority order for this branch. Do not start a lower
 section if a higher section is incoherent, unverified, or too large to review.
 
+Active priority index:
+
+- current source work: protected-content review correction under
+  [Trusted content and access rights](#trusted-content-and-access-rights)
+- separate remaining product proof: collaboration installed localhost and
+  public-seed gates, with no scope expansion
+- all other work remains queued below
+
 ### Collaboration candidate closeout
 
-This is the only active closeout for `codex/post-0.6-consolidation`. It is based
-on released `main` at `d358dedb` and is a candidate for the next 0.7 development
-line. Do not resume work from superseded hardening, network-profile, or
-collaboration worktrees.
+This is the remaining collaboration closeout for
+`codex/post-0.6-consolidation`. It is based on released `main` at `d358dedb`
+and is a candidate for the next 0.7 development line. Do not resume work from
+superseded hardening, network-profile, or collaboration worktrees.
 
 The source boundary is complete: a person is a signed Profile, a Runtime owns
 authority and collaboration state, Carrier transports authenticated endpoint
@@ -399,21 +407,21 @@ whose own comments describe behaviour that was never implemented.
 ### 0. Branch readiness and reviewability
 
 Branch assumptions: `main` is the released 0.6.0 line at `d358dedb`;
-`codex/post-0.6-consolidation` is the sole active local post-release
+`codex/post-0.6-consolidation` is the remaining unpublished collaboration
 integration line and remains unpublished until this checklist's verification
-and review items pass.
+and review items pass; protected-content correction on
+`feat/protected-content-runtime-lifecycle` is separate current source work.
 
 - [ ] Keep this branch reviewable: split changes into coherent commit slices with no corrective commits, no hidden migrations, and no unrelated local artifacts.
 - [ ] Keep oversized-file cleanup frozen unless branch review exposes a concrete no-behavior blocker. The existing Browser/Wallet/provider cleanup is already split into focused sibling modules: Browser gateway, Wallet gateway, Wallet UI send/receive/create/request/state/preference flows, wallet-provider EVM crypto, and wallet-provider approval test groups. Keep those seams stable and verified. Do not split `capsules/browser/browser/browser.js` further unless a diagnostic-frame/session seam is proven mechanical and behavior-free. Treat `gateway_tests/room.rs`, `gateway_room.rs`, `gateway_tests/home_system.rs`, `room_service.rs`, `auth_gateway.rs`, and `home_cmd.rs` as later cleanup unless they become direct release-review blockers. Keep `scripts/home-entropy-check.mjs` as a broad alignment gate for now, but do not let it accumulate new product logic. Each future split must be no-behavior, separately testable, and covered by the narrow Rust/JS smoke commands for that surface.
 - [ ] Review this branch in authority-bound slices, not as one Browser mega-diff: content availability/protected content providers, chain provider core, auth/recovery core, Wallet authority surface, Home/System UX, Chat/Carrier updates, capsule authority manifests, Browser ABI/adapter, Browser proof tooling, shared runtime/gateway, then release/registry/docs. Each slice must be a coherent commit with its own verification commands. Shared runtime/gateway hunks require manual hunk-level review because they cross provider boundaries. Keep `chain_provider_core` separate from Browser: typed proof, prepare, broadcast, sync health, and node lifecycle are blockchain-quadrant provider work, even when Browser consumes them through Wallet. Keep `auth_recovery_core` separate from route wiring: passkey/WebAuthn verification, proof-bound sessions, principal roots, and Recovery Kit helpers are authority primitives consumed by Home/System/Wallet gateway routes. The Wallet authority surface should be reviewed as provider authority core, Wallet app and connector capsules, then gateway/Inbox/audit wiring only after shared gateway hunks are isolated. For Home/System UX, run `node scripts/home-passkey-virtual-auth-smoke.mjs` on loopback Home to prove signed passkey journeys without a human cookie, then run the Camofox smokes for layout coverage. For Browser ABI/provider work, run the Browser Rust tests, `scripts/check-wci-alignment.sh`, `node scripts/home-entropy-check.mjs`, `node scripts/browser-display-mode-smoke.mjs`, `scripts/browser-wallet-bridge-smoke.sh`, and `scripts/browser-glide-wallet-smoke.sh`. Browser proof tooling must keep provider decision reports, objective audits, and runbooks structured and fail closed while product media/manual evidence is missing. Each slice must name its verification commands and must not claim Browser completion unless `scripts/browser-objective-audit.mjs` passes with accepted product media plus matching manual UX evidence.
-- [ ] Keep the accepted 0.6 reconciliation closed and reviewable: ESP, Wallet,
-  Recovery, Home authority, GBA, and the bounded Browser continuation are
-  reconciled in [state.md](state.md). Carrier reconciliation, the shell UI
+- [ ] Do not reopen the accepted 0.6 reconciliation except for a newly proven
+  released-line defect with a named owner and verification command. ESP,
+  Wallet, Recovery, Home authority, GBA, and the bounded Browser continuation
+  are reconciled in [state.md](state.md). Carrier reconciliation, the shell UI
   redesign, and extended AI UI work remain excluded. Before claiming
   completeness, run `git diff --check`, the Home and Browser entropy checks,
   WCI alignment, `just candidate-command-audit`, and touched-surface tests.
-  Reopen a slice only for a newly proven release-candidate defect with a named
-  owner and verification command.
 - [ ] Treat Remote Carrier Exit as part of the Carrier slice: two-runtime evidence must cite the exact source/exit runtime DIDs and endpoint evidence; the installed artifact readiness report and route-readiness report must be hash-bound; evidence for route readiness, installed artifact readiness, discovery, policy, accounting, stream transport, Browser proof, and cleanup must cite reviewed route nouns; the local Browser machine-proof artifact must cite the reviewed route target or target host; local artifacts must stay redacted, and remote paths need an explicit digest and review trail. Compose Inspector, typed Runtime authority, installed artifact readiness, route-readiness, operator evidence, Browser handoff, manual UX, performance/zoom, and clean-worktree proof before any full-goal claim.
 - [ ] Keep the verification gate green after each slice: run Rust workspace commands from `elastos/` such as `cargo fmt --all -- --check`, the narrow Rust tests for touched crates, `cargo check` for changed capsules, `git diff --check`, `scripts/check-wci-alignment.sh`, `scripts/protected-content-provider-contract-smoke.sh` only as the provisional provider retirement guard where those old capsules are touched, `node scripts/home-entropy-check.mjs` where Home UI is touched, `scripts/auth-wallet-focus-smoke.sh` after auth/wallet/chain changes, `scripts/installed-provider-verify.sh <provider>` after installed provider binary changes, and a live `/apps/home/` proof before handing browser-visible changes back for testing.
 - [ ] Do not add visible UI, protocol surface, provider behavior, or blockchain hooks unless the runtime capability path, fail-closed behavior, and docs contract are already explicit.
@@ -425,9 +433,9 @@ and review items pass.
 - [ ] Keep the Browser provider proof language explicit: Selkies is the current self-hosted baseline, not the acceptance answer. Native/browser-product proof must stay tied to `browser-native-supervisor-smoke.sh`, `browser-native-proxy-engine-smoke.sh`, `browser-native-supervisor-proxy-smoke.sh`, `browser-native-operator-config.mjs`, and `browser-native-target-preflight.sh`; Browser wallet connector effects must keep `wallet-connector-transaction-smoke.mjs` in the verification set.
 - [ ] Keep protected-content release claims exact: `scripts/browser-ela-city-protected-content-open-smoke.sh` proves that Runtime Browser can open the known `ela.city` protected-content route and cleanly release the page session, and the current branch has a funded live purchase/playback proof for the known test path. Release notes may cite that current user journey, but must not claim arbitrary protected-content readiness, production dDRM completeness, dKMS readiness, or generic decrypt/render provider completion.
 
-### 0.6.0 release-candidate preservation
-- [ ] Review execution order for preserving the accepted 0.6.0 candidate on
-  its `upstream/0.6-dev` base:
+### Released 0.6.x product-proof and follow-up debt
+- [ ] Review execution order for maintaining and rechecking released 0.6.x
+  follow-up evidence and product-proof debt against released `main`:
   1. Keep reusable source/review gates green on this branch:
      `git diff --check`, `node scripts/home-entropy-check.mjs`,
      `node scripts/browser-entropy-check.mjs`,
@@ -449,11 +457,12 @@ and review items pass.
      and close at least one app, then return Home cleanly. Source-home proof does
      not close this item.
   5. Keep source/local Carrier setup proof green with
-     `scripts/local-carrier-setup-smoke.sh` before a candidate gateway exists.
-     Candidate public install proof with the branch binary needs a staged or
-     published 0.6.0-compatible manifest with the current `home` profile and
-     checksummed artifacts; then rerun `scripts/public-install-identity-smoke.sh`
-     and `scripts/public-install-home-frontdoor-smoke.sh` with
+     `scripts/local-carrier-setup-smoke.sh` before a staged or published
+     gateway exists for branch-override install proof. Branch-override public
+     install proof with the branch binary needs a staged or published
+     0.6.0-compatible manifest with the current `home` profile and checksummed
+     artifacts; then rerun `scripts/public-install-identity-smoke.sh` and
+     `scripts/public-install-home-frontdoor-smoke.sh` with
      `ELASTOS_PUBLISHER_GATEWAY=<candidate-url>` and the branch binary override.
      After final publish, rerun both without overrides.
   6. If Browser product readiness is in scope, keep
@@ -887,12 +896,70 @@ absence. Live `decrypt` is unchanged. Rights evaluation at open stays on the
 existing Runtime-to-rights seam; the server adapter still maps that seam to
 Chain evidence and does not register a second `rights` name.
 
-Completed protected-content packaging, composition, clear-media import,
-chain policy, Library mint, and Slice D buy / Library open/play on the
-test registry are recorded in `state.md`. Open work starts at the
-installed prerequisites. Do not start Slice E while live `decrypt` is
-still the only working product open path.
+Current source already requires a signed `network_available` receipt for the
+exact encrypted object, expected provider/publisher/object identities, three
+replicas, freshness, and a full manifest/file refetch before a mint becomes
+buyable. Pinning and replication stay behind `elastos://content` and the
+content/availability provider; no raw IPFS/Kubo/Carrier route becomes capsule
+input or protected-content contract authority. The missing product gate is a
+fresh availability recheck immediately before any purchase effect starts:
+mint-time evidence must not remain sellable forever. First cutover also has no
+protected-content unpublish/retire action: active listings and purchased
+content remain pinned until a later explicit Runtime-owned retirement policy
+settles listing, buyer-access, retention, and provider unpin receipts. The
+installed product gate must prove three real replicas and repair after losing
+one; the current test-provider proof is source evidence only, not that
+installed proof.
 
+Published `34465959` is the accepted protected-content prefix. Local commits
+`35ea84cc`, `5856d6a9`, `79821d5c`, and `b8b527ac` are unaccepted review
+evidence only. Keep their useful proof references, but do not call Slice C or
+Slice D complete from them.
+
+Source RPC trust is repaired at local `0e407f01`: the current protected-content
+path uses finalized-only `hasAccessByContentId(address,bytes16)` evidence with
+node-local corroboration across the configured protected-content RPC pool, and
+the old string `hasAccess` ABI path is no longer current source truth.
+Deployed allowed/denied Base proof against the reviewed proxy and Runtime-owned
+`buyAccess` execution remain open.
+
+Remaining work, in exact dependency order:
+
+- [ ] Gate 1 — Mint durability. Create a durable stable mint intent before
+  provider dispatch, keep one stable request identity across restart, resume
+  exact work or terminally abort it, settle protect cancel/close exactly, and
+  retain cleanup ownership on timeout or unknown settlement.
+- [ ] Gate 1a — Fresh pre-buy availability. Recheck a fresh signed
+  `network_available` receipt for the exact encrypted object immediately before
+  any purchase effect starts; mint-time availability must not remain sellable
+  forever.
+- [ ] Gate 2 — Runtime-owned buy, immutable listings, and persistence. Capsule
+  input identifies only the object/listing/offer. Runtime must derive exact
+  `AuthorityGateway.buyAccess` calldata from immutable listing terms and
+  operator-owned Chain config, use the existing Wallet/Inbox approval plus
+  transaction-effects coordinator, derive the validated chain outcome from
+  confirmed Runtime-owned effects, keep purchases separate per principal, prove
+  second-buyer/replay/substitution behavior, and persist owner-only bounded
+  state with temp-file write + sync + atomic rename plus restart/corruption
+  coverage. Before the first product proof, choose one honest creator mode
+  only: either bind the first acceptance to a pre-existing verified Elacity
+  asset/listing, or add a Runtime-owned creator transaction that creates/binds
+  the asset before listing. In either mode, the immutable listing must bind
+  full encrypted-content identity + exact bytes16 access KID + seller + ledger
+  + tokenId + quantity + price/pay token. Do not infer token identity from
+  metadata, scan transaction bytes, or accept those values as caller
+  authority.
+- [ ] Gate 3 — Viewer settlement. Authorize the caller before changing
+  ownership, retire only after exact typed `closed` / `already_absent`
+  settlement, retain a reconciliation obligation on timeout/unknown/provider
+  failure, and prove wrong-principal close plus restart/expiry cleanup.
+- [ ] Gate 4 — Inactive combined proof. Fake chain observations must be
+  denied; provider close/cancel failure must leave no secret or false
+- [ ] Gate 5 — Docs/config prerequisites. After this source repair is accepted,
+  update `state.md` and `docs/PROTECTED_CONTENT_EXTRACTION.md` so they no
+  longer call local `35ea84cc`, `5856d6a9`, `79821d5c`, or `b8b527ac` complete
+  or canonical before the repaired code and installed proof support that
+  claim. Also keep the installed prerequisites explicit:
 - [ ] Installed prerequisite: provision one signed permissioned custody profile
   before product cutover. Persist it owner-only as
   `{data_dir}/protected-content/custody-composition.json` with schema
@@ -913,13 +980,14 @@ still the only working product open path.
   without that policy
   (`runtime_custody_library_publish_fails_closed_without_chain_policy`).
   Do not upgrade deterministic fixtures into a product claim.
-- [ ] Slice E — one atomic cutover commit. Entry: Slices A-D are green while
-  still inactive. Exit: activate the new product routes and remove the old
-  provisional startup, DTO, provider-resource/catalog, build/install/component/
-  WCI/test/doc surfaces for `drm`, `rights`, `key`, and the provisional
-  decrypt path in the same commit. No old/new route stays active together. No
-  fallback, no compatibility decoder, no dual write, no dual authority, and no
-  second journal/registry/supervisor/coordinator. Likely files:
+- [ ] Slice E — one atomic cutover commit. Entry: the gates above plus the
+  installed prerequisites are green while the new path is still inactive.
+  Exit: activate the new product routes and remove the old provisional
+  startup, DTO, provider-resource/catalog, build/install/component/WCI/test/doc
+  surfaces for `drm`, `rights`, `key`, and the provisional decrypt path in the
+  same commit. No old/new route stays active together. No fallback, no
+  compatibility decoder, no dual write, no dual authority, and no second
+  journal/registry/supervisor/coordinator. Likely files:
   `elastos/crates/elastos-server/src/server_infra.rs`,
   `elastos/crates/elastos-server/src/provider_resource.rs`,
   `elastos/crates/elastos-server/src/library.rs`,
@@ -929,10 +997,10 @@ still the only working product open path.
   component/install/publish surfaces, old provider tests/docs. Verification:
   focused absence/search checks, route/resource tests, and installed artifact
   parity on the cutover set.
-- [ ] Slice F — minimum UI and installed one-Runtime/two-principal acceptance.
-  Entry: atomic cutover commit is source-green. Exit: one installed Runtime
-  proves creator import/mint/list, buyer deny-before-purchase, real Wallet
-  approval, real Chain result, buyer open -> 2-of-3 release -> viewer
+- [ ] Installed acceptance — minimum UI and one-Runtime/two-principal proof.
+  Entry: the atomic cutover commit is source-green. Exit: one installed
+  Runtime proves creator import/mint/list, buyer deny-before-purchase, real
+  Wallet approval, real Chain result, buyer open -> 2-of-3 release -> viewer
   init/segment read -> close, wrong-object rejection, tampered-segment
   rejection, exact replay, Runtime restart, provider cleanup, zero unresolved
   journals/sessions, and no CEK/raw share/clear-media/topology/credential/
@@ -998,7 +1066,7 @@ harness freeze) waits on `source-macos` and is not this path.
 - [ ] Re-audit `provider/registry.rs` from current source, not from the stale dead-code list that existed before the 2026-03-31 cleanup. Only remove API surface that is now proven unused on the installed path.
 - [ ] Continue the crate-by-crate orphaned-code audit with the same fail-closed rule: delete only after proving the installed path does not use it.
 
-## Later
+## Long term
 
 - [ ] Evaluate WebAuthn PRF and passkey-derived wallet keys only after passkeys are stable as runtime-session and wallet-provider approval gates.
 - [ ] Define the browser host-adapter model without faking Linux parity, using the Browser/Net/Exit ABI above so server, desktop, mobile, and kiosk hosts expose the same capability contract.
