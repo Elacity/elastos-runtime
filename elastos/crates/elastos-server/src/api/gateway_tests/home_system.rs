@@ -2159,7 +2159,10 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
             "status": "ready",
         })
     );
-    assert_eq!(payload["identity"]["profile_readiness"]["status"], "setup_required");
+    assert_eq!(
+        payload["identity"]["profile_readiness"]["status"],
+        "setup_required"
+    );
 
     let profile = app
         .clone()
