@@ -1342,6 +1342,7 @@ async fn browser_wallet_broadcast_transaction(
         authority,
         RuntimeTransactionLookup::ApprovalId(request_id),
         None,
+        None,
     )
     .await?;
     Ok(serde_json::json!({

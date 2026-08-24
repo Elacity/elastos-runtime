@@ -440,6 +440,333 @@ pub(in crate::api::gateway) fn runtime_transaction_effect_id(
     Ok(format!("transaction-effect:sha256:{digest}"))
 }
 
+pub(in crate::api::gateway) fn exact_runtime_transaction_effect_id(
+    source: &str,
+    principal_id: &str,
+    request_sha256: &str,
+    request_binding: &Value,
+) -> anyhow::Result<String> {
+    if !matches!(
+        source,
+        NATIVE_TRANSACTION_SOURCE | BROWSER_TRANSACTION_SOURCE
+    ) {
+        anyhow::bail!("unsupported transaction effect source");
+    }
+    if !valid_bounded_text(principal_id, 256) || !valid_sha256(request_sha256) {
+        anyhow::bail!("invalid exact transaction effect binding");
+    }
+    let digest = runtime_transaction_request_sha256(&json!({
+        "domain": "elastos.runtime.exact-transaction-effect/v1",
+        "source": source,
+        "principal_id": principal_id,
+        "request_sha256": request_sha256,
+        "request_binding": request_binding,
+    }))?;
+    Ok(format!("transaction-effect:sha256:{digest}"))
+}
+
+fn bind_transaction_intent_runtime_context(
+    intent: &mut Value,
+    request: &RuntimeTransactionRequest,
+    authority: &RuntimeWalletAuthority,
+    include_metadata: bool,
+) -> anyhow::Result<()> {
+    let Some(intent_object) = intent.as_object_mut() else {
+        anyhow::bail!("transaction intent must be a JSON object");
+    };
+    if include_metadata {
+        if let Some(metadata) = request.metadata.as_object() {
+            for (key, value) in metadata {
+                intent_object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    intent_object.insert(
+        "principal_id".to_string(),
+        json!(authority.verified_context().principal_id()),
+    );
+    intent_object.insert(
+        "session_id".to_string(),
+        json!(authority.verified_context().session_id()),
+    );
+    intent_object.insert("effect_id".to_string(), json!(request.effect_id.as_str()));
+    intent_object.insert("source".to_string(), json!(request.source));
+    intent_object.insert(
+        "request_sha256".to_string(),
+        json!(request.request_sha256.as_str()),
+    );
+    intent_object.insert("account_id".to_string(), json!(request.account_id.as_str()));
+    intent_object.insert(
+        "chain_namespace".to_string(),
+        json!(request.chain_namespace.as_str()),
+    );
+    intent_object.insert(
+        "proof_binding_id".to_string(),
+        json!(authority.verified_context().proof_binding_id()),
+    );
+    intent_object.insert(
+        "grant_id".to_string(),
+        json!(authority.verified_context().grant_id()),
+    );
+    intent_object.insert(
+        "launch_id".to_string(),
+        json!(authority.verified_context().launch_id()),
+    );
+    intent_object.insert(
+        "requested_by_actor".to_string(),
+        json!(authority.verified_context().actor()),
+    );
+    intent_object
+        .entry("method".to_string())
+        .or_insert_with(|| {
+            json!(if request.source == NATIVE_TRANSACTION_SOURCE {
+                "wallet_send"
+            } else {
+                "eth_sendTransaction"
+            })
+        });
+    Ok(())
+}
+
+fn rebind_prepared_exact_effect(
+    effect: &mut RuntimeTransactionEffect,
+    authority: &RuntimeWalletAuthority,
+    request: &RuntimeTransactionRequest,
+) -> anyhow::Result<()> {
+    effect.authority = transaction_authority(authority);
+    bind_transaction_intent_runtime_context(&mut effect.intent, request, authority, false)?;
+    effect.wallet_request_sha256 = wallet_operation_request_sha256(
+        authority,
+        &effect.approval_request_id,
+        transaction_approval_operation(effect),
+    )?;
+    effect.updated_at = now_ts();
+    effect.validate(authority.verified_context().principal_id())
+}
+
+async fn exact_wallet_approval_by_id(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    approval_request_id: &str,
+) -> Result<Option<Value>, (StatusCode, String)> {
+    let data = runtime_wallet_data(
+        state,
+        authority,
+        WalletProviderOperationV2::ListApprovals {
+            include_resolved: true,
+        },
+    )
+    .await
+    .map_err(wallet_unavailable)?;
+    let approvals = data
+        .get("approval_requests")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Wallet approval store returned an invalid approvals list".to_string(),
+            )
+        })?;
+    let mut matched = None;
+    for approval in approvals {
+        if !approval.is_object() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Wallet approval store returned a malformed approval entry".to_string(),
+            ));
+        }
+        if approval.get("request_id").and_then(Value::as_str) == Some(approval_request_id) {
+            if matched.is_some() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Wallet approval store returned duplicate exact approval identities"
+                        .to_string(),
+                ));
+            }
+            matched = Some(approval.clone());
+        }
+    }
+    Ok(matched)
+}
+
+pub(in crate::api::gateway) async fn ensure_exact_runtime_transaction_approval(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    request: RuntimeTransactionRequest,
+) -> Result<RuntimeTransactionApproval, (StatusCode, String)> {
+    validate_transaction_request(authority, &request)?;
+    let principal_id = authority.verified_context().principal_id();
+    let lock = transaction_effect_lock(&state.data_dir, principal_id).await;
+    let _guard = lock.lock().await;
+    let mut store = load_transaction_effect_store(state, principal_id)?;
+    let request_binding = transaction_request_binding(&request);
+    let authority_binding = transaction_authority(authority);
+    let expected_effect_id = exact_runtime_transaction_effect_id(
+        request.source,
+        principal_id,
+        &request.request_sha256,
+        &request_binding,
+    )
+    .map_err(internal_error)?;
+    if request.effect_id != expected_effect_id {
+        return Err((
+            StatusCode::CONFLICT,
+            "exact Runtime transaction effect identity does not match the verified principal and request binding".to_string(),
+        ));
+    }
+    let expected_approval_request_id = wallet_request_id(&request.effect_id, "approval");
+    let now = now_ts();
+
+    let existing_effect = if let Some(index) = store
+        .effects
+        .iter()
+        .position(|effect| effect.effect_id == request.effect_id)
+    {
+        let effect = &store.effects[index];
+        if effect.approval_request_id != expected_approval_request_id
+            || effect.source != request.source
+            || effect.authority.principal_id != authority_binding.principal_id
+            || effect.request_sha256 != request.request_sha256
+            || effect.request_binding != request_binding
+            || effect.account_id != request.account_id
+            || !effect.address.eq_ignore_ascii_case(&request.address)
+            || effect.chain_namespace != request.chain_namespace
+            || effect.network != request.network
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "exact Runtime transaction effect identity was reused with substituted bindings"
+                    .to_string(),
+            ));
+        }
+        true
+    } else {
+        let mut intent = prepare_chain_transaction(state, &request).await?;
+        bind_transaction_intent_runtime_context(&mut intent, &request, authority, true)
+            .map_err(internal_error)?;
+        let mut effect = RuntimeTransactionEffect {
+            schema: TRANSACTION_EFFECT_SCHEMA.to_string(),
+            effect_id: request.effect_id.clone(),
+            source: request.source.to_string(),
+            authority: authority_binding,
+            request_sha256: request.request_sha256.clone(),
+            request_binding,
+            approval_request_id: expected_approval_request_id.clone(),
+            wallet_request_sha256: String::new(),
+            approval_expires_at: now.saturating_add(WALLET_APPROVAL_REQUEST_TTL_SECS),
+            approval_reason: request.approval_reason.clone(),
+            account_id: request.account_id.clone(),
+            address: request.address.clone(),
+            chain_namespace: request.chain_namespace.clone(),
+            network: request.network.clone(),
+            intent,
+            state: TransactionEffectState::Prepared,
+            approval_snapshot: None,
+            signed_transaction: None,
+            wallet_binding: None,
+            wallet_transaction_hash: None,
+            signed_result: None,
+            receipt: None,
+            requested_audit_completed: false,
+            projection_completed: false,
+            completion_audit_completed: false,
+            completion_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        effect.wallet_request_sha256 = wallet_operation_request_sha256(
+            authority,
+            &effect.approval_request_id,
+            transaction_approval_operation(&effect),
+        )
+        .map_err(internal_error)?;
+        effect.validate(principal_id).map_err(internal_error)?;
+        store.prepare_capacity().map_err(conflict_error)?;
+        if store
+            .effects
+            .iter()
+            .any(|effect| effect.approval_request_id == expected_approval_request_id)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "exact Runtime transaction approval identity was reused with substituted bindings"
+                    .to_string(),
+            ));
+        }
+        store.effects.push(effect);
+        save_transaction_effect_store(state, &store)?;
+        false
+    };
+    let effect_index = store
+        .effects
+        .iter()
+        .position(|effect| effect.effect_id == request.effect_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "exact Runtime transaction effect disappeared during approval recovery".to_string(),
+            )
+        })?;
+
+    let approval = if existing_effect {
+        ensure_requested_transaction_audit(state, &mut store, effect_index)?;
+        match exact_wallet_approval_by_id(
+            state,
+            authority,
+            &store.effects[effect_index].approval_request_id,
+        )
+        .await?
+        {
+            Some(approval) => {
+                let effect = &store.effects[effect_index];
+                validate_approval_snapshot(effect, authority, &approval)?;
+                let effect = &mut store.effects[effect_index];
+                effect.approval_snapshot = Some(approval.clone());
+                if effect.state == TransactionEffectState::Prepared {
+                    effect.state = TransactionEffectState::ApprovalPending;
+                }
+                effect.updated_at = now_ts();
+                save_transaction_effect_store(state, &store)?;
+                approval
+            }
+            None => {
+                let effect = &mut store.effects[effect_index];
+                if effect.approval_snapshot.is_some() {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "exact Runtime transaction approval is missing from the Wallet approval store"
+                            .to_string(),
+                    ));
+                }
+                if effect.state != TransactionEffectState::Prepared {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "exact Runtime transaction approval cannot be recreated after durable progression beyond the prepared state"
+                            .to_string(),
+                    ));
+                }
+                if effect.approval_expires_at <= now_ts() {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "exact Runtime transaction approval expired before durable recovery"
+                            .to_string(),
+                    ));
+                }
+                rebind_prepared_exact_effect(effect, authority, &request)
+                    .map_err(internal_error)?;
+                save_transaction_effect_store(state, &store)?;
+                ensure_effect_wallet_approval(state, authority, &mut store, effect_index).await?
+            }
+        }
+    } else {
+        ensure_effect_wallet_approval(state, authority, &mut store, effect_index).await?
+    };
+    Ok(RuntimeTransactionApproval {
+        effect_id: request.effect_id,
+        approval_request: approval,
+    })
+}
+
 pub(in crate::api::gateway) async fn ensure_runtime_transaction_approval(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
@@ -477,57 +804,8 @@ pub(in crate::api::gateway) async fn ensure_runtime_transaction_approval(
         index
     } else {
         let mut intent = prepare_chain_transaction(state, &request).await?;
-        if let Some(intent_object) = intent.as_object_mut() {
-            if let Some(metadata) = request.metadata.as_object() {
-                for (key, value) in metadata {
-                    intent_object.insert(key.clone(), value.clone());
-                }
-            }
-            intent_object.insert(
-                "principal_id".to_string(),
-                json!(authority.verified_context().principal_id()),
-            );
-            intent_object.insert(
-                "session_id".to_string(),
-                json!(authority.verified_context().session_id()),
-            );
-            intent_object.insert("effect_id".to_string(), json!(request.effect_id.as_str()));
-            intent_object.insert("source".to_string(), json!(request.source));
-            intent_object.insert(
-                "request_sha256".to_string(),
-                json!(request.request_sha256.as_str()),
-            );
-            intent_object.insert("account_id".to_string(), json!(request.account_id.as_str()));
-            intent_object.insert(
-                "chain_namespace".to_string(),
-                json!(request.chain_namespace.as_str()),
-            );
-            intent_object.insert(
-                "proof_binding_id".to_string(),
-                json!(authority.verified_context().proof_binding_id()),
-            );
-            intent_object.insert(
-                "grant_id".to_string(),
-                json!(authority.verified_context().grant_id()),
-            );
-            intent_object.insert(
-                "launch_id".to_string(),
-                json!(authority.verified_context().launch_id()),
-            );
-            intent_object.insert(
-                "requested_by_actor".to_string(),
-                json!(authority.verified_context().actor()),
-            );
-            intent_object
-                .entry("method".to_string())
-                .or_insert_with(|| {
-                    json!(if request.source == NATIVE_TRANSACTION_SOURCE {
-                        "wallet_send"
-                    } else {
-                        "eth_sendTransaction"
-                    })
-                });
-        }
+        bind_transaction_intent_runtime_context(&mut intent, &request, authority, true)
+            .map_err(internal_error)?;
         let approval_request_id = wallet_request_id(&request.effect_id, "approval");
         let mut effect = RuntimeTransactionEffect {
             schema: TRANSACTION_EFFECT_SCHEMA.to_string(),
@@ -705,28 +983,50 @@ pub(in crate::api::gateway) async fn complete_runtime_transaction_effect(
     state: &GatewayState,
     authority: &RuntimeWalletAuthority,
     lookup: RuntimeTransactionLookup<'_>,
+    exact_approved_request: Option<&RuntimeTransactionRequest>,
     managed_approval: Option<RuntimeManagedTransactionApproval<'_>>,
 ) -> Result<RuntimeTransactionCompletion, (StatusCode, String)> {
+    let approval_resume = match (&lookup, exact_approved_request) {
+        (RuntimeTransactionLookup::ApprovalId(approval_request_id), Some(request)) => {
+            validate_transaction_request(authority, request)?;
+            Some((*approval_request_id, request))
+        }
+        (RuntimeTransactionLookup::EffectId(_), Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "exact approved-request recovery requires approval-id lookup".to_string(),
+            ));
+        }
+        (_, None) => None,
+    };
     let principal_id = authority.verified_context().principal_id();
     let lock = transaction_effect_lock(&state.data_dir, principal_id).await;
     let _guard = lock.lock().await;
     let mut store = load_transaction_effect_store(state, principal_id)?;
-    let effect_index = match find_effect_index(&store, &lookup) {
-        Some(index) => index,
-        None => match lookup {
-            RuntimeTransactionLookup::ApprovalId(request_id) => {
-                create_browser_effect_from_approval(state, authority, &mut store, request_id)
-                    .await?
-            }
-            RuntimeTransactionLookup::EffectId(_) => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    "Runtime transaction effect not found".to_string(),
-                ));
-            }
-        },
+    let effect_index = if let Some((approval_request_id, request)) = approval_resume {
+        approved_request_effect_index(&store, approval_request_id, request)?
+    } else {
+        match find_effect_index(&store, &lookup) {
+            Some(index) => index,
+            None => match lookup {
+                RuntimeTransactionLookup::ApprovalId(request_id) => {
+                    create_browser_effect_from_approval(state, authority, &mut store, request_id)
+                        .await?
+                }
+                RuntimeTransactionLookup::EffectId(_) => {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        "Runtime transaction effect not found".to_string(),
+                    ));
+                }
+            },
+        }
     };
-    require_effect_authority(&store.effects[effect_index], authority)?;
+    if approval_resume.is_some() {
+        require_effect_principal(&store.effects[effect_index], authority)?;
+    } else {
+        require_effect_authority(&store.effects[effect_index], authority)?;
+    }
     ensure_requested_transaction_audit(state, &mut store, effect_index)?;
     let already_confirmed = store.effects[effect_index].receipt.is_some();
 
@@ -2154,6 +2454,19 @@ fn require_effect_authority(
     Ok(())
 }
 
+fn require_effect_principal(
+    effect: &RuntimeTransactionEffect,
+    authority: &RuntimeWalletAuthority,
+) -> Result<(), (StatusCode, String)> {
+    if effect.authority.principal_id != authority.verified_context().principal_id() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "transaction effect belongs to different verified Runtime principal".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn transaction_effect_location(
     state: &GatewayState,
     principal_id: &str,
@@ -2284,7 +2597,47 @@ fn find_effect_index(
     })
 }
 
-fn wallet_request_id(effect_id: &str, phase: &str) -> String {
+fn approved_request_effect_index(
+    store: &RuntimeTransactionEffectStore,
+    approval_request_id: &str,
+    request: &RuntimeTransactionRequest,
+) -> Result<usize, (StatusCode, String)> {
+    let Some(index) = store
+        .effects
+        .iter()
+        .position(|effect| effect.approval_request_id == approval_request_id)
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "approved Runtime transaction effect not found".to_string(),
+        ));
+    };
+    let effect = &store.effects[index];
+    if effect.approval_snapshot.is_none() {
+        return Err((
+            StatusCode::CONFLICT,
+            "approved Runtime transaction effect is missing its durable approval snapshot"
+                .to_string(),
+        ));
+    }
+    let expected_request_binding = transaction_request_binding(request);
+    if effect.source != request.source
+        || effect.request_sha256 != request.request_sha256
+        || effect.request_binding != expected_request_binding
+        || effect.account_id != request.account_id
+        || !effect.address.eq_ignore_ascii_case(&request.address)
+        || effect.chain_namespace != request.chain_namespace
+        || effect.network != request.network
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "approved Runtime transaction recovery binding mismatch".to_string(),
+        ));
+    }
+    Ok(index)
+}
+
+pub(in crate::api::gateway) fn wallet_request_id(effect_id: &str, phase: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"elastos.runtime.transaction-wallet-request/v1");
     digest.update([0]);
@@ -2631,5 +2984,1366 @@ mod exact_signed_transaction_tests {
         );
         let signature = k256::ecdsa::Signature::from_scalars(r, high_s).unwrap();
         assert!(validate_low_s_signature(&signature).is_err());
+    }
+}
+
+#[cfg(test)]
+mod approved_request_resume_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    use async_trait::async_trait;
+    use elastos_runtime::provider::{
+        Provider, ProviderError, ProviderRegistry, ResourceRequest, ResourceResponse,
+    };
+    use elastos_wallet_contract::{
+        VerifiedWalletInvocationContext, WalletProviderOperationV2, WalletProviderRequestV2,
+        WalletProviderResponseV2, WalletResultV2,
+    };
+    use k256::ecdsa::SigningKey;
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    struct MockApprovedWalletProvider {
+        approvals: Mutex<Vec<Value>>,
+        list_mode: ApprovalListMode,
+        list_calls: AtomicUsize,
+        request_approval_calls: AtomicUsize,
+        attach_calls: AtomicUsize,
+        requests: Mutex<Vec<Value>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ApprovalListMode {
+        Stored,
+        Unavailable,
+        Malformed,
+    }
+
+    impl MockApprovedWalletProvider {
+        fn new(approvals: Vec<Value>) -> Self {
+            Self {
+                approvals: Mutex::new(approvals),
+                list_mode: ApprovalListMode::Stored,
+                list_calls: AtomicUsize::new(0),
+                request_approval_calls: AtomicUsize::new(0),
+                attach_calls: AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn unavailable_list(mut self) -> Self {
+            self.list_mode = ApprovalListMode::Unavailable;
+            self
+        }
+
+        fn malformed_list(mut self) -> Self {
+            self.list_mode = ApprovalListMode::Malformed;
+            self
+        }
+
+        fn build_approval(
+            &self,
+            wallet_request: &WalletProviderRequestV2,
+        ) -> Result<Value, ProviderError> {
+            let WalletProviderOperationV2::RequestApproval {
+                account_id,
+                chain_namespace,
+                intent,
+                resource,
+                reason,
+                payload,
+                expires_at,
+            } = &wallet_request.operation
+            else {
+                return Err(ProviderError::Provider(
+                    "build_approval requires Wallet RequestApproval".to_string(),
+                ));
+            };
+            let address = payload.get("from").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::Provider(
+                    "RequestApproval payload is missing its originating address".to_string(),
+                )
+            })?;
+            let payload_hash = format!(
+                "sha256:{}",
+                runtime_transaction_request_sha256(payload)
+                    .map_err(|err| ProviderError::Provider(err.to_string()))?
+            );
+            Ok(json!({
+                "schema": "elastos.wallet.approval_request/v1",
+                "request_id": wallet_request.request_id,
+                "wallet_request_sha256": wallet_request.request_sha256,
+                "authority_binding": wallet_request.session_binding,
+                "status": "pending",
+                "intent": intent,
+                "requested_by_actor": wallet_request.authority.actor,
+                "resource": resource,
+                "reason": reason,
+                "account_id": account_id,
+                "chain_namespace": chain_namespace,
+                "address": address,
+                "proof_binding_id": wallet_request.authority.proof_binding_id,
+                "payload_hash": payload_hash,
+                "payload": payload,
+                "principal_id": wallet_request.authority.principal_id,
+                "session_id": wallet_request.authority.session_id,
+                "launch_id": wallet_request.authority.launch_id,
+                "created_at": wallet_request.issued_at,
+                "expires_at": expires_at,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockApprovedWalletProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "test wallet provider supports only raw operations".to_string(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["wallet"]
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-approved-wallet-provider"
+        }
+
+        async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            let wallet_request: WalletProviderRequestV2 =
+                serde_json::from_value(request.get("request").cloned().ok_or_else(|| {
+                    ProviderError::Provider("missing Wallet request".to_string())
+                })?)
+                .map_err(|err| ProviderError::Provider(err.to_string()))?;
+            let data = match wallet_request.operation {
+                WalletProviderOperationV2::RequestApproval {
+                    ref account_id,
+                    ref chain_namespace,
+                    ref intent,
+                    ref resource,
+                    ref reason,
+                    ref payload,
+                    expires_at,
+                } => {
+                    self.request_approval_calls.fetch_add(1, Ordering::SeqCst);
+                    let mut approvals = self.approvals.lock().await;
+                    let approval = if let Some(existing) = approvals.iter().find(|approval| {
+                        approval.get("request_id").and_then(Value::as_str)
+                            == Some(wallet_request.request_id.as_str())
+                    }) {
+                        if existing.get("account_id").and_then(Value::as_str)
+                            != Some(account_id.as_str())
+                            || existing.get("chain_namespace").and_then(Value::as_str)
+                                != Some(chain_namespace.as_str())
+                            || existing.get("intent").and_then(Value::as_str)
+                                != Some(intent.as_str())
+                            || existing.get("resource").and_then(Value::as_str)
+                                != Some(resource.as_str())
+                            || existing.get("reason").and_then(Value::as_str)
+                                != Some(reason.as_str())
+                            || existing.get("payload") != Some(payload)
+                            || existing.get("expires_at").and_then(Value::as_u64)
+                                != Some(expires_at)
+                            || existing
+                                .get("wallet_request_sha256")
+                                .and_then(Value::as_str)
+                                != Some(wallet_request.request_sha256.as_str())
+                            || existing.get("principal_id").and_then(Value::as_str)
+                                != Some(wallet_request.authority.principal_id.as_str())
+                            || existing.get("session_id").and_then(Value::as_str)
+                                != Some(wallet_request.authority.session_id.as_str())
+                            || existing.get("launch_id").and_then(Value::as_str)
+                                != Some(wallet_request.authority.launch_id.as_str())
+                        {
+                            return Err(ProviderError::Provider(
+                                "RequestApproval binding mismatch in exact approval test"
+                                    .to_string(),
+                            ));
+                        }
+                        existing.clone()
+                    } else {
+                        let approval = self.build_approval(&wallet_request)?;
+                        approvals.push(approval.clone());
+                        approval
+                    };
+                    json!({ "approval_request": approval })
+                }
+                WalletProviderOperationV2::ListApprovals { .. } => {
+                    self.list_calls.fetch_add(1, Ordering::SeqCst);
+                    match self.list_mode {
+                        ApprovalListMode::Stored => {
+                            let approvals = self.approvals.lock().await.clone();
+                            json!({ "approval_requests": approvals })
+                        }
+                        ApprovalListMode::Unavailable => {
+                            return Err(ProviderError::Provider(
+                                "wallet approval list unavailable in exact approval test"
+                                    .to_string(),
+                            ));
+                        }
+                        ApprovalListMode::Malformed => {
+                            json!({ "approval_requests": "malformed" })
+                        }
+                    }
+                }
+                WalletProviderOperationV2::AttachValidatedChainOutcome { .. } => {
+                    self.attach_calls.fetch_add(1, Ordering::SeqCst);
+                    json!({ "attached": true })
+                }
+                _ => {
+                    return Err(ProviderError::Provider(
+                        "unsupported Wallet operation in approved resume test".to_string(),
+                    ));
+                }
+            };
+            Ok(json!({
+                "status": "ok",
+                "data": serde_json::to_value(WalletProviderResponseV2::for_request(
+                    &wallet_request,
+                    WalletResultV2::Ok { data },
+                ))
+                .map_err(|err| ProviderError::Provider(err.to_string()))?,
+            }))
+        }
+    }
+
+    struct MockBroadcastChainProvider {
+        expected_network: String,
+        expected_hash: String,
+        calls: AtomicUsize,
+        requests: Mutex<Vec<Value>>,
+    }
+
+    impl MockBroadcastChainProvider {
+        fn new(expected_network: String, expected_hash: String) -> Self {
+            Self {
+                expected_network,
+                expected_hash,
+                calls: AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockBroadcastChainProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "test chain provider supports only raw operations".to_string(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["chain"]
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-broadcast-chain-provider"
+        }
+
+        async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            if request.get("op").and_then(Value::as_str) != Some("broadcast_transaction") {
+                return Err(ProviderError::Provider(
+                    "unexpected Chain operation in approved resume test".to_string(),
+                ));
+            }
+            if request.get("network").and_then(Value::as_str)
+                != Some(self.expected_network.as_str())
+            {
+                return Err(ProviderError::Provider(
+                    "unexpected Chain network in approved resume test".to_string(),
+                ));
+            }
+            let signed_transaction = request
+                .get("signed_transaction")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProviderError::Provider(
+                        "missing signed transaction in approved resume test".to_string(),
+                    )
+                })?;
+            let raw = hex::decode(signed_transaction.trim_start_matches("0x"))
+                .map_err(|err| ProviderError::Provider(err.to_string()))?;
+            let observed_hash = format!("0x{}", hex::encode(Keccak256::digest(raw)));
+            if !observed_hash.eq_ignore_ascii_case(&self.expected_hash) {
+                return Err(ProviderError::Provider(
+                    "unexpected broadcast hash in approved resume test".to_string(),
+                ));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "schema": "elastos.chain.broadcast_receipt/v1",
+                "network": self.expected_network,
+                "transaction_hash": self.expected_hash,
+                "receipt": {
+                    "transactionHash": self.expected_hash,
+                }
+            }))
+        }
+    }
+
+    struct MockPrepareChainProvider {
+        expected_request: RuntimeTransactionRequest,
+        intent: Value,
+        calls: AtomicUsize,
+        requests: Mutex<Vec<Value>>,
+    }
+
+    impl MockPrepareChainProvider {
+        fn new(expected_request: RuntimeTransactionRequest, intent: Value) -> Self {
+            Self {
+                expected_request,
+                intent,
+                calls: AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for MockPrepareChainProvider {
+        async fn handle(
+            &self,
+            _request: ResourceRequest,
+        ) -> Result<ResourceResponse, ProviderError> {
+            Err(ProviderError::Provider(
+                "test chain provider supports only raw operations".to_string(),
+            ))
+        }
+
+        fn schemes(&self) -> Vec<&'static str> {
+            vec!["chain"]
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-prepare-chain-provider"
+        }
+
+        async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+            self.requests.lock().await.push(request.clone());
+            if request.get("op").and_then(Value::as_str) != Some("prepare_transaction") {
+                return Err(ProviderError::Provider(
+                    "unexpected Chain operation in exact approval test".to_string(),
+                ));
+            }
+            if request.get("network").and_then(Value::as_str)
+                != Some(self.expected_request.network.as_str())
+                || !request
+                    .get("from")
+                    .and_then(Value::as_str)
+                    .is_some_and(|from| from.eq_ignore_ascii_case(&self.expected_request.address))
+                || !request
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .is_some_and(|to| to.eq_ignore_ascii_case(&self.expected_request.to))
+                || request.get("value").and_then(Value::as_str)
+                    != Some(self.expected_request.value.as_str())
+                || request.get("data").and_then(Value::as_str)
+                    != Some(self.expected_request.data.as_str())
+            {
+                return Err(ProviderError::Provider(
+                    "prepare_transaction request binding mismatch in exact approval test"
+                        .to_string(),
+                ));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.intent.clone())
+        }
+    }
+
+    fn test_gateway_state(
+        root: &std::path::Path,
+        provider_registry: Option<Arc<ProviderRegistry>>,
+    ) -> GatewayState {
+        GatewayState {
+            provider_registry,
+            collaboration_chat_product_port: None,
+            collaboration_presence_product_port: None,
+            collaboration_discovery_service: None,
+            identity_manager: Arc::new(OnceLock::new()),
+            cache_dir: root.join("cache"),
+            data_dir: root.join("data"),
+        }
+    }
+
+    fn test_authority(
+        principal_id: &str,
+        session_id: &str,
+        actor: &str,
+        launch_id: &str,
+    ) -> RuntimeWalletAuthority {
+        RuntimeWalletAuthority::from_verified_context(
+            VerifiedWalletInvocationContext::new(
+                principal_id,
+                session_id,
+                Some("proof:test".to_string()),
+                "grant:test",
+                actor,
+                launch_id,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn trim_integer(bytes: &[u8]) -> &[u8] {
+        let first = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(bytes.len());
+        &bytes[first..]
+    }
+
+    fn address_for_key(key: &SigningKey) -> String {
+        let point = key.verifying_key().to_encoded_point(false);
+        let digest = Keccak256::digest(&point.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&digest[12..]))
+    }
+
+    fn sign_intent(intent: &Value, key: &SigningKey) -> (String, String, String) {
+        let chain_id = intent["chain_id"].as_u64().unwrap();
+        let nonce = exact_payload_quantity(intent, "nonce").unwrap();
+        let gas_price = exact_payload_quantity(intent, "gas_price").unwrap();
+        let gas_limit = exact_payload_quantity(intent, "gas_limit").unwrap();
+        let to = exact_payload_bytes(intent, "to").unwrap();
+        let value = exact_payload_quantity(intent, "value").unwrap();
+        let data = exact_payload_bytes(intent, "data").unwrap();
+        let chain_id_bytes = chain_id.to_be_bytes();
+        let signing_payload = rlp_encode_list(&[
+            rlp_encode_bytes(&nonce),
+            rlp_encode_bytes(&gas_price),
+            rlp_encode_bytes(&gas_limit),
+            rlp_encode_bytes(&to),
+            rlp_encode_bytes(&value),
+            rlp_encode_bytes(&data),
+            rlp_encode_bytes(trim_integer(&chain_id_bytes)),
+            rlp_encode_bytes(&[]),
+            rlp_encode_bytes(&[]),
+        ]);
+        let signing_hash = Keccak256::digest(signing_payload);
+        let (signature, recovery_id) = key.sign_prehash_recoverable(&signing_hash).unwrap();
+        let signature = signature.to_bytes();
+        let v = chain_id * 2 + 35 + u64::from(recovery_id.to_byte());
+        let v_bytes = v.to_be_bytes();
+        let signed = rlp_encode_list(&[
+            rlp_encode_bytes(&nonce),
+            rlp_encode_bytes(&gas_price),
+            rlp_encode_bytes(&gas_limit),
+            rlp_encode_bytes(&to),
+            rlp_encode_bytes(&value),
+            rlp_encode_bytes(&data),
+            rlp_encode_bytes(trim_integer(&v_bytes)),
+            rlp_encode_bytes(trim_integer(&signature[..32])),
+            rlp_encode_bytes(trim_integer(&signature[32..])),
+        ]);
+        let canonical = format!("0x{}", hex::encode(&signed));
+        let transaction_hash = format!("0x{}", hex::encode(Keccak256::digest(&signed)));
+        let sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&signed)));
+        (canonical, transaction_hash, sha256)
+    }
+
+    fn approved_resume_fixture(
+        authority: &RuntimeWalletAuthority,
+    ) -> (
+        RuntimeTransactionRequest,
+        RuntimeTransactionEffect,
+        Value,
+        String,
+    ) {
+        let key = SigningKey::from_bytes((&[0x31; 32]).into()).unwrap();
+        let address = address_for_key(&key);
+        let request_sha256 = runtime_transaction_request_sha256(&json!({
+            "domain": "resume-test",
+            "binding": "creator-mint",
+        }))
+        .unwrap();
+        let effect_id = runtime_transaction_effect_id(
+            NATIVE_TRANSACTION_SOURCE,
+            authority,
+            &json!({
+                "approval_request_id": "wallet-request:resume-approved",
+                "request_sha256": request_sha256,
+            }),
+        )
+        .unwrap();
+        let request = RuntimeTransactionRequest {
+            source: NATIVE_TRANSACTION_SOURCE,
+            effect_id: effect_id.clone(),
+            request_sha256: request_sha256.clone(),
+            account_id: format!("wallet:eip155:8453:{address}"),
+            address: address.clone(),
+            chain_namespace: "eip155:8453".to_string(),
+            network: "base-mainnet".to_string(),
+            to: "0x2222222222222222222222222222222222222222".to_string(),
+            value: "0x0".to_string(),
+            data: "0x1234".to_string(),
+            approval_reason: "Creator mint approval".to_string(),
+            metadata: json!({ "flow": "protected-content-creator-mint" }),
+        };
+        let intent = json!({
+            "schema": "elastos.chain.unsigned_transaction_intent/v1",
+            "transaction_type": "eip155_legacy",
+            "network": { "id": "base-mainnet", "chain_id": 8453 },
+            "from": address,
+            "to": request.to,
+            "value": request.value,
+            "data": request.data,
+            "chain_id": 8453,
+            "nonce": "0x1",
+            "gas_price": "0x3b9aca00",
+            "gas_limit": "0x5208",
+            "requires_wallet_approval": true,
+            "wallet_intent": "transaction_intent",
+            "method": "eth_sendTransaction"
+        });
+        let approval_request_id = wallet_request_id(&effect_id, "approval");
+        let mut effect = RuntimeTransactionEffect {
+            schema: TRANSACTION_EFFECT_SCHEMA.to_string(),
+            effect_id,
+            source: NATIVE_TRANSACTION_SOURCE.to_string(),
+            authority: transaction_authority(authority),
+            request_sha256,
+            request_binding: transaction_request_binding(&request),
+            approval_request_id,
+            wallet_request_sha256: format!("request:sha256:{}", "f".repeat(64)),
+            approval_expires_at: now_ts().saturating_add(600),
+            approval_reason: request.approval_reason.clone(),
+            account_id: request.account_id.clone(),
+            address: request.address.clone(),
+            chain_namespace: request.chain_namespace.clone(),
+            network: request.network.clone(),
+            intent,
+            state: TransactionEffectState::ApprovalPending,
+            approval_snapshot: None,
+            signed_transaction: None,
+            wallet_binding: None,
+            wallet_transaction_hash: None,
+            signed_result: None,
+            receipt: None,
+            requested_audit_completed: false,
+            projection_completed: false,
+            completion_audit_completed: false,
+            completion_error: None,
+            created_at: now_ts(),
+            updated_at: now_ts(),
+        };
+        effect.wallet_request_sha256 = wallet_operation_request_sha256(
+            authority,
+            &effect.approval_request_id,
+            transaction_approval_operation(&effect),
+        )
+        .unwrap();
+        let (signed_transaction, transaction_hash, signed_sha256) =
+            sign_intent(&effect.intent, &key);
+        let approval = json!({
+            "schema": "elastos.wallet.approval_request/v1",
+            "request_id": effect.approval_request_id,
+            "wallet_request_sha256": effect.wallet_request_sha256,
+            "principal_id": effect.authority.principal_id,
+            "session_id": effect.authority.session_id,
+            "launch_id": effect.authority.launch_id,
+            "account_id": effect.account_id,
+            "chain_namespace": effect.chain_namespace,
+            "address": effect.address,
+            "intent": "transaction_intent",
+            "requested_by_actor": effect.authority.actor,
+            "resource": format!("elastos://chain/{}/broadcast_transaction", effect.network),
+            "reason": effect.approval_reason,
+            "payload": effect.intent,
+            "payload_hash": format!("sha256:{}", "a".repeat(64)),
+            "authority_binding": "authority-binding:test",
+            "created_at": effect.created_at,
+            "expires_at": effect.approval_expires_at,
+            "status": "completed",
+            "signed_result": {
+                "schema": "elastos.wallet.signed-transaction-result/v1",
+                "request_id": effect.approval_request_id,
+                "method": "eth_sendTransaction",
+                "chain_namespace": effect.chain_namespace,
+                "signer": effect.address,
+                "payload_hash": format!("sha256:{}", "a".repeat(64)),
+                "signed_transaction": signed_transaction,
+                "transaction_hash": transaction_hash,
+            }
+        });
+        effect.approval_snapshot = Some(approval.clone());
+        effect.wallet_binding = Some(RuntimeTransactionWalletBinding::ManagedSigned {
+            signed_transaction_sha256: signed_sha256,
+        });
+        effect.wallet_transaction_hash = Some(transaction_hash.clone());
+        effect.signed_result = approval.get("signed_result").cloned();
+        effect.wallet_binding = None;
+        effect.wallet_transaction_hash = None;
+        effect.signed_result = None;
+        (request, effect, approval, transaction_hash)
+    }
+
+    fn exact_resume_fixture(
+        authority: &RuntimeWalletAuthority,
+    ) -> (
+        RuntimeTransactionRequest,
+        RuntimeTransactionEffect,
+        Value,
+        String,
+    ) {
+        let key = SigningKey::from_bytes((&[0x41; 32]).into()).unwrap();
+        let address = address_for_key(&key);
+        let request_sha256 = runtime_transaction_request_sha256(&json!({
+            "domain": "exact-resume-test",
+            "binding": "creator-mint",
+        }))
+        .unwrap();
+        let mut request = RuntimeTransactionRequest {
+            source: NATIVE_TRANSACTION_SOURCE,
+            effect_id: String::new(),
+            request_sha256: request_sha256.clone(),
+            account_id: format!("wallet:eip155:8453:{address}"),
+            address: address.clone(),
+            chain_namespace: "eip155:8453".to_string(),
+            network: "base-mainnet".to_string(),
+            to: "0x2222222222222222222222222222222222222222".to_string(),
+            value: "0x0".to_string(),
+            data: "0x1234".to_string(),
+            approval_reason: "Creator mint approval".to_string(),
+            metadata: json!({ "flow": "protected-content-creator-mint" }),
+        };
+        let request_binding = transaction_request_binding(&request);
+        request.effect_id = exact_runtime_transaction_effect_id(
+            NATIVE_TRANSACTION_SOURCE,
+            authority.verified_context().principal_id(),
+            &request.request_sha256,
+            &request_binding,
+        )
+        .unwrap();
+        let mut intent = json!({
+            "schema": "elastos.chain.unsigned_transaction_intent/v1",
+            "transaction_type": "eip155_legacy",
+            "network": { "id": "base-mainnet", "chain_id": 8453 },
+            "from": address,
+            "to": request.to,
+            "value": request.value,
+            "data": request.data,
+            "chain_id": 8453,
+            "nonce": "0x1",
+            "gas_price": "0x3b9aca00",
+            "gas_limit": "0x5208",
+            "requires_wallet_approval": true,
+            "wallet_intent": "transaction_intent",
+            "method": "eth_sendTransaction"
+        });
+        bind_transaction_intent_runtime_context(&mut intent, &request, authority, true).unwrap();
+        let approval_request_id = wallet_request_id(&request.effect_id, "approval");
+        let mut effect = RuntimeTransactionEffect {
+            schema: TRANSACTION_EFFECT_SCHEMA.to_string(),
+            effect_id: request.effect_id.clone(),
+            source: NATIVE_TRANSACTION_SOURCE.to_string(),
+            authority: transaction_authority(authority),
+            request_sha256,
+            request_binding,
+            approval_request_id,
+            wallet_request_sha256: String::new(),
+            approval_expires_at: now_ts().saturating_add(600),
+            approval_reason: request.approval_reason.clone(),
+            account_id: request.account_id.clone(),
+            address: request.address.clone(),
+            chain_namespace: request.chain_namespace.clone(),
+            network: request.network.clone(),
+            intent,
+            state: TransactionEffectState::Prepared,
+            approval_snapshot: None,
+            signed_transaction: None,
+            wallet_binding: None,
+            wallet_transaction_hash: None,
+            signed_result: None,
+            receipt: None,
+            requested_audit_completed: false,
+            projection_completed: false,
+            completion_audit_completed: false,
+            completion_error: None,
+            created_at: now_ts(),
+            updated_at: now_ts(),
+        };
+        effect.wallet_request_sha256 = wallet_operation_request_sha256(
+            authority,
+            &effect.approval_request_id,
+            transaction_approval_operation(&effect),
+        )
+        .unwrap();
+        let (signed_transaction, transaction_hash, _signed_sha256) =
+            sign_intent(&effect.intent, &key);
+        let approval = json!({
+            "schema": "elastos.wallet.approval_request/v1",
+            "request_id": effect.approval_request_id,
+            "wallet_request_sha256": effect.wallet_request_sha256,
+            "principal_id": effect.authority.principal_id,
+            "session_id": effect.authority.session_id,
+            "launch_id": effect.authority.launch_id,
+            "account_id": effect.account_id,
+            "chain_namespace": effect.chain_namespace,
+            "address": effect.address,
+            "intent": "transaction_intent",
+            "requested_by_actor": effect.authority.actor,
+            "resource": format!("elastos://chain/{}/broadcast_transaction", effect.network),
+            "reason": effect.approval_reason,
+            "payload": effect.intent,
+            "payload_hash": format!("sha256:{}", "b".repeat(64)),
+            "authority_binding": "authority-binding:test",
+            "created_at": effect.created_at,
+            "expires_at": effect.approval_expires_at,
+            "status": "completed",
+            "signed_result": {
+                "schema": "elastos.wallet.signed-transaction-result/v1",
+                "request_id": effect.approval_request_id,
+                "method": "eth_sendTransaction",
+                "chain_namespace": effect.chain_namespace,
+                "signer": effect.address,
+                "payload_hash": format!("sha256:{}", "b".repeat(64)),
+                "signed_transaction": signed_transaction,
+                "transaction_hash": transaction_hash,
+            }
+        });
+        (request, effect, approval, transaction_hash)
+    }
+
+    #[tokio::test]
+    async fn exact_transaction_approval_creates_once_and_pending_resume_reuses_same_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let create_authority = test_authority(
+            "principal:test",
+            "session:create",
+            "library",
+            "launch:create",
+        );
+        let resumed_authority = test_authority(
+            "principal:test",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let (request, effect, mut approval, _hash) = exact_resume_fixture(&create_authority);
+        approval["status"] = json!("pending");
+        approval.as_object_mut().unwrap().remove("signed_result");
+        let wallet = Arc::new(MockApprovedWalletProvider::new(vec![]));
+        let chain = Arc::new(MockPrepareChainProvider::new(
+            request.clone(),
+            effect.intent.clone(),
+        ));
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("wallet", wallet.clone())
+            .await
+            .unwrap();
+        registry
+            .register_sub_provider("chain", chain.clone())
+            .await
+            .unwrap();
+        let state = test_gateway_state(root.path(), Some(registry));
+
+        let created =
+            ensure_exact_runtime_transaction_approval(&state, &create_authority, request.clone())
+                .await
+                .unwrap();
+        assert_eq!(created.effect_id, request.effect_id);
+        assert_eq!(
+            created
+                .approval_request
+                .get("request_id")
+                .and_then(Value::as_str),
+            Some(wallet_request_id(&request.effect_id, "approval").as_str())
+        );
+
+        let resumed =
+            ensure_exact_runtime_transaction_approval(&state, &resumed_authority, request.clone())
+                .await
+                .unwrap();
+        assert_eq!(resumed.effect_id, request.effect_id);
+        assert_eq!(resumed.approval_request, created.approval_request);
+        assert_eq!(wallet.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.request_approval_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+
+        let persisted = load_transaction_effect_store(&state, "principal:test").unwrap();
+        assert_eq!(persisted.effects.len(), 1);
+        assert_eq!(
+            persisted.effects[0].state,
+            TransactionEffectState::ApprovalPending
+        );
+        assert_eq!(persisted.effects[0].authority.session_id, "session:create");
+        assert_eq!(
+            persisted.effects[0].approval_request_id,
+            wallet_request_id(&request.effect_id, "approval")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_transaction_approval_adopts_prepared_effect_without_duplicate() {
+        let root = tempfile::tempdir().unwrap();
+        let original_authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let resumed_authority = test_authority(
+            "principal:test",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let (request, effect, mut approval, _hash) = exact_resume_fixture(&original_authority);
+        approval["status"] = json!("pending");
+        approval.as_object_mut().unwrap().remove("signed_result");
+        let wallet = Arc::new(MockApprovedWalletProvider::new(vec![approval.clone()]));
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("wallet", wallet.clone())
+            .await
+            .unwrap();
+        let state = test_gateway_state(root.path(), Some(registry));
+
+        let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+        store.effects.push(effect);
+        save_transaction_effect_store(&state, &store).unwrap();
+
+        let resumed =
+            ensure_exact_runtime_transaction_approval(&state, &resumed_authority, request.clone())
+                .await
+                .unwrap();
+        assert_eq!(resumed.effect_id, request.effect_id);
+        assert_eq!(
+            resumed
+                .approval_request
+                .get("request_id")
+                .and_then(Value::as_str),
+            Some(wallet_request_id(&request.effect_id, "approval").as_str())
+        );
+        assert_eq!(wallet.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.request_approval_calls.load(Ordering::SeqCst), 0);
+
+        let persisted = load_transaction_effect_store(&state, "principal:test").unwrap();
+        assert_eq!(persisted.effects.len(), 1);
+        assert_eq!(
+            persisted.effects[0].authority.session_id,
+            "session:original"
+        );
+        assert!(persisted.effects[0].approval_snapshot.is_some());
+        assert!(persisted.effects[0].requested_audit_completed);
+        assert_eq!(
+            persisted.effects[0].state,
+            TransactionEffectState::ApprovalPending
+        );
+        let audit_count = crate::auth::load_auth_state(&state.data_dir)
+            .unwrap()
+            .audit
+            .iter()
+            .filter(|event| {
+                event.event_id
+                    == format!("audit:transaction-effect:{}:requested", request.effect_id)
+            })
+            .count();
+        assert_eq!(audit_count, 1);
+
+        let resumed_again =
+            ensure_exact_runtime_transaction_approval(&state, &resumed_authority, request.clone())
+                .await
+                .unwrap();
+        assert_eq!(resumed_again.approval_request, resumed.approval_request);
+        let persisted_again = load_transaction_effect_store(&state, "principal:test").unwrap();
+        assert!(persisted_again.effects[0].requested_audit_completed);
+        let audit_count_again = crate::auth::load_auth_state(&state.data_dir)
+            .unwrap()
+            .audit
+            .iter()
+            .filter(|event| {
+                event.event_id
+                    == format!("audit:transaction-effect:{}:requested", request.effect_id)
+            })
+            .count();
+        assert_eq!(audit_count_again, 1);
+    }
+
+    #[tokio::test]
+    async fn exact_transaction_approval_recreates_prepared_effect_after_authoritative_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let original_authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let resumed_authority = test_authority(
+            "principal:test",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let (request, effect, _approval, _hash) = exact_resume_fixture(&original_authority);
+        let wallet = Arc::new(MockApprovedWalletProvider::new(vec![]));
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("wallet", wallet.clone())
+            .await
+            .unwrap();
+        let state = test_gateway_state(root.path(), Some(registry));
+        let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+        store.effects.push(effect);
+        save_transaction_effect_store(&state, &store).unwrap();
+
+        let resumed =
+            ensure_exact_runtime_transaction_approval(&state, &resumed_authority, request.clone())
+                .await
+                .unwrap();
+        assert_eq!(resumed.effect_id, request.effect_id);
+        assert_eq!(
+            resumed
+                .approval_request
+                .get("session_id")
+                .and_then(Value::as_str),
+            Some("session:resumed")
+        );
+        assert_eq!(wallet.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.request_approval_calls.load(Ordering::SeqCst), 1);
+
+        let persisted = load_transaction_effect_store(&state, "principal:test").unwrap();
+        assert_eq!(persisted.effects.len(), 1);
+        assert_eq!(
+            persisted.effects[0].state,
+            TransactionEffectState::ApprovalPending
+        );
+        assert_eq!(persisted.effects[0].authority.session_id, "session:resumed");
+        assert_eq!(persisted.effects[0].authority.launch_id, "launch:resumed");
+        assert!(persisted.effects[0].approval_snapshot.is_some());
+        assert!(persisted.effects[0].requested_audit_completed);
+    }
+
+    #[tokio::test]
+    async fn exact_transaction_approval_rejects_expired_prepared_effect_before_rebind() {
+        let root = tempfile::tempdir().unwrap();
+        let original_authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let resumed_authority = test_authority(
+            "principal:test",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let (request, mut effect, _approval, _hash) = exact_resume_fixture(&original_authority);
+        effect.approval_expires_at = now_ts().saturating_sub(1);
+        let wallet = Arc::new(MockApprovedWalletProvider::new(vec![]));
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("wallet", wallet.clone())
+            .await
+            .unwrap();
+        let state = test_gateway_state(root.path(), Some(registry));
+        let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+        store.effects.push(effect);
+        save_transaction_effect_store(&state, &store).unwrap();
+
+        let err =
+            ensure_exact_runtime_transaction_approval(&state, &resumed_authority, request.clone())
+                .await
+                .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(wallet.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.request_approval_calls.load(Ordering::SeqCst), 0);
+
+        let persisted = load_transaction_effect_store(&state, "principal:test").unwrap();
+        assert_eq!(persisted.effects.len(), 1);
+        assert_eq!(
+            persisted.effects[0].authority.session_id,
+            "session:original"
+        );
+        assert!(persisted.effects[0].approval_snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_transaction_approval_resumes_completed_effect_without_duplicate() {
+        let root = tempfile::tempdir().unwrap();
+        let original_authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let resumed_authority = test_authority(
+            "principal:test",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let (request, mut effect, approval, transaction_hash) =
+            exact_resume_fixture(&original_authority);
+        effect.approval_snapshot = Some(approval.clone());
+        effect.wallet_binding = Some(RuntimeTransactionWalletBinding::ExternalConnector {
+            connector_id: "wallet-test".to_string(),
+            originating_address: effect.address.clone(),
+        });
+        effect.wallet_transaction_hash = Some(transaction_hash.clone());
+        effect.receipt = Some(json!({
+            "schema": "elastos.chain.broadcast_receipt/v1",
+            "network": effect.network,
+            "transaction_hash": transaction_hash,
+            "receipt": {
+                "transactionHash": transaction_hash,
+            }
+        }));
+        effect.state = TransactionEffectState::Complete;
+        effect.requested_audit_completed = true;
+        effect.projection_completed = true;
+        effect.completion_audit_completed = true;
+
+        let wallet = Arc::new(MockApprovedWalletProvider::new(vec![approval.clone()]));
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("wallet", wallet.clone())
+            .await
+            .unwrap();
+        let state = test_gateway_state(root.path(), Some(registry));
+        let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+        store.effects.push(effect);
+        save_transaction_effect_store(&state, &store).unwrap();
+
+        let resumed =
+            ensure_exact_runtime_transaction_approval(&state, &resumed_authority, request.clone())
+                .await
+                .unwrap();
+        assert_eq!(resumed.effect_id, request.effect_id);
+        assert_eq!(resumed.approval_request, approval);
+        assert_eq!(wallet.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.request_approval_calls.load(Ordering::SeqCst), 0);
+
+        let persisted = load_transaction_effect_store(&state, "principal:test").unwrap();
+        assert_eq!(persisted.effects.len(), 1);
+        assert_eq!(persisted.effects[0].state, TransactionEffectState::Complete);
+        assert_eq!(
+            persisted.effects[0].authority.session_id,
+            "session:original"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_transaction_approval_rejects_conflicting_wallet_approval_and_bad_lists() {
+        let root = tempfile::tempdir().unwrap();
+        let original_authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let resumed_authority = test_authority(
+            "principal:test",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let (request, effect, mut approval, _hash) = exact_resume_fixture(&original_authority);
+        approval["status"] = json!("pending");
+        approval.as_object_mut().unwrap().remove("signed_result");
+
+        let conflict_wallet = Arc::new(MockApprovedWalletProvider::new(vec![{
+            let mut conflicting = approval.clone();
+            conflicting["wallet_request_sha256"] = json!("request:sha256:conflict");
+            conflicting
+        }]));
+        let conflict_registry = Arc::new(ProviderRegistry::new());
+        conflict_registry
+            .register_sub_provider("wallet", conflict_wallet.clone())
+            .await
+            .unwrap();
+        let conflict_state = test_gateway_state(root.path(), Some(conflict_registry));
+        let mut conflict_store = RuntimeTransactionEffectStore::empty("principal:test");
+        conflict_store.effects.push(effect.clone());
+        save_transaction_effect_store(&conflict_state, &conflict_store).unwrap();
+        let err = ensure_exact_runtime_transaction_approval(
+            &conflict_state,
+            &resumed_authority,
+            request.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(conflict_wallet.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            conflict_wallet
+                .request_approval_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        for wallet in [
+            Arc::new(MockApprovedWalletProvider::new(vec![]).unavailable_list()),
+            Arc::new(MockApprovedWalletProvider::new(vec![]).malformed_list()),
+            Arc::new(MockApprovedWalletProvider::new(vec![
+                approval.clone(),
+                approval.clone(),
+            ])),
+        ] {
+            let isolated_root = tempfile::tempdir().unwrap();
+            let registry = Arc::new(ProviderRegistry::new());
+            registry
+                .register_sub_provider("wallet", wallet.clone())
+                .await
+                .unwrap();
+            let state = test_gateway_state(isolated_root.path(), Some(registry));
+            let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+            store.effects.push(effect.clone());
+            save_transaction_effect_store(&state, &store).unwrap();
+            let err = ensure_exact_runtime_transaction_approval(
+                &state,
+                &resumed_authority,
+                request.clone(),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.0 == StatusCode::SERVICE_UNAVAILABLE || err.0 == StatusCode::CONFLICT);
+            assert_eq!(wallet.list_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(wallet.request_approval_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_transaction_approval_rejects_substituted_bindings_and_wrong_approval_id() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let (request, effect, _approval, _hash) = exact_resume_fixture(&authority);
+        let state = test_gateway_state(root.path(), None);
+
+        let substituted_principal = test_authority(
+            "principal:other",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let err = ensure_exact_runtime_transaction_approval(
+            &state,
+            &substituted_principal,
+            request.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        for mutate in [
+            |request: &mut RuntimeTransactionRequest| {
+                request.account_id = "wallet:eip155:8453:substituted".to_string();
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.address = "0x9999999999999999999999999999999999999999".to_string();
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.request_sha256 = "b".repeat(64);
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.data = "0xbeef".to_string();
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.source = BROWSER_TRANSACTION_SOURCE;
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.chain_namespace = "eip155:20".to_string();
+                request.network = "esc-mainnet".to_string();
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.effect_id = format!("transaction-effect:sha256:{}", "c".repeat(64));
+            },
+        ] {
+            let mut substituted = request.clone();
+            mutate(&mut substituted);
+            let err = ensure_exact_runtime_transaction_approval(&state, &authority, substituted)
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, StatusCode::CONFLICT);
+        }
+
+        let mut tampered_effect = effect;
+        tampered_effect.approval_request_id = "wallet-request:tampered".to_string();
+        let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+        store.effects.push(tampered_effect);
+        save_transaction_effect_store(&state, &store).unwrap();
+        let err = ensure_exact_runtime_transaction_approval(&state, &authority, request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn approved_request_effect_index_requires_exact_bindings() {
+        let authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let (request, effect, _approval, _hash) = approved_resume_fixture(&authority);
+        let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+        store.effects.push(effect);
+
+        assert_eq!(
+            approved_request_effect_index(
+                &store,
+                store.effects[0].approval_request_id.as_str(),
+                &request,
+            )
+            .unwrap(),
+            0
+        );
+
+        let status = approved_request_effect_index(&store, "wallet-request:missing", &request)
+            .unwrap_err()
+            .0;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        for mutate in [
+            |request: &mut RuntimeTransactionRequest| {
+                request.account_id = "wallet:eip155:8453:substituted".to_string();
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.address = "0x9999999999999999999999999999999999999999".to_string();
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.request_sha256 = "b".repeat(64);
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.data = "0xbeef".to_string();
+            },
+            |request: &mut RuntimeTransactionRequest| {
+                request.chain_namespace = "eip155:20".to_string();
+                request.network = "esc-mainnet".to_string();
+            },
+        ] {
+            let mut substituted = request.clone();
+            mutate(&mut substituted);
+            let err = approved_request_effect_index(
+                &store,
+                store.effects[0].approval_request_id.as_str(),
+                &substituted,
+            )
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::CONFLICT);
+            assert!(err.1.contains("recovery binding mismatch"));
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_request_resume_completes_exact_effect_after_session_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let original_authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let resumed_authority = test_authority(
+            "principal:test",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let (request, effect, approval, transaction_hash) =
+            approved_resume_fixture(&original_authority);
+        let wallet = Arc::new(MockApprovedWalletProvider::new(vec![approval.clone()]));
+        let chain = Arc::new(MockBroadcastChainProvider::new(
+            request.network.clone(),
+            transaction_hash.clone(),
+        ));
+        let registry = Arc::new(ProviderRegistry::new());
+        registry
+            .register_sub_provider("wallet", wallet.clone())
+            .await
+            .unwrap();
+        registry
+            .register_sub_provider("chain", chain.clone())
+            .await
+            .unwrap();
+        let state = test_gateway_state(root.path(), Some(registry));
+
+        let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+        store.effects.push(effect);
+        save_transaction_effect_store(&state, &store).unwrap();
+
+        let completion = complete_runtime_transaction_effect(
+            &state,
+            &resumed_authority,
+            RuntimeTransactionLookup::ApprovalId(store.effects[0].approval_request_id.as_str()),
+            Some(&request),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!completion.completion_pending);
+        assert!(completion.completion_error.is_none());
+        assert_eq!(completion.transaction_hash, transaction_hash);
+        assert_eq!(
+            completion
+                .approval_request
+                .get("session_id")
+                .and_then(Value::as_str),
+            Some("session:original")
+        );
+        assert_eq!(wallet.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wallet.attach_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(chain.calls.load(Ordering::SeqCst), 1);
+
+        let persisted = load_transaction_effect_store(&state, "principal:test").unwrap();
+        let persisted_effect = persisted.effects.first().unwrap();
+        assert_eq!(persisted_effect.state, TransactionEffectState::Complete);
+        assert_eq!(persisted_effect.authority.session_id, "session:original");
+        assert_eq!(persisted_effect.authority.launch_id, "launch:original");
+        assert!(persisted_effect.receipt.is_some());
+    }
+
+    #[tokio::test]
+    async fn approved_request_resume_rejects_substituted_principal() {
+        let root = tempfile::tempdir().unwrap();
+        let original_authority = test_authority(
+            "principal:test",
+            "session:original",
+            "library",
+            "launch:original",
+        );
+        let substituted_authority = test_authority(
+            "principal:other",
+            "session:resumed",
+            "system",
+            "launch:resumed",
+        );
+        let (request, effect, _approval, _hash) = approved_resume_fixture(&original_authority);
+        let state = test_gateway_state(root.path(), None);
+
+        let mut store = RuntimeTransactionEffectStore::empty("principal:test");
+        store.effects.push(effect);
+        save_transaction_effect_store(&state, &store).unwrap();
+
+        let err = complete_runtime_transaction_effect(
+            &state,
+            &substituted_authority,
+            RuntimeTransactionLookup::ApprovalId(store.effects[0].approval_request_id.as_str()),
+            Some(&request),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }
