@@ -146,6 +146,60 @@ impl ChainProvider {
                 &content_access_id,
                 action,
             ),
+            Request::ResolveProtectedContentCreatorMint {
+                network,
+                ledger,
+                token_uri,
+                op_type_code,
+                content_access_id,
+                value,
+                op_raw,
+                sell,
+            } => self.resolve_protected_content_creator_mint(
+                &network,
+                &ledger,
+                &token_uri,
+                op_type_code,
+                &content_access_id,
+                value.as_deref(),
+                op_raw.as_ref(),
+                sell.as_ref(),
+            ),
+            Request::ResolveProtectedContentMintReceipt {
+                network,
+                hash,
+                creator,
+                ledger,
+                token_uri,
+                op_type_code,
+            } => self.resolve_protected_content_mint_receipt(
+                &network,
+                &hash,
+                &creator,
+                &ledger,
+                &token_uri,
+                op_type_code,
+            ),
+            Request::ResolveProtectedContentVerifiedListing {
+                network,
+                seller,
+                ledger,
+                token_id,
+            } => self
+                .resolve_protected_content_verified_listing(&network, &seller, &ledger, &token_id),
+            Request::ResolveProtectedContentPurchase {
+                seller,
+                chain_namespace,
+                network,
+                ledger,
+                token_id,
+            } => self.resolve_protected_content_purchase(
+                &seller,
+                &chain_namespace,
+                &network,
+                &ledger,
+                &token_id,
+            ),
             Request::Proof {
                 network,
                 proof_kind,
@@ -794,12 +848,6 @@ impl ChainProvider {
                 Ok(source) => source,
                 Err(response) => return response,
             };
-        if method.selector != format!("0x{}", encode_hex(policy.function_selector().as_bytes())) {
-            return Response::error(
-                "rights_selector_mismatch",
-                "configured rights method selector does not match policy",
-            );
-        }
         let subject = format!("0x{}", encode_hex(request.binding().wallet().as_bytes()));
         let data = match method.abi {
             RightsMethodAbi::HasAccessByContentIdAddressBytes16 => {
@@ -941,6 +989,415 @@ impl ChainProvider {
         }))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "creator mint assembly binds the exact on-chain mint terms without an intermediate authority struct"
+    )]
+    fn resolve_protected_content_creator_mint(
+        &self,
+        network_id: &str,
+        ledger: &str,
+        token_uri: &str,
+        op_type_code: u16,
+        content_access_id: &str,
+        value: Option<&str>,
+        op_raw: Option<&ProtectedContentMintOpRaw>,
+        sell: Option<&ProtectedContentMintSell>,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network,
+            Err(response) => return response,
+        };
+        let mint = match self.configured_protected_content_creator_mint_source(network_id) {
+            Ok(mint) => mint,
+            Err(response) => return response,
+        };
+        if let Err(err) = validate_evm_address(ledger) {
+            return Response::error("invalid_protected_content_creator_mint_request", &err);
+        }
+        if token_uri.trim().is_empty() {
+            return Response::error(
+                "invalid_protected_content_creator_mint_request",
+                "token_uri must not be empty",
+            );
+        }
+        let content_access_id = match decode_hex(content_access_id, Some(16), "content_access_id") {
+            Ok(bytes) => match <[u8; 16]>::try_from(bytes.as_slice()) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Response::error(
+                        "invalid_protected_content_creator_mint_request",
+                        "content_access_id must be 16 bytes",
+                    )
+                }
+            },
+            Err(err) => {
+                return Response::error("invalid_protected_content_creator_mint_request", &err);
+            }
+        };
+        let value = value.unwrap_or("0x0");
+        if let Err(err) = validate_hex_quantity(value, "value") {
+            return Response::error("invalid_protected_content_creator_mint_request", &err);
+        }
+
+        let (op_raw_bytes, sell_raw_bytes) = if op_type_code == 0 {
+            if op_raw.is_some() || sell.is_some() {
+                return Response::error(
+                    "invalid_protected_content_creator_mint_request",
+                    "free protected-content mint must not carry paid listing terms",
+                );
+            }
+            match encode_protected_content_mint_op_raw_free(&content_access_id) {
+                Ok(op_raw) => (op_raw, Vec::new()),
+                Err(err) => {
+                    return Response::error("invalid_protected_content_creator_mint_request", &err);
+                }
+            }
+        } else {
+            let (Some(op_raw), Some(sell)) = (op_raw, sell) else {
+                return Response::error(
+                    "invalid_protected_content_creator_mint_request",
+                    "paid protected-content mint requires op_raw and sell terms",
+                );
+            };
+            let reseller_cut = match (op_type_code, op_raw.reseller_cut) {
+                (1, None) => None,
+                (1, Some(_)) => {
+                    return Response::error(
+                        "invalid_protected_content_creator_mint_request",
+                        "buy_once protected-content mint must not carry reseller_cut",
+                    )
+                }
+                (2, Some(cut)) => Some(cut),
+                (2, None) => {
+                    return Response::error(
+                        "invalid_protected_content_creator_mint_request",
+                        "buy_and_resell protected-content mint requires reseller_cut",
+                    )
+                }
+                _ => {
+                    return Response::error(
+                        "invalid_protected_content_creator_mint_request",
+                        "unsupported protected-content mint op_type_code",
+                    )
+                }
+            };
+            let op_raw_bytes = match encode_protected_content_mint_op_raw_paid(
+                &content_access_id,
+                &op_raw.metadata_uri,
+                &op_raw.addresses,
+                &op_raw.role_types,
+                &op_raw.amounts,
+                reseller_cut,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    return Response::error("invalid_protected_content_creator_mint_request", &err);
+                }
+            };
+            let sell_raw_bytes = match encode_protected_content_sell_raw_data(
+                &sell.copies,
+                &sell.price,
+                &sell.pay_token,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    return Response::error("invalid_protected_content_creator_mint_request", &err);
+                }
+            };
+            (op_raw_bytes, sell_raw_bytes)
+        };
+
+        let data = match encode_protected_content_creator_mint_call(
+            mint.abi.selector(),
+            token_uri,
+            op_type_code,
+            &op_raw_bytes,
+            &sell_raw_bytes,
+        ) {
+            Ok(data) => data,
+            Err(err) => {
+                return Response::error("invalid_protected_content_creator_mint_request", &err)
+            }
+        };
+
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_CREATOR_MINT_SCHEMA,
+            "network": network.id,
+            "function": mint.abi.function(),
+            "to": ledger,
+            "data": data,
+            "value": value,
+            "content_access_id": format!("0x{}", encode_hex(&content_access_id)),
+            "signed": false,
+        }))
+    }
+
+    fn resolve_protected_content_mint_receipt(
+        &self,
+        network_id: &str,
+        hash: &str,
+        creator: &str,
+        ledger: &str,
+        token_uri: &str,
+        op_type_code: u16,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network,
+            Err(response) => return response,
+        };
+        let mint = match self.configured_protected_content_creator_mint_source(network_id) {
+            Ok(mint) => mint,
+            Err(response) => return response,
+        };
+        let market = match self.configured_protected_content_market_source(network_id) {
+            Ok(market) => market,
+            Err(response) => return response,
+        };
+        if let Err(err) = validate_evm_hash(hash) {
+            return Response::error("invalid_protected_content_mint_receipt_request", &err);
+        }
+        if let Err(err) = validate_evm_address(creator) {
+            return Response::error("invalid_protected_content_mint_receipt_request", &err);
+        }
+        if let Err(err) = validate_evm_address(ledger) {
+            return Response::error("invalid_protected_content_mint_receipt_request", &err);
+        }
+        if token_uri.trim().is_empty() {
+            return Response::error(
+                "invalid_protected_content_mint_receipt_request",
+                "token_uri must not be empty",
+            );
+        }
+        let observation = match self.observe_protected_content_mint_receipt(
+            network,
+            market,
+            mint,
+            hash,
+            creator,
+            ledger,
+            token_uri,
+            op_type_code,
+        ) {
+            Ok(observation) => observation,
+            Err(response) => return response,
+        };
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_MINT_RECEIPT_SCHEMA,
+            "network": network.id,
+            "chain_id": observation.chain_id,
+            "token_id": observation.token_id,
+            "operative": observation.operative,
+        }))
+    }
+
+    fn resolve_protected_content_verified_listing(
+        &self,
+        network_id: &str,
+        seller: &str,
+        ledger: &str,
+        token_id: &str,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network,
+            Err(response) => return response,
+        };
+        if let Err(err) = validate_evm_address(seller) {
+            return Response::error("invalid_protected_content_purchase_request", &err);
+        }
+        if let Err(err) = validate_evm_address(ledger) {
+            return Response::error("invalid_protected_content_purchase_request", &err);
+        }
+        if let Err(err) = validate_hex_quantity(token_id, "token_id") {
+            return Response::error("invalid_protected_content_purchase_request", &err);
+        }
+        let seller = normalize_evm_address(seller);
+        let ledger = normalize_evm_address(ledger);
+        let token_id = match normalize_hex_quantity(token_id, "token_id") {
+            Ok(value) => value,
+            Err(err) => return Response::error("invalid_protected_content_purchase_request", &err),
+        };
+        let market = match self.configured_protected_content_market_source(network_id) {
+            Ok(market) => market,
+            Err(response) => return response,
+        };
+        let verified_listing = match self.observe_protected_content_verified_listing(
+            network, market, &seller, &ledger, &token_id,
+        ) {
+            Ok(verified_listing) => verified_listing,
+            Err(response) => return response,
+        };
+        let mut data = json!({
+            "schema": PROTECTED_CONTENT_VERIFIED_LISTING_SCHEMA,
+            "network": network.id,
+            "chain_id": verified_listing.chain_id,
+            "seller": seller,
+            "ledger": ledger,
+            "token_id": token_id,
+            "operative": verified_listing.operative,
+            "quantity": verified_listing.quantity,
+            "price": verified_listing.price,
+            "pay_token": verified_listing.pay_token,
+        });
+        if let Some(payment_processor) = verified_listing.payment_processor {
+            data["payment_processor"] = json!(payment_processor);
+        }
+        Response::ok(data)
+    }
+
+    fn resolve_protected_content_purchase(
+        &self,
+        seller: &str,
+        chain_namespace: &str,
+        network_id: &str,
+        ledger: &str,
+        token_id: &str,
+    ) -> Response {
+        let network = match self.evm_network(network_id) {
+            Ok(network) => network,
+            Err(response) => return response,
+        };
+        let Some(expected_chain_id) = network.chain_id else {
+            return Response::error(
+                "protected_content_market_not_configured",
+                "no configured protected-content market source matches listing network",
+            );
+        };
+        if chain_namespace != format!("eip155:{expected_chain_id}") {
+            return Response::error(
+                "invalid_protected_content_purchase_request",
+                "protected-content purchase request Chain namespace does not match network",
+            );
+        }
+        if let Err(err) = validate_evm_address(seller) {
+            return Response::error("invalid_protected_content_purchase_request", &err);
+        }
+        if let Err(err) = validate_evm_address(ledger) {
+            return Response::error("invalid_protected_content_purchase_request", &err);
+        }
+        if let Err(err) = validate_hex_quantity(token_id, "token_id") {
+            return Response::error("invalid_protected_content_purchase_request", &err);
+        }
+        let seller = normalize_evm_address(seller);
+        let ledger = normalize_evm_address(ledger);
+        let token_id = match normalize_hex_quantity(token_id, "token_id") {
+            Ok(value) => value,
+            Err(err) => return Response::error("invalid_protected_content_purchase_request", &err),
+        };
+        let market = match self.configured_protected_content_market_source(network_id) {
+            Ok(market) => market,
+            Err(response) => return response,
+        };
+        let verified_listing = match self.observe_protected_content_verified_listing(
+            network, market, &seller, &ledger, &token_id,
+        ) {
+            Ok(verified_listing) => verified_listing,
+            Err(response) => return response,
+        };
+        if verified_listing.quantity == "0x0" {
+            return Response::error(
+                "protected_content_verified_listing_unavailable",
+                "verified listing does not have available stock for a one-copy purchase",
+            );
+        }
+        let market_contract = normalize_evm_address(&market.authority_gateway_contract);
+        let price = verified_listing.price.clone();
+        let verified_pay_token = verified_listing.pay_token.clone();
+        let is_native_purchase = verified_pay_token == "0x0000000000000000000000000000000000000000";
+        let buy_call = match encode_authority_gateway_buy_access_call(
+            if is_native_purchase {
+                PROTECTED_CONTENT_BUY_ACCESS_NATIVE_SELECTOR
+            } else {
+                PROTECTED_CONTENT_BUY_ACCESS_ERC20_SELECTOR
+            },
+            &seller,
+            &ledger,
+            &token_id,
+            PROTECTED_CONTENT_PURCHASE_QUANTITY_HEX,
+            &price,
+            (!is_native_purchase).then_some(verified_pay_token.as_str()),
+        ) {
+            Ok(data) => data,
+            Err(err) => return Response::error("invalid_protected_content_purchase_request", &err),
+        };
+        let steps = if is_native_purchase {
+            vec![json!({
+                "stage": "buy",
+                "to": market_contract,
+                "value": price,
+                "data": buy_call,
+            })]
+        } else {
+            let Some(payment_processor) = verified_listing.payment_processor.as_deref() else {
+                return Response::error(
+                    "upstream_invalid_protected_content_verified_listing",
+                    "ERC-20 verified listing is missing paymentProcessor",
+                );
+            };
+            let approval_call = match encode_erc20_approve_call(payment_processor, &price) {
+                Ok(data) => data,
+                Err(err) => {
+                    return Response::error("invalid_protected_content_purchase_request", &err)
+                }
+            };
+            vec![
+                json!({
+                    "stage": "approval",
+                    "to": verified_pay_token,
+                    "value": "0x0",
+                    "data": approval_call,
+                }),
+                json!({
+                    "stage": "buy",
+                    "to": market_contract,
+                    "value": "0x0",
+                    "data": buy_call,
+                }),
+            ]
+        };
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_PURCHASE_SCHEMA,
+            "network": network.id,
+            "purchase_quantity": PROTECTED_CONTENT_PURCHASE_QUANTITY_HEX,
+            "verified_listing": {
+                "chain_id": verified_listing.chain_id,
+                "seller": seller,
+                "ledger": ledger,
+                "token_id": token_id,
+                "operative": verified_listing.operative,
+                "available_quantity": verified_listing.quantity,
+                "price": verified_listing.price,
+                "pay_token": verified_listing.pay_token,
+                "payment_processor": verified_listing.payment_processor,
+            },
+            "steps": steps,
+        }))
+    }
+
+    fn configured_protected_content_creator_mint_source(
+        &self,
+        network_id: &str,
+    ) -> Result<&ProtectedContentCreatorMintMethod, Response> {
+        let mut matches = self
+            .networks
+            .iter()
+            .filter(|network| network.kind == ChainKind::EvmJsonRpc && network.id == network_id)
+            .filter_map(|network| network.protected_content_creator_mint.as_ref());
+        let Some(source) = matches.next() else {
+            return Err(Response::error(
+                "protected_content_creator_mint_not_configured",
+                "no configured protected-content creator mint source matches network",
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(Response::error(
+                "ambiguous_protected_content_creator_mint_source",
+                "multiple protected-content creator mint sources match network",
+            ));
+        }
+        Ok(source)
+    }
+
     fn configured_protected_content_policy_source_for_policy(
         &self,
         policy: &RightsPolicyBodyV1,
@@ -1017,6 +1474,590 @@ impl ChainProvider {
             ));
         }
         Ok(source)
+    }
+
+    fn configured_protected_content_market_source(
+        &self,
+        network_id: &str,
+    ) -> Result<&ProtectedContentMarketMethod, Response> {
+        let mut matches = self
+            .networks
+            .iter()
+            .filter(|network| network.kind == ChainKind::EvmJsonRpc && network.id == network_id)
+            .filter_map(|network| network.protected_content_market.as_ref());
+        let Some(source) = matches.next() else {
+            return Err(Response::error(
+                "protected_content_market_not_configured",
+                "no configured protected-content market source matches listing network",
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(Response::error(
+                "ambiguous_protected_content_market_source",
+                "multiple protected-content market sources match listing network",
+            ));
+        }
+        Ok(source)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mint receipt corroboration binds one exact transaction receipt to creator, ledger, token URI, and op type"
+    )]
+    fn observe_protected_content_mint_receipt(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        mint: &ProtectedContentCreatorMintMethod,
+        hash: &str,
+        creator: &str,
+        ledger: &str,
+        token_uri: &str,
+        op_type_code: u16,
+    ) -> Result<ProtectedContentMintReceiptObservation, Response> {
+        let mut successful = Vec::new();
+        let mut first_error = None;
+        let mut saw_pending = false;
+        for rpc_url in &market.evidence_rpc_urls {
+            match self.observe_protected_content_mint_receipt_source(
+                network,
+                rpc_url,
+                mint,
+                hash,
+                creator,
+                ledger,
+                token_uri,
+                op_type_code,
+            ) {
+                Ok(Some(observation)) => successful.push(observation),
+                Ok(None) => saw_pending = true,
+                Err(response) => {
+                    if first_error.is_none() {
+                        first_error = Some(response);
+                    }
+                }
+            }
+        }
+        if successful
+            .iter()
+            .any(|observation| observation.chain_id != network.chain_id.unwrap_or_default())
+        {
+            return Err(Response::error(
+                "conflicting_protected_content_mint_receipt_observations",
+                "protected-content mint receipt sources disagree with configured chain id",
+            ));
+        }
+        if successful.len() >= 2 {
+            let reference = successful[0].clone();
+            if successful[1..]
+                .iter()
+                .any(|observation| *observation != reference)
+            {
+                return Err(Response::error(
+                    "conflicting_protected_content_mint_receipt_observations",
+                    "protected-content mint receipt sources disagree on the exact finalized bind",
+                ));
+            }
+            return Ok(reference);
+        }
+        if successful.is_empty() {
+            if let Some(response) = first_error {
+                return Err(response);
+            }
+            if saw_pending {
+                return Err(Response::error(
+                    "protected_content_mint_receipt_pending",
+                    "protected-content mint receipt is not finalized on enough configured sources",
+                ));
+            }
+        }
+        Err(Response::error(
+            "insufficient_protected_content_mint_receipt_observations",
+            "protected-content mint receipt sources produced fewer than two matching finalized binds",
+        ))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mint receipt corroboration binds one exact transaction receipt to creator, ledger, token URI, and op type"
+    )]
+    fn observe_protected_content_mint_receipt_source(
+        &self,
+        network: &ChainNetwork,
+        rpc_url: &str,
+        mint: &ProtectedContentCreatorMintMethod,
+        hash: &str,
+        creator: &str,
+        ledger: &str,
+        token_uri: &str,
+        op_type_code: u16,
+    ) -> Result<Option<ProtectedContentMintReceiptObservation>, Response> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let chain_id = match self
+            .evm_rpc(&source_network, "eth_chainId", json!([]))
+            .ok()
+            .and_then(|value| value.as_str().and_then(|value| parse_hex_u64(value).ok()))
+        {
+            Some(chain_id) => chain_id,
+            None => return Ok(None),
+        };
+        let receipt = match self
+            .evm_rpc(&source_network, "eth_getTransactionReceipt", json!([hash]))
+            .ok()
+        {
+            Some(receipt) if !receipt.is_null() => receipt,
+            Some(_) | None => return Ok(None),
+        };
+        let status = match receipt.get("status").and_then(Value::as_str) {
+            Some(status) => status,
+            None => {
+                return Err(Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "protected-content mint receipt status is missing",
+                ))
+            }
+        };
+        if status == "0x0" {
+            return Err(Response::error(
+                "protected_content_mint_receipt_failed",
+                "protected-content mint transaction failed",
+            ));
+        }
+        if status != "0x1" {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "protected-content mint receipt status must be exactly 0x1",
+            ));
+        }
+        let Some(receipt_transaction_hash) = receipt.get("transactionHash").and_then(Value::as_str)
+        else {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "protected-content mint receipt transaction hash is missing",
+            ));
+        };
+        if !receipt_transaction_hash.eq_ignore_ascii_case(hash) {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "protected-content mint receipt transaction hash does not match request",
+            ));
+        }
+        let Some(receipt_from) = receipt.get("from").and_then(Value::as_str) else {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "protected-content mint receipt signer is missing",
+            ));
+        };
+        if !receipt_from.eq_ignore_ascii_case(creator) {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "protected-content mint receipt signer does not match creator",
+            ));
+        }
+        let Some(receipt_to) = receipt.get("to").and_then(Value::as_str) else {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "protected-content mint receipt target is missing",
+            ));
+        };
+        if !receipt_to.eq_ignore_ascii_case(ledger) {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "protected-content mint receipt target does not match ledger",
+            ));
+        }
+        let receipt_block_number = receipt
+            .get("blockNumber")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "protected-content mint receipt block number is missing",
+                )
+            })
+            .and_then(|value| {
+                parse_hex_u64(value).map_err(|_| {
+                    Response::error(
+                        "invalid_protected_content_mint_receipt",
+                        "protected-content mint receipt block number must be a hex quantity",
+                    )
+                })
+            })?;
+        let receipt_block_hash = receipt
+            .get("blockHash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "protected-content mint receipt block hash is missing",
+                )
+            })
+            .and_then(|value| {
+                decode_hex(value, Some(32), "protected-content mint receipt block hash").map_err(
+                    |_| {
+                        Response::error(
+                            "invalid_protected_content_mint_receipt",
+                            "protected-content mint receipt block hash must be 32 bytes",
+                        )
+                    },
+                )
+            })
+            .and_then(|value| {
+                let bytes: [u8; 32] = value.as_slice().try_into().map_err(|_| {
+                    Response::error(
+                        "invalid_protected_content_mint_receipt",
+                        "protected-content mint receipt block hash must be 32 bytes",
+                    )
+                })?;
+                Ok(Digest32::new(bytes))
+            })?;
+        let canonical_block = match self
+            .evm_rpc(
+                &source_network,
+                "eth_getBlockByNumber",
+                json!([format!("0x{receipt_block_number:x}"), false]),
+            )
+            .ok()
+        {
+            Some(block) if !block.is_null() => block,
+            Some(_) | None => return Ok(None),
+        };
+        let canonical_number = canonical_block
+            .get("number")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "canonical block number is missing",
+                )
+            })
+            .and_then(|value| {
+                parse_hex_u64(value).map_err(|_| {
+                    Response::error(
+                        "invalid_protected_content_mint_receipt",
+                        "canonical block number must be a hex quantity",
+                    )
+                })
+            })?;
+        let canonical_hash = canonical_block
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "canonical block hash is missing",
+                )
+            })
+            .and_then(|value| {
+                decode_hex(value, Some(32), "canonical block hash").map_err(|_| {
+                    Response::error(
+                        "invalid_protected_content_mint_receipt",
+                        "canonical block hash must be 32 bytes",
+                    )
+                })
+            })
+            .and_then(|value| {
+                let bytes: [u8; 32] = value.as_slice().try_into().map_err(|_| {
+                    Response::error(
+                        "invalid_protected_content_mint_receipt",
+                        "canonical block hash must be 32 bytes",
+                    )
+                })?;
+                Ok(Digest32::new(bytes))
+            })?;
+        if canonical_number != receipt_block_number || canonical_hash != receipt_block_hash {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "protected-content mint receipt block does not match the canonical block",
+            ));
+        }
+        let canonical_transactions = canonical_block
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "canonical block transaction list is missing",
+                )
+            })?;
+        if !canonical_transactions.iter().any(|entry| {
+            entry
+                .as_str()
+                .is_some_and(|transaction_hash| transaction_hash.eq_ignore_ascii_case(hash))
+        }) {
+            return Err(Response::error(
+                "invalid_protected_content_mint_receipt",
+                "canonical block does not contain the protected-content mint transaction",
+            ));
+        }
+        let finalized = match self
+            .evm_rpc(
+                &source_network,
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+            )
+            .ok()
+            .and_then(|value| evm_finalized_block(&value).ok())
+        {
+            Some(finalized) => finalized,
+            None => return Ok(None),
+        };
+        if receipt_block_number > finalized.finalized_block_number {
+            return Ok(None);
+        }
+        let logs = match receipt.get("logs").and_then(Value::as_array) {
+            Some(logs) => logs,
+            None => {
+                return Err(Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "protected-content mint receipt logs are missing",
+                ))
+            }
+        };
+        let mut matches = Vec::new();
+        for log in logs {
+            let Some(address) = log.get("address").and_then(Value::as_str) else {
+                continue;
+            };
+            if !address.eq_ignore_ascii_case(&mint.asset_created_emitter) {
+                continue;
+            }
+            let Some(topic0) = log
+                .get("topics")
+                .and_then(Value::as_array)
+                .and_then(|topics| topics.first())
+                .and_then(Value::as_str)
+            else {
+                return Err(Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "configured AssetCreated log is malformed",
+                ));
+            };
+            if !topic0.eq_ignore_ascii_case(mint.abi.asset_created_topic0()) {
+                continue;
+            }
+            let decoded = decode_protected_content_asset_created_log(log)
+                .map_err(|err| Response::error("invalid_protected_content_mint_receipt", &err))?;
+            if !decoded.creator.eq_ignore_ascii_case(creator) {
+                return Err(Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "AssetCreated creator does not match expected creator",
+                ));
+            }
+            if !decoded.ledger.eq_ignore_ascii_case(ledger) {
+                return Err(Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "AssetCreated channel does not match expected ledger",
+                ));
+            }
+            if decoded.token_uri != token_uri {
+                return Err(Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "AssetCreated token URI does not match expected token URI",
+                ));
+            }
+            if decoded.op_type_code != op_type_code {
+                return Err(Response::error(
+                    "invalid_protected_content_mint_receipt",
+                    "AssetCreated op type does not match expected mint op type",
+                ));
+            }
+            matches.push(decoded);
+        }
+        match matches.as_slice() {
+            [] => Err(Response::error(
+                "protected_content_mint_receipt_not_bound",
+                "receipt does not contain the configured AssetCreated bind for this mint",
+            )),
+            [decoded] => Ok(Some(ProtectedContentMintReceiptObservation {
+                chain_id,
+                receipt_block_number,
+                receipt_block_hash,
+                token_id: decoded.token_id.clone(),
+                operative: decoded.operative.clone(),
+            })),
+            _ => Err(Response::error(
+                "ambiguous_protected_content_mint_receipt",
+                "receipt contains multiple matching AssetCreated binds",
+            )),
+        }
+    }
+
+    fn observe_protected_content_verified_listing(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        seller: &str,
+        ledger: &str,
+        token_id: &str,
+    ) -> Result<ProtectedContentVerifiedListingObservation, Response> {
+        let mut successful = Vec::new();
+        let mut first_error = None;
+        for rpc_url in &market.evidence_rpc_urls {
+            match self.observe_protected_content_verified_listing_source(
+                network, market, rpc_url, seller, ledger, token_id,
+            ) {
+                Ok(Some(observation)) => successful.push(observation),
+                Ok(None) => {}
+                Err(response) => {
+                    if first_error.is_none() {
+                        first_error = Some(response);
+                    }
+                }
+            }
+        }
+        if successful
+            .iter()
+            .any(|observation| observation.chain_id != network.chain_id.unwrap_or_default())
+        {
+            return Err(Response::error(
+                "conflicting_protected_content_verified_listing_observations",
+                "protected-content verified listing sources disagree with configured chain id",
+            ));
+        }
+        if successful.len() >= 2 {
+            let reference = successful[0].clone();
+            if successful[1..]
+                .iter()
+                .any(|observation| *observation != reference)
+            {
+                return Err(Response::error(
+                    "conflicting_protected_content_verified_listing_observations",
+                    "protected-content verified listing sources disagree on the finalized tuple",
+                ));
+            }
+            return Ok(reference);
+        }
+        if successful.is_empty() {
+            if let Some(response) = first_error {
+                return Err(response);
+            }
+        }
+        Err(Response::error(
+            "insufficient_protected_content_verified_listing_observations",
+            "protected-content verified listing sources produced fewer than two matching finalized tuples",
+        ))
+    }
+
+    fn observe_protected_content_verified_listing_source(
+        &self,
+        network: &ChainNetwork,
+        market: &ProtectedContentMarketMethod,
+        rpc_url: &str,
+        seller: &str,
+        ledger: &str,
+        token_id: &str,
+    ) -> Result<Option<ProtectedContentVerifiedListingObservation>, Response> {
+        let mut source_network = network.clone();
+        source_network.rpc_url = rpc_url.to_string();
+        let chain_id = match self
+            .evm_rpc(&source_network, "eth_chainId", json!([]))
+            .ok()
+            .and_then(|value| value.as_str().and_then(|value| parse_hex_u64(value).ok()))
+        {
+            Some(chain_id) => chain_id,
+            None => return Ok(None),
+        };
+        let finalized = match self
+            .evm_rpc(
+                &source_network,
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+            )
+            .ok()
+            .and_then(|value| evm_finalized_block(&value).ok())
+        {
+            Some(finalized) => finalized,
+            None => return Ok(None),
+        };
+        let operative_data = encode_authority_gateway_operative_call(ledger, token_id)
+            .map_err(|err| Response::error("invalid_protected_content_purchase_request", &err))?;
+        let operative_result = match self
+            .evm_rpc(
+                &source_network,
+                "eth_call",
+                json!([
+                    { "to": market.authority_gateway_contract, "data": operative_data },
+                    {
+                        "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                        "requireCanonical": true,
+                    }
+                ]),
+            )
+            .ok()
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let operative = decode_evm_address_word(&operative_result, "operative").map_err(|err| {
+            Response::error("upstream_invalid_protected_content_verified_listing", &err)
+        })?;
+        let listing_data = encode_authority_gateway_listing_call(&operative, seller)
+            .map_err(|err| Response::error("invalid_protected_content_purchase_request", &err))?;
+        let listing_result = match self
+            .evm_rpc(
+                &source_network,
+                "eth_call",
+                json!([
+                    { "to": market.authority_gateway_contract, "data": listing_data },
+                    {
+                        "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                        "requireCanonical": true,
+                    }
+                ]),
+            )
+            .ok()
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let listing = decode_protected_content_listing(&listing_result).map_err(|err| {
+            Response::error("upstream_invalid_protected_content_verified_listing", &err)
+        })?;
+        let payment_processor = if listing.pay_token != "0x0000000000000000000000000000000000000000"
+        {
+            let payment_processor_data =
+                encode_operatives_payment_processor_call().map_err(|err| {
+                    Response::error("invalid_protected_content_purchase_request", &err)
+                })?;
+            let payment_processor_result = match self
+                .evm_rpc(
+                    &source_network,
+                    "eth_call",
+                    json!([
+                        { "to": operative, "data": payment_processor_data },
+                        {
+                            "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                            "requireCanonical": true,
+                        }
+                    ]),
+                )
+                .ok()
+            {
+                Some(result) => result,
+                None => return Ok(None),
+            };
+            Some(
+                decode_evm_address_word(&payment_processor_result, "paymentProcessor").map_err(
+                    |err| {
+                        Response::error("upstream_invalid_protected_content_verified_listing", &err)
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        Ok(Some(ProtectedContentVerifiedListingObservation {
+            chain_id,
+            finalized_block_number: finalized.finalized_block_number,
+            finalized_block_hash: finalized.finalized_block_hash,
+            operative,
+            quantity: listing.quantity,
+            price: listing.price,
+            pay_token: listing.pay_token,
+            payment_processor,
+        }))
     }
 
     fn observe_protected_content_rights(
@@ -1377,6 +2418,27 @@ impl ChainProvider {
         .map_err(|err| Response::error("node_lifecycle_state_unavailable", &err))?;
         Ok(entry)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProtectedContentMintReceiptObservation {
+    chain_id: u64,
+    receipt_block_number: u64,
+    receipt_block_hash: Digest32,
+    token_id: String,
+    operative: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProtectedContentVerifiedListingObservation {
+    chain_id: u64,
+    finalized_block_number: u64,
+    finalized_block_hash: Digest32,
+    operative: String,
+    quantity: String,
+    price: String,
+    pay_token: String,
+    payment_processor: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

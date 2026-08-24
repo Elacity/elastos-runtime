@@ -332,12 +332,6 @@ enum ObjectProviderRequest {
     Buy {
         principal_id: String,
         mint_id: String,
-        #[serde(default)]
-        wallet_request_hex: Option<String>,
-        #[serde(default)]
-        wallet_response_hex: Option<String>,
-        #[serde(default)]
-        purchase: Option<crate::protected_content_runtime::RuntimeCustodyPurchaseEvidence>,
     },
     OpenViewer {
         principal_id: String,
@@ -1845,17 +1839,11 @@ async fn handle_runtime_custody_library_request(
         ObjectProviderRequest::Buy {
             principal_id,
             mint_id,
-            wallet_request_hex,
-            wallet_response_hex,
-            purchase,
         } => crate::protected_content_runtime::buy_runtime_custody_listing(
             &data_dir,
             crate::protected_content_runtime::RuntimeCustodyBuyInput {
                 principal_id,
                 mint_id,
-                wallet_request_hex,
-                wallet_response_hex,
-                purchase,
             },
         ),
         ObjectProviderRequest::OpenViewer {

@@ -20,7 +20,8 @@ use elastos_protected_content_runtime::{
     PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeCustodyProvider,
     RuntimeDecryptProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome,
     RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeMintNodeBinding,
-    RuntimeMintSelectedNode, RuntimeOpenError, RuntimeOpenViewerSessionInput,
+    RuntimeMintNodeReceipt, RuntimeMintSelectedNode, RuntimeOpenError,
+    RuntimeOpenViewerSessionInput,
     RuntimeProtectedContentPurchaseIntent, RuntimeProviderCallError,
     RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseJournal, RuntimeReleaseTerminalResult, RuntimeRightsProvider,
@@ -67,25 +68,26 @@ use elastos_protected_content_contracts::{
     CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, CanonicalContract, ContentAccessIdV1,
     CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
     CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
-    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyNodeProvisioningRecordV1,
-    CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1, CustodyPoolMemberStateV1,
-    CustodyPoolMemberV1, CustodyPoolOperatorIdV1, CustodyPoolStatementV1, Digest32,
-    EncryptedContentIdentityV1, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
-    KeyReleaseOutcomeV1, KeyReleaseRequestV1, MAX_RIGHTS_EVIDENCE_LIFETIME_SECS,
-    NodeContributionRefV1, NodeContributionStatementV1, NodeCustodyPublicKeyV1, NodePublicKey,
-    PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES, PqHybridSealedShareV1, ProfileIdentityV1,
-    ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
-    RecipientPublicKeyBytesV1, RecipientSealedContributionV1, ReplayNonce16, RightsActionV1,
-    RightsDecisionV1, RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1,
-    RightsObservationFinalityV1, RightsPolicyBodyV1, RightsRequestV1,
-    RuntimeCustodyProvisioningIdV1, RuntimeCustodyProvisioningStatementV1,
-    RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
-    RuntimeSessionBindingV1, ShareCoordinateV1, SignedCustodyCommitteeAuthorizationV1,
-    SignedCustodyEpochV1, SignedCustodyPoolV1, SignedNodeContributionV1,
-    SignedNodeRightsDecisionV1, SignedRecipientKeyAuthorizationV1,
-    SignedRuntimeCustodyProvisioningV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
-    TerminalReceiptIssuerKey, TerminalReceiptStatementV1, ThresholdV1, ValidatedCustodyCommitteeV1,
-    WalletAddress, WalletSignedRightsRequestV1, X_WING_DRAFT06_CIPHERTEXT_BYTES,
+    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyNodeProvisioningRecordIdentityV1,
+    CustodyNodeProvisioningRecordV1, CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1,
+    CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1,
+    CustodyPoolStatementV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
+    EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1,
+    MAX_RIGHTS_EVIDENCE_LIFETIME_SECS, NodeContributionRefV1, NodeContributionStatementV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
+    PqHybridSealedShareV1, ProfileIdentityV1, ProtectedContentBindingV1,
+    RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
+    RecipientSealedContributionV1, ReplayNonce16, RightsActionV1, RightsDecisionV1,
+    RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1, RightsObservationFinalityV1,
+    RightsPolicyBodyV1, RightsRequestV1, RuntimeCustodyProvisioningIdV1,
+    RuntimeCustodyProvisioningStatementV1, RuntimeOperationIssuerKeyV1,
+    RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1,
+    ShareCoordinateV1, SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1,
+    SignedCustodyPoolV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
+    SignedRecipientKeyAuthorizationV1, SignedRuntimeCustodyProvisioningV1,
+    SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
+    TerminalReceiptStatementV1, ThresholdV1, ValidatedCustodyCommitteeV1, WalletAddress,
+    WalletSignedRightsRequestV1, X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, CustodyProviderRequestV1, CustodyProviderResponseV1,
@@ -340,6 +342,39 @@ impl ContentAvailabilityTestProvider {
         Ok(ok_provider_response(json!({
             "data": base64::engine::general_purpose::STANDARD.encode(bytes),
         })))
+    }
+
+    async fn seed_published_protected_content(
+        &self,
+        directory: &Path,
+        object_identity: &str,
+        publisher_did: &str,
+    ) -> Result<(), ProviderError> {
+        let files = super::protected_content_directory_files(directory)
+            .map_err(|error| ProviderError::Provider(error.to_string()))?
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(directory.join(&path))
+                    .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                Ok(json!({
+                    "path": path,
+                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }))
+            })
+            .collect::<Result<Vec<_>, ProviderError>>()?;
+        self.publish(&json!({
+            "op": "publish",
+            "object_kind": "protected-content",
+            "object_did": object_identity,
+            "publisher_did": publisher_did,
+            "files": files,
+        }))
+        .await?;
+        Ok(())
+    }
+
+    async fn requests(&self) -> Vec<Value> {
+        self.requests.lock().await.clone()
     }
 }
 
@@ -939,6 +974,124 @@ async fn publish_protected_content_for_test(
     .await
 }
 
+struct RuntimeCustodyPrebuyAvailabilityHarness {
+    _temp: tempfile::TempDir,
+    data_dir: PathBuf,
+    registry: Arc<ProviderRegistry>,
+    content_provider: Arc<ContentAvailabilityTestProvider>,
+    mint_id: Digest32,
+}
+
+async fn runtime_custody_prebuy_availability_harness(
+    provider_seed: u8,
+    provider_config: ContentAvailabilityTestConfig,
+) -> RuntimeCustodyPrebuyAvailabilityHarness {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    owner_only_dir(&data_dir.join("protected-content"));
+
+    let mint_draft = mint_draft_for_composition_journal_test();
+    let fixture_now = crate::auth::now_ts();
+    let mint_journal = runtime_mint_journal(&data_dir);
+    mint_journal.persist_bound(&mint_draft).unwrap();
+    for (index, node) in mint_draft.nodes().iter().enumerate() {
+        let seed = u8::try_from(index + 1).unwrap();
+        mint_journal
+            .mark_node_effect_started(mint_draft.mint_id(), node.node_public_key())
+            .unwrap();
+        mint_journal
+            .mark_node_receipt(
+                mint_draft.mint_id(),
+                RuntimeMintNodeReceipt::new(
+                    node.node_public_key(),
+                    RuntimeCustodyProvisioningIdV1::new(digest(0x80 + seed)).unwrap(),
+                    CustodyNodeProvisioningRecordIdentityV1::new(digest(0xa0 + seed), 128)
+                        .unwrap(),
+                    node.owner_state_root(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    let custody_provisioned = mint_journal.mark_custody_provisioned(mint_draft.mint_id()).unwrap();
+    assert_eq!(
+        custody_provisioned.custody_terminal(),
+        Some(elastos_protected_content_runtime::RuntimeCustodyTerminalKind::CustodyProvisioned)
+    );
+
+    let expected_provider_did =
+        ContentAvailabilityTestProvider::new(0x61, ContentAvailabilityTestConfig::accepted())
+            .signer_did();
+    let requirement = availability_requirement(expected_provider_did);
+    let evidence = elastos_protected_content_runtime::RuntimeVerifiedContentAvailability::new(
+        ContentAvailabilityTestProvider::CID,
+        requirement.expected_object_identity(),
+        requirement.expected_publisher_did(),
+        &requirement,
+        3,
+        fixture_now.saturating_sub(1),
+        digest(0x71),
+        mint_draft.encrypted_content().clone(),
+        mint_draft.media_identity().media_manifest_root(),
+    )
+    .unwrap();
+    let available = mint_journal
+        .mark_content_available(mint_draft.mint_id(), &requirement, evidence)
+        .unwrap();
+    assert_eq!(available.draft().mint_id(), mint_draft.mint_id());
+    assert!(available.content_availability().is_some());
+
+    super::persist_runtime_custody_listing(
+        &data_dir,
+        &super::RuntimeCustodyListingRecord {
+            schema: super::RUNTIME_LISTING_SCHEMA_V1.to_string(),
+            mint_id: hex::encode(mint_draft.mint_id().as_bytes()),
+            content_id: super::runtime_protected_content_id(mint_draft.encrypted_content())
+                .unwrap(),
+            cid: ContentAvailabilityTestProvider::CID.to_string(),
+            publisher_principal_id: "person:local:creator".to_string(),
+            buyer_principal_id: None,
+            published_at: fixture_now.saturating_sub(2),
+            bought_at: None,
+        },
+    )
+    .unwrap();
+
+    let (init_segment, encrypted_segments) = media_components(0x41);
+    let media_identity = CencFmp4MediaIdentityV1::new_from_bytes(
+        &init_segment,
+        &encrypted_segments,
+        MEDIA_MIME_TYPE_V1,
+        MEDIA_CODECS_V1,
+    )
+    .unwrap();
+    let protected_directory =
+        protected_content_directory_from_parts(&init_segment, &encrypted_segments, &media_identity);
+    let content_provider = ContentAvailabilityTestProvider::new(provider_seed, provider_config);
+    content_provider
+        .seed_published_protected_content(
+            protected_directory.path(),
+            requirement.expected_object_identity(),
+            requirement.expected_publisher_did(),
+        )
+        .await
+        .unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("content", content_provider.clone())
+        .await
+        .unwrap();
+
+    RuntimeCustodyPrebuyAvailabilityHarness {
+        _temp: temp,
+        data_dir,
+        registry,
+        content_provider,
+        mint_id: mint_draft.mint_id(),
+    }
+}
+
 #[tokio::test]
 async fn protected_content_availability_publishes_status_refetches_and_verifies_exact_media() {
     let evidence =
@@ -1024,6 +1177,155 @@ async fn protected_content_availability_rejects_wrong_signed_receipt_or_refetche
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn runtime_custody_prebuy_availability_refetches_fresh_exact_receipt_without_publish() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig {
+            checked_at: NOW,
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+    )
+    .await;
+    let verified = super::verify_fresh_runtime_custody_buy_availability(
+        &harness.data_dir,
+        harness.registry.as_ref(),
+        harness.mint_id,
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(verified.content_cid(), ContentAvailabilityTestProvider::CID);
+    assert_eq!(verified.required_replicas(), 3);
+    assert_eq!(verified.observed_replicas(), 3);
+
+    let requests = harness.content_provider.requests().await;
+    assert!(requests
+        .iter()
+        .any(|request| request.get("op").and_then(Value::as_str) == Some("status")));
+    assert!(requests
+        .iter()
+        .any(|request| request.get("op").and_then(Value::as_str) == Some("fetch")));
+    assert!(requests
+        .iter()
+        .all(|request| matches!(
+            request.get("op").and_then(Value::as_str),
+            Some("status" | "fetch")
+        )));
+    assert!(!requests
+        .iter()
+        .any(|request| request.get("op").and_then(Value::as_str) == Some("publish")));
+}
+
+#[tokio::test]
+async fn runtime_custody_prebuy_availability_rejects_stale_receipt() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig {
+            checked_at: NOW - super::PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS - 1,
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+    )
+    .await;
+    assert!(super::verify_fresh_runtime_custody_buy_availability(
+        &harness.data_dir,
+        harness.registry.as_ref(),
+        harness.mint_id,
+        NOW,
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn runtime_custody_prebuy_availability_rejects_wrong_receipt_binding_or_manifest() {
+    let cases = [
+        ContentAvailabilityTestConfig {
+            receipt_object_identity: Some("did:key:wrong#content".to_string()),
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            receipt_publisher_did: Some("did:key:wrong#publisher".to_string()),
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            policy: "wrong-policy".to_string(),
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            replicas: 2,
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+        ContentAvailabilityTestConfig {
+            mutate_manifest_extra_file: true,
+            ..ContentAvailabilityTestConfig::accepted()
+        },
+    ];
+    for config in cases {
+        let harness = runtime_custody_prebuy_availability_harness(0x61, config).await;
+        assert!(super::verify_fresh_runtime_custody_buy_availability(
+            &harness.data_dir,
+            harness.registry.as_ref(),
+            harness.mint_id,
+            NOW,
+        )
+        .await
+        .is_err());
+    }
+
+    let wrong_signer = runtime_custody_prebuy_availability_harness(
+        0x62,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    assert!(super::verify_fresh_runtime_custody_buy_availability(
+        &wrong_signer.data_dir,
+        wrong_signer.registry.as_ref(),
+        wrong_signer.mint_id,
+        NOW,
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn runtime_custody_prebuy_availability_requires_existing_mint_and_listing_before_provider_use() {
+    let missing_listing = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    fs::remove_file(super::runtime_listing_path(
+        &missing_listing.data_dir,
+        missing_listing.mint_id,
+    ))
+    .unwrap();
+    assert!(super::verify_fresh_runtime_custody_buy_availability(
+        &missing_listing.data_dir,
+        missing_listing.registry.as_ref(),
+        missing_listing.mint_id,
+        NOW,
+    )
+    .await
+    .is_err());
+    assert!(missing_listing.content_provider.requests().await.is_empty());
+
+    let wrong_mint = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    assert!(super::verify_fresh_runtime_custody_buy_availability(
+        &wrong_mint.data_dir,
+        wrong_mint.registry.as_ref(),
+        digest(0x33),
+        NOW,
+    )
+    .await
+    .is_err());
+    assert!(wrong_mint.content_provider.requests().await.is_empty());
 }
 
 fn mutate_protected_content_descriptor(directory: &Path) {

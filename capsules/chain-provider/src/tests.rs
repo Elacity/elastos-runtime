@@ -120,34 +120,114 @@ fn provider_with_rights_rpc_and_policies(
     selector: &str,
     protected_content_policies: Value,
 ) -> ChainProvider {
+    provider_with_rights_rpc_policies_and_purchase(
+        rpc_url,
+        selector,
+        protected_content_policies,
+        Value::Null,
+    )
+}
+
+fn provider_with_rights_rpc_policies_and_purchase(
+    rpc_url: String,
+    selector: &str,
+    protected_content_policies: Value,
+    protected_content_market: Value,
+) -> ChainProvider {
+    let networks = vec![json!({
+        "id": "esc-local",
+        "display_name": "ESC Local",
+        "kind": "evm_json_rpc",
+        "chain_id": 20,
+        "native_symbol": "ELA",
+        "provider": "test",
+        "mainnet": false,
+        "explorer_url": null,
+        "rpc_url": rpc_url,
+        "rights_methods": [{
+            "id": "has_access_by_content_id",
+            "contract": "0x0000000000000000000000000000000000000001",
+            "abi": "has_access_by_content_id_address_bytes16",
+            "selector": selector,
+            "protected_content_policies": protected_content_policies
+        }],
+        "protected_content_market": protected_content_market
+    })];
+    let mut provider = ChainProvider::new();
+    let init = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
+                "networks": networks
+            }
+        }),
+    });
+    assert!(matches!(init, Response::Ok { .. }));
+    provider.now_unix_seconds = || RIGHTS_EVIDENCE_NOW;
+    provider
+}
+
+fn protected_content_market_source(evidence_rpc_urls: Vec<String>) -> Value {
+    json!({
+        "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
+        "evidence_rpc_urls": evidence_rpc_urls
+    })
+}
+
+fn mutated_asset_created_log_data(mut log: Value, mutate: impl FnOnce(&mut Vec<u8>)) -> Value {
+    let data = log
+        .get("data")
+        .and_then(Value::as_str)
+        .expect("asset log data");
+    let mut bytes = decode_hex(data, None, "asset log data").expect("decode asset log data");
+    mutate(&mut bytes);
+    log["data"] = json!(format!("0x{}", encode_hex(&bytes)));
+    log
+}
+
+fn provider_with_creator_mint_rpc(rpc_url: String) -> ChainProvider {
+    provider_with_creator_mint_rpc_and_market_sources(
+        rpc_url,
+        vec![
+            "https://rpc-a.example".to_string(),
+            "https://rpc-b.example".to_string(),
+        ],
+    )
+}
+
+fn provider_with_creator_mint_rpc_and_market_sources(
+    rpc_url: String,
+    evidence_rpc_urls: Vec<String>,
+) -> ChainProvider {
     let mut provider = ChainProvider::new();
     let init = provider.handle(Request::Init {
         config: json!({
             "extra": {
                 "protected_content_runtime_issuer": runtime_issuer_hex(0x42),
                 "networks": [{
-                    "id": "esc-local",
-                    "display_name": "ESC Local",
+                    "id": "base-local",
+                    "display_name": "Base Local",
                     "kind": "evm_json_rpc",
-                    "chain_id": 20,
-                    "native_symbol": "ELA",
+                    "chain_id": 8453,
+                    "native_symbol": "ETH",
                     "provider": "test",
-                    "mainnet": false,
+                    "mainnet": true,
                     "explorer_url": null,
                     "rpc_url": rpc_url,
-                    "rights_methods": [{
-                        "id": "has_access_by_content_id",
-                        "contract": "0x0000000000000000000000000000000000000001",
-                        "abi": "has_access_by_content_id_address_bytes16",
-                        "selector": selector,
-                        "protected_content_policies": protected_content_policies
-                    }]
+                    "rights_methods": [],
+                    "protected_content_creator_mint": {
+                        "asset_created_emitter": "0x00000000000000000000000000000000000000dd",
+                        "abi": "elacity_mint_v1"
+                    },
+                    "protected_content_market": {
+                        "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
+                        "evidence_rpc_urls": evidence_rpc_urls
+                    }
                 }]
             }
         }),
     });
     assert!(matches!(init, Response::Ok { .. }));
-    provider.now_unix_seconds = || RIGHTS_EVIDENCE_NOW;
     provider
 }
 
@@ -264,6 +344,77 @@ fn evm_bool_word(value: bool) -> Value {
     json!(format!("0x{}", encode_hex(&bytes)))
 }
 
+fn protected_content_asset_created_log(
+    emitter: &str,
+    creator: &str,
+    ledger: &str,
+    operative: &str,
+    token_id: &str,
+    token_uri: &str,
+    op_type_code: u16,
+) -> Value {
+    validate_hex_quantity(token_id, "token_id").unwrap();
+    let raw = token_id.strip_prefix("0x").unwrap();
+    let padded = if raw.len() % 2 == 0 {
+        raw.to_string()
+    } else {
+        format!("0{raw}")
+    };
+    let mut data = padded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = (chunk[0] as char).to_digit(16).unwrap() as u8;
+            let low = (chunk[1] as char).to_digit(16).unwrap() as u8;
+            (high << 4) | low
+        })
+        .collect::<Vec<_>>();
+    let mut token_id_word = vec![0u8; 32 - data.len()];
+    token_id_word.append(&mut data);
+    let mut encoded = token_id_word;
+    encoded.extend_from_slice(&abi_word_usize(96));
+    encoded.extend_from_slice(&abi_word_u128(op_type_code as u128));
+    encoded.extend_from_slice(&abi_encode_string(token_uri.as_bytes()));
+    json!({
+        "address": emitter,
+        "topics": [
+            ProtectedContentCreatorMintAbi::ElacityMintV1.asset_created_topic0(),
+            format!("0x{}", encode_hex(&abi_word_address(creator).unwrap())),
+            format!("0x{}", encode_hex(&abi_word_address(ledger).unwrap())),
+            format!("0x{}", encode_hex(&abi_word_address(operative).unwrap())),
+        ],
+        "data": format!("0x{}", encode_hex(&encoded)),
+    })
+}
+
+fn protected_content_mint_receipt_json(
+    transaction_hash: &str,
+    from: &str,
+    to: &str,
+    block_number: &str,
+    block_hash: &str,
+    status: &str,
+    logs: Vec<Value>,
+) -> Value {
+    json!({
+        "transactionHash": transaction_hash,
+        "status": status,
+        "from": from,
+        "to": to,
+        "blockNumber": block_number,
+        "blockHash": block_hash,
+        "logs": logs,
+    })
+}
+
+fn canonical_block_json(number: &str, hash: &str, transactions: Vec<&str>) -> Value {
+    json!({
+        "number": number,
+        "hash": hash,
+        "transactions": transactions,
+    })
+}
+
 #[test]
 fn encode_has_access_by_content_id_call_uses_address_and_bytes16_abi() {
     let access_id = [0x41; 16];
@@ -279,6 +430,98 @@ fn encode_has_access_by_content_id_call_uses_address_and_bytes16_abi() {
             "0x12345678",
             "00000000000000000000000000000000000000000000000000000000000000ab",
             "4141414141414141414141414141414100000000000000000000000000000000"
+        )
+    );
+}
+
+#[test]
+fn encode_authority_gateway_buy_access_call_uses_exact_listing_terms_and_optional_pay_token() {
+    let without_pay_token = encode_authority_gateway_buy_access_call(
+        PROTECTED_CONTENT_BUY_ACCESS_NATIVE_SELECTOR,
+        "0x0000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000002",
+        "0x03",
+        "0x04",
+        "0x05",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        without_pay_token,
+        concat!(
+            "0xf7580ad9",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            "0000000000000000000000000000000000000000000000000000000000000003",
+            "0000000000000000000000000000000000000000000000000000000000000004",
+            "0000000000000000000000000000000000000000000000000000000000000005"
+        )
+    );
+
+    let with_pay_token = encode_authority_gateway_buy_access_call(
+        PROTECTED_CONTENT_BUY_ACCESS_ERC20_SELECTOR,
+        "0x0000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000002",
+        "0x03",
+        "0x04",
+        "0x05",
+        Some("0x0000000000000000000000000000000000000006"),
+    )
+    .unwrap();
+    assert_eq!(
+        with_pay_token,
+        concat!(
+            "0x0ede2294",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            "0000000000000000000000000000000000000000000000000000000000000003",
+            "0000000000000000000000000000000000000000000000000000000000000004",
+            "0000000000000000000000000000000000000000000000000000000000000005",
+            "0000000000000000000000000000000000000000000000000000000000000006"
+        )
+    );
+
+    let approval =
+        encode_erc20_approve_call("0x00000000000000000000000000000000000000bb", "0x14").unwrap();
+    assert_eq!(
+        approval,
+        concat!(
+            "0x095ea7b3",
+            "00000000000000000000000000000000000000000000000000000000000000bb",
+            "0000000000000000000000000000000000000000000000000000000000000014"
+        )
+    );
+}
+
+#[test]
+fn protected_content_read_selectors_match_reviewed_abi_signatures() {
+    let operative_selector = &sha3::Keccak256::digest(b"operative(address,uint256)")[..4];
+    assert_eq!(
+        format!("0x{}", encode_hex(operative_selector)),
+        PROTECTED_CONTENT_OPERATIVE_SELECTOR
+    );
+
+    let mint_selector = &sha3::Keccak256::digest(b"mint(string,uint16,bytes,bytes)")[..4];
+    assert_eq!(
+        format!("0x{}", encode_hex(mint_selector)),
+        ProtectedContentCreatorMintAbi::ElacityMintV1.selector()
+    );
+}
+
+#[test]
+fn encode_authority_gateway_listing_call_uses_access_token_id_one() {
+    let encoded = encode_authority_gateway_listing_call(
+        "0x0000000000000000000000000000000000000044",
+        "0x0000000000000000000000000000000000000055",
+    )
+    .unwrap();
+    assert_eq!(
+        encoded,
+        concat!(
+            "0x6bd3a64b",
+            "0000000000000000000000000000000000000000000000000000000000000044",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "0000000000000000000000000000000000000000000000000000000000000055"
         )
     );
 }
@@ -1984,6 +2227,1317 @@ fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
 }
 
 #[test]
+fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_id() {
+    let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
+    let access_id = [0x41; 16];
+    let data = ok_data(
+        provider.handle(Request::ResolveProtectedContentCreatorMint {
+            network: "base-local".to_string(),
+            ledger: "0x0000000000000000000000000000000000000022".to_string(),
+            token_uri: "ipfs://protected-content/metadata.json".to_string(),
+            op_type_code: 0,
+            content_access_id: format!("0x{}", encode_hex(&access_id)),
+            value: Some("0x0".to_string()),
+            op_raw: None,
+            sell: None,
+        }),
+    );
+    assert_eq!(data["schema"], PROTECTED_CONTENT_CREATOR_MINT_SCHEMA);
+    assert_eq!(data["network"], "base-local");
+    assert_eq!(
+        data["function"],
+        ProtectedContentCreatorMintAbi::ElacityMintV1.function()
+    );
+    assert_eq!(data["to"], "0x0000000000000000000000000000000000000022");
+    assert_eq!(data["value"], "0x0");
+    assert_eq!(
+        data["content_access_id"],
+        format!("0x{}", encode_hex(&access_id))
+    );
+    assert_eq!(
+        data["data"],
+        encode_protected_content_creator_mint_call(
+            ProtectedContentCreatorMintAbi::ElacityMintV1.selector(),
+            "ipfs://protected-content/metadata.json",
+            0,
+            &encode_protected_content_mint_op_raw_free(&access_id).unwrap(),
+            &[],
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn resolve_protected_content_mint_receipt_requires_two_finalized_agreeing_receipts() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let finalized_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let receipt = protected_content_mint_receipt_json(
+        hash,
+        creator,
+        ledger,
+        "0x2a",
+        receipt_block_hash,
+        "0x1",
+        vec![protected_content_asset_created_log(
+            emitter, creator, ledger, operative, "0x03", token_uri, 0,
+        )],
+    );
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        ("eth_getTransactionReceipt", json!([hash]), receipt.clone()),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2b", "hash": finalized_hash }),
+        ),
+    ];
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ],
+    );
+    let data = ok_data(
+        provider.handle(Request::ResolveProtectedContentMintReceipt {
+            network: "base-local".to_string(),
+            hash: hash.to_string(),
+            creator: creator.to_string(),
+            ledger: ledger.to_string(),
+            token_uri: token_uri.to_string(),
+            op_type_code: 0,
+        }),
+    );
+    assert_eq!(data["schema"], PROTECTED_CONTENT_MINT_RECEIPT_SCHEMA);
+    assert_eq!(data["network"], "base-local");
+    assert_eq!(data["chain_id"], 8453);
+    assert_eq!(data["token_id"], "0x3");
+    assert_eq!(data["operative"], operative);
+}
+
+#[test]
+fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let wrong_creator = "0x0000000000000000000000000000000000000099";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let wrong_ledger = "0x00000000000000000000000000000000000000aa";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let finalized_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn mutate_asset_created_log_data(mut log: Value, mutate: impl FnOnce(&mut Vec<u8>)) -> Value {
+        let data = log
+            .get("data")
+            .and_then(Value::as_str)
+            .expect("asset log data");
+        let mut bytes = decode_hex(data, None, "asset log data").expect("decode asset log data");
+        mutate(&mut bytes);
+        log["data"] = json!(format!("0x{}", encode_hex(&bytes)));
+        log
+    }
+
+    fn mutate_asset_created_log_topic(
+        mut log: Value,
+        index: usize,
+        mutate: impl FnOnce(&mut Vec<u8>),
+    ) -> Value {
+        let topic = log["topics"][index].as_str().expect("asset log topic");
+        let mut bytes = decode_hex(topic, Some(32), "asset log topic").expect("decode topic");
+        mutate(&mut bytes);
+        log["topics"][index] = json!(format!("0x{}", encode_hex(&bytes)));
+        log
+    }
+
+    for (label, receipt, expected_code) in [
+        (
+            "wrong emitter",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![protected_content_asset_created_log(
+                    "0x00000000000000000000000000000000000000ee",
+                    creator,
+                    ledger,
+                    operative,
+                    "0x03",
+                    token_uri,
+                    0,
+                )],
+            ),
+            "protected_content_mint_receipt_not_bound",
+        ),
+        (
+            "wrong creator",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![protected_content_asset_created_log(
+                    emitter,
+                    wrong_creator,
+                    ledger,
+                    operative,
+                    "0x03",
+                    token_uri,
+                    0,
+                )],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+        (
+            "wrong ledger",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![protected_content_asset_created_log(
+                    emitter,
+                    creator,
+                    wrong_ledger,
+                    operative,
+                    "0x03",
+                    token_uri,
+                    0,
+                )],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+        (
+            "ambiguous",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    protected_content_asset_created_log(
+                        emitter,
+                        creator,
+                        ledger,
+                        "0x0000000000000000000000000000000000000055",
+                        "0x04",
+                        token_uri,
+                        0,
+                    ),
+                ],
+            ),
+            "ambiguous_protected_content_mint_receipt",
+        ),
+        (
+            "wrong transaction hash",
+            protected_content_mint_receipt_json(
+                "0x9999999999999999999999999999999999999999999999999999999999999999",
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![protected_content_asset_created_log(
+                    emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                )],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+        (
+            "malformed status",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x2",
+                vec![protected_content_asset_created_log(
+                    emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                )],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+        (
+            "non-canonical creator topic",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![mutate_asset_created_log_topic(
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    1,
+                    |topic| topic[0] = 1,
+                )],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+        (
+            "non-canonical token uri offset",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![mutate_asset_created_log_data(
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    |data| data[63] = 0x80,
+                )],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+        (
+            "non-canonical trailing data",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![mutate_asset_created_log_data(
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    |data| data.extend_from_slice(&[0u8; 32]),
+                )],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+        (
+            "non-zero token uri padding",
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![mutate_asset_created_log_data(
+                    protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    ),
+                    |data| {
+                        let last = data.last_mut().expect("token uri padding byte");
+                        *last = 1;
+                    },
+                )],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+    ] {
+        let sequence = vec![
+            ("eth_chainId", json!([]), json!("0x2105")),
+            ("eth_getTransactionReceipt", json!([hash]), receipt.clone()),
+            (
+                "eth_getBlockByNumber",
+                json!(["0x2a", false]),
+                canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+            ),
+            (
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+                json!({ "number": "0x2b", "hash": finalized_hash }),
+            ),
+        ];
+        let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+            "http://127.0.0.1:9".to_string(),
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        );
+        assert_eq!(
+            error_code(
+                provider.handle(Request::ResolveProtectedContentMintReceipt {
+                    network: "base-local".to_string(),
+                    hash: hash.to_string(),
+                    creator: creator.to_string(),
+                    ledger: ledger.to_string(),
+                    token_uri: token_uri.to_string(),
+                    op_type_code: 0,
+                })
+            ),
+            expected_code,
+            "{label}"
+        );
+    }
+
+    let conflicting_a = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        (
+            "eth_getTransactionReceipt",
+            json!([hash]),
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![protected_content_asset_created_log(
+                    emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                )],
+            ),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2b", "hash": finalized_hash }),
+        ),
+    ];
+    let conflicting_b = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        (
+            "eth_getTransactionReceipt",
+            json!([hash]),
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![protected_content_asset_created_log(
+                    emitter,
+                    creator,
+                    ledger,
+                    "0x0000000000000000000000000000000000000055",
+                    "0x04",
+                    token_uri,
+                    0,
+                )],
+            ),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2b", "hash": finalized_hash }),
+        ),
+    ];
+    let mut conflicting_provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(conflicting_a),
+            spawn_rpc_sequence_asserting_server(conflicting_b),
+        ],
+    );
+    assert_eq!(
+        error_code(
+            conflicting_provider.handle(Request::ResolveProtectedContentMintReceipt {
+                network: "base-local".to_string(),
+                hash: hash.to_string(),
+                creator: creator.to_string(),
+                ledger: ledger.to_string(),
+                token_uri: token_uri.to_string(),
+                op_type_code: 0,
+            })
+        ),
+        "conflicting_protected_content_mint_receipt_observations"
+    );
+
+    for (label, canonical_block, expected_code) in [
+        (
+            "noncanonical receipt block",
+            canonical_block_json(
+                "0x2a",
+                "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                vec![hash],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+        (
+            "missing transaction in canonical block",
+            canonical_block_json(
+                "0x2a",
+                receipt_block_hash,
+                vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            ),
+            "invalid_protected_content_mint_receipt",
+        ),
+    ] {
+        let sequence = vec![
+            ("eth_chainId", json!([]), json!("0x2105")),
+            (
+                "eth_getTransactionReceipt",
+                json!([hash]),
+                protected_content_mint_receipt_json(
+                    hash,
+                    creator,
+                    ledger,
+                    "0x2a",
+                    receipt_block_hash,
+                    "0x1",
+                    vec![protected_content_asset_created_log(
+                        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                    )],
+                ),
+            ),
+            (
+                "eth_getBlockByNumber",
+                json!(["0x2a", false]),
+                canonical_block,
+            ),
+            (
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+                json!({ "number": "0x2b", "hash": finalized_hash }),
+            ),
+        ];
+        let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+            "http://127.0.0.1:9".to_string(),
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        );
+        assert_eq!(
+            error_code(
+                provider.handle(Request::ResolveProtectedContentMintReceipt {
+                    network: "base-local".to_string(),
+                    hash: hash.to_string(),
+                    creator: creator.to_string(),
+                    ledger: ledger.to_string(),
+                    token_uri: token_uri.to_string(),
+                    op_type_code: 0,
+                })
+            ),
+            expected_code,
+            "{label}"
+        );
+    }
+
+    let failed_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        (
+            "eth_getTransactionReceipt",
+            json!([hash]),
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x0",
+                vec![protected_content_asset_created_log(
+                    emitter, creator, ledger, operative, "0x03", token_uri, 0,
+                )],
+            ),
+        ),
+    ];
+    let mut failed_provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(failed_sequence.clone()),
+            spawn_rpc_sequence_asserting_server(failed_sequence),
+        ],
+    );
+    assert_eq!(
+        error_code(
+            failed_provider.handle(Request::ResolveProtectedContentMintReceipt {
+                network: "base-local".to_string(),
+                hash: hash.to_string(),
+                creator: creator.to_string(),
+                ledger: ledger.to_string(),
+                token_uri: token_uri.to_string(),
+                op_type_code: 0,
+            })
+        ),
+        "protected_content_mint_receipt_failed"
+    );
+
+    let mut extra_topics_log = protected_content_asset_created_log(
+        emitter, creator, ledger, operative, "0x03", token_uri, 0,
+    );
+    extra_topics_log
+        .get_mut("topics")
+        .and_then(Value::as_array_mut)
+        .expect("topics array")
+        .push(json!(
+            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ));
+    let extra_topics_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        (
+            "eth_getTransactionReceipt",
+            json!([hash]),
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![extra_topics_log],
+            ),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2b", "hash": finalized_hash }),
+        ),
+    ];
+    let mut extra_topics_provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(extra_topics_sequence.clone()),
+            spawn_rpc_sequence_asserting_server(extra_topics_sequence),
+        ],
+    );
+    assert_eq!(
+        error_code(
+            extra_topics_provider.handle(Request::ResolveProtectedContentMintReceipt {
+                network: "base-local".to_string(),
+                hash: hash.to_string(),
+                creator: creator.to_string(),
+                ledger: ledger.to_string(),
+                token_uri: token_uri.to_string(),
+                op_type_code: 0,
+            })
+        ),
+        "invalid_protected_content_mint_receipt"
+    );
+}
+
+#[test]
+fn resolve_protected_content_verified_listing_returns_common_finalized_tuple() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let payment_processor = "0x00000000000000000000000000000000000000bb";
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2c", "hash": finalized_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_operative_call(
+                        "0x0000000000000000000000000000000000000022",
+                        "0x03"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_listing_call(
+                        operative,
+                        "0x0000000000000000000000000000000000000011"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000007",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000033"
+            )),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": operative,
+                    "data": encode_operatives_payment_processor_call().unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(format!(
+                "0x{:0>64}",
+                payment_processor.trim_start_matches("0x")
+            )),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    let listing = ok_data(
+        provider.handle(Request::ResolveProtectedContentVerifiedListing {
+            network: "esc-local".to_string(),
+            seller: "0x0000000000000000000000000000000000000011".to_string(),
+            ledger: "0x0000000000000000000000000000000000000022".to_string(),
+            token_id: "0x03".to_string(),
+        }),
+    );
+    assert_eq!(listing["schema"], PROTECTED_CONTENT_VERIFIED_LISTING_SCHEMA);
+    assert_eq!(listing["chain_id"], 20);
+    assert_eq!(
+        listing["seller"],
+        "0x0000000000000000000000000000000000000011"
+    );
+    assert_eq!(
+        listing["ledger"],
+        "0x0000000000000000000000000000000000000022"
+    );
+    assert_eq!(listing["token_id"], "0x3");
+    assert_eq!(listing["operative"], operative);
+    assert_eq!(listing["quantity"], "0x7");
+    assert_eq!(listing["price"], "0x5");
+    assert_eq!(
+        listing["pay_token"],
+        "0x0000000000000000000000000000000000000033"
+    );
+    assert_eq!(listing["payment_processor"], payment_processor);
+}
+
+#[test]
+fn resolve_protected_content_verified_listing_rejects_conflicting_sources() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let sequence_a = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2c", "hash": finalized_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_operative_call(
+                        "0x0000000000000000000000000000000000000022",
+                        "0x03"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!("0x0000000000000000000000000000000000000000000000000000000000000044"),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_listing_call(
+                        "0x0000000000000000000000000000000000000044",
+                        "0x0000000000000000000000000000000000000011"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000007",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000033"
+            )),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x0000000000000000000000000000000000000044",
+                    "data": encode_operatives_payment_processor_call().unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!("0x00000000000000000000000000000000000000000000000000000000000000bb"),
+        ),
+    ];
+    let sequence_b = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2c", "hash": finalized_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_operative_call(
+                        "0x0000000000000000000000000000000000000022",
+                        "0x03"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!("0x0000000000000000000000000000000000000000000000000000000000000044"),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_listing_call(
+                        "0x0000000000000000000000000000000000000044",
+                        "0x0000000000000000000000000000000000000011"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000007",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000099"
+            )),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x0000000000000000000000000000000000000044",
+                    "data": encode_operatives_payment_processor_call().unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!("0x00000000000000000000000000000000000000000000000000000000000000bb"),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence_a),
+            spawn_rpc_sequence_asserting_server(sequence_b),
+        ]),
+    );
+    assert_eq!(
+        error_code(
+            provider.handle(Request::ResolveProtectedContentVerifiedListing {
+                network: "esc-local".to_string(),
+                seller: "0x0000000000000000000000000000000000000011".to_string(),
+                ledger: "0x0000000000000000000000000000000000000022".to_string(),
+                token_id: "0x03".to_string(),
+            })
+        ),
+        "conflicting_protected_content_verified_listing_observations"
+    );
+}
+
+#[test]
+fn resolve_protected_content_verified_listing_rejects_noncanonical_address_word() {
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let mut noncanonical_operative_word =
+        abi_word_address("0x0000000000000000000000000000000000000044").unwrap();
+    noncanonical_operative_word[0] = 1;
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2c", "hash": finalized_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_operative_call(
+                        "0x0000000000000000000000000000000000000022",
+                        "0x03"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(format!("0x{}", encode_hex(&noncanonical_operative_word))),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ]),
+    );
+    assert_eq!(
+        error_code(
+            provider.handle(Request::ResolveProtectedContentVerifiedListing {
+                network: "esc-local".to_string(),
+                seller: "0x0000000000000000000000000000000000000011".to_string(),
+                ledger: "0x0000000000000000000000000000000000000022".to_string(),
+                token_id: "0x03".to_string(),
+            })
+        ),
+        "upstream_invalid_protected_content_verified_listing"
+    );
+}
+
+#[test]
+fn resolve_protected_content_purchase_returns_exact_network_target_value_and_data() {
+    let finalized_hash = "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let payment_processor = "0x00000000000000000000000000000000000000bb";
+    let erc20_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2b", "hash": finalized_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_operative_call(
+                        "0x0000000000000000000000000000000000000022",
+                        "0x03"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_listing_call(
+                        operative,
+                        "0x0000000000000000000000000000000000000011"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(concat!(
+                "0x",
+                "000000000000000000000000000000000000000000000000000000000000270f",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000033"
+            )),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": operative,
+                    "data": encode_operatives_payment_processor_call().unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(format!(
+                "0x{:0>64}",
+                payment_processor.trim_start_matches("0x")
+            )),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(erc20_sequence.clone()),
+            spawn_rpc_sequence_asserting_server(erc20_sequence),
+        ]),
+    );
+    let data = ok_data(provider.handle(Request::ResolveProtectedContentPurchase {
+        seller: "0x0000000000000000000000000000000000000011".to_string(),
+        chain_namespace: "eip155:20".to_string(),
+        network: "esc-local".to_string(),
+        ledger: "0x0000000000000000000000000000000000000022".to_string(),
+        token_id: "0x03".to_string(),
+    }));
+    let rendered = serde_json::to_string(&data).unwrap();
+    assert!(!rendered.contains("http://127.0.0.1:9"));
+    assert_eq!(data["schema"], PROTECTED_CONTENT_PURCHASE_SCHEMA);
+    assert_eq!(data["network"], "esc-local");
+    assert_eq!(data["purchase_quantity"], "0x1");
+    assert_eq!(data["verified_listing"]["token_id"], "0x3");
+    assert_eq!(data["verified_listing"]["available_quantity"], "0x270f");
+    assert_eq!(data["verified_listing"]["price"], "0x5");
+    assert_eq!(
+        data["verified_listing"]["pay_token"],
+        "0x0000000000000000000000000000000000000033"
+    );
+    assert_eq!(
+        data["verified_listing"]["payment_processor"],
+        payment_processor
+    );
+    let steps = data["steps"].as_array().expect("ordered transaction steps");
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0]["stage"], "approval");
+    assert_eq!(steps[0]["to"], "0x0000000000000000000000000000000000000033");
+    assert_eq!(steps[0]["value"], "0x0");
+    assert_eq!(
+        steps[0]["data"],
+        encode_erc20_approve_call(payment_processor, "0x5",).unwrap()
+    );
+    assert_eq!(steps[1]["stage"], "buy");
+    assert_eq!(steps[1]["to"], "0x00000000000000000000000000000000000000aa");
+    assert_eq!(steps[1]["value"], "0x0");
+    assert_eq!(
+        steps[1]["data"],
+        encode_authority_gateway_buy_access_call(
+            PROTECTED_CONTENT_BUY_ACCESS_ERC20_SELECTOR,
+            "0x0000000000000000000000000000000000000011",
+            "0x0000000000000000000000000000000000000022",
+            "0x3",
+            "0x1",
+            "0x05",
+            Some("0x0000000000000000000000000000000000000033"),
+        )
+        .unwrap()
+    );
+
+    let native_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2b", "hash": finalized_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_operative_call(
+                        "0x0000000000000000000000000000000000000022",
+                        "0x03"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_listing_call(
+                        operative,
+                        "0x0000000000000000000000000000000000000011"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000009999",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
+        ),
+    ];
+    let mut native_provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(native_sequence.clone()),
+            spawn_rpc_sequence_asserting_server(native_sequence),
+        ]),
+    );
+    let native = ok_data(
+        native_provider.handle(Request::ResolveProtectedContentPurchase {
+            seller: "0x0000000000000000000000000000000000000011".to_string(),
+            chain_namespace: "eip155:20".to_string(),
+            network: "esc-local".to_string(),
+            ledger: "0x0000000000000000000000000000000000000022".to_string(),
+            token_id: "0x03".to_string(),
+        }),
+    );
+    assert_eq!(native["purchase_quantity"], "0x1");
+    assert_eq!(native["verified_listing"]["available_quantity"], "0x9999");
+    let native_steps = native["steps"].as_array().expect("native steps");
+    assert_eq!(native_steps.len(), 1);
+    assert_eq!(native_steps[0]["stage"], "buy");
+    assert_eq!(
+        native_steps[0]["to"],
+        "0x00000000000000000000000000000000000000aa"
+    );
+    assert_eq!(native_steps[0]["value"], "0x5");
+    assert_eq!(
+        native_steps[0]["data"],
+        encode_authority_gateway_buy_access_call(
+            PROTECTED_CONTENT_BUY_ACCESS_NATIVE_SELECTOR,
+            "0x0000000000000000000000000000000000000011",
+            "0x0000000000000000000000000000000000000022",
+            "0x3",
+            "0x1",
+            "0x05",
+            None,
+        )
+        .unwrap()
+    );
+
+    let zero_stock_sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2b", "hash": finalized_hash }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_operative_call(
+                        "0x0000000000000000000000000000000000000022",
+                        "0x03"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(format!("0x{:0>64}", operative.trim_start_matches("0x"))),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x00000000000000000000000000000000000000aa",
+                    "data": encode_authority_gateway_listing_call(
+                        operative,
+                        "0x0000000000000000000000000000000000000011"
+                    ).unwrap()
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            json!(concat!(
+                "0x",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "0000000000000000000000000000000000000000000000000000000000000005",
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )),
+        ),
+    ];
+    let mut zero_stock_provider = provider_with_rights_rpc_policies_and_purchase(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        json!([]),
+        protected_content_market_source(vec![
+            spawn_rpc_sequence_asserting_server(zero_stock_sequence.clone()),
+            spawn_rpc_sequence_asserting_server(zero_stock_sequence),
+        ]),
+    );
+    assert_eq!(
+        error_code(
+            zero_stock_provider.handle(Request::ResolveProtectedContentPurchase {
+                seller: "0x0000000000000000000000000000000000000011".to_string(),
+                chain_namespace: "eip155:20".to_string(),
+                network: "esc-local".to_string(),
+                ledger: "0x0000000000000000000000000000000000000022".to_string(),
+                token_id: "0x03".to_string(),
+            })
+        ),
+        "protected_content_verified_listing_unavailable"
+    );
+
+    let denied = provider.handle(Request::ResolveProtectedContentPurchase {
+        seller: "0x0000000000000000000000000000000000000011".to_string(),
+        chain_namespace: "eip155:8453".to_string(),
+        network: "esc-local".to_string(),
+        ledger: "0x0000000000000000000000000000000000000022".to_string(),
+        token_id: "0x03".to_string(),
+    });
+    assert_eq!(
+        error_code(denied),
+        "invalid_protected_content_purchase_request"
+    );
+}
+
+#[test]
+fn init_rejects_unknown_protected_content_market_selector_field() {
+    let mut provider = ChainProvider::new();
+    let response = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "networks": [{
+                    "id": "esc-local",
+                    "display_name": "ESC Local",
+                    "kind": "evm_json_rpc",
+                    "chain_id": 20,
+                    "native_symbol": "ELA",
+                    "provider": "test",
+                    "mainnet": false,
+                    "explorer_url": null,
+                    "rpc_url": "http://127.0.0.1:9",
+                    "rights_methods": [],
+                    "protected_content_market": {
+                        "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
+                        "selector": "0x0ede2294"
+                    }
+                }]
+            }
+        }),
+    });
+    assert_eq!(error_code(response), "invalid_config");
+}
+
+#[test]
+fn init_rejects_unknown_protected_content_market_payment_processor_field() {
+    let mut provider = ChainProvider::new();
+    let response = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "networks": [{
+                    "id": "esc-local",
+                    "display_name": "ESC Local",
+                    "kind": "evm_json_rpc",
+                    "chain_id": 20,
+                    "native_symbol": "ELA",
+                    "provider": "test",
+                    "mainnet": false,
+                    "explorer_url": null,
+                    "rpc_url": "http://127.0.0.1:9",
+                    "rights_methods": [],
+                    "protected_content_market": {
+                        "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
+                        "payment_processor": "0x00000000000000000000000000000000000000bb",
+                        "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
+                    }
+                }]
+            }
+        }),
+    });
+    assert_eq!(error_code(response), "invalid_config");
+}
+
+#[test]
+fn init_rejects_stale_protected_content_purchase_config_field() {
+    let mut provider = ChainProvider::new();
+    let response = provider.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "networks": [{
+                    "id": "esc-local",
+                    "display_name": "ESC Local",
+                    "kind": "evm_json_rpc",
+                    "chain_id": 20,
+                    "native_symbol": "ELA",
+                    "provider": "test",
+                    "mainnet": false,
+                    "explorer_url": null,
+                    "rpc_url": "http://127.0.0.1:9",
+                    "rights_methods": [],
+                    "protected_content_purchase": {
+                        "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
+                        "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
+                    }
+                }]
+            }
+        }),
+    });
+    assert_eq!(error_code(response), "invalid_config");
+}
+
+#[test]
 fn init_rejects_invalid_or_duplicate_protected_content_policy_sources() {
     for invalid_policies in [
         json!([{
@@ -2146,14 +3700,24 @@ fn protected_content_rights_evidence_rejects_malformed_or_oversized_contract_byt
 }
 
 #[test]
-fn protected_content_rights_evidence_rejects_selector_mismatch_without_backend() {
+fn protected_content_rights_evidence_rejects_unconfigured_selector_without_backend() {
     let operation = protected_content_signed_operation();
-    let mut provider = provider_with_rights_rpc("http://127.0.0.1:9".to_string(), "0x87654321");
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x87654321",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                "https://rpc-a.example".to_string(),
+                "https://rpc-b.example".to_string(),
+            ],
+        ),
+    );
     assert_eq!(
         error_code(provider.handle(Request::ProtectedContentRightsEvidence {
             signed_runtime_release_operation: contract_hex(&operation),
         })),
-        "rights_selector_mismatch"
+        "rights_query_not_configured"
     );
 }
 
@@ -2252,6 +3816,72 @@ fn protected_content_rights_evidence_sanitizes_upstream_rpc_errors() {
         }
         other => panic!("expected sanitized error, got {other:?}"),
     }
+}
+
+#[test]
+fn resolve_protected_content_mint_receipt_rejects_huge_token_uri_length_without_panicking() {
+    let hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let creator = "0x0000000000000000000000000000000000000011";
+    let ledger = "0x0000000000000000000000000000000000000022";
+    let operative = "0x0000000000000000000000000000000000000044";
+    let emitter = "0x00000000000000000000000000000000000000dd";
+    let token_uri = "ipfs://protected-content/metadata.json";
+    let receipt_block_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let finalized_hash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let huge_length_log = mutated_asset_created_log_data(
+        protected_content_asset_created_log(
+            emitter, creator, ledger, operative, "0x03", token_uri, 0,
+        ),
+        |data| {
+            data[96..128].fill(0xff);
+        },
+    );
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x2105")),
+        (
+            "eth_getTransactionReceipt",
+            json!([hash]),
+            protected_content_mint_receipt_json(
+                hash,
+                creator,
+                ledger,
+                "0x2a",
+                receipt_block_hash,
+                "0x1",
+                vec![huge_length_log],
+            ),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["0x2a", false]),
+            canonical_block_json("0x2a", receipt_block_hash, vec![hash]),
+        ),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({ "number": "0x2b", "hash": finalized_hash }),
+        ),
+    ];
+    let mut provider = provider_with_creator_mint_rpc_and_market_sources(
+        "http://127.0.0.1:9".to_string(),
+        vec![
+            spawn_rpc_sequence_asserting_server(sequence.clone()),
+            spawn_rpc_sequence_asserting_server(sequence),
+        ],
+    );
+    assert_eq!(
+        error_code(
+            provider.handle(Request::ResolveProtectedContentMintReceipt {
+                network: "base-local".to_string(),
+                hash: hash.to_string(),
+                creator: creator.to_string(),
+                ledger: ledger.to_string(),
+                token_uri: token_uri.to_string(),
+                op_type_code: 0,
+            })
+        ),
+        "invalid_protected_content_mint_receipt"
+    );
 }
 
 #[test]

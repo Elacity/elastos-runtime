@@ -7,6 +7,14 @@ use elastos_protected_content_contracts::{EvmRightsMethodAbiV1, RightsActionV1};
 pub(super) const NODE_LIFECYCLE_STATE_SCHEMA: &str = "elastos.chain.node_lifecycle_state/v1";
 pub(super) const PROTECTED_CONTENT_POLICY_SCHEMA: &str =
     "elastos.chain.protected-content-policy/v1";
+pub(super) const PROTECTED_CONTENT_CREATOR_MINT_SCHEMA: &str =
+    "elastos.chain.protected-content-creator-mint/v1";
+pub(super) const PROTECTED_CONTENT_MINT_RECEIPT_SCHEMA: &str =
+    "elastos.chain.protected-content-mint-receipt/v1";
+pub(super) const PROTECTED_CONTENT_VERIFIED_LISTING_SCHEMA: &str =
+    "elastos.chain.protected-content-verified-listing/v1";
+pub(super) const PROTECTED_CONTENT_PURCHASE_SCHEMA: &str =
+    "elastos.chain.protected-content-purchase/v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +26,7 @@ pub(super) enum ChainKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ChainNetwork {
     pub(super) id: String,
     pub(super) display_name: String,
@@ -32,6 +41,10 @@ pub(super) struct ChainNetwork {
     pub(super) rpc_url: String,
     #[serde(default)]
     pub(super) rights_methods: Vec<RightsMethod>,
+    #[serde(default)]
+    pub(super) protected_content_creator_mint: Option<ProtectedContentCreatorMintMethod>,
+    #[serde(default)]
+    pub(super) protected_content_market: Option<ProtectedContentMarketMethod>,
 }
 
 impl ChainNetwork {
@@ -59,6 +72,59 @@ pub(super) struct RightsMethod {
     pub(super) selector: String,
     #[serde(default)]
     pub(super) protected_content_policies: Vec<ProtectedContentPolicySource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProtectedContentCreatorMintMethod {
+    pub(super) asset_created_emitter: String,
+    pub(super) abi: ProtectedContentCreatorMintAbi,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProtectedContentCreatorMintAbi {
+    ElacityMintV1,
+}
+
+impl ProtectedContentCreatorMintAbi {
+    pub(super) const fn selector(self) -> &'static str {
+        "0x47cbeeb4"
+    }
+
+    pub(super) const fn function(self) -> &'static str {
+        "mint(string,uint16,bytes,bytes)"
+    }
+
+    pub(super) const fn asset_created_topic0(self) -> &'static str {
+        "0xc0a995e4052be044599af577ab2f3382d67bd34df95a76226e7c464e9d4dba46"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProtectedContentMarketMethod {
+    pub(super) authority_gateway_contract: String,
+    pub(super) evidence_rpc_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProtectedContentMintOpRaw {
+    pub(super) metadata_uri: String,
+    pub(super) addresses: Vec<String>,
+    pub(super) role_types: Vec<u64>,
+    pub(super) amounts: Vec<String>,
+    #[serde(default)]
+    pub(super) reseller_cut: Option<u16>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProtectedContentMintSell {
+    pub(super) copies: String,
+    pub(super) price: String,
+    pub(super) pay_token: String,
 }
 
 impl RightsMethod {
@@ -194,6 +260,40 @@ pub(super) enum Request {
         encrypted_content: String,
         content_access_id: String,
         action: ProtectedContentPolicyAction,
+    },
+    ResolveProtectedContentCreatorMint {
+        network: String,
+        ledger: String,
+        token_uri: String,
+        op_type_code: u16,
+        content_access_id: String,
+        #[serde(default)]
+        value: Option<String>,
+        #[serde(default)]
+        op_raw: Option<ProtectedContentMintOpRaw>,
+        #[serde(default)]
+        sell: Option<ProtectedContentMintSell>,
+    },
+    ResolveProtectedContentMintReceipt {
+        network: String,
+        hash: String,
+        creator: String,
+        ledger: String,
+        token_uri: String,
+        op_type_code: u16,
+    },
+    ResolveProtectedContentVerifiedListing {
+        network: String,
+        seller: String,
+        ledger: String,
+        token_id: String,
+    },
+    ResolveProtectedContentPurchase {
+        seller: String,
+        chain_namespace: String,
+        network: String,
+        ledger: String,
+        token_id: String,
     },
     Proof {
         network: String,

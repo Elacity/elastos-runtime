@@ -14,6 +14,8 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             explorer_url: Some("https://blockchain.elastos.io".to_string()),
             rpc_url: "https://blockchain.elastos.io/api/v1".to_string(),
             rights_methods: Vec::new(),
+            protected_content_creator_mint: None,
+            protected_content_market: None,
         },
         ChainNetwork {
             id: "esc-mainnet".to_string(),
@@ -26,6 +28,8 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             explorer_url: Some("https://esc.elastos.io".to_string()),
             rpc_url: "https://api.elastos.io/esc".to_string(),
             rights_methods: Vec::new(),
+            protected_content_creator_mint: None,
+            protected_content_market: None,
         },
         ChainNetwork {
             id: "base-mainnet".to_string(),
@@ -39,6 +43,8 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             rpc_url: env::var("BASE_RPC_URL")
                 .unwrap_or_else(|_| "https://mainnet.base.org".to_string()),
             rights_methods: Vec::new(),
+            protected_content_creator_mint: None,
+            protected_content_market: None,
         },
         ChainNetwork {
             id: "btc-mainnet".to_string(),
@@ -52,6 +58,8 @@ pub(super) fn default_networks() -> Vec<ChainNetwork> {
             rpc_url: env::var("BITCOIN_REST_URL")
                 .unwrap_or_else(|_| "https://mempool.space/api".to_string()),
             rights_methods: Vec::new(),
+            protected_content_creator_mint: None,
+            protected_content_market: None,
         },
     ]
 }
@@ -75,7 +83,22 @@ pub(super) fn validate_networks(networks: &[ChainNetwork]) -> Result<(), String>
                 network.id
             ));
         }
+        if network.kind != ChainKind::EvmJsonRpc && network.protected_content_creator_mint.is_some()
+        {
+            return Err(format!(
+                "network {} cannot configure protected-content creator mint on a non-EVM backend",
+                network.id
+            ));
+        }
+        if network.kind != ChainKind::EvmJsonRpc && network.protected_content_market.is_some() {
+            return Err(format!(
+                "network {} cannot configure protected-content market on a non-EVM backend",
+                network.id
+            ));
+        }
         validate_rights_methods(network)?;
+        validate_protected_content_creator_mint(network)?;
+        validate_protected_content_market(network)?;
     }
     Ok(())
 }
@@ -104,6 +127,29 @@ pub(super) fn validate_rights_methods(network: &ChainNetwork) -> Result<(), Stri
             validate_protected_content_policy_sources(network, policy)?;
         }
     }
+    Ok(())
+}
+
+fn validate_protected_content_creator_mint(network: &ChainNetwork) -> Result<(), String> {
+    let Some(mint) = network.protected_content_creator_mint.as_ref() else {
+        return Ok(());
+    };
+    validate_evm_address(&mint.asset_created_emitter)?;
+    Ok(())
+}
+
+fn validate_protected_content_market(network: &ChainNetwork) -> Result<(), String> {
+    let Some(market) = network.protected_content_market.as_ref() else {
+        return Ok(());
+    };
+    validate_evm_address(&market.authority_gateway_contract)?;
+    validate_protected_content_policy_sources(
+        network,
+        &ProtectedContentPolicySource {
+            action: ProtectedContentPolicyAction::View,
+            evidence_rpc_urls: market.evidence_rpc_urls.clone(),
+        },
+    )?;
     Ok(())
 }
 

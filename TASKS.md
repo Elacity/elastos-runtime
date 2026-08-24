@@ -925,14 +925,32 @@ Deployed allowed/denied Base proof against the reviewed proxy and Runtime-owned
 
 Remaining work, in exact dependency order:
 
-- [ ] Gate 1 — Mint durability. Create a durable stable mint intent before
-  provider dispatch, keep one stable request identity across restart, resume
-  exact work or terminally abort it, settle protect cancel/close exactly, and
-  retain cleanup ownership on timeout or unknown settlement.
+- [x] Gate 1 — Mint durability is complete at local `0204b9a1`. Runtime now
+  persists a stable mint intent before protect dispatch, keeps one stable
+  request identity across restart, resumes exact work or terminally aborts it,
+  settles protect cancel/close exactly, and retains cleanup ownership on
+  timeout or unknown settlement.
 - [ ] Gate 1a — Fresh pre-buy availability. Recheck a fresh signed
   `network_available` receipt for the exact encrypted object immediately before
   any purchase effect starts; mint-time availability must not remain sellable
   forever.
+- [ ] Gate 1b — Verified creator asset/listing bind. Runtime generates a new
+  exact 16-byte access KID, so the normal publish path requires a Runtime-owned
+  creator mint/list transaction; a verified import of an existing Elacity asset
+  whose exact KID already matches the protected bytes is a separate later flow.
+  Caller input may express desired creator terms only. It is never authority
+  for seller, network, tokenId, operative, payment processor, chain outcome,
+  or completed purchase evidence. The exact signed creator transaction must
+  carry the exact KID and protected identity, its confirmed receipt must yield
+  the exact ledger/channel, content tokenId, and operative, and Runtime must
+  corroborate operative/listing/paymentProcessor through the existing explicit
+  multi-source Chain evidence model before it creates the immutable listing.
+  That immutable listing binds the exact encrypted-content identity + exact
+  bytes16 access KID + seller + ledger + content tokenId + operative +
+  price/pay token; available stock is a fresh finalized observation, not
+  immutable listing truth. No metadata authority, no historical EventHub scan,
+  no transaction-byte substring scan, no fallback, and no second
+  coordinator/provider/registry/journal.
 - [ ] Gate 2 — Runtime-owned buy, immutable listings, and persistence. Capsule
   input identifies only the object/listing/offer. Runtime must derive exact
   `AuthorityGateway.buyAccess` calldata from immutable listing terms and
@@ -941,13 +959,17 @@ Remaining work, in exact dependency order:
   confirmed Runtime-owned effects, keep purchases separate per principal, prove
   second-buyer/replay/substitution behavior, and persist owner-only bounded
   state with temp-file write + sync + atomic rename plus restart/corruption
-  coverage. Before the first product proof, choose one honest creator mode
-  only: either bind the first acceptance to a pre-existing verified Elacity
-  asset/listing, or add a Runtime-owned creator transaction that creates/binds
-  the asset before listing. In either mode, the immutable listing must bind
-  full encrypted-content identity + exact bytes16 access KID + seller + ledger
-  + tokenId + quantity + price/pay token. Do not infer token identity from
-  metadata, scan transaction bytes, or accept those values as caller
+  coverage. Immediately before purchase, Runtime must fetch a fresh verified
+  listing, require available stock `>= 1`, require the immutable terms to
+  match, and only then assemble exact purchase quantity `1`; do not confuse
+  listing stock with purchase quantity or treat stale stock as authority.
+  Before the first product proof, choose one honest creator mode only: either
+  bind the first acceptance to a pre-existing verified Elacity asset/listing,
+  or add a Runtime-owned creator transaction that creates/binds the asset
+  before listing. In either mode, the immutable listing must bind full
+  encrypted-content identity + exact bytes16 access KID + seller + ledger +
+  tokenId + operative + price/pay token. Do not infer token identity from
+  metadata, scan transaction bytes, or accept listing stock or those values as caller
   authority.
 - [ ] Gate 3 — Viewer settlement. Authorize the caller before changing
   ownership, retire only after exact typed `closed` / `already_absent`
@@ -955,6 +977,9 @@ Remaining work, in exact dependency order:
   failure, and prove wrong-principal close plus restart/expiry cleanup.
 - [ ] Gate 4 — Inactive combined proof. Fake chain observations must be
   denied; provider close/cancel failure must leave no secret or false
+  completion; no CEK/share/topology leakage may escape; and the installed
+  one-Runtime/two-principal mint -> buy -> open -> play proof remains the
+  final product gate.
 - [ ] Gate 5 — Docs/config prerequisites. After this source repair is accepted,
   update `state.md` and `docs/PROTECTED_CONTENT_EXTRACTION.md` so they no
   longer call local `35ea84cc`, `5856d6a9`, `79821d5c`, or `b8b527ac` complete
@@ -1023,7 +1048,7 @@ Remaining work, in exact dependency order:
   9. route/path/host/port/credential, CEK, share, ciphertext, or clear-media
      bytes entering Runtime or Library journals; or
   10. proceeding without the signed custody profile or Chain contract config,
-      or starting Slice E cutover work early, or running below 15% free disk.
+      or starting Slice E cutover work early, or running below 10% free disk.
 - [ ] Planning estimate: budget 4-7 focused working days plus review and the
   installed proof cycle. Do not describe the remaining work as “two small
   tasks.”

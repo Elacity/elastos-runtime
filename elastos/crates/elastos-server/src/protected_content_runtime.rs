@@ -45,9 +45,9 @@ use elastos_protected_content_rights::{
 use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
     PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
-    RuntimeCustodyTerminalKind, RuntimeDecryptProvider, RuntimeMintConfiguredCustodyProvider,
-    RuntimeMintCoordinator, RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome,
-    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
+    RuntimeDecryptProvider, RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator,
+    RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome, RuntimeMintDraft,
+    RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
     RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
     RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeReleaseTerminalResult,
@@ -2602,29 +2602,9 @@ struct RuntimeCustodyPurchaseRecord {
     confirmed_at: u64,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RuntimeCustodyPurchaseEvidence {
-    pub account_id: String,
-    pub address: String,
-    pub approval_request_id: String,
-    pub chain_namespace: String,
-    pub network: String,
-    pub to: String,
-    pub value: String,
-    pub data: String,
-    pub wallet_binding: ValidatedChainOutcomeBindingV1,
-    pub transaction_hash: String,
-    pub chain_observation: Value,
-    pub confirmed_at: u64,
-}
-
 pub(crate) struct RuntimeCustodyBuyInput {
     pub principal_id: String,
     pub mint_id: String,
-    pub wallet_request_hex: Option<String>,
-    pub wallet_response_hex: Option<String>,
-    pub purchase: Option<RuntimeCustodyPurchaseEvidence>,
 }
 
 pub(crate) struct RuntimeCustodyViewerOpenInput {
@@ -2726,116 +2706,77 @@ pub(crate) fn buy_runtime_custody_listing(
     data_dir: &Path,
     input: RuntimeCustodyBuyInput,
 ) -> anyhow::Result<Value> {
-    let wallet_request_hex = input.wallet_request_hex.filter(|value| !value.is_empty());
-    let wallet_response_hex = input.wallet_response_hex.filter(|value| !value.is_empty());
-    let (Some(wallet_request_hex), Some(wallet_response_hex), Some(purchase)) =
-        (wallet_request_hex, wallet_response_hex, input.purchase)
-    else {
-        anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
-    };
     let mint_id = parse_mint_id_hex(&input.mint_id)?;
     let listing = load_runtime_custody_listing(data_dir, mint_id)?
-        .ok_or_else(|| anyhow::anyhow!("Runtime custody listing is unavailable"))?;
-    if listing
-        .buyer_principal_id
-        .as_deref()
-        .is_some_and(|buyer| buyer != input.principal_id)
-    {
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
+    let _ = (input.principal_id, listing);
+    anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+}
+
+async fn verify_fresh_runtime_custody_buy_availability(
+    data_dir: &Path,
+    registry: &ProviderRegistry,
+    mint_id: Digest32,
+    now_unix_seconds: u64,
+) -> anyhow::Result<RuntimeVerifiedContentAvailability> {
+    let expected_mint_id = hex::encode(mint_id.as_bytes());
+    let listing = load_runtime_custody_listing(data_dir, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
+    if listing.mint_id != expected_mint_id {
         anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
     }
     let mint = runtime_mint_journal(data_dir)
         .load(mint_id)
-        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
-    if mint.custody_terminal() != Some(RuntimeCustodyTerminalKind::CustodyProvisioned)
-        || mint.content_availability().is_none()
-    {
-        anyhow::bail!("Runtime custody mint selection is invalid");
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
+    let persisted = mint
+        .content_availability()
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
+    let expected_content_id = runtime_protected_content_id(mint.draft().encrypted_content())
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
+    if listing.content_id != expected_content_id || listing.cid != persisted.content_cid() {
+        anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
     }
-    let wallet_request = decode_hex_bytes(&wallet_request_hex)
-        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?;
-    let wallet_response = decode_hex_bytes(&wallet_response_hex)
-        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?;
-    let effect = RuntimeVerifiedPurchaseEffect::new(
-        RuntimeProtectedContentPurchaseIntent::new(
-            mint_id,
-            mint.draft().encrypted_content().clone(),
-            mint.draft().key_envelope().clone(),
-            mint.draft().policy().clone(),
-            RightsActionV1::View,
-            purchase.chain_namespace.clone(),
-            purchase.network.clone(),
-            purchase.to.clone(),
-            purchase.value.clone(),
-            purchase.data.clone(),
-        )
-        .map_err(|_| anyhow::anyhow!("Runtime custody chain evidence is invalid"))?,
-        RuntimePurchaseEffectAuthority::new(
-            input.principal_id.clone(),
-            purchase.account_id.clone(),
-            purchase.address.clone(),
-            purchase.approval_request_id.clone(),
-        )
-        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?,
-        purchase.wallet_binding.clone(),
-        purchase.transaction_hash.clone(),
-        purchase.chain_observation.clone(),
-        purchase.confirmed_at,
+    let requirement = RuntimeContentAvailabilityRequirement::new(
+        persisted.expected_provider_did(),
+        persisted.object_identity(),
+        persisted.publisher_identity(),
+        persisted.policy(),
+        persisted.required_replicas(),
+        PROTECTED_CONTENT_AVAILABILITY_MAX_AGE_SECS,
+        PROTECTED_CONTENT_AVAILABILITY_MAX_FUTURE_SKEW_SECS,
     )
-    .map_err(runtime_open_error)?;
-    let receipt = bind_buy(
-        &mint,
-        &wallet_request,
-        &wallet_response,
-        &effect,
-        crate::auth::now_ts(),
+    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    let content_cid = persisted.content_cid();
+    let receipt = fetch_content_availability_receipt(registry, content_cid)
+        .await
+        .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    let manifest = crate::content::fetch_content_object_manifest(registry, content_cid)
+        .await
+        .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    verify_protected_content_manifest_and_files(
+        registry,
+        content_cid,
+        &manifest,
+        mint.draft().media_identity(),
     )
-    .map_err(runtime_open_error)?;
-    let bought_at = crate::auth::now_ts();
-    let chain_transaction = format!("0x{}", hex::encode(receipt.chain_transaction().as_bytes()));
-    persist_runtime_custody_purchase(
-        data_dir,
-        &RuntimeCustodyPurchaseRecord {
-            schema: RUNTIME_PURCHASE_SCHEMA_V1.to_string(),
-            principal_id: input.principal_id.clone(),
-            mint_id: listing.mint_id.clone(),
-            content_id: listing.content_id.clone(),
-            cid: listing.cid.clone(),
-            chain_transaction: chain_transaction.clone(),
-            bought_at,
-            wallet_request_hex,
-            wallet_response_hex,
-            account_id: purchase.account_id,
-            address: purchase.address,
-            approval_request_id: purchase.approval_request_id,
-            chain_namespace: purchase.chain_namespace,
-            network: purchase.network,
-            to: purchase.to,
-            value: purchase.value,
-            data: purchase.data,
-            wallet_binding: purchase.wallet_binding,
-            chain_observation: purchase.chain_observation,
-            confirmed_at: purchase.confirmed_at,
-        },
-    )?;
-    let mut listing = listing;
-    listing.buyer_principal_id = Some(input.principal_id);
-    listing.bought_at = Some(bought_at);
-    persist_runtime_custody_listing(data_dir, &listing)?;
-    Ok(json!({
-        "schema": RUNTIME_PURCHASE_SCHEMA_V1,
-        "mint_id": listing.mint_id,
-        "content_id": listing.content_id,
-        "cid": listing.cid,
-        "chain_transaction": chain_transaction,
-        "bought_at": bought_at,
-        "availability": {
-            "schema": "elastos.library.runtime-custody-availability/v1",
-            "status": "buyer_owned",
-            "cid": listing.cid,
-            "content_id": listing.content_id,
-            "mint_id": listing.mint_id,
-        },
-    }))
+    .await
+    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    let verified = verify_protected_content_receipt(
+        content_cid,
+        &manifest,
+        &receipt,
+        mint.draft().media_identity(),
+        &requirement,
+        now_unix_seconds,
+    )
+    .map_err(|_| anyhow::anyhow!("Runtime custody content availability is unavailable"))?;
+    if verified.content_cid() != listing.cid
+        || verified.encrypted_content() != mint.draft().encrypted_content()
+        || verified.media_manifest_root() != mint.draft().media_identity().media_manifest_root()
+    {
+        anyhow::bail!("Runtime custody content availability is unavailable");
+    }
+    Ok(verified)
 }
 
 pub(crate) async fn open_runtime_custody_viewer(
@@ -3222,20 +3163,6 @@ fn load_runtime_custody_listing(
         anyhow::bail!("Runtime custody listing is invalid");
     }
     Ok(Some(record))
-}
-
-fn persist_runtime_custody_purchase(
-    data_dir: &Path,
-    record: &RuntimeCustodyPurchaseRecord,
-) -> anyhow::Result<()> {
-    write_owner_only_bytes(
-        &runtime_purchase_path(
-            data_dir,
-            &record.principal_id,
-            parse_mint_id_hex(&record.mint_id)?,
-        ),
-        &serde_json::to_vec(record)?,
-    )
 }
 
 fn load_runtime_custody_purchase(

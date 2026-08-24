@@ -879,6 +879,42 @@ mod tests {
         assert!(
             build_capability_resource(
                 "chain",
+                "resolve_protected_content_creator_mint",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content creator mint resolution must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_mint_receipt",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content mint receipt bind must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_verified_listing",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content verified listing resolution must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
+                "resolve_protected_content_purchase",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content purchase assembly must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
                 "protected_content_rights_evidence",
                 &serde_json::json!({})
             )
