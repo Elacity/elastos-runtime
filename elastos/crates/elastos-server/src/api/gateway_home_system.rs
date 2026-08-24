@@ -1874,7 +1874,7 @@ pub(super) async fn people_profile_update(
             Ok(recovery) => recovery,
             Err(err) => return home_error_response(err),
         };
-        if !recovery.root_encrypted || !recovery.recovery_configured {
+        if !recovery_allows_first_profile(&recovery) {
             return (
                 StatusCode::CONFLICT,
                 Json(PeopleProfileProtectionRequiredResponse {
@@ -3697,6 +3697,7 @@ fn standard_home_identity_summary() -> HomeIdentitySummary {
     HomeIdentitySummary {
         device_did: None,
         profile_readiness: None,
+        recovery_readiness: None,
         profile_setup_display_name: None,
         profile: None,
     }
@@ -3705,6 +3706,58 @@ fn standard_home_identity_summary() -> HomeIdentitySummary {
 pub(in crate::api) struct ProfileReadinessProjection {
     pub readiness: ProfileReadinessSummary,
     profile: Option<crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument>,
+}
+
+fn recovery_allows_first_profile(
+    recovery: &elastos_runtime::auth::PrincipalRootRecoveryStatusV1,
+) -> bool {
+    recovery.root_encrypted && recovery.recovery_configured
+}
+
+pub(super) fn recovery_readiness_for_context(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> RecoveryReadinessSummary {
+    recovery_readiness_for_principal(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+    )
+}
+
+fn recovery_readiness_for_principal(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    localhost_root: &str,
+) -> RecoveryReadinessSummary {
+    let inventory = crate::api::auth_gateway::principal_root_protected_object_inventory(
+        data_dir,
+        localhost_root,
+    );
+    match crate::auth::inspect_declarative_principal_root_protection(
+        data_dir,
+        principal_id,
+        localhost_root,
+        &inventory,
+    ) {
+        Ok(inspection) => {
+            let Some(protection) = inspection.protection.as_ref() else {
+                return RecoveryReadinessSummary::setup_required();
+            };
+            let root_encrypted = inspection.plaintext_object_count == 0
+                && inspection.encrypted_object_count == inspection.declared_object_count;
+            let recovery_configured = protection
+                .protectors
+                .iter()
+                .any(|protector| protector.verified_at.is_some());
+            if root_encrypted && recovery_configured {
+                RecoveryReadinessSummary::ready()
+            } else {
+                RecoveryReadinessSummary::setup_required()
+            }
+        }
+        Err(_) => RecoveryReadinessSummary::unavailable(),
+    }
 }
 
 pub(in crate::api) fn profile_readiness_for_principal(

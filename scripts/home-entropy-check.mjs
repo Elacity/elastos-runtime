@@ -1832,7 +1832,7 @@ assert(
 assert(
   homeGuiTemplateHtml.includes('id="setup-sheet"') &&
     homeGuiTemplateHtml.includes('id="setup-sheet-recovery"') &&
-    homeGuiTemplateHtml.includes('id="setup-sheet-skip-recovery"') &&
+    !homeGuiTemplateHtml.includes('id="setup-sheet-skip-recovery"') &&
     homeGuiTemplateHtml.includes('id="setup-sheet-profile"') &&
     homeGuiJs.includes("bindSetupSheet()") &&
     homeGuiJs.includes("holdHomeSetupAct") &&
@@ -1842,7 +1842,7 @@ assert(
       'const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1"',
     ) &&
     read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
-      "readiness.schema !== PROFILE_READINESS_SCHEMA",
+      "readiness.schema !== schema",
     ) &&
     read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
       'openTarget("system", { query: { settings: "security" } })',
@@ -1854,13 +1854,39 @@ assert(
       'const SETUP_HOLD_TARGETS = new Set(["chat-room"])',
     ) &&
     read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
-      "A Recovery Kit is optional",
+      "Save a Recovery Kit, then create your Profile",
     ) &&
+    read("capsules/home-gui/browser/home-gui-template.html").includes(
+      "Required first. Download a kit in System",
+    ) &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes("yieldSetupSheet()") &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
+      'sheet.classList.add("is-yielded")',
+    ) &&
+    read("capsules/home-gui/browser/style.css").includes(".setup-sheet.is-yielded") &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes("rememberChromeNotification") &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes('kind: "home_setup"') &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes(
+      'const RECOVERY_READINESS_SCHEMA = "elastos.recovery.readiness/v1"',
+    ) &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes("homeRecoveryStatus") &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes("is-complete") &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes("setupFinished") &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes("Home is set up.") &&
+    read("capsules/home-gui/browser/shell-setup-sheet.js").includes('profileButton.textContent = profileReady ? "Created"') &&
+    read("capsules/home-gui/browser/home-gui-template.html").includes(
+      'id="setup-sheet-step-recovery"',
+    ) &&
+    gatewayApi.includes('const SCHEMA: &\'static str = "elastos.recovery.readiness/v1"') &&
+    gatewayApi.includes("recovery_readiness_for_context") &&
+    gatewayApi.includes("recovery_allows_first_profile") &&
+    read("capsules/home-gui/browser/shell-notifications.js").includes("rememberChromeNotification") &&
+    read("capsules/home-gui/browser/shell-notifications.js").includes('const HOME_SETUP_KIND = "home_setup"') &&
     !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("localStorage") &&
     !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("Math.random") &&
     !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("/api/auth/recovery") &&
     !read("capsules/home-gui/browser/shell-setup-sheet.js").includes("/api/apps/people/profile"),
-  "First-run setup is Home chrome over host profile_readiness; Profile first; Recovery is skippable; ceremony stays on System and People; Chat is held until the Profile fact is ready",
+  "First-run setup is Home chrome over host profile_readiness and recovery_readiness; Recovery Kit first; no Later skip; close leaves a session setup reminder; kit tick and Profile CTA follow host facts only; ceremony stays on System and People; Chat is held until the Profile fact is ready",
 );
 assert(
   !homeGuiJs.includes('"#agent-harness"') &&

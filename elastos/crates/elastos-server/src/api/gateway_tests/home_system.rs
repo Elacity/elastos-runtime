@@ -2136,6 +2136,31 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
         .iter()
         .any(|protector| protector.verified_at.is_some()));
 
+    let kit_summary = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .uri("/api/apps/people/summary")
+                .header("x-elastos-home-token", authority.people_token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(kit_summary.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(kit_summary.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload["identity"]["recovery_readiness"],
+        json!({
+            "schema": "elastos.recovery.readiness/v1",
+            "status": "ready",
+        })
+    );
+    assert_eq!(payload["identity"]["profile_readiness"]["status"], "setup_required");
+
     let profile = app
         .clone()
         .oneshot(
