@@ -167,6 +167,11 @@ shell selection, child-message routing, launch grants, and browser-session
 behavior. [CARRIER.md](CARRIER.md) owns peer admission and member/guest
 boundaries.
 
+Current Windows direction is WSL-first, not native parity. The host keeps the
+same Runtime and provider contracts while a small Windows launcher owns start,
+stop, update, and browser opening. Later native Windows adapters still belong
+behind the same Runtime and Browser contracts. See [WINDOWS.md](WINDOWS.md).
+
 ## The three layers
 
 ### Layer 1: Runtime (`elastos` binary)

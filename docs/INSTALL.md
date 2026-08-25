@@ -21,6 +21,11 @@ The current default Home exposes System, People, Services, Browser, Wallet,
 Documents, Library, Marketplace, Archive, and Inbox. People is installed as a
 separate app capsule; Home presents it but does not own its state or authority.
 
+Native Windows is not an accepted install target today. The current product
+direction is a local Linux Runtime inside WSL2 with a small Windows launcher.
+See [WINDOWS.md](WINDOWS.md) for the current Windows strategy and the later
+native-adapter boundary.
+
 The installer URL bootstraps trust once. Later first-party setup and update
 operations use the trusted Carrier source by default. Users do not manage a
 release-head CID or gateway on the normal path.

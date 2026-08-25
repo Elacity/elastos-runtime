@@ -13,6 +13,7 @@ Each top-level ledger has one job:
 - [Repository README](../README.md): quick install, source build, and system model
 - [Getting started](GETTING_STARTED.md): user installation and source development
 - [Installing ElastOS](INSTALL.md): Linux setup, update, and trust
+- [Windows strategy](WINDOWS.md): WSL-first host direction and later native adapters
 - [Glossary](GLOSSARY.md): canonical terminology
 
 ## Architecture and core model

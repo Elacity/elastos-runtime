@@ -369,6 +369,13 @@ Use Linux as the full-runtime baseline until another platform earns equivalent
 evidence. macOS, Windows, mobile, and remote hosts can support useful subsets
 without claiming Linux or KVM parity.
 
+The first Windows product should be WSL2, not a rushed native Runtime. Keep the
+Linux Runtime and provider stack inside WSL, add a small signed Windows launcher
+for start, stop, update, health checks, and Home opening, and keep Runtime
+state in the Linux filesystem with explicit storage budgets and cleanup.
+Native Windows remains later host-adapter work behind the same Runtime and
+Browser contracts.
+
 ### Native object model and content-first design
 
 Packaging existing web apps helps bring software into ElastOS, but the native

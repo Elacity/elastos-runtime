@@ -191,6 +191,16 @@ section if a higher section is incoherent, unverified, or too large to review.
 ### 4. Release / install / update coherence
 - [ ] Lock interactive-launch, stale-runtime, and stale-support-asset regressions with explicit coverage.
 - [ ] Extend outsider proof beyond local x86_64 until Jetson/WSL evidence is equally solid.
+- [ ] Prove the first WSL-first installed flow on a fresh Windows machine:
+  install the signed WSL distribution and launcher, open Home on stable
+  localhost, complete Recovery Kit and Profile, exercise Wallet, People, Chat,
+  restart, update, bounded storage cleanup, and honest Browser availability.
+- [ ] Repair the overly broad non-WASI Unix guard in `elastos-guest` and keep
+  CI split honest: portable Windows checks should be required when they are
+  real product contracts, while experimental native-host checks remain explicit
+  evidence until native Windows support is reviewed.
+- [ ] Package the Windows launcher and runtime receipts without leaking WSL
+  paths, Linux ports, or host topology into capsule or provider contracts.
 - [ ] Keep `scripts/public-install-identity-smoke.sh` in scope as the DID-backed People/profile contract for public install proof.
 - [ ] Keep `scripts/public-install-operator-smoke.sh` and `scripts/public-install-home-frontdoor-smoke.sh` in scope as installed public front-door/operator proof.
 - [ ] Keep `scripts/audit-linux-runtime-portability.sh` in scope as the public Linux runtime portability proof.
