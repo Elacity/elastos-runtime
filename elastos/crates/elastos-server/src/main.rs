@@ -1206,11 +1206,27 @@ async fn main() -> anyhow::Result<()> {
     // `log_*!(component: "...", ...)`.
     let log_threshold =
         elastos_logger::resolve_level(cli.log_level, &["ELASTOS_LOG"], elastos_logger::Level::Info);
-    elastos_logger::init(
-        elastos_logger::LoggerConfig::new("elastos", log_threshold)
-            .with_sink(std::sync::Arc::new(SuppressableStderrSink))
-            .build(),
-    );
+    let mut log_config = elastos_logger::LoggerConfig::new("elastos", log_threshold)
+        .with_sink(std::sync::Arc::new(SuppressableStderrSink));
+    // Observe-only AI insight sink: per-component JSON-lines ring files, off unless the
+    // operator sets ELASTOS_LOG_JSON_DIR.
+    let mut json_sink_error = None;
+    if let Ok(dir) = std::env::var("ELASTOS_LOG_JSON_DIR") {
+        if !dir.trim().is_empty() {
+            match elastos_logger::JsonRingSink::new(dir.trim()) {
+                Ok(sink) => log_config = log_config.with_sink(std::sync::Arc::new(sink)),
+                Err(e) => json_sink_error = Some((dir, e)),
+            }
+        }
+    }
+    elastos_logger::init(log_config.build());
+    if let Some((dir, e)) = json_sink_error {
+        log_warn!(
+            "ELASTOS_LOG_JSON_DIR '{}' unusable, JSON sink disabled: {}",
+            dir,
+            e
+        );
+    }
 
     let command = cli.command.unwrap_or(Commands::Home {
         status: false,

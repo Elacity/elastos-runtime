@@ -18,8 +18,10 @@ pub use record::{now_rfc3339, LogRecord};
 pub use sink::{FileSink, LogSink, StderrSink, StdoutSink, VecSink};
 
 mod config;
+mod json;
 
 pub use config::{resolve_level, LoggerConfig};
+pub use json::JsonRingSink;
 
 /// Privacy fingerprint: a short, non-reversible tag (`fp:` + first 8 hex of SHA-256) for a sensitive
 /// identifier (wallet, content id, grant, seed). Use this in TRACE/INFO instead of the raw value so

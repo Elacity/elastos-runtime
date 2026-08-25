@@ -256,7 +256,7 @@ impl VmRawBridge {
                 "op": "init",
                 "config": self.init_config.clone()
             });
-            log_info!(
+            log_trace!(
                 component: LOG_COMPONENT,
                 "sending init to guest {}:{} config={}",
                 self.guest_host,
@@ -285,7 +285,7 @@ impl VmRawBridge {
                     )));
                 }
             };
-            log_info!(
+            log_trace!(
                 component: LOG_COMPONENT,
                 "init response from guest {}:{} in {:.1}s: {}",
                 self.guest_host,
