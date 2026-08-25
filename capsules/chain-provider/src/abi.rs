@@ -64,12 +64,6 @@ pub(super) fn encode_protected_content_creator_mint_call(
     Ok(format!("0x{}", encode_hex(&bytes)))
 }
 
-pub(super) fn encode_protected_content_mint_op_raw_free(
-    content_access_id: &[u8; 16],
-) -> Result<Vec<u8>, String> {
-    Ok(abi_word_bytes16(content_access_id))
-}
-
 pub(super) fn encode_protected_content_mint_op_raw_paid(
     content_access_id: &[u8; 16],
     metadata_uri: &str,

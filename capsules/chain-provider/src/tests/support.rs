@@ -100,6 +100,7 @@ pub(super) fn spawn_rpc_sequence_server(responses: Vec<(&'static str, Value)>) -
     format!("http://{addr}")
 }
 
+#[derive(Clone)]
 pub(super) enum RpcReply {
     Result(Value),
     Error(Value),

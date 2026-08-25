@@ -53,6 +53,7 @@ const PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE: u64 = 2;
 const PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT: &str = "0x3b6";
 const PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FINALIZED_AGE_SECS: u64 = 30 * 60;
 const PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FUTURE_SKEW_SECS: u64 = 30;
+const PROTECTED_CONTENT_UNBOUND_CONTENT_ID_SELECTOR: [u8; 4] = [0xca, 0xd8, 0x82, 0x23];
 
 struct ChainProvider {
     networks: Vec<ChainNetwork>,
@@ -884,9 +885,19 @@ impl ChainProvider {
             policy.chain_id(),
             &method.contract,
             &data,
+            &policy.content_access_id(),
         ) {
             Ok(observation) => observation,
             Err(response) => return response,
+        };
+        let has_access = match observation.outcome {
+            ProtectedContentRightsObservationKind::HasAccess(has_access) => has_access,
+            ProtectedContentRightsObservationKind::Unbound(_) => {
+                return Response::error(
+                    "unknown_protected_content_object",
+                    "protected-content content access id is not bound on chain",
+                )
+            }
         };
         let acquired_at = now;
         let expires_at = match acquired_at
@@ -910,7 +921,7 @@ impl ChainProvider {
             observation.chain_id,
             observation.finalized_block_number,
             observation.finalized_block_hash,
-            observation.has_access,
+            has_access,
             acquired_at,
             expires_at,
         )
@@ -1429,9 +1440,19 @@ impl ChainProvider {
             expected_chain_id,
             &method.contract,
             &data,
+            &content_access_id,
         ) {
             Ok(observation) => observation,
             Err(response) => return response,
+        };
+        let has_access = match observation.outcome {
+            ProtectedContentRightsObservationKind::HasAccess(has_access) => has_access,
+            ProtectedContentRightsObservationKind::Unbound(_) => {
+                return Response::error(
+                    "unknown_protected_content_object",
+                    "protected-content content access id is not bound on chain",
+                )
+            }
         };
         let now = (self.now_unix_seconds)();
         if let Err(err) = validate_finalized_observation_freshness(
@@ -1449,7 +1470,7 @@ impl ChainProvider {
             "chain_id": observation.chain_id,
             "wallet": normalize_evm_address(wallet),
             "content_access_id": format!("0x{}", encode_hex(content_access_id.as_bytes())),
-            "has_access": observation.has_access,
+            "has_access": has_access,
             "finalized_block_number": observation.finalized_block_number,
             "finalized_block_hash": format!("0x{}", encode_hex(observation.finalized_block_hash.as_bytes())),
             "finalized_block_timestamp": observation.finalized_block_timestamp,
@@ -2211,12 +2232,17 @@ impl ChainProvider {
         expected_chain_id: u64,
         contract: &str,
         data: &str,
-    ) -> Result<ProtectedContentEvidenceObservation, Response> {
+        expected_content_access_id: &ContentAccessIdV1,
+    ) -> Result<ProtectedContentRightsObservation, Response> {
         let mut successful = Vec::new();
         for rpc_url in evidence_rpc_urls {
-            if let Some(observation) =
-                self.observe_protected_content_rights_source(network, rpc_url, contract, data)
-            {
+            if let Some(observation) = self.observe_protected_content_rights_source(
+                network,
+                rpc_url,
+                contract,
+                data,
+                expected_content_access_id,
+            ) {
                 successful.push(observation);
             }
         }
@@ -2254,7 +2280,8 @@ impl ChainProvider {
         rpc_url: &str,
         contract: &str,
         data: &str,
-    ) -> Option<ProtectedContentEvidenceObservation> {
+        expected_content_access_id: &ContentAccessIdV1,
+    ) -> Option<ProtectedContentRightsObservation> {
         let mut source_network = network.clone();
         source_network.rpc_url = rpc_url.to_string();
         let chain_id = self
@@ -2269,23 +2296,55 @@ impl ChainProvider {
             )
             .ok()
             .and_then(|value| evm_finalized_block(&value).ok())?;
-        let has_access = self
-            .evm_rpc(
-                &source_network,
-                "eth_call",
-                json!([
+        let outcome = self.protected_content_eth_call_outcome(
+            &source_network,
+            contract,
+            data,
+            &finalized.finalized_block_hash,
+            expected_content_access_id,
+        )?;
+        finalized.chain_id = chain_id;
+        finalized.outcome = outcome;
+        Some(finalized)
+    }
+
+    fn protected_content_eth_call_outcome(
+        &self,
+        network: &ChainNetwork,
+        contract: &str,
+        data: &str,
+        finalized_block_hash: &Digest32,
+        expected_content_access_id: &ContentAccessIdV1,
+    ) -> Option<ProtectedContentRightsObservationKind> {
+        let response = self
+            .client
+            .post(&network.rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_call",
+                "params": [
                     { "to": contract, "data": data },
                     {
-                        "blockHash": format!("0x{}", encode_hex(finalized.finalized_block_hash.as_bytes())),
+                        "blockHash": format!("0x{}", encode_hex(finalized_block_hash.as_bytes())),
                         "requireCanonical": true
                     }
-                ]),
-            )
+                ],
+            }))
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = response.json::<Value>().ok()?;
+        if let Some(error) = body.get("error") {
+            return decode_protected_content_unbound_content_id(error, expected_content_access_id)
+                .map(ProtectedContentRightsObservationKind::Unbound);
+        }
+        let result = body.get("result")?.clone();
+        decode_evm_bool(&result)
             .ok()
-            .and_then(|result| decode_evm_bool(&result).ok())?;
-        finalized.chain_id = chain_id;
-        finalized.has_access = has_access;
-        Some(finalized)
+            .map(ProtectedContentRightsObservationKind::HasAccess)
     }
 
     fn proof(&self, network_id: &str, proof_kind: ChainProofKind, subject: &str) -> Response {
@@ -2586,15 +2645,21 @@ struct ProtectedContentVerifiedListingObservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ProtectedContentEvidenceObservation {
+struct ProtectedContentRightsObservation {
     chain_id: u64,
     finalized_block_number: u64,
     finalized_block_hash: Digest32,
     finalized_block_timestamp: u64,
-    has_access: bool,
+    outcome: ProtectedContentRightsObservationKind,
 }
 
-fn evm_finalized_block(value: &Value) -> Result<ProtectedContentEvidenceObservation, String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtectedContentRightsObservationKind {
+    HasAccess(bool),
+    Unbound(ContentAccessIdV1),
+}
+
+fn evm_finalized_block(value: &Value) -> Result<ProtectedContentRightsObservation, String> {
     let finalized_block_number = value
         .get("number")
         .and_then(Value::as_str)
@@ -2615,7 +2680,7 @@ fn evm_finalized_block(value: &Value) -> Result<ProtectedContentEvidenceObservat
                 .map_err(|_| "EVM block timestamp must be a hex quantity".to_string())
         })?;
     let bytes = decode_hex(hash, Some(32), "EVM block hash")?;
-    Ok(ProtectedContentEvidenceObservation {
+    Ok(ProtectedContentRightsObservation {
         chain_id: 0,
         finalized_block_number,
         finalized_block_hash: Digest32::new(
@@ -2624,8 +2689,45 @@ fn evm_finalized_block(value: &Value) -> Result<ProtectedContentEvidenceObservat
                 .map_err(|_| "EVM block hash must be 32 bytes".to_string())?,
         ),
         finalized_block_timestamp,
-        has_access: false,
+        outcome: ProtectedContentRightsObservationKind::HasAccess(false),
     })
+}
+
+fn decode_protected_content_unbound_content_id(
+    error: &Value,
+    expected_content_access_id: &ContentAccessIdV1,
+) -> Option<ContentAccessIdV1> {
+    let revert_data = protected_content_revert_data(error)?;
+    let bytes = decode_hex(revert_data, Some(36), "protected-content revert data").ok()?;
+    if bytes[..4] != PROTECTED_CONTENT_UNBOUND_CONTENT_ID_SELECTOR {
+        return None;
+    }
+    if bytes[4..20] != expected_content_access_id.as_bytes()[..] {
+        return None;
+    }
+    if bytes[20..36].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    ContentAccessIdV1::new(bytes[4..20].try_into().ok()?).ok()
+}
+
+fn protected_content_revert_data(error: &Value) -> Option<&str> {
+    error
+        .get("data")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            error
+                .get("data")
+                .and_then(|value| value.get("data"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            error
+                .get("data")
+                .and_then(|value| value.get("originalError"))
+                .and_then(|value| value.get("data"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn validate_finalized_observation_freshness(

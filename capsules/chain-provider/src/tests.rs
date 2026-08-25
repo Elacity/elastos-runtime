@@ -346,6 +346,19 @@ fn evm_bool_word(value: bool) -> Value {
     json!(format!("0x{}", encode_hex(&bytes)))
 }
 
+fn unbound_content_id_error(access_id: &ContentAccessIdV1) -> Value {
+    json!({
+        "code": 3,
+        "message": "execution reverted",
+        "data": format!(
+            "0x{}{}{}",
+            "cad88223",
+            encode_hex(access_id.as_bytes()),
+            "00000000000000000000000000000000"
+        ),
+    })
+}
+
 fn protected_content_asset_created_log(
     emitter: &str,
     creator: &str,
@@ -357,7 +370,7 @@ fn protected_content_asset_created_log(
 ) -> Value {
     validate_hex_quantity(token_id, "token_id").unwrap();
     let raw = token_id.strip_prefix("0x").unwrap();
-    let padded = if raw.len() % 2 == 0 {
+    let padded = if raw.len().is_multiple_of(2) {
         raw.to_string()
     } else {
         format!("0{raw}")
@@ -2096,6 +2109,281 @@ fn protected_content_rights_evidence_rejects_when_eip1898_call_does_not_succeed_
         error_code(provider.handle(Request::ProtectedContentRightsEvidence {
             signed_runtime_release_operation: contract_hex(&operation),
         })),
+        "insufficient_rights_observations"
+    );
+}
+
+#[test]
+fn protected_content_rights_evidence_classifies_exact_matching_unbound_content_id() {
+    let operation = protected_content_signed_operation();
+    let policy = operation.statement().policy_body();
+    let expected_data = encode_has_access_by_content_id_call(
+        "0x12345678",
+        policy.content_access_id().as_bytes(),
+        &wallet_subject_hex(&operation),
+    )
+    .unwrap();
+    let finalized_hash = "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2a", finalized_hash)),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data },
+                { "blockHash": finalized_hash, "requireCanonical": true }
+            ]),
+            RpcReply::Error(unbound_content_id_error(&policy.content_access_id())),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server_with_replies(sequence.clone()),
+                spawn_rpc_sequence_asserting_server_with_replies(sequence),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ProtectedContentRightsEvidence {
+            signed_runtime_release_operation: contract_hex(&operation),
+        })),
+        "unknown_protected_content_object"
+    );
+}
+
+#[test]
+fn protected_content_rights_evidence_requires_two_matching_unbound_sources() {
+    let operation = protected_content_signed_operation();
+    let policy = operation.statement().policy_body();
+    let expected_data = encode_has_access_by_content_id_call(
+        "0x12345678",
+        policy.content_access_id().as_bytes(),
+        &wallet_subject_hex(&operation),
+    )
+    .unwrap();
+    let finalized_hash = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let unbound_sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2a", finalized_hash)),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data },
+                { "blockHash": finalized_hash, "requireCanonical": true }
+            ]),
+            RpcReply::Error(unbound_content_id_error(&policy.content_access_id())),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server_with_replies(unbound_sequence),
+                "http://127.0.0.1:9".to_string(),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(provider.handle(Request::ProtectedContentRightsEvidence {
+            signed_runtime_release_operation: contract_hex(&operation),
+        })),
+        "insufficient_rights_observations"
+    );
+}
+
+#[test]
+fn protected_content_rights_evidence_rejects_unbound_conflicts_and_wrong_reverts() {
+    let operation = protected_content_signed_operation();
+    let policy = operation.statement().policy_body();
+    let expected_data = encode_has_access_by_content_id_call(
+        "0x12345678",
+        policy.content_access_id().as_bytes(),
+        &wallet_subject_hex(&operation),
+    )
+    .unwrap();
+    let finalized_hash = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let unbound_sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2a", finalized_hash)),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data.clone() },
+                { "blockHash": finalized_hash, "requireCanonical": true }
+            ]),
+            RpcReply::Error(unbound_content_id_error(&policy.content_access_id())),
+        ),
+    ];
+    let allow_sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2a", finalized_hash)),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data.clone() },
+                { "blockHash": finalized_hash, "requireCanonical": true }
+            ]),
+            RpcReply::Result(evm_bool_word(true)),
+        ),
+    ];
+    let mut unbound_vs_allow = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server_with_replies(unbound_sequence.clone()),
+                spawn_rpc_sequence_asserting_server_with_replies(allow_sequence),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(
+            unbound_vs_allow.handle(Request::ProtectedContentRightsEvidence {
+                signed_runtime_release_operation: contract_hex(&operation),
+            })
+        ),
+        "conflicting_rights_observations"
+    );
+
+    let deny_sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2a", finalized_hash)),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data.clone() },
+                { "blockHash": finalized_hash, "requireCanonical": true }
+            ]),
+            RpcReply::Result(evm_bool_word(false)),
+        ),
+    ];
+    let mut unbound_vs_deny = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server_with_replies(unbound_sequence.clone()),
+                spawn_rpc_sequence_asserting_server_with_replies(deny_sequence),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(
+            unbound_vs_deny.handle(Request::ProtectedContentRightsEvidence {
+                signed_runtime_release_operation: contract_hex(&operation),
+            })
+        ),
+        "conflicting_rights_observations"
+    );
+
+    let wrong_selector = json!({
+        "code": 3,
+        "message": "execution reverted",
+        "data": format!(
+            "0x{}{}{}",
+            "deadbeef",
+            encode_hex(policy.content_access_id().as_bytes()),
+            "00000000000000000000000000000000"
+        ),
+    });
+    let wrong_selector_sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2a", finalized_hash)),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data.clone() },
+                { "blockHash": finalized_hash, "requireCanonical": true }
+            ]),
+            RpcReply::Error(wrong_selector),
+        ),
+    ];
+    let mut wrong_selector_provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server_with_replies(wrong_selector_sequence.clone()),
+                spawn_rpc_sequence_asserting_server_with_replies(wrong_selector_sequence),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(
+            wrong_selector_provider.handle(Request::ProtectedContentRightsEvidence {
+                signed_runtime_release_operation: contract_hex(&operation),
+            })
+        ),
+        "insufficient_rights_observations"
+    );
+
+    let wrong_access_id = content_access_id(0x99);
+    let wrong_kid_sequence = vec![
+        ("eth_chainId", json!([]), RpcReply::Result(json!("0x14"))),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            RpcReply::Result(finalized_block_json("0x2a", finalized_hash)),
+        ),
+        (
+            "eth_call",
+            json!([
+                { "to": "0x0000000000000000000000000000000000000001", "data": expected_data },
+                { "blockHash": finalized_hash, "requireCanonical": true }
+            ]),
+            RpcReply::Error(unbound_content_id_error(&wrong_access_id)),
+        ),
+    ];
+    let mut wrong_kid_provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server_with_replies(wrong_kid_sequence.clone()),
+                spawn_rpc_sequence_asserting_server_with_replies(wrong_kid_sequence),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(
+            wrong_kid_provider.handle(Request::ProtectedContentRightsEvidence {
+                signed_runtime_release_operation: contract_hex(&operation),
+            })
+        ),
         "insufficient_rights_observations"
     );
 }
