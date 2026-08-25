@@ -165,6 +165,25 @@ section if a higher section is incoherent, unverified, or too large to review.
 - [ ] Decide the explicit home-return contract for native and non-native chat surfaces.
 - [ ] Split Home surfaces cleanly into launchable apps, site/share actions, and support assets instead of mixing them in one Apps list.
 - [ ] Keep only shipped, installable, launchable, and useful items in `Apps`; demote or hide unfinished catalog-only entries until they earn real Home actions.
+- [ ] Review PR #23 at published tip `5e546ef4` as a complete Home URUX flow,
+  not only as the Recovery change. Keep the landed shared recovery-ready
+  predicate and regression test from `a86aec71`, plus the entropy correction
+  from `5e546ef4`, while proving a fresh principal through sign-in, Recovery
+  Kit, Profile, close/Escape reminder, restart, Chat/Inbox, Wallet connectors,
+  Agent/Studio routing, capsule boundaries, and live logs before merge.
+- [ ] Keep the experimental Windows job non-blocking for PR #23 because Windows
+  is not an accepted target for that slice, but retain and track the signal. The
+  current failure is Unix terminal code in `elastos-guest` compiled for Windows;
+  future Windows support needs explicit platform guards and a Windows host/guest
+  adapter rather than deletion of the check or a false portability claim.
+- [ ] Keep PR #23's merge boundary explicit: it targets
+  `feat/home-agent-harness-rebuild`. Merging it does not update
+  `review/collaboration-candidate` or `upstream/0.7-dev`; reconcile that parent
+  stack in a separate reviewed integration step.
+- [ ] Keep one canonical Windows plan in [docs/WINDOWS.md](docs/WINDOWS.md):
+  WSL2 is the first Windows product target, native Windows remains later host
+  adapter work, and the experimental Windows CI failure stays visible as
+  portability evidence.
 - [ ] Make `MyWebSite` useful from Home with a real local preview path plus a first-class `Go public` action, not just long notices.
 - [ ] Make `setup --profile demo` install the app capsules Home honestly advertises, or stop advertising them there.
 - [ ] Decide whether blocked apps should be hidden entirely from the main Apps surface or moved into an explicit install/setup section.
