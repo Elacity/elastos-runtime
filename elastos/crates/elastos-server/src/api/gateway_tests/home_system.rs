@@ -2200,6 +2200,68 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
 }
 
 #[tokio::test]
+async fn test_recovery_readiness_and_first_profile_gate_use_the_same_recovery_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+
+    let (status, payload) = home_test_get_json(
+        &app,
+        "/api/apps/people/summary",
+        authority.people_token.as_str(),
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["identity"]["recovery_readiness"],
+        json!({
+            "schema": "elastos.recovery.readiness/v1",
+            "status": "setup_required",
+        })
+    );
+    let (status, payload) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        authority.people_token.as_str(),
+        "null",
+        json!({"display_name": "Anders"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(payload["status"], "recovery_required");
+
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+
+    let (status, payload) = home_test_get_json(
+        &app,
+        "/api/apps/people/summary",
+        authority.people_token.as_str(),
+        "null",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["identity"]["recovery_readiness"],
+        json!({
+            "schema": "elastos.recovery.readiness/v1",
+            "status": "ready",
+        })
+    );
+    let (status, payload) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        authority.people_token.as_str(),
+        "null",
+        json!({"display_name": "Anders"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["profile_readiness"]["status"], "ready");
+}
+
+#[tokio::test]
 async fn test_people_invite_create_route_is_absent_and_read_only() {
     let dir = tempfile::tempdir().unwrap();
     let app = gateway_router(test_state(dir.path()));

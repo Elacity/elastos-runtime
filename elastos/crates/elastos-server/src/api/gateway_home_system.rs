@@ -3708,10 +3708,17 @@ pub(in crate::api) struct ProfileReadinessProjection {
     profile: Option<crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument>,
 }
 
+/// One recovery rule for first-run. Home `recovery_readiness` and the
+/// first-Profile POST gate both call this. Ready means the principal root is
+/// encrypted and a verified recovery protector exists.
+fn recovery_rule_is_ready(root_encrypted: bool, recovery_configured: bool) -> bool {
+    root_encrypted && recovery_configured
+}
+
 fn recovery_allows_first_profile(
     recovery: &elastos_runtime::auth::PrincipalRootRecoveryStatusV1,
 ) -> bool {
-    recovery.root_encrypted && recovery.recovery_configured
+    recovery_rule_is_ready(recovery.root_encrypted, recovery.recovery_configured)
 }
 
 pub(super) fn recovery_readiness_for_context(
@@ -3750,7 +3757,7 @@ fn recovery_readiness_for_principal(
                 .protectors
                 .iter()
                 .any(|protector| protector.verified_at.is_some());
-            if root_encrypted && recovery_configured {
+            if recovery_rule_is_ready(root_encrypted, recovery_configured) {
                 RecoveryReadinessSummary::ready()
             } else {
                 RecoveryReadinessSummary::setup_required()
@@ -5723,5 +5730,45 @@ mod home_realtime_tests {
                 .any(|event| event.kind == "home.summary.changed"),
             "People changes must not force a generic Home summary event"
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_rule_lockstep_tests {
+    use super::*;
+    use elastos_runtime::auth::PrincipalRootRecoveryStatusV1;
+
+    #[test]
+    fn recovery_readiness_ready_iff_first_profile_gate_allows() {
+        for (root_encrypted, recovery_configured) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let allowed = recovery_rule_is_ready(root_encrypted, recovery_configured);
+            let mut recovery = PrincipalRootRecoveryStatusV1::unprotected(
+                "principal:test".to_string(),
+                "Users/self".to_string(),
+            );
+            recovery.root_encrypted = root_encrypted;
+            recovery.recovery_configured = recovery_configured;
+            assert_eq!(
+                recovery_allows_first_profile(&recovery),
+                allowed,
+                "gate must use recovery_rule_is_ready({root_encrypted}, {recovery_configured})"
+            );
+            let readiness = if recovery_rule_is_ready(root_encrypted, recovery_configured) {
+                RecoveryReadinessSummary::ready()
+            } else {
+                RecoveryReadinessSummary::setup_required()
+            };
+            assert_eq!(
+                readiness,
+                if allowed {
+                    RecoveryReadinessSummary::ready()
+                } else {
+                    RecoveryReadinessSummary::setup_required()
+                },
+                "recovery_readiness must use the same recovery rule as the first-Profile gate"
+            );
+        }
     }
 }
