@@ -216,6 +216,8 @@ fn provider_with_creator_mint_rpc_and_market_sources(
                     "rpc_url": rpc_url,
                     "rights_methods": [],
                     "protected_content_creator_mint": {
+                        "ledger": "0x0000000000000000000000000000000000000022",
+                        "pay_token": "0x0000000000000000000000000000000000000033",
                         "asset_created_emitter": "0x00000000000000000000000000000000000000dd",
                         "abi": "elacity_mint_v1"
                     },
@@ -2230,23 +2232,27 @@ fn resolve_protected_content_policy_rejects_missing_or_ambiguous_sources() {
 fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_id() {
     let mut provider = provider_with_creator_mint_rpc("http://127.0.0.1:9".to_string());
     let access_id = [0x41; 16];
+    let creator = "0x0000000000000000000000000000000000000011";
     let data = ok_data(
         provider.handle(Request::ResolveProtectedContentCreatorMint {
-            network: "base-local".to_string(),
-            ledger: "0x0000000000000000000000000000000000000022".to_string(),
+            creator: creator.to_string(),
             token_uri: "ipfs://protected-content/metadata.json".to_string(),
-            op_type_code: 0,
             content_access_id: format!("0x{}", encode_hex(&access_id)),
-            value: Some("0x0".to_string()),
-            op_raw: None,
-            sell: None,
+            copies: "0x7".to_string(),
+            price: "0x5".to_string(),
         }),
     );
     assert_eq!(data["schema"], PROTECTED_CONTENT_CREATOR_MINT_SCHEMA);
     assert_eq!(data["network"], "base-local");
+    assert_eq!(data["chain_namespace"], "eip155:8453");
     assert_eq!(
         data["function"],
         ProtectedContentCreatorMintAbi::ElacityMintV1.function()
+    );
+    assert_eq!(data["ledger"], "0x0000000000000000000000000000000000000022");
+    assert_eq!(
+        data["pay_token"],
+        "0x0000000000000000000000000000000000000033"
     );
     assert_eq!(data["to"], "0x0000000000000000000000000000000000000022");
     assert_eq!(data["value"], "0x0");
@@ -2259,12 +2265,169 @@ fn resolve_protected_content_creator_mint_returns_exact_call_and_content_access_
         encode_protected_content_creator_mint_call(
             ProtectedContentCreatorMintAbi::ElacityMintV1.selector(),
             "ipfs://protected-content/metadata.json",
-            0,
-            &encode_protected_content_mint_op_raw_free(&access_id).unwrap(),
-            &[],
+            PROTECTED_CONTENT_CREATOR_BUY_ONCE_OP_TYPE,
+            &encode_protected_content_mint_op_raw_paid(
+                &access_id,
+                "ipfs://protected-content/metadata.json",
+                &[creator.to_string(), creator.to_string()],
+                &[
+                    PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE,
+                    PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE,
+                ],
+                &[
+                    "0x7".to_string(),
+                    PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT.to_string(),
+                ],
+                None,
+            )
+            .unwrap(),
+            &encode_protected_content_sell_raw_data(
+                "0x7",
+                "0x5",
+                "0x0000000000000000000000000000000000000033",
+            )
+            .unwrap(),
         )
         .unwrap()
     );
+    assert!(data.get("reseller_cut").is_none());
+}
+
+#[test]
+fn resolve_protected_content_creator_mint_rejects_missing_or_ambiguous_creator_network() {
+    let mut unconfigured = ChainProvider::new();
+    let init = unconfigured.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "networks": [{
+                    "id": "base-local",
+                    "display_name": "Base Local",
+                    "kind": "evm_json_rpc",
+                    "chain_id": 8453,
+                    "native_symbol": "ETH",
+                    "provider": "test",
+                    "mainnet": true,
+                    "explorer_url": null,
+                    "rpc_url": "http://127.0.0.1:9",
+                    "rights_methods": [],
+                    "protected_content_market": {
+                        "authority_gateway_contract": "0x00000000000000000000000000000000000000aa",
+                        "evidence_rpc_urls": ["https://rpc-a.example", "https://rpc-b.example"]
+                    }
+                }]
+            }
+        }),
+    });
+    assert!(matches!(init, Response::Ok { .. }));
+    assert_eq!(
+        error_code(
+            unconfigured.handle(Request::ResolveProtectedContentCreatorMint {
+                creator: "0x0000000000000000000000000000000000000011".to_string(),
+                token_uri: "ipfs://protected-content/metadata.json".to_string(),
+                content_access_id: format!("0x{}", encode_hex(&[0x41; 16])),
+                copies: "0x1".to_string(),
+                price: "0x5".to_string(),
+            })
+        ),
+        "protected_content_creator_mint_not_configured"
+    );
+
+    let mut ambiguous = ChainProvider::new();
+    let init = ambiguous.handle(Request::Init {
+        config: json!({
+            "extra": {
+                "networks": [
+                    {
+                        "id": "base-a",
+                        "display_name": "Base A",
+                        "kind": "evm_json_rpc",
+                        "chain_id": 8453,
+                        "native_symbol": "ETH",
+                        "provider": "test",
+                        "mainnet": true,
+                        "explorer_url": null,
+                        "rpc_url": "http://127.0.0.1:9",
+                        "rights_methods": [],
+                        "protected_content_creator_mint": {
+                            "ledger": "0x0000000000000000000000000000000000000022",
+                            "pay_token": "0x0000000000000000000000000000000000000033",
+                            "asset_created_emitter": "0x00000000000000000000000000000000000000dd",
+                            "abi": "elacity_mint_v1"
+                        }
+                    },
+                    {
+                        "id": "base-b",
+                        "display_name": "Base B",
+                        "kind": "evm_json_rpc",
+                        "chain_id": 8454,
+                        "native_symbol": "ETH",
+                        "provider": "test",
+                        "mainnet": true,
+                        "explorer_url": null,
+                        "rpc_url": "http://127.0.0.1:9",
+                        "rights_methods": [],
+                        "protected_content_creator_mint": {
+                            "ledger": "0x0000000000000000000000000000000000000044",
+                            "pay_token": "0x0000000000000000000000000000000000000055",
+                            "asset_created_emitter": "0x00000000000000000000000000000000000000ee",
+                            "abi": "elacity_mint_v1"
+                        }
+                    }
+                ]
+            }
+        }),
+    });
+    assert!(matches!(init, Response::Ok { .. }));
+    assert_eq!(
+        error_code(
+            ambiguous.handle(Request::ResolveProtectedContentCreatorMint {
+                creator: "0x0000000000000000000000000000000000000011".to_string(),
+                token_uri: "ipfs://protected-content/metadata.json".to_string(),
+                content_access_id: format!("0x{}", encode_hex(&[0x41; 16])),
+                copies: "0x1".to_string(),
+                price: "0x5".to_string(),
+            })
+        ),
+        "ambiguous_protected_content_creator_mint_source"
+    );
+}
+
+#[test]
+fn init_rejects_invalid_protected_content_creator_mint_addresses() {
+    for (field, value) in [
+        ("ledger", "0x1234"),
+        ("pay_token", "not-an-address"),
+        ("asset_created_emitter", "0x1234"),
+    ] {
+        let mut creator_mint = json!({
+            "ledger": "0x0000000000000000000000000000000000000022",
+            "pay_token": "0x0000000000000000000000000000000000000033",
+            "asset_created_emitter": "0x00000000000000000000000000000000000000dd",
+            "abi": "elacity_mint_v1"
+        });
+        creator_mint[field] = json!(value);
+        let mut provider = ChainProvider::new();
+        let response = provider.handle(Request::Init {
+            config: json!({
+                "extra": {
+                    "networks": [{
+                        "id": "base-local",
+                        "display_name": "Base Local",
+                        "kind": "evm_json_rpc",
+                        "chain_id": 8453,
+                        "native_symbol": "ETH",
+                        "provider": "test",
+                        "mainnet": true,
+                        "explorer_url": null,
+                        "rpc_url": "http://127.0.0.1:9",
+                        "rights_methods": [],
+                        "protected_content_creator_mint": creator_mint
+                    }]
+                }
+            }),
+        });
+        assert_eq!(error_code(response), "invalid_config");
+    }
 }
 
 #[test]

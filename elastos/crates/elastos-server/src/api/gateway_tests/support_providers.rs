@@ -1,5 +1,55 @@
 struct MockChainProvider;
 
+const MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY: &str = "0x00000000000000000000000000000000000000aa";
+const MOCK_PROTECTED_CONTENT_PAY_TOKEN: &str = "0x00000000000000000000000000000000000000bb";
+const MOCK_PROTECTED_CONTENT_OPERATIVE: &str = "0x00000000000000000000000000000000000000dd";
+const MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR: &str = "0x00000000000000000000000000000000000000ff";
+const MOCK_PROTECTED_CONTENT_TOKEN_ID: &str = "0x77";
+const MOCK_PROTECTED_CONTENT_LISTING_QUANTITY: &str = "0x2";
+const MOCK_PROTECTED_CONTENT_LISTING_PRICE: &str = "0x5";
+const MOCK_PROTECTED_CONTENT_CHAIN_ID: u64 = 8453;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MockProtectedContentChainMode {
+    Success,
+    ReceiptError,
+    ListingError,
+}
+
+fn mock_content_publish_requests() -> &'static std::sync::Mutex<Vec<serde_json::Value>> {
+    static REQUESTS: std::sync::OnceLock<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::OnceLock::new();
+    REQUESTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn reset_mock_content_publish_requests() {
+    mock_content_publish_requests().lock().unwrap().clear();
+}
+
+fn mock_content_publish_request_count() -> usize {
+    mock_content_publish_requests().lock().unwrap().len()
+}
+
+fn mock_protected_content_chain_mode() -> &'static std::sync::Mutex<MockProtectedContentChainMode> {
+    static MODE: std::sync::OnceLock<std::sync::Mutex<MockProtectedContentChainMode>> =
+        std::sync::OnceLock::new();
+    MODE.get_or_init(|| std::sync::Mutex::new(MockProtectedContentChainMode::Success))
+}
+
+fn reset_mock_protected_content_chain_mode() {
+    *mock_protected_content_chain_mode().lock().unwrap() = MockProtectedContentChainMode::Success;
+}
+
+fn set_mock_protected_content_chain_receipt_error() {
+    *mock_protected_content_chain_mode().lock().unwrap() =
+        MockProtectedContentChainMode::ReceiptError;
+}
+
+fn set_mock_protected_content_chain_listing_error() {
+    *mock_protected_content_chain_mode().lock().unwrap() =
+        MockProtectedContentChainMode::ListingError;
+}
+
 const MOCK_MANAGED_EVM_ADDRESS: &str = "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a";
 
 fn mock_trim_integer_bytes(bytes: &[u8]) -> &[u8] {
@@ -14,7 +64,9 @@ fn mock_managed_evm_signing_key(index: usize) -> Result<EvmSigningKey, ProviderE
     let byte = u8::try_from(index)
         .ok()
         .and_then(|value| value.checked_add(0x10))
-        .ok_or_else(|| ProviderError::Provider("mock managed EVM key index overflow".to_string()))?;
+        .ok_or_else(|| {
+            ProviderError::Provider("mock managed EVM key index overflow".to_string())
+        })?;
     EvmSigningKey::from_bytes((&[byte; 32]).into())
         .map_err(|err| ProviderError::Provider(err.to_string()))
 }
@@ -240,6 +292,90 @@ impl Provider for MockChainProvider {
                     "block_number": 42
                 }
             })),
+            Some("resolve_protected_content_creator_mint") => Ok(json!({
+                "status": "ok",
+                "data": {
+                    "schema": "elastos.chain.protected-content-creator-mint/v1",
+                    "network": "base-mainnet",
+                    "chain_namespace": "eip155:8453",
+                    "function": "mint(string,uint16,bytes,bytes)",
+                    "ledger": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
+                    "pay_token": MOCK_PROTECTED_CONTENT_PAY_TOKEN,
+                    "to": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
+                    "data": format!(
+                        "0x{}",
+                        hex::encode(Keccak256::digest(
+                            serde_json::to_vec(&json!({
+                                "creator": required_test_str(request, "creator")?,
+                                "token_uri": required_test_str(request, "token_uri")?,
+                                "content_access_id": required_test_str(request, "content_access_id")?,
+                                "copies": required_test_str(request, "copies")?,
+                                "price": required_test_str(request, "price")?,
+                            }))
+                            .map_err(|err| ProviderError::Provider(err.to_string()))?
+                        ))
+                    ),
+                    "value": "0x0",
+                    "content_access_id": required_test_str(request, "content_access_id")?
+                        .to_ascii_lowercase(),
+                    "signed": false
+                }
+            })),
+            Some("resolve_protected_content_mint_receipt") => {
+                if *mock_protected_content_chain_mode().lock().unwrap()
+                    == MockProtectedContentChainMode::ReceiptError
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "unavailable",
+                        "message": "mock protected-content mint receipt unavailable"
+                    }));
+                }
+                if request.get("op_type_code").and_then(Value::as_u64) != Some(1) {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "invalid_request",
+                        "message": "mock protected-content mint receipt requires BUY_ONCE op type"
+                    }));
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-mint-receipt/v1",
+                        "network": required_test_str(request, "network")?,
+                        "chain_id": MOCK_PROTECTED_CONTENT_CHAIN_ID,
+                        "token_id": MOCK_PROTECTED_CONTENT_TOKEN_ID,
+                        "operative": MOCK_PROTECTED_CONTENT_OPERATIVE
+                    }
+                }))
+            }
+            Some("resolve_protected_content_verified_listing") => {
+                if *mock_protected_content_chain_mode().lock().unwrap()
+                    == MockProtectedContentChainMode::ListingError
+                {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "unavailable",
+                        "message": "mock protected-content verified listing unavailable"
+                    }));
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-verified-listing/v1",
+                        "network": required_test_str(request, "network")?,
+                        "chain_id": MOCK_PROTECTED_CONTENT_CHAIN_ID,
+                        "seller": required_test_str(request, "seller")?.to_ascii_lowercase(),
+                        "ledger": required_test_str(request, "ledger")?.to_ascii_lowercase(),
+                        "token_id": required_test_str(request, "token_id")?.to_ascii_lowercase(),
+                        "operative": MOCK_PROTECTED_CONTENT_OPERATIVE,
+                        "quantity": MOCK_PROTECTED_CONTENT_LISTING_QUANTITY,
+                        "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+                        "pay_token": MOCK_PROTECTED_CONTENT_PAY_TOKEN,
+                        "payment_processor": MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR
+                    }
+                }))
+            }
             Some("node_lifecycle") => Ok(json!({
                 "status": "ok",
                 "data": {
@@ -390,8 +526,7 @@ impl Provider for MockChainProvider {
             })),
             Some("transaction") => {
                 let hash = required_test_str(request, "hash")?;
-                if hash
-                    == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                if hash == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
                     || mock_chain_hidden_transaction_hashes()
                         .lock()
                         .unwrap()
@@ -443,8 +578,7 @@ impl Provider for MockChainProvider {
             }
             Some("receipt") => {
                 let hash = required_test_str(request, "hash")?;
-                if hash
-                    == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                if hash == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
                     || mock_chain_hidden_transaction_hashes()
                         .lock()
                         .unwrap()
@@ -622,6 +756,12 @@ impl Provider for MockContentProvider {
                 }
             })),
             (Some("publish"), _, _) => {
+                if request.get("object_kind").and_then(|value| value.as_str()) != Some("sealed") {
+                    mock_content_publish_requests()
+                        .lock()
+                        .unwrap()
+                        .push(request.clone());
+                }
                 if request.get("object_kind").and_then(|value| value.as_str()) == Some("sealed") {
                     validate_mock_sealed_publish_request(request)?;
                 }
@@ -721,7 +861,10 @@ fn validate_mock_sealed_publish_request(request: &serde_json::Value) -> Result<(
         .and_then(|value| value.as_array())
         .ok_or_else(|| ProviderError::Provider("sealed publish links are required".into()))?;
     for (rel, cid) in [
-        ("availability.receipt", sealed_object.availability_receipt_cid.as_str()),
+        (
+            "availability.receipt",
+            sealed_object.availability_receipt_cid.as_str(),
+        ),
         ("payload", sealed_object.payload_cid.as_str()),
         ("rights.policy", sealed_object.rights_policy_cid.as_str()),
     ] {
@@ -1390,7 +1533,7 @@ impl Provider for MockWebSpaceProvider {
                     "status": "ok",
                     "data": stat
                 }))
-            },
+            }
             Some("health") => Ok(json!({
                 "status": "ok",
                 "data": {
@@ -1464,7 +1607,7 @@ impl Provider for MockWebSpaceProvider {
                         "size": cached.bytes.len()
                     }
                 }))
-            },
+            }
             Some("write")
                 if path.starts_with("localhost://WebSpaces/Mutable/")
                     || path.starts_with("localhost://WebSpaces/OperatorMutable/") =>
@@ -1486,27 +1629,27 @@ impl Provider for MockWebSpaceProvider {
                     || path.starts_with("localhost://WebSpaces/OperatorMutable/") =>
             {
                 Ok(json!({
-                "status": "ok",
-                "data": {
-                    "schema": "elastos.webspace.mkdir-receipt/v1",
-                    "action": "created",
-                    "handle_uri": path
-                }
-            }))
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.webspace.mkdir-receipt/v1",
+                        "action": "created",
+                        "handle_uri": path
+                    }
+                }))
             }
             Some("delete")
                 if path.starts_with("localhost://WebSpaces/Mutable/")
                     || path.starts_with("localhost://WebSpaces/OperatorMutable/") =>
             {
                 Ok(json!({
-                "status": "ok",
-                "data": {
-                    "schema": "elastos.webspace.delete-receipt/v1",
-                    "action": "deleted",
-                    "handle_uri": path,
-                    "removed_count": 1
-                }
-            }))
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.webspace.delete-receipt/v1",
+                        "action": "deleted",
+                        "handle_uri": path,
+                        "removed_count": 1
+                    }
+                }))
             }
             Some("sync")
                 if path.starts_with("localhost://WebSpaces/Mutable/")
@@ -1542,7 +1685,7 @@ impl Provider for MockWebSpaceProvider {
                         "size": size
                     }
                 }))
-            },
+            }
             Some("read") if path.ends_with("_meta.json") || path.contains("/content/") => {
                 let bytes = serde_json::to_vec_pretty(&json!({
                     "handle_uri": path.trim_end_matches("/_meta.json"),
@@ -1903,10 +2046,7 @@ fn mock_webspace_stat(path: &str) -> serde_json::Value {
     })
 }
 
-fn mock_cached_webspace_stat(
-    path: &str,
-    cached: &MockCachedWebSpaceObject,
-) -> serde_json::Value {
+fn mock_cached_webspace_stat(path: &str, cached: &MockCachedWebSpaceObject) -> serde_json::Value {
     let mut stat = mock_webspace_stat(path);
     stat["size"] = json!(cached.bytes.len());
     stat["resolver_state"] = json!("materialized-local");
@@ -2700,7 +2840,9 @@ impl Provider for MockBrowserEngineProvider {
                 Some("principal_owned_reset_scoped_unprotected")
             );
             assert_eq!(
-                profile.get("protected_storage").and_then(|value| value.as_bool()),
+                profile
+                    .get("protected_storage")
+                    .and_then(|value| value.as_bool()),
                 Some(false)
             );
             assert_eq!(
@@ -2734,15 +2876,16 @@ impl Provider for MockBrowserEngineProvider {
                 .get("disk_path")
                 .and_then(|value| value.as_str())
                 .is_some_and(|path| {
-                    path.starts_with('/')
-                        && path.ends_with("/BrowserProfiles/default/profile.ext4")
+                    path.starts_with('/') && path.ends_with("/BrowserProfiles/default/profile.ext4")
                 }));
             let stream_session = request
                 .get("stream_session")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             assert_eq!(
-                stream_session.get("schema").and_then(|value| value.as_str()),
+                stream_session
+                    .get("schema")
+                    .and_then(|value| value.as_str()),
                 Some("elastos.exit.stream-session/v1")
             );
             if stream_session
@@ -3210,10 +3353,7 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                     request,
                 )
                 .await?;
-                let effect = response
-                    .get("data")
-                    .cloned()
-                    .expect("mock launch effect");
+                let effect = response.get("data").cloned().expect("mock launch effect");
                 *self.effect.lock().await = Some(effect);
                 match self.failure {
                     MockDispatchedBrowserLaunchFailure::ResponseLoss => {
@@ -3248,11 +3388,8 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                 }
             }
             Some("status") if request.get("lifecycle_generation").is_some() => {
-                let reconciliation_call = self
-                    .reconciliation_calls
-                    .record(request.clone())
-                    .await
-                    - 1;
+                let reconciliation_call =
+                    self.reconciliation_calls.record(request.clone()).await - 1;
                 if matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::DidNotActResourcesInUse
@@ -3389,20 +3526,16 @@ impl Provider for MockReconciliatingBrowserEngineProvider {
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::HangingReconciliation
                 ) {
-                    return std::future::pending::<
-                        Result<serde_json::Value, ProviderError>,
-                    >()
-                    .await;
+                    return std::future::pending::<Result<serde_json::Value, ProviderError>>()
+                        .await;
                 }
                 if matches!(
                     self.failure,
                     MockDispatchedBrowserLaunchFailure::TimeoutThenLateSuccess
                 ) && reconciliation_call == 0
                 {
-                    return std::future::pending::<
-                        Result<serde_json::Value, ProviderError>,
-                    >()
-                    .await;
+                    return std::future::pending::<Result<serde_json::Value, ProviderError>>()
+                        .await;
                 }
                 if matches!(
                     self.failure,
@@ -3544,9 +3677,11 @@ impl Provider for MockRetryingBrowserEngineProvider {
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
         if request.get("op").and_then(|value| value.as_str()) == Some("launch") {
-            let response =
-                <MockBrowserEngineProvider as Provider>::send_raw(&MockBrowserEngineProvider, request)
-                    .await?;
+            let response = <MockBrowserEngineProvider as Provider>::send_raw(
+                &MockBrowserEngineProvider,
+                request,
+            )
+            .await?;
             if response.get("status").and_then(|value| value.as_str()) == Some("ok") {
                 if let Some(ownership) = &self.ownership {
                     ownership.observe_launch();
@@ -3580,9 +3715,11 @@ impl Provider for MockRetryingBrowserEngineProvider {
                     }
                 };
             }
-            let response =
-                <MockBrowserEngineProvider as Provider>::send_raw(&MockBrowserEngineProvider, request)
-                    .await?;
+            let response = <MockBrowserEngineProvider as Provider>::send_raw(
+                &MockBrowserEngineProvider,
+                request,
+            )
+            .await?;
             if response.get("status").and_then(|value| value.as_str()) == Some("ok") {
                 if let Some(ownership) = &self.ownership {
                     ownership.observe_terminal_close();
@@ -3782,15 +3919,14 @@ impl Provider for MockWalletProvider {
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
         if request.get("op").and_then(|value| value.as_str()) == Some(WALLET_BUS_OPERATION) {
-            let request_bytes = serde_json::to_vec(request.get("request").ok_or_else(|| {
-                ProviderError::Provider("missing Wallet Bus v2 request".into())
-            })?)
-            .map_err(|err| ProviderError::Provider(err.to_string()))?;
-            let wallet_request = WalletProviderRequestV2::decode_at(
-                &request_bytes,
-                crate::auth::now_ts(),
-            )
-            .map_err(|err| ProviderError::Provider(err.to_string()))?;
+            let request_bytes =
+                serde_json::to_vec(request.get("request").ok_or_else(|| {
+                    ProviderError::Provider("missing Wallet Bus v2 request".into())
+                })?)
+                .map_err(|err| ProviderError::Provider(err.to_string()))?;
+            let wallet_request =
+                WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts())
+                    .map_err(|err| ProviderError::Provider(err.to_string()))?;
             let legacy_request = match &wallet_request.operation {
                 WalletProviderOperationV2::ListAccounts { include_revoked } => json!({
                     "op": "accounts",
@@ -3973,12 +4109,14 @@ impl Provider for MockWalletProvider {
                     "request_id": request_id,
                     "reason": reason,
                 }),
-                WalletProviderOperationV2::ApproveConnectorHandoff { request_id, reason } => json!({
-                    "op": "approve_approval",
-                    "principal_id": wallet_request.authority.principal_id,
-                    "request_id": request_id,
-                    "reason": reason,
-                }),
+                WalletProviderOperationV2::ApproveConnectorHandoff { request_id, reason } => {
+                    json!({
+                        "op": "approve_approval",
+                        "principal_id": wallet_request.authority.principal_id,
+                        "request_id": request_id,
+                        "reason": reason,
+                    })
+                }
                 WalletProviderOperationV2::CompleteConnectorHandoff {
                     request_id,
                     payload_hash,
@@ -4125,7 +4263,10 @@ impl RecordingWalletProvider {
                 wallet_request.authority.proof_binding_id.as_deref(),
                 Some(expected_authority.proof_binding_id.as_str())
             );
-            assert_eq!(wallet_request.authority.grant_id, expected_authority.grant_id);
+            assert_eq!(
+                wallet_request.authority.grant_id,
+                expected_authority.grant_id
+            );
             if let Some(expected_launch_id) = launch_id.as_deref() {
                 assert_eq!(wallet_request.authority.launch_id, expected_launch_id);
             } else {
@@ -4176,10 +4317,7 @@ impl RecordingWalletProvider {
             }
             assert_eq!(request["_runtime_invocation"]["source"], "runtime");
             assert_eq!(request["_runtime_invocation"]["target"], "wallet");
-            assert_eq!(
-                request["_runtime_invocation"]["op"],
-                WALLET_BUS_OPERATION
-            );
+            assert_eq!(request["_runtime_invocation"]["op"], WALLET_BUS_OPERATION);
             assert_eq!(
                 request["_runtime_invocation"]["transport"],
                 "runtime-local-provider-plane"
@@ -4231,10 +4369,7 @@ impl RecordingWalletProvider {
                 wallet_request.authority.principal_id,
                 expected.principal_id()
             );
-            assert_eq!(
-                wallet_request.authority.session_id,
-                expected.session_id()
-            );
+            assert_eq!(wallet_request.authority.session_id, expected.session_id());
             assert_eq!(
                 wallet_request.authority.proof_binding_id.as_deref(),
                 expected.proof_binding_id()
@@ -4301,10 +4436,7 @@ impl RecordingWalletProvider {
                 wallet_request.authority.principal_id,
                 expected.principal_id()
             );
-            assert_eq!(
-                wallet_request.authority.session_id,
-                expected.session_id()
-            );
+            assert_eq!(wallet_request.authority.session_id, expected.session_id());
             assert_eq!(
                 wallet_request.authority.proof_binding_id.as_deref(),
                 expected.proof_binding_id()
@@ -4318,11 +4450,94 @@ impl RecordingWalletProvider {
 }
 
 impl MockWalletProvider {
+    async fn seed_managed_evm_account_for_principal(&self, principal_id: &str) -> String {
+        let account_id = format!("wallet:eip155:8453:{MOCK_MANAGED_EVM_ADDRESS}");
+        let account = json!({
+            "account_id": account_id,
+            "principal_id": principal_id,
+            "proof_binding_id": format!(
+                "proof:wallet:managed:eip155:8453:{MOCK_MANAGED_EVM_ADDRESS}"
+            ),
+            "chain_namespace": "eip155:8453",
+            "address": MOCK_MANAGED_EVM_ADDRESS,
+            "proof_type": "managed_evm",
+            "signing_available": true,
+            "signing_status": "managed_key_available",
+            "label": "Managed",
+            "linked_at": crate::auth::now_ts()
+        });
+        let mut accounts = self.accounts.lock().await;
+        if let Some(existing) = accounts.iter_mut().find(|existing| {
+            existing.get("principal_id").and_then(Value::as_str) == Some(principal_id)
+                && existing.get("account_id").and_then(Value::as_str) == Some(account_id.as_str())
+        }) {
+            *existing = account;
+        } else {
+            accounts.push(account);
+        }
+        account_id
+    }
+
+    async fn latest_transaction_approval_request_id(&self) -> Option<String> {
+        let approvals = self.approvals.lock().await;
+        approvals
+            .iter()
+            .rev()
+            .find(|approval| {
+                approval.get("intent").and_then(Value::as_str) == Some("transaction_intent")
+            })
+            .and_then(|approval| approval.get("request_id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+    }
+
+    async fn latest_transaction_signed_transaction(&self) -> Option<String> {
+        let approvals = self.approvals.lock().await;
+        approvals
+            .iter()
+            .rev()
+            .find(|approval| {
+                approval.get("intent").and_then(Value::as_str) == Some("transaction_intent")
+            })
+            .and_then(|approval| approval.get("signed_result"))
+            .and_then(|result| result.get("signed_transaction"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    }
+
+    async fn complete_latest_transaction_approval(&self) -> String {
+        let mut approvals = self.approvals.lock().await;
+        let approval = approvals
+            .iter_mut()
+            .rev()
+            .find(|approval| {
+                approval.get("intent").and_then(Value::as_str) == Some("transaction_intent")
+            })
+            .expect("mock transaction approval");
+        let signed_transaction = mock_sign_eip155_transaction(
+            approval
+                .get("payload")
+                .expect("mock transaction approval payload"),
+        )
+        .unwrap();
+        let transaction_hash = signed_evm_transaction_hash_for_test(&signed_transaction);
+        approval["status"] = serde_json::Value::String("completed".to_string());
+        approval["signed_result"] = json!({
+            "schema": "elastos.wallet.signed-transaction-result/v1",
+            "request_id": approval.get("request_id").cloned().unwrap_or(json!("wallet-request:test")),
+            "method": "eth_sendTransaction",
+            "signed_transaction": signed_transaction,
+            "transaction_hash": transaction_hash,
+            "signer": approval.get("address").cloned().unwrap_or(json!(MOCK_MANAGED_EVM_ADDRESS)),
+            "chain_namespace": approval.get("chain_namespace").cloned().unwrap_or(json!("eip155:8453")),
+            "payload_hash": approval.get("payload_hash").cloned().unwrap_or(json!("0x00")),
+        });
+        transaction_hash
+    }
+
     async fn send_legacy_raw(
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
-
         match request.get("op").and_then(|value| value.as_str()) {
             Some("challenge") => {
                 let domain = required_test_str(request, "domain")?;
@@ -4879,12 +5094,12 @@ impl MockWalletProvider {
                     }
                     let chain_namespace = required_test_str(recovery_key, "chain_namespace")?;
                     let address = required_test_str(recovery_key, "address")?;
-                    let proof_type =
-                        if chain_namespace == "bip122:000000000019d6689c085ae165831e93" {
-                            "managed_btc_p2wpkh"
-                        } else {
-                            "managed_evm"
-                        };
+                    let proof_type = if chain_namespace == "bip122:000000000019d6689c085ae165831e93"
+                    {
+                        "managed_btc_p2wpkh"
+                    } else {
+                        "managed_evm"
+                    };
                     imported_accounts.push(json!({
                         "account_id": account_id,
                         "principal_id": principal_id,
@@ -5105,8 +5320,7 @@ impl MockWalletProvider {
                     .map(ToString::to_string)
                     .unwrap_or_else(|| format!("wallet-approval:mock-{}", approvals.len() + 1));
                 if let Some(existing) = approvals.iter().find(|approval| {
-                    approval.get("request_id").and_then(Value::as_str)
-                        == Some(request_id.as_str())
+                    approval.get("request_id").and_then(Value::as_str) == Some(request_id.as_str())
                 }) {
                     return Ok(json!({
                         "status": "ok",
@@ -5229,9 +5443,11 @@ impl MockWalletProvider {
                     == Some("transaction_intent")
                 {
                     let signed_transaction = mock_sign_eip155_transaction(
-                        approval
-                            .get("payload")
-                            .ok_or_else(|| ProviderError::Provider("mock transaction approval is missing payload".to_string()))?,
+                        approval.get("payload").ok_or_else(|| {
+                            ProviderError::Provider(
+                                "mock transaction approval is missing payload".to_string(),
+                            )
+                        })?,
                     )?;
                     let transaction_hash =
                         signed_evm_transaction_hash_for_test(&signed_transaction);
@@ -5429,9 +5645,11 @@ impl MockWalletProvider {
                     == Some("transaction_intent")
                 {
                     let signed_transaction = mock_sign_eip155_transaction(
-                        approval
-                            .get("payload")
-                            .ok_or_else(|| ProviderError::Provider("mock transaction approval is missing payload".to_string()))?,
+                        approval.get("payload").ok_or_else(|| {
+                            ProviderError::Provider(
+                                "mock transaction approval is missing payload".to_string(),
+                            )
+                        })?,
                     )?;
                     let transaction_hash =
                         signed_evm_transaction_hash_for_test(&signed_transaction);
@@ -5472,7 +5690,7 @@ impl MockWalletProvider {
                     .cloned()
                     .ok_or_else(|| {
                         ProviderError::Provider("missing validated Chain outcome".to_string())
-                })?;
+                    })?;
                 let request_id = required_test_str(&outcome, "approval_request_id")?;
                 let mut approvals = self.approvals.lock().await;
                 let Some(approval) = approvals.iter_mut().find(|approval| {

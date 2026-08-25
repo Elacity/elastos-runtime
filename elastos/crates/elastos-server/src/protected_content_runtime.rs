@@ -7,7 +7,7 @@
 //! open/share path or expose provider topology to capsules.
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::HashMap;
 use std::fs;
@@ -20,41 +20,40 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use base64::Engine as _;
 use ed25519_dalek::Signer as _;
 use elastos_protected_content_contracts::{
-    CanonicalContract, ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1,
-    CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, Digest32, EncryptedContentIdentityV1,
-    KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1, NodeCustodyPublicKeyV1,
-    NodePublicKey, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
-    RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1, RightsEvaluationEvidenceRequestV1,
-    RightsPolicyBodyV1, RightsPolicyIdentityV1, RightsRequestV1, RuntimeOperationIssuerKeyV1,
-    RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
+    validate_custody_epoch_against_pool_at, CanonicalContract, ContentAccessIdV1,
+    CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, Digest32,
+    EncryptedContentIdentityV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, RecipientKeyAuthorizationStatementV1,
+    RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
+    RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1, RightsRequestV1,
+    RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
     SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
     SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
     TerminalReceiptStatementV1, WalletSignedRightsRequestV1,
-    validate_custody_epoch_against_pool_at,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, DecryptProviderRequestOpV1, DecryptProviderRequestV1,
-    DecryptProviderResponseV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, ProtectProviderRequestV1,
-    ProtectProviderResponseStatusV1, ProtectProviderResponseV1, ProtectionSessionNodeV1,
-    RightsProviderRequestV1, RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1,
-    ViewerMediaPartSelectorV1,
+    DecryptProviderResponseV1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
+    ProtectProviderResponseV1, ProtectionSessionNodeV1, RightsProviderRequestV1,
+    RightsProviderResponseV1, ValidatedCencFmp4MediaSessionLayoutV1, ViewerMediaPartSelectorV1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 use elastos_protected_content_rights::{
-    CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP, PrivateCustodyRightsRequestV1,
+    PrivateCustodyRightsRequestV1, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
 };
 use elastos_protected_content_runtime::RuntimeProviderCallError;
 use elastos_protected_content_runtime::{
-    PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
+    bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
+    prepare_recipient, read_viewer_media_part, resolve_runtime_mint_selected_nodes,
+    PersistedRuntimeMint, PersistedRuntimeReleaseOperation, RuntimeContentAvailabilityRequirement,
     RuntimeDecryptProvider, RuntimeMintConfiguredCustodyProvider, RuntimeMintCoordinator,
-    RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome, RuntimeMintDraft,
-    RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
+    RuntimeMintCoordinatorError, RuntimeMintCoordinatorOutcome, RuntimeMintCreatorTerminalEvidence,
+    RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeOpenViewerSessionInput,
     RuntimeProtectedContentPurchaseIntent, RuntimePurchaseEffectAuthority,
     RuntimeReleaseAuditRecord, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseJournal, RuntimeReleaseJournalError, RuntimeReleaseTerminalResult,
     RuntimeSelectedProvider, RuntimeVerifiedContentAvailability, RuntimeVerifiedPurchaseEffect,
-    RuntimeViewerSession, bind_buy, cancel_prepared_recipient, close_viewer_session,
-    open_viewer_session, prepare_recipient, read_viewer_media_part,
-    resolve_runtime_mint_selected_nodes,
+    RuntimeViewerSession,
 };
 use elastos_runtime::provider::bridge::{ProviderBridge, ProviderConfig};
 use elastos_runtime::provider::{
@@ -62,12 +61,12 @@ use elastos_runtime::provider::{
     ProviderRegistry, ProviderTransfer, ResourceRequest, ResourceResponse,
 };
 use elastos_wallet_contract::{
-    MAX_INVOCATION_TTL_SECS, ValidatedChainOutcomeBindingV1, VerifiedWalletInvocationContext,
-    WALLET_BUS_OPERATION, WalletProviderOperationV2, WalletProviderRequestV2,
+    ValidatedChainOutcomeBindingV1, VerifiedWalletInvocationContext, WalletProviderOperationV2,
+    WalletProviderRequestV2, MAX_INVOCATION_TTL_SECS, WALLET_BUS_OPERATION,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::Digest as _;
 
 pub(crate) const CUSTODY_PROVIDER_ID: &str = "custody";
@@ -1934,11 +1933,15 @@ fn verify_protected_content_receipt(
     .map_err(|_| anyhow::anyhow!("protected content availability evidence is invalid"))
 }
 
+#[derive(Clone)]
 pub(crate) struct RuntimeCustodyLibraryPublishInput {
     pub object_uri: String,
     pub principal_id: String,
     pub mime_type: String,
     pub codecs: String,
+    pub wallet_account_id: String,
+    pub copies: String,
+    pub price: String,
     pub clear_init_segment: Vec<u8>,
     pub clear_segments: Vec<Vec<u8>>,
     pub source_storage: String,
@@ -1952,6 +1955,9 @@ impl std::fmt::Debug for RuntimeCustodyLibraryPublishInput {
             .field("principal_id", &self.principal_id)
             .field("mime_type", &self.mime_type)
             .field("codecs", &self.codecs)
+            .field("wallet_account_id", &self.wallet_account_id)
+            .field("copies", &self.copies)
+            .field("price", &self.price)
             .field("clear_init_segment_bytes", &self.clear_init_segment.len())
             .field("clear_segment_count", &self.clear_segments.len())
             .field("source_storage", &self.source_storage)
@@ -2085,19 +2091,6 @@ pub(crate) async fn publish_runtime_custody_library_object(
         _ => anyhow::bail!("Runtime custody availability record failed"),
     }
     persist_runtime_open_envelope(data_dir, mint_draft.mint_id(), &protected.envelope)?;
-    persist_runtime_custody_listing(
-        data_dir,
-        &RuntimeCustodyListingRecord {
-            schema: RUNTIME_LISTING_SCHEMA_V1.to_string(),
-            mint_id: hex::encode(mint_draft.mint_id().as_bytes()),
-            content_id: content_id.clone(),
-            cid: evidence.content_cid().to_string(),
-            publisher_principal_id: input.principal_id.clone(),
-            buyer_principal_id: None,
-            published_at: crate::auth::now_ts(),
-            bought_at: None,
-        },
-    )?;
     let facts = runtime_custody_library_publish_facts(&input, &mint_draft, &content_id, &evidence);
     mint_journal
         .mark_intent_completed(mint_intent.request_id(), mint_draft.mint_id())
@@ -2564,12 +2557,25 @@ fn runtime_custody_library_publish_facts(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeCustodyListingRecord {
+pub(crate) struct RuntimeCustodyListingRecord {
     schema: String,
     mint_id: String,
     content_id: String,
+    content_access_id: String,
     cid: String,
+    metadata_cid: String,
+    token_uri: String,
     publisher_principal_id: String,
+    seller_address: String,
+    chain_namespace: String,
+    network: String,
+    ledger: String,
+    token_id: String,
+    operative: String,
+    price: String,
+    pay_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payment_processor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     buyer_principal_id: Option<String>,
     published_at: u64,
@@ -2628,8 +2634,8 @@ struct RuntimeCustodyViewerState {
     cid: String,
 }
 
-fn runtime_custody_viewer_sessions()
--> &'static Mutex<HashMap<RuntimeCustodyViewerKey, RuntimeCustodyViewerState>> {
+fn runtime_custody_viewer_sessions(
+) -> &'static Mutex<HashMap<RuntimeCustodyViewerKey, RuntimeCustodyViewerState>> {
     static SESSIONS: OnceLock<Mutex<HashMap<RuntimeCustodyViewerKey, RuntimeCustodyViewerState>>> =
         OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -3140,7 +3146,7 @@ fn load_runtime_open_envelope(
     ))
 }
 
-fn persist_runtime_custody_listing(
+pub(crate) fn persist_runtime_custody_listing(
     data_dir: &Path,
     record: &RuntimeCustodyListingRecord,
 ) -> anyhow::Result<()> {
@@ -3150,7 +3156,7 @@ fn persist_runtime_custody_listing(
     )
 }
 
-fn load_runtime_custody_listing(
+pub(crate) fn load_runtime_custody_listing(
     data_dir: &Path,
     mint_id: Digest32,
 ) -> anyhow::Result<Option<RuntimeCustodyListingRecord>> {
@@ -3163,6 +3169,76 @@ fn load_runtime_custody_listing(
         anyhow::bail!("Runtime custody listing is invalid");
     }
     Ok(Some(record))
+}
+
+pub(crate) fn persist_runtime_custody_creator_listing(
+    data_dir: &Path,
+    mint: &PersistedRuntimeMint,
+    facts: &RuntimeCustodyLibraryPublishFacts,
+    publisher_principal_id: &str,
+    terminal: &RuntimeMintCreatorTerminalEvidence,
+) -> anyhow::Result<()> {
+    let mint_id = mint.draft().mint_id();
+    let expected = RuntimeCustodyListingRecord {
+        schema: RUNTIME_LISTING_SCHEMA_V1.to_string(),
+        mint_id: hex::encode(mint_id.as_bytes()),
+        content_id: facts.content_id.clone(),
+        content_access_id: format!(
+            "0x{}",
+            hex::encode(mint.draft().content_access_id().as_bytes())
+        ),
+        cid: facts.content_cid.clone(),
+        metadata_cid: terminal.metadata_cid().to_string(),
+        token_uri: terminal.token_uri().to_string(),
+        publisher_principal_id: publisher_principal_id.to_string(),
+        seller_address: terminal.seller().to_string(),
+        chain_namespace: terminal.chain_namespace().to_string(),
+        network: terminal.network().to_string(),
+        ledger: terminal.ledger().to_string(),
+        token_id: terminal.token_id().to_string(),
+        operative: terminal.operative().to_string(),
+        price: terminal.price().to_string(),
+        pay_token: terminal.pay_token().to_string(),
+        payment_processor: terminal.payment_processor().map(str::to_string),
+        buyer_principal_id: None,
+        published_at: crate::auth::now_ts(),
+        bought_at: None,
+    };
+    if let Some(existing) = load_runtime_custody_listing(data_dir, mint_id)? {
+        if existing.schema == expected.schema
+            && existing.mint_id == expected.mint_id
+            && existing.content_id == expected.content_id
+            && existing.content_access_id == expected.content_access_id
+            && existing.cid == expected.cid
+            && existing.metadata_cid == expected.metadata_cid
+            && existing.token_uri == expected.token_uri
+            && existing.publisher_principal_id == expected.publisher_principal_id
+            && existing
+                .seller_address
+                .eq_ignore_ascii_case(&expected.seller_address)
+            && existing.chain_namespace == expected.chain_namespace
+            && existing.network == expected.network
+            && existing.ledger.eq_ignore_ascii_case(&expected.ledger)
+            && existing.token_id.eq_ignore_ascii_case(&expected.token_id)
+            && existing.operative.eq_ignore_ascii_case(&expected.operative)
+            && existing.price == expected.price
+            && existing.pay_token.eq_ignore_ascii_case(&expected.pay_token)
+            && existing
+                .payment_processor
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                == expected
+                    .payment_processor
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+            && existing.buyer_principal_id.is_none()
+            && existing.bought_at.is_none()
+        {
+            return Ok(());
+        }
+        anyhow::bail!("Runtime custody listing is invalid");
+    }
+    persist_runtime_custody_listing(data_dir, &expected)
 }
 
 fn load_runtime_custody_purchase(

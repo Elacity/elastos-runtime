@@ -360,12 +360,21 @@ enum ObjectProviderRequest {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 enum LibraryPublishProtectionRequest {
-    RuntimeCustody { mime_type: String, codecs: String },
+    RuntimeCustody {
+        mime_type: String,
+        codecs: String,
+        wallet_account_id: String,
+        copies: String,
+        price: String,
+    },
 }
 
 struct LoadedRuntimeCustodyPublishInput {
     mime_type: String,
     codecs: String,
+    wallet_account_id: String,
+    copies: String,
+    price: String,
     clear_init_segment: Vec<u8>,
     clear_segments: Vec<Vec<u8>>,
 }
@@ -424,6 +433,7 @@ impl Provider for ObjectProvider {
                     &uri,
                     if_revision.as_deref(),
                     protection,
+                    None,
                 )
                 .await
             }
@@ -674,6 +684,18 @@ pub async fn handle_object_provider_runtime_request(
     registry: Arc<ProviderRegistry>,
     request: &Value,
 ) -> Value {
+    handle_object_provider_runtime_request_with_gateway(data_dir, registry, request, None).await
+}
+
+pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
+    data_dir: &Path,
+    registry: Arc<ProviderRegistry>,
+    request: &Value,
+    gateway_authority: Option<(
+        &crate::api::gateway::GatewayState,
+        &crate::api::gateway::RuntimeWalletAuthority,
+    )>,
+) -> Value {
     let request = match serde_json::from_value::<ObjectProviderRequest>(request.clone()) {
         Ok(request) => request,
         Err(err) => return provider_error("invalid_request", &err.to_string()),
@@ -702,6 +724,7 @@ pub async fn handle_object_provider_runtime_request(
                 &uri,
                 if_revision.as_deref(),
                 protection,
+                gateway_authority,
             )
             .await
         }
@@ -1907,25 +1930,38 @@ async fn library_publish(
     uri: &str,
     if_revision: Option<&str>,
     protection: Option<LibraryPublishProtectionRequest>,
+    gateway_authority: Option<(
+        &crate::api::gateway::GatewayState,
+        &crate::api::gateway::RuntimeWalletAuthority,
+    )>,
 ) -> anyhow::Result<Value> {
     let target = library_target(data_dir, principal_id, uri)?;
     check_revision(data_dir, principal_id, &target.uri, if_revision)?;
     if let Some(protection) = protection {
         let loaded =
             validate_runtime_custody_publish_input(data_dir, principal_id, &target, protection)?;
-        let facts = crate::protected_content_runtime::publish_runtime_custody_library_object(
-            data_dir,
+        let runtime_input = crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
+            object_uri: target.uri.clone(),
+            principal_id: principal_id.to_string(),
+            mime_type: loaded.mime_type,
+            codecs: loaded.codecs,
+            wallet_account_id: loaded.wallet_account_id,
+            copies: loaded.copies,
+            price: loaded.price,
+            clear_init_segment: loaded.clear_init_segment,
+            clear_segments: loaded.clear_segments,
+            source_storage: published_source_storage(data_dir, principal_id, &target)?.to_string(),
+        };
+        let Some((state, authority)) = gateway_authority else {
+            anyhow::bail!(
+                "Runtime custody creator mint requires verified gateway Wallet authority"
+            );
+        };
+        let facts = crate::api::gateway::runtime_custody_publish_via_gateway(
+            state,
+            authority,
             registry,
-            crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput {
-                object_uri: target.uri.clone(),
-                principal_id: principal_id.to_string(),
-                mime_type: loaded.mime_type,
-                codecs: loaded.codecs,
-                clear_init_segment: loaded.clear_init_segment,
-                clear_segments: loaded.clear_segments,
-                source_storage: published_source_storage(data_dir, principal_id, &target)?
-                    .to_string(),
-            },
+            runtime_input,
         )
         .await?;
         let record = LibraryPublishRecord {
@@ -5890,7 +5926,13 @@ fn validate_runtime_custody_publish_input(
     target: &LibraryTarget,
     protection: LibraryPublishProtectionRequest,
 ) -> anyhow::Result<LoadedRuntimeCustodyPublishInput> {
-    let LibraryPublishProtectionRequest::RuntimeCustody { mime_type, codecs } = protection;
+    let LibraryPublishProtectionRequest::RuntimeCustody {
+        mime_type,
+        codecs,
+        wallet_account_id,
+        copies,
+        price,
+    } = protection;
     validate_runtime_custody_media_declaration(&mime_type, "mime_type")?;
     validate_runtime_custody_media_declaration(&codecs, "codecs")?;
 
@@ -5981,6 +6023,9 @@ fn validate_runtime_custody_publish_input(
     Ok(LoadedRuntimeCustodyPublishInput {
         mime_type,
         codecs,
+        wallet_account_id,
+        copies,
+        price,
         clear_init_segment: clear_init,
         clear_segments,
     })

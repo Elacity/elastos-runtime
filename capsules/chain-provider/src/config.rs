@@ -134,6 +134,8 @@ fn validate_protected_content_creator_mint(network: &ChainNetwork) -> Result<(),
     let Some(mint) = network.protected_content_creator_mint.as_ref() else {
         return Ok(());
     };
+    validate_evm_address(&mint.ledger)?;
+    validate_evm_address(&mint.pay_token)?;
     validate_evm_address(&mint.asset_created_emitter)?;
     Ok(())
 }

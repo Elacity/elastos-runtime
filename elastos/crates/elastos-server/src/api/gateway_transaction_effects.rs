@@ -1675,7 +1675,9 @@ fn validate_transaction_request(
     validate_authority_binding(&transaction_authority(authority)).map_err(internal_error)
 }
 
-fn transaction_request_binding(request: &RuntimeTransactionRequest) -> Value {
+pub(in crate::api::gateway) fn transaction_request_binding(
+    request: &RuntimeTransactionRequest,
+) -> Value {
     canonical_json(json!({
         "source": request.source,
         "account_id": request.account_id,

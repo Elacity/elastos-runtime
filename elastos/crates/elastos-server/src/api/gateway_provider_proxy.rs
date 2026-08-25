@@ -49,6 +49,83 @@ struct LibraryUploadSession {
     updated_at: u64,
 }
 
+const RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE: &str =
+    "Runtime custody creator mint is pending exact Wallet or Chain settlement";
+const RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE: &str =
+    "Runtime custody creator mint is unavailable";
+const RUNTIME_CUSTODY_CREATOR_OP_TYPE_CODE: u16 = 1;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedProtectedContentCreatorMint {
+    schema: String,
+    network: String,
+    chain_namespace: String,
+    function: String,
+    ledger: String,
+    pay_token: String,
+    to: String,
+    data: String,
+    value: String,
+    content_access_id: String,
+    signed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedProtectedContentMintReceipt {
+    schema: String,
+    network: String,
+    chain_id: u64,
+    token_id: String,
+    operative: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedProtectedContentVerifiedListing {
+    schema: String,
+    network: String,
+    chain_id: u64,
+    seller: String,
+    ledger: String,
+    token_id: String,
+    operative: String,
+    quantity: String,
+    price: String,
+    pay_token: String,
+    #[serde(default)]
+    payment_processor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RuntimeCustodyCreatorMetadata<'a> {
+    schema: &'static str,
+    name: &'a str,
+    mime_type: &'a str,
+    codecs: &'a str,
+    encrypted_content_cid: &'a str,
+    content_access_id: String,
+    protected_content_identity: &'a str,
+}
+
+#[derive(Clone)]
+struct RuntimeCustodyCreatorAccount {
+    account_id: String,
+    address: String,
+}
+
+#[derive(Clone)]
+struct RuntimeCustodyCreatorChainPlan {
+    network: String,
+    chain_namespace: String,
+    ledger: String,
+    pay_token: String,
+    to: String,
+    data: String,
+    value: String,
+}
+
 pub(super) async fn gateway_library_upload(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -1363,11 +1440,12 @@ pub(super) async fn gateway_provider_proxy(
         },
         _ => return (StatusCode::NOT_FOUND, "Gateway provider not found").into_response(),
     };
-    let context =
-        match require_home_launch_token_for_any_context(&state.data_dir, &headers, allowed_apps) {
-            Ok(context) => context,
-            Err(err) => return gateway_provider_error_response(&scheme, err),
-        };
+    let required = match require_home_launch_token_binding(&state.data_dir, &headers, allowed_apps)
+    {
+        Ok(required) => required,
+        Err(err) => return gateway_provider_error_response(&scheme, err),
+    };
+    let context = required.context.clone();
     let principal_id = context.principal_id.clone();
     let session_id = context.session_id.clone();
     let registry = match state.provider_registry.as_ref().cloned() {
@@ -1524,10 +1602,21 @@ pub(super) async fn gateway_provider_proxy(
         && (library_operation_needs_runtime_coordinator(&op)
             || library_request_targets_webspace(&request))
     {
-        crate::library::handle_object_provider_runtime_request(
+        let wallet_authority = if op == "publish" && request.get("protection").is_some() {
+            match runtime_wallet_authority(&required) {
+                Ok(authority) => Some(authority),
+                Err(err) => return gateway_provider_error_response(&scheme, err),
+            }
+        } else {
+            None
+        };
+        crate::library::handle_object_provider_runtime_request_with_gateway(
             &state.data_dir,
             Arc::clone(&registry),
             &request,
+            wallet_authority
+                .as_ref()
+                .map(|authority| (&state, authority)),
         )
         .await
     } else {
@@ -1621,6 +1710,473 @@ pub(super) async fn gateway_provider_proxy(
     }
 
     Json(response).into_response()
+}
+
+async fn resolve_runtime_custody_creator_account(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    wallet_account_id: &str,
+) -> anyhow::Result<RuntimeCustodyCreatorAccount> {
+    let accounts = system_wallet_accounts_summary(state, authority).await;
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|account| account.account_id == wallet_account_id)
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    if !account.signing_available || !is_managed_wallet_proof_type(&account.proof_type) {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    validate_wallet_evm_address(&account.address, "creator")
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    Ok(RuntimeCustodyCreatorAccount {
+        account_id: account.account_id.clone(),
+        address: account.address.to_ascii_lowercase(),
+    })
+}
+
+async fn publish_runtime_custody_creator_metadata(
+    registry: &ProviderRegistry,
+    data_dir: &std::path::Path,
+    object_uri: &str,
+    mime_type: &str,
+    codecs: &str,
+    facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+    content_access_id: elastos_protected_content_contracts::ContentAccessIdV1,
+) -> anyhow::Result<(String, String)> {
+    let metadata = RuntimeCustodyCreatorMetadata {
+        schema: "elastos.protected-content.metadata/v1",
+        name: runtime_custody_metadata_name(object_uri),
+        mime_type,
+        codecs,
+        encrypted_content_cid: &facts.content_cid,
+        content_access_id: format!("0x{}", hex::encode(content_access_id.as_bytes())),
+        protected_content_identity: &facts.content_id,
+    };
+    let bytes = serde_json::to_vec(&metadata)?;
+    let parent = data_dir.join("protected-content");
+    std::fs::create_dir_all(&parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix("creator-metadata-")
+        .tempdir_in(&parent)?;
+    std::fs::write(staging.path().join("metadata.json"), bytes)?;
+    let metadata_cid = crate::content::publish_directory_via_provider_with_kind(
+        registry,
+        staging.path(),
+        "directory",
+        None,
+        None,
+    )
+    .await?;
+    Ok((
+        metadata_cid.clone(),
+        format!("ipfs://{metadata_cid}/metadata.json"),
+    ))
+}
+
+fn runtime_custody_metadata_name(object_uri: &str) -> &str {
+    object_uri
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or("protected-content")
+}
+
+fn runtime_custody_creator_effect_binding(
+    request: &RuntimeTransactionRequest,
+) -> anyhow::Result<elastos_protected_content_runtime::RuntimeMintCreatorEffectBinding> {
+    elastos_protected_content_runtime::RuntimeMintCreatorEffectBinding::new(
+        request.effect_id.clone(),
+        wallet_request_id(&request.effect_id, "approval"),
+        request.request_sha256.clone(),
+        request.account_id.clone(),
+        request.address.clone(),
+        request.chain_namespace.clone(),
+        request.network.clone(),
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))
+}
+
+fn runtime_custody_creator_chain_id(chain_namespace: &str) -> anyhow::Result<u64> {
+    chain_namespace
+        .strip_prefix("eip155:")
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))
+}
+
+async fn resolve_runtime_custody_creator_chain_plan(
+    state: &GatewayState,
+    creator_state: &elastos_protected_content_runtime::RuntimeMintCreatorState,
+    creator_address: &str,
+    content_access_id: elastos_protected_content_contracts::ContentAccessIdV1,
+    token_uri: &str,
+) -> anyhow::Result<RuntimeCustodyCreatorChainPlan> {
+    let response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "resolve_protected_content_creator_mint",
+            "creator": creator_address,
+            "token_uri": token_uri,
+            "content_access_id": format!("0x{}", hex::encode(content_access_id.as_bytes())),
+            "copies": creator_state.desired_terms().copies(),
+            "price": creator_state.desired_terms().price(),
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    let resolved: ResolvedProtectedContentCreatorMint = serde_json::from_value(response)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    if resolved.schema != "elastos.chain.protected-content-creator-mint/v1"
+        || resolved.signed
+        || resolved.function != "mint(string,uint16,bytes,bytes)"
+        || !resolved
+            .content_access_id
+            .eq_ignore_ascii_case(&format!("0x{}", hex::encode(content_access_id.as_bytes())))
+        || wallet_chain_namespace_network(&resolved.chain_namespace)
+            != Some(resolved.network.as_str())
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    validate_wallet_evm_address(&resolved.ledger, "creator ledger")
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    validate_wallet_evm_address(&resolved.to, "creator transaction target")
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    validate_wallet_evm_address(&resolved.pay_token, "creator pay token")
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    if !resolved.ledger.eq_ignore_ascii_case(&resolved.to) {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    Ok(RuntimeCustodyCreatorChainPlan {
+        network: resolved.network,
+        chain_namespace: resolved.chain_namespace,
+        ledger: resolved.ledger.to_ascii_lowercase(),
+        pay_token: resolved.pay_token.to_ascii_lowercase(),
+        to: resolved.to.to_ascii_lowercase(),
+        data: resolved.data,
+        value: resolved.value,
+    })
+}
+
+fn runtime_custody_creator_transaction_request(
+    principal_id: &str,
+    creator_account: &RuntimeCustodyCreatorAccount,
+    creator_state: &elastos_protected_content_runtime::RuntimeMintCreatorState,
+    chain_plan: &RuntimeCustodyCreatorChainPlan,
+    mint_id: elastos_protected_content_contracts::Digest32,
+    token_uri: &str,
+) -> anyhow::Result<RuntimeTransactionRequest> {
+    let stable_request = serde_json::json!({
+        "domain": "elastos.protected-content.creator-request/v1",
+        "effect_id": "",
+        "wallet_account_id": creator_account.account_id,
+        "address": creator_account.address,
+        "chain_namespace": chain_plan.chain_namespace,
+        "network": chain_plan.network,
+        "to": chain_plan.to,
+        "value": chain_plan.value,
+        "data": chain_plan.data,
+        "ledger": chain_plan.ledger,
+        "pay_token": chain_plan.pay_token,
+        "metadata_cid": creator_state.metadata_cid(),
+        "token_uri": token_uri,
+        "mint_id": hex::encode(mint_id.as_bytes()),
+        "copies": creator_state.desired_terms().copies(),
+        "price": creator_state.desired_terms().price(),
+    });
+    let request_sha256 = runtime_transaction_request_sha256(&stable_request)?;
+    let mut request = RuntimeTransactionRequest {
+        source: NATIVE_TRANSACTION_SOURCE,
+        effect_id: String::new(),
+        request_sha256,
+        account_id: creator_account.account_id.clone(),
+        address: creator_account.address.clone(),
+        chain_namespace: chain_plan.chain_namespace.clone(),
+        network: chain_plan.network.clone(),
+        to: chain_plan.to.clone(),
+        value: chain_plan.value.clone(),
+        data: chain_plan.data.clone(),
+        approval_reason: "Create protected-content creator listing".to_string(),
+        metadata: serde_json::json!({
+            "product_operation": "protected_content_creator_mint",
+            "ledger": chain_plan.ledger,
+            "pay_token": chain_plan.pay_token,
+            "metadata_cid": creator_state.metadata_cid(),
+            "token_uri": token_uri,
+        }),
+    };
+    let request_binding = transaction_request_binding(&request);
+    request.effect_id = exact_runtime_transaction_effect_id(
+        NATIVE_TRANSACTION_SOURCE,
+        principal_id,
+        &request.request_sha256,
+        &request_binding,
+    )?;
+    Ok(request)
+}
+
+async fn finalize_runtime_custody_creator_listing(
+    state: &GatewayState,
+    creator_state: &elastos_protected_content_runtime::RuntimeMintCreatorState,
+    creator_address: &str,
+    chain_plan: &RuntimeCustodyCreatorChainPlan,
+    transaction_hash: &str,
+) -> anyhow::Result<elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence> {
+    let receipt_response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "resolve_protected_content_mint_receipt",
+            "network": chain_plan.network,
+            "hash": transaction_hash,
+            "creator": creator_address,
+            "ledger": chain_plan.ledger,
+            "token_uri": creator_state.token_uri(),
+            "op_type_code": RUNTIME_CUSTODY_CREATOR_OP_TYPE_CODE,
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    let receipt: ResolvedProtectedContentMintReceipt = serde_json::from_value(receipt_response)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+
+    let listing_response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "resolve_protected_content_verified_listing",
+            "network": chain_plan.network,
+            "seller": creator_address,
+            "ledger": chain_plan.ledger,
+            "token_id": receipt.token_id,
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    let listing: ResolvedProtectedContentVerifiedListing = serde_json::from_value(listing_response)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    validate_runtime_custody_creator_terminal_bindings(
+        creator_state,
+        creator_address,
+        chain_plan,
+        &receipt,
+        &listing,
+    )?;
+    elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence::new(
+        creator_state.metadata_cid(),
+        creator_state.token_uri(),
+        creator_address,
+        &chain_plan.chain_namespace,
+        &chain_plan.network,
+        &chain_plan.ledger,
+        listing.token_id,
+        listing.operative,
+        listing.price,
+        listing.pay_token,
+        listing
+            .payment_processor
+            .map(|value| value.to_ascii_lowercase()),
+        transaction_hash,
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))
+}
+
+fn validate_runtime_custody_creator_terminal_bindings(
+    creator_state: &elastos_protected_content_runtime::RuntimeMintCreatorState,
+    creator_address: &str,
+    chain_plan: &RuntimeCustodyCreatorChainPlan,
+    receipt: &ResolvedProtectedContentMintReceipt,
+    listing: &ResolvedProtectedContentVerifiedListing,
+) -> anyhow::Result<()> {
+    let expected_chain_id = runtime_custody_creator_chain_id(&chain_plan.chain_namespace)?;
+    if receipt.schema != "elastos.chain.protected-content-mint-receipt/v1"
+        || receipt.network != chain_plan.network
+        || receipt.chain_id != expected_chain_id
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    if listing.schema != "elastos.chain.protected-content-verified-listing/v1"
+        || listing.network != chain_plan.network
+        || listing.chain_id != expected_chain_id
+        || listing.chain_id != receipt.chain_id
+        || !listing.seller.eq_ignore_ascii_case(creator_address)
+        || !listing.ledger.eq_ignore_ascii_case(&chain_plan.ledger)
+        || !listing.token_id.eq_ignore_ascii_case(&receipt.token_id)
+        || !listing.operative.eq_ignore_ascii_case(&receipt.operative)
+        || listing.quantity != creator_state.desired_terms().copies()
+        || listing.price != creator_state.desired_terms().price()
+        || !listing
+            .pay_token
+            .eq_ignore_ascii_case(&chain_plan.pay_token)
+    {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    Ok(())
+}
+
+pub(crate) async fn runtime_custody_publish_via_gateway(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    registry: Arc<ProviderRegistry>,
+    input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
+) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
+    let facts = crate::protected_content_runtime::publish_runtime_custody_library_object(
+        &state.data_dir,
+        Arc::clone(&registry),
+        input.clone(),
+    )
+    .await?;
+    runtime_custody_publish_creator_tail_from_facts(state, authority, registry, input, facts).await
+}
+
+async fn runtime_custody_publish_creator_tail_from_facts(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    registry: Arc<ProviderRegistry>,
+    input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
+    facts: crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
+    let creator_account =
+        resolve_runtime_custody_creator_account(state, authority, &input.wallet_account_id).await?;
+    let desired_terms = elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
+        input.wallet_account_id.clone(),
+        input.copies.clone(),
+        input.price.clone(),
+    )
+    .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    let mint_journal = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir);
+    let mut mint = mint_journal
+        .load(facts.mint_id)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    if let Some(existing) = mint.creator_state() {
+        if existing.desired_terms() != &desired_terms {
+            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        }
+        if let Some(terminal) = existing.terminal() {
+            if !terminal
+                .seller()
+                .eq_ignore_ascii_case(&creator_account.address)
+            {
+                anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+            }
+            crate::protected_content_runtime::persist_runtime_custody_creator_listing(
+                &state.data_dir,
+                &mint,
+                &facts,
+                &input.principal_id,
+                terminal,
+            )?;
+            return Ok(facts);
+        }
+    }
+    let creator_state = match mint.creator_state().cloned() {
+        Some(existing) => existing,
+        None => {
+            let (metadata_cid, token_uri) = publish_runtime_custody_creator_metadata(
+                registry.as_ref(),
+                &state.data_dir,
+                &input.object_uri,
+                &input.mime_type,
+                &input.codecs,
+                &facts,
+                mint.draft().content_access_id(),
+            )
+            .await?;
+            let creator_state = elastos_protected_content_runtime::RuntimeMintCreatorState::new(
+                desired_terms.clone(),
+                metadata_cid,
+                token_uri,
+            )
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+            mint = mint_journal
+                .bind_creator_state(facts.mint_id, creator_state.clone())
+                .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+            creator_state
+        }
+    };
+    let chain_plan = resolve_runtime_custody_creator_chain_plan(
+        state,
+        &creator_state,
+        &creator_account.address,
+        mint.draft().content_access_id(),
+        creator_state.token_uri(),
+    )
+    .await?;
+    let request = runtime_custody_creator_transaction_request(
+        &input.principal_id,
+        &creator_account,
+        &creator_state,
+        &chain_plan,
+        facts.mint_id,
+        creator_state.token_uri(),
+    )?;
+    let effect_binding = runtime_custody_creator_effect_binding(&request)?;
+    if let Some(existing) = mint.creator_state().and_then(|state| state.effect()) {
+        if existing != &effect_binding {
+            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        }
+    } else {
+        mint_journal
+            .bind_creator_effect(facts.mint_id, effect_binding.clone())
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    }
+    let approval = ensure_exact_runtime_transaction_approval(state, authority, request.clone())
+        .await
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+    let completion = match complete_runtime_transaction_effect(
+        state,
+        authority,
+        RuntimeTransactionLookup::ApprovalId(effect_binding.approval_request_id()),
+        Some(&request),
+        None,
+    )
+    .await
+    {
+        Ok(completion) => completion,
+        Err((status, message))
+            if status == StatusCode::BAD_REQUEST
+                && message == "transaction approval is not completed" =>
+        {
+            let _ = approval;
+            anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+        }
+        Err((_, message)) => return Err(anyhow::anyhow!(message)),
+    };
+    if completion.receipt.is_none() {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+    }
+    if completion.completion_pending {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_PENDING_MESSAGE);
+    }
+    if completion.completion_error.is_some() {
+        anyhow::bail!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+    }
+    let terminal = finalize_runtime_custody_creator_listing(
+        state,
+        &creator_state,
+        &creator_account.address,
+        &chain_plan,
+        &completion.transaction_hash,
+    )
+    .await?;
+    mint = mint_journal
+        .mark_creator_completed(facts.mint_id, terminal.clone())
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE))?;
+    crate::protected_content_runtime::persist_runtime_custody_creator_listing(
+        &state.data_dir,
+        &mint,
+        &facts,
+        &input.principal_id,
+        &terminal,
+    )?;
+    Ok(facts)
+}
+
+#[cfg(test)]
+pub(crate) async fn runtime_custody_publish_creator_tail_for_test(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    registry: Arc<ProviderRegistry>,
+    input: crate::protected_content_runtime::RuntimeCustodyLibraryPublishInput,
+    facts: crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts> {
+    runtime_custody_publish_creator_tail_from_facts(state, authority, registry, input, facts).await
 }
 
 pub(super) fn provider_proxy_runtime_metadata_field(request: &serde_json::Value) -> Option<&str> {
@@ -1749,4 +2305,201 @@ fn library_events_sse_event(payload: serde_json::Value) -> SseEvent {
         r#"{"schema":"elastos.library.events/v1","status":"error","events":[]}"#.to_string()
     });
     SseEvent::default().event("library-events").data(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_creator_state() -> elastos_protected_content_runtime::RuntimeMintCreatorState {
+        let desired_terms = elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
+            "wallet-account-1".to_string(),
+            "0x2".to_string(),
+            "0x5".to_string(),
+        )
+        .unwrap();
+        elastos_protected_content_runtime::RuntimeMintCreatorState::new(
+            desired_terms,
+            "bafycreatorcid".to_string(),
+            "ipfs://bafymetadata/metadata.json".to_string(),
+        )
+        .unwrap()
+    }
+
+    fn test_chain_plan() -> RuntimeCustodyCreatorChainPlan {
+        RuntimeCustodyCreatorChainPlan {
+            network: "base-mainnet".to_string(),
+            chain_namespace: "eip155:8453".to_string(),
+            ledger: "0x00000000000000000000000000000000000000aa".to_string(),
+            pay_token: "0x00000000000000000000000000000000000000bb".to_string(),
+            to: "0x00000000000000000000000000000000000000cc".to_string(),
+            data: "0x1234".to_string(),
+            value: "0x0".to_string(),
+        }
+    }
+
+    fn test_receipt(chain_id: u64) -> ResolvedProtectedContentMintReceipt {
+        ResolvedProtectedContentMintReceipt {
+            schema: "elastos.chain.protected-content-mint-receipt/v1".to_string(),
+            network: "base-mainnet".to_string(),
+            chain_id,
+            token_id: "0x77".to_string(),
+            operative: "0x00000000000000000000000000000000000000dd".to_string(),
+        }
+    }
+
+    fn test_listing(chain_id: u64) -> ResolvedProtectedContentVerifiedListing {
+        ResolvedProtectedContentVerifiedListing {
+            schema: "elastos.chain.protected-content-verified-listing/v1".to_string(),
+            network: "base-mainnet".to_string(),
+            chain_id,
+            seller: "0x00000000000000000000000000000000000000ee".to_string(),
+            ledger: "0x00000000000000000000000000000000000000aa".to_string(),
+            token_id: "0x77".to_string(),
+            operative: "0x00000000000000000000000000000000000000dd".to_string(),
+            quantity: "0x2".to_string(),
+            price: "0x5".to_string(),
+            pay_token: "0x00000000000000000000000000000000000000bb".to_string(),
+            payment_processor: Some("0x00000000000000000000000000000000000000ff".to_string()),
+        }
+    }
+
+    #[test]
+    fn runtime_custody_creator_terminal_bindings_accept_exact_chain_identity() {
+        let creator_state = test_creator_state();
+        let chain_plan = test_chain_plan();
+        let receipt = test_receipt(8453);
+        let listing = test_listing(8453);
+
+        assert!(validate_runtime_custody_creator_terminal_bindings(
+            &creator_state,
+            "0x00000000000000000000000000000000000000ee",
+            &chain_plan,
+            &receipt,
+            &listing,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn runtime_custody_creator_terminal_bindings_accept_normalized_price_terms() {
+        let creator_state = elastos_protected_content_runtime::RuntimeMintCreatorState::new(
+            elastos_protected_content_runtime::RuntimeMintCreatorDesiredTerms::new(
+                "wallet-account-1",
+                "0x02",
+                "0x05",
+            )
+            .unwrap(),
+            "bafycreatorcid",
+            "ipfs://bafycreatorcid/metadata.json",
+        )
+        .unwrap();
+        let chain_plan = test_chain_plan();
+        let receipt = test_receipt(8453);
+        let listing = test_listing(8453);
+
+        assert!(validate_runtime_custody_creator_terminal_bindings(
+            &creator_state,
+            "0x00000000000000000000000000000000000000ee",
+            &chain_plan,
+            &receipt,
+            &listing,
+        )
+        .is_ok());
+        assert_eq!(creator_state.desired_terms().copies(), "0x2");
+        assert_eq!(creator_state.desired_terms().price(), "0x5");
+    }
+
+    #[test]
+    fn runtime_custody_creator_request_uses_canonical_exact_effect_identity() {
+        let creator_state = test_creator_state();
+        let chain_plan = test_chain_plan();
+        let creator_account = RuntimeCustodyCreatorAccount {
+            account_id: "wallet:eip155:8453:0x00000000000000000000000000000000000000ee".to_string(),
+            address: "0x00000000000000000000000000000000000000ee".to_string(),
+        };
+        let request = runtime_custody_creator_transaction_request(
+            "did:key:z6Mkcreatorprincipal1111111111111111111111111111111",
+            &creator_account,
+            &creator_state,
+            &chain_plan,
+            elastos_protected_content_contracts::Digest32::new([0x77; 32]),
+            creator_state.token_uri(),
+        )
+        .unwrap();
+        let request_binding = transaction_request_binding(&request);
+        let expected = exact_runtime_transaction_effect_id(
+            NATIVE_TRANSACTION_SOURCE,
+            "did:key:z6Mkcreatorprincipal1111111111111111111111111111111",
+            &request.request_sha256,
+            &request_binding,
+        )
+        .unwrap();
+        assert_eq!(request.effect_id, expected);
+        assert!(request.metadata.get("method").is_none());
+        assert_eq!(
+            request
+                .metadata
+                .get("product_operation")
+                .and_then(|value| value.as_str()),
+            Some("protected_content_creator_mint")
+        );
+    }
+
+    #[test]
+    fn runtime_custody_creator_terminal_bindings_reject_mismatched_evidence_fields() {
+        let cases: &[fn(
+            &mut ResolvedProtectedContentMintReceipt,
+            &mut ResolvedProtectedContentVerifiedListing,
+            &mut RuntimeCustodyCreatorChainPlan,
+        )] = &[
+            |receipt, _, _| receipt.chain_id = 8454,
+            |_, listing, _| listing.chain_id = 8454,
+            |receipt, _, _| receipt.network = "wrong-mainnet".to_string(),
+            |_, listing, _| listing.network = "wrong-mainnet".to_string(),
+            |_, listing, _| {
+                listing.seller = "0x00000000000000000000000000000000000000aa".to_string()
+            },
+            |_, listing, _| {
+                listing.ledger = "0x00000000000000000000000000000000000000ab".to_string()
+            },
+            |receipt, _, _| receipt.token_id = "0x78".to_string(),
+            |_, listing, _| listing.token_id = "0x78".to_string(),
+            |receipt, _, _| {
+                receipt.operative = "0x00000000000000000000000000000000000000ab".to_string()
+            },
+            |_, listing, _| {
+                listing.operative = "0x00000000000000000000000000000000000000ab".to_string()
+            },
+            |_, listing, _| listing.quantity = "0x0".to_string(),
+            |_, listing, _| listing.quantity = "0x3".to_string(),
+            |_, listing, _| listing.price = "0x6".to_string(),
+            |_, listing, _| {
+                listing.pay_token = "0x00000000000000000000000000000000000000aa".to_string()
+            },
+            |_, _, chain_plan| {
+                chain_plan.ledger = "0x00000000000000000000000000000000000000ab".to_string()
+            },
+            |_, _, chain_plan| {
+                chain_plan.pay_token = "0x00000000000000000000000000000000000000aa".to_string()
+            },
+        ];
+
+        for mutate in cases {
+            let creator_state = test_creator_state();
+            let mut chain_plan = test_chain_plan();
+            let mut receipt = test_receipt(8453);
+            let mut listing = test_listing(8453);
+            mutate(&mut receipt, &mut listing, &mut chain_plan);
+            let err = validate_runtime_custody_creator_terminal_bindings(
+                &creator_state,
+                "0x00000000000000000000000000000000000000ee",
+                &chain_plan,
+                &receipt,
+                &listing,
+            )
+            .unwrap_err();
+            assert_eq!(err.to_string(), RUNTIME_CUSTODY_CREATOR_UNAVAILABLE_MESSAGE);
+        }
+    }
 }

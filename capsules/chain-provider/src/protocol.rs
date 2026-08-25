@@ -77,6 +77,8 @@ pub(super) struct RightsMethod {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ProtectedContentCreatorMintMethod {
+    pub(super) ledger: String,
+    pub(super) pay_token: String,
     pub(super) asset_created_emitter: String,
     pub(super) abi: ProtectedContentCreatorMintAbi,
 }
@@ -106,25 +108,6 @@ impl ProtectedContentCreatorMintAbi {
 pub(super) struct ProtectedContentMarketMethod {
     pub(super) authority_gateway_contract: String,
     pub(super) evidence_rpc_urls: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ProtectedContentMintOpRaw {
-    pub(super) metadata_uri: String,
-    pub(super) addresses: Vec<String>,
-    pub(super) role_types: Vec<u64>,
-    pub(super) amounts: Vec<String>,
-    #[serde(default)]
-    pub(super) reseller_cut: Option<u16>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ProtectedContentMintSell {
-    pub(super) copies: String,
-    pub(super) price: String,
-    pub(super) pay_token: String,
 }
 
 impl RightsMethod {
@@ -262,17 +245,11 @@ pub(super) enum Request {
         action: ProtectedContentPolicyAction,
     },
     ResolveProtectedContentCreatorMint {
-        network: String,
-        ledger: String,
+        creator: String,
         token_uri: String,
-        op_type_code: u16,
         content_access_id: String,
-        #[serde(default)]
-        value: Option<String>,
-        #[serde(default)]
-        op_raw: Option<ProtectedContentMintOpRaw>,
-        #[serde(default)]
-        sell: Option<ProtectedContentMintSell>,
+        copies: String,
+        price: String,
     },
     ResolveProtectedContentMintReceipt {
         network: String,

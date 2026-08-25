@@ -41,6 +41,16 @@ const PROVIDER_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
 const NODE_LIFECYCLE_CONTROL_REASON: &str =
     "node lifecycle control requires an operator-approved supervisor";
 const MAX_PROTECTED_CONTENT_RUNTIME_OPERATION_BYTES: usize = 16384;
+// Source-backed first creator mode for protected content:
+// - BUY_ONCE op type 1
+// - ACCESS_TOKEN role 1
+// - ROYALTY_SHARE role 2
+// - creator royalty 950 tenths of a percent (95%), matching the public PC2
+//   default where the protocol retains 5%
+const PROTECTED_CONTENT_CREATOR_BUY_ONCE_OP_TYPE: u16 = 1;
+const PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE: u64 = 1;
+const PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE: u64 = 2;
+const PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT: &str = "0x3b6";
 
 struct ChainProvider {
     networks: Vec<ChainNetwork>,
@@ -147,23 +157,17 @@ impl ChainProvider {
                 action,
             ),
             Request::ResolveProtectedContentCreatorMint {
-                network,
-                ledger,
+                creator,
                 token_uri,
-                op_type_code,
                 content_access_id,
-                value,
-                op_raw,
-                sell,
+                copies,
+                price,
             } => self.resolve_protected_content_creator_mint(
-                &network,
-                &ledger,
+                &creator,
                 &token_uri,
-                op_type_code,
                 &content_access_id,
-                value.as_deref(),
-                op_raw.as_ref(),
-                sell.as_ref(),
+                &copies,
+                &price,
             ),
             Request::ResolveProtectedContentMintReceipt {
                 network,
@@ -995,24 +999,17 @@ impl ChainProvider {
     )]
     fn resolve_protected_content_creator_mint(
         &self,
-        network_id: &str,
-        ledger: &str,
+        creator: &str,
         token_uri: &str,
-        op_type_code: u16,
         content_access_id: &str,
-        value: Option<&str>,
-        op_raw: Option<&ProtectedContentMintOpRaw>,
-        sell: Option<&ProtectedContentMintSell>,
+        copies: &str,
+        price: &str,
     ) -> Response {
-        let network = match self.evm_network(network_id) {
-            Ok(network) => network,
+        let (network, mint) = match self.configured_global_protected_content_creator_mint_source() {
+            Ok(source) => source,
             Err(response) => return response,
         };
-        let mint = match self.configured_protected_content_creator_mint_source(network_id) {
-            Ok(mint) => mint,
-            Err(response) => return response,
-        };
-        if let Err(err) = validate_evm_address(ledger) {
+        if let Err(err) = validate_evm_address(creator) {
             return Response::error("invalid_protected_content_creator_mint_request", &err);
         }
         if token_uri.trim().is_empty() {
@@ -1035,83 +1032,62 @@ impl ChainProvider {
                 return Response::error("invalid_protected_content_creator_mint_request", &err);
             }
         };
-        let value = value.unwrap_or("0x0");
-        if let Err(err) = validate_hex_quantity(value, "value") {
-            return Response::error("invalid_protected_content_creator_mint_request", &err);
-        }
-
-        let (op_raw_bytes, sell_raw_bytes) = if op_type_code == 0 {
-            if op_raw.is_some() || sell.is_some() {
-                return Response::error(
-                    "invalid_protected_content_creator_mint_request",
-                    "free protected-content mint must not carry paid listing terms",
-                );
+        let copies = match normalize_hex_quantity(copies, "copies") {
+            Ok(value) => value,
+            Err(err) => {
+                return Response::error("invalid_protected_content_creator_mint_request", &err);
             }
-            match encode_protected_content_mint_op_raw_free(&content_access_id) {
-                Ok(op_raw) => (op_raw, Vec::new()),
-                Err(err) => {
-                    return Response::error("invalid_protected_content_creator_mint_request", &err);
-                }
-            }
-        } else {
-            let (Some(op_raw), Some(sell)) = (op_raw, sell) else {
-                return Response::error(
-                    "invalid_protected_content_creator_mint_request",
-                    "paid protected-content mint requires op_raw and sell terms",
-                );
-            };
-            let reseller_cut = match (op_type_code, op_raw.reseller_cut) {
-                (1, None) => None,
-                (1, Some(_)) => {
-                    return Response::error(
-                        "invalid_protected_content_creator_mint_request",
-                        "buy_once protected-content mint must not carry reseller_cut",
-                    )
-                }
-                (2, Some(cut)) => Some(cut),
-                (2, None) => {
-                    return Response::error(
-                        "invalid_protected_content_creator_mint_request",
-                        "buy_and_resell protected-content mint requires reseller_cut",
-                    )
-                }
-                _ => {
-                    return Response::error(
-                        "invalid_protected_content_creator_mint_request",
-                        "unsupported protected-content mint op_type_code",
-                    )
-                }
-            };
-            let op_raw_bytes = match encode_protected_content_mint_op_raw_paid(
-                &content_access_id,
-                &op_raw.metadata_uri,
-                &op_raw.addresses,
-                &op_raw.role_types,
-                &op_raw.amounts,
-                reseller_cut,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    return Response::error("invalid_protected_content_creator_mint_request", &err);
-                }
-            };
-            let sell_raw_bytes = match encode_protected_content_sell_raw_data(
-                &sell.copies,
-                &sell.price,
-                &sell.pay_token,
-            ) {
-                Ok(value) => value,
-                Err(err) => {
-                    return Response::error("invalid_protected_content_creator_mint_request", &err);
-                }
-            };
-            (op_raw_bytes, sell_raw_bytes)
         };
+        if copies == "0x0" {
+            return Response::error(
+                "invalid_protected_content_creator_mint_request",
+                "copies must be greater than zero",
+            );
+        }
+        let price = match normalize_hex_quantity(price, "price") {
+            Ok(value) => value,
+            Err(err) => {
+                return Response::error("invalid_protected_content_creator_mint_request", &err);
+            }
+        };
+        if price == "0x0" {
+            return Response::error(
+                "invalid_protected_content_creator_mint_request",
+                "price must be greater than zero",
+            );
+        }
+        let creator = normalize_evm_address(creator);
+        let op_raw_bytes = match encode_protected_content_mint_op_raw_paid(
+            &content_access_id,
+            token_uri,
+            &[creator.clone(), creator.clone()],
+            &[
+                PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE,
+                PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE,
+            ],
+            &[
+                copies.clone(),
+                PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT.to_string(),
+            ],
+            None,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                return Response::error("invalid_protected_content_creator_mint_request", &err);
+            }
+        };
+        let sell_raw_bytes =
+            match encode_protected_content_sell_raw_data(&copies, &price, &mint.pay_token) {
+                Ok(value) => value,
+                Err(err) => {
+                    return Response::error("invalid_protected_content_creator_mint_request", &err);
+                }
+            };
 
         let data = match encode_protected_content_creator_mint_call(
             mint.abi.selector(),
             token_uri,
-            op_type_code,
+            PROTECTED_CONTENT_CREATOR_BUY_ONCE_OP_TYPE,
             &op_raw_bytes,
             &sell_raw_bytes,
         ) {
@@ -1120,14 +1096,23 @@ impl ChainProvider {
                 return Response::error("invalid_protected_content_creator_mint_request", &err)
             }
         };
+        let Some(chain_id) = network.chain_id else {
+            return Response::error(
+                "protected_content_creator_mint_not_configured",
+                "configured protected-content creator mint network is missing chain id",
+            );
+        };
 
         Response::ok(json!({
             "schema": PROTECTED_CONTENT_CREATOR_MINT_SCHEMA,
             "network": network.id,
+            "chain_namespace": format!("eip155:{chain_id}"),
             "function": mint.abi.function(),
-            "to": ledger,
+            "ledger": mint.ledger,
+            "pay_token": mint.pay_token,
+            "to": mint.ledger,
             "data": data,
-            "value": value,
+            "value": "0x0",
             "content_access_id": format!("0x{}", encode_hex(&content_access_id)),
             "signed": false,
         }))
@@ -1372,6 +1357,34 @@ impl ChainProvider {
             },
             "steps": steps,
         }))
+    }
+
+    fn configured_global_protected_content_creator_mint_source(
+        &self,
+    ) -> Result<(&ChainNetwork, &ProtectedContentCreatorMintMethod), Response> {
+        let mut matches = self
+            .networks
+            .iter()
+            .filter(|network| network.kind == ChainKind::EvmJsonRpc)
+            .filter_map(|network| {
+                network
+                    .protected_content_creator_mint
+                    .as_ref()
+                    .map(|mint| (network, mint))
+            });
+        let Some(source) = matches.next() else {
+            return Err(Response::error(
+                "protected_content_creator_mint_not_configured",
+                "no configured protected-content creator mint source is available",
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(Response::error(
+                "ambiguous_protected_content_creator_mint_source",
+                "multiple protected-content creator mint sources are configured",
+            ));
+        }
+        Ok(source)
     }
 
     fn configured_protected_content_creator_mint_source(

@@ -24,11 +24,12 @@ use elastos_protected_content_provider_contracts::{
 };
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::geteuid;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-const STORE_MAGIC: &[u8; 8] = b"epc-mj04";
-const STORE_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-journal/v4";
+const STORE_MAGIC: &[u8; 8] = b"epc-mj05";
+const STORE_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-journal/v5";
 const INTENT_MAGIC: &[u8; 8] = b"epc-mi01";
 const INTENT_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-mint-intent/v1";
 const STORE_LOCK_FILE: &str = "runtime-mint-journal.lock";
@@ -951,12 +952,349 @@ struct MintNodeState {
     receipt: Option<RuntimeMintNodeReceipt>,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMintCreatorDesiredTerms {
+    wallet_account_id: String,
+    copies: String,
+    price: String,
+}
+
+impl RuntimeMintCreatorDesiredTerms {
+    pub fn new(
+        wallet_account_id: impl Into<String>,
+        copies: impl Into<String>,
+        price: impl Into<String>,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        let wallet_account_id = wallet_account_id.into();
+        let copies = normalize_intent_hex_quantity(&copies.into())?;
+        let price = normalize_intent_hex_quantity(&price.into())?;
+        let value = Self {
+            wallet_account_id,
+            copies,
+            price,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        validate_intent_text(&self.wallet_account_id)?;
+        validate_canonical_intent_hex_quantity(&self.copies)?;
+        validate_canonical_intent_hex_quantity(&self.price)?;
+        Ok(())
+    }
+
+    pub fn wallet_account_id(&self) -> &str {
+        &self.wallet_account_id
+    }
+
+    pub fn copies(&self) -> &str {
+        &self.copies
+    }
+
+    pub fn price(&self) -> &str {
+        &self.price
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMintCreatorEffectBinding {
+    effect_id: String,
+    approval_request_id: String,
+    request_sha256: String,
+    account_id: String,
+    address: String,
+    chain_namespace: String,
+    network: String,
+}
+
+impl RuntimeMintCreatorEffectBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        effect_id: impl Into<String>,
+        approval_request_id: impl Into<String>,
+        request_sha256: impl Into<String>,
+        account_id: impl Into<String>,
+        address: impl Into<String>,
+        chain_namespace: impl Into<String>,
+        network: impl Into<String>,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        let value = Self {
+            effect_id: effect_id.into(),
+            approval_request_id: approval_request_id.into(),
+            request_sha256: request_sha256.into(),
+            account_id: account_id.into(),
+            address: address.into(),
+            chain_namespace: chain_namespace.into(),
+            network: network.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        validate_intent_text(&self.effect_id)?;
+        validate_intent_text(&self.approval_request_id)?;
+        validate_intent_text(&self.request_sha256)?;
+        validate_intent_text(&self.account_id)?;
+        validate_intent_text(&self.address)?;
+        validate_intent_text(&self.chain_namespace)?;
+        validate_intent_text(&self.network)?;
+        Ok(())
+    }
+
+    pub fn effect_id(&self) -> &str {
+        &self.effect_id
+    }
+
+    pub fn approval_request_id(&self) -> &str {
+        &self.approval_request_id
+    }
+
+    pub fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn chain_namespace(&self) -> &str {
+        &self.chain_namespace
+    }
+
+    pub fn network(&self) -> &str {
+        &self.network
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMintCreatorTerminalEvidence {
+    metadata_cid: String,
+    token_uri: String,
+    seller: String,
+    chain_namespace: String,
+    network: String,
+    ledger: String,
+    token_id: String,
+    operative: String,
+    price: String,
+    pay_token: String,
+    payment_processor: Option<String>,
+    transaction_hash: String,
+}
+
+impl RuntimeMintCreatorTerminalEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        metadata_cid: impl Into<String>,
+        token_uri: impl Into<String>,
+        seller: impl Into<String>,
+        chain_namespace: impl Into<String>,
+        network: impl Into<String>,
+        ledger: impl Into<String>,
+        token_id: impl Into<String>,
+        operative: impl Into<String>,
+        price: impl Into<String>,
+        pay_token: impl Into<String>,
+        payment_processor: Option<String>,
+        transaction_hash: impl Into<String>,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        let value = Self {
+            metadata_cid: metadata_cid.into(),
+            token_uri: token_uri.into(),
+            seller: seller.into(),
+            chain_namespace: chain_namespace.into(),
+            network: network.into(),
+            ledger: ledger.into(),
+            token_id: token_id.into(),
+            operative: operative.into(),
+            price: price.into(),
+            pay_token: pay_token.into(),
+            payment_processor,
+            transaction_hash: transaction_hash.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        validate_intent_text(&self.metadata_cid)?;
+        validate_intent_text(&self.token_uri)?;
+        validate_intent_text(&self.seller)?;
+        validate_intent_text(&self.chain_namespace)?;
+        validate_intent_text(&self.network)?;
+        validate_intent_text(&self.ledger)?;
+        validate_intent_text(&self.token_id)?;
+        validate_intent_text(&self.operative)?;
+        validate_intent_text(&self.price)?;
+        validate_intent_text(&self.pay_token)?;
+        validate_intent_text(&self.transaction_hash)?;
+        if let Some(payment_processor) = &self.payment_processor {
+            validate_intent_text(payment_processor)?;
+        }
+        Ok(())
+    }
+
+    pub fn metadata_cid(&self) -> &str {
+        &self.metadata_cid
+    }
+
+    pub fn token_uri(&self) -> &str {
+        &self.token_uri
+    }
+
+    pub fn seller(&self) -> &str {
+        &self.seller
+    }
+
+    pub fn chain_namespace(&self) -> &str {
+        &self.chain_namespace
+    }
+
+    pub fn network(&self) -> &str {
+        &self.network
+    }
+
+    pub fn ledger(&self) -> &str {
+        &self.ledger
+    }
+
+    pub fn token_id(&self) -> &str {
+        &self.token_id
+    }
+
+    pub fn operative(&self) -> &str {
+        &self.operative
+    }
+
+    pub fn price(&self) -> &str {
+        &self.price
+    }
+
+    pub fn pay_token(&self) -> &str {
+        &self.pay_token
+    }
+
+    pub fn payment_processor(&self) -> Option<&str> {
+        self.payment_processor.as_deref()
+    }
+
+    pub fn transaction_hash(&self) -> &str {
+        &self.transaction_hash
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeMintCreatorState {
+    desired_terms: RuntimeMintCreatorDesiredTerms,
+    metadata_cid: String,
+    token_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect: Option<RuntimeMintCreatorEffectBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal: Option<RuntimeMintCreatorTerminalEvidence>,
+}
+
+impl RuntimeMintCreatorState {
+    pub fn new(
+        desired_terms: RuntimeMintCreatorDesiredTerms,
+        metadata_cid: impl Into<String>,
+        token_uri: impl Into<String>,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        let value = Self {
+            desired_terms,
+            metadata_cid: metadata_cid.into(),
+            token_uri: token_uri.into(),
+            effect: None,
+            terminal: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), RuntimeMintJournalError> {
+        self.desired_terms.validate()?;
+        validate_intent_text(&self.metadata_cid)?;
+        validate_intent_text(&self.token_uri)?;
+        if let Some(effect) = &self.effect {
+            effect.validate()?;
+        }
+        if let Some(terminal) = &self.terminal {
+            terminal.validate()?;
+            if terminal.metadata_cid != self.metadata_cid || terminal.token_uri != self.token_uri {
+                return Err(RuntimeMintJournalError::InvalidSelection);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn desired_terms(&self) -> &RuntimeMintCreatorDesiredTerms {
+        &self.desired_terms
+    }
+
+    pub fn metadata_cid(&self) -> &str {
+        &self.metadata_cid
+    }
+
+    pub fn token_uri(&self) -> &str {
+        &self.token_uri
+    }
+
+    pub fn effect(&self) -> Option<&RuntimeMintCreatorEffectBinding> {
+        self.effect.as_ref()
+    }
+
+    pub fn terminal(&self) -> Option<&RuntimeMintCreatorTerminalEvidence> {
+        self.terminal.as_ref()
+    }
+
+    pub fn with_effect(
+        mut self,
+        effect: RuntimeMintCreatorEffectBinding,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        if let Some(existing) = &self.effect {
+            if existing != &effect {
+                return Err(RuntimeMintJournalError::Conflict);
+            }
+            return Ok(self);
+        }
+        self.effect = Some(effect);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_terminal(
+        mut self,
+        terminal: RuntimeMintCreatorTerminalEvidence,
+    ) -> Result<Self, RuntimeMintJournalError> {
+        if let Some(existing) = &self.terminal {
+            if existing != &terminal {
+                return Err(RuntimeMintJournalError::Conflict);
+            }
+            return Ok(self);
+        }
+        self.terminal = Some(terminal);
+        self.validate()?;
+        Ok(self)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PersistedRuntimeMint {
     draft: RuntimeMintDraft,
     node_states: Vec<MintNodeState>,
     custody_terminal: Option<RuntimeCustodyTerminalKind>,
     content_availability: Option<RuntimeVerifiedContentAvailability>,
+    creator_state: Option<RuntimeMintCreatorState>,
 }
 
 impl fmt::Debug for PersistedRuntimeMint {
@@ -966,6 +1304,15 @@ impl fmt::Debug for PersistedRuntimeMint {
             .field("mint_id", &self.draft.mint_id)
             .field("custody_terminal", &self.custody_terminal)
             .field("content_availability", &self.content_availability)
+            .field("creator_state_present", &self.creator_state.is_some())
+            .field(
+                "creator_state_terminal",
+                &self
+                    .creator_state
+                    .as_ref()
+                    .and_then(RuntimeMintCreatorState::terminal)
+                    .is_some(),
+            )
             .finish()
     }
 }
@@ -981,6 +1328,10 @@ impl PersistedRuntimeMint {
 
     pub fn content_availability(&self) -> Option<&RuntimeVerifiedContentAvailability> {
         self.content_availability.as_ref()
+    }
+
+    pub fn creator_state(&self) -> Option<&RuntimeMintCreatorState> {
+        self.creator_state.as_ref()
     }
 
     pub fn accepted_orphans(&self) -> Vec<&RuntimeMintNodeReceipt> {
@@ -1047,6 +1398,7 @@ impl RuntimeMintJournal {
                 .collect(),
             custody_terminal: None,
             content_availability: None,
+            creator_state: None,
         };
         self.write_or_replay(&record)
     }
@@ -1334,6 +1686,67 @@ impl RuntimeMintJournal {
         Ok(record)
     }
 
+    pub fn bind_creator_state(
+        &self,
+        mint_id: Digest32,
+        creator_state: RuntimeMintCreatorState,
+    ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut record = self.read_record(mint_id)?;
+        if record.content_availability.is_none()
+            || record.custody_terminal != Some(RuntimeCustodyTerminalKind::CustodyProvisioned)
+        {
+            return Err(RuntimeMintJournalError::Conflict);
+        }
+        match &record.creator_state {
+            Some(existing) if existing != &creator_state => {
+                return Err(RuntimeMintJournalError::Conflict)
+            }
+            Some(_) => return Ok(record),
+            None => {}
+        }
+        record.creator_state = Some(creator_state);
+        self.write_replace(&record)?;
+        Ok(record)
+    }
+
+    pub fn bind_creator_effect(
+        &self,
+        mint_id: Digest32,
+        effect: RuntimeMintCreatorEffectBinding,
+    ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut record = self.read_record(mint_id)?;
+        let creator_state = record
+            .creator_state
+            .take()
+            .ok_or(RuntimeMintJournalError::Conflict)?
+            .with_effect(effect)?;
+        record.creator_state = Some(creator_state);
+        self.write_replace(&record)?;
+        Ok(record)
+    }
+
+    pub fn mark_creator_completed(
+        &self,
+        mint_id: Digest32,
+        terminal: RuntimeMintCreatorTerminalEvidence,
+    ) -> Result<PersistedRuntimeMint, RuntimeMintJournalError> {
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.ensure_root_dir()?;
+        let mut record = self.read_record(mint_id)?;
+        let creator_state = record
+            .creator_state
+            .take()
+            .ok_or(RuntimeMintJournalError::Conflict)?
+            .with_terminal(terminal)?;
+        record.creator_state = Some(creator_state);
+        self.write_replace(&record)?;
+        Ok(record)
+    }
+
     fn ensure_root_dir(&self) -> Result<(), RuntimeMintJournalError> {
         if let Some(parent) = self.root_dir.parent() {
             create_owner_only_directory(parent)?;
@@ -1558,6 +1971,15 @@ fn encode_record(record: &PersistedRuntimeMint) -> Result<Vec<u8>, RuntimeMintJo
             payload.extend_from_slice(evidence.media_manifest_root.as_bytes());
         }
     }
+    match &record.creator_state {
+        None => payload.push(0),
+        Some(creator_state) => {
+            payload.push(1);
+            let bytes =
+                serde_json::to_vec(creator_state).map_err(|_| RuntimeMintJournalError::Corrupt)?;
+            push_nested(&mut payload, &bytes)?;
+        }
+    }
     let digest = {
         let mut hasher = Sha256::new();
         hasher.update(STORE_DIGEST_DOMAIN);
@@ -1683,6 +2105,17 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
         }
         _ => return Err(RuntimeMintJournalError::Corrupt),
     };
+    let creator_state = match read_u8(payload, &mut off)? {
+        0 => None,
+        1 => {
+            let bytes = read_nested(payload, &mut off)?;
+            let creator_state: RuntimeMintCreatorState =
+                serde_json::from_slice(&bytes).map_err(|_| RuntimeMintJournalError::Corrupt)?;
+            creator_state.validate()?;
+            Some(creator_state)
+        }
+        _ => return Err(RuntimeMintJournalError::Corrupt),
+    };
     if off != payload.len() {
         return Err(RuntimeMintJournalError::Corrupt);
     }
@@ -1703,6 +2136,7 @@ fn decode_record(bytes: &[u8]) -> Result<PersistedRuntimeMint, RuntimeMintJourna
         node_states,
         custody_terminal,
         content_availability,
+        creator_state,
     })
 }
 
@@ -1984,6 +2418,64 @@ fn validate_availability_text(value: &str) -> Result<(), RuntimeMintJournalError
 
 fn validate_intent_text(value: &str) -> Result<(), RuntimeMintJournalError> {
     validate_availability_text(value)
+}
+
+fn validate_canonical_intent_hex_quantity(value: &str) -> Result<(), RuntimeMintJournalError> {
+    if normalize_intent_hex_quantity(value)? != value {
+        return Err(RuntimeMintJournalError::InvalidSelection);
+    }
+    Ok(())
+}
+
+fn normalize_intent_hex_quantity(value: &str) -> Result<String, RuntimeMintJournalError> {
+    validate_intent_text(value)?;
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or(RuntimeMintJournalError::InvalidSelection)?;
+    if raw.is_empty() {
+        return Err(RuntimeMintJournalError::InvalidSelection);
+    }
+    let padded = if raw.len() % 2 == 0 {
+        raw.to_string()
+    } else {
+        format!("0{raw}")
+    };
+    let mut decoded = Vec::with_capacity(padded.len() / 2);
+    for chunk in padded.as_bytes().chunks_exact(2) {
+        let high = intent_hex_value(chunk[0]).ok_or(RuntimeMintJournalError::InvalidSelection)?;
+        let low = intent_hex_value(chunk[1]).ok_or(RuntimeMintJournalError::InvalidSelection)?;
+        decoded.push((high << 4) | low);
+    }
+    if decoded.len() > 32 {
+        return Err(RuntimeMintJournalError::InvalidSelection);
+    }
+    let normalized = normalize_intent_hex_quantity_bytes(&decoded);
+    if normalized == "0x0" {
+        return Err(RuntimeMintJournalError::InvalidSelection);
+    }
+    Ok(normalized)
+}
+
+fn normalize_intent_hex_quantity_bytes(bytes: &[u8]) -> String {
+    match bytes.iter().position(|byte| *byte != 0) {
+        Some(index) => {
+            let hex = bytes[index..]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("0x{}", hex.trim_start_matches('0'))
+        }
+        None => "0x0".to_string(),
+    }
+}
+
+fn intent_hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn compute_source_binding_digest(object_uri: &str, source_storage: &str) -> Digest32 {
@@ -2300,6 +2792,41 @@ mod tests {
             digest(receipt_seed),
             draft.encrypted_content().clone(),
             draft.media_identity().media_manifest_root(),
+        )
+        .unwrap()
+    }
+
+    fn creator_desired_terms() -> RuntimeMintCreatorDesiredTerms {
+        RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x3", "0x5").unwrap()
+    }
+
+    fn creator_effect_binding() -> RuntimeMintCreatorEffectBinding {
+        RuntimeMintCreatorEffectBinding::new(
+            "creator-effect-1",
+            "approval-request-1",
+            hex::encode(digest(0x91).as_bytes()),
+            "wallet-account-1",
+            "0x1111111111111111111111111111111111111111",
+            "eip155",
+            "base-mainnet",
+        )
+        .unwrap()
+    }
+
+    fn creator_terminal_evidence() -> RuntimeMintCreatorTerminalEvidence {
+        RuntimeMintCreatorTerminalEvidence::new(
+            "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
+            "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
+            "0x1111111111111111111111111111111111111111",
+            "eip155",
+            "base-mainnet",
+            "elacity",
+            "0x0a",
+            "0x2222222222222222222222222222222222222222",
+            "0x5",
+            "0x3333333333333333333333333333333333333333",
+            Some("0x4444444444444444444444444444444444444444".to_string()),
+            "0x5555555555555555555555555555555555555555555555555555555555555555",
         )
         .unwrap()
     }
@@ -2691,6 +3218,161 @@ mod tests {
             .load(draft.mint_id())
             .unwrap();
         assert_eq!(reloaded.content_availability(), Some(&evidence));
+    }
+
+    #[test]
+    fn creator_state_is_durable_and_exact_restart_safe() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let draft = draft();
+        custody_provision_all(&journal, &draft);
+        let requirement = availability_requirement();
+        let evidence = availability_evidence(&draft, 0x77);
+        journal
+            .mark_content_available(draft.mint_id(), &requirement, evidence)
+            .unwrap();
+
+        let creator_state = RuntimeMintCreatorState::new(
+            creator_desired_terms(),
+            "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
+            "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
+        )
+        .unwrap();
+        let bound = journal
+            .bind_creator_state(draft.mint_id(), creator_state.clone())
+            .unwrap();
+        assert!(bound.creator_state() == Some(&creator_state));
+        assert!(
+            journal
+                .bind_creator_state(draft.mint_id(), creator_state.clone())
+                .unwrap()
+                == bound
+        );
+
+        let with_effect = journal
+            .bind_creator_effect(draft.mint_id(), creator_effect_binding())
+            .unwrap();
+        assert!(
+            with_effect
+                .creator_state()
+                .and_then(RuntimeMintCreatorState::effect)
+                == Some(&creator_effect_binding())
+        );
+
+        let completed = journal
+            .mark_creator_completed(draft.mint_id(), creator_terminal_evidence())
+            .unwrap();
+        assert!(
+            completed
+                .creator_state()
+                .and_then(RuntimeMintCreatorState::terminal)
+                == Some(&creator_terminal_evidence())
+        );
+
+        let reloaded = RuntimeMintJournal::new(&root)
+            .load(draft.mint_id())
+            .unwrap();
+        assert!(reloaded.creator_state() == completed.creator_state());
+    }
+
+    #[test]
+    fn creator_desired_terms_normalize_hex_quantities() {
+        let terms =
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x05", "0x000A").unwrap();
+        assert_eq!(terms.wallet_account_id(), "wallet-account-1");
+        assert_eq!(terms.copies(), "0x5");
+        assert_eq!(terms.price(), "0xa");
+    }
+
+    #[test]
+    fn creator_desired_terms_reject_zero_invalid_and_oversized_quantities() {
+        let oversized = format!("0x1{}", "0".repeat(64));
+        for (copies, price) in [
+            ("0x0", "0x1"),
+            ("0x00", "0x1"),
+            ("", "0x1"),
+            ("1", "0x1"),
+            ("0x", "0x1"),
+            ("0xgg", "0x1"),
+            (oversized.as_str(), "0x1"),
+            ("0x1", "0x0"),
+            ("0x1", ""),
+            ("0x1", "5"),
+            ("0x1", "0x"),
+            ("0x1", "0xgg"),
+            ("0x1", oversized.as_str()),
+        ] {
+            assert!(matches!(
+                RuntimeMintCreatorDesiredTerms::new("wallet-account-1", copies, price),
+                Err(RuntimeMintJournalError::InvalidSelection)
+            ));
+        }
+    }
+
+    #[test]
+    fn creator_state_replay_accepts_equivalent_hex_spellings() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_journal_root(&temp);
+        let journal = RuntimeMintJournal::new(&root);
+        let draft = draft();
+        custody_provision_all(&journal, &draft);
+        let requirement = availability_requirement();
+        let evidence = availability_evidence(&draft, 0x77);
+        journal
+            .mark_content_available(draft.mint_id(), &requirement, evidence)
+            .unwrap();
+
+        let initial_state = RuntimeMintCreatorState::new(
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x02", "0x05").unwrap(),
+            "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
+            "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
+        )
+        .unwrap();
+        let replay_state = RuntimeMintCreatorState::new(
+            RuntimeMintCreatorDesiredTerms::new("wallet-account-1", "0x2", "0x5").unwrap(),
+            "bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y",
+            "ipfs://bafybeifcreatorstatecid4m3z6kz3h6e57u4zylg66szavqixxkzh6g5zk3y/metadata.json",
+        )
+        .unwrap();
+
+        let first = journal
+            .bind_creator_state(draft.mint_id(), initial_state)
+            .unwrap();
+        let replay = journal
+            .bind_creator_state(draft.mint_id(), replay_state.clone())
+            .unwrap();
+        assert!(replay.creator_state() == Some(&replay_state));
+        assert!(first == replay);
+    }
+
+    #[test]
+    fn v5_record_rejects_missing_creator_state_discriminator() {
+        let draft = draft();
+        let record = PersistedRuntimeMint {
+            draft,
+            node_states: Vec::new(),
+            custody_terminal: None,
+            content_availability: None,
+            creator_state: None,
+        };
+        let encoded = encode_record(&record).unwrap();
+        let payload = &encoded[40..];
+        let truncated_payload = &payload[..payload.len() - 1];
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(STORE_DIGEST_DOMAIN);
+            hasher.update(truncated_payload);
+            hasher.finalize()
+        };
+        let mut truncated = Vec::with_capacity(8 + 32 + truncated_payload.len());
+        truncated.extend_from_slice(STORE_MAGIC);
+        truncated.extend_from_slice(&digest);
+        truncated.extend_from_slice(truncated_payload);
+        assert_eq!(
+            decode_record(&truncated),
+            Err(RuntimeMintJournalError::Corrupt)
+        );
     }
 
     #[test]

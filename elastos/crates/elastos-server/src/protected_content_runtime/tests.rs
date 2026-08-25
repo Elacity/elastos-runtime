@@ -796,7 +796,7 @@ fn make_clear_segment(track_id: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn media_components(seed: u8) -> (Vec<u8>, Vec<Vec<u8>>) {
+pub(crate) fn media_components(seed: u8) -> (Vec<u8>, Vec<Vec<u8>>) {
     let ftyp = make_box(b"ftyp", b"isom\0\0\0\0isomiso6");
     let trak_video = make_track(1, b"vide");
     let trak_audio = make_track(2, b"soun");
@@ -1049,8 +1049,23 @@ async fn runtime_custody_prebuy_availability_harness(
             mint_id: hex::encode(mint_draft.mint_id().as_bytes()),
             content_id: super::runtime_protected_content_id(mint_draft.encrypted_content())
                 .unwrap(),
+            content_access_id: format!(
+                "0x{}",
+                hex::encode(mint_draft.content_access_id().as_bytes())
+            ),
             cid: ContentAvailabilityTestProvider::CID.to_string(),
+            metadata_cid: "bafybeicreatormetadata".to_string(),
+            token_uri: "ipfs://bafybeicreatormetadata/metadata.json".to_string(),
             publisher_principal_id: "person:local:creator".to_string(),
+            seller_address: "0x0000000000000000000000000000000000000011".to_string(),
+            chain_namespace: "eip155:8453".to_string(),
+            network: "base-mainnet".to_string(),
+            ledger: "0x0000000000000000000000000000000000000022".to_string(),
+            token_id: "0x1".to_string(),
+            operative: "0x0000000000000000000000000000000000000033".to_string(),
+            price: "0x5".to_string(),
+            pay_token: "0x0000000000000000000000000000000000000033".to_string(),
+            payment_processor: Some("0x0000000000000000000000000000000000000044".to_string()),
             buyer_principal_id: None,
             published_at: fixture_now.saturating_sub(2),
             bought_at: None,
@@ -3787,16 +3802,12 @@ fn unresolved_release_scan_is_empty_without_creating_state() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("data");
     std::fs::create_dir(&data_dir).unwrap();
-    assert!(
-        list_unresolved_runtime_releases(&data_dir)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        unresolved_release_audit_records(&data_dir)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(list_unresolved_runtime_releases(&data_dir)
+        .unwrap()
+        .is_empty());
+    assert!(unresolved_release_audit_records(&data_dir)
+        .unwrap()
+        .is_empty());
     assert!(!data_dir.join("protected-content").exists());
 }
 
@@ -4053,15 +4064,13 @@ async fn inactive_custody_wrapper_status_surface_matches_public_dispatch() {
             "evaluate"
         ])
     );
-    assert!(
-        status["supported_operations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|value| value != "shutdown"
-                && value != "prepare_evidence"
-                && value != "settle_evidence")
-    );
+    assert!(status["supported_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|value| value != "shutdown"
+            && value != "prepare_evidence"
+            && value != "settle_evidence"));
     assert_eq!(status["request_schema"], "req-schema");
     assert_eq!(status["response_schema"], "resp-schema");
 }
@@ -4172,11 +4181,9 @@ async fn inactive_custody_wrapper_rejects_invalid_transport_and_injected_carrier
         }))
         .await
         .unwrap_err();
-    assert!(
-        invalid_transport
-            .to_string()
-            .contains("runtime envelope is invalid")
-    );
+    assert!(invalid_transport
+        .to_string()
+        .contains("runtime envelope is invalid"));
 
     let injected_carrier = provider
         .send_raw(&json!({
@@ -4189,11 +4196,9 @@ async fn inactive_custody_wrapper_rejects_invalid_transport_and_injected_carrier
         }))
         .await
         .unwrap_err();
-    assert!(
-        injected_carrier
-            .to_string()
-            .contains("unsupported injected carrier data")
-    );
+    assert!(injected_carrier
+        .to_string()
+        .contains("unsupported injected carrier data"));
 }
 
 #[tokio::test]
@@ -4654,16 +4659,12 @@ async fn runtime_release_coordinator_process_two_of_three_success_stops_before_t
     assert_eq!(chain1.requests().await.len(), 1);
     assert_eq!(chain2.requests().await.len(), 1);
     assert_eq!(chain3.requests().await.len(), 0);
-    assert!(
-        list_unresolved_runtime_releases(&runtime_data_dir)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        unresolved_release_audit_records(&runtime_data_dir)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(list_unresolved_runtime_releases(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
+    assert!(unresolved_release_audit_records(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
     let terminal_debug = format!(
         "{:?}",
         RuntimeReleaseTerminalResult::ContributionsReady {
@@ -4810,16 +4811,12 @@ async fn runtime_release_coordinator_process_two_of_three_success_stops_before_t
             .contribution_count(),
         0
     );
-    assert!(
-        list_unresolved_runtime_releases(&runtime_data_dir)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        unresolved_release_audit_records(&runtime_data_dir)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(list_unresolved_runtime_releases(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
+    assert!(unresolved_release_audit_records(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
     let beta_terminal_debug = format!(
         "{:?}",
         RuntimeReleaseTerminalResult::RightsDenied {
@@ -4847,8 +4844,8 @@ async fn runtime_release_coordinator_process_two_of_three_success_stops_before_t
 
 #[cfg(unix)]
 #[tokio::test]
-async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_recipient_and_closes_cleanly()
- {
+async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_recipient_and_closes_cleanly(
+) {
     let custody_binary = required_test_binary_path(TEST_CUSTODY_PROVIDER_BIN_ENV);
     let decrypt_binary = required_test_binary_path(TEST_DECRYPT_PROVIDER_BIN_ENV);
     let protect_binary = required_test_binary_path(TEST_PROTECT_PROVIDER_BIN_ENV);
@@ -5378,16 +5375,12 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     assert_eq!(chain1.requests().await.len(), 1);
     assert_eq!(chain2.requests().await.len(), 1);
     assert_eq!(chain3.requests().await.len(), 0);
-    assert!(
-        list_unresolved_runtime_releases(&runtime_data_dir)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        unresolved_release_audit_records(&runtime_data_dir)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(list_unresolved_runtime_releases(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
+    assert!(unresolved_release_audit_records(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
 
     let terminal_receipt = make_signed_terminal_receipt_at(
         &operation,
@@ -5549,16 +5542,12 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         Err(RuntimeOpenError::DecryptResult)
     );
 
-    assert!(
-        list_unresolved_runtime_releases(&runtime_data_dir)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        unresolved_release_audit_records(&runtime_data_dir)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(list_unresolved_runtime_releases(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
+    assert!(unresolved_release_audit_records(&runtime_data_dir)
+        .unwrap()
+        .is_empty());
 
     for fixture in ordered_fixtures {
         fixture
@@ -5661,11 +5650,9 @@ async fn inactive_custody_duplicate_registration_rejects_and_settles_rejected_ch
     let error = register_inactive_custody_provider(&registry, &binary, &data_dir)
         .await
         .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("failed to register inactive custody route")
-    );
+    assert!(error
+        .to_string()
+        .contains("failed to register inactive custody route"));
 
     let pids = read_pids(&pid_file);
     assert_eq!(pids.len(), 2);
@@ -5960,11 +5947,9 @@ fn runtime_protected_content_id_is_exact_lowercase_domain_hash_and_changes_for_m
     assert_eq!(derived, expected);
     assert!(derived.starts_with("content:"));
     assert_eq!(derived.len(), "content:".len() + 64);
-    assert!(
-        derived["content:".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    );
+    assert!(derived["content:".len()..]
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
 
     let changed_digest = EncryptedContentIdentityV1::new(digest(0x42), 2048).unwrap();
     let changed_len = EncryptedContentIdentityV1::new(digest(0x41), 2049).unwrap();
@@ -6048,16 +6033,14 @@ async fn runtime_resolve_rights_policy_recomputes_identity_and_rejects_mismatch(
             )
             .await
             .unwrap();
-        assert!(
-            resolve_runtime_rights_policy(
-                registry.as_ref(),
-                &encrypted_content_identity,
-                access_id,
-                RightsActionV1::View
-            )
-            .await
-            .is_err()
-        );
+        assert!(resolve_runtime_rights_policy(
+            registry.as_ref(),
+            &encrypted_content_identity,
+            access_id,
+            RightsActionV1::View
+        )
+        .await
+        .is_err());
     }
 }
 
@@ -6075,6 +6058,9 @@ async fn runtime_custody_library_publish_fails_closed_without_composition() {
             principal_id: "person:local:runtime-custody-missing-composition".to_string(),
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
             codecs: MEDIA_CODECS_V1.to_string(),
+            wallet_account_id: "wallet-account-1".to_string(),
+            copies: "0x1".to_string(),
+            price: "0x5".to_string(),
             clear_init_segment,
             clear_segments,
             source_storage: "plain_localhost_root".to_string(),
@@ -6124,6 +6110,9 @@ async fn runtime_custody_library_publish_fails_closed_without_device_key() {
             principal_id: "person:local:runtime-custody-missing-device-key".to_string(),
             mime_type: MEDIA_MIME_TYPE_V1.to_string(),
             codecs: MEDIA_CODECS_V1.to_string(),
+            wallet_account_id: "wallet-account-1".to_string(),
+            copies: "0x1".to_string(),
+            price: "0x5".to_string(),
             clear_init_segment,
             clear_segments,
             source_storage: "plain_localhost_root".to_string(),
@@ -6166,6 +6155,9 @@ fn library_publish_test_input(principal_id: &str) -> RuntimeCustodyLibraryPublis
         principal_id: principal_id.to_string(),
         mime_type: MEDIA_MIME_TYPE_V1.to_string(),
         codecs: MEDIA_CODECS_V1.to_string(),
+        wallet_account_id: "wallet-account-1".to_string(),
+        copies: "0x1".to_string(),
+        price: "0x5".to_string(),
         clear_init_segment,
         clear_segments,
         source_storage: "plain_localhost_root".to_string(),
@@ -7197,11 +7189,9 @@ async fn runtime_custody_library_publish_protects_mints_and_records_identity_onl
         status["data"]["published"]["content_security"]["mint_id"],
         mint_id
     );
-    assert!(
-        status["data"]["published"]["content_security"]
-            .get("sealed_object")
-            .is_none()
-    );
+    assert!(status["data"]["published"]["content_security"]
+        .get("sealed_object")
+        .is_none());
 
     let share = harness
         .registry
@@ -7239,6 +7229,9 @@ async fn runtime_custody_library_publish_protects_mints_and_records_identity_onl
                     "mode": "runtime_custody",
                     "mime_type": MEDIA_MIME_TYPE_V1,
                     "codecs": MEDIA_CODECS_V1,
+                    "wallet_account_id": "wallet-account-1",
+                    "copies": "0x1",
+                    "price": "0x5",
                 },
             }),
         )
@@ -7254,6 +7247,9 @@ async fn runtime_custody_library_publish_protects_mints_and_records_identity_onl
         principal_id: harness.creator.clone(),
         mime_type: MEDIA_MIME_TYPE_V1.to_string(),
         codecs: MEDIA_CODECS_V1.to_string(),
+        wallet_account_id: "wallet-account-1".to_string(),
+        copies: "0x1".to_string(),
+        price: "0x5".to_string(),
         clear_init_segment: harness.clear_init.clone(),
         clear_segments: harness.clear_segments.clone(),
         source_storage: "protected_principal_root".to_string(),
@@ -7642,11 +7638,9 @@ async fn runtime_custody_library_buy_binds_wallet_chain_and_marks_listing_buyer_
     assert_eq!(listing["buyer_principal_id"], harness.buyer);
     assert_eq!(listing["availability"]["status"], "buyer_owned");
     assert!(!listings.to_string().contains("sealed"));
-    assert!(
-        !listings
-            .to_string()
-            .contains(&hex::encode(&harness.clear_init))
-    );
+    assert!(!listings
+        .to_string()
+        .contains(&hex::encode(&harness.clear_init)));
 
     let stranger_listings = harness
         .registry

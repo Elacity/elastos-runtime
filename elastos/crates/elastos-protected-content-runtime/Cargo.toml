@@ -12,6 +12,7 @@ elastos-protected-content-contracts = { path = "../elastos-protected-content-con
 elastos-wallet-contract = { path = "../elastos-wallet-contract" }
 hex = "0.4"
 nix = { version = "0.29", features = ["fs", "user"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "1.0"

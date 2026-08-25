@@ -9,7 +9,7 @@ const HOME_LAUNCH_TOKEN_SCHEMA: &str = "elastos.home.launch-token/v4";
 const HOME_LAUNCH_CONTEXT_SCHEMA: &str = "elastos.runtime.browser-launch/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HomeLaunchTokenContext {
+pub(in crate::api) struct HomeLaunchTokenContext {
     pub principal_id: String,
     pub session_id: String,
     pub proof_binding_id: Option<String>,
@@ -94,12 +94,12 @@ pub(in crate::api) struct RequiredHomeLaunchToken {
 
 /// Runtime-owned Wallet authority produced only after launch-token validation.
 #[derive(Debug, Clone)]
-pub(in crate::api) struct RuntimeWalletAuthority {
+pub(crate) struct RuntimeWalletAuthority {
     context: VerifiedWalletInvocationContext,
 }
 
 impl RuntimeWalletAuthority {
-    pub(in crate::api) fn verified_context(&self) -> &VerifiedWalletInvocationContext {
+    pub(crate) fn verified_context(&self) -> &VerifiedWalletInvocationContext {
         &self.context
     }
 
@@ -163,7 +163,7 @@ fn home_launch_cookie_header(
     HeaderValue::from_str(&value).map_err(|err| anyhow::anyhow!("invalid Set-Cookie header: {err}"))
 }
 
-pub(crate) fn local_home_launch_token_context(
+pub(in crate::api) fn local_home_launch_token_context(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<HomeLaunchTokenContext> {
     let (_signing_key, did) = elastos_identity::load_or_create_did(data_dir)?;
@@ -220,7 +220,7 @@ pub(crate) fn issue_home_launch_token_for_auth_grant(
     )
 }
 
-pub(crate) fn issue_home_launch_token_with_context(
+pub(in crate::api) fn issue_home_launch_token_with_context(
     data_dir: &std::path::Path,
     app: &str,
     context: &HomeLaunchTokenContext,
@@ -228,7 +228,7 @@ pub(crate) fn issue_home_launch_token_with_context(
     issue_home_launch_token_at(data_dir, &HomeLaunchContext::direct(app), context, now_ts())
 }
 
-pub(crate) fn issue_home_projection_launch_token_with_context(
+pub(in crate::api) fn issue_home_projection_launch_token_with_context(
     data_dir: &std::path::Path,
     selected_resource: &str,
     executable_actor: &str,
