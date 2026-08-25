@@ -13,7 +13,7 @@ mod record;
 mod sink;
 
 pub use level::Level;
-pub use logger::{emit, enabled, init, level, Logger};
+pub use logger::{emit, emit_as, enabled, init, level, Logger};
 pub use record::{now_rfc3339, LogRecord};
 pub use sink::{FileSink, LogSink, StderrSink, StdoutSink, VecSink};
 
@@ -38,6 +38,12 @@ pub fn fp(value: &str) -> String {
 /// (lazy), so a suppressed TRACE costs one integer compare.
 #[macro_export]
 macro_rules! log_at {
+    ($level:expr, component: $component:expr, $($arg:tt)*) => {{
+        let __lvl = $level;
+        if $crate::enabled(__lvl) {
+            $crate::emit_as(__lvl, $component, module_path!(), &format!($($arg)*));
+        }
+    }};
     ($level:expr, $($arg:tt)*) => {{
         let __lvl = $level;
         if $crate::enabled(__lvl) {
@@ -80,8 +86,10 @@ mod macro_tests {
         ));
         crate::log_trace!("hidden {}", 1); // Trace < Info → dropped
         crate::log_warn!("shown {}", 2); // Warn >= Info → kept
+        crate::log_warn!(component: "auth", "override {}", 3); // per-surface component
         let lines = sink.lines();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("WARN test: shown 2"));
+        assert!(lines[1].contains("WARN auth: override 3"));
     }
 }
