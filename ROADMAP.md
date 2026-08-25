@@ -391,6 +391,13 @@ Marketplace is a catalog over signed capsule packages. Remote mutation waits
 for package identity, publisher trust, interface compatibility, applicable
 rights, and rollback receipts.
 
+Free games, GGUF models, and similar downloads should enter as signed content
+capsules identified by bundle CID. A community-controlled ElastOS catalog can
+index those CIDs while availability providers retain and replicate the bytes.
+External repositories such as Hugging Face belong behind optional gateway
+provider capsules that import approved artifacts into the same native content
+path. They must not become direct Home URLs or a parallel install system.
+
 ### Identity evolution
 
 Keep `did:key` as the device and node foundation, not the human account root.

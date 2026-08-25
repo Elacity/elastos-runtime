@@ -68,6 +68,24 @@ elastos setup --with site-provider --with tunnel-provider --with cloudflared
 elastos setup --with kubo --with ipfs-provider
 ```
 
+## Setup and content Get are different operations
+
+`elastos setup` is an operator/bootstrap path for installing the selected
+Runtime profile from a trusted release. It is not the product contract for a
+Home content catalog.
+
+Downloadable games, GGUF models, and similar data should be published as signed
+content capsules identified by the CID of their complete bundle. Home `Get`
+will request a typed Runtime operation that verifies, fetches, pins, and admits
+that exact capsule through the content and availability providers. A service
+offer is needed only for a running provider capability, not for the content
+package itself.
+
+Until that Get contract is implemented and verified, raw `url` entries and
+setup-only model downloads remain operator provisioning details. They must not
+be projected as remotely installable Home catalog items. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 ## Manual bootstrap
 
 Use an explicit gateway only when the publisher URL is unavailable or when

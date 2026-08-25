@@ -4,6 +4,12 @@ Protected content is Runtime-mediated. App, viewer, and content capsules ask to
 open an object; they do not receive raw wallet, chain, IPFS, Elacity, or key
 authority.
 
+Protected and free content use the same content-capsule identity and
+availability path. The protected variant adds encrypted payload, rights,
+key-release, and decrypt contracts; it does not introduce another catalog,
+download rail, or transport identity. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 The contract is:
 
 `capsule -> runtime capability -> elastos://drm/open -> drm-provider -> rights/key/decrypt providers`

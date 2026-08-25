@@ -202,6 +202,22 @@ authority. Package roles, types, execution ABIs, and checked authoring examples
 belong in [CAPSULE_AUTHORING.md](CAPSULE_AUTHORING.md). All capsule effects
 still cross Runtime authority checks.
 
+### Content capsule distribution
+
+Games, local model files, and similar downloadable data are content capsules.
+Their stable identity is the CID of the complete immutable bundle. Signed
+catalog entries point to that identity, availability receipts state who retains
+it, and Runtime records local admission. None of those projections is a service
+offer.
+
+Home asks Runtime to Get an exact content capsule. Runtime verifies the caller
+and publisher, selects content and availability providers, fetches and pins the
+CID, admits it atomically, and writes a receipt. External repositories remain
+behind gateway provider capsules. They may import approved bytes into this
+normal content path but may not become ambient capsule networking or a second
+install rail. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 ### Boundary decisions
 
 These decisions keep the layers from collapsing into one another:

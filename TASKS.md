@@ -272,6 +272,33 @@ section if a higher section is incoherent, unverified, or too large to review.
   2. Runtime: signed bundle identity, whole-package verification, interface/version contracts, install receipts, update policy
   3. Carrier: package/update distribution and peer discovery for trusted sources
   4. Blockchain: publisher identity, provenance receipts, and optional license/payment hooks without making token mechanics the core model
+- [ ] Define the free content-capsule Get slice before adding Store or
+  Marketplace UI. Games and GGUFs use signed `role=content`, `type=data`
+  capsules identified by complete bundle CID. Home requests a typed Runtime
+  operation; content and availability providers fetch and pin; Runtime verifies
+  and atomically admits the capsule and writes install/removal receipts.
+- [ ] Make one canonical signed content package record feed trusted-source
+  bootstrap, the available-content projection, and installed inventory. Do not
+  add a third registry beside the current duplicate `components.json`
+  `capsules` and `external` shapes. Keep raw URL model entries setup-only until
+  they are repackaged as content capsules.
+- [ ] Use the existing trusted publisher as the bounded bootstrap availability
+  source while the network matures, without changing content identity away from
+  CID. Keep large GGUF bytes out of Git history; review their manifests,
+  provenance, licenses, and catalog records in source.
+- [ ] For the first additional `gba-*` content capsule, propose a small
+  `feat/gba-<slug>-content` branch from `upstream/0.7-dev` and obtain the
+  operator's required base confirmation before creating it. Keep that slice to
+  the licensed content bundle, manifest, provenance, shared-viewer binding, and
+  verification. It must not depend on Home recovery PR #23, parked model-provider
+  PR #17, Store UI, paid rights, or dKMS; catalog/Get integration is a separate
+  Runtime slice.
+- [ ] Defer direct Hugging Face catalog integration. If approved later, build a
+  dedicated gateway provider capsule that resolves an immutable external
+  revision, verifies license/source/hash/size, packages it as an ElastOS content
+  capsule, publishes it through the normal content/availability providers, and
+  returns the CID and receipts. Prefer an ElastOS-native community-controlled
+  model catalog; never give ordinary capsules ambient Hugging Face access.
 - [ ] Keep Marketplace remote install/update/uninstall gated until the signed install contract exists. Marketplace may browse installed and verified Runtime apps, show details, and open installed Home launch targets, but remote actions need signed app manifests, publisher identity, install/update/removal receipts, provider policy, payment receipts where required, dDRM rights/key/decrypt policy, and Home/capsule change events before one-click install is exposed. Loose repo/dev folders can remain Home/dev targets, but they must not be presented as remotely installable Marketplace apps.
 - [ ] Do not prioritize rich DRM economics, DeFi/BtcFi, Android box specifics, or literal Capsule-NFT mechanics before the package identity, principal, space, and provider contracts are real.
 

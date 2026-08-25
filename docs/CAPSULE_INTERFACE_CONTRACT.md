@@ -110,6 +110,14 @@ the installed `components.json`. Missing or invalid `components.json` fails
 closed. Checked-in source directories never make a capsule installed,
 launchable, or invokable.
 
+This endpoint is the installed product inventory, not a global network catalog.
+A future Home Get projection may list signed content-capsule entries that are
+not yet installed, but each row must point to the canonical signed manifest and
+bundle CID. Runtime owns the typed Get operation, package verification, atomic
+admission, receipt, and inventory refresh. The projection must not call setup or
+download helpers directly or keep another package database. See
+[Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md).
+
 Home summary embeds those two projections and derives every capsule launcher
 target from the catalog. Content with a bound viewer is launchable through that
 viewer. People is a normal catalog-backed app capsule at `/apps/people/`; shells

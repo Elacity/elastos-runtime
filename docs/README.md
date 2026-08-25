@@ -23,6 +23,8 @@ Each top-level ledger has one job:
 - [Namespaces](NAMESPACES.md): `localhost://`, `elastos://`, and principal roots
 - [Carrier](CARRIER.md): endpoint-authenticated communication and content transport
 - [Content availability](CONTENT_AVAILABILITY.md): CID, IPLD, availability, and replication
+- [Content capsule distribution](CONTENT_CAPSULE_DISTRIBUTION.md): games,
+  models, Get, bootstrap sources, and external gateways
 - [People and conversations](PEOPLE_CONVERSATIONS.md): profiles, contacts,
   discovery, and current Chat integration
 - [Design system](DESIGN_SYSTEM.md): first-party visual and interaction contract
