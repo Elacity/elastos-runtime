@@ -35,7 +35,8 @@ pub async fn run_serve(
         crate::print_first_run_welcome(&data_dir);
     }
 
-    eprintln!(
+    log_info!(
+        component: LOG_COMPONENT,
         "ElastOS Runtime v{} starting on {}",
         crate::ELASTOS_VERSION,
         addr
@@ -271,8 +272,9 @@ pub async fn run_serve(
                     )
                     .await;
 
-                eprintln!(
-                    "[serve] WASM capsule '{}' with resource bridge active",
+                log_info!(
+                    component: LOG_COMPONENT,
+                    "WASM capsule '{}' with resource bridge active",
                     manifest.name
                 );
 
@@ -286,7 +288,7 @@ pub async fn run_serve(
                 let handle =
                     run_result.map_err(|e| anyhow::anyhow!("WASM capsule failed: {}", e))?;
 
-                eprintln!("[serve] WASM capsule '{}' exited", handle.manifest.name);
+                log_info!(component: LOG_COMPONENT, "WASM capsule '{}' exited", handle.manifest.name);
                 return Ok(());
             }
         }
@@ -442,11 +444,11 @@ pub async fn run_serve(
     };
     let coords_path = crate::runtime_control::runtime_coord_path(&data_dir);
     if let Err(e) = crate::runtime_control::write_runtime_coords(&coords_path, &coords) {
-        eprintln!("[serve] Warning: failed to write runtime coords: {}", e);
+        log_warn!(component: LOG_COMPONENT, "failed to write runtime coords: {}", e);
     } else if runtime_kind == crate::runtime_control::RUNTIME_KIND_MANAGED_CHAT {
-        eprintln!("[serve] Managed chat runtime ready");
+        log_info!(component: LOG_COMPONENT, "Managed chat runtime ready");
     } else {
-        eprintln!("[serve] Attach commands (elastos chat, elastos run) ready");
+        log_info!(component: LOG_COMPONENT, "Attach commands (elastos chat, elastos run) ready");
     }
 
     {

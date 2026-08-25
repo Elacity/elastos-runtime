@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+use elastos_logger::log_warn;
+
+const LOG_COMPONENT: &str = "share";
+
 use elastos_server::content::{
     fetch_bytes_via_provider, parse_content_object_manifest, verify_content_object_file,
     ContentObjectManifest, CONTENT_OBJECT_MANIFEST_PATH,
@@ -138,7 +142,7 @@ pub async fn run_share(
 
     tokio::signal::ctrl_c().await?;
     if let Err(err) = tunnel.shutdown().await {
-        eprintln!("Warning: failed to stop public share cleanly: {}", err);
+        log_warn!(component: LOG_COMPONENT, "failed to stop public share cleanly: {}", err);
     }
     Ok(())
 }

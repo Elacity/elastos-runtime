@@ -108,7 +108,7 @@ async fn run_microvm_via_operator_runtime(
     capsule_args: &[String],
 ) -> anyhow::Result<()> {
     let coords = operator_runtime_coords().await?;
-    eprintln!("[run] Attaching to runtime at {}", coords.api_url);
+    log_info!(component: LOG_COMPONENT, "Attaching to runtime at {}", coords.api_url);
 
     let tokens = crate::runtime_control::attach_to_runtime(&coords).await?;
     let client = reqwest::Client::new();
@@ -142,7 +142,7 @@ async fn run_microvm_via_operator_runtime(
     }
 
     let handle = body["handle"].as_str().unwrap_or("?").to_string();
-    eprintln!("[run] MicroVM '{}' launched: {}", manifest.name, handle);
+    log_info!(component: LOG_COMPONENT, "MicroVM '{}' launched: {}", manifest.name, handle);
     let saved = crate::runtime_control::enable_host_raw_mode_pub();
     tokio::signal::ctrl_c().await?;
     drop(saved);
@@ -161,8 +161,9 @@ async fn run_component_via_operator_runtime(
     capsule_args: Vec<String>,
 ) -> anyhow::Result<()> {
     let coords = operator_runtime_coords().await?;
-    eprintln!(
-        "[run] Component capsule attached to runtime at {}",
+    log_info!(
+        component: LOG_COMPONENT,
+        "Component capsule attached to runtime at {}",
         coords.api_url
     );
 
@@ -198,7 +199,7 @@ async fn run_component_via_operator_runtime(
         .run_local(capsule_dir, capsule_args)
         .await
         .map_err(|e| anyhow::anyhow!("Component capsule failed: {}", e))?;
-    eprintln!("[run] Component capsule '{}' exited", handle.manifest.name);
+    log_info!(component: LOG_COMPONENT, "Component capsule '{}' exited", handle.manifest.name);
     Ok(())
 }
 

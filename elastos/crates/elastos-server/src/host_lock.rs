@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
+use elastos_logger::log_critical;
 use serde::{Deserialize, Serialize};
+
+const LOG_COMPONENT: &str = "lock";
 
 #[derive(Debug)]
 pub struct HostProcessGuard {
@@ -173,7 +176,7 @@ pub fn spawn_installed_binary_supersession_watch(data_dir: &Path, role: &str) {
         loop {
             interval.tick().await;
             if let Some(reason) = watch.superseded_reason() {
-                eprintln!("[{}] {}", role, reason);
+                log_critical!(component: LOG_COMPONENT, "[{}] {}", role, reason);
                 std::process::exit(75);
             }
         }

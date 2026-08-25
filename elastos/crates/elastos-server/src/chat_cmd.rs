@@ -3,10 +3,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io::IsTerminal, io::Read, io::Write};
 
+use elastos_logger::log_warn;
 use elastos_server::sources::{
     default_data_dir, load_trusted_sources, normalize_gateways, TrustedSource, TrustedSourcesConfig,
 };
 use sha2::{Digest, Sha256};
+
+const LOG_COMPONENT: &str = "chat";
 
 const CHAT_TOPIC: &str = "#general";
 const PRESENCE_ATTACH_RETRY_BACKOFF: Duration = Duration::from_secs(12);
@@ -597,11 +600,11 @@ async fn run_native_chat_with_runtime(
         if let Err(err) =
             leave_chat_topic(&client, api, client_token, &peer_cap, &discovery_topic).await
         {
-            eprintln!("[chat] cleanup failed: {}", err);
+            log_warn!(component: LOG_COMPONENT, "cleanup failed: {}", err);
         }
     }
     if let Err(err) = leave_chat_topic(&client, api, client_token, &peer_cap, CHAT_TOPIC).await {
-        eprintln!("[chat] cleanup failed: {}", err);
+        log_warn!(component: LOG_COMPONENT, "cleanup failed: {}", err);
     }
 
     return_to_home_if_requested(home_requested)?;

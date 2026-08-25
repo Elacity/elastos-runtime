@@ -4,9 +4,12 @@ use crate::crypto::{decode_did_key, encode_did_key};
 use crate::ipfs::{collect_files_for_ipfs, find_viewer_dir};
 use crate::sources::default_data_dir;
 use ed25519_dalek::{Signer, Verifier};
+use elastos_logger::log_warn;
 use elastos_runtime::signature;
 use sha2::Digest;
 use std::path::PathBuf;
+
+const LOG_COMPONENT: &str = "share";
 
 // --- Share catalog types ---
 
@@ -622,7 +625,7 @@ pub async fn publish_channel_head_via_provider(
     ) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Warning: head creation failed: {}", e);
+            log_warn!(component: LOG_COMPONENT, "head creation failed: {}", e);
             return None;
         }
     };
@@ -640,7 +643,7 @@ pub async fn publish_channel_head_via_provider(
             Some(hcid)
         }
         Err(e) => {
-            eprintln!("Warning: head publish failed: {}", e);
+            log_warn!(component: LOG_COMPONENT, "head publish failed: {}", e);
             None
         }
     }

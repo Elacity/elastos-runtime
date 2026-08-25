@@ -844,8 +844,9 @@ impl Supervisor {
                 return Ok(capsule_dir);
             }
 
-            eprintln!(
-                "  Refreshing cached capsule '{}' (registry CID changed or cache metadata missing)...",
+            log_info!(
+                component: LOG_COMPONENT,
+                "Refreshing cached capsule '{}' (registry CID changed or cache metadata missing)...",
                 name
             );
             let _ = tokio::fs::remove_dir_all(&capsule_dir).await;
@@ -1065,8 +1066,9 @@ impl Supervisor {
                         Some(session.token)
                     }
                     None => {
-                        eprintln!(
-                            "[supervisor] Warning: no session registry, capsule '{}' gets no token",
+                        log_warn!(
+                            component: LOG_COMPONENT,
+                            "no session registry, capsule '{}' gets no token",
                             name
                         );
                         None
@@ -1181,9 +1183,12 @@ impl Supervisor {
             .await
             .map_err(|e| anyhow::anyhow!("VM boot failed for '{}': {}", name, e))?;
 
-        eprintln!(
-            "[supervisor] Launched VM '{}': handle={} vsock_cid={}",
-            name, handle, cid
+        log_info!(
+            component: LOG_COMPONENT,
+            "Launched VM '{}': handle={} vsock_cid={}",
+            name,
+            handle,
+            cid
         );
 
         // Register provider route using guest IP (TCP bridge over TAP)
@@ -1263,8 +1268,9 @@ impl Supervisor {
             )
             .await;
 
-        eprintln!(
-            "[supervisor] Launched carrier service '{}': handle={} binary={}",
+        log_info!(
+            component: LOG_COMPONENT,
+            "Launched carrier service '{}': handle={} binary={}",
             name,
             handle,
             binary_path.display()
@@ -1339,7 +1345,7 @@ impl Supervisor {
             }
         }
 
-        eprintln!("[supervisor] Stopped capsule handle={}", handle);
+        log_info!(component: LOG_COMPONENT, "Stopped capsule handle={}", handle);
         Ok(())
     }
 
@@ -1363,16 +1369,21 @@ impl Supervisor {
                 let code = match vm.wait_for_exit().await {
                     Ok(status) => {
                         let code = status.code().unwrap_or(-1);
-                        eprintln!(
-                            "[supervisor] Capsule '{}' (handle={}) exited with code {}",
-                            capsule.name, handle, code
+                        log_info!(
+                            component: LOG_COMPONENT,
+                            "Capsule '{}' (handle={}) exited with code {}",
+                            capsule.name,
+                            handle,
+                            code
                         );
                         code
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[supervisor] Error waiting for capsule '{}': {}",
-                            capsule.name, e
+                        log_warn!(
+                            component: LOG_COMPONENT,
+                            "Error waiting for capsule '{}': {}",
+                            capsule.name,
+                            e
                         );
                         bail!("VM wait failed for '{}': {}", capsule.name, e);
                     }
@@ -1390,9 +1401,11 @@ impl Supervisor {
             CapsuleBackend::HostProcess => {
                 // Carrier services are background services — they don't "exit".
                 // Waiting on them is a no-op; they run until stopped.
-                eprintln!(
-                    "[supervisor] Carrier service '{}' (handle={}) — wait is a no-op",
-                    capsule.name, handle
+                log_info!(
+                    component: LOG_COMPONENT,
+                    "Carrier service '{}' (handle={}) — wait is a no-op",
+                    capsule.name,
+                    handle
                 );
                 0
             }
