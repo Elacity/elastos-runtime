@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use elastos_logger::log_info;
+
+const LOG_COMPONENT: &str = "run";
+
 pub async fn run_capsule(
     path: Option<PathBuf>,
     cid: Option<String>,
@@ -58,7 +62,7 @@ async fn resolve_capsule_dir(
     cid: Option<String>,
 ) -> anyhow::Result<PathBuf> {
     if let Some(cid) = cid {
-        tracing::info!("Running capsule from CID: {}", cid);
+        log_info!(component: LOG_COMPONENT, "Running capsule from CID: {}", cid);
         let content_registry = crate::get_content_registry().await?;
         return elastos_server::content::prepare_capsule_from_content_provider(
             &content_registry,
@@ -68,7 +72,7 @@ async fn resolve_capsule_dir(
     }
 
     if let Some(path) = path {
-        tracing::info!("Running capsule from: {}", path.display());
+        log_info!(component: LOG_COMPONENT, "Running capsule from: {}", path.display());
         return Ok(path);
     }
 

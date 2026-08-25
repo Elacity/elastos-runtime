@@ -11,12 +11,15 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use elastos_common::localhost::{publisher_release_head_path, publisher_release_manifest_path};
+use elastos_logger::log_trace;
 
 use crate::crypto::{verify_release_envelope, verify_release_envelope_against_dids};
 use crate::sources::{
     default_data_dir, default_install_path, load_trusted_sources, normalize_gateways,
     save_trusted_sources, TrustedSource,
 };
+
+const LOG_COMPONENT: &str = "update";
 
 /// Async callback for fetching content by CID from the trusted source.
 /// The caller decides whether any explicit transport override is allowed.
@@ -83,7 +86,7 @@ pub async fn try_gateway_head_discovery(
 
     for gw in publisher_gateways {
         let url = format!("{}/release-head.json", gw.trim_end_matches('/'));
-        tracing::debug!("update: trying explicit transport override: {}", gw);
+        log_trace!(component: LOG_COMPONENT, "update: trying explicit transport override: {}", gw);
         let resp = match client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {

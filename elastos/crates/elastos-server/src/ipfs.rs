@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use base64::Engine;
 
+use elastos_logger::log_info;
 use elastos_runtime::provider;
+
+const LOG_COMPONENT: &str = "ipfs";
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IpfsStatus {
@@ -311,7 +314,8 @@ pub async fn prepare_capsule_from_cid(
         .validate()
         .map_err(|e| anyhow::anyhow!("Invalid manifest from CID {}: {}", cid, e))?;
 
-    tracing::info!(
+    log_info!(
+        component: LOG_COMPONENT,
         "Loading capsule '{}' ({:?}) from CID",
         manifest.name,
         manifest.capsule_type

@@ -27,6 +27,7 @@ use crate::api::middleware::{
 };
 use crate::api::routes;
 use crate::runtime::Runtime;
+use elastos_logger::log_info;
 use elastos_runtime::capability::evaluator::ShellPassthroughVerifier;
 use elastos_runtime::capability::{
     AutoGrantVerifier, CapabilityManager, PendingRequestStore, PolicyEvaluator, RulesVerifier,
@@ -34,6 +35,8 @@ use elastos_runtime::capability::{
 use elastos_runtime::namespace::NamespaceStore;
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::SessionRegistry;
+
+const LOG_COMPONENT: &str = "gw";
 
 /// Middleware that sets Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers.
 /// Required for SharedArrayBuffer (used by threaded WASM like mgba-wasm).
@@ -92,7 +95,7 @@ impl Drop for HostHelperProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        tracing::info!("{} host helper stopped", self.name);
+        log_info!(component: LOG_COMPONENT, "{} host helper stopped", self.name);
     }
 }
 
@@ -145,7 +148,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
 
     let policy_evaluator = match shadow_mode.as_str() {
         "rules" => {
-            tracing::info!("Shadow verification enabled (RulesVerifier)");
+            log_info!(component: LOG_COMPONENT, "Shadow verification enabled (RulesVerifier)");
             Arc::new(PolicyEvaluator::with_shadow(
                 Box::new(ShellPassthroughVerifier),
                 Box::new(RulesVerifier::with_defaults()),
@@ -153,7 +156,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             ))
         }
         "1" | "true" | "yes" | "on" => {
-            tracing::info!("Shadow verification enabled (AutoGrantVerifier)");
+            log_info!(component: LOG_COMPONENT, "Shadow verification enabled (AutoGrantVerifier)");
             Arc::new(PolicyEvaluator::with_shadow(
                 Box::new(ShellPassthroughVerifier),
                 Box::new(AutoGrantVerifier),
@@ -470,12 +473,12 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             .with_state(test_state);
 
         app = app.merge(test_routes);
-        tracing::info!("Test endpoints enabled (debug build)");
+        log_info!(component: LOG_COMPONENT, "Test endpoints enabled (debug build)");
     }
 
     // Add data capsule file serving at /capsule-data/ if data_dir is provided
     if let Some(ref dir) = data_dir {
-        tracing::info!("Serving capsule data from: {}", dir.display());
+        log_info!(component: LOG_COMPONENT, "Serving capsule data from: {}", dir.display());
         let data_serve = ServeDir::new(dir);
         app = app.nest_service("/capsule-data", data_serve);
     }
@@ -483,7 +486,7 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
     // Add static file serving for web capsules if directory is provided
     let has_capsule = capsule_dir.is_some();
     if let Some(dir) = capsule_dir {
-        tracing::info!("Serving web capsule from: {}", dir.display());
+        log_info!(component: LOG_COMPONENT, "Serving web capsule from: {}", dir.display());
         let serve_dir = ServeDir::new(&dir).append_index_html_on_directories(true);
         app = app.fallback_service(serve_dir);
     }
@@ -497,9 +500,13 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
     // Start server with or without TLS
     if let Some(tls_config) = tls_config {
         let socket_addr: std::net::SocketAddr = addr.parse()?;
-        tracing::info!("API server listening on https://{} (TLS + sessions)", addr);
+        log_info!(
+            component: LOG_COMPONENT,
+            "API server listening on https://{} (TLS + sessions)",
+            addr
+        );
         if has_capsule {
-            tracing::info!("Web capsule available at https://{}", addr);
+            log_info!(component: LOG_COMPONENT, "Web capsule available at https://{}", addr);
         }
         // Signal readiness before blocking on serve (TLS bind is implicit)
         if let Some(tx) = ready_tx {
@@ -510,9 +517,13 @@ pub async fn start_server_with_sessions(config: ServerConfig) -> anyhow::Result<
             .await?;
     } else {
         let listener = TcpListener::bind(&addr).await?;
-        tracing::info!("API server listening on http://{} (sessions enabled)", addr);
+        log_info!(
+            component: LOG_COMPONENT,
+            "API server listening on http://{} (sessions enabled)",
+            addr
+        );
         if has_capsule {
-            tracing::info!("Web capsule available at http://{}", addr);
+            log_info!(component: LOG_COMPONENT, "Web capsule available at http://{}", addr);
         }
         // Signal readiness after successful bind, before blocking on serve
         if let Some(tx) = ready_tx {

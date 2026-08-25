@@ -33,6 +33,7 @@ use std::sync::Arc;
 use trust_cmd::KeysCommand;
 
 pub(crate) use chat_cmd::request_attached_capability;
+use elastos_logger::{log_info, log_warn};
 use elastos_runtime::{bootstrap, provider, session};
 #[cfg(test)]
 pub(crate) use elastos_server::binaries::verify_component_binary_with_data_dir;
@@ -1713,8 +1714,8 @@ async fn serve_web_capsule(
             } else {
                 elastos_server::ipfs::find_viewer_dir(viewer_path)?
             };
-            tracing::info!("Viewer capsule: {}", viewer_dir.display());
-            tracing::info!("Data capsule: {}", capsule_dir.display());
+            log_info!("Viewer capsule: {}", viewer_dir.display());
+            log_info!("Data capsule: {}", capsule_dir.display());
             (viewer_dir, Some(capsule_dir.clone()))
         }
         None => (capsule_dir.clone(), None),
@@ -1765,7 +1766,7 @@ async fn serve_web_capsule(
             .spawn()
         {
             Ok(child) => {
-                tracing::info!(
+                log_info!(
                     "Spawned shell capsule (PID {}, mode={})",
                     child.id().unwrap_or(0),
                     shell_mode
@@ -1773,12 +1774,12 @@ async fn serve_web_capsule(
                 Some(child)
             }
             Err(e) => {
-                tracing::warn!("Failed to spawn shell capsule: {}", e);
+                log_warn!("Failed to spawn shell capsule: {}", e);
                 None
             }
         }
     } else {
-        tracing::info!("Shell capsule not found, skipping spawn");
+        log_info!("Shell capsule not found, skipping spawn");
         None
     };
 
@@ -2147,14 +2148,14 @@ pub(crate) async fn create_runtime(
         match CrosvmProvider::new(CrosvmConfig::default()) {
             Ok(provider) => {
                 if let Err(e) = provider.init().await {
-                    tracing::warn!("Failed to initialize crosvm provider: {}", e);
+                    log_warn!("Failed to initialize crosvm provider: {}", e);
                 } else {
-                    tracing::info!("crosvm provider enabled (KVM available)");
+                    log_info!("crosvm provider enabled (KVM available)");
                     compute_providers.push(Arc::new(provider));
                 }
             }
             Err(e) => {
-                tracing::warn!("crosvm provider not available: {}", e);
+                log_warn!("crosvm provider not available: {}", e);
             }
         }
     }

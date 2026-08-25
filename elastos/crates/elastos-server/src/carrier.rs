@@ -45,7 +45,8 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+
+use elastos_logger::{fp, log_info, log_trace, log_warn};
 
 use elastos_common::localhost::{
     publisher_artifacts_path, publisher_install_script_path, publisher_publish_state_path,
@@ -60,6 +61,8 @@ use elastos_runtime::provider::{
 use crate::content::{ContentObjectManifest, CONTENT_OBJECT_MANIFEST_PATH};
 use crate::operator_control::{OperatorHandler, OperatorRuntimeContext, OPERATOR_ALPN};
 use crate::sources::TrustedSource;
+
+const LOG_COMPONENT: &str = "carrier";
 
 const CARRIER_ALPN: &[u8] = b"elastos/carrier/1";
 const BROWSER_CARRIER_STREAM_SCHEMA: &str = "elastos.browser.carrier-stream/v1";
@@ -317,7 +320,10 @@ impl CarrierNode {
             let _ = task.await;
         }
         if let Err(err) = self.gossip.shutdown().await {
-            tracing::warn!(error = %err, "carrier gossip shutdown failed during runtime shutdown");
+            log_warn!(
+                component: LOG_COMPONENT,
+                "carrier gossip shutdown failed during runtime shutdown: {err}"
+            );
         }
         self.endpoint.close().await;
     }
@@ -461,12 +467,14 @@ fn add_ticket_endpoints(
         }
         added.push(peer_id.clone());
         if mark_bootstrap {
-            info!(
+            log_info!(
+                component: LOG_COMPONENT,
                 "carrier: added bootstrap peer {} to address book",
                 &peer_id[..12]
             );
         } else {
-            debug!(
+            log_trace!(
+                component: LOG_COMPONENT,
                 "carrier: remembered peer {} for DHT rendezvous",
                 &peer_id[..12]
             );
@@ -556,7 +564,7 @@ async fn connect_ticket_endpoints(
                 }
             }
             Err(e) => {
-                debug!("carrier: connect to {} failed: {}", addr.id, e);
+                log_trace!(component: LOG_COMPONENT, "carrier: connect to {} failed: {}", addr.id, e);
             }
         }
     }
@@ -671,12 +679,14 @@ async fn join_gossip_topic_direct(
     }
     let topic = topic_hash(topic_name);
     if bootstrap_peers.is_empty() {
-        info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "carrier: gossip_join '{}' direct mode with 0 bootstrap peer(s)",
             topic_name
         );
     } else {
-        info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "carrier: gossip_join '{}' with {} bootstrap peer(s)",
             topic_name,
             bootstrap_peers.len()
@@ -739,7 +749,8 @@ async fn join_gossip_topic(
         TOPIC_DISCOVERY_SECRET.to_vec(),
         TopicTrackerConfig::default(),
     );
-    info!(
+    log_info!(
+        component: LOG_COMPONENT,
         "carrier: gossip_join '{}' via DHT auto-discovery ({} connected bootstrap peer(s))",
         topic_name,
         bootstrap_peers.len()
@@ -832,7 +843,7 @@ pub async fn start_carrier_node_with_registry(
             let config = iroh::RelayConfig::new(url.into(), Some(Default::default()));
             builder =
                 builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([config])));
-            info!("carrier: using custom relay {}", relay_url);
+            log_info!(component: LOG_COMPONENT, "carrier: using custom relay {}", relay_url);
         }
     }
     let endpoint = match builder
@@ -863,7 +874,7 @@ pub async fn start_carrier_node_with_registry(
                 .add(mdns);
         }
     } else {
-        info!("carrier: mDNS discovery disabled by ELASTOS_CARRIER_MDNS");
+        log_info!(component: LOG_COMPONENT, "carrier: mDNS discovery disabled by ELASTOS_CARRIER_MDNS");
     }
 
     // Add MemoryLookup for explicit peer addresses (--connect tickets)
@@ -922,13 +933,22 @@ pub async fn start_carrier_node_with_registry(
                 .iter()
                 .filter(|a| matches!(a, iroh::TransportAddr::Ip(_)))
                 .count();
-            info!(
+            log_info!(
+                component: LOG_COMPONENT,
                 "carrier: online {} (port {}, {} relay, {} direct)",
-                did, bound_port, relay_count, ip_count
+                fp(did),
+                bound_port,
+                relay_count,
+                ip_count
             );
         }
         Err(_) => {
-            info!("carrier: online {} (port {}, no relay)", did, bound_port);
+            log_info!(
+                component: LOG_COMPONENT,
+                "carrier: online {} (port {}, no relay)",
+                fp(did),
+                bound_port
+            );
         }
     }
 
@@ -936,13 +956,15 @@ pub async fn start_carrier_node_with_registry(
         let mut state = gossip_state.lock().await;
         match join_gossip_topic(&mut state, CHAT_DISCOVERY_TOPIC_GENERAL, true).await {
             Ok(()) => {
-                info!(
+                log_info!(
+                    component: LOG_COMPONENT,
                     "carrier: trusted source discovery topic '{}' ready",
                     CHAT_DISCOVERY_TOPIC_GENERAL
                 );
             }
             Err(err) => {
-                tracing::warn!(
+                log_warn!(
+                    component: LOG_COMPONENT,
                     "carrier: failed to join trusted source discovery topic '{}': {}",
                     CHAT_DISCOVERY_TOPIC_GENERAL,
                     err
@@ -1031,7 +1053,7 @@ async fn handle_file_connection(
             )
             .await
             {
-                debug!("carrier file stream error: {:#}", e);
+                log_trace!(component: LOG_COMPONENT, "carrier file stream error: {:#}", e);
             }
         });
     }
@@ -1095,7 +1117,7 @@ async fn handle_file_stream(
                 )
                 .await?;
             }
-            info!("carrier: served release_head");
+            log_info!(component: LOG_COMPONENT, "carrier: served release_head");
         }
         "file" => {
             let path = &msg.path;
@@ -1130,7 +1152,7 @@ async fn handle_file_stream(
             send.write_all(&content).await?;
             send.finish()?;
             send.stopped().await.ok();
-            info!("carrier: served file {} ({} bytes)", path, len);
+            log_info!(component: LOG_COMPONENT, "carrier: served file {} ({} bytes)", path, len);
         }
         "content_fetch" => {
             let Some(registry) = provider_registry.and_then(|registry| registry.upgrade()) else {
@@ -1161,7 +1183,8 @@ async fn handle_file_stream(
                     send.write_all(&content).await?;
                     send.finish()?;
                     send.stopped().await.ok();
-                    info!(
+                    log_info!(
+                        component: LOG_COMPONENT,
                         "carrier: served content {}{}{} ({} bytes)",
                         cid,
                         if path.is_empty() { "" } else { "/" },
@@ -1559,13 +1582,11 @@ async fn bridge_browser_carrier_stream_to_relay(
         Ok::<u64, anyhow::Error>(copied)
     };
     let (to_relay, to_engine) = tokio::try_join!(to_relay, from_relay)?;
-    tracing::info!(
-        relay = %relay_path.display(),
-        stream_id = %stream_id,
-        target = %target,
-        to_relay,
-        to_engine,
-        "Browser Carrier exit stream closed"
+    log_info!(
+        component: LOG_COMPONENT,
+        "Browser Carrier exit stream closed: relay={} stream_id={stream_id} target={} to_relay={to_relay} to_engine={to_engine}",
+        relay_path.display(),
+        fp(&target)
     );
     Ok(())
 }
@@ -1898,7 +1919,7 @@ impl CarrierAvailabilityProvider {
             match CarrierPeerAttestationExchangeClient::from_config(config) {
                 Ok(client) => Some(client),
                 Err(err) => {
-                    tracing::warn!("carrier peer-attestation exchange disabled: {}", err);
+                    log_warn!(component: LOG_COMPONENT, "carrier peer-attestation exchange disabled: {}", err);
                     None
                 }
             }
@@ -1925,7 +1946,7 @@ impl CarrierAvailabilityProvider {
         };
         if let Some(data_dir) = &self.data_dir {
             if let Err(err) = save_carrier_peer_reputation(data_dir, &snapshot) {
-                tracing::debug!("carrier peer reputation save failed: {}", err);
+                log_trace!(component: LOG_COMPONENT, "carrier peer reputation save failed: {}", err);
             }
         }
     }
@@ -2923,12 +2944,12 @@ impl CarrierAvailabilityProvider {
             Some(sender) => {
                 match tokio::time::timeout(GOSSIP_SEND_TIMEOUT, sender.broadcast(bytes)).await {
                     Err(_) => {
-                        tracing::debug!("Carrier availability broadcast timed out");
+                        log_trace!(component: LOG_COMPONENT, "Carrier availability broadcast timed out");
                         "local_only"
                     }
                     Ok(Ok(_)) => "carrier",
                     Ok(Err(err)) => {
-                        tracing::debug!("Carrier availability broadcast failed: {}", err);
+                        log_trace!(component: LOG_COMPONENT, "Carrier availability broadcast failed: {}", err);
                         "local_only"
                     }
                 }
@@ -5135,11 +5156,12 @@ fn load_carrier_peer_reputation(
         return HashMap::new();
     };
     let Ok(store) = serde_json::from_slice::<CarrierPeerReputationStore>(&bytes) else {
-        tracing::debug!("carrier peer reputation decode failed: {}", path.display());
+        log_trace!(component: LOG_COMPONENT, "carrier peer reputation decode failed: {}", path.display());
         return HashMap::new();
     };
     if store.schema != CARRIER_PEER_REPUTATION_SCHEMA {
-        tracing::debug!(
+        log_trace!(
+            component: LOG_COMPONENT,
             "carrier peer reputation schema mismatch at {}: {}",
             path.display(),
             store.schema
@@ -5574,7 +5596,7 @@ impl Provider for CarrierGossipProvider {
                         // Broadcast may fail with 0 peers — message is still in
                         // the local buffer for same-runtime clients, but remote
                         // peers did NOT receive it. Report honestly.
-                        tracing::debug!("gossip broadcast to external peers failed: {}", e);
+                        log_trace!(component: LOG_COMPONENT, "gossip broadcast to external peers failed: {}", e);
                         Ok(serde_json::json!({
                             "status":"ok",
                             "broadcast":"local_only",
@@ -5582,7 +5604,7 @@ impl Provider for CarrierGossipProvider {
                         }))
                     }
                     Err(_) => {
-                        tracing::debug!("gossip broadcast to external peers timed out");
+                        log_trace!(component: LOG_COMPONENT, "gossip broadcast to external peers timed out");
                         Ok(serde_json::json!({
                             "status":"ok",
                             "broadcast":"local_only",
@@ -6096,7 +6118,7 @@ impl CarrierGossipReceiver {
                     if receiver.is_joined().await.unwrap_or(false) {
                         Err(err.into())
                     } else {
-                        tracing::warn!("carrier discovered gossip receiver ended: {err}");
+                        log_warn!(component: LOG_COMPONENT, "carrier discovered gossip receiver ended: {err}");
                         Ok(None)
                     }
                 }
@@ -6118,11 +6140,11 @@ async fn recv_loop(
                 handle_gossip_event(event, &buffers, &peers, &topic_peers, &topic).await;
             }
             Err(e) => {
-                tracing::warn!("carrier recv_loop error on '{}': {}", topic, e);
+                log_warn!(component: LOG_COMPONENT, "carrier recv_loop error on '{}': {}", topic, e);
                 // Continue — transient errors should not kill the receiver
             }
             Ok(None) => {
-                tracing::info!("carrier recv_loop ended for '{}' (stream closed)", topic);
+                log_info!(component: LOG_COMPONENT, "carrier recv_loop ended for '{}' (stream closed)", topic);
                 break;
             }
         }
@@ -6327,10 +6349,10 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                             // Keep the cause. A message that will not send is
                             // hard enough to diagnose without the Runtime
                             // throwing away the reason on its way out.
-                            tracing::debug!(
-                                peer = %peer_did,
-                                error = %err,
-                                "Carrier peer connect failed"
+                            log_trace!(
+                                component: LOG_COMPONENT,
+                                "Carrier peer connect failed: peer={} error={err}",
+                                fp(peer_did)
                             );
                             ProviderError::Unavailable(
                                 "no verified Carrier route to the requested peer".to_string(),
@@ -6340,10 +6362,10 @@ impl ProviderCarrierInvoker for CarrierProviderInvoker {
                     .invoke_provider(invocation, request)
                     .await
                     .map_err(|err| {
-                        tracing::debug!(
-                            peer = %peer_did,
-                            error = %err,
-                            "Carrier peer invocation failed"
+                        log_trace!(
+                            component: LOG_COMPONENT,
+                            "Carrier peer invocation failed: peer={} error={err}",
+                            fp(peer_did)
                         );
                         ProviderError::Provider(
                             "Carrier provider invocation peer_did route failed".to_string(),

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use elastos_logger::log_trace;
 use futures_lite::future::Boxed;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, SecretKey, Watcher};
@@ -28,6 +29,8 @@ use crate::{
         local_runtime_access, room_slug, ApprovalOutcome, DenyOutcome, RoomSummary,
     },
 };
+
+const LOG_COMPONENT: &str = "operator";
 
 pub const OPERATOR_ALPN: &[u8] = b"elastos/operator/1";
 pub const OPERATOR_ACTION_STATUS_READ: &str = "status.read";
@@ -1049,7 +1052,7 @@ async fn handle_operator_connection(
         let stream_ctx = ctx.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_operator_stream(&mut send, recv, &stream_ctx).await {
-                tracing::debug!("operator control stream error: {:#}", err);
+                log_trace!(component: LOG_COMPONENT, "operator control stream error: {:#}", err);
             }
         });
     }

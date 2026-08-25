@@ -20,8 +20,11 @@ use crate::setup::{CapsuleEntry, ComponentsManifest};
 use crate::vm_provider::VmCapsuleProvider;
 
 use elastos_crosvm::{CrosvmConfig, NetworkConfig, RunningVm, VmConfig};
+use elastos_logger::{log_error, log_info, log_trace, log_warn};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::{SessionRegistry, SessionType};
+
+const LOG_COMPONENT: &str = "supervisor";
 
 /// TCP port used by VM provider capsules for raw JSON request/response over the
 /// Carrier-managed control network.
@@ -257,7 +260,8 @@ impl Supervisor {
                         path.display()
                     ))
                 })?;
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "{} host artifact verified against installed manifest ({})",
             component,
             checksum
@@ -337,7 +341,8 @@ impl Supervisor {
                 }
             }
 
-            tracing::info!(
+            log_info!(
+                component: LOG_COMPONENT,
                 "carrier service '{}' rooted in ensured capsule artifact {} ({})",
                 name,
                 entry.cid,
@@ -348,7 +353,8 @@ impl Supervisor {
                 }
             );
         } else {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "carrier service '{}' launching from nested binary under capsule artifact root without direct artifact-binary match: {}",
                 name,
                 binary.display()
@@ -564,17 +570,19 @@ impl Supervisor {
             ProviderRoute::SubProvider(sub) => {
                 match registry.register_sub_provider(&sub, provider).await {
                     Ok(_) => {
-                        tracing::info!(
-                        "Registered VM sub-provider route elastos://{}/... -> capsule '{}' (guest={}, port={})",
-                        sub,
-                        capsule_name,
-                        guest_ip,
-                        VM_PROVIDER_PORT
-                    );
+                        log_info!(
+                            component: LOG_COMPONENT,
+                            "Registered VM sub-provider route elastos://{}/... -> capsule '{}' (guest={}, port={})",
+                            sub,
+                            capsule_name,
+                            guest_ip,
+                            VM_PROVIDER_PORT
+                        );
                         Some(ProviderRoute::SubProvider(sub))
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        log_warn!(
+                            component: LOG_COMPONENT,
                             "Failed to register VM provider route for '{}' ({}): {}",
                             capsule_name,
                             provides,
@@ -586,7 +594,8 @@ impl Supervisor {
             }
             ProviderRoute::Scheme(scheme) => {
                 registry.register(provider).await;
-                tracing::info!(
+                log_info!(
+                    component: LOG_COMPONENT,
                     "Registered VM provider route {}://... -> capsule '{}' (guest={}, port={})",
                     scheme,
                     capsule_name,
@@ -629,7 +638,8 @@ impl Supervisor {
             ProviderRoute::SubProvider(sub) => {
                 match registry.register_sub_provider(&sub, provider).await {
                     Ok(_) => {
-                        tracing::info!(
+                        log_info!(
+                            component: LOG_COMPONENT,
                             "Registered carrier service route elastos://{}/... -> '{}' (binary={})",
                             sub,
                             capsule_name,
@@ -638,7 +648,8 @@ impl Supervisor {
                         Some(ProviderRoute::SubProvider(sub))
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        log_warn!(
+                            component: LOG_COMPONENT,
                             "Failed to register carrier service route for '{}' ({}): {}",
                             capsule_name,
                             provides,
@@ -650,7 +661,8 @@ impl Supervisor {
             }
             ProviderRoute::Scheme(scheme) => {
                 registry.register(provider).await;
-                tracing::info!(
+                log_info!(
+                    component: LOG_COMPONENT,
                     "Registered carrier service route {}://... -> '{}' (binary={})",
                     scheme,
                     capsule_name,
@@ -710,7 +722,8 @@ impl Supervisor {
                 .join("overlays")
                 .join(format!("{}.ext4", handle));
             let _ = tokio::fs::remove_file(&overlay_path).await;
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Reaped exited capsule '{}' and unregistered provider route",
                 handle
             );
@@ -950,7 +963,7 @@ impl Supervisor {
         if manifest.permissions.host_process && manifest.provides.is_some() {
             // Skip if built-in Carrier already provides this (e.g., peer-provider → carrier-gossip)
             if name == "peer-provider" && self.provider_registry.is_some() {
-                tracing::debug!("peer-provider handled by built-in Carrier");
+                log_trace!(component: LOG_COMPONENT, "peer-provider handled by built-in Carrier");
                 return Ok((String::new(), 0));
             }
             return self
@@ -1158,7 +1171,7 @@ impl Supervisor {
             )
             .await
             {
-                tracing::warn!("resource bridge failed for '{}': {}", name, e);
+                log_warn!(component: LOG_COMPONENT, "resource bridge failed for '{}': {}", name, e);
             }
         }
 
@@ -1523,7 +1536,7 @@ impl Supervisor {
                     )
                     .await
                 {
-                    tracing::error!("Gateway server exited with error: {}", e);
+                    log_error!(component: LOG_COMPONENT, "Gateway server exited with error: {}", e);
                 }
             }
         });

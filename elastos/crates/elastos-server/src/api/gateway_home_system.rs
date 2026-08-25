@@ -3,8 +3,11 @@ use std::future::Future;
 
 use anyhow::Context as _;
 use elastos_common::CapsuleRole;
+use elastos_logger::{log_trace, log_warn};
 
 use super::*;
+
+const LOG_COMPONENT: &str = "home";
 
 const HOME_EVENTS_SCHEMA: &str = "elastos.home.events/v1";
 const HOME_EVENTS_DEFAULT_WAIT_MS: u64 = 25_000;
@@ -1911,9 +1914,9 @@ pub(super) async fn services_summary(
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         if let Err(err) = home_services_sync_access_decisions(&data_dir, &context) {
-            tracing::warn!(
-                error = %err,
-                "could not sync Services access decisions"
+            log_warn!(
+                component: LOG_COMPONENT,
+                "could not sync Services access decisions: {err}"
             );
         }
         let mut home_state = home_state(&data_dir);
@@ -2092,20 +2095,21 @@ fn home_services_selection_state(
         Err(err) => return Err(err).with_context(|| format!("could not read {}", path.display())),
     };
     if raw.len() > HOME_SERVICES_STATE_MAX_BYTES {
-        tracing::warn!(
-            path = %path.display(),
-            bytes = raw.len(),
-            "ignored oversized Home services state"
+        log_warn!(
+            component: LOG_COMPONENT,
+            "ignored oversized Home services state: path={} bytes={}",
+            path.display(),
+            raw.len()
         );
         return Ok(default_state);
     }
     let mut state: HomeServicesSelectionState = match serde_json::from_slice(&raw) {
         Ok(state) => state,
         Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "ignored invalid Home services state"
+            log_warn!(
+                component: LOG_COMPONENT,
+                "ignored invalid Home services state: path={} error={err}",
+                path.display()
             );
             return Ok(default_state);
         }
@@ -2118,10 +2122,11 @@ fn home_services_selection_state(
     if state.schema.trim().is_empty() {
         state.schema = HOME_SERVICES_STATE_SCHEMA.to_string();
     } else if state.schema != HOME_SERVICES_STATE_SCHEMA {
-        tracing::warn!(
-            path = %path.display(),
-            schema = %state.schema,
-            "ignored unsupported Home services state schema"
+        log_warn!(
+            component: LOG_COMPONENT,
+            "ignored unsupported Home services state schema: path={} schema={}",
+            path.display(),
+            state.schema
         );
         return Ok(default_state);
     }
@@ -2527,7 +2532,9 @@ fn home_services_sync_access_decisions(
             &runtime.peer_id,
         ) {
             Ok(merged) => changed |= merged,
-            Err(err) => tracing::warn!("service access decision ignored: {err}"),
+            Err(err) => {
+                log_warn!(component: LOG_COMPONENT, "service access decision ignored: {err}")
+            }
         }
     }
     if changed {
@@ -3843,10 +3850,9 @@ fn home_active_shell_summary(
     if needs_repair && !active.is_empty() {
         if let Some(context) = context {
             if let Err(err) = home_save_active_shell(data_dir, context, &active) {
-                tracing::warn!(
-                    active_shell = %active,
-                    error = %err,
-                    "failed to repair obsolete Home active shell state"
+                log_warn!(
+                    component: LOG_COMPONENT,
+                    "failed to repair obsolete Home active shell state: active_shell={active} error={err}"
                 );
             }
         }
@@ -3955,10 +3961,10 @@ fn home_active_shell_state(
     let state: HomeActiveShellState = match serde_json::from_slice(&bytes) {
         Ok(state) => state,
         Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "ignored invalid Home active shell state"
+            log_warn!(
+                component: LOG_COMPONENT,
+                "ignored invalid Home active shell state: path={} error={err}",
+                path.display()
             );
             return Ok(None);
         }
@@ -3967,9 +3973,10 @@ fn home_active_shell_state(
         || state.principal_id != principal_id
         || state.localhost_root != localhost_root
     {
-        tracing::warn!(
-            path = %path.display(),
-            "ignored mismatched Home active shell state"
+        log_warn!(
+            component: LOG_COMPONENT,
+            "ignored mismatched Home active shell state: path={}",
+            path.display()
         );
         return Ok(None);
     }
@@ -4270,35 +4277,38 @@ fn home_browser_state(
     let mut state: HomeBrowserStateSummary = match serde_json::from_slice(&bytes) {
         Ok(state) => state,
         Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "ignored invalid Home browser state"
+            log_warn!(
+                component: LOG_COMPONENT,
+                "ignored invalid Home browser state: path={} error={err}",
+                path.display()
             );
             return Ok(default_home_browser_state(context));
         }
     };
     if state.schema != HOME_BROWSER_STATE_SCHEMA {
-        tracing::warn!(
-            path = %path.display(),
-            schema = %state.schema,
-            "ignored unsupported Home browser state schema"
+        log_warn!(
+            component: LOG_COMPONENT,
+            "ignored unsupported Home browser state schema: path={} schema={}",
+            path.display(),
+            state.schema
         );
         return Ok(default_home_browser_state(context));
     }
     if state.principal_id != principal_id {
-        tracing::warn!(
-            path = %path.display(),
-            principal_id = %state.principal_id,
-            "ignored Home browser state principal mismatch"
+        log_warn!(
+            component: LOG_COMPONENT,
+            "ignored Home browser state principal mismatch: path={} principal_id={}",
+            path.display(),
+            state.principal_id
         );
         return Ok(default_home_browser_state(context));
     }
     if state.localhost_root != localhost_root {
-        tracing::warn!(
-            path = %path.display(),
-            localhost_root = %state.localhost_root,
-            "ignored Home browser state root mismatch"
+        log_warn!(
+            component: LOG_COMPONENT,
+            "ignored Home browser state root mismatch: path={} localhost_root={}",
+            path.display(),
+            state.localhost_root
         );
         return Ok(default_home_browser_state(context));
     }
@@ -5370,7 +5380,7 @@ fn refresh_runtime_owned_contexts_after_profile_change(
         return;
     };
     if let Err(err) = service.register_runtime_owned_contexts(data_dir) {
-        tracing::debug!(error = %err, "refreshing collaboration contexts after a Profile change failed");
+        log_trace!(component: LOG_COMPONENT, "refreshing collaboration contexts after a Profile change failed: {err}");
     }
 }
 

@@ -12,10 +12,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use elastos_logger::log_info;
 use elastos_runtime::provider::{
     EntryType, Provider, ProviderError, ResourceAction, ResourceEntry, ResourceRequest,
     ResourceResponse,
 };
+
+const LOG_COMPONENT: &str = "carrier";
 
 struct ChildIo {
     reader: BufReader<std::process::ChildStdout>,
@@ -115,7 +118,11 @@ impl CarrierServiceBridge {
                     init_resp
                 )));
             }
-            tracing::info!("carrier service '{}' initialized", self.binary_path);
+            log_info!(
+                component: LOG_COMPONENT,
+                "carrier service '{}' initialized",
+                self.binary_path
+            );
         }
 
         let io = guard

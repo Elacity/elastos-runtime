@@ -35,6 +35,9 @@ use crate::collaboration_protocol::{
     verify_collaboration_message, VerifiedCollaborationMessage,
 };
 use crate::crypto::{domain_separated_sign, encode_did_key};
+use elastos_logger::{fp, log_trace};
+
+const LOG_COMPONENT: &str = "collab";
 
 pub(crate) const DIRECT_MESSAGE_PROVIDER_SCHEME: &str = "collaboration-direct";
 pub(crate) const DIRECT_MESSAGE_PROVIDER_OP: &str = "deliver";
@@ -1405,10 +1408,10 @@ impl CollaborationDirectMessageService {
                 // Carrier loops it through authenticated admission without a
                 // network dial, so a remaining failure here is an admission or
                 // foreign route problem.
-                tracing::debug!(
-                    peer_did = %recipient_endpoint_did,
-                    error = %err,
-                    "direct message delivery attempt failed; envelope stays pending"
+                log_trace!(
+                    component: LOG_COMPONENT,
+                    "direct message delivery attempt failed; envelope stays pending: peer_did={} error={err}",
+                    fp(recipient_endpoint_did)
                 );
                 return Ok(DirectDeliveryStatus::Pending);
             }
@@ -1671,7 +1674,7 @@ impl Provider for CollaborationDirectMessageProvider {
                 .map_err(|err| {
                     // The receiving side is where a refusal is explainable; say
                     // why here or the sender only ever learns "rejected".
-                    tracing::debug!(error = %err, "direct message delivery rejected");
+                    log_trace!(component: LOG_COMPONENT, "direct message delivery rejected: {err}");
                     ProviderError::Provider("direct message delivery rejected".to_string())
                 })?
         };

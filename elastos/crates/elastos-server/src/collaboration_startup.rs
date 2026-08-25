@@ -26,6 +26,9 @@ use crate::collaboration_profile_loader::{
     MAX_CHAIN_PROFILES,
 };
 use crate::collaboration_transport::CollaborationTransportDriver;
+use elastos_logger::{log_info, log_trace, log_warn};
+
+const LOG_COMPONENT: &str = "collab";
 
 pub const COLLABORATION_STARTUP_CONFIG_FILE: &str = "collaboration-network-v1.json";
 pub const COLLABORATION_STARTUP_CONFIG_SCHEMA: &str =
@@ -229,7 +232,7 @@ pub async fn start_collaboration_runtime_service(
     let presence_port = CollaborationPresenceProductPort::new(core.clone())?;
     let registered = discovery_service.register_runtime_owned_contexts(data_root)?;
     if registered > 0 {
-        tracing::info!("collaboration ready for {registered} Profile(s)");
+        log_info!(component: LOG_COMPONENT, "collaboration ready for {registered} Profile(s)");
     }
     let joined = join_collaboration_network(carrier, &profile).await?;
     let driver = CollaborationTransportDriver::new(core, joined);
@@ -471,7 +474,7 @@ async fn run_runtime_owned_presence_worker(
             Some(&discovery_service),
             now_secs(),
         ) {
-            tracing::debug!(error = %err, "runtime presence refresh failed");
+            log_trace!(component: LOG_COMPONENT, "runtime presence refresh failed: {err}");
         }
     }
 }
@@ -490,57 +493,63 @@ async fn run_collaboration_worker_cycle_with_presence(
                     .project_prepared_message(data_root, message, None)
                     .is_err()
                 {
-                    tracing::warn!("collaboration Chat outgoing projection cycle failed");
+                    log_warn!(component: LOG_COMPONENT, "collaboration Chat outgoing projection cycle failed");
                     break;
                 }
             }
         }
-        Err(_) => tracing::warn!("collaboration Chat outgoing projection cycle failed"),
+        Err(_) => {
+            log_warn!(component: LOG_COMPONENT, "collaboration Chat outgoing projection cycle failed")
+        }
     }
     match presence_port.pending_outgoing_presences(now) {
         Ok(presences) => {
             for presence in &presences {
                 if let Err(err) = presence_port.project_prepared_presence(presence, now) {
-                    tracing::warn!(
-                        diagnostic = %bounded_presence_projection_diagnostic(&err),
-                        "collaboration presence outgoing projection cycle failed"
+                    log_warn!(
+                        component: LOG_COMPONENT,
+                        "collaboration presence outgoing projection cycle failed: diagnostic={}",
+                        bounded_presence_projection_diagnostic(&err)
                     );
                     break;
                 }
             }
         }
-        Err(err) => tracing::warn!(
-            diagnostic = %bounded_presence_projection_diagnostic(&err),
-            "collaboration presence outgoing projection cycle failed"
+        Err(err) => log_warn!(
+            component: LOG_COMPONENT,
+            "collaboration presence outgoing projection cycle failed: diagnostic={}",
+            bounded_presence_projection_diagnostic(&err)
         ),
     }
     if driver.retry_outgoing_once(now).await.is_err() {
-        tracing::warn!("collaboration outgoing retry cycle failed");
+        log_warn!(component: LOG_COMPONENT, "collaboration outgoing retry cycle failed");
     }
     if driver.process_incoming_once(now).await.is_err() {
-        tracing::warn!("collaboration incoming cycle failed");
+        log_warn!(component: LOG_COMPONENT, "collaboration incoming cycle failed");
     }
     match product_port.pending_messages() {
         Ok(handoffs) => {
             for handoff in &handoffs {
                 if product_port.project_handoff(data_root, handoff).is_err() {
-                    tracing::warn!("collaboration Chat projection cycle failed");
+                    log_warn!(component: LOG_COMPONENT, "collaboration Chat projection cycle failed");
                     break;
                 }
             }
         }
-        Err(_) => tracing::warn!("collaboration Chat projection cycle failed"),
+        Err(_) => log_warn!(component: LOG_COMPONENT, "collaboration Chat projection cycle failed"),
     }
     match presence_port.pending_presences() {
         Ok(handoffs) => {
             for handoff in &handoffs {
                 if presence_port.project_handoff(handoff, now).is_err() {
-                    tracing::warn!("collaboration presence projection cycle failed");
+                    log_warn!(component: LOG_COMPONENT, "collaboration presence projection cycle failed");
                     break;
                 }
             }
         }
-        Err(_) => tracing::warn!("collaboration presence projection cycle failed"),
+        Err(_) => {
+            log_warn!(component: LOG_COMPONENT, "collaboration presence projection cycle failed")
+        }
     }
 }
 

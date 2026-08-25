@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use elastos_common::localhost::{ensure_file_backed_roots, file_backed_prefixes};
+use elastos_logger::{log_info, log_trace, log_warn};
 use elastos_runtime::provider::{
     ProviderInvocation, ProviderInvocationTransport, ProviderTransfer,
 };
@@ -16,6 +17,8 @@ use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
 use elastos_server::{api, fetcher, ownership};
 use elastos_wallet_contract::WALLET_PROTOCOL_VERSION;
+
+const LOG_COMPONENT: &str = "infra";
 
 pub(crate) struct ServerInfrastructure {
     pub(crate) audit_log: Arc<primitives::audit::AuditLog>,
@@ -232,11 +235,11 @@ async fn setup_server_infrastructure_impl(
 
     let tls_config = match elastos_tls::load_or_create_tls_config(&data_dir).await {
         Ok(config) => {
-            tracing::info!("TLS enabled (self-signed CA)");
+            log_info!(component: LOG_COMPONENT, "TLS enabled (self-signed CA)");
             Some(config)
         }
         Err(e) => {
-            tracing::warn!("TLS disabled: {}. Running without HTTPS.", e);
+            log_warn!(component: LOG_COMPONENT, "TLS disabled: {}. Running without HTTPS.", e);
             None
         }
     };
@@ -255,7 +258,7 @@ async fn setup_server_infrastructure_impl(
         .register_sub_provider("content", content_provider)
         .await
     {
-        tracing::warn!("Failed to register elastos://content sub-provider: {}", err);
+        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://content sub-provider: {}", err);
     }
     provider_registry
         .register(Arc::new(DocumentsProvider::new(
@@ -287,14 +290,15 @@ async fn setup_server_infrastructure_impl(
         .register_sub_provider("inspect", inspect_provider)
         .await
     {
-        tracing::warn!("Failed to register elastos://inspect sub-provider: {}", err);
+        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://inspect sub-provider: {}", err);
     }
     let device_key = elastos_identity::load_or_create_device_key(&data_dir)?;
     let device_key_hex = hex::encode(device_key.as_ref());
     let mut provider_cid = "sha256:unavailable".to_string();
     let verify_provider_binary = |name: &str, path: &std::path::Path| -> anyhow::Result<()> {
         let checksum = crate::setup::verify_installed_component_binary(&data_dir, name, path)?;
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "{} binary verified against installed manifest ({})",
             name,
             checksum
@@ -304,7 +308,7 @@ async fn setup_server_infrastructure_impl(
 
     if let Some(path) = crate::find_installed_provider_binary("did-provider") {
         if let Err(e) = verify_provider_binary("did-provider", &path) {
-            tracing::warn!("Skipping did-provider due to verification failure: {}", e);
+            log_warn!(component: LOG_COMPONENT, "Skipping did-provider due to verification failure: {}", e);
         } else {
             let did_config = provider::BridgeProviderConfig {
                 base_path: data_dir.to_string_lossy().to_string(),
@@ -322,11 +326,13 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("did", provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://did sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://did sub-provider: {}", e);
                     }
-                    tracing::info!("did-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "did-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn did-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn did-provider: {}", e)
+                }
             }
         }
     }
@@ -365,7 +371,8 @@ async fn setup_server_infrastructure_impl(
                     e
                 )
             })?;
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "localhost-provider capsule {} from {}",
             provider_cid,
             binary_path.display()
@@ -417,9 +424,10 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("llama", provider)
                         .await
                     {
-                        tracing::warn!("Failed to register llama sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register llama sub-provider: {}", e);
                     }
-                    tracing::info!(
+                    log_info!(
+                        component: LOG_COMPONENT,
                         "llama-provider registered (lazy start — model loads on first request){}",
                         llama_endpoint
                             .as_ref()
@@ -427,7 +435,9 @@ async fn setup_server_infrastructure_impl(
                             .unwrap_or_default()
                     );
                 }
-                Err(e) => tracing::warn!("llama-provider unavailable: {} (local AI disabled)", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "llama-provider unavailable: {} (local AI disabled)", e)
+                }
             }
         }
 
@@ -443,7 +453,8 @@ async fn setup_server_infrastructure_impl(
                 if v.starts_with("http://") || v.starts_with("https://") {
                     ai_extra.insert("ollama_url".into(), serde_json::Value::String(v));
                 } else {
-                    tracing::warn!(
+                    log_warn!(
+                        component: LOG_COMPONENT,
                         "OLLAMA_URL ignored (must start with http:// or https://): {}",
                         v
                     );
@@ -471,18 +482,19 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("ai", provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://ai sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://ai sub-provider: {}", e);
                     }
-                    tracing::info!("ai-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "ai-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn ai-provider: {}", e),
+                Err(e) => log_warn!(component: LOG_COMPONENT, "Failed to spawn ai-provider: {}", e),
             }
         }
 
         if let Some(availability_config) = availability_provider_config_from_env() {
             if let Some(path) = crate::find_installed_provider_binary("availability-provider") {
                 if let Err(e) = verify_provider_binary("availability-provider", &path) {
-                    tracing::warn!(
+                    log_warn!(
+                        component: LOG_COMPONENT,
                         "Skipping availability-provider due to verification failure: {}",
                         e
                     );
@@ -502,20 +514,24 @@ async fn setup_server_infrastructure_impl(
                                 .register_sub_provider("availability", availability_provider)
                                 .await
                             {
-                                tracing::warn!(
+                                log_warn!(
+                                    component: LOG_COMPONENT,
                                     "Failed to register elastos://availability sub-provider: {}",
                                     e
                                 );
                             } else {
                                 external_availability_registered = true;
                             }
-                            tracing::info!("availability-provider capsule from {}", path.display());
+                            log_info!(component: LOG_COMPONENT, "availability-provider capsule from {}", path.display());
                         }
-                        Err(e) => tracing::warn!("Failed to spawn availability-provider: {}", e),
+                        Err(e) => {
+                            log_warn!(component: LOG_COMPONENT, "Failed to spawn availability-provider: {}", e)
+                        }
                     }
                 }
             } else {
-                tracing::warn!(
+                log_warn!(
+                    component: LOG_COMPONENT,
                     "Availability provider configured but availability-provider binary is not installed"
                 );
             }
@@ -524,7 +540,8 @@ async fn setup_server_infrastructure_impl(
 
     if let Some(path) = crate::find_installed_provider_binary("content-block-graph-provider") {
         if let Err(e) = verify_provider_binary("content-block-graph-provider", &path) {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Skipping content-block-graph-provider due to verification failure: {}",
                 e
             );
@@ -545,28 +562,34 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("block-graph", block_graph_provider)
                         .await
                     {
-                        tracing::warn!(
+                        log_warn!(
+                            component: LOG_COMPONENT,
                             "Failed to register elastos://block-graph sub-provider: {}",
                             e
                         );
                     }
-                    tracing::info!(
+                    log_info!(
+                        component: LOG_COMPONENT,
                         "content-block-graph-provider capsule from {}",
                         path.display()
                     );
                 }
-                Err(e) => tracing::warn!("Failed to spawn content-block-graph-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn content-block-graph-provider: {}", e)
+                }
             }
         }
     } else {
-        tracing::warn!(
+        log_warn!(
+            component: LOG_COMPONENT,
             "content-block-graph-provider binary is not installed; arbitrary DAG repair will fail closed"
         );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("object-provider") {
         if let Err(e) = verify_provider_binary("object-provider", &path) {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Skipping {} due to verification failure: {}",
                 "object-provider",
                 e
@@ -589,22 +612,26 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("object", object_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://object sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://object sub-provider: {}", e);
                     }
-                    tracing::info!("object-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "object-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn object-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn object-provider: {}", e)
+                }
             }
         }
     } else {
-        tracing::warn!(
+        log_warn!(
+            component: LOG_COMPONENT,
             "object-provider binary is not installed; Library object operations will fail closed"
         );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("webspace-provider") {
         if let Err(e) = verify_provider_binary("webspace-provider", &path) {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Skipping webspace-provider due to verification failure: {}",
                 e
             );
@@ -620,20 +647,24 @@ async fn setup_server_infrastructure_impl(
                         provider::CapsuleProvider::with_scheme(Arc::new(bridge), "webspace"),
                     );
                     provider_registry.register(provider).await;
-                    tracing::info!("webspace-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "webspace-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn webspace-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn webspace-provider: {}", e)
+                }
             }
         }
     } else {
-        tracing::warn!(
+        log_warn!(
+            component: LOG_COMPONENT,
             "webspace-provider binary is not installed; WebSpace roots will fail closed"
         );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("operator-drive-adapter") {
         if let Err(e) = verify_provider_binary("operator-drive-adapter", &path) {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Skipping operator-drive-adapter due to verification failure: {}",
                 e
             );
@@ -653,16 +684,18 @@ async fn setup_server_infrastructure_impl(
                             "operator-drive-adapter",
                         ));
                     provider_registry.register(provider).await;
-                    tracing::info!("operator-drive-adapter capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "operator-drive-adapter capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn operator-drive-adapter: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn operator-drive-adapter: {}", e)
+                }
             }
         }
     }
 
     if let Some(path) = crate::find_installed_provider_binary("ipfs-provider") {
         if let Err(e) = verify_provider_binary("ipfs-provider", &path) {
-            tracing::warn!("Skipping ipfs-provider due to verification failure: {}", e);
+            log_warn!(component: LOG_COMPONENT, "Skipping ipfs-provider due to verification failure: {}", e);
         } else {
             match provider::ProviderBridge::spawn(&path, Default::default()).await {
                 Ok(bridge) => {
@@ -674,22 +707,23 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("ipfs", ipfs_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://ipfs sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://ipfs sub-provider: {}", e);
                     }
-                    tracing::info!("ipfs-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "ipfs-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
+                Err(e) => log_warn!(component: LOG_COMPONENT, "ipfs-provider unavailable: {}", e),
             }
         }
     } else {
-        tracing::warn!(
+        log_warn!(
+            component: LOG_COMPONENT,
             "ipfs-provider binary is not installed; elastos://content publish/fetch will fail closed"
         );
     }
 
     if let Some(path) = crate::find_installed_provider_binary("chain-provider") {
         if let Err(e) = verify_provider_binary("chain-provider", &path) {
-            tracing::warn!("Skipping chain-provider due to verification failure: {}", e);
+            log_warn!(component: LOG_COMPONENT, "Skipping chain-provider due to verification failure: {}", e);
         } else {
             match provider::ProviderBridge::spawn(&path, Default::default()).await {
                 Ok(bridge) => {
@@ -700,18 +734,20 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("chain", chain_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://chain sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://chain sub-provider: {}", e);
                     }
-                    tracing::info!("chain-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "chain-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn chain-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn chain-provider: {}", e)
+                }
             }
         }
     }
 
     if let Some(path) = crate::find_installed_provider_binary("net-provider") {
         if let Err(e) = verify_provider_binary("net-provider", &path) {
-            tracing::warn!("Skipping net-provider due to verification failure: {}", e);
+            log_warn!(component: LOG_COMPONENT, "Skipping net-provider due to verification failure: {}", e);
         } else {
             match provider::ProviderBridge::spawn(&path, Default::default()).await {
                 Ok(bridge) => {
@@ -722,11 +758,13 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("net", net_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://net sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://net sub-provider: {}", e);
                     }
-                    tracing::info!("net-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "net-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn net-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn net-provider: {}", e)
+                }
             }
         }
     }
@@ -734,24 +772,28 @@ async fn setup_server_infrastructure_impl(
     if let Some(local_exit_config) = browser_local_exit_config_from_env(&data_dir) {
         if let Some(path) = crate::find_installed_provider_binary("browser-local-exit") {
             if let Err(e) = verify_provider_binary("browser-local-exit", &path) {
-                tracing::warn!(
+                log_warn!(
+                    component: LOG_COMPONENT,
                     "Skipping browser-local-exit due to verification failure: {}",
                     e
                 );
             } else {
                 match spawn_browser_local_exit(&path, &local_exit_config) {
                     Ok(child) => {
-                        tracing::info!("browser-local-exit helper from {}", path.display());
+                        log_info!(component: LOG_COMPONENT, "browser-local-exit helper from {}", path.display());
                         managed_host_processes.push(api::server::HostHelperProcess {
                             name: "browser-local-exit",
                             child,
                         });
                     }
-                    Err(e) => tracing::warn!("Failed to spawn browser-local-exit: {}", e),
+                    Err(e) => {
+                        log_warn!(component: LOG_COMPONENT, "Failed to spawn browser-local-exit: {}", e)
+                    }
                 }
             }
         } else {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Browser local Exit configured but browser-local-exit binary is not installed"
             );
         }
@@ -759,7 +801,7 @@ async fn setup_server_infrastructure_impl(
 
     if let Some(path) = crate::find_installed_provider_binary("exit-provider") {
         if let Err(e) = verify_provider_binary("exit-provider", &path) {
-            tracing::warn!("Skipping exit-provider due to verification failure: {}", e);
+            log_warn!(component: LOG_COMPONENT, "Skipping exit-provider due to verification failure: {}", e);
         } else {
             let exit_config = provider::BridgeProviderConfig {
                 extra: exit_provider_config_from_env(&data_dir).unwrap_or(serde_json::Value::Null),
@@ -774,18 +816,21 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("exit", exit_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://exit sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://exit sub-provider: {}", e);
                     }
-                    tracing::info!("exit-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "exit-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn exit-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn exit-provider: {}", e)
+                }
             }
         }
     }
 
     if let Some(path) = crate::find_installed_provider_binary("browser-engine-adapter") {
         if let Err(e) = verify_provider_binary("browser-engine-adapter", &path) {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Skipping browser-engine-adapter due to verification failure: {}",
                 e
             );
@@ -806,21 +851,24 @@ async fn setup_server_infrastructure_impl(
                     .await
                     {
                         Ok(()) => {
-                            tracing::info!("browser-engine-adapter capsule from {}", path.display())
+                            log_info!(component: LOG_COMPONENT, "browser-engine-adapter capsule from {}", path.display())
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to start browser-engine-adapter: {}", e)
+                            log_warn!(component: LOG_COMPONENT, "Failed to start browser-engine-adapter: {}", e)
                         }
                     }
                 }
-                Err(e) => tracing::warn!("Failed to spawn browser-engine-adapter: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn browser-engine-adapter: {}", e)
+                }
             }
         }
     }
 
     if let Some(path) = crate::find_installed_provider_binary("wallet-provider") {
         if let Err(e) = verify_provider_binary("wallet-provider", &path) {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Skipping wallet-provider due to verification failure: {}",
                 e
             );
@@ -843,21 +891,23 @@ async fn setup_server_infrastructure_impl(
                     .await;
                     match startup {
                         Ok(()) => {
-                            tracing::info!("wallet-provider v2 capsule from {}", path.display())
+                            log_info!(component: LOG_COMPONENT, "wallet-provider v2 capsule from {}", path.display())
                         }
                         Err(e) => {
-                            tracing::warn!("Skipping wallet-provider after shutdown/reap: {}", e)
+                            log_warn!(component: LOG_COMPONENT, "Skipping wallet-provider after shutdown/reap: {}", e)
                         }
                     }
                 }
-                Err(e) => tracing::warn!("Failed to spawn wallet-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn wallet-provider: {}", e)
+                }
             }
         }
     }
 
     if let Some(path) = crate::find_installed_provider_binary("drm-provider") {
         if let Err(e) = verify_provider_binary("drm-provider", &path) {
-            tracing::warn!("Skipping drm-provider due to verification failure: {}", e);
+            log_warn!(component: LOG_COMPONENT, "Skipping drm-provider due to verification failure: {}", e);
         } else {
             match provider::ProviderBridge::spawn(&path, Default::default()).await {
                 Ok(bridge) => {
@@ -868,18 +918,21 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("drm", drm_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://drm sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://drm sub-provider: {}", e);
                     }
-                    tracing::info!("drm-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "drm-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn drm-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn drm-provider: {}", e)
+                }
             }
         }
     }
 
     if let Some(path) = crate::find_installed_provider_binary("rights-provider") {
         if let Err(e) = verify_provider_binary("rights-provider", &path) {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Skipping rights-provider due to verification failure: {}",
                 e
             );
@@ -893,18 +946,20 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("rights", rights_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://rights sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://rights sub-provider: {}", e);
                     }
-                    tracing::info!("rights-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "rights-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn rights-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn rights-provider: {}", e)
+                }
             }
         }
     }
 
     if let Some(path) = crate::find_installed_provider_binary("key-provider") {
         if let Err(e) = verify_provider_binary("key-provider", &path) {
-            tracing::warn!("Skipping key-provider due to verification failure: {}", e);
+            log_warn!(component: LOG_COMPONENT, "Skipping key-provider due to verification failure: {}", e);
         } else {
             match provider::ProviderBridge::spawn(&path, Default::default()).await {
                 Ok(bridge) => {
@@ -915,18 +970,21 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("key", key_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://key sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://key sub-provider: {}", e);
                     }
-                    tracing::info!("key-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "key-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn key-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn key-provider: {}", e)
+                }
             }
         }
     }
 
     if let Some(path) = crate::find_installed_provider_binary("decrypt-provider") {
         if let Err(e) = verify_provider_binary("decrypt-provider", &path) {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Skipping decrypt-provider due to verification failure: {}",
                 e
             );
@@ -940,11 +998,13 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("decrypt", decrypt_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register elastos://decrypt sub-provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register elastos://decrypt sub-provider: {}", e);
                     }
-                    tracing::info!("decrypt-provider capsule from {}", path.display());
+                    log_info!(component: LOG_COMPONENT, "decrypt-provider capsule from {}", path.display());
                 }
-                Err(e) => tracing::warn!("Failed to spawn decrypt-provider: {}", e),
+                Err(e) => {
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn decrypt-provider: {}", e)
+                }
             }
         }
     }
@@ -981,7 +1041,7 @@ async fn setup_server_infrastructure_impl(
                     .register_sub_provider("peer", gossip_provider)
                     .await
                 {
-                    tracing::warn!("Failed to register Carrier gossip provider: {}", e);
+                    log_warn!(component: LOG_COMPONENT, "Failed to register Carrier gossip provider: {}", e);
                 }
                 if !external_availability_registered {
                     let availability_provider: Arc<dyn provider::Provider> =
@@ -996,16 +1056,16 @@ async fn setup_server_infrastructure_impl(
                         .register_sub_provider("availability", availability_provider)
                         .await
                     {
-                        tracing::warn!("Failed to register Carrier availability provider: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to register Carrier availability provider: {}", e);
                     }
                 }
                 carrier_service = Some(elastos_server::carrier::CarrierRuntimeService::new(
                     carrier_node,
                 ));
-                tracing::info!("Carrier node online (P2P + gossip)");
+                log_info!(component: LOG_COMPONENT, "Carrier node online (P2P + gossip)");
             }
             Err(e) => {
-                tracing::warn!("Carrier node failed: {:#}", e);
+                log_warn!(component: LOG_COMPONENT, "Carrier node failed: {:#}", e);
             }
         }
     }
@@ -1046,7 +1106,7 @@ async fn setup_server_infrastructure_impl(
 
     let identity_state = match elastos_identity::IdentityManager::new(data_dir.clone()) {
         Ok(manager) => {
-            tracing::info!("Identity manager initialized (dynamic RP)");
+            log_info!(component: LOG_COMPONENT, "Identity manager initialized (dynamic RP)");
             Some(api::handlers::identity::IdentityState {
                 manager: Arc::new(tokio::sync::Mutex::new(manager)),
                 session_registry: session_registry.clone(),
@@ -1055,7 +1115,7 @@ async fn setup_server_infrastructure_impl(
             })
         }
         Err(e) => {
-            tracing::warn!("Identity manager disabled: {}", e);
+            log_warn!(component: LOG_COMPONENT, "Identity manager disabled: {}", e);
             None
         }
     };
@@ -1066,7 +1126,7 @@ async fn setup_server_infrastructure_impl(
                 "sha256:{}",
                 hex::encode(elastos_runtime::signature::hash_content(&bytes))
             );
-            tracing::info!("shell capsule {} from {}", cid, path.display());
+            log_info!(component: LOG_COMPONENT, "shell capsule {} from {}", cid, path.display());
             cid
         })
     });
@@ -1227,7 +1287,8 @@ fn availability_provider_config_from_env() -> Option<serde_json::Value> {
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(value) => return Some(value),
             Err(err) => {
-                tracing::warn!(
+                log_warn!(
+                    component: LOG_COMPONENT,
                     "Ignoring invalid ELASTOS_AVAILABILITY_PROVIDER_CONFIG JSON: {}",
                     err
                 );
@@ -1265,7 +1326,8 @@ fn carrier_peer_attestation_exchange_config_from_env() -> Option<serde_json::Val
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(value) => return Some(value),
             Err(err) => {
-                tracing::warn!(
+                log_warn!(
+                    component: LOG_COMPONENT,
                     "Ignoring invalid ELASTOS_CARRIER_PEER_ATTESTATION_EXCHANGE_CONFIG JSON: {}",
                     err
                 );
@@ -1351,13 +1413,15 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 fn maybe_spawn_content_repair_scheduler(registry: Arc<provider::ProviderRegistry>) {
     let Some(config) = content_repair_scheduler_config_from_env() else {
-        tracing::debug!(
+        log_trace!(
+            component: LOG_COMPONENT,
             "{} is disabled; content repair worker remains manual/operator-triggered",
             CONTENT_REPAIR_SCHEDULER_ENV
         );
         return;
     };
-    tracing::info!(
+    log_info!(
+        component: LOG_COMPONENT,
         "content repair scheduler enabled: interval={}s limit={} max_attempts={} failure_budget={} include_healthy_check={}",
         config.interval_secs,
         config.limit,
@@ -1373,7 +1437,8 @@ fn maybe_spawn_content_repair_scheduler(registry: Arc<provider::ProviderRegistry
             match invoke_content_repair_worker(&registry, config).await {
                 Ok(response) => {
                     let data = response.get("data").unwrap_or(&response);
-                    tracing::debug!(
+                    log_trace!(
+                        component: LOG_COMPONENT,
                         "content repair scheduler run completed: checked={} repaired={} failed={} skipped={}",
                         data.get("checked").and_then(|value| value.as_u64()).unwrap_or(0),
                         data.get("repaired").and_then(|value| value.as_u64()).unwrap_or(0),
@@ -1382,7 +1447,7 @@ fn maybe_spawn_content_repair_scheduler(registry: Arc<provider::ProviderRegistry
                     );
                 }
                 Err(err) => {
-                    tracing::warn!("content repair scheduler run failed: {}", err);
+                    log_warn!(component: LOG_COMPONENT, "content repair scheduler run failed: {}", err);
                 }
             }
         }
@@ -1455,7 +1520,7 @@ fn provider_config_from_env_or_file(
         return match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(value) => Some(value),
             Err(err) => {
-                tracing::warn!("Ignoring invalid {} JSON: {}", env_name, err);
+                log_warn!(component: LOG_COMPONENT, "Ignoring invalid {} JSON: {}", env_name, err);
                 None
             }
         };
@@ -1465,7 +1530,8 @@ fn provider_config_from_env_or_file(
     match serde_json::from_str::<serde_json::Value>(&raw) {
         Ok(value) => Some(value),
         Err(err) => {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Ignoring invalid provider config {}: {}",
                 path.display(),
                 err

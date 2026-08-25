@@ -10,8 +10,11 @@ use elastos_compute::providers::{BridgeHostcall, ComponentProvider};
 use elastos_compute::{CapsuleHandle, ComputeProvider};
 use elastos_storage::StorageProvider;
 
+use elastos_logger::{log_info, log_trace, log_warn};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::signature::{hash_content, SignatureVerifier};
+
+const LOG_COMPONENT: &str = "runtime";
 
 /// Information about a running capsule (for API responses and lifecycle management)
 #[derive(Debug, Clone)]
@@ -123,7 +126,7 @@ impl Runtime {
                     .map_err(|err| err.to_string())?;
                 serde_json::to_string(&response).map_err(|err| err.to_string())
             }));
-            tracing::info!("Component resource bridge configured");
+            log_info!(component: LOG_COMPONENT, "Component resource bridge configured");
         }
 
         let mut guard = self.provider_registry.write().await;
@@ -195,11 +198,13 @@ impl Runtime {
         *self.signature_dev_mode.write().await = dev_mode;
 
         if dev_mode {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "Capsule signature verification running in dev_mode=true; unsigned local capsules are allowed"
             );
         } else {
-            tracing::info!(
+            log_info!(
+                component: LOG_COMPONENT,
                 "Capsule signature verification enforced with {} trusted key(s)",
                 trusted_key_count
             );
@@ -250,7 +255,8 @@ impl Runtime {
             ));
         }
 
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "Loading capsule '{}' ({:?})",
             manifest.name,
             manifest.capsule_type
@@ -340,7 +346,8 @@ impl Runtime {
 
         if manifest.signature.is_none() {
             if dev_mode {
-                tracing::warn!(
+                log_warn!(
+                    component: LOG_COMPONENT,
                     "Unsigned capsule '{}' allowed because dev_mode=true",
                     manifest.name
                 );
@@ -375,7 +382,7 @@ impl Runtime {
             ));
         }
 
-        tracing::info!("Capsule signature verified successfully");
+        log_info!(component: LOG_COMPONENT, "Capsule signature verified successfully");
         Ok(())
     }
 
@@ -405,7 +412,7 @@ impl Runtime {
     /// register capsules that weren't started through Runtime's run_* methods.
     pub async fn register_capsule(&self, info: RunningCapsuleInfo) {
         let mut capsules = self.running_capsules.write().await;
-        tracing::info!("Registered capsule '{}' with ID: {}", info.name, info.id);
+        log_info!(component: LOG_COMPONENT, "Registered capsule '{}' with ID: {}", info.name, info.id);
         capsules.insert(info.id.clone(), info);
     }
 
@@ -413,7 +420,7 @@ impl Runtime {
     pub async fn unregister_capsule(&self, id: &str) {
         let mut capsules = self.running_capsules.write().await;
         if capsules.remove(id).is_some() {
-            tracing::info!("Unregistered capsule: {}", id);
+            log_info!(component: LOG_COMPONENT, "Unregistered capsule: {}", id);
         }
     }
 
@@ -434,7 +441,7 @@ impl Runtime {
         let mut capsules = self.running_capsules.write().await;
         if let Some(info) = capsules.get_mut(id) {
             info.status = status.to_string();
-            tracing::debug!("Updated capsule {} status to: {}", id, status);
+            log_trace!(component: LOG_COMPONENT, "Updated capsule {} status to: {}", id, status);
         }
     }
 
@@ -457,7 +464,7 @@ impl Runtime {
         if let Some(handle) = &info.handle {
             // Find the provider that supports this capsule type
             if let Some(provider) = self.get_provider_for_manifest(&handle.manifest) {
-                tracing::info!("Stopping capsule '{}' ({})", info.name, id);
+                log_info!(component: LOG_COMPONENT, "Stopping capsule '{}' ({})", info.name, id);
                 provider.stop(handle).await?;
             }
         }

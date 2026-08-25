@@ -17,6 +17,7 @@ use base64::Engine as _;
 use elastos_common::protected_content::{
     validate_protected_content_key_envelope_algorithms, SealedObjectV1, SEALED_OBJECT_SCHEMA,
 };
+use elastos_logger::{log_info, log_warn};
 use elastos_runtime::provider::{
     Provider, ProviderByteRange, ProviderError, ProviderInvocation, ProviderInvocationTransport,
     ProviderProgress, ProviderRegistry, ProviderStreamOptions, ProviderTransfer, ResourceRequest,
@@ -25,6 +26,8 @@ use elastos_runtime::provider::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
+
+const LOG_COMPONENT: &str = "content";
 
 const AVAILABILITY_RECEIPT_SCHEMA: &str = "elastos.content.availability.receipt/v1";
 const AVAILABILITY_RECEIPT_DOMAIN: &str = "elastos.content.availability.receipt.v1";
@@ -386,7 +389,7 @@ impl ContentProvider {
             match ContentOperatorAlertSink::from_config(config) {
                 Ok(sink) => Some(sink),
                 Err(err) => {
-                    tracing::warn!("content operator alert sink disabled: {}", err);
+                    log_warn!(component: LOG_COMPONENT, "content operator alert sink disabled: {}", err);
                     None
                 }
             }
@@ -395,7 +398,7 @@ impl ContentProvider {
             match ContentStorageMarketAdmissionClient::from_config(config) {
                 Ok(client) => Some(client),
                 Err(err) => {
-                    tracing::warn!("content storage-market admission disabled: {}", err);
+                    log_warn!(component: LOG_COMPONENT, "content storage-market admission disabled: {}", err);
                     None
                 }
             }
@@ -404,7 +407,7 @@ impl ContentProvider {
             match ContentExternalRepairFleetClient::from_config(config) {
                 Ok(client) => Some(client),
                 Err(err) => {
-                    tracing::warn!("content external repair fleet disabled: {}", err);
+                    log_warn!(component: LOG_COMPONENT, "content external repair fleet disabled: {}", err);
                     None
                 }
             }
@@ -417,7 +420,8 @@ impl ContentProvider {
                     {
                         Ok(sink) => Some(sink),
                         Err(err) => {
-                            tracing::warn!(
+                            log_warn!(
+                                component: LOG_COMPONENT,
                                 "content federated operator alert exchange disabled: {}",
                                 err
                             );
@@ -430,7 +434,8 @@ impl ContentProvider {
                 match ContentFederatedAbuseControlExchangeClient::from_config(config) {
                     Ok(client) => Some(client),
                     Err(err) => {
-                        tracing::warn!(
+                        log_warn!(
+                            component: LOG_COMPONENT,
                             "content federated abuse-control exchange disabled: {}",
                             err
                         );
@@ -443,7 +448,7 @@ impl ContentProvider {
                 match ContentFederatedQuotaLedgerExchangeClient::from_config(config) {
                     Ok(client) => Some(client),
                     Err(err) => {
-                        tracing::warn!("content federated quota-ledger exchange disabled: {}", err);
+                        log_warn!(component: LOG_COMPONENT, "content federated quota-ledger exchange disabled: {}", err);
                         None
                     }
                 }
@@ -2614,7 +2619,8 @@ pub async fn prepare_capsule_from_content_provider(
         .validate()
         .map_err(|err| anyhow::anyhow!("Invalid manifest from CID {}: {}", cid, err))?;
 
-    tracing::info!(
+    log_info!(
+        component: LOG_COMPONENT,
         "Loading capsule '{}' ({:?}) through content availability",
         manifest.name,
         manifest.capsule_type

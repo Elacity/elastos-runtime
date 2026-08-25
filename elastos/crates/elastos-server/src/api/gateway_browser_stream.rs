@@ -23,6 +23,12 @@ use tokio::io::{
 #[cfg(unix)]
 use tokio::net::{TcpStream, UnixListener, UnixStream};
 
+#[cfg(unix)]
+use elastos_logger::{log_info, log_trace, log_warn};
+
+#[cfg(unix)]
+const LOG_COMPONENT: &str = "browser";
+
 const BROWSER_RUNTIME_STREAM_TMP_DIR: &str = "elastos-browser-streams";
 const BROWSER_ADAPTER_IPC_TMP_DIR: &str = "elastos-browser-adapter-ipc";
 #[cfg(unix)]
@@ -179,14 +185,13 @@ impl BrowserMediaDiagnosticBudget {
         match self.next() {
             BrowserMediaDiagnosticDecision::Emit => true,
             BrowserMediaDiagnosticDecision::SuppressionSummary => {
-                tracing::warn!(
-                    generation = self.generation,
-                    page_id = self.page_id,
-                    media_stream_id = self.media_stream_id,
-                    media_event = "diagnostics_suppressed",
-                    diagnostic_event_limit = BROWSER_MEDIA_DIAGNOSTIC_EVENT_LIMIT,
-                    suppressed_events_at_least = 1_u64,
-                    "Browser VZ media diagnostic"
+                log_warn!(
+                    component: LOG_COMPONENT,
+                    "Browser VZ media diagnostic: generation={} page_id={} media_stream_id={} media_event=diagnostics_suppressed diagnostic_event_limit={} suppressed_events_at_least=1",
+                    self.generation,
+                    self.page_id,
+                    self.media_stream_id,
+                    BROWSER_MEDIA_DIAGNOSTIC_EVENT_LIMIT
                 );
                 false
             }
@@ -209,14 +214,14 @@ impl Drop for BrowserMediaSessionDiagnostic {
             return;
         }
         if self.budget.event_allowed() {
-            tracing::warn!(
-                generation = self.generation,
-                page_id = self.page_id,
-                media_stream_id = self.media_stream_id,
-                media_event = "guest_relay_cancelled",
-                guest_to_turn_bytes = self.guest_to_turn.load(Ordering::Relaxed),
-                turn_to_guest_bytes = self.turn_to_guest.load(Ordering::Relaxed),
-                "Browser VZ media diagnostic"
+            log_warn!(
+                component: LOG_COMPONENT,
+                "Browser VZ media diagnostic: generation={} page_id={} media_stream_id={} media_event=guest_relay_cancelled guest_to_turn_bytes={} turn_to_guest_bytes={}",
+                self.generation,
+                self.page_id,
+                self.media_stream_id,
+                self.guest_to_turn.load(Ordering::Relaxed),
+                self.turn_to_guest.load(Ordering::Relaxed)
             );
         }
     }
@@ -575,12 +580,9 @@ pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
                         let media_stream_id = media_stream_id.clone();
                         let media_diagnostics = Arc::clone(&media_diagnostics);
                         if media_diagnostics.event_allowed() {
-                            tracing::info!(
-                                generation,
-                                page_id,
-                                media_stream_id,
-                                media_event = "guest_relay_accepted",
-                                "Browser VZ media diagnostic"
+                            log_info!(
+                                component: LOG_COMPONENT,
+                                "Browser VZ media diagnostic: generation={generation} page_id={page_id} media_stream_id={media_stream_id} media_event=guest_relay_accepted"
                             );
                         }
                         sessions.spawn(async move {
@@ -598,25 +600,19 @@ pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
                             let mut turn = match TcpStream::connect(target).await {
                                 Ok(turn) => {
                                     if media_diagnostics.event_allowed() {
-                                        tracing::info!(
-                                            generation,
-                                            page_id,
-                                            media_stream_id,
-                                            media_event = "turn_connected",
-                                            "Browser VZ media diagnostic"
+                                        log_info!(
+                                            component: LOG_COMPONENT,
+                                            "Browser VZ media diagnostic: generation={generation} page_id={page_id} media_stream_id={media_stream_id} media_event=turn_connected"
                                         );
                                     }
                                     turn
                                 }
                                 Err(error) => {
                                     if media_diagnostics.event_allowed() {
-                                        tracing::warn!(
-                                            generation,
-                                            page_id,
-                                            media_stream_id,
-                                            media_event = "turn_connect_failed",
-                                            error_kind = ?error.kind(),
-                                            "Browser VZ media diagnostic"
+                                        log_warn!(
+                                            component: LOG_COMPONENT,
+                                            "Browser VZ media diagnostic: generation={generation} page_id={page_id} media_stream_id={media_stream_id} media_event=turn_connect_failed error_kind={:?}",
+                                            error.kind()
                                         );
                                     }
                                     diagnostic.mark_reported();
@@ -628,24 +624,14 @@ pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
                             let turn_to_guest_bytes = turn_to_guest.load(Ordering::Relaxed);
                             if media_diagnostics.event_allowed() {
                                 match result {
-                                    Ok(_) => tracing::info!(
-                                        generation,
-                                        page_id,
-                                        media_stream_id,
-                                        media_event = "guest_relay_closed",
-                                        guest_to_turn_bytes,
-                                        turn_to_guest_bytes,
-                                        "Browser VZ media diagnostic"
+                                    Ok(_) => log_info!(
+                                        component: LOG_COMPONENT,
+                                        "Browser VZ media diagnostic: generation={generation} page_id={page_id} media_stream_id={media_stream_id} media_event=guest_relay_closed guest_to_turn_bytes={guest_to_turn_bytes} turn_to_guest_bytes={turn_to_guest_bytes}"
                                     ),
-                                    Err(error) => tracing::warn!(
-                                        generation,
-                                        page_id,
-                                        media_stream_id,
-                                        media_event = "guest_relay_failed",
-                                        guest_to_turn_bytes,
-                                        turn_to_guest_bytes,
-                                        error_kind = ?error.kind(),
-                                        "Browser VZ media diagnostic"
+                                    Err(error) => log_warn!(
+                                        component: LOG_COMPONENT,
+                                        "Browser VZ media diagnostic: generation={generation} page_id={page_id} media_stream_id={media_stream_id} media_event=guest_relay_failed guest_to_turn_bytes={guest_to_turn_bytes} turn_to_guest_bytes={turn_to_guest_bytes} error_kind={:?}",
+                                        error.kind()
                                     ),
                                 }
                             }
@@ -657,13 +643,9 @@ pub(in crate::api::gateway) async fn spawn_browser_vz_fixed_media_listener(
                 result = sessions.join_next(), if !sessions.is_empty() => {
                     if let Some(Err(error)) = result {
                         if media_diagnostics.event_allowed() {
-                            tracing::warn!(
-                                generation,
-                                page_id,
-                                media_stream_id,
-                                media_event = "guest_relay_task_failed",
-                                error = %error,
-                                "Browser VZ media diagnostic"
+                            log_warn!(
+                                component: LOG_COMPONENT,
+                                "Browser VZ media diagnostic: generation={generation} page_id={page_id} media_stream_id={media_stream_id} media_event=guest_relay_task_failed error={error}"
                             );
                         }
                     }
@@ -1121,9 +1103,10 @@ async fn bridge_browser_runtime_stream_to_local_relay(
     relay: Option<BrowserExitRelay>,
 ) -> anyhow::Result<()> {
     let Some(relay) = relay else {
-        tracing::info!(
-            path = %session_path.display(),
-            "browser runtime stream accepted and closed fail-closed"
+        log_info!(
+            component: LOG_COMPONENT,
+            "browser runtime stream accepted and closed fail-closed: path={}",
+            session_path.display()
         );
         return Ok(());
     };
@@ -1133,42 +1116,41 @@ async fn bridge_browser_runtime_stream_to_local_relay(
     relay_stream.write_all(&open_line).await?;
     match copy_bidirectional(stream, &mut relay_stream).await {
         Ok((to_relay, to_engine)) => {
-            tracing::info!(
-                path = %session_path.display(),
-                relay = %relay.path.display(),
-                stream_id = %open_log.stream_id,
-                target = %open_log.target,
-                scheme = %open_log.scheme,
-                host = %open_log.host,
-                to_relay,
-                to_engine,
-                "browser runtime stream relay session closed"
+            log_info!(
+                component: LOG_COMPONENT,
+                "browser runtime stream relay session closed: path={} relay={} stream_id={} target={} scheme={} host={} to_relay={to_relay} to_engine={to_engine}",
+                session_path.display(),
+                relay.path.display(),
+                open_log.stream_id,
+                open_log.target,
+                open_log.scheme,
+                open_log.host
             );
             Ok(())
         }
         Err(err) => {
             if browser_stream_copy_was_cancelled(&err) {
-                tracing::info!(
-                    path = %session_path.display(),
-                    relay = %relay.path.display(),
-                    stream_id = %open_log.stream_id,
-                    target = %open_log.target,
-                    scheme = %open_log.scheme,
-                    host = %open_log.host,
-                    error = %err,
-                    "browser runtime stream relay session closed by peer"
+                log_info!(
+                    component: LOG_COMPONENT,
+                    "browser runtime stream relay session closed by peer: path={} relay={} stream_id={} target={} scheme={} host={} error={err}",
+                    session_path.display(),
+                    relay.path.display(),
+                    open_log.stream_id,
+                    open_log.target,
+                    open_log.scheme,
+                    open_log.host
                 );
                 Ok(())
             } else {
-                tracing::warn!(
-                    path = %session_path.display(),
-                    relay = %relay.path.display(),
-                    stream_id = %open_log.stream_id,
-                    target = %open_log.target,
-                    scheme = %open_log.scheme,
-                    host = %open_log.host,
-                    error = %err,
-                    "browser runtime stream relay session failed"
+                log_warn!(
+                    component: LOG_COMPONENT,
+                    "browser runtime stream relay session failed: path={} relay={} stream_id={} target={} scheme={} host={} error={err}",
+                    session_path.display(),
+                    relay.path.display(),
+                    open_log.stream_id,
+                    open_log.target,
+                    open_log.scheme,
+                    open_log.host
                 );
                 Err(err.into())
             }
@@ -1214,13 +1196,10 @@ async fn bridge_browser_runtime_stream_to_carrier(
         Ok::<u64, anyhow::Error>(copied)
     };
     let (to_carrier, to_engine) = tokio::try_join!(to_carrier, from_carrier)?;
-    tracing::info!(
-        path = %session_path.display(),
-        stream_id = %stream_id,
-        target = %target,
-        to_carrier,
-        to_engine,
-        "browser runtime stream Carrier session closed"
+    log_info!(
+        component: LOG_COMPONENT,
+        "browser runtime stream Carrier session closed: path={} stream_id={stream_id} target={target} to_carrier={to_carrier} to_engine={to_engine}",
+        session_path.display()
     );
     Ok(())
 }
@@ -1312,10 +1291,10 @@ async fn spawn_browser_runtime_stream_listener_with_accept_timeout(
                                 )
                                 .await
                                 {
-                                    tracing::warn!(
-                                        path = %session_path.display(),
-                                        error = %err,
-                                        "browser runtime stream local relay failed"
+                                    log_warn!(
+                                        component: LOG_COMPONENT,
+                                        "browser runtime stream local relay failed: path={} error={err}",
+                                        session_path.display()
                                     );
                                 }
                             }
@@ -1327,10 +1306,10 @@ async fn spawn_browser_runtime_stream_listener_with_accept_timeout(
                                 )
                                 .await
                                 {
-                                    tracing::warn!(
-                                        path = %session_path.display(),
-                                        error = %err,
-                                        "browser runtime stream Carrier relay failed"
+                                    log_warn!(
+                                        component: LOG_COMPONENT,
+                                        "browser runtime stream Carrier relay failed: path={} error={err}",
+                                        session_path.display()
                                     );
                                 }
                             }
@@ -1338,18 +1317,19 @@ async fn spawn_browser_runtime_stream_listener_with_accept_timeout(
                     });
                 }
                 Ok(Err(err)) => {
-                    tracing::info!(
-                        path = %cleanup_path.display(),
-                        error = %err,
-                        "browser runtime stream listener failed"
+                    log_info!(
+                        component: LOG_COMPONENT,
+                        "browser runtime stream listener failed: path={} error={err}",
+                        cleanup_path.display()
                     );
                     break;
                 }
                 Err(_) => {
                     if !accepted_any {
-                        tracing::debug!(
-                            path = %cleanup_path.display(),
-                            "browser runtime stream listener expired before first use"
+                        log_trace!(
+                            component: LOG_COMPONENT,
+                            "browser runtime stream listener expired before first use: path={}",
+                            cleanup_path.display()
                         );
                         break;
                     }
@@ -1357,10 +1337,10 @@ async fn spawn_browser_runtime_stream_listener_with_accept_timeout(
                 },
                 result = sessions.join_next(), if !sessions.is_empty() => {
                     if let Some(Err(err)) = result {
-                        tracing::warn!(
-                            path = %cleanup_path.display(),
-                            error = %err,
-                            "browser runtime stream relay task failed"
+                        log_warn!(
+                            component: LOG_COMPONENT,
+                            "browser runtime stream relay task failed: path={} error={err}",
+                            cleanup_path.display()
                         );
                     }
                 }

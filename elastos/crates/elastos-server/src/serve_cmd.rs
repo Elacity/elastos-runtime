@@ -3,8 +3,11 @@ use std::sync::Arc;
 
 use elastos_compute::ComputeProvider;
 use elastos_crosvm::{CrosvmConfig, CrosvmProvider};
+use elastos_logger::{fp, log_error, log_info, log_trace, log_warn};
 use elastos_runtime::{bootstrap, session};
 use sha2::Digest as _;
+
+const LOG_COMPONENT: &str = "serve";
 
 pub async fn run_serve(
     addr: String,
@@ -37,7 +40,8 @@ pub async fn run_serve(
         crate::ELASTOS_VERSION,
         addr
     );
-    tracing::info!(
+    log_info!(
+        component: LOG_COMPONENT,
         "Starting ElastOS Runtime server v{} on {}",
         crate::ELASTOS_VERSION,
         addr
@@ -46,7 +50,7 @@ pub async fn run_serve(
     let runtime = crate::create_runtime(&storage_path).await?;
 
     let capsule_dir = if let Some(ref cid_str) = cid {
-        tracing::info!("Loading capsule from CID: {}", cid_str);
+        log_info!(component: LOG_COMPONENT, "Loading capsule from CID: {}", cid_str);
         let content_registry = crate::get_content_registry().await?;
         Some(
             elastos_server::content::prepare_capsule_from_content_provider(
@@ -69,7 +73,7 @@ pub async fn run_serve(
                 .map_err(|e| anyhow::anyhow!("Invalid manifest: {}", e))?;
 
             if manifest.capsule_type == elastos_common::CapsuleType::MicroVM {
-                tracing::info!("Launching MicroVM capsule: {}", manifest.name);
+                log_info!(component: LOG_COMPONENT, "Launching MicroVM capsule: {}", manifest.name);
 
                 let vm_provider = CrosvmProvider::new(CrosvmConfig::default())
                     .map_err(|e| anyhow::anyhow!("Failed to create crosvm provider: {}", e))?;
@@ -133,10 +137,11 @@ pub async fn run_serve(
                             .map_err(|e| anyhow::anyhow!("Failed to set token: {}", e))?;
                     }
 
-                    tracing::info!(
+                    log_info!(
+                        component: LOG_COMPONENT,
                         "Created session for VM {}: token={}... tap={}",
                         vm_id,
-                        &shell_session.token[..8],
+                        fp(&shell_session.token),
                         needs_tap,
                     );
                 }
@@ -164,7 +169,8 @@ pub async fn run_serve(
                 runtime_arc.register_capsule(capsule_info).await;
 
                 if tls_config.is_some() {
-                    tracing::warn!(
+                    log_warn!(
+                        component: LOG_COMPONENT,
                         "TLS proxy not available on the current VM path. Using plain HTTP."
                     );
                 }
@@ -187,7 +193,7 @@ pub async fn run_serve(
                 } else {
                     addr.clone()
                 };
-                tracing::info!("API server will bind to {}", api_bind_addr);
+                log_info!(component: LOG_COMPONENT, "API server will bind to {}", api_bind_addr);
 
                 let provider_registry = infra.provider_registry;
                 let namespace_store = infra.namespace_store;
@@ -230,7 +236,7 @@ pub async fn run_serve(
                         )
                         .await
                         {
-                            tracing::error!("API server error: {}", e);
+                            log_error!(component: LOG_COMPONENT, "API server error: {}", e);
                         }
                     }
                 });
@@ -240,7 +246,7 @@ pub async fn run_serve(
                 api_handle.abort();
                 runtime_arc.unregister_capsule(&handle.id.0).await;
                 if let Err(e) = vm_provider.stop(&handle).await {
-                    tracing::warn!("Error stopping VM: {}", e);
+                    log_warn!(component: LOG_COMPONENT, "Error stopping VM: {}", e);
                 }
                 if let Some(service) = collaboration_service.as_mut() {
                     service.shutdown().await?;
@@ -285,7 +291,7 @@ pub async fn run_serve(
             }
         }
 
-        tracing::info!("Serving web capsule from: {}", capsule_dir.display());
+        log_info!(component: LOG_COMPONENT, "Serving web capsule from: {}", capsule_dir.display());
         return crate::serve_web_capsule(runtime, capsule_dir, &addr, false, None).await;
     }
 
@@ -323,7 +329,11 @@ pub async fn run_serve(
 
     let _shell_child = if let Some(shell_path) = crate::find_installed_provider_binary("shell") {
         if let Err(e) = crate::verify_component_binary("shell", &shell_path) {
-            tracing::warn!("Skipping shell capsule due to verification failure: {}", e);
+            log_warn!(
+                component: LOG_COMPONENT,
+                "Skipping shell capsule due to verification failure: {}",
+                e
+            );
             None
         } else {
             let api_url = format!("http://{}", addr);
@@ -344,7 +354,8 @@ pub async fn run_serve(
                 .spawn()
             {
                 Ok(child) => {
-                    tracing::info!(
+                    log_info!(
+                        component: LOG_COMPONENT,
                         "Spawned shell capsule (PID {}, mode={})",
                         child.id().unwrap_or(0),
                         shell_mode
@@ -352,13 +363,13 @@ pub async fn run_serve(
                     Some(child)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to spawn shell capsule: {}", e);
+                    log_warn!(component: LOG_COMPONENT, "Failed to spawn shell capsule: {}", e);
                     None
                 }
             }
         }
     } else {
-        tracing::info!("Shell capsule not found, skipping spawn");
+        log_info!(component: LOG_COMPONENT, "Shell capsule not found, skipping spawn");
         None
     };
 
@@ -446,7 +457,7 @@ pub async fn run_serve(
                 interval.tick().await;
                 let removed = registry.cleanup_stale_sessions(600).await;
                 if removed > 0 {
-                    tracing::debug!("Cleaned up {} idle attach sessions", removed);
+                    log_trace!(component: LOG_COMPONENT, "Cleaned up {} idle attach sessions", removed);
                 }
             }
         });

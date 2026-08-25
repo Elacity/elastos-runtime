@@ -49,6 +49,9 @@ use crate::collaboration_network::{
 use crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument;
 use crate::collaboration_protocol::validate_id;
 use crate::crypto::{domain_separated_sign, encode_did_key};
+use elastos_logger::log_warn;
+
+const LOG_COMPONENT: &str = "collab";
 
 const COLLABORATION_DISCOVERY_PROVIDER_SCHEME: &str = "collaboration";
 const MAX_DISCOVERY_CLIENT_STATES: usize = 32;
@@ -382,10 +385,11 @@ impl CollaborationDiscoveryService {
             match registered_for_principal {
                 Ok(()) => registered = registered.saturating_add(1),
                 Err(err) => {
-                    tracing::warn!(
-                        principal_id = %principal.principal_id,
-                        error = %err,
-                        "collaboration registration skipped for this Profile"
+                    log_warn!(
+                        component: LOG_COMPONENT,
+                        "collaboration registration skipped for this Profile: principal_id={} error={}",
+                        principal.principal_id,
+                        err
                     );
                 }
             }
@@ -616,7 +620,7 @@ impl CollaborationDiscoveryService {
         let due = match self.sync_contexts.lock() {
             Ok(contexts) => due_sync_contexts(&contexts, now),
             Err(_) => {
-                tracing::warn!("discovery sync context lock is poisoned");
+                log_warn!(component: LOG_COMPONENT, "discovery sync context lock is poisoned");
                 return;
             }
         };
@@ -696,7 +700,7 @@ impl CollaborationDiscoveryService {
                 None
             };
             let Ok(mut contexts) = self.sync_contexts.lock() else {
-                tracing::warn!("discovery sync context lock is poisoned");
+                log_warn!(component: LOG_COMPONENT, "discovery sync context lock is poisoned");
                 return;
             };
             let Some(current) = contexts.get_mut(&key) else {
