@@ -29,6 +29,7 @@ elastos/storage/
 
 # Allow tracked ROM templates (uCity Advance is open-source)
 !capsules/gba-ucity/ucity.gba
+!capsules/gba-nonogram/nonogram.gba
 
 # Logs
 *.log
