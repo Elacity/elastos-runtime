@@ -10,7 +10,7 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use elastos_logger::{log_info, log_trace, log_warn};
+use elastos_logger::{fp, log_info, log_trace, log_warn};
 use elastos_runtime::provider::{
     EntryType, Provider, ProviderError, ResourceAction, ResourceEntry, ResourceRequest,
     ResourceResponse,
@@ -237,12 +237,13 @@ impl VmRawBridge {
             .map_err(|_| ProviderError::Provider("vm bridge mutex poisoned".into()))?;
 
         if guard.is_some() {
-            log_info!(
+            log_trace!(
                 component: LOG_COMPONENT,
-                "reusing persistent connection to guest {}:{} for: {}",
+                "reusing persistent connection to guest {}:{} for op={} payload={}",
                 self.guest_host,
                 self.guest_port,
-                serde_json::to_string(request).unwrap_or_default()
+                request.get("op").and_then(|v| v.as_str()).unwrap_or("?"),
+                fp(&serde_json::to_string(request).unwrap_or_default())
             );
         }
 
@@ -257,10 +258,10 @@ impl VmRawBridge {
             });
             log_info!(
                 component: LOG_COMPONENT,
-                "sending init to guest {}:{}: {}",
+                "sending init to guest {}:{} config={}",
                 self.guest_host,
                 self.guest_port,
-                serde_json::to_string(&init_req).unwrap_or_default()
+                fp(&serde_json::to_string(&init_req).unwrap_or_default())
             );
             let init_start = std::time::Instant::now();
             let init_resp = match Self::send_line_and_read_json(
