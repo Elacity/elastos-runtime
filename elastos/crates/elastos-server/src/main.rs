@@ -77,8 +77,30 @@ fn should_isolate_process_group(argv: &[String]) -> bool {
     All resource access is capability-gated by the local control plane.")]
 #[command(version = ELASTOS_VERSION)]
 struct Cli {
+    /// Log verbosity: trace|debug|info|warn|error|critical (overrides ELASTOS_LOG)
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = parse_log_level)]
+    log_level: Option<elastos_logger::Level>,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+fn parse_log_level(s: &str) -> Result<elastos_logger::Level, String> {
+    elastos_logger::Level::parse(s).ok_or_else(|| {
+        format!("unknown log level '{s}' (use trace|debug|info|warn|error|critical)")
+    })
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::parse_log_level;
+
+    #[test]
+    fn parses_known_levels_and_rejects_unknown() {
+        assert_eq!(parse_log_level("warn"), Ok(elastos_logger::Level::Warn));
+        assert_eq!(parse_log_level("DEBUG"), Ok(elastos_logger::Level::Trace));
+        assert!(parse_log_level("verbose").is_err());
+    }
 }
 
 #[derive(Subcommand)]
@@ -1130,6 +1152,19 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ConditionalStderr {
     }
 }
 
+/// `elastos-logger` sink honoring the same interactive-TUI suppression flag as
+/// [`ConditionalStderr`]: while a VM owns the terminal, records are dropped.
+struct SuppressableStderrSink;
+
+impl elastos_logger::LogSink for SuppressableStderrSink {
+    fn write(&self, rec: &elastos_logger::LogRecord) {
+        if !SUPPRESS_LOGGING.load(Ordering::Relaxed) {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "{}", rec.format_line());
+        }
+    }
+}
+
 struct ConditionalStderrWriter {
     suppress: bool,
 }
@@ -1207,6 +1242,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Install the process-global elastos-logger: threshold CLI > ELASTOS_LOG > Info, stderr sink
+    // sharing the interactive-TUI suppression flag. Surfaces stamp per-surface components via
+    // `log_*!(component: "...", ...)`.
+    let log_threshold =
+        elastos_logger::resolve_level(cli.log_level, &["ELASTOS_LOG"], elastos_logger::Level::Info);
+    elastos_logger::init(
+        elastos_logger::LoggerConfig::new("elastos", log_threshold)
+            .with_sink(std::sync::Arc::new(SuppressableStderrSink))
+            .build(),
+    );
+
     let command = cli.command.unwrap_or(Commands::Home {
         status: false,
         json: false,

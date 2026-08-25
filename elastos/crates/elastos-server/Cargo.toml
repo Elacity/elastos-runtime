@@ -10,6 +10,7 @@ name = "elastos"
 path = "src/main.rs"
 
 [dependencies]
+elastos-logger = { path = "../elastos-logger" }
 elastos-runtime = { path = "../elastos-runtime" }
 elastos-namespace = { path = "../elastos-namespace" }
 elastos-common = { path = "../elastos-common" }
