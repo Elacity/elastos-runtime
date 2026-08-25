@@ -160,8 +160,8 @@ D. implement inactive Runtime provider lifecycle, registration, routing, audit,
    (`feat/protected-content-runtime-lifecycle` from rights `43a83e5b`); do not
    continue `feat/protected-content-runtime-coordinator-v1`;
 E. PQ-hybrid share wrap, recipient possession, decrypt-session wrap, and the
-   Runtime mint journal/2-of-3 provision are on the unpublished integration
-   tree (`elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`, X-Wing draft-06
+   Runtime mint journal/2-of-3 provision are on the current review tree
+   (`elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`, X-Wing draft-06
    confidentiality only). This remains a source-only permissioned draft; the
    current authority signatures remain classical and are not claimed
    quantum-safe. Full PQ authorization remains a pre-activation decision.
@@ -209,7 +209,7 @@ principals. Current source pins one local Runtime device issuer; multi-Runtime
 issuer admission and cross-Runtime protected-content exchange are later
 explicit pre-public-network gates.
 
-Share wrap on this unpublished tree is PQ-hybrid. It is still not a product
+Share wrap on this current review tree is PQ-hybrid. It is still not a product
 mint path. First minted objects must stay PQ-hybrid; do not add a classical
 journey. PR #15 / `feat/dkms-esp-port` is research evidence for
 PQ-hybrid envelope crypto, threshold tests, node-local custody, lifecycle
@@ -217,17 +217,18 @@ scenarios, CENC/play, and UX shape. Its public `shares[]` metadata, PQ-off
 decrypt defaults, raw-CEK/reference operations, old DRM orchestration, direct
 TCP/IP topology, and standalone harness must not become the product path.
 
-The published protected-content review line now reaches
-`origin/feat/protected-content-custody-provider` (`f7cd6c3d`), which is still
-source-only and unregistered. Local descendants add Wallet-rights, a private
-Runtime coordinator, typed Chain evidence, and a typed rights evaluator; those
-remain unpublished source work. Do not continue
-`feat/protected-content-runtime-coordinator-v1`. Local
-`feat/protected-content-runtime-lifecycle` implements Slice D buy plus
-Library open/play on the test registry without replacing the
-provisional `key` or `rights` routes. Rights evaluation invokes existing `chain`
-evidence through the Runtime registry. The remaining-work plan is
-[Protected-content extraction](docs/PROTECTED_CONTENT_EXTRACTION.md).
+The published protected-content lifecycle prefix currently reaches
+`origin/feat/protected-content-runtime-lifecycle` at `34465959`. The earlier
+published `origin/feat/protected-content-custody-provider` branch remains
+historical source-only evidence for the custody-provider introduction. Local
+`feat/protected-content-runtime-lifecycle` adds the inactive Runtime-owned
+mint/list/buy/open/release/decrypt/close source path without changing
+installed product behavior. It also adds Wallet-rights, a private Runtime
+coordinator, typed Chain evidence, and a typed rights evaluator on that source
+line. Do not continue `feat/protected-content-runtime-coordinator-v1`. Rights
+evaluation invokes existing `chain` evidence through the Runtime registry. The
+remaining-work plan is the
+[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md).
 
 Carrier remains transport only throughout that sequence. It carries
 Runtime-selected traffic, but it does not define rights authority, custody
@@ -249,7 +250,7 @@ require independent review and operational evidence.
 The repository now has a canonical source-only v1 review line in
 [Protected-content v1 contracts](docs/PROTECTED_CONTENT_CONTRACTS_V1.md),
 [Protected content](docs/PROTECTED_CONTENT.md), and
-[Protected-content extraction](docs/PROTECTED_CONTENT_EXTRACTION.md). The current installed/provider
+[Protected-content integration plan](docs/PROTECTED_CONTENT_EXTRACTION.md). The current installed/provider
 path still uses the older provisional `elastos_common::protected_content` DTOs
 plus fail-closed provider stubs. The canonical source line is not product proof
 until Runtime, providers, Library, Wallet, Chain, custody, decrypt output, and

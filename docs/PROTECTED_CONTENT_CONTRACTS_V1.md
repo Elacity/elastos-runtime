@@ -166,7 +166,7 @@ action semantics from the boolean on-chain entitlement alone. Production-
 approved chain ids, contract addresses, selectors, and ABI fixtures remain open
 review inputs, but they are required typed policy fields now, not ambient
 provider configuration. The observation finality model itself is fixed to
-`finalized` in this unpublished v1 line.
+`finalized` in this current review v1 line.
 
 `RightsEvaluationEvidenceRequestV1` is the matching typed evidence request. It
 pins the exact `ProtectedContentBindingV1` and `RightsPolicyIdentityV1`. A node
@@ -336,7 +336,7 @@ not solve malicious custody nodes, rights-policy correctness, Runtime durable
 replay storage, full operational custody state, recovery from a durable claim
 without a result, issuer-key lifecycle, node admission/rotation/recovery,
 Library list/open/play, rendering, or product workflow safety. Share wrap on
-this unpublished tree is `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`:
+this current review tree is `elastos-xwing-draft06-hkdf-sha256-aes256gcm/v1`:
 X-Wing draft-06 with X25519 + ML-KEM-768, HKDF-SHA256, and AES-256-GCM.
 This is PQ-hybrid confidentiality only; authority signatures remain
 Ed25519/classical and full PQ authorization is a pre-activation decision. The
