@@ -16,6 +16,36 @@ enum MockProtectedContentChainMode {
     ListingError,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MockProtectedContentPurchaseAccessMode {
+    Allow,
+    Deny,
+    Error,
+}
+
+#[derive(Clone)]
+struct MockProtectedContentPurchaseFixture {
+    native_purchase: bool,
+    access_mode: MockProtectedContentPurchaseAccessMode,
+    listing_quantity: String,
+}
+
+#[derive(Clone)]
+struct MockPublishedProtectedContentState {
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    receipt: crate::content::SignedAvailabilityReceipt,
+}
+
+impl Default for MockProtectedContentPurchaseFixture {
+    fn default() -> Self {
+        Self {
+            native_purchase: false,
+            access_mode: MockProtectedContentPurchaseAccessMode::Allow,
+            listing_quantity: MOCK_PROTECTED_CONTENT_LISTING_QUANTITY.to_string(),
+        }
+    }
+}
+
 fn mock_content_publish_requests() -> &'static std::sync::Mutex<Vec<serde_json::Value>> {
     static REQUESTS: std::sync::OnceLock<std::sync::Mutex<Vec<serde_json::Value>>> =
         std::sync::OnceLock::new();
@@ -28,6 +58,125 @@ fn reset_mock_content_publish_requests() {
 
 fn mock_content_publish_request_count() -> usize {
     mock_content_publish_requests().lock().unwrap().len()
+}
+
+fn mock_published_protected_content(
+) -> &'static std::sync::Mutex<Option<MockPublishedProtectedContentState>> {
+    static STATE: std::sync::OnceLock<
+        std::sync::Mutex<Option<MockPublishedProtectedContentState>>,
+    > = std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn mock_protected_content_provider_signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32])
+}
+
+fn mock_protected_content_provider_signer_did() -> String {
+    crate::crypto::domain_separated_sign(
+        &mock_protected_content_provider_signing_key(),
+        "elastos.content.availability.receipt.v1",
+        b"mock-protected-content-provider",
+    )
+    .1
+}
+
+fn mock_protected_content_file(path: &str, bytes: &[u8]) -> crate::content::ContentObjectFile {
+    crate::content::ContentObjectFile {
+        path: path.to_string(),
+        sha256: hex::encode(sha2::Sha256::digest(bytes)),
+        size: bytes.len() as u64,
+    }
+}
+
+fn mock_protected_content_manifest_digest(files: &[crate::content::ContentObjectFile]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    for file in files {
+        hasher.update(file.path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(file.sha256.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(file.size.to_string().as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn seed_mock_published_protected_content(
+    object_identity: &str,
+    publisher_did: &str,
+    media_identity: &elastos_protected_content_provider_contracts::CencFmp4MediaIdentityV1,
+    protected_init: &[u8],
+    protected_segments: &[Vec<u8>],
+    checked_at: u64,
+) {
+    let descriptor = media_identity.canonical_bytes().unwrap();
+    let mut files = std::collections::BTreeMap::new();
+    let mut manifest_files = Vec::with_capacity(protected_segments.len() + 2);
+
+    let identity_path = "protected-content/v1/identity.bin";
+    files.insert(identity_path.to_string(), descriptor.clone());
+    manifest_files.push(mock_protected_content_file(identity_path, &descriptor));
+
+    let init_path = "protected-content/v1/init.mp4";
+    files.insert(init_path.to_string(), protected_init.to_vec());
+    manifest_files.push(mock_protected_content_file(init_path, protected_init));
+
+    for (index, segment) in protected_segments.iter().enumerate() {
+        let path = format!("protected-content/v1/segments/{index:08}.m4s");
+        files.insert(path.clone(), segment.clone());
+        manifest_files.push(mock_protected_content_file(&path, segment));
+    }
+    manifest_files.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let manifest = crate::content::ContentObjectManifest {
+        schema: "elastos.content.object.manifest/v1".to_string(),
+        kind: "protected-content".to_string(),
+        content_digest: mock_protected_content_manifest_digest(&manifest_files),
+        files: manifest_files,
+        links: Vec::new(),
+        object_did: Some(object_identity.to_string()),
+        publisher_did: Some(publisher_did.to_string()),
+    };
+    files.insert(
+        crate::content::CONTENT_OBJECT_MANIFEST_PATH.to_string(),
+        serde_json::to_vec(&manifest).unwrap(),
+    );
+
+    let payload = crate::content::AvailabilityReceipt {
+        schema: "elastos.content.availability.receipt/v1".to_string(),
+        cid: TEST_CIDV1.to_string(),
+        uri: format!("elastos://{TEST_CIDV1}"),
+        object_did: Some(object_identity.to_string()),
+        publisher_did: publisher_did.to_string(),
+        provider: "content".to_string(),
+        policy: "replicate:3".to_string(),
+        status: "network_available".to_string(),
+        replicas: 3,
+        peer_selection: json!({}),
+        quota: json!({}),
+        repair_worker: json!({}),
+        storage_market: json!({}),
+        repair_graph: json!({}),
+        abuse_controls: json!({}),
+        accounting: json!({}),
+        checked_at,
+    };
+    let payload_bytes = serde_json::to_string(&serde_json::to_value(&payload).unwrap()).unwrap();
+    let (signature, signer_did) = crate::crypto::domain_separated_sign(
+        &mock_protected_content_provider_signing_key(),
+        "elastos.content.availability.receipt.v1",
+        payload_bytes.as_bytes(),
+    );
+    *mock_published_protected_content().lock().unwrap() =
+        Some(MockPublishedProtectedContentState {
+            files,
+            receipt: crate::content::SignedAvailabilityReceipt {
+                payload,
+                signature,
+                signer_did,
+            },
+        });
 }
 
 fn mock_protected_content_chain_mode() -> &'static std::sync::Mutex<MockProtectedContentChainMode> {
@@ -48,6 +197,65 @@ fn set_mock_protected_content_chain_receipt_error() {
 fn set_mock_protected_content_chain_listing_error() {
     *mock_protected_content_chain_mode().lock().unwrap() =
         MockProtectedContentChainMode::ListingError;
+}
+
+fn mock_protected_content_purchase_fixture(
+) -> &'static std::sync::Mutex<MockProtectedContentPurchaseFixture> {
+    static FIXTURE: std::sync::OnceLock<std::sync::Mutex<MockProtectedContentPurchaseFixture>> =
+        std::sync::OnceLock::new();
+    FIXTURE.get_or_init(|| std::sync::Mutex::new(MockProtectedContentPurchaseFixture::default()))
+}
+
+fn reset_mock_protected_content_purchase_fixture() {
+    *mock_protected_content_purchase_fixture().lock().unwrap() =
+        MockProtectedContentPurchaseFixture::default();
+}
+
+fn set_mock_protected_content_purchase_native() {
+    mock_protected_content_purchase_fixture()
+        .lock()
+        .unwrap()
+        .native_purchase = true;
+}
+
+fn set_mock_protected_content_purchase_access_denied() {
+    mock_protected_content_purchase_fixture()
+        .lock()
+        .unwrap()
+        .access_mode = MockProtectedContentPurchaseAccessMode::Deny;
+}
+
+fn set_mock_protected_content_purchase_access_error() {
+    mock_protected_content_purchase_fixture()
+        .lock()
+        .unwrap()
+        .access_mode = MockProtectedContentPurchaseAccessMode::Error;
+}
+
+fn set_mock_protected_content_listing_quantity(quantity: &str) {
+    mock_protected_content_purchase_fixture()
+        .lock()
+        .unwrap()
+        .listing_quantity = quantity.to_string();
+}
+
+fn mock_chain_raw_requests() -> &'static std::sync::Mutex<Vec<serde_json::Value>> {
+    static REQUESTS: std::sync::OnceLock<std::sync::Mutex<Vec<serde_json::Value>>> =
+        std::sync::OnceLock::new();
+    REQUESTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn reset_mock_chain_raw_requests() {
+    mock_chain_raw_requests().lock().unwrap().clear();
+}
+
+fn mock_chain_raw_request_count(op: &str) -> usize {
+    mock_chain_raw_requests()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.get("op").and_then(Value::as_str) == Some(op))
+        .count()
 }
 
 const MOCK_MANAGED_EVM_ADDRESS: &str = "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a";
@@ -228,6 +436,10 @@ impl Provider for MockChainProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        mock_chain_raw_requests()
+            .lock()
+            .unwrap()
+            .push(request.clone());
         match request.get("op").and_then(|value| value.as_str()) {
             Some("networks") => Ok(json!({
                 "status": "ok",
@@ -359,6 +571,15 @@ impl Provider for MockChainProvider {
                         "message": "mock protected-content verified listing unavailable"
                     }));
                 }
+                let fixture = mock_protected_content_purchase_fixture()
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let pay_token = if fixture.native_purchase {
+                    "0x0000000000000000000000000000000000000000".to_string()
+                } else {
+                    MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_string()
+                };
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -369,10 +590,97 @@ impl Provider for MockChainProvider {
                         "ledger": required_test_str(request, "ledger")?.to_ascii_lowercase(),
                         "token_id": required_test_str(request, "token_id")?.to_ascii_lowercase(),
                         "operative": MOCK_PROTECTED_CONTENT_OPERATIVE,
-                        "quantity": MOCK_PROTECTED_CONTENT_LISTING_QUANTITY,
+                        "quantity": fixture.listing_quantity,
                         "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
-                        "pay_token": MOCK_PROTECTED_CONTENT_PAY_TOKEN,
-                        "payment_processor": MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR
+                        "pay_token": pay_token,
+                        "payment_processor": (!fixture.native_purchase)
+                            .then_some(MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR)
+                    }
+                }))
+            }
+            Some("resolve_protected_content_purchase") => {
+                let fixture = mock_protected_content_purchase_fixture()
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let pay_token = if fixture.native_purchase {
+                    "0x0000000000000000000000000000000000000000".to_string()
+                } else {
+                    MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_string()
+                };
+                let steps = if fixture.native_purchase {
+                    json!([{
+                        "stage": "buy",
+                        "to": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
+                        "value": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+                        "data": "0x6e61746976655f627579"
+                    }])
+                } else {
+                    json!([
+                        {
+                            "stage": "approval",
+                            "to": MOCK_PROTECTED_CONTENT_PAY_TOKEN,
+                            "value": "0x0",
+                            "data": "0x617070726f7665"
+                        },
+                        {
+                            "stage": "buy",
+                            "to": MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY,
+                            "value": "0x0",
+                            "data": "0x627579"
+                        }
+                    ])
+                };
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-purchase/v1",
+                        "network": required_test_str(request, "network")?,
+                        "purchase_quantity": "0x1",
+                        "verified_listing": {
+                            "chain_id": MOCK_PROTECTED_CONTENT_CHAIN_ID,
+                            "seller": required_test_str(request, "seller")?.to_ascii_lowercase(),
+                            "ledger": required_test_str(request, "ledger")?.to_ascii_lowercase(),
+                            "token_id": required_test_str(request, "token_id")?.to_ascii_lowercase(),
+                            "operative": MOCK_PROTECTED_CONTENT_OPERATIVE,
+                            "available_quantity": fixture.listing_quantity,
+                            "price": MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+                            "pay_token": pay_token,
+                            "payment_processor": (!fixture.native_purchase)
+                                .then_some(MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR)
+                        },
+                        "steps": steps
+                    }
+                }))
+            }
+            Some("resolve_protected_content_purchase_access") => {
+                let fixture = mock_protected_content_purchase_fixture()
+                    .lock()
+                    .unwrap()
+                    .clone();
+                if fixture.access_mode == MockProtectedContentPurchaseAccessMode::Error {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "stale_protected_content_purchase_access_observation",
+                        "message": "mock protected-content purchase access is unavailable"
+                    }));
+                }
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-purchase-access/v1",
+                        "request_id": required_test_str(request, "request_id")?,
+                        "network": required_test_str(request, "network")?,
+                        "chain_id": MOCK_PROTECTED_CONTENT_CHAIN_ID,
+                        "wallet": required_test_str(request, "wallet")?.to_ascii_lowercase(),
+                        "content_access_id": required_test_str(request, "content_access_id")?
+                            .to_ascii_lowercase(),
+                        "has_access": fixture.access_mode
+                            == MockProtectedContentPurchaseAccessMode::Allow,
+                        "finalized_block_number": 44,
+                        "finalized_block_hash": format!("0x{}", hex::encode([0x44; 32])),
+                        "finalized_block_timestamp": crate::auth::now_ts().saturating_sub(5),
+                        "observed_at": crate::auth::now_ts(),
                     }
                 }))
             }
@@ -724,6 +1032,49 @@ impl Provider for MockContentProvider {
         &self,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        if request.get("cid").and_then(|value| value.as_str()) == Some(TEST_CIDV1) {
+            let published = mock_published_protected_content().lock().unwrap().clone();
+            if let Some(published) = published {
+                match (
+                    request.get("op").and_then(|value| value.as_str()),
+                    request.get("path").and_then(|value| value.as_str()),
+                ) {
+                    (Some("status"), _) => {
+                        return Ok(json!({
+                            "status": "ok",
+                            "data": {
+                                "cid": TEST_CIDV1,
+                                "uri": format!("elastos://{TEST_CIDV1}"),
+                                "availability": {
+                                    "status": "network_available",
+                                    "provider": "mock-content-provider",
+                                    "replicas": 3
+                                },
+                                "receipt": published.receipt,
+                            }
+                        }));
+                    }
+                    (Some("fetch"), Some(path)) => {
+                        if let Some(bytes) = published.files.get(path) {
+                            return Ok(json!({
+                                "status": "ok",
+                                "data": {
+                                    "cid": TEST_CIDV1,
+                                    "path": path,
+                                    "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                                    "availability": {
+                                        "status": "network_available",
+                                        "provider": "mock-content-provider",
+                                        "replicas": 3
+                                    }
+                                }
+                            }));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         match (
             request.get("op").and_then(|value| value.as_str()),
             request.get("cid").and_then(|value| value.as_str()),

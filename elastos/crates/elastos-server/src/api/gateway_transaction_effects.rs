@@ -72,6 +72,7 @@ pub(in crate::api::gateway) struct RuntimeTransactionCompletion {
     pub(in crate::api::gateway) approval_request_id: String,
     pub(in crate::api::gateway) transaction_hash: String,
     pub(in crate::api::gateway) approval_request: Value,
+    pub(in crate::api::gateway) validated_chain_outcome: Option<ValidatedChainOutcomeV1>,
     pub(in crate::api::gateway) signed_result: Option<Value>,
     pub(in crate::api::gateway) receipt: Option<Value>,
     pub(in crate::api::gateway) completion_pending: bool,
@@ -1219,6 +1220,7 @@ pub(in crate::api::gateway) async fn complete_runtime_transaction_effect(
             .approval_snapshot
             .clone()
             .unwrap_or_else(|| json!({})),
+        validated_chain_outcome: validated_chain_outcome(effect).ok(),
         signed_result: effect.signed_result.clone(),
         receipt: effect.receipt.clone(),
         completion_pending: effect.state != TransactionEffectState::Complete,

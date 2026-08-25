@@ -2195,14 +2195,12 @@ mod tests {
     fn custody_provisioned_mint_rejects_buy_pending_content_availability_receipt() {
         let operation = signed_runtime_release_operation(0x42);
         let (_mint_temp, provisioned) = custody_provisioned_mint_matching(&operation);
-        let (wallet_request, wallet_response) = wallet_request_response(&operation);
         assert_eq!(
             bind_buy(
                 &provisioned,
-                &wallet_request,
-                &wallet_response,
+                "profile:alpha",
+                profile_identity(0x26),
                 &purchase_effect_for_wallet(&provisioned, &operation),
-                NOW,
             ),
             Err(RuntimeOpenError::MintSelection)
         );
@@ -2567,7 +2565,6 @@ mod tests {
     async fn inactive_two_principals_mint_verified_availability_buy_open_play_and_close() {
         let envelope = custody_envelope(0x11);
         let allowed = signed_runtime_release_operation_for(0x42, 0x11, 7, 0x30);
-        let denied = signed_runtime_release_operation_for(0x42, 0x11, 8, 0x31);
         let (_mint_temp, provisioned, mint_root) =
             provision_custody_provisioned_mint(&allowed, &envelope).await;
         let availability = verified_content_availability(&provisioned);
@@ -2590,18 +2587,6 @@ mod tests {
             available
         );
 
-        let (req_a, resp_a) = wallet_request_response_for(
-            &allowed,
-            "profile:alpha",
-            "wallet-account-alpha",
-            "wallet-request:11111111111111111111111111111111",
-        );
-        let (req_b, resp_b) = wallet_request_response_for(
-            &denied,
-            "profile:beta",
-            "wallet-account-beta",
-            "wallet-request:22222222222222222222222222222222",
-        );
         let effect_a = purchase_effect_for_account(
             &available,
             &allowed,
@@ -2610,13 +2595,30 @@ mod tests {
             "wallet-request:11111111111111111111111111111111",
             0xaa,
         );
-        let buy = bind_buy(&available, &req_a, &resp_a, &effect_a, NOW).unwrap();
+        let buy = bind_buy(
+            &available,
+            "profile:alpha",
+            profile_identity(0x26),
+            &effect_a,
+        )
+        .unwrap();
         assert_eq!(
-            bind_buy(&available, &req_a, &resp_a, &effect_a, NOW).unwrap(),
+            bind_buy(
+                &available,
+                "profile:alpha",
+                profile_identity(0x26),
+                &effect_a
+            )
+            .unwrap(),
             buy
         );
         assert_eq!(
-            bind_buy(&available, &req_b, &resp_b, &effect_a, NOW,),
+            bind_buy(
+                &available,
+                "profile:beta",
+                profile_identity(0x26),
+                &effect_a,
+            ),
             Err(RuntimeOpenError::ChainEvidence)
         );
 
@@ -2624,6 +2626,12 @@ mod tests {
         let prepared = prepare_recipient(
             &decrypt,
             &buy,
+            allowed
+                .statement()
+                .rights_request()
+                .request()
+                .binding()
+                .runtime_session_binding(),
             allowed.statement().audit_request_id(),
             allowed.statement().runtime_operation_issuer(),
             NOW + 10,

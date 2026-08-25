@@ -332,6 +332,7 @@ enum ObjectProviderRequest {
     Buy {
         principal_id: String,
         mint_id: String,
+        account_id: String,
     },
     OpenViewer {
         principal_id: String,
@@ -487,7 +488,7 @@ impl Provider for ObjectProvider {
                         "object provider registry unavailable",
                     ));
                 };
-                handle_runtime_custody_library_request(data_dir, registry, request).await
+                handle_runtime_custody_library_request(data_dir, registry, request, None).await
             }
             request => {
                 tokio::task::spawn_blocking(move || handle_library_request(&data_dir, request))
@@ -750,7 +751,8 @@ pub(crate) async fn handle_object_provider_runtime_request_with_gateway(
         | ObjectProviderRequest::OpenViewer { .. }
         | ObjectProviderRequest::ReadViewer { .. }
         | ObjectProviderRequest::CloseViewer { .. }) => {
-            handle_runtime_custody_library_request(data_dir, registry, request).await
+            handle_runtime_custody_library_request(data_dir, registry, request, gateway_authority)
+                .await
         }
         request @ (ObjectProviderRequest::Status { .. }
         | ObjectProviderRequest::Share { .. }
@@ -1851,6 +1853,10 @@ async fn handle_runtime_custody_library_request(
     data_dir: PathBuf,
     registry: Arc<ProviderRegistry>,
     request: ObjectProviderRequest,
+    gateway_authority: Option<(
+        &crate::api::gateway::GatewayState,
+        &crate::api::gateway::RuntimeWalletAuthority,
+    )>,
 ) -> anyhow::Result<Value> {
     match request {
         ObjectProviderRequest::ListRuntimeCustody { principal_id } => {
@@ -1862,13 +1868,25 @@ async fn handle_runtime_custody_library_request(
         ObjectProviderRequest::Buy {
             principal_id,
             mint_id,
-        } => crate::protected_content_runtime::buy_runtime_custody_listing(
-            &data_dir,
-            crate::protected_content_runtime::RuntimeCustodyBuyInput {
-                principal_id,
-                mint_id,
-            },
-        ),
+            account_id,
+        } => {
+            let Some((state, authority)) = gateway_authority else {
+                anyhow::bail!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+                );
+            };
+            crate::api::gateway::runtime_custody_buy_via_gateway(
+                state,
+                authority,
+                registry,
+                crate::protected_content_runtime::RuntimeCustodyBuyInput {
+                    principal_id,
+                    mint_id,
+                    account_id,
+                },
+            )
+            .await
+        }
         ObjectProviderRequest::OpenViewer {
             principal_id,
             mint_id,

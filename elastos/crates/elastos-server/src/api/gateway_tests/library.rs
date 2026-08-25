@@ -371,13 +371,12 @@ fn seed_completed_runtime_custody_mint(
             .unwrap();
     }
     journal.mark_custody_provisioned(draft.mint_id()).unwrap();
-    let content_id = format!(
-        "content:{}",
-        hex::encode(elastos_protected_content_contracts::Digest32::new([0x91; 32]).as_bytes())
-    );
+    let content_id =
+        crate::protected_content_runtime::runtime_protected_content_id(draft.encrypted_content())
+            .unwrap();
     let requirement =
         elastos_protected_content_runtime::RuntimeContentAvailabilityRequirement::new(
-            "did:key:z6MkpMockProvider1111111111111111111111111111111",
+            mock_protected_content_provider_signer_did(),
             content_id.clone(),
             input.principal_id.clone(),
             "replicate:3",
@@ -401,6 +400,14 @@ fn seed_completed_runtime_custody_mint(
     journal
         .mark_content_available(draft.mint_id(), &requirement, evidence.clone())
         .unwrap();
+    seed_mock_published_protected_content(
+        &content_id,
+        &input.principal_id,
+        draft.media_identity(),
+        &protected_init_segment,
+        &protected_segments,
+        evidence.checked_at(),
+    );
     journal
         .mark_intent_completed(request_id, draft.mint_id())
         .unwrap();
@@ -422,6 +429,60 @@ fn seed_completed_runtime_custody_mint(
             "access": "buyer_purchase_required"
         }),
     }
+}
+
+fn seed_runtime_custody_creator_listing_for_buy(
+    data_dir: &std::path::Path,
+    publisher_principal_id: &str,
+    facts: &crate::protected_content_runtime::RuntimeCustodyLibraryPublishFacts,
+    seller_address: &str,
+    native_purchase: bool,
+) -> crate::protected_content_runtime::RuntimeCustodyListingRecord {
+    let mint = crate::protected_content_runtime::runtime_mint_journal(data_dir)
+        .load(facts.mint_id)
+        .unwrap();
+    let metadata_cid = TEST_CIDV0;
+    let token_uri = format!("ipfs://{metadata_cid}/metadata.json");
+    let pay_token = if native_purchase {
+        "0x0000000000000000000000000000000000000000".to_string()
+    } else {
+        MOCK_PROTECTED_CONTENT_PAY_TOKEN.to_ascii_lowercase()
+    };
+    let terminal = elastos_protected_content_runtime::RuntimeMintCreatorTerminalEvidence::new(
+        metadata_cid,
+        &token_uri,
+        seller_address.to_ascii_lowercase(),
+        "eip155:8453",
+        "base-mainnet",
+        MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.to_ascii_lowercase(),
+        MOCK_PROTECTED_CONTENT_TOKEN_ID,
+        MOCK_PROTECTED_CONTENT_OPERATIVE.to_ascii_lowercase(),
+        MOCK_PROTECTED_CONTENT_LISTING_PRICE,
+        pay_token,
+        (!native_purchase).then_some(MOCK_PROTECTED_CONTENT_PAYMENT_PROCESSOR.to_ascii_lowercase()),
+        format!("0x{}", hex::encode([0xc1; 32])),
+    )
+    .unwrap();
+    crate::protected_content_runtime::persist_runtime_custody_creator_listing(
+        data_dir,
+        &mint,
+        facts,
+        publisher_principal_id,
+        &terminal,
+    )
+    .unwrap();
+    crate::protected_content_runtime::load_runtime_custody_listing(data_dir, facts.mint_id)
+        .unwrap()
+        .unwrap()
+}
+
+fn runtime_custody_listing_path_for_test(
+    data_dir: &std::path::Path,
+    mint_id: elastos_protected_content_contracts::Digest32,
+) -> std::path::PathBuf {
+    data_dir
+        .join("protected-content/runtime-listings")
+        .join(format!("{}.json", hex::encode(mint_id.as_bytes())))
 }
 
 async fn write_library_bytes(app: &axum::Router, token: &str, uri: &str, bytes: &[u8]) {
@@ -6347,6 +6408,7 @@ async fn test_runtime_custody_creator_tail_listing_error_is_unavailable_without_
         .latest_transaction_signed_transaction()
         .await
         .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
     assert_eq!(mock_chain_broadcast_count(&signed_transaction), 0);
     set_mock_protected_content_chain_listing_error();
 
@@ -6537,6 +6599,492 @@ async fn test_library_provider_runtime_custody_buy_rejects_caller_supplied_purch
             .contains("unknown field"),
         "{payload}"
     );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_raw_provider_call_requires_gateway_wallet_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = crate::library::handle_object_provider_runtime_request_with_gateway(
+        dir.path(),
+        Arc::new(ProviderRegistry::new()),
+        &json!({
+            "op": "buy",
+            "principal_id": "person:local:raw-provider-buy",
+            "mint_id": "00".repeat(32),
+            "account_id": "wallet:eip155:8453:0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(response["status"], "error");
+    assert_eq!(
+        response["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+    );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_fails_before_effects_when_fresh_availability_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-no-availability",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x91, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        false,
+    );
+    let app = gateway_router(state);
+    let (status, payload) = post_library(
+        app,
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "error");
+    assert_eq!(
+        payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+    );
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await,
+        None
+    );
+    assert!(
+        crate::protected_content_runtime::load_runtime_custody_purchase(
+            dir.path(),
+            &authority.principal_id,
+            facts.mint_id,
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_native_terminal_replay_is_exact_and_listing_stays_immutable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-native",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x92, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let listing_path = runtime_custody_listing_path_for_test(dir.path(), facts.mint_id);
+    let listing_before = std::fs::read(&listing_path).unwrap();
+    let app = gateway_router(state);
+
+    let (pending_status, pending_payload) = post_library(
+        app.clone(),
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(pending_status, StatusCode::OK);
+    assert_eq!(pending_payload["status"], "error");
+    assert_eq!(
+        pending_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let approval_request_id = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_transaction = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (ok_status, ok_payload) = post_library(
+        app.clone(),
+        &replay_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_payload["status"], "ok");
+    assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase_access"),
+        1
+    );
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
+    let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+        dir.path(),
+        &authority.principal_id,
+        facts.mint_id,
+    )
+    .unwrap()
+    .unwrap();
+    let purchase_json = serde_json::to_string(&purchase).unwrap();
+    assert!(!purchase_json.contains(&signed_transaction));
+    assert!(!purchase_json.contains("\"signed_result\""));
+    assert!(!purchase_json.contains("session_id"));
+    assert!(!purchase_json.contains("grant_id"));
+    assert!(!purchase_json.contains("http://"));
+
+    set_mock_protected_content_listing_quantity("0x0");
+    let replay_again_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (replay_status, replay_payload) = post_library(
+        app,
+        &replay_again_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(replay_payload["status"], "ok");
+    assert_eq!(
+        replay_payload["data"]["availability"]["status"],
+        "buyer_owned"
+    );
+    assert_eq!(
+        wallet_provider
+            .provider
+            .latest_transaction_approval_request_id()
+            .await
+            .as_deref(),
+        Some(approval_request_id.as_str())
+    );
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+    assert_eq!(mock_chain_broadcast_count(&signed_transaction), 1);
+    assert_eq!(std::fs::read(listing_path).unwrap(), listing_before);
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_erc20_orders_approval_then_buy_without_duplicate_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-erc20",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x93, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        false,
+    );
+    let app = gateway_router(state);
+
+    let (pending_one_status, pending_one_payload) = post_library(
+        app.clone(),
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(pending_one_status, StatusCode::OK);
+    assert_eq!(pending_one_payload["status"], "error");
+    assert_eq!(
+        pending_one_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let approval_request_one = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    let _approval_tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_approval = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed approval transaction");
+    reset_mock_chain_broadcast_count(&signed_approval);
+
+    let replay_one_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (pending_two_status, pending_two_payload) = post_library(
+        app.clone(),
+        &replay_one_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(pending_two_status, StatusCode::OK);
+    assert_eq!(pending_two_payload["status"], "error");
+    assert_eq!(
+        pending_two_payload["message"],
+        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+    );
+    let approval_request_two = wallet_provider
+        .provider
+        .latest_transaction_approval_request_id()
+        .await
+        .unwrap();
+    assert_ne!(approval_request_one, approval_request_two);
+    assert_eq!(mock_chain_broadcast_count(&signed_approval), 1);
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+    let _buy_tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_buy = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed buy transaction");
+    reset_mock_chain_broadcast_count(&signed_buy);
+
+    let replay_two_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (ok_status, ok_payload) = post_library(
+        app.clone(),
+        &replay_two_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_payload["status"], "ok");
+    assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
+    assert_eq!(mock_chain_broadcast_count(&signed_approval), 1);
+    assert_eq!(mock_chain_broadcast_count(&signed_buy), 1);
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+
+    let replay_again_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (replay_status, replay_payload) = post_library(
+        app,
+        &replay_again_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(replay_payload["status"], "ok");
+    assert_eq!(mock_chain_broadcast_count(&signed_approval), 1);
+    assert_eq!(mock_chain_broadcast_count(&signed_buy), 1);
+    assert_eq!(
+        mock_chain_raw_request_count("resolve_protected_content_purchase"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_runtime_custody_buy_access_corroboration_stays_nonterminal_until_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, wallet_provider) = wallet_chain_test_state_with_observer(dir.path()).await;
+    let registry = state.provider_registry.as_ref().unwrap().clone();
+    registry
+        .register_sub_provider("content", Arc::new(MockContentProvider))
+        .await
+        .unwrap();
+    reset_mock_protected_content_chain_mode();
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    reset_mock_chain_raw_requests();
+
+    let authority = passkey_authority_with_profile(dir.path(), "buyer");
+    let token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let wallet_account_id = wallet_provider
+        .provider
+        .seed_managed_evm_account_for_principal(&authority.principal_id)
+        .await;
+    let uri = format!(
+        "{}/Documents/protected-buy-access-pending",
+        crate::auth::principal_localhost_root(&authority.principal_id)
+    );
+    let publish_input =
+        runtime_custody_creator_test_input(&authority.principal_id, &uri, 0x94, &wallet_account_id);
+    let facts = seed_completed_runtime_custody_mint(dir.path(), &publish_input);
+    seed_runtime_custody_creator_listing_for_buy(
+        dir.path(),
+        &authority.principal_id,
+        &facts,
+        MOCK_MANAGED_EVM_ADDRESS,
+        true,
+    );
+    let app = gateway_router(state);
+    let _ = post_library(
+        app.clone(),
+        &token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    let _tx_hash = wallet_provider
+        .provider
+        .complete_latest_transaction_approval()
+        .await;
+    let signed_transaction = wallet_provider
+        .provider
+        .latest_transaction_signed_transaction()
+        .await
+        .expect("completed mock transaction");
+    reset_mock_chain_broadcast_count(&signed_transaction);
+
+    for set_mode in [
+        set_mock_protected_content_purchase_access_denied as fn(),
+        set_mock_protected_content_purchase_access_error as fn(),
+    ] {
+        reset_mock_protected_content_purchase_fixture();
+        set_mock_protected_content_purchase_native();
+        set_mode();
+        let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+        let (status, payload) = post_library(
+            app.clone(),
+            &replay_token,
+            "buy",
+            json!({
+                "mint_id": hex::encode(facts.mint_id.as_bytes()),
+                "account_id": wallet_account_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["status"], "error");
+        assert_eq!(
+            payload["message"],
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+        );
+        let purchase = crate::protected_content_runtime::load_runtime_custody_purchase(
+            dir.path(),
+            &authority.principal_id,
+            facts.mint_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            purchase.progress,
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_buy: Some(_)
+            }
+        ));
+    }
+
+    reset_mock_protected_content_purchase_fixture();
+    set_mock_protected_content_purchase_native();
+    let replay_token = app_token_for_authority(dir.path(), LIBRARY_CAPSULE_ID, &authority);
+    let (ok_status, ok_payload) = post_library(
+        app,
+        &replay_token,
+        "buy",
+        json!({
+            "mint_id": hex::encode(facts.mint_id.as_bytes()),
+            "account_id": wallet_account_id,
+        }),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_payload["status"], "ok");
+    assert_eq!(ok_payload["data"]["availability"]["status"], "buyer_owned");
 }
 
 #[tokio::test]

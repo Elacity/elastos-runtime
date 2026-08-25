@@ -15,6 +15,8 @@ pub(super) const PROTECTED_CONTENT_VERIFIED_LISTING_SCHEMA: &str =
     "elastos.chain.protected-content-verified-listing/v1";
 pub(super) const PROTECTED_CONTENT_PURCHASE_SCHEMA: &str =
     "elastos.chain.protected-content-purchase/v1";
+pub(super) const PROTECTED_CONTENT_PURCHASE_ACCESS_SCHEMA: &str =
+    "elastos.chain.protected-content-purchase-access/v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -271,6 +273,12 @@ pub(super) enum Request {
         network: String,
         ledger: String,
         token_id: String,
+    },
+    ResolveProtectedContentPurchaseAccess {
+        request_id: String,
+        network: String,
+        wallet: String,
+        content_access_id: String,
     },
     Proof {
         network: String,

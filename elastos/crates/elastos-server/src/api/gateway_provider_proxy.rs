@@ -1,6 +1,9 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use elastos_protected_content_contracts::Digest32;
+use sha2::Digest as _;
+
 use super::*;
 
 const LIBRARY_EVENTS_STREAM_KEEPALIVE_SECS: u64 = 15;
@@ -97,6 +100,43 @@ struct ResolvedProtectedContentVerifiedListing {
     #[serde(default)]
     payment_processor: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedProtectedContentPurchase {
+    schema: String,
+    network: String,
+    purchase_quantity: String,
+    verified_listing: ResolvedProtectedContentPurchaseListing,
+    steps: Vec<ResolvedProtectedContentPurchaseStep>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedProtectedContentPurchaseListing {
+    chain_id: u64,
+    seller: String,
+    ledger: String,
+    token_id: String,
+    operative: String,
+    available_quantity: String,
+    price: String,
+    pay_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payment_processor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedProtectedContentPurchaseStep {
+    stage: String,
+    to: String,
+    value: String,
+    data: String,
+}
+
+type ResolvedProtectedContentPurchaseAccess =
+    crate::protected_content_runtime::RuntimeCustodyPurchaseAccessEvidenceRecord;
 
 #[derive(Serialize)]
 struct RuntimeCustodyCreatorMetadata<'a> {
@@ -1602,14 +1642,15 @@ pub(super) async fn gateway_provider_proxy(
         && (library_operation_needs_runtime_coordinator(&op)
             || library_request_targets_webspace(&request))
     {
-        let wallet_authority = if op == "publish" && request.get("protection").is_some() {
-            match runtime_wallet_authority(&required) {
-                Ok(authority) => Some(authority),
-                Err(err) => return gateway_provider_error_response(&scheme, err),
-            }
-        } else {
-            None
-        };
+        let wallet_authority =
+            if (op == "publish" && request.get("protection").is_some()) || op == "buy" {
+                match runtime_wallet_authority(&required) {
+                    Ok(authority) => Some(authority),
+                    Err(err) => return gateway_provider_error_response(&scheme, err),
+                }
+            } else {
+                None
+            };
         crate::library::handle_object_provider_runtime_request_with_gateway(
             &state.data_dir,
             Arc::clone(&registry),
@@ -1732,6 +1773,436 @@ async fn resolve_runtime_custody_creator_account(
         account_id: account.account_id.clone(),
         address: account.address.to_ascii_lowercase(),
     })
+}
+
+async fn resolve_runtime_custody_buyer_account(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    wallet_account_id: &str,
+) -> anyhow::Result<RuntimeCustodyCreatorAccount> {
+    let accounts = system_wallet_accounts_summary(state, authority).await;
+    let account = accounts
+        .accounts
+        .iter()
+        .find(|account| account.account_id == wallet_account_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+            )
+        })?;
+    if !account.signing_available || !is_managed_wallet_proof_type(&account.proof_type) {
+        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+    }
+    validate_wallet_evm_address(&account.address, "buyer").map_err(|(_, _)| {
+        anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
+    })?;
+    Ok(RuntimeCustodyCreatorAccount {
+        account_id: account.account_id.clone(),
+        address: account.address.to_ascii_lowercase(),
+    })
+}
+
+fn runtime_custody_listing_sha256(bytes: &[u8]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn parse_runtime_custody_listing_bytes(
+    listing_bytes: &[u8],
+) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyListingRecord> {
+    serde_json::from_slice(listing_bytes).map_err(|_| {
+        anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
+    })
+}
+
+fn runtime_custody_purchase_chain_id(chain_namespace: &str) -> anyhow::Result<u64> {
+    runtime_custody_creator_chain_id(chain_namespace).map_err(|_| {
+        anyhow::anyhow!(
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+        )
+    })
+}
+
+fn runtime_custody_purchase_availability_receipt_digest(
+    availability: &elastos_protected_content_runtime::RuntimeVerifiedContentAvailability,
+) -> String {
+    format!(
+        "sha256:{}",
+        hex::encode(availability.receipt_digest().as_bytes())
+    )
+}
+
+fn runtime_custody_buy_terminal_response(
+    purchase: &crate::protected_content_runtime::RuntimeCustodyPurchaseRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": crate::protected_content_runtime::RUNTIME_PURCHASE_SCHEMA_V1,
+        "mint_id": purchase.mint_id,
+        "content_id": purchase.content_id,
+        "cid": purchase.cid,
+        "availability": {
+            "schema": "elastos.library.runtime-custody-availability/v1",
+            "status": "buyer_owned",
+            "cid": purchase.cid,
+            "content_id": purchase.content_id,
+            "mint_id": purchase.mint_id,
+        },
+    })
+}
+
+fn runtime_custody_purchase_stage_record(
+    stage: &str,
+    request: &RuntimeTransactionRequest,
+) -> anyhow::Result<crate::protected_content_runtime::RuntimeCustodyPurchaseStageRecord> {
+    Ok(
+        crate::protected_content_runtime::RuntimeCustodyPurchaseStageRecord {
+            stage: stage.to_string(),
+            effect_id: request.effect_id.clone(),
+            approval_request_id: wallet_request_id(&request.effect_id, "approval"),
+            request_sha256: request.request_sha256.clone(),
+            chain_namespace: request.chain_namespace.clone(),
+            network: request.network.clone(),
+            to: request.to.clone(),
+            value: request.value.clone(),
+            data: request.data.clone(),
+        },
+    )
+}
+
+fn runtime_custody_purchase_transaction_request(
+    principal_id: &str,
+    buyer_account: &RuntimeCustodyCreatorAccount,
+    listing: &crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    listing_sha256: &str,
+    mint_id: elastos_protected_content_contracts::Digest32,
+    stage: &ResolvedProtectedContentPurchaseStep,
+) -> anyhow::Result<RuntimeTransactionRequest> {
+    let stable_request = serde_json::json!({
+        "domain": "elastos.protected-content.purchase-request/v1",
+        "effect_id": "",
+        "wallet_account_id": buyer_account.account_id,
+        "address": buyer_account.address,
+        "chain_namespace": listing.chain_namespace,
+        "network": listing.network,
+        "to": stage.to,
+        "value": stage.value,
+        "data": stage.data,
+        "listing_sha256": listing_sha256,
+        "mint_id": hex::encode(mint_id.as_bytes()),
+        "seller": listing.seller_address,
+        "ledger": listing.ledger,
+        "token_id": listing.token_id,
+        "operative": listing.operative,
+        "price": listing.price,
+        "pay_token": listing.pay_token,
+        "purchase_quantity": "0x1",
+        "stage": stage.stage,
+    });
+    let request_sha256 = runtime_transaction_request_sha256(&stable_request)?;
+    let mut request = RuntimeTransactionRequest {
+        source: NATIVE_TRANSACTION_SOURCE,
+        effect_id: String::new(),
+        request_sha256,
+        account_id: buyer_account.account_id.clone(),
+        address: buyer_account.address.clone(),
+        chain_namespace: listing.chain_namespace.clone(),
+        network: listing.network.clone(),
+        to: stage.to.clone(),
+        value: stage.value.clone(),
+        data: stage.data.clone(),
+        approval_reason: "Buy protected content access".to_string(),
+        metadata: serde_json::json!({
+            "product_operation": format!("protected_content_purchase_{}", stage.stage),
+            "mint_id": hex::encode(mint_id.as_bytes()),
+            "listing_sha256": listing_sha256,
+            "seller": listing.seller_address,
+            "ledger": listing.ledger,
+            "token_id": listing.token_id,
+            "price": listing.price,
+            "pay_token": listing.pay_token,
+            "purchase_quantity": "0x1",
+        }),
+    };
+    let request_binding = transaction_request_binding(&request);
+    request.effect_id = exact_runtime_transaction_effect_id(
+        NATIVE_TRANSACTION_SOURCE,
+        principal_id,
+        &request.request_sha256,
+        &request_binding,
+    )?;
+    Ok(request)
+}
+
+fn validate_runtime_custody_purchase_stage_request(
+    principal_id: &str,
+    buyer_account: &RuntimeCustodyCreatorAccount,
+    listing: &crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    listing_sha256: &str,
+    mint_id: elastos_protected_content_contracts::Digest32,
+    stage: &crate::protected_content_runtime::RuntimeCustodyPurchaseStageRecord,
+    expected_stage: &str,
+) -> anyhow::Result<RuntimeTransactionRequest> {
+    let request = runtime_custody_purchase_transaction_request(
+        principal_id,
+        buyer_account,
+        listing,
+        listing_sha256,
+        mint_id,
+        &ResolvedProtectedContentPurchaseStep {
+            stage: stage.stage.clone(),
+            to: stage.to.clone(),
+            value: stage.value.clone(),
+            data: stage.data.clone(),
+        },
+    )?;
+    if stage.stage != expected_stage
+        || stage.effect_id != request.effect_id
+        || stage.approval_request_id != wallet_request_id(&request.effect_id, "approval")
+        || stage.request_sha256 != request.request_sha256
+        || stage.chain_namespace != request.chain_namespace
+        || stage.network != request.network
+        || stage.to != request.to
+        || stage.value != request.value
+        || stage.data != request.data
+    {
+        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+    }
+    Ok(request)
+}
+
+struct RuntimeCustodyExpectedPurchaseIdentity<'a> {
+    principal_id: &'a str,
+    profile_did: &'a str,
+    mint_id_hex: &'a str,
+    content_id: &'a str,
+    content_cid: &'a str,
+    listing_sha256: &'a str,
+    listing: &'a crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    buyer_account: &'a RuntimeCustodyCreatorAccount,
+}
+
+fn validate_runtime_custody_purchase_record_identity(
+    purchase: &crate::protected_content_runtime::RuntimeCustodyPurchaseRecord,
+    expected: &RuntimeCustodyExpectedPurchaseIdentity<'_>,
+) -> anyhow::Result<()> {
+    if purchase.schema != crate::protected_content_runtime::RUNTIME_PURCHASE_SCHEMA_V1
+        || purchase.principal_id != expected.principal_id
+        || purchase.profile_did != expected.profile_did
+        || purchase.mint_id != expected.mint_id_hex
+        || purchase.content_id != expected.content_id
+        || purchase.cid != expected.content_cid
+        || purchase.listing_sha256 != expected.listing_sha256
+        || !purchase
+            .seller_address
+            .eq_ignore_ascii_case(&expected.listing.seller_address)
+        || purchase.chain_namespace != expected.listing.chain_namespace
+        || purchase.network != expected.listing.network
+        || !purchase
+            .ledger
+            .eq_ignore_ascii_case(&expected.listing.ledger)
+        || !purchase
+            .token_id
+            .eq_ignore_ascii_case(&expected.listing.token_id)
+        || !purchase
+            .operative
+            .eq_ignore_ascii_case(&expected.listing.operative)
+        || purchase.price != expected.listing.price
+        || !purchase
+            .pay_token
+            .eq_ignore_ascii_case(&expected.listing.pay_token)
+        || purchase
+            .payment_processor
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            != expected
+                .listing
+                .payment_processor
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+        || purchase.account_id != expected.buyer_account.account_id
+        || !purchase
+            .address
+            .eq_ignore_ascii_case(&expected.buyer_account.address)
+    {
+        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+    }
+    Ok(())
+}
+
+async fn resolve_runtime_custody_purchase_plan(
+    state: &GatewayState,
+    listing: &crate::protected_content_runtime::RuntimeCustodyListingRecord,
+) -> anyhow::Result<ResolvedProtectedContentPurchase> {
+    let response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "resolve_protected_content_purchase",
+            "seller": listing.seller_address,
+            "chain_namespace": listing.chain_namespace,
+            "network": listing.network,
+            "ledger": listing.ledger,
+            "token_id": listing.token_id,
+        }),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+        )
+    })?;
+    let resolved: ResolvedProtectedContentPurchase =
+        serde_json::from_value(response).map_err(|_| {
+            anyhow::anyhow!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+            )
+        })?;
+    let expected_chain_id = runtime_custody_purchase_chain_id(&listing.chain_namespace)?;
+    if resolved.schema != "elastos.chain.protected-content-purchase/v1"
+        || resolved.network != listing.network
+        || resolved.purchase_quantity != "0x1"
+        || resolved.verified_listing.chain_id != expected_chain_id
+        || !resolved
+            .verified_listing
+            .seller
+            .eq_ignore_ascii_case(&listing.seller_address)
+        || !resolved
+            .verified_listing
+            .ledger
+            .eq_ignore_ascii_case(&listing.ledger)
+        || !resolved
+            .verified_listing
+            .token_id
+            .eq_ignore_ascii_case(&listing.token_id)
+        || !resolved
+            .verified_listing
+            .operative
+            .eq_ignore_ascii_case(&listing.operative)
+        || resolved.verified_listing.price != listing.price
+        || !resolved
+            .verified_listing
+            .pay_token
+            .eq_ignore_ascii_case(&listing.pay_token)
+        || resolved
+            .verified_listing
+            .payment_processor
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            != listing
+                .payment_processor
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+        || resolved.verified_listing.available_quantity == "0x0"
+    {
+        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+    }
+    match resolved.steps.as_slice() {
+        [buy] if buy.stage == "buy" => {}
+        [approval, buy] if approval.stage == "approval" && buy.stage == "buy" => {}
+        _ => anyhow::bail!(
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+        ),
+    }
+    for step in &resolved.steps {
+        validate_wallet_evm_address(&step.to, "purchase transaction target").map_err(
+            |(_, _)| {
+                anyhow::anyhow!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+                )
+            },
+        )?;
+    }
+    Ok(resolved)
+}
+
+async fn resolve_runtime_custody_purchase_access(
+    state: &GatewayState,
+    listing: &crate::protected_content_runtime::RuntimeCustodyListingRecord,
+    buyer_account: &RuntimeCustodyCreatorAccount,
+    content_access_id_hex: &str,
+    request_id: &str,
+) -> anyhow::Result<Option<ResolvedProtectedContentPurchaseAccess>> {
+    let response = wallet_chain_provider_data(
+        state,
+        serde_json::json!({
+            "op": "resolve_protected_content_purchase_access",
+            "request_id": request_id,
+            "network": listing.network,
+            "wallet": buyer_account.address,
+            "content_access_id": content_access_id_hex,
+        }),
+    )
+    .await;
+    let Ok(response) = response else {
+        return Ok(None);
+    };
+    let access: ResolvedProtectedContentPurchaseAccess =
+        serde_json::from_value(response).map_err(|_| {
+            anyhow::anyhow!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+            )
+        })?;
+    if access.schema != "elastos.chain.protected-content-purchase-access/v1"
+        || access.request_id != request_id
+        || access.network != listing.network
+        || access.chain_id != runtime_custody_purchase_chain_id(&listing.chain_namespace)?
+        || !access.wallet.eq_ignore_ascii_case(&buyer_account.address)
+        || !access
+            .content_access_id
+            .eq_ignore_ascii_case(content_access_id_hex)
+    {
+        anyhow::bail!(
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+        );
+    }
+    Ok(access.has_access.then_some(access))
+}
+
+async fn complete_runtime_custody_purchase_stage(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    request: &RuntimeTransactionRequest,
+) -> anyhow::Result<Option<RuntimeTransactionCompletion>> {
+    let _approval = ensure_exact_runtime_transaction_approval(state, authority, request.clone())
+        .await
+        .map_err(|(_, _)| {
+            anyhow::anyhow!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+            )
+        })?;
+    let completion = match complete_runtime_transaction_effect(
+        state,
+        authority,
+        RuntimeTransactionLookup::ApprovalId(
+            wallet_request_id(&request.effect_id, "approval").as_str(),
+        ),
+        Some(request),
+        None,
+    )
+    .await
+    {
+        Ok(completion) => completion,
+        Err((status, message))
+            if status == StatusCode::BAD_REQUEST
+                && message == "transaction approval is not completed" =>
+        {
+            return Ok(None);
+        }
+        Err((_, _)) => {
+            anyhow::bail!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+            )
+        }
+    };
+    if completion.receipt.is_none() || completion.completion_pending {
+        return Ok(None);
+    }
+    if completion.completion_error.is_some() {
+        anyhow::bail!(
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+        );
+    }
+    Ok(Some(completion))
 }
 
 async fn publish_runtime_custody_creator_metadata(
@@ -2023,6 +2494,341 @@ pub(crate) async fn runtime_custody_publish_via_gateway(
     )
     .await?;
     runtime_custody_publish_creator_tail_from_facts(state, authority, registry, input, facts).await
+}
+
+pub(crate) async fn runtime_custody_buy_via_gateway(
+    state: &GatewayState,
+    authority: &RuntimeWalletAuthority,
+    registry: Arc<ProviderRegistry>,
+    input: crate::protected_content_runtime::RuntimeCustodyBuyInput,
+) -> anyhow::Result<serde_json::Value> {
+    let mint_id = hex::decode(&input.mint_id)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(Digest32::new)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+            )
+        })?;
+    let buyer_account =
+        resolve_runtime_custody_buyer_account(state, authority, &input.account_id).await?;
+    let listing_bytes = crate::protected_content_runtime::load_runtime_custody_listing_bytes(
+        &state.data_dir,
+        mint_id,
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
+    })?;
+    let listing = parse_runtime_custody_listing_bytes(&listing_bytes)?;
+    let listing_sha256 = runtime_custody_listing_sha256(&listing_bytes);
+    let mint = crate::protected_content_runtime::runtime_mint_journal(&state.data_dir)
+        .load(mint_id)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+            )
+        })?;
+    let availability = mint.content_availability().ok_or_else(|| {
+        anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
+    })?;
+    let expected_content_id = crate::protected_content_runtime::runtime_protected_content_id(
+        mint.draft().encrypted_content(),
+    )
+    .map_err(|_| {
+        anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
+    })?;
+    let expected_content_access_id = format!(
+        "0x{}",
+        hex::encode(mint.draft().content_access_id().as_bytes())
+    );
+    if listing.mint_id != input.mint_id
+        || listing.content_id != expected_content_id
+        || listing.content_access_id != expected_content_access_id
+        || listing.cid != availability.content_cid()
+    {
+        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
+    }
+    let localhost_root = crate::auth::principal_localhost_root(&input.principal_id);
+    let profile = crate::collaboration_profile_authority::load_profile_authority(
+        &state.data_dir,
+        &input.principal_id,
+        &localhost_root,
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE)
+    })?;
+    let profile_did = profile.document().profile_did.clone();
+    let now = crate::auth::now_ts();
+    let mut purchase = match crate::protected_content_runtime::load_runtime_custody_purchase(
+        &state.data_dir,
+        &input.principal_id,
+        mint_id,
+    )? {
+        Some(existing) => {
+            let expected_identity = RuntimeCustodyExpectedPurchaseIdentity {
+                principal_id: &input.principal_id,
+                profile_did: &profile_did,
+                mint_id_hex: &input.mint_id,
+                content_id: &expected_content_id,
+                content_cid: availability.content_cid(),
+                listing_sha256: &listing_sha256,
+                listing: &listing,
+                buyer_account: &buyer_account,
+            };
+            validate_runtime_custody_purchase_record_identity(&existing, &expected_identity)?;
+            existing
+        }
+        None => {
+            let purchase_plan = resolve_runtime_custody_purchase_plan(state, &listing).await?;
+            let mut steps = purchase_plan.steps.iter();
+            let approval_request = match purchase_plan.steps.as_slice() {
+                [approval, buy] if approval.stage == "approval" && buy.stage == "buy" => {
+                    Some(runtime_custody_purchase_transaction_request(
+                        &input.principal_id,
+                        &buyer_account,
+                        &listing,
+                        &listing_sha256,
+                        mint_id,
+                        approval,
+                    )?)
+                }
+                [buy] if buy.stage == "buy" => None,
+                _ => anyhow::bail!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+                ),
+            };
+            let buy_step = steps.next_back().ok_or_else(|| {
+                anyhow::anyhow!(
+                    crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+                )
+            })?;
+            let buy_request = runtime_custody_purchase_transaction_request(
+                &input.principal_id,
+                &buyer_account,
+                &listing,
+                &listing_sha256,
+                mint_id,
+                buy_step,
+            )?;
+            let fresh_availability =
+                crate::protected_content_runtime::verify_fresh_runtime_custody_buy_availability(
+                    &state.data_dir,
+                    registry.as_ref(),
+                    mint_id,
+                    now,
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+                    )
+                })?;
+            let purchase = crate::protected_content_runtime::RuntimeCustodyPurchaseRecord {
+                schema: crate::protected_content_runtime::RUNTIME_PURCHASE_SCHEMA_V1.to_string(),
+                principal_id: input.principal_id.clone(),
+                profile_did: profile_did.clone(),
+                mint_id: input.mint_id.clone(),
+                content_id: expected_content_id.clone(),
+                cid: availability.content_cid().to_string(),
+                listing_sha256: listing_sha256.clone(),
+                seller_address: listing.seller_address.clone(),
+                chain_namespace: listing.chain_namespace.clone(),
+                network: listing.network.clone(),
+                ledger: listing.ledger.clone(),
+                token_id: listing.token_id.clone(),
+                operative: listing.operative.clone(),
+                price: listing.price.clone(),
+                pay_token: listing.pay_token.clone(),
+                payment_processor: listing.payment_processor.clone(),
+                availability_receipt_digest: runtime_custody_purchase_availability_receipt_digest(
+                    &fresh_availability,
+                ),
+                account_id: buyer_account.account_id.clone(),
+                address: buyer_account.address.clone(),
+                approval_stage: approval_request
+                    .as_ref()
+                    .map(|request| runtime_custody_purchase_stage_record("approval", request))
+                    .transpose()?,
+                buy_stage: runtime_custody_purchase_stage_record("buy", &buy_request)?,
+                progress:
+                    crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                        confirmed_buy: None,
+                    },
+                created_at: now,
+                updated_at: now,
+            };
+            crate::protected_content_runtime::persist_runtime_custody_purchase(
+                &state.data_dir,
+                &purchase,
+            )?;
+            purchase
+        }
+    };
+
+    let approval_request = purchase
+        .approval_stage
+        .as_ref()
+        .map(|stage| {
+            validate_runtime_custody_purchase_stage_request(
+                &input.principal_id,
+                &buyer_account,
+                &listing,
+                &listing_sha256,
+                mint_id,
+                stage,
+                "approval",
+            )
+        })
+        .transpose()?;
+    let buy_request = validate_runtime_custody_purchase_stage_request(
+        &input.principal_id,
+        &buyer_account,
+        &listing,
+        &listing_sha256,
+        mint_id,
+        &purchase.buy_stage,
+        "buy",
+    )?;
+
+    if matches!(
+        purchase.progress,
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. }
+    ) {
+        return Ok(runtime_custody_buy_terminal_response(&purchase));
+    }
+
+    let fresh_availability =
+        crate::protected_content_runtime::verify_fresh_runtime_custody_buy_availability(
+            &state.data_dir,
+            registry.as_ref(),
+            mint_id,
+            now,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE
+            )
+        })?;
+    let fresh_receipt_digest =
+        runtime_custody_purchase_availability_receipt_digest(&fresh_availability);
+    if purchase.availability_receipt_digest != fresh_receipt_digest {
+        purchase.availability_receipt_digest = fresh_receipt_digest;
+        purchase.updated_at = crate::auth::now_ts();
+        crate::protected_content_runtime::persist_runtime_custody_purchase(
+            &state.data_dir,
+            &purchase,
+        )?;
+    }
+
+    if let Some(approval_request) = approval_request.as_ref() {
+        let approval_completion =
+            complete_runtime_custody_purchase_stage(state, authority, approval_request).await?;
+        if approval_completion.is_none() {
+            purchase.updated_at = crate::auth::now_ts();
+            crate::protected_content_runtime::persist_runtime_custody_purchase(
+                &state.data_dir,
+                &purchase,
+            )?;
+            anyhow::bail!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+            );
+        }
+    }
+
+    if let crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+        confirmed_buy: None,
+    } = &purchase.progress
+    {
+        let buy_completion =
+            complete_runtime_custody_purchase_stage(state, authority, &buy_request).await?;
+        let Some(buy_completion) = buy_completion else {
+            purchase.updated_at = crate::auth::now_ts();
+            crate::protected_content_runtime::persist_runtime_custody_purchase(
+                &state.data_dir,
+                &purchase,
+            )?;
+            anyhow::bail!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+            );
+        };
+        let wallet_binding = buy_completion
+            .validated_chain_outcome
+            .as_ref()
+            .map(|outcome| {
+                (
+                    outcome.binding.clone(),
+                    outcome.chain_observation.clone(),
+                    outcome.confirmed_at,
+                )
+            });
+        let Some((wallet_binding, chain_observation, confirmed_at)) = wallet_binding else {
+            anyhow::bail!(
+                crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE
+            );
+        };
+        purchase.progress =
+            crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+                confirmed_buy: Some(
+                    crate::protected_content_runtime::RuntimeCustodyConfirmedPurchaseStage {
+                        chain_transaction: buy_completion.transaction_hash,
+                        wallet_binding,
+                        chain_observation,
+                        confirmed_at,
+                    },
+                ),
+            };
+        purchase.updated_at = crate::auth::now_ts();
+        crate::protected_content_runtime::persist_runtime_custody_purchase(
+            &state.data_dir,
+            &purchase,
+        )?;
+    }
+
+    let confirmed_buy = match &purchase.progress {
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_buy: Some(confirmed_buy),
+        } => confirmed_buy.clone(),
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete { .. } => {
+            return Ok(runtime_custody_buy_terminal_response(&purchase));
+        }
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Pending {
+            confirmed_buy: None,
+        } => anyhow::bail!(
+            crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE
+        ),
+    };
+    let access = resolve_runtime_custody_purchase_access(
+        state,
+        &listing,
+        &buyer_account,
+        &expected_content_access_id,
+        &format!("purchase-access:{}", purchase.buy_stage.effect_id),
+    )
+    .await?;
+    let Some(access) = access else {
+        purchase.updated_at = crate::auth::now_ts();
+        crate::protected_content_runtime::persist_runtime_custody_purchase(
+            &state.data_dir,
+            &purchase,
+        )?;
+        anyhow::bail!(crate::protected_content_runtime::RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE);
+    };
+    purchase.progress =
+        crate::protected_content_runtime::RuntimeCustodyPurchaseProgress::Complete {
+            terminal: crate::protected_content_runtime::RuntimeCustodyTerminalPurchaseRecord {
+                chain_transaction: confirmed_buy.chain_transaction,
+                wallet_binding: confirmed_buy.wallet_binding,
+                chain_observation: confirmed_buy.chain_observation,
+                access_evidence: access,
+                confirmed_at: confirmed_buy.confirmed_at,
+                bought_at: crate::auth::now_ts(),
+            },
+        };
+    purchase.updated_at = crate::auth::now_ts();
+    crate::protected_content_runtime::persist_runtime_custody_purchase(&state.data_dir, &purchase)?;
+    Ok(runtime_custody_buy_terminal_response(&purchase))
 }
 
 async fn runtime_custody_publish_creator_tail_from_facts(

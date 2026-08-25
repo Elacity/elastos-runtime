@@ -9,30 +9,29 @@ use std::sync::{Arc, Weak};
 
 use base64::Engine as _;
 use custody_provider::{
-    ProvisionedCustodyProviderPublicKeys, parse_and_verify_provisioning_output,
+    parse_and_verify_provisioning_output, ProvisionedCustodyProviderPublicKeys,
 };
 use ed25519_dalek::{Signer as _, SigningKey};
 use elastos_protected_content_custody::provision_custody_envelope;
 use elastos_protected_content_rights::{
-    CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP, chain_rights_evidence_request,
+    chain_rights_evidence_request, CHAIN_PROVIDER_ID, CHAIN_RIGHTS_EVIDENCE_OP,
 };
 use elastos_protected_content_runtime::{
+    bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
+    prepare_recipient, read_viewer_media_part, resolve_runtime_mint_selected_nodes,
     PersistedRuntimeMint, RuntimeContentAvailabilityRequirement, RuntimeCustodyProvider,
     RuntimeDecryptProvider, RuntimeMintCoordinator, RuntimeMintCoordinatorOutcome,
     RuntimeMintDraft, RuntimeMintIntent, RuntimeMintJournal, RuntimeMintNodeBinding,
     RuntimeMintNodeReceipt, RuntimeMintSelectedNode, RuntimeOpenError,
-    RuntimeOpenViewerSessionInput,
-    RuntimeProtectedContentPurchaseIntent, RuntimeProviderCallError,
+    RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent, RuntimeProviderCallError,
     RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseJournal, RuntimeReleaseTerminalResult, RuntimeRightsProvider,
-    RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect, bind_buy, cancel_prepared_recipient,
-    close_viewer_session, open_viewer_session, prepare_recipient, read_viewer_media_part,
-    resolve_runtime_mint_selected_nodes,
+    RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect,
 };
 use elastos_runtime::provider::{
-    CapsuleProvider, Provider, ProviderBridge, ProviderCarrierInvoker, ProviderCarrierRoute,
-    ProviderError, ProviderInvocation, ProviderInvocationTransport, ProviderRegistry,
-    ResourceRequest, ResourceResponse, bridge::ProviderConfig,
+    bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderCarrierInvoker,
+    ProviderCarrierRoute, ProviderError, ProviderInvocation, ProviderInvocationTransport,
+    ProviderRegistry, ResourceRequest, ResourceResponse,
 };
 use elastos_wallet_contract::{
     ProtectedContentRightsSignatureResultV1, ValidatedChainOutcomeBindingV1,
@@ -40,62 +39,67 @@ use elastos_wallet_contract::{
     WalletProviderResponseV2, WalletResultV2,
 };
 use k256::ecdsa::SigningKey as WalletSigningKey;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::Digest as _;
 use sha3::Keccak256;
 use tokio::sync::Mutex;
-use x_wing::TryKeyInit as _;
 use x_wing::kem::{Decapsulator as _, KeyExport as _};
+use x_wing::TryKeyInit as _;
 
 use super::{
+    invoke_json_provider, list_unresolved_runtime_releases, load_or_persist_runtime_mint_intent,
+    load_runtime_custody_composition, load_runtime_custody_composition_config,
+    publish_runtime_custody_library_object, register_inactive_custody_provider,
+    register_inactive_custody_sub_provider, register_protect_provider,
+    resolve_runtime_rights_policy, runtime_mint_journal, runtime_protected_content_id,
+    runtime_purchase_path, unresolved_release_audit_records, write_owner_only_bytes,
+    InactiveCustodyProvider, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
+    RuntimeCustodyLibraryPublishInput, RuntimeCustodyPurchaseAccessEvidenceRecord,
+    RuntimeCustodyPurchaseProgress, RuntimeCustodyPurchaseRecord,
+    RuntimeCustodyPurchaseStageRecord, RuntimeCustodyRegistryAdapter,
+    RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
+    RuntimeCustodyTerminalPurchaseRecord, RuntimeDecryptRegistryAdapter,
     CHAIN_PROTECTED_CONTENT_POLICY_SCHEMA_V1, CUSTODY_COMPOSITION_SCHEMA_V1, CUSTODY_PROVIDER_ID,
-    InactiveCustodyProvider, PROTECT_PROVIDER_ID, RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
+    PROTECT_PROVIDER_ID, RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE,
     RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE,
     RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE, RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE,
     RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE, RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE,
-    RUNTIME_PROVIDER_ID, RuntimeCustodyComposition, RuntimeCustodyCompositionConfigFile,
-    RuntimeCustodyLibraryPublishInput, RuntimeCustodyRegistryAdapter,
-    RuntimeCustodyRouteBindingConfig, RuntimeCustodyRouteTransportConfig,
-    RuntimeDecryptRegistryAdapter, invoke_json_provider, list_unresolved_runtime_releases,
-    load_or_persist_runtime_mint_intent, load_runtime_custody_composition,
-    load_runtime_custody_composition_config, publish_runtime_custody_library_object,
-    register_inactive_custody_provider, register_inactive_custody_sub_provider,
-    register_protect_provider, resolve_runtime_rights_policy, runtime_mint_journal,
-    runtime_protected_content_id, unresolved_release_audit_records,
+    RUNTIME_PROVIDER_ID, RUNTIME_PURCHASE_SCHEMA_V1,
 };
 use elastos_protected_content_contracts::{
-    CUSTODY_X_WING_AES256GCM_SUITE_ID_V1, CanonicalContract, ContentAccessIdV1,
-    CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationIdentityV1,
-    CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeManifestV1, CustodyEnvelopeV1,
-    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyNodeProvisioningRecordIdentityV1,
-    CustodyNodeProvisioningRecordV1, CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1,
-    CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1,
-    CustodyPoolStatementV1, Digest32, EncryptedContentIdentityV1, EvmContractAddressV1,
-    EvmFunctionSelectorV1, EvmRightsMethodAbiV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1,
-    MAX_RIGHTS_EVIDENCE_LIFETIME_SECS, NodeContributionRefV1, NodeContributionStatementV1,
-    NodeCustodyPublicKeyV1, NodePublicKey, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
-    PqHybridSealedShareV1, ProfileIdentityV1, ProtectedContentBindingV1,
-    RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1,
-    RecipientSealedContributionV1, ReplayNonce16, RightsActionV1, RightsDecisionV1,
-    RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1, RightsObservationFinalityV1,
-    RightsPolicyBodyV1, RightsRequestV1, RuntimeCustodyProvisioningIdV1,
-    RuntimeCustodyProvisioningStatementV1, RuntimeOperationIssuerKeyV1,
-    RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1,
-    ShareCoordinateV1, SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1,
-    SignedCustodyPoolV1, SignedNodeContributionV1, SignedNodeRightsDecisionV1,
-    SignedRecipientKeyAuthorizationV1, SignedRuntimeCustodyProvisioningV1,
-    SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
-    TerminalReceiptStatementV1, ThresholdV1, ValidatedCustodyCommitteeV1, WalletAddress,
-    WalletSignedRightsRequestV1, X_WING_DRAFT06_CIPHERTEXT_BYTES,
+    CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
+    CustodyCommitteeAuthorizationIdentityV1, CustodyCommitteeAuthorizationStatementV1,
+    CustodyEnvelopeManifestV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
+    CustodyNodeProvisioningRecordIdentityV1, CustodyNodeProvisioningRecordV1,
+    CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1, CustodyPoolMemberStateV1,
+    CustodyPoolMemberV1, CustodyPoolOperatorIdV1, CustodyPoolStatementV1, Digest32,
+    EncryptedContentIdentityV1, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
+    KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1, NodeContributionStatementV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, PqHybridSealedShareV1, ProfileIdentityV1,
+    ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
+    RecipientPublicKeyBytesV1, RecipientSealedContributionV1, ReplayNonce16, RightsActionV1,
+    RightsDecisionV1, RightsEvaluationEvidenceRequestV1, RightsEvaluationEvidenceV1,
+    RightsObservationFinalityV1, RightsPolicyBodyV1, RightsRequestV1,
+    RuntimeCustodyProvisioningIdV1, RuntimeCustodyProvisioningStatementV1,
+    RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
+    RuntimeSessionBindingV1, ShareCoordinateV1, SignedCustodyCommitteeAuthorizationV1,
+    SignedCustodyEpochV1, SignedCustodyPoolV1, SignedNodeContributionV1,
+    SignedNodeRightsDecisionV1, SignedRecipientKeyAuthorizationV1,
+    SignedRuntimeCustodyProvisioningV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
+    TerminalReceiptIssuerKey, TerminalReceiptStatementV1, ThresholdV1, ValidatedCustodyCommitteeV1,
+    WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+    MAX_RIGHTS_EVIDENCE_LIFETIME_SECS, PQ_HYBRID_SEALED_SHARE_ENVELOPE_BYTES,
+    X_WING_DRAFT06_CIPHERTEXT_BYTES,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, CustodyProviderRequestV1, CustodyProviderResponseV1,
     DecryptProviderRequestV1, DecryptProviderResponseStatusV1, DecryptProviderResponseV1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1, ProtectProviderRequestV1, ProtectProviderResponseStatusV1,
-    ProtectProviderResponseV1, ProtectionSessionNodeV1, ProviderFailureCodeV1,
-    RightsProviderRequestV1, RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
+    ProtectProviderRequestV1, ProtectProviderResponseStatusV1, ProtectProviderResponseV1,
+    ProtectionSessionNodeV1, ProviderFailureCodeV1, RightsProviderRequestV1,
+    RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
     ValidatedCustodyProviderRequestV1, ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
+    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 
 struct RecordingProvider {
@@ -1006,15 +1010,16 @@ async fn runtime_custody_prebuy_availability_harness(
                 RuntimeMintNodeReceipt::new(
                     node.node_public_key(),
                     RuntimeCustodyProvisioningIdV1::new(digest(0x80 + seed)).unwrap(),
-                    CustodyNodeProvisioningRecordIdentityV1::new(digest(0xa0 + seed), 128)
-                        .unwrap(),
+                    CustodyNodeProvisioningRecordIdentityV1::new(digest(0xa0 + seed), 128).unwrap(),
                     node.owner_state_root(),
                 )
                 .unwrap(),
             )
             .unwrap();
     }
-    let custody_provisioned = mint_journal.mark_custody_provisioned(mint_draft.mint_id()).unwrap();
+    let custody_provisioned = mint_journal
+        .mark_custody_provisioned(mint_draft.mint_id())
+        .unwrap();
     assert_eq!(
         custody_provisioned.custody_terminal(),
         Some(elastos_protected_content_runtime::RuntimeCustodyTerminalKind::CustodyProvisioned)
@@ -1066,9 +1071,7 @@ async fn runtime_custody_prebuy_availability_harness(
             price: "0x5".to_string(),
             pay_token: "0x0000000000000000000000000000000000000033".to_string(),
             payment_processor: Some("0x0000000000000000000000000000000000000044".to_string()),
-            buyer_principal_id: None,
             published_at: fixture_now.saturating_sub(2),
-            bought_at: None,
         },
     )
     .unwrap();
@@ -1133,15 +1136,13 @@ async fn protected_content_availability_rejects_wrong_signed_receipt_or_refetche
     let wrong_signer =
         ContentAvailabilityTestProvider::new(0x62, ContentAvailabilityTestConfig::accepted())
             .signer_did();
-    assert!(
-        publish_protected_content_for_test(
-            ContentAvailabilityTestConfig::accepted(),
-            Some(wrong_signer),
-            None,
-        )
-        .await
-        .is_err()
-    );
+    assert!(publish_protected_content_for_test(
+        ContentAvailabilityTestConfig::accepted(),
+        Some(wrong_signer),
+        None,
+    )
+    .await
+    .is_err());
     for config in [
         ContentAvailabilityTestConfig {
             receipt_object_identity: Some("did:key:wrong#content".to_string()),
@@ -1186,11 +1187,9 @@ async fn protected_content_availability_rejects_wrong_signed_receipt_or_refetche
             ..ContentAvailabilityTestConfig::accepted()
         },
     ] {
-        assert!(
-            publish_protected_content_for_test(config, None, None)
-                .await
-                .is_err()
-        );
+        assert!(publish_protected_content_for_test(config, None, None)
+            .await
+            .is_err());
     }
 }
 
@@ -1223,12 +1222,10 @@ async fn runtime_custody_prebuy_availability_refetches_fresh_exact_receipt_witho
     assert!(requests
         .iter()
         .any(|request| request.get("op").and_then(Value::as_str) == Some("fetch")));
-    assert!(requests
-        .iter()
-        .all(|request| matches!(
-            request.get("op").and_then(Value::as_str),
-            Some("status" | "fetch")
-        )));
+    assert!(requests.iter().all(|request| matches!(
+        request.get("op").and_then(Value::as_str),
+        Some("status" | "fetch")
+    )));
     assert!(!requests
         .iter()
         .any(|request| request.get("op").and_then(Value::as_str) == Some("publish")));
@@ -1306,7 +1303,8 @@ async fn runtime_custody_prebuy_availability_rejects_wrong_receipt_binding_or_ma
 }
 
 #[tokio::test]
-async fn runtime_custody_prebuy_availability_requires_existing_mint_and_listing_before_provider_use() {
+async fn runtime_custody_prebuy_availability_requires_existing_mint_and_listing_before_provider_use(
+) {
     let missing_listing = runtime_custody_prebuy_availability_harness(
         0x61,
         ContentAvailabilityTestConfig::accepted(),
@@ -1450,15 +1448,13 @@ async fn protected_content_availability_rejects_descriptor_layout_and_extra_sour
         mutate_protected_content_segment,
         add_extra_protected_content_file,
     ] {
-        assert!(
-            publish_protected_content_for_test(
-                ContentAvailabilityTestConfig::accepted(),
-                None,
-                Some(mutate_directory),
-            )
-            .await
-            .is_err()
-        );
+        assert!(publish_protected_content_for_test(
+            ContentAvailabilityTestConfig::accepted(),
+            None,
+            Some(mutate_directory),
+        )
+        .await
+        .is_err());
     }
 }
 
@@ -1479,15 +1475,13 @@ async fn protected_content_availability_rejects_fixed_layout_names_indices_sizes
         mutate_protected_content_segment,
         truncate_protected_content_segment,
     ] {
-        assert!(
-            publish_protected_content_for_test(
-                ContentAvailabilityTestConfig::accepted(),
-                None,
-                Some(mutate_directory),
-            )
-            .await
-            .is_err()
-        );
+        assert!(publish_protected_content_for_test(
+            ContentAvailabilityTestConfig::accepted(),
+            None,
+            Some(mutate_directory),
+        )
+        .await
+        .is_err());
     }
 }
 
@@ -1787,6 +1781,123 @@ fn install_profile_authority_keeping_device_key(
 }
 
 #[cfg(unix)]
+fn load_profile_did_for_test(data_dir: &Path, principal_id: &str) -> String {
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        principal_id,
+        &localhost_root,
+    )
+    .unwrap()
+    .unwrap()
+    .document()
+    .profile_did
+    .clone()
+}
+
+#[cfg(unix)]
+fn persist_runtime_custody_purchase_for_mint(
+    data_dir: &Path,
+    mint: &PersistedRuntimeMint,
+    principal_id: &str,
+    profile_did: &str,
+    now: u64,
+) -> RuntimeCustodyPurchaseRecord {
+    let listing_bytes = super::load_runtime_custody_listing_bytes(data_dir, mint.draft().mint_id())
+        .unwrap()
+        .expect("runtime custody listing bytes");
+    let listing = super::load_runtime_custody_listing(data_dir, mint.draft().mint_id())
+        .unwrap()
+        .expect("runtime custody listing");
+    let wallet_binding = ValidatedChainOutcomeBindingV1::ManagedSigned {
+        signed_transaction_sha256: format!("sha256:{}", hex::encode([0xab; 32])),
+    };
+    let chain_transaction = format!("0x{}", hex::encode([0xaa; 32]));
+    let chain_observation = json!({
+        "schema": "elastos.chain.broadcast_receipt/v1",
+        "network": "esc-mainnet",
+    });
+    let record = RuntimeCustodyPurchaseRecord {
+        schema: RUNTIME_PURCHASE_SCHEMA_V1.to_string(),
+        principal_id: principal_id.to_string(),
+        profile_did: profile_did.to_string(),
+        mint_id: hex::encode(mint.draft().mint_id().as_bytes()),
+        content_id: runtime_protected_content_id(mint.draft().encrypted_content()).unwrap(),
+        cid: mint
+            .content_availability()
+            .unwrap()
+            .content_cid()
+            .to_string(),
+        listing_sha256: format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(&listing_bytes))
+        ),
+        seller_address: listing.seller_address.clone(),
+        chain_namespace: listing.chain_namespace.clone(),
+        network: listing.network.clone(),
+        ledger: listing.ledger.clone(),
+        token_id: listing.token_id.clone(),
+        operative: listing.operative.clone(),
+        price: listing.price.clone(),
+        pay_token: listing.pay_token.clone(),
+        payment_processor: listing.payment_processor.clone(),
+        availability_receipt_digest: format!(
+            "sha256:{}",
+            hex::encode(
+                mint.content_availability()
+                    .unwrap()
+                    .receipt_digest()
+                    .as_bytes()
+            )
+        ),
+        account_id: "wallet-account-alpha".to_string(),
+        address: wallet_address_hex(wallet(7)),
+        approval_stage: None,
+        buy_stage: RuntimeCustodyPurchaseStageRecord {
+            stage: "buy".to_string(),
+            effect_id: "runtime-effect:11111111111111111111111111111111".to_string(),
+            approval_request_id: "wallet-request:11111111111111111111111111111111".to_string(),
+            request_sha256: format!("sha256:{}", hex::encode([0xac; 32])),
+            chain_namespace: listing.chain_namespace.clone(),
+            network: listing.network.clone(),
+            to: "0x2222222222222222222222222222222222222222".to_string(),
+            value: "0x1".to_string(),
+            data: "0x".to_string(),
+        },
+        progress: RuntimeCustodyPurchaseProgress::Complete {
+            terminal: RuntimeCustodyTerminalPurchaseRecord {
+                chain_transaction,
+                wallet_binding,
+                chain_observation,
+                access_evidence: RuntimeCustodyPurchaseAccessEvidenceRecord {
+                    schema: "elastos.chain.protected-content-purchase-access/v1".to_string(),
+                    request_id: "purchase-access:test".to_string(),
+                    network: "esc-mainnet".to_string(),
+                    chain_id: 20,
+                    wallet: wallet_address_hex(wallet(7)),
+                    content_access_id: listing.content_access_id.clone(),
+                    has_access: true,
+                    finalized_block_number: 44,
+                    finalized_block_hash: format!("0x{}", hex::encode([0xad; 32])),
+                    finalized_block_timestamp: now,
+                    observed_at: now,
+                },
+                confirmed_at: now,
+                bought_at: now,
+            },
+        },
+        created_at: now,
+        updated_at: now,
+    };
+    write_owner_only_bytes(
+        &runtime_purchase_path(data_dir, principal_id, mint.draft().mint_id()),
+        &serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    record
+}
+
+#[cfg(unix)]
 fn install_profile_authority_for_release_test(
     data_dir: &Path,
     principal_id: &str,
@@ -1944,64 +2055,54 @@ fn profile_authorized_runtime_release_assembly_is_exact_and_side_effect_free() {
         device_before,
         fs::read(directory.path().join("identity/device.key")).unwrap()
     );
-    assert!(
-        !directory
-            .path()
-            .join("protected-content/runtime-release")
-            .exists()
-    );
+    assert!(!directory
+        .path()
+        .join("protected-content/runtime-release")
+        .exists());
     let debug = format!("{operation:?}");
     assert!(!debug.contains("profile_signing_seed_hex"));
     assert!(!debug.contains(&profile_signing_seed_hex));
-    assert!(
-        !operation
-            .canonical_bytes()
-            .unwrap()
-            .windows(profile_signing_seed_hex.len())
-            .any(|window| window == profile_signing_seed_hex.as_bytes())
-    );
+    assert!(!operation
+        .canonical_bytes()
+        .unwrap()
+        .windows(profile_signing_seed_hex.len())
+        .any(|window| window == profile_signing_seed_hex.as_bytes()));
     assert!(!debug.contains(&hex::encode([0x42; 32])));
 
-    assert!(
-        super::assemble_protected_content_runtime_release_operation(
-            directory.path(),
-            principal_id,
-            &localhost_root,
-            "proof:passkey:missing-protected-content-release",
-            release_operation_assembly_input(profile),
-            NOW + 3,
-        )
-        .is_err()
-    );
+    assert!(super::assemble_protected_content_runtime_release_operation(
+        directory.path(),
+        principal_id,
+        &localhost_root,
+        "proof:passkey:missing-protected-content-release",
+        release_operation_assembly_input(profile),
+        NOW + 3,
+    )
+    .is_err());
 
     let foreign_proof = store_profile_signing_passkey(
         directory.path(),
         "person:local:foreign-protected-content-release",
         "credential-foreign-protected-content",
     );
-    assert!(
-        super::assemble_protected_content_runtime_release_operation(
-            directory.path(),
-            principal_id,
-            &localhost_root,
-            &foreign_proof,
-            release_operation_assembly_input(profile),
-            NOW + 3,
-        )
-        .is_err()
-    );
+    assert!(super::assemble_protected_content_runtime_release_operation(
+        directory.path(),
+        principal_id,
+        &localhost_root,
+        &foreign_proof,
+        release_operation_assembly_input(profile),
+        NOW + 3,
+    )
+    .is_err());
     crate::auth::revoke_passkey_binding(directory.path(), &proof_binding_id, NOW + 4).unwrap();
-    assert!(
-        super::assemble_protected_content_runtime_release_operation(
-            directory.path(),
-            principal_id,
-            &localhost_root,
-            &proof_binding_id,
-            release_operation_assembly_input(profile),
-            NOW + 4,
-        )
-        .is_err()
-    );
+    assert!(super::assemble_protected_content_runtime_release_operation(
+        directory.path(),
+        principal_id,
+        &localhost_root,
+        &proof_binding_id,
+        release_operation_assembly_input(profile),
+        NOW + 4,
+    )
+    .is_err());
 }
 
 #[cfg(unix)]
@@ -2032,11 +2133,9 @@ fn profile_authorized_runtime_release_assembly_fails_without_required_authority(
         NOW + 3,
     )
     .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("protected principal root is required")
-    );
+    assert!(error
+        .to_string()
+        .contains("protected principal root is required"));
 
     let missing_profile = tempfile::tempdir().unwrap();
     let missing_profile_principal = "person:local:missing-profile-release";
@@ -2056,50 +2155,44 @@ fn profile_authorized_runtime_release_assembly_fails_without_required_authority(
         missing_profile.path(),
         missing_profile_principal,
     );
-    assert!(
-        super::assemble_protected_content_runtime_release_operation(
-            missing_profile.path(),
-            missing_profile_principal,
-            &crate::auth::principal_localhost_root(missing_profile_principal),
-            &missing_profile_proof,
-            release_operation_assembly_input(other_profile),
-            NOW + 3,
-        )
-        .is_err()
-    );
+    assert!(super::assemble_protected_content_runtime_release_operation(
+        missing_profile.path(),
+        missing_profile_principal,
+        &crate::auth::principal_localhost_root(missing_profile_principal),
+        &missing_profile_proof,
+        release_operation_assembly_input(other_profile),
+        NOW + 3,
+    )
+    .is_err());
 
     let missing_device = tempfile::tempdir().unwrap();
     let missing_device_principal = "person:local:missing-device-release";
     let (proof_binding_id, localhost_root, profile) =
         install_profile_authority_for_release_test(missing_device.path(), missing_device_principal);
     fs::remove_file(missing_device.path().join("identity/device.key")).unwrap();
-    assert!(
-        super::assemble_protected_content_runtime_release_operation(
-            missing_device.path(),
-            missing_device_principal,
-            &localhost_root,
-            &proof_binding_id,
-            release_operation_assembly_input(profile),
-            NOW + 3,
-        )
-        .is_err()
-    );
+    assert!(super::assemble_protected_content_runtime_release_operation(
+        missing_device.path(),
+        missing_device_principal,
+        &localhost_root,
+        &proof_binding_id,
+        release_operation_assembly_input(profile),
+        NOW + 3,
+    )
+    .is_err());
 
     let mismatch = tempfile::tempdir().unwrap();
     let mismatch_principal = "person:local:mismatched-profile-release";
     let (proof_binding_id, localhost_root, _) =
         install_profile_authority_for_release_test(mismatch.path(), mismatch_principal);
-    assert!(
-        super::assemble_protected_content_runtime_release_operation(
-            mismatch.path(),
-            mismatch_principal,
-            &localhost_root,
-            &proof_binding_id,
-            release_operation_assembly_input(other_profile),
-            NOW + 3,
-        )
-        .is_err()
-    );
+    assert!(super::assemble_protected_content_runtime_release_operation(
+        mismatch.path(),
+        mismatch_principal,
+        &localhost_root,
+        &proof_binding_id,
+        release_operation_assembly_input(other_profile),
+        NOW + 3,
+    )
+    .is_err());
 }
 
 fn make_signed_runtime_release_operation_for_envelope_and_seed(
@@ -3286,36 +3379,30 @@ fn runtime_custody_composition_rejects_trust_anchor_and_route_mismatches() {
             .to_bytes(),
     );
     write_owner_only_custody_composition_config(&data_dir, &wrong_policy);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected trust-anchor rejection")
-            .to_string()
-            .contains("trust anchors")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected trust-anchor rejection")
+        .to_string()
+        .contains("trust anchors"));
 
     let mut wrong_auth = custody_composition_config(now, base_routes.clone());
     wrong_auth.expected_committee_authorization_identity_base64 =
         canonical_b64(&CustodyCommitteeAuthorizationIdentityV1::new(digest(0xfe), 1).unwrap());
     write_owner_only_custody_composition_config(&data_dir, &wrong_auth);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected authorization-identity rejection")
-            .to_string()
-            .contains("trust anchors")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected authorization-identity rejection")
+        .to_string()
+        .contains("trust anchors"));
 
     let mut missing_route = custody_composition_config(now, base_routes.clone());
     missing_route.routes.pop();
     write_owner_only_custody_composition_config(&data_dir, &missing_route);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected missing-route rejection")
-            .to_string()
-            .contains("exactly three selected nodes")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected missing-route rejection")
+        .to_string()
+        .contains("exactly three selected nodes"));
 
     let mut extra_route = custody_composition_config(now, base_routes.clone());
     extra_route.routes.push(RuntimeCustodyRouteBindingConfig {
@@ -3326,61 +3413,51 @@ fn runtime_custody_composition_rejects_trust_anchor_and_route_mismatches() {
         },
     });
     write_owner_only_custody_composition_config(&data_dir, &extra_route);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected extra-route rejection")
-            .to_string()
-            .contains("exactly three selected nodes")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected extra-route rejection")
+        .to_string()
+        .contains("exactly three selected nodes"));
 
     let mut duplicate_route = custody_composition_config(now, base_routes.clone());
     duplicate_route.routes[1].node_public_key_base64 =
         duplicate_route.routes[0].node_public_key_base64.clone();
     write_owner_only_custody_composition_config(&data_dir, &duplicate_route);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected duplicate-node rejection")
-            .to_string()
-            .contains("duplicated or invalid")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected duplicate-node rejection")
+        .to_string()
+        .contains("duplicated or invalid"));
 
     let mut duplicate_root = custody_composition_config(now, base_routes.clone());
     duplicate_root.routes[1].owner_state_root_base64 =
         duplicate_root.routes[0].owner_state_root_base64.clone();
     write_owner_only_custody_composition_config(&data_dir, &duplicate_root);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected duplicate-root rejection")
-            .to_string()
-            .contains("duplicated or invalid")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected duplicate-root rejection")
+        .to_string()
+        .contains("duplicated or invalid"));
 
     let mut two_local = custody_composition_config(now, base_routes.clone());
     two_local.routes[1].transport = RuntimeCustodyRouteTransportConfig::Local;
     write_owner_only_custody_composition_config(&data_dir, &two_local);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected multi-local rejection")
-            .to_string()
-            .contains("at most one local")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected multi-local rejection")
+        .to_string()
+        .contains("at most one local"));
 
     let mut duplicate_peer = custody_composition_config(now, base_routes);
     duplicate_peer.routes[2].transport = RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
         peer_did: peer_did_1,
     };
     write_owner_only_custody_composition_config(&data_dir, &duplicate_peer);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected duplicate-peer rejection")
-            .to_string()
-            .contains("carrier peer DIDs must be distinct")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected duplicate-peer rejection")
+        .to_string()
+        .contains("carrier peer DIDs must be distinct"));
 
     let mut foreign_node = custody_composition_config(
         now,
@@ -3399,13 +3476,11 @@ fn runtime_custody_composition_rejects_trust_anchor_and_route_mismatches() {
     );
     foreign_node.routes[2].node_public_key_base64 = raw_b64_32(*node_public_key(9).as_bytes());
     write_owner_only_custody_composition_config(&data_dir, &foreign_node);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected foreign-node rejection")
-            .to_string()
-            .contains("signed node set")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected foreign-node rejection")
+        .to_string()
+        .contains("signed node set"));
 }
 
 #[cfg(unix)]
@@ -3436,13 +3511,11 @@ fn runtime_custody_composition_rejects_noncanonical_json_and_base64_and_bad_peer
 
     fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected noncanonical-json rejection")
-            .to_string()
-            .contains("not canonical")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected noncanonical-json rejection")
+        .to_string()
+        .contains("not canonical"));
 
     write_owner_only_custody_composition_config(&data_dir, &config);
     config.signed_pool_base64.push('\n');
@@ -3452,13 +3525,11 @@ fn runtime_custody_composition_rejects_noncanonical_json_and_base64_and_bad_peer
     )
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected base64 rejection")
-            .to_string()
-            .contains("base64")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected base64 rejection")
+        .to_string()
+        .contains("base64"));
 
     let mut bad_peer = custody_composition_config(
         now,
@@ -3476,25 +3547,21 @@ fn runtime_custody_composition_rejects_noncanonical_json_and_base64_and_bad_peer
         ),
     );
     write_owner_only_custody_composition_config(&data_dir, &bad_peer);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected invalid did:key rejection")
-            .to_string()
-            .contains("did:key")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected invalid did:key rejection")
+        .to_string()
+        .contains("did:key"));
 
     bad_peer.routes[1].transport = RuntimeCustodyRouteTransportConfig::CarrierPeerDid {
         peer_did: format!("{} ", peer_did_for_seed(0xde)),
     };
     write_owner_only_custody_composition_config(&data_dir, &bad_peer);
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected noncanonical did:key rejection")
-            .to_string()
-            .contains("did:key")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected noncanonical did:key rejection")
+        .to_string()
+        .contains("did:key"));
 }
 
 #[cfg(unix)]
@@ -3527,13 +3594,11 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
         fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected unsafe-file-mode rejection")
-            .to_string()
-            .contains("owner-only")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected unsafe-file-mode rejection")
+        .to_string()
+        .contains("owner-only"));
 
     write_owner_only_custody_composition_config(&data_dir, &config);
     fs::set_permissions(
@@ -3541,13 +3606,11 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
         fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    assert!(
-        load_runtime_custody_composition_config(&data_dir)
-            .err()
-            .expect("expected unsafe-parent-mode rejection")
-            .to_string()
-            .contains("owner-only")
-    );
+    assert!(load_runtime_custody_composition_config(&data_dir)
+        .err()
+        .expect("expected unsafe-parent-mode rejection")
+        .to_string()
+        .contains("owner-only"));
 
     write_owner_only_custody_composition_config(&data_dir, &config);
     let symlink_data_dir = temp.path().join("symlink-data");
@@ -3566,13 +3629,11 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
     )
     .unwrap();
     fs::set_permissions(&symlink_config_path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(
-        load_runtime_custody_composition_config(&symlink_data_dir)
-            .err()
-            .expect("expected symlink-parent rejection")
-            .to_string()
-            .contains("owner-only directory")
-    );
+    assert!(load_runtime_custody_composition_config(&symlink_data_dir)
+        .err()
+        .expect("expected symlink-parent rejection")
+        .to_string()
+        .contains("owner-only directory"));
 
     let symlink_file_data_dir = temp.path().join("symlink-file-data");
     owner_only_dir(&symlink_file_data_dir);
@@ -3633,13 +3694,11 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
         custody_composition_config_path(&hard_link_data_dir),
     )
     .unwrap();
-    assert!(
-        load_runtime_custody_composition_config(&hard_link_data_dir)
-            .err()
-            .expect("expected hard-link rejection")
-            .to_string()
-            .contains("hard-linked")
-    );
+    assert!(load_runtime_custody_composition_config(&hard_link_data_dir)
+        .err()
+        .expect("expected hard-link rejection")
+        .to_string()
+        .contains("hard-linked"));
 }
 
 #[cfg(unix)]
@@ -5149,20 +5208,6 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     let mint = mint_journal.load(mint_draft.mint_id()).unwrap();
     assert!(mint.content_availability().is_some());
 
-    let placeholder_operation = make_signed_runtime_release_operation_for_envelope_and_epoch_at(
-        0x21,
-        &envelope,
-        custody_epoch.clone(),
-        crate::auth::now_ts(),
-    );
-    let (placeholder_wallet_request, placeholder_wallet_response) =
-        wallet_request_response_for_release_at(
-            &placeholder_operation,
-            "profile:alpha",
-            "wallet-account-alpha",
-            "wallet-request:11111111111111111111111111111111",
-            crate::auth::now_ts(),
-        );
     let purchase_effect = runtime_verified_purchase_effect_for_mint(
         &mint,
         "profile:alpha",
@@ -5171,15 +5216,19 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         0xaa,
         crate::auth::now_ts(),
     );
-    let preliminary_buy = bind_buy(
-        &mint,
-        &placeholder_wallet_request,
-        &placeholder_wallet_response,
-        &purchase_effect,
-        crate::auth::now_ts(),
+    let profile = ProfileIdentityV1::from_public_key_bytes(
+        SigningKey::from_bytes(&[0x26; 32])
+            .verifying_key()
+            .to_bytes(),
     )
     .unwrap();
-    assert_eq!(preliminary_buy.binding(), &binding_for_envelope(&envelope));
+    let session_a = RuntimeSessionBindingV1::new(digest(0x66)).unwrap();
+    let session_b = RuntimeSessionBindingV1::new(digest(0x67)).unwrap();
+    let preliminary_buy = bind_buy(&mint, "profile:alpha", profile, &purchase_effect).unwrap();
+    assert_eq!(
+        preliminary_buy.binding_for_session(session_a).unwrap(),
+        binding_for_envelope(&envelope)
+    );
     assert_eq!(preliminary_buy.action(), RightsActionV1::View);
 
     let decrypt_registry = Arc::new(ProviderRegistry::new());
@@ -5212,6 +5261,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     let prepared_a = prepare_recipient(
         &decrypt,
         &preliminary_buy,
+        session_a,
         audit_a,
         runtime_operation_issuer_for_seed(0x21),
         prepare_issued_at,
@@ -5222,6 +5272,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     let prepared_b = prepare_recipient(
         &decrypt,
         &preliminary_buy,
+        session_b,
         audit_b,
         runtime_operation_issuer_for_seed(0x21),
         prepare_issued_at,
@@ -5229,6 +5280,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
     )
     .await
     .unwrap();
+    assert_ne!(prepared_a.binding(), prepared_b.binding());
 
     let operation = make_signed_runtime_release_operation_for_envelope_and_epoch_and_recipient_at(
         0x21,
@@ -5239,6 +5291,10 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         audit_a,
         flow_now,
     );
+    assert_eq!(
+        prepared_a.binding(),
+        operation.statement().rights_request().request().binding()
+    );
     let (wallet_request, wallet_response) = wallet_request_response_for_release_at(
         &operation,
         "profile:alpha",
@@ -5246,14 +5302,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         "wallet-request:11111111111111111111111111111111",
         flow_now,
     );
-    let buy = bind_buy(
-        &mint,
-        &wallet_request,
-        &wallet_response,
-        &purchase_effect,
-        flow_now,
-    )
-    .unwrap();
+    let buy = bind_buy(&mint, "profile:alpha", profile, &purchase_effect).unwrap();
 
     let rights_request_1 = RightsProviderRequestV1::new_evaluate(
         ordered_fixtures[0].provisioned.node_public_key,
@@ -5533,6 +5582,7 @@ async fn runtime_decrypt_registry_adapter_process_reconstructs_for_prepared_reci
         prepare_recipient(
             &decrypt,
             &buy,
+            RuntimeSessionBindingV1::new(digest(0x66)).unwrap(),
             RuntimeReleaseAuditIdV1::new(digest(0xaf)).unwrap(),
             runtime_operation_issuer_for_seed(0x21),
             crate::auth::now_ts(),
@@ -7726,32 +7776,194 @@ async fn runtime_custody_library_open_is_denied_before_purchase() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
+async fn runtime_custody_purchase_requires_current_verified_profile_authority() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-profile-check";
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let listing_path = super::runtime_listing_path(&harness.data_dir, mint.draft().mint_id());
+    let listing_before = fs::read(&listing_path).unwrap();
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &derived_device_key_for_seed(0x27).1,
+        crate::auth::now_ts(),
+    );
+    let purchase_path =
+        super::runtime_purchase_path(&harness.data_dir, principal_id, mint.draft().mint_id());
+    let purchase_json = String::from_utf8(fs::read(&purchase_path).unwrap()).unwrap();
+    assert!(!purchase_json.contains("wallet_request_hex"));
+    assert!(!purchase_json.contains("wallet_response_hex"));
+    assert_eq!(fs::read(&listing_path).unwrap(), listing_before);
+    let missing = super::load_runtime_custody_profile_did(&harness.data_dir, principal_id);
+    assert!(missing.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_purchase_reconstruction_rejects_mismatched_profile_did() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-profile-check";
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let (_proof_binding_id, _profile_identity) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &derived_device_key_for_seed(0x27).1,
+        crate::auth::now_ts(),
+    );
+    let mismatch = super::reconstructed_buy_receipt(&mint, &purchase, &current_profile_did);
+    assert!(mismatch.is_err());
+    assert!(mismatch
+        .unwrap_err()
+        .to_string()
+        .contains("Runtime custody chain evidence is invalid"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-profile-check";
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let (_proof_binding_id, _profile_identity) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let buy = super::reconstructed_buy_receipt(&mint, &purchase, &current_profile_did).unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    registry
+        .register_sub_provider("wallet", Arc::new(LibraryReleaseWalletProvider))
+        .await
+        .unwrap();
+    let session_a = super::derive_runtime_custody_session_binding(
+        principal_id,
+        &current_profile_did,
+        "proof:alpha",
+        "runtime-session:alpha",
+        "grant:alpha",
+        mint.draft().mint_id(),
+    )
+    .unwrap();
+    let session_b = super::derive_runtime_custody_session_binding(
+        principal_id,
+        &current_profile_did,
+        "proof:alpha",
+        "runtime-session:beta",
+        "grant:alpha",
+        mint.draft().mint_id(),
+    )
+    .unwrap();
+    assert_ne!(session_a, session_b);
+    let now = crate::auth::now_ts();
+    let (request_a, response_a, signed_a) = super::invoke_runtime_release_wallet(
+        registry.as_ref(),
+        &buy,
+        &recipient_identity(0x30),
+        super::RuntimeReleaseWalletInvocation {
+            principal_id,
+            account_id: &purchase.account_id,
+            proof_binding_id: "proof:alpha",
+            session_id: "runtime-session:alpha",
+            grant_id: "grant:alpha",
+            mint_id: mint.draft().mint_id(),
+            runtime_session_binding: session_a,
+        },
+        now,
+    )
+    .await
+    .unwrap();
+    let expected_a = buy.binding_for_session(session_a).unwrap();
+    assert_eq!(signed_a.request().binding(), &expected_a);
+    let decoded_request_a = WalletProviderRequestV2::decode_at(&request_a, now).unwrap();
+    WalletProviderResponseV2::decode_for_request(&response_a, &decoded_request_a).unwrap();
+    let request_a_hex = match &decoded_request_a.operation {
+        WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+            canonical_rights_request_hex,
+            ..
+        } => canonical_rights_request_hex.clone(),
+        other => panic!("unexpected wallet request: {other:?}"),
+    };
+    let request_a_binding =
+        RightsRequestV1::from_canonical_bytes(&hex::decode(request_a_hex).unwrap()).unwrap();
+    assert_eq!(request_a_binding.binding(), &expected_a);
+
+    let (request_b, _response_b, signed_b) = super::invoke_runtime_release_wallet(
+        registry.as_ref(),
+        &buy,
+        &recipient_identity(0x30),
+        super::RuntimeReleaseWalletInvocation {
+            principal_id,
+            account_id: &purchase.account_id,
+            proof_binding_id: "proof:alpha",
+            session_id: "runtime-session:beta",
+            grant_id: "grant:alpha",
+            mint_id: mint.draft().mint_id(),
+            runtime_session_binding: session_b,
+        },
+        now,
+    )
+    .await
+    .unwrap();
+    let expected_b = buy.binding_for_session(session_b).unwrap();
+    assert_eq!(signed_b.request().binding(), &expected_b);
+    assert_ne!(expected_a, expected_b);
+    let decoded_request_b = WalletProviderRequestV2::decode_at(&request_b, now).unwrap();
+    let request_b_hex = match &decoded_request_b.operation {
+        WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+            canonical_rights_request_hex,
+            ..
+        } => canonical_rights_request_hex.clone(),
+        other => panic!("unexpected wallet request: {other:?}"),
+    };
+    let request_b_binding =
+        RightsRequestV1::from_canonical_bytes(&hex::decode(request_b_hex).unwrap()).unwrap();
+    assert_eq!(request_b_binding.binding(), &expected_b);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_after_purchase_fails_closed_without_profile() {
     let harness = publish_library_runtime_custody_harness().await;
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(Digest32::new(
             hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
         ))
         .unwrap();
-    let now = crate::auth::now_ts();
-    let (wallet_request_hex, wallet_response_hex, purchase) =
-        wallet_buy_bundle_for_mint(&mint, &harness.buyer, now);
-    let buy = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "buy",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "wallet_request_hex": wallet_request_hex,
-                "wallet_response_hex": wallet_response_hex,
-                "purchase": purchase,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(buy["status"], "ok", "{buy}");
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        &harness.buyer,
+        "did:key:zmissing-profile",
+        crate::auth::now_ts(),
+    );
     let open = harness
         .registry
         .send_raw(
@@ -7760,6 +7972,97 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
                 "op": "open_viewer",
                 "principal_id": harness.buyer,
                 "mint_id": harness.mint_id,
+                "proof_binding_id": "proof:alpha",
+                "session_id": "runtime-session:alpha",
+                "grant_id": "grant:alpha",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open["status"], "error", "{open}");
+    assert!(
+        open["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
+        "{open}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_after_purchase_rejects_mismatched_purchased_profile() {
+    let harness = publish_library_runtime_custody_harness().await;
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(Digest32::new(
+            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
+        ))
+        .unwrap();
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        &harness.buyer,
+        &derived_device_key_for_seed(0x27).1,
+        crate::auth::now_ts(),
+    );
+    let open = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "open_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "proof_binding_id": proof_binding_id,
+                "session_id": "runtime-session:alpha",
+                "grant_id": "grant:alpha",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(open["status"], "error", "{open}");
+    assert!(
+        open["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Runtime custody chain evidence is invalid"),
+        "{open}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
+    let harness = publish_library_runtime_custody_harness().await;
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(Digest32::new(
+            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
+        ))
+        .unwrap();
+    let now = crate::auth::now_ts();
+    let profile_did = load_profile_did_for_test(&harness.data_dir, &harness.buyer);
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        &harness.buyer,
+        &profile_did,
+        now,
+    );
+    let open = harness
+        .registry
+        .send_raw(
+            "object",
+            &json!({
+                "op": "open_viewer",
+                "principal_id": harness.buyer,
+                "mint_id": harness.mint_id,
+                "proof_binding_id": proof_binding_id,
+                "session_id": "runtime-session:alpha",
+                "grant_id": "grant:alpha",
             }),
         )
         .await
@@ -8079,25 +8382,14 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_toke
             hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
         ))
         .unwrap();
-    let now = crate::auth::now_ts();
-    let (wallet_request_hex, wallet_response_hex, purchase) =
-        wallet_buy_bundle_for_mint(&mint, &harness.buyer, now);
-    let buy = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "buy",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "wallet_request_hex": wallet_request_hex,
-                "wallet_response_hex": wallet_response_hex,
-                "purchase": purchase,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(buy["status"], "ok", "{buy}");
+    let profile_did = derived_device_key_for_seed(0x26).1;
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        &harness.buyer,
+        &profile_did,
+        crate::auth::now_ts(),
+    );
     let open = harness
         .registry
         .send_raw(
@@ -8126,30 +8418,21 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
     let harness = publish_library_runtime_custody_harness().await;
     register_test_decrypt_provider(&harness.registry, &derived_device_runtime_issuer_hex(0x21))
         .await;
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(Digest32::new(
             hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
         ))
         .unwrap();
-    let now = crate::auth::now_ts();
-    let (wallet_request_hex, wallet_response_hex, purchase) =
-        wallet_buy_bundle_for_mint(&mint, &harness.buyer, now);
-    let buy = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "buy",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "wallet_request_hex": wallet_request_hex,
-                "wallet_response_hex": wallet_response_hex,
-                "purchase": purchase,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(buy["status"], "ok", "{buy}");
+    let profile_did = load_profile_did_for_test(&harness.data_dir, &harness.buyer);
+    persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        &harness.buyer,
+        &profile_did,
+        crate::auth::now_ts(),
+    );
     let open = harness
         .registry
         .send_raw(
@@ -8158,7 +8441,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
                 "op": "open_viewer",
                 "principal_id": harness.buyer,
                 "mint_id": harness.mint_id,
-                "proof_binding_id": "proof:passkey:missing-wallet",
+                "proof_binding_id": proof_binding_id,
                 "session_id": "runtime-session:alpha",
                 "grant_id": "grant:alpha",
             }),
@@ -8179,7 +8462,7 @@ async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wal
 #[tokio::test]
 async fn runtime_custody_library_open_after_buy_reads_clear_media_and_closes() {
     let harness = publish_library_runtime_custody_play_harness().await;
-    let (proof_binding_id, profile) =
+    let (proof_binding_id, _) =
         install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
     let mint = runtime_mint_journal(&harness.data_dir)
         .load(Digest32::new(
@@ -8187,24 +8470,26 @@ async fn runtime_custody_library_open_after_buy_reads_clear_media_and_closes() {
         ))
         .unwrap();
     let now = crate::auth::now_ts();
-    let (wallet_request_hex, wallet_response_hex, purchase) =
-        wallet_buy_bundle_for_mint_with_profile(&mint, &harness.buyer, now, profile);
-    let buy = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "buy",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "wallet_request_hex": wallet_request_hex,
-                "wallet_response_hex": wallet_response_hex,
-                "purchase": purchase,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(buy["status"], "ok", "{buy}");
+    let profile_did = load_profile_did_for_test(&harness.data_dir, &harness.buyer);
+    let listing_path = super::runtime_listing_path(&harness.data_dir, mint.draft().mint_id());
+    let listing_before = fs::read(&listing_path).unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        &harness.buyer,
+        &profile_did,
+        now,
+    );
+    let purchase_bytes = fs::read(super::runtime_purchase_path(
+        &harness.data_dir,
+        &harness.buyer,
+        mint.draft().mint_id(),
+    ))
+    .unwrap();
+    let purchase_json = String::from_utf8(purchase_bytes).unwrap();
+    assert!(!purchase_json.contains("wallet_request_hex"));
+    assert!(!purchase_json.contains("wallet_response_hex"));
+    assert_eq!(purchase.profile_did, profile_did);
     let open = harness
         .registry
         .send_raw(
@@ -8299,4 +8584,5 @@ async fn runtime_custody_library_open_after_buy_reads_clear_media_and_closes() {
     if listings_root.exists() {
         assert!(!any_file_contains(&listings_root, &harness.clear_init));
     }
+    assert_eq!(fs::read(&listing_path).unwrap(), listing_before);
 }

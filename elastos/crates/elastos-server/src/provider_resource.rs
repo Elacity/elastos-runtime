@@ -915,6 +915,15 @@ mod tests {
         assert!(
             build_capability_resource(
                 "chain",
+                "resolve_protected_content_purchase_access",
+                &serde_json::json!({})
+            )
+            .is_err(),
+            "protected-content purchase access corroboration must stay Runtime-internal"
+        );
+        assert!(
+            build_capability_resource(
+                "chain",
                 "protected_content_rights_evidence",
                 &serde_json::json!({})
             )

@@ -51,6 +51,8 @@ const PROTECTED_CONTENT_CREATOR_BUY_ONCE_OP_TYPE: u16 = 1;
 const PROTECTED_CONTENT_CREATOR_ACCESS_TOKEN_ROLE: u64 = 1;
 const PROTECTED_CONTENT_CREATOR_ROYALTY_SHARE_ROLE: u64 = 2;
 const PROTECTED_CONTENT_CREATOR_ROYALTY_TENTHS_PERCENT: &str = "0x3b6";
+const PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FINALIZED_AGE_SECS: u64 = 30 * 60;
+const PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 struct ChainProvider {
     networks: Vec<ChainNetwork>,
@@ -203,6 +205,17 @@ impl ChainProvider {
                 &network,
                 &ledger,
                 &token_id,
+            ),
+            Request::ResolveProtectedContentPurchaseAccess {
+                request_id,
+                network,
+                wallet,
+                content_access_id,
+            } => self.resolve_protected_content_purchase_access(
+                &request_id,
+                &network,
+                &wallet,
+                &content_access_id,
             ),
             Request::Proof {
                 network,
@@ -1359,6 +1372,91 @@ impl ChainProvider {
         }))
     }
 
+    fn resolve_protected_content_purchase_access(
+        &self,
+        request_id: &str,
+        network_id: &str,
+        wallet: &str,
+        content_access_id: &str,
+    ) -> Response {
+        if request_id.trim().is_empty() || request_id.len() > 256 {
+            return Response::error(
+                "invalid_protected_content_purchase_access_request",
+                "protected-content purchase access request identity is invalid",
+            );
+        }
+        if let Err(err) = validate_evm_address(wallet) {
+            return Response::error("invalid_protected_content_purchase_access_request", &err);
+        }
+        let content_access_id = match parse_content_access_id(content_access_id) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        let (network, method, policy_source) = match self
+            .configured_protected_content_policy_source_for_network(
+                network_id,
+                ProtectedContentPolicyAction::View,
+            ) {
+            Ok(source) => source,
+            Err(response) => return response,
+        };
+        let Some(expected_chain_id) = network.chain_id else {
+            return Response::error(
+                "protected_content_purchase_access_not_configured",
+                "no configured protected-content purchase access source matches listing network",
+            );
+        };
+        let data = match method.abi {
+            RightsMethodAbi::HasAccessByContentIdAddressBytes16 => {
+                match encode_has_access_by_content_id_call(
+                    &method.selector,
+                    content_access_id.as_bytes(),
+                    &normalize_evm_address(wallet),
+                ) {
+                    Ok(data) => data,
+                    Err(err) => {
+                        return Response::error(
+                            "invalid_protected_content_purchase_access_request",
+                            &err,
+                        )
+                    }
+                }
+            }
+        };
+        let observation = match self.observe_protected_content_rights(
+            network,
+            &policy_source.evidence_rpc_urls,
+            expected_chain_id,
+            &method.contract,
+            &data,
+        ) {
+            Ok(observation) => observation,
+            Err(response) => return response,
+        };
+        let now = (self.now_unix_seconds)();
+        if let Err(err) = validate_finalized_observation_freshness(
+            observation.finalized_block_timestamp,
+            now,
+            PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FINALIZED_AGE_SECS,
+            PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FUTURE_SKEW_SECS,
+        ) {
+            return Response::error("stale_protected_content_purchase_access_observation", &err);
+        }
+        Response::ok(json!({
+            "schema": PROTECTED_CONTENT_PURCHASE_ACCESS_SCHEMA,
+            "request_id": request_id,
+            "network": network.id,
+            "chain_id": observation.chain_id,
+            "wallet": normalize_evm_address(wallet),
+            "content_access_id": format!("0x{}", encode_hex(content_access_id.as_bytes())),
+            "has_access": observation.has_access,
+            "finalized_block_number": observation.finalized_block_number,
+            "finalized_block_hash": format!("0x{}", encode_hex(observation.finalized_block_hash.as_bytes())),
+            "finalized_block_timestamp": observation.finalized_block_timestamp,
+            "observed_at": now,
+        }))
+    }
+
     fn configured_global_protected_content_creator_mint_source(
         &self,
     ) -> Result<(&ChainNetwork, &ProtectedContentCreatorMintMethod), Response> {
@@ -1484,6 +1582,39 @@ impl ChainProvider {
             return Err(Response::error(
                 "ambiguous_rights_policy_source",
                 "multiple protected-content rights policy sources match action",
+            ));
+        }
+        Ok(source)
+    }
+
+    fn configured_protected_content_policy_source_for_network(
+        &self,
+        network_id: &str,
+        action: ProtectedContentPolicyAction,
+    ) -> Result<(&ChainNetwork, &RightsMethod, &ProtectedContentPolicySource), Response> {
+        let mut matches = self
+            .networks
+            .iter()
+            .filter(|network| network.kind == ChainKind::EvmJsonRpc && network.id == network_id)
+            .flat_map(|network| {
+                network.rights_methods.iter().flat_map(move |method| {
+                    method
+                        .protected_content_policies
+                        .iter()
+                        .filter(move |policy| policy.action == action)
+                        .map(move |policy| (network, method, policy))
+                })
+            });
+        let Some(source) = matches.next() else {
+            return Err(Response::error(
+                "protected_content_purchase_access_not_configured",
+                "no configured protected-content purchase access source matches listing network",
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(Response::error(
+                "ambiguous_protected_content_purchase_access_source",
+                "multiple protected-content purchase access sources match listing network",
             ));
         }
         Ok(source)
@@ -2459,6 +2590,7 @@ struct ProtectedContentEvidenceObservation {
     chain_id: u64,
     finalized_block_number: u64,
     finalized_block_hash: Digest32,
+    finalized_block_timestamp: u64,
     has_access: bool,
 }
 
@@ -2474,6 +2606,14 @@ fn evm_finalized_block(value: &Value) -> Result<ProtectedContentEvidenceObservat
         .get("hash")
         .and_then(Value::as_str)
         .ok_or_else(|| "EVM block hash missing".to_string())?;
+    let finalized_block_timestamp = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "EVM block timestamp missing".to_string())
+        .and_then(|value| {
+            parse_hex_u64(value)
+                .map_err(|_| "EVM block timestamp must be a hex quantity".to_string())
+        })?;
     let bytes = decode_hex(hash, Some(32), "EVM block hash")?;
     Ok(ProtectedContentEvidenceObservation {
         chain_id: 0,
@@ -2483,8 +2623,29 @@ fn evm_finalized_block(value: &Value) -> Result<ProtectedContentEvidenceObservat
                 .try_into()
                 .map_err(|_| "EVM block hash must be 32 bytes".to_string())?,
         ),
+        finalized_block_timestamp,
         has_access: false,
     })
+}
+
+fn validate_finalized_observation_freshness(
+    finalized_block_timestamp: u64,
+    now_unix_seconds: u64,
+    max_age_secs: u64,
+    max_future_skew_secs: u64,
+) -> Result<(), String> {
+    if finalized_block_timestamp > now_unix_seconds {
+        let skew = finalized_block_timestamp - now_unix_seconds;
+        if skew > max_future_skew_secs {
+            return Err("finalized observation is too far in the future".to_string());
+        }
+        return Ok(());
+    }
+    let age = now_unix_seconds - finalized_block_timestamp;
+    if age > max_age_secs {
+        return Err("finalized observation is too stale".to_string());
+    }
+    Ok(())
 }
 
 fn parse_evm_contract_address(value: &str) -> Result<EvmContractAddressV1, Response> {

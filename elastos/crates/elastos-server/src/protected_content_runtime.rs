@@ -23,13 +23,13 @@ use elastos_protected_content_contracts::{
     validate_custody_epoch_against_pool_at, CanonicalContract, ContentAccessIdV1,
     CustodyCommitteeAuthorizationIdentityV1, CustodyEnvelopeV1, CustodyEpochIssuerKeyV1, Digest32,
     EncryptedContentIdentityV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1,
-    NodeCustodyPublicKeyV1, NodePublicKey, RecipientKeyAuthorizationStatementV1,
+    NodeCustodyPublicKeyV1, NodePublicKey, ProfileIdentityV1, RecipientKeyAuthorizationStatementV1,
     RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
     RightsEvaluationEvidenceRequestV1, RightsPolicyBodyV1, RightsPolicyIdentityV1, RightsRequestV1,
     RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeReleaseOperationStatementV1,
-    SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
-    SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
-    TerminalReceiptStatementV1, WalletSignedRightsRequestV1,
+    RuntimeSessionBindingV1, SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1,
+    SignedCustodyPoolV1, SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1,
+    TerminalReceiptIssuerKey, TerminalReceiptStatementV1, WalletSignedRightsRequestV1,
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, DecryptProviderRequestOpV1, DecryptProviderRequestV1,
@@ -81,6 +81,10 @@ pub(crate) const RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE: &str =
     "Runtime custody composition is not configured";
 pub(crate) const RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE: &str =
     "Runtime custody purchase is denied before buy";
+pub(crate) const RUNTIME_CUSTODY_PURCHASE_PENDING_MESSAGE: &str =
+    "Runtime custody purchase is pending exact Wallet or Chain settlement";
+pub(crate) const RUNTIME_CUSTODY_PURCHASE_UNAVAILABLE_MESSAGE: &str =
+    "Runtime custody purchase is unavailable";
 pub(crate) const RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE: &str =
     "Runtime custody open is denied before purchase";
 pub(crate) const RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE: &str =
@@ -100,7 +104,7 @@ const RUNTIME_OPEN_MATERIAL_ROOT: &str = "protected-content/runtime-open";
 const RUNTIME_LISTING_ROOT: &str = "protected-content/runtime-listings";
 const RUNTIME_PURCHASE_ROOT: &str = "protected-content/runtime-purchases";
 const RUNTIME_LISTING_SCHEMA_V1: &str = "elastos.library.runtime-custody-listing/v1";
-const RUNTIME_PURCHASE_SCHEMA_V1: &str = "elastos.library.runtime-custody-purchase/v1";
+pub(crate) const RUNTIME_PURCHASE_SCHEMA_V1: &str = "elastos.library.runtime-custody-purchase/v1";
 const CUSTODY_COMPOSITION_SCHEMA_V1: &str = "elastos.protected-content.custody-composition/v1";
 const MAX_CUSTODY_COMPOSITION_BYTES: usize = 64 * 1024;
 const MAX_CUSTODY_COMPOSITION_BLOB_BYTES: usize = 16 * 1024;
@@ -2558,59 +2562,124 @@ fn runtime_custody_library_publish_facts(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeCustodyListingRecord {
-    schema: String,
-    mint_id: String,
-    content_id: String,
-    content_access_id: String,
-    cid: String,
-    metadata_cid: String,
-    token_uri: String,
-    publisher_principal_id: String,
-    seller_address: String,
-    chain_namespace: String,
-    network: String,
-    ledger: String,
-    token_id: String,
-    operative: String,
-    price: String,
-    pay_token: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    payment_processor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    buyer_principal_id: Option<String>,
-    published_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bought_at: Option<u64>,
+    pub(crate) schema: String,
+    pub(crate) mint_id: String,
+    pub(crate) content_id: String,
+    pub(crate) content_access_id: String,
+    pub(crate) cid: String,
+    pub(crate) metadata_cid: String,
+    pub(crate) token_uri: String,
+    pub(crate) publisher_principal_id: String,
+    pub(crate) seller_address: String,
+    pub(crate) chain_namespace: String,
+    pub(crate) network: String,
+    pub(crate) ledger: String,
+    pub(crate) token_id: String,
+    pub(crate) operative: String,
+    pub(crate) price: String,
+    pub(crate) pay_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) payment_processor: Option<String>,
+    pub(crate) published_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeCustodyPurchaseRecord {
-    schema: String,
-    principal_id: String,
-    mint_id: String,
-    content_id: String,
-    cid: String,
-    chain_transaction: String,
-    bought_at: u64,
-    wallet_request_hex: String,
-    wallet_response_hex: String,
-    account_id: String,
-    address: String,
-    approval_request_id: String,
-    chain_namespace: String,
-    network: String,
-    to: String,
-    value: String,
-    data: String,
-    wallet_binding: ValidatedChainOutcomeBindingV1,
-    chain_observation: Value,
-    confirmed_at: u64,
+pub(crate) struct RuntimeCustodyPurchaseStageRecord {
+    pub(crate) stage: String,
+    pub(crate) effect_id: String,
+    pub(crate) approval_request_id: String,
+    pub(crate) request_sha256: String,
+    pub(crate) chain_namespace: String,
+    pub(crate) network: String,
+    pub(crate) to: String,
+    pub(crate) value: String,
+    pub(crate) data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeCustodyConfirmedPurchaseStage {
+    pub(crate) chain_transaction: String,
+    pub(crate) wallet_binding: ValidatedChainOutcomeBindingV1,
+    pub(crate) chain_observation: Value,
+    pub(crate) confirmed_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeCustodyPurchaseAccessEvidenceRecord {
+    pub(crate) schema: String,
+    pub(crate) request_id: String,
+    pub(crate) network: String,
+    pub(crate) chain_id: u64,
+    pub(crate) wallet: String,
+    pub(crate) content_access_id: String,
+    pub(crate) has_access: bool,
+    pub(crate) finalized_block_number: u64,
+    pub(crate) finalized_block_hash: String,
+    pub(crate) finalized_block_timestamp: u64,
+    pub(crate) observed_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeCustodyTerminalPurchaseRecord {
+    pub(crate) chain_transaction: String,
+    pub(crate) wallet_binding: ValidatedChainOutcomeBindingV1,
+    pub(crate) chain_observation: Value,
+    pub(crate) access_evidence: RuntimeCustodyPurchaseAccessEvidenceRecord,
+    pub(crate) confirmed_at: u64,
+    pub(crate) bought_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RuntimeCustodyPurchaseProgress {
+    Pending {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        confirmed_buy: Option<RuntimeCustodyConfirmedPurchaseStage>,
+    },
+    Complete {
+        terminal: RuntimeCustodyTerminalPurchaseRecord,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeCustodyPurchaseRecord {
+    pub(crate) schema: String,
+    pub(crate) principal_id: String,
+    pub(crate) profile_did: String,
+    pub(crate) mint_id: String,
+    pub(crate) content_id: String,
+    pub(crate) cid: String,
+    pub(crate) listing_sha256: String,
+    pub(crate) seller_address: String,
+    pub(crate) chain_namespace: String,
+    pub(crate) network: String,
+    pub(crate) ledger: String,
+    pub(crate) token_id: String,
+    pub(crate) operative: String,
+    pub(crate) price: String,
+    pub(crate) pay_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) payment_processor: Option<String>,
+    pub(crate) availability_receipt_digest: String,
+    pub(crate) account_id: String,
+    pub(crate) address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) approval_stage: Option<RuntimeCustodyPurchaseStageRecord>,
+    pub(crate) buy_stage: RuntimeCustodyPurchaseStageRecord,
+    pub(crate) progress: RuntimeCustodyPurchaseProgress,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: u64,
 }
 
 pub(crate) struct RuntimeCustodyBuyInput {
     pub principal_id: String,
     pub mint_id: String,
+    pub account_id: String,
 }
 
 pub(crate) struct RuntimeCustodyViewerOpenInput {
@@ -2661,35 +2730,16 @@ pub(crate) fn list_runtime_custody_listings(
             if record.schema != RUNTIME_LISTING_SCHEMA_V1 {
                 anyhow::bail!("Runtime custody listing is invalid");
             }
-            let is_publisher = record.publisher_principal_id == principal_id;
-            let is_buyer = record.buyer_principal_id.as_deref() == Some(principal_id);
-            if record.buyer_principal_id.is_some() && !is_publisher && !is_buyer {
-                continue;
-            }
             listings.push(json!({
                 "schema": RUNTIME_LISTING_SCHEMA_V1,
                 "mint_id": record.mint_id,
                 "content_id": record.content_id,
                 "cid": record.cid,
                 "publisher_principal_id": record.publisher_principal_id,
-                "buyer_principal_id": if is_publisher || is_buyer {
-                    record.buyer_principal_id.clone()
-                } else {
-                    None
-                },
                 "published_at": record.published_at,
-                "bought_at": if is_publisher || is_buyer {
-                    record.bought_at
-                } else {
-                    None
-                },
                 "availability": {
                     "schema": "elastos.library.runtime-custody-availability/v1",
-                    "status": if record.buyer_principal_id.is_some() {
-                        "buyer_owned"
-                    } else {
-                        PROTECTED_CONTENT_AVAILABLE_STATUS
-                    },
+                    "status": PROTECTED_CONTENT_AVAILABLE_STATUS,
                     "cid": record.cid,
                     "content_id": record.content_id,
                     "mint_id": record.mint_id,
@@ -2708,18 +2758,7 @@ pub(crate) fn list_runtime_custody_listings(
     }))
 }
 
-pub(crate) fn buy_runtime_custody_listing(
-    data_dir: &Path,
-    input: RuntimeCustodyBuyInput,
-) -> anyhow::Result<Value> {
-    let mint_id = parse_mint_id_hex(&input.mint_id)?;
-    let listing = load_runtime_custody_listing(data_dir, mint_id)?
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE))?;
-    let _ = (input.principal_id, listing);
-    anyhow::bail!(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE);
-}
-
-async fn verify_fresh_runtime_custody_buy_availability(
+pub(crate) async fn verify_fresh_runtime_custody_buy_availability(
     data_dir: &Path,
     registry: &ProviderRegistry,
     mint_id: Digest32,
@@ -2793,41 +2832,9 @@ pub(crate) async fn open_runtime_custody_viewer(
     let mint_id = parse_mint_id_hex(&input.mint_id)?;
     let purchase = load_runtime_custody_purchase(data_dir, &input.principal_id, mint_id)?
         .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE))?;
-    let composition = load_runtime_custody_composition(data_dir, registry.clone())?
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
-    let (device_key, _) =
-        crate::collaboration_profile_authority::load_existing_device_signing_key(data_dir)?
-            .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
-    let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
-        .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
-    let envelope = load_runtime_open_envelope(data_dir, mint_id)?
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?;
-    let mint = runtime_mint_journal(data_dir)
-        .load(mint_id)
-        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
-    let (media_identity, protected_init) = fetch_runtime_custody_open_media(
-        registry.as_ref(),
-        &purchase.cid,
-        mint.draft().media_identity(),
-    )
-    .await?;
-    let buy = reconstructed_buy_receipt(&mint, &purchase)?;
-    let now = crate::auth::now_ts();
-    let audit_request_id = runtime_open_audit_id(&input.principal_id, mint_id, now);
-    let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
-    let prepared = match prepare_recipient(
-        &decrypt,
-        &buy,
-        audit_request_id,
-        runtime_issuer,
-        now.saturating_sub(5),
-        now + 60,
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(_) => anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
-    };
+    if purchase.principal_id != input.principal_id {
+        anyhow::bail!(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE);
+    }
     let proof_binding_id = input
         .proof_binding_id
         .as_deref()
@@ -2840,18 +2847,67 @@ pub(crate) async fn open_runtime_custody_viewer(
     let (Some(proof_binding_id), Some(session_id), Some(grant_id)) =
         (proof_binding_id, session_id, grant_id)
     else {
-        let _ = cancel_prepared_recipient(&decrypt, &prepared).await;
         anyhow::bail!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE);
+    };
+    let profile_did = load_runtime_custody_profile_did(data_dir, &input.principal_id)?;
+    let runtime_session_binding = derive_runtime_custody_session_binding(
+        &input.principal_id,
+        &profile_did,
+        proof_binding_id,
+        session_id,
+        grant_id,
+        mint_id,
+    )?;
+    let composition = load_runtime_custody_composition(data_dir, registry.clone())?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE))?;
+    let (device_key, _) =
+        crate::collaboration_profile_authority::load_existing_device_signing_key(data_dir)?
+            .ok_or_else(|| anyhow::anyhow!("local Runtime device signing key is missing"))?;
+    let runtime_issuer = RuntimeOperationIssuerKeyV1::new(device_key.verifying_key().to_bytes())
+        .map_err(|_| anyhow::anyhow!("local Runtime device signing key is invalid"))?;
+    let envelope = load_runtime_open_envelope(data_dir, mint_id)?
+        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_VIEWER_ENVELOPE_UNAVAILABLE_MESSAGE))?;
+    let mint = runtime_mint_journal(data_dir)
+        .load(mint_id)
+        .map_err(|_| anyhow::anyhow!("Runtime custody mint selection is invalid"))?;
+    let buy = reconstructed_buy_receipt(&mint, &purchase, &profile_did)?;
+    let (media_identity, protected_init) = fetch_runtime_custody_open_media(
+        registry.as_ref(),
+        &purchase.cid,
+        mint.draft().media_identity(),
+    )
+    .await?;
+    let now = crate::auth::now_ts();
+    let audit_request_id = runtime_open_audit_id(&input.principal_id, mint_id, now);
+    let decrypt = RuntimeDecryptRegistryAdapter::new(registry.clone());
+    let prepared = match prepare_recipient(
+        &decrypt,
+        &buy,
+        runtime_session_binding,
+        audit_request_id,
+        runtime_issuer,
+        now.saturating_sub(5),
+        now + 60,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(_) => anyhow::bail!(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
     };
     let (release_wallet_request, release_wallet_response, signed_rights) =
         match invoke_runtime_release_wallet(
             registry.as_ref(),
-            &purchase,
+            &buy,
             prepared.recipient_identity(),
-            proof_binding_id,
-            session_id,
-            grant_id,
-            mint_id,
+            RuntimeReleaseWalletInvocation {
+                principal_id: &input.principal_id,
+                account_id: &purchase.account_id,
+                proof_binding_id,
+                session_id,
+                grant_id,
+                mint_id,
+                runtime_session_binding,
+            },
             now,
         )
         .await
@@ -2897,7 +2953,7 @@ pub(crate) async fn open_runtime_custody_viewer(
         RuntimeReleaseOperationAssemblyInput {
             rights_request: signed_rights,
             release_request,
-            recipient_public_key: prepared.recipient_public_key().clone(),
+            recipient_public_key: *prepared.recipient_public_key(),
             recipient_identity: prepared.recipient_identity().clone(),
             policy_body: policy.body().clone(),
             evidence_request,
@@ -3171,6 +3227,17 @@ pub(crate) fn load_runtime_custody_listing(
     Ok(Some(record))
 }
 
+pub(crate) fn load_runtime_custody_listing_bytes(
+    data_dir: &Path,
+    mint_id: Digest32,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let path = runtime_listing_path(data_dir, mint_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(fs::read(path)?))
+}
+
 pub(crate) fn persist_runtime_custody_creator_listing(
     data_dir: &Path,
     mint: &PersistedRuntimeMint,
@@ -3200,9 +3267,7 @@ pub(crate) fn persist_runtime_custody_creator_listing(
         price: terminal.price().to_string(),
         pay_token: terminal.pay_token().to_string(),
         payment_processor: terminal.payment_processor().map(str::to_string),
-        buyer_principal_id: None,
         published_at: crate::auth::now_ts(),
-        bought_at: None,
     };
     if let Some(existing) = load_runtime_custody_listing(data_dir, mint_id)? {
         if existing.schema == expected.schema
@@ -3231,8 +3296,6 @@ pub(crate) fn persist_runtime_custody_creator_listing(
                     .payment_processor
                     .as_deref()
                     .map(str::to_ascii_lowercase)
-            && existing.buyer_principal_id.is_none()
-            && existing.bought_at.is_none()
         {
             return Ok(());
         }
@@ -3241,7 +3304,7 @@ pub(crate) fn persist_runtime_custody_creator_listing(
     persist_runtime_custody_listing(data_dir, &expected)
 }
 
-fn load_runtime_custody_purchase(
+pub(crate) fn load_runtime_custody_purchase(
     data_dir: &Path,
     principal_id: &str,
     mint_id: Digest32,
@@ -3257,14 +3320,36 @@ fn load_runtime_custody_purchase(
     Ok(Some(record))
 }
 
+pub(crate) fn persist_runtime_custody_purchase(
+    data_dir: &Path,
+    purchase: &RuntimeCustodyPurchaseRecord,
+) -> anyhow::Result<()> {
+    write_owner_only_bytes(
+        &runtime_purchase_path(
+            data_dir,
+            &purchase.principal_id,
+            parse_mint_id_hex(&purchase.mint_id)?,
+        ),
+        &serde_json::to_vec(purchase)?,
+    )
+}
+
 fn reconstructed_buy_receipt(
     mint: &elastos_protected_content_runtime::PersistedRuntimeMint,
     purchase: &RuntimeCustodyPurchaseRecord,
+    current_profile_did: &str,
 ) -> anyhow::Result<elastos_protected_content_runtime::RuntimeBuyReceipt> {
-    let wallet_request = decode_hex_bytes(&purchase.wallet_request_hex)
-        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?;
-    let wallet_response = decode_hex_bytes(&purchase.wallet_response_hex)
-        .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?;
+    if purchase.profile_did != current_profile_did {
+        return Err(runtime_open_error(
+            elastos_protected_content_runtime::RuntimeOpenError::ChainEvidence,
+        ));
+    }
+    let profile_identity = profile_identity_from_did(current_profile_did)?;
+    let RuntimeCustodyPurchaseProgress::Complete { terminal } = &purchase.progress else {
+        return Err(runtime_open_error(
+            elastos_protected_content_runtime::RuntimeOpenError::ChainEvidence,
+        ));
+    };
     let effect = RuntimeVerifiedPurchaseEffect::new(
         RuntimeProtectedContentPurchaseIntent::new(
             mint.draft().mint_id(),
@@ -3274,55 +3359,50 @@ fn reconstructed_buy_receipt(
             RightsActionV1::View,
             purchase.chain_namespace.clone(),
             purchase.network.clone(),
-            purchase.to.clone(),
-            purchase.value.clone(),
-            purchase.data.clone(),
+            purchase.buy_stage.to.clone(),
+            purchase.buy_stage.value.clone(),
+            purchase.buy_stage.data.clone(),
         )
         .map_err(|_| anyhow::anyhow!("Runtime custody chain evidence is invalid"))?,
         RuntimePurchaseEffectAuthority::new(
             purchase.principal_id.clone(),
             purchase.account_id.clone(),
             purchase.address.clone(),
-            purchase.approval_request_id.clone(),
+            purchase.buy_stage.approval_request_id.clone(),
         )
         .map_err(|_| anyhow::anyhow!("Runtime custody wallet authority is invalid"))?,
-        purchase.wallet_binding.clone(),
-        purchase.chain_transaction.clone(),
-        purchase.chain_observation.clone(),
-        purchase.confirmed_at,
+        terminal.wallet_binding.clone(),
+        terminal.chain_transaction.clone(),
+        terminal.chain_observation.clone(),
+        terminal.confirmed_at,
     )
     .map_err(runtime_open_error)?;
-    bind_buy(
-        mint,
-        &wallet_request,
-        &wallet_response,
-        &effect,
-        crate::auth::now_ts(),
-    )
-    .map_err(runtime_open_error)
+    bind_buy(mint, &purchase.principal_id, profile_identity, &effect).map_err(runtime_open_error)
+}
+
+struct RuntimeReleaseWalletInvocation<'a> {
+    principal_id: &'a str,
+    account_id: &'a str,
+    proof_binding_id: &'a str,
+    session_id: &'a str,
+    grant_id: &'a str,
+    mint_id: Digest32,
+    runtime_session_binding: RuntimeSessionBindingV1,
 }
 
 async fn invoke_runtime_release_wallet(
     registry: &ProviderRegistry,
-    purchase: &RuntimeCustodyPurchaseRecord,
+    buy: &elastos_protected_content_runtime::RuntimeBuyReceipt,
     recipient: &RecipientKeyIdentityV1,
-    proof_binding_id: &str,
-    session_id: &str,
-    grant_id: &str,
-    mint_id: Digest32,
+    invocation: RuntimeReleaseWalletInvocation<'_>,
     now: u64,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>, WalletSignedRightsRequestV1)> {
-    let buy_request = decode_hex_bytes(&purchase.wallet_request_hex)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
-    let buy_response = decode_hex_bytes(&purchase.wallet_response_hex)
-        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
-    let buy_signed = wallet_signed_rights_from_bytes(&buy_request, &buy_response)
-        .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
     let mut replay_nonce = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut replay_nonce);
     let rights_request = RightsRequestV1::new(
-        buy_signed.request().binding().clone(),
-        buy_signed.request().action(),
+        buy.binding_for_session(invocation.runtime_session_binding)
+            .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?,
+        buy.action(),
         recipient.clone(),
         now.saturating_sub(5),
         now + 180,
@@ -3332,12 +3412,15 @@ async fn invoke_runtime_release_wallet(
     let mut request_entropy = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut request_entropy);
     let context = VerifiedWalletInvocationContext::new(
-        purchase.principal_id.clone(),
-        session_id,
-        Some(proof_binding_id.to_string()),
-        grant_id,
+        invocation.principal_id.to_string(),
+        invocation.session_id,
+        Some(invocation.proof_binding_id.to_string()),
+        invocation.grant_id,
         "runtime",
-        format!("runtime-open-{}", hex::encode(mint_id.as_bytes())),
+        format!(
+            "runtime-open-{}",
+            hex::encode(invocation.mint_id.as_bytes())
+        ),
     )
     .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
     let wallet_request = WalletProviderRequestV2::new(
@@ -3346,7 +3429,7 @@ async fn invoke_runtime_release_wallet(
         now,
         now.saturating_add(MAX_INVOCATION_TTL_SECS),
         WalletProviderOperationV2::RequestProtectedContentRightsSignature {
-            account_id: purchase.account_id.clone(),
+            account_id: invocation.account_id.to_string(),
             canonical_rights_request_hex: hex::encode(rights_request.canonical_bytes().map_err(
                 |_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
             )?),
@@ -3549,6 +3632,55 @@ fn runtime_open_audit_id(
     RuntimeReleaseAuditIdV1::new(Digest32::new(hasher.finalize().into())).unwrap_or_else(|_| {
         RuntimeReleaseAuditIdV1::new(Digest32::new([1; 32])).expect("nonzero audit id")
     })
+}
+
+fn load_runtime_custody_profile_did(data_dir: &Path, principal_id: &str) -> anyhow::Result<String> {
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    let profile = crate::collaboration_profile_authority::load_profile_authority(
+        data_dir,
+        principal_id,
+        &localhost_root,
+    )?
+    .ok_or_else(|| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    Ok(profile.document().profile_did.clone())
+}
+
+fn profile_identity_from_did(profile_did: &str) -> anyhow::Result<ProfileIdentityV1> {
+    let key = crate::crypto::decode_did_key(profile_did)
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    ProfileIdentityV1::from_public_key_bytes(key.to_bytes())
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))
+}
+
+fn update_length_prefixed_session_field(
+    hasher: &mut sha2::Sha256,
+    value: &[u8],
+) -> anyhow::Result<()> {
+    let encoded_len = u32::try_from(value.len())
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))?;
+    hasher.update(encoded_len.to_be_bytes());
+    hasher.update(value);
+    Ok(())
+}
+
+fn derive_runtime_custody_session_binding(
+    principal_id: &str,
+    profile_did: &str,
+    proof_binding_id: &str,
+    session_id: &str,
+    grant_id: &str,
+    mint_id: Digest32,
+) -> anyhow::Result<RuntimeSessionBindingV1> {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"elastos.protected-content.runtime-session-binding.v1");
+    update_length_prefixed_session_field(&mut hasher, principal_id.as_bytes())?;
+    update_length_prefixed_session_field(&mut hasher, profile_did.as_bytes())?;
+    update_length_prefixed_session_field(&mut hasher, proof_binding_id.as_bytes())?;
+    update_length_prefixed_session_field(&mut hasher, session_id.as_bytes())?;
+    update_length_prefixed_session_field(&mut hasher, grant_id.as_bytes())?;
+    update_length_prefixed_session_field(&mut hasher, mint_id.as_bytes())?;
+    RuntimeSessionBindingV1::new(Digest32::new(hasher.finalize().into()))
+        .map_err(|_| anyhow::anyhow!(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE))
 }
 
 fn audit_nonce_bytes(audit_request_id: RuntimeReleaseAuditIdV1) -> [u8; 16] {

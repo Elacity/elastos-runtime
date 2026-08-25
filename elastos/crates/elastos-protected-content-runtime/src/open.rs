@@ -9,10 +9,10 @@
 use std::fmt;
 
 use elastos_protected_content_contracts::{
-    CanonicalContract, ContractError, CustodyEnvelopeV1, Digest32, EncryptedContentIdentityV1,
-    KeyEnvelopeIdentityV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
-    RecipientPublicKeyBytesV1, RightsActionV1, RightsPolicyIdentityV1, RightsRequestV1,
-    RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, SignedNodeContributionV1,
+    ContractError, CustodyEnvelopeV1, Digest32, EncryptedContentIdentityV1, KeyEnvelopeIdentityV1,
+    ProfileIdentityV1, ProtectedContentBindingV1, RecipientKeyIdentityV1,
+    RecipientPublicKeyBytesV1, RightsActionV1, RightsPolicyIdentityV1, RuntimeOperationIssuerKeyV1,
+    RuntimeReleaseAuditIdV1, RuntimeSessionBindingV1, SignedNodeContributionV1,
     SignedRuntimeReleaseOperationV1, SignedTerminalReceiptV1, TerminalReceiptIssuerKey,
     WalletAddress,
 };
@@ -23,13 +23,11 @@ use elastos_protected_content_provider_contracts::{
 };
 use elastos_wallet_contract::{
     PublicNetwork, ValidatedChainOutcomeBindingV1, ValidatedChainOutcomeV1,
-    WalletProviderOperationV2, WalletProviderRequestV2, WalletProviderResponseV2,
     VALIDATED_CHAIN_OUTCOME_SCHEMA,
 };
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::coordinator::validate_wallet_rights_signature;
 use crate::{PersistedRuntimeMint, RuntimeProviderCallError, RuntimeReleaseCoordinatorError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -373,7 +371,11 @@ impl RuntimeVerifiedPurchaseEffect {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeBuyReceipt {
     mint_id: Digest32,
-    binding: ProtectedContentBindingV1,
+    encrypted_content: EncryptedContentIdentityV1,
+    key_envelope: KeyEnvelopeIdentityV1,
+    rights_policy: RightsPolicyIdentityV1,
+    profile: ProfileIdentityV1,
+    wallet: WalletAddress,
     action: RightsActionV1,
     chain_transaction: Digest32,
 }
@@ -383,7 +385,11 @@ impl fmt::Debug for RuntimeBuyReceipt {
         formatter
             .debug_struct("RuntimeBuyReceipt")
             .field("mint_id", &self.mint_id)
-            .field("binding", &self.binding)
+            .field("encrypted_content", &self.encrypted_content)
+            .field("key_envelope", &self.key_envelope)
+            .field("rights_policy", &self.rights_policy)
+            .field("profile", &self.profile)
+            .field("wallet", &self.wallet)
             .field("action", &self.action)
             .field("chain_transaction", &self.chain_transaction)
             .finish()
@@ -395,20 +401,24 @@ impl RuntimeBuyReceipt {
         self.mint_id
     }
 
-    pub fn binding(&self) -> &ProtectedContentBindingV1 {
-        &self.binding
-    }
-
     pub fn encrypted_content(&self) -> &EncryptedContentIdentityV1 {
-        self.binding.encrypted_content()
+        &self.encrypted_content
     }
 
     pub fn key_envelope(&self) -> &KeyEnvelopeIdentityV1 {
-        self.binding.key_envelope()
+        &self.key_envelope
+    }
+
+    pub fn rights_policy(&self) -> &RightsPolicyIdentityV1 {
+        &self.rights_policy
+    }
+
+    pub const fn profile(&self) -> ProfileIdentityV1 {
+        self.profile
     }
 
     pub const fn wallet(&self) -> WalletAddress {
-        self.binding.wallet()
+        self.wallet
     }
 
     pub const fn action(&self) -> RightsActionV1 {
@@ -417,6 +427,20 @@ impl RuntimeBuyReceipt {
 
     pub const fn chain_transaction(&self) -> Digest32 {
         self.chain_transaction
+    }
+
+    pub fn binding_for_session(
+        &self,
+        runtime_session_binding: RuntimeSessionBindingV1,
+    ) -> Result<ProtectedContentBindingV1, ContractError> {
+        ProtectedContentBindingV1::new(
+            self.encrypted_content.clone(),
+            self.key_envelope.clone(),
+            self.rights_policy.clone(),
+            self.profile,
+            self.wallet,
+            runtime_session_binding,
+        )
     }
 }
 
@@ -575,32 +599,17 @@ pub fn reject_bearer_playback(bytes: &[u8]) -> Result<(), RuntimeOpenError> {
 
 pub fn bind_buy(
     custody_provisioned_mint: &PersistedRuntimeMint,
-    wallet_request_bytes: &[u8],
-    wallet_response_bytes: &[u8],
+    principal_id: &str,
+    profile: ProfileIdentityV1,
     purchase_effect: &RuntimeVerifiedPurchaseEffect,
-    now_unix_seconds: u64,
 ) -> Result<RuntimeBuyReceipt, RuntimeOpenError> {
-    reject_bearer_playback(wallet_request_bytes)?;
-    reject_bearer_playback(wallet_response_bytes)?;
-    if looks_like_home_launch_token(wallet_request_bytes) {
-        return Err(RuntimeOpenError::WalletAuthority);
-    }
     if custody_provisioned_mint.custody_terminal()
         != Some(crate::RuntimeCustodyTerminalKind::CustodyProvisioned)
         || custody_provisioned_mint.content_availability().is_none()
     {
         return Err(RuntimeOpenError::MintSelection);
     }
-    let wallet_request = WalletProviderRequestV2::decode_at(wallet_request_bytes, now_unix_seconds)
-        .map_err(|_| RuntimeOpenError::WalletAuthority)?;
-    let wallet_response =
-        WalletProviderResponseV2::decode_for_request(wallet_response_bytes, &wallet_request)
-            .map_err(|_| RuntimeOpenError::WalletAuthority)?;
-    let (account_id, expected) = expected_rights_request_from_wallet(&wallet_request)?;
-    if wallet_request.authority.principal_id != purchase_effect.authority().principal_id() {
-        return Err(RuntimeOpenError::ChainEvidence);
-    }
-    if account_id != purchase_effect.authority().account_id() {
+    if purchase_effect.authority().principal_id() != principal_id {
         return Err(RuntimeOpenError::ChainEvidence);
     }
     if purchase_effect.intent().mint_id() != custody_provisioned_mint.draft().mint_id()
@@ -609,21 +618,17 @@ pub fn bind_buy(
         || purchase_effect.intent().key_envelope()
             != custody_provisioned_mint.draft().key_envelope()
         || purchase_effect.intent().rights_policy() != custody_provisioned_mint.draft().policy()
-        || purchase_effect.intent().encrypted_content() != expected.binding().encrypted_content()
-        || purchase_effect.intent().key_envelope() != expected.binding().key_envelope()
-        || purchase_effect.intent().rights_policy() != expected.binding().rights_policy()
-        || purchase_effect.intent().action() != expected.action()
     {
         return Err(RuntimeOpenError::MintSelection);
     }
-    let signed = validate_wallet_rights_signature(&wallet_request, &wallet_response, &expected)?;
-    if signed.request().binding().wallet() != purchase_effect.wallet_address() {
-        return Err(RuntimeOpenError::ChainEvidence);
-    }
     Ok(RuntimeBuyReceipt {
         mint_id: custody_provisioned_mint.draft().mint_id(),
-        binding: signed.request().binding().clone(),
-        action: signed.request().action(),
+        encrypted_content: custody_provisioned_mint.draft().encrypted_content().clone(),
+        key_envelope: custody_provisioned_mint.draft().key_envelope().clone(),
+        rights_policy: custody_provisioned_mint.draft().policy().clone(),
+        profile,
+        wallet: purchase_effect.wallet_address(),
+        action: purchase_effect.intent().action(),
         chain_transaction: purchase_effect.transaction_hash(),
     })
 }
@@ -631,13 +636,17 @@ pub fn bind_buy(
 pub async fn prepare_recipient(
     decrypt: &dyn RuntimeDecryptProvider,
     buy: &RuntimeBuyReceipt,
+    runtime_session_binding: RuntimeSessionBindingV1,
     audit_request_id: RuntimeReleaseAuditIdV1,
     runtime_operation_issuer: RuntimeOperationIssuerKeyV1,
     now_unix_seconds: u64,
     expires_at: u64,
 ) -> Result<RuntimePreparedRecipient, RuntimeOpenError> {
+    let binding = buy
+        .binding_for_session(runtime_session_binding)
+        .map_err(|_| RuntimeOpenError::MintSelection)?;
     let request = DecryptProviderRequestV1::new_prepare_recipient(
-        buy.binding(),
+        &binding,
         audit_request_id,
         buy.action(),
         runtime_operation_issuer,
@@ -671,7 +680,7 @@ pub async fn prepare_recipient(
     Ok(RuntimePreparedRecipient {
         audit_request_id: audit_request_id.digest(),
         prepared_recipient_handle: *response.prepared_recipient_handle()?,
-        binding: buy.binding().clone(),
+        binding,
         action: buy.action(),
         runtime_operation_issuer,
         expires_at,
@@ -690,7 +699,11 @@ pub async fn open_viewer_session(
         .rights_request()
         .request()
         .binding();
-    if input.prepared_recipient.binding() != input.buy.binding()
+    let expected_binding = input
+        .buy
+        .binding_for_session(binding.runtime_session_binding())
+        .map_err(|_| RuntimeOpenError::MintSelection)?;
+    if input.prepared_recipient.binding() != &expected_binding
         || input.prepared_recipient.action() != input.buy.action()
         || input.prepared_recipient.audit_request_id()
             != input
@@ -721,7 +734,7 @@ pub async fn open_viewer_session(
             .statement()
             .expires_at()
             > input.prepared_recipient.expires_at()
-        || input.buy.binding() != binding
+        || &expected_binding != binding
         || input.buy.action()
             != input
                 .signed_runtime_release_operation
@@ -931,41 +944,6 @@ fn transaction_digest_from_hash(transaction_hash: &str) -> Result<Digest32, Runt
     Ok(digest)
 }
 
-fn expected_rights_request_from_wallet(
-    wallet_request: &WalletProviderRequestV2,
-) -> Result<(String, RightsRequestV1), RuntimeOpenError> {
-    let (account_id, canonical_rights_request_hex) = match &wallet_request.operation {
-        WalletProviderOperationV2::RequestProtectedContentRightsSignature {
-            account_id,
-            canonical_rights_request_hex,
-            ..
-        } => (account_id.clone(), canonical_rights_request_hex),
-        _ => return Err(RuntimeOpenError::WalletAuthority),
-    };
-    let rights_request_bytes =
-        hex::decode(canonical_rights_request_hex).map_err(|_| RuntimeOpenError::WalletAuthority)?;
-    let request = RightsRequestV1::from_canonical_bytes(&rights_request_bytes)
-        .map_err(|_| RuntimeOpenError::WalletAuthority)?;
-    Ok((account_id, request))
-}
-
-fn looks_like_home_launch_token(bytes: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return false;
-    };
-    match value {
-        Value::Object(map) => {
-            map.contains_key("launch_token")
-                || map.contains_key("home_launch_token")
-                || map
-                    .get("token_type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value.eq_ignore_ascii_case("home_launch"))
-        }
-        _ => false,
-    }
-}
-
 fn json_contains_bearer_playback(value: &Value) -> bool {
     match value {
         Value::Object(map) => {
@@ -1034,22 +1012,16 @@ fn parse_wallet_address(value: &str) -> Result<WalletAddress, RuntimeOpenError> 
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
-    use elastos_auth::ethereum_signed_message_hash;
     use elastos_protected_content_contracts::{
-        CanonicalContract, ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1,
-        CustodyEpochIdentityV1, CustodyNodeProvisioningRecordIdentityV1,
-        CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1, CustodyPoolOperatorIdV1,
-        KeyEnvelopeIdentityV1, NodeSetV1, ProfileIdentityV1, ProtectedContentBindingV1,
-        RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
-        RightsPolicyIdentityV1, RightsRequestV1, RuntimeCustodyProvisioningIdV1,
-        RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1, RuntimeSessionBindingV1, ThresholdV1,
-        WalletAddress, WalletSignedRightsRequestV1, CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
+        ContentAccessIdV1, CustodyCommitteeAuthorizationIdentityV1, CustodyEpochIdentityV1,
+        CustodyNodeProvisioningRecordIdentityV1, CustodyPoolFailureDomainIdV1,
+        CustodyPoolIdentityV1, CustodyPoolOperatorIdV1, KeyEnvelopeIdentityV1, NodeSetV1,
+        ProfileIdentityV1, RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, RightsActionV1,
+        RightsPolicyIdentityV1, RuntimeCustodyProvisioningIdV1, RuntimeOperationIssuerKeyV1,
+        RuntimeReleaseAuditIdV1, RuntimeSessionBindingV1, ThresholdV1, WalletAddress,
+        CUSTODY_X_WING_AES256GCM_SUITE_ID_V1,
     };
-    use elastos_wallet_contract::{
-        ProtectedContentRightsSignatureResultV1, ValidatedChainOutcomeBindingV1,
-        VerifiedWalletInvocationContext, WalletProviderOperationV2, WalletProviderRequestV2,
-        WalletProviderResponseV2, WalletResultV2,
-    };
+    use elastos_wallet_contract::ValidatedChainOutcomeBindingV1;
     use k256::ecdsa::SigningKey as WalletSigningKey;
     use serde_json::json;
     use sha3::{Digest as _, Keccak256};
@@ -1092,6 +1064,19 @@ mod tests {
         let encoded = wallet_key(seed).verifying_key().to_encoded_point(false);
         let digest = Keccak256::digest(&encoded.as_bytes()[1..]);
         WalletAddress::new(digest[12..].try_into().unwrap())
+    }
+
+    fn profile_identity(seed: u8) -> ProfileIdentityV1 {
+        ProfileIdentityV1::from_public_key_bytes(
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn session_binding(seed: u8) -> RuntimeSessionBindingV1 {
+        RuntimeSessionBindingV1::new(digest(seed)).unwrap()
     }
 
     fn recipient_identity(seed: u8) -> RecipientKeyIdentityV1 {
@@ -1233,80 +1218,6 @@ mod tests {
             .unwrap()
     }
 
-    fn wallet_for_policy(
-        mint: &PersistedRuntimeMint,
-        policy: RightsPolicyIdentityV1,
-    ) -> (Vec<u8>, Vec<u8>) {
-        let binding = ProtectedContentBindingV1::new(
-            mint.draft().encrypted_content().clone(),
-            mint.draft().key_envelope().clone(),
-            policy,
-            ProfileIdentityV1::from_public_key_bytes(
-                SigningKey::from_bytes(&[0x26; 32])
-                    .verifying_key()
-                    .to_bytes(),
-            )
-            .unwrap(),
-            wallet(7),
-            RuntimeSessionBindingV1::new(digest(0x66)).unwrap(),
-        )
-        .unwrap();
-        let request = RightsRequestV1::new(
-            binding,
-            RightsActionV1::View,
-            recipient_identity(0x30),
-            NOW,
-            NOW + 180,
-            ReplayNonce16::new([0x55; 16]),
-        )
-        .unwrap();
-        let (signature, recovery_id) = wallet_key(7)
-            .sign_prehash_recoverable(&ethereum_signed_message_hash(
-                &request.canonical_bytes().unwrap(),
-            ))
-            .unwrap();
-        let mut signature_bytes = signature.to_bytes().to_vec();
-        signature_bytes.push(recovery_id.to_byte());
-        let signed = WalletSignedRightsRequestV1::new(request.clone(), signature_bytes).unwrap();
-        let context = VerifiedWalletInvocationContext::new(
-            "profile:alpha",
-            "runtime-session:alpha",
-            Some("proof:alpha".to_string()),
-            "grant:alpha",
-            "runtime",
-            "launch:alpha",
-        )
-        .unwrap();
-        let wallet_request = WalletProviderRequestV2::new(
-            &context,
-            "wallet-request:11111111111111111111111111111111",
-            NOW,
-            NOW + 120,
-            WalletProviderOperationV2::RequestProtectedContentRightsSignature {
-                account_id: WALLET_ACCOUNT.to_string(),
-                canonical_rights_request_hex: hex::encode(request.canonical_bytes().unwrap()),
-                reason: "Open protected content".to_string(),
-            },
-        )
-        .unwrap();
-        let result = ProtectedContentRightsSignatureResultV1::new(
-            WALLET_ACCOUNT,
-            wallet_address_hex(request.binding().wallet()),
-            hex::encode(signed.canonical_bytes().unwrap()),
-        )
-        .unwrap();
-        let wallet_response = WalletProviderResponseV2::for_request(
-            &wallet_request,
-            WalletResultV2::Ok {
-                data: serde_json::to_value(result).unwrap(),
-            },
-        );
-        (
-            serde_json::to_vec(&wallet_request).unwrap(),
-            serde_json::to_vec(&wallet_response).unwrap(),
-        )
-    }
-
     fn purchase_intent(mint: &PersistedRuntimeMint) -> RuntimeProtectedContentPurchaseIntent {
         RuntimeProtectedContentPurchaseIntent::new(
             mint.draft().mint_id(),
@@ -1332,17 +1243,14 @@ mod tests {
     }
 
     fn buy_receipt_for_open_tests(mint: &PersistedRuntimeMint) -> RuntimeBuyReceipt {
-        let (request_bytes, response_bytes) =
-            wallet_for_policy(mint, mint.draft().policy().clone());
-        let request = WalletProviderRequestV2::decode_at(&request_bytes, NOW).unwrap();
-        let response =
-            WalletProviderResponseV2::decode_for_request(&response_bytes, &request).unwrap();
-        let (_, expected) = expected_rights_request_from_wallet(&request).unwrap();
-        let signed = validate_wallet_rights_signature(&request, &response, &expected).unwrap();
         RuntimeBuyReceipt {
             mint_id: mint.draft().mint_id(),
-            binding: signed.request().binding().clone(),
-            action: signed.request().action(),
+            encrypted_content: mint.draft().encrypted_content().clone(),
+            key_envelope: mint.draft().key_envelope().clone(),
+            rights_policy: mint.draft().policy().clone(),
+            profile: profile_identity(0x26),
+            wallet: wallet(7),
+            action: RightsActionV1::View,
             chain_transaction: digest(0xaa),
         }
     }
@@ -1563,22 +1471,16 @@ mod tests {
     }
 
     #[test]
-    fn home_launch_token_is_not_wallet_authority() {
-        let token = br#"{"launch_token":"home-edge-credential","op":"open"}"#;
-        assert!(looks_like_home_launch_token(token));
-        assert!(!looks_like_home_launch_token(
-            br#"{"schema":"elastos.wallet.provider.request/v2"}"#
-        ));
-    }
-
-    #[test]
     fn bind_buy_rejects_custody_provisioned_mint_pending_availability_receipt() {
         let (_temp, provisioned) = persist_mint(true);
-        let (request, response) =
-            wallet_for_policy(&provisioned, provisioned.draft().policy().clone());
         let effect = purchase_effect(&provisioned, WALLET_ACCOUNT, 0xaa);
         assert_eq!(
-            bind_buy(&provisioned, &request, &response, &effect, NOW),
+            bind_buy(
+                &provisioned,
+                "profile:alpha",
+                profile_identity(0x26),
+                &effect
+            ),
             Err(RuntimeOpenError::MintSelection)
         );
     }
@@ -1587,105 +1489,62 @@ mod tests {
     fn bind_buy_accepts_exact_verified_content_availability() {
         let (temp, provisioned) = persist_mint(true);
         let available = persist_content_availability(&temp, &provisioned);
-        let (request, response) = wallet_for_policy(&available, available.draft().policy().clone());
         let effect = purchase_effect(&available, WALLET_ACCOUNT, 0xaa);
-        let receipt = bind_buy(&available, &request, &response, &effect, NOW).unwrap();
+        let profile = profile_identity(0x26);
+        let receipt = bind_buy(&available, "profile:alpha", profile, &effect).unwrap();
         assert_eq!(receipt.mint_id(), available.draft().mint_id());
+        assert_eq!(receipt.profile(), profile);
+        assert_eq!(receipt.wallet(), wallet(7));
         assert_eq!(
-            receipt.binding().encrypted_content(),
+            receipt.encrypted_content(),
             available.draft().encrypted_content()
+        );
+    }
+
+    #[test]
+    fn bind_buy_is_session_independent_and_derives_fresh_binding_per_session() {
+        let (temp, provisioned) = persist_mint(true);
+        let available = persist_content_availability(&temp, &provisioned);
+        let profile = profile_identity(0x26);
+        let effect = purchase_effect(&available, WALLET_ACCOUNT, 0xaa);
+        let receipt = bind_buy(&available, "profile:alpha", profile, &effect).unwrap();
+        let first = receipt.binding_for_session(session_binding(0x66)).unwrap();
+        let second = receipt.binding_for_session(session_binding(0x67)).unwrap();
+        assert_eq!(first.profile(), profile);
+        assert_eq!(first.wallet(), wallet(7));
+        assert_ne!(first, second);
+        assert_ne!(
+            first.runtime_session_binding(),
+            second.runtime_session_binding()
         );
     }
 
     #[test]
     fn bind_buy_fails_closed_without_content_availability_and_on_wrong_inputs() {
         let (_bound_temp, bound) = persist_mint(false);
-        let (request, response) = wallet_for_policy(&bound, bound.draft().policy().clone());
         let outcome = purchase_effect(&bound, WALLET_ACCOUNT, 0xaa);
         assert_eq!(
-            bind_buy(&bound, &request, &response, &outcome, NOW),
+            bind_buy(&bound, "profile:alpha", profile_identity(0x26), &outcome),
             Err(RuntimeOpenError::MintSelection)
         );
 
         let (mint_temp, custody_provisioned) = persist_mint(true);
         let available_mint = persist_content_availability(&mint_temp, &custody_provisioned);
-        let (request, response) = wallet_for_policy(
-            &available_mint,
-            RightsPolicyIdentityV1::new(digest(0x77), 384).unwrap(),
-        );
-        assert_eq!(
-            bind_buy(&available_mint, &request, &response, &outcome, NOW),
-            Err(RuntimeOpenError::MintSelection)
-        );
-
-        let context = VerifiedWalletInvocationContext::new(
-            "profile:alpha",
-            "runtime-session:alpha",
-            Some("proof:alpha".to_string()),
-            "grant:alpha",
-            "runtime",
-            "launch:alpha",
-        )
-        .unwrap();
-        let generic = WalletProviderRequestV2::new(
-            &context,
-            "wallet-request:11111111111111111111111111111111",
-            NOW,
-            NOW + 120,
-            WalletProviderOperationV2::ListAccounts {
-                include_revoked: false,
-            },
-        )
-        .unwrap();
-        let generic_response = WalletProviderResponseV2::for_request(
-            &generic,
-            WalletResultV2::Ok {
-                data: json!({"accounts": []}),
-            },
-        );
         assert_eq!(
             bind_buy(
                 &available_mint,
-                &serde_json::to_vec(&generic).unwrap(),
-                &serde_json::to_vec(&generic_response).unwrap(),
+                "profile:alpha",
+                profile_identity(0x26),
                 &outcome,
-                NOW
             ),
-            Err(RuntimeOpenError::WalletAuthority)
+            Err(RuntimeOpenError::MintSelection)
         );
     }
 
     #[test]
-    fn bind_buy_fails_closed_on_bearer_url_home_token_and_invalid_chain() {
+    fn bind_buy_fails_closed_on_invalid_chain_and_authority() {
         let (temp, custody_provisioned) = persist_mint(true);
         let available_mint = persist_content_availability(&temp, &custody_provisioned);
-        let (request, response) =
-            wallet_for_policy(&available_mint, available_mint.draft().policy().clone());
-        let outcome = purchase_effect(&available_mint, WALLET_ACCOUNT, 0xaa);
-
-        let mut injected: serde_json::Value = serde_json::from_slice(&request).unwrap();
-        injected["play_url"] = json!("https://example.test/play");
-        assert_eq!(
-            bind_buy(
-                &available_mint,
-                &serde_json::to_vec(&injected).unwrap(),
-                &response,
-                &outcome,
-                NOW
-            ),
-            Err(RuntimeOpenError::BearerPlaybackUrl)
-        );
-
-        assert_eq!(
-            bind_buy(
-                &available_mint,
-                br#"{"launch_token":"home-edge-credential","op":"open"}"#,
-                br#"{"ok":true}"#,
-                &outcome,
-                NOW
-            ),
-            Err(RuntimeOpenError::WalletAuthority)
-        );
 
         assert_eq!(
             RuntimeVerifiedPurchaseEffect::new(
@@ -1712,35 +1571,25 @@ mod tests {
 
         let mismatched = purchase_effect(&available_mint, "wallet-account-other", 0xaa);
         assert_eq!(
-            bind_buy(&available_mint, &request, &response, &mismatched, NOW),
+            bind_buy(
+                &available_mint,
+                "profile:alpha",
+                profile_identity(0x26),
+                &mismatched,
+            ),
             Err(RuntimeOpenError::ChainEvidence)
         );
 
         let wrong_principal =
             purchase_effect_for_principal(&available_mint, "profile:beta", WALLET_ACCOUNT, 0xaa);
         assert_eq!(
-            bind_buy(&available_mint, &request, &response, &wrong_principal, NOW),
-            Err(RuntimeOpenError::ChainEvidence)
-        );
-
-        assert_eq!(
-            RuntimeVerifiedPurchaseEffect::new(
-                purchase_intent(&available_mint),
-                RuntimePurchaseEffectAuthority::new(
-                    "profile:alpha",
-                    WALLET_ACCOUNT,
-                    wallet_address_hex(wallet(7)),
-                    "wallet-request:00112233445566778899aabbccddeeff",
-                )
-                .unwrap(),
-                ValidatedChainOutcomeBindingV1::ManagedSigned {
-                    signed_transaction_sha256: format!("sha256:{}", hex::encode([0xab; 32])),
-                },
-                format!("0x{}", hex::encode([0xaa; 32])),
-                json!({"play_url":"https://example.test/play"}),
-                NOW,
+            bind_buy(
+                &available_mint,
+                "profile:alpha",
+                profile_identity(0x26),
+                &wrong_principal,
             ),
-            Err(RuntimeOpenError::BearerPlaybackUrl)
+            Err(RuntimeOpenError::ChainEvidence)
         );
     }
 
@@ -1750,6 +1599,7 @@ mod tests {
         let buy = buy_receipt_for_open_tests(&custody_provisioned_mint);
         let audit_id = runtime_release_audit_id(0x71);
         let issuer = runtime_operation_issuer(0x42);
+        let runtime_session_binding = session_binding(0x66);
         let response = DecryptProviderResponseV1::new_prepared_recipient(
             audit_id,
             opaque_handle(0x21),
@@ -1759,12 +1609,28 @@ mod tests {
         .unwrap();
         let provider = FakeDecryptProvider::with_prepare_response(issuer, NOW, response);
 
-        let first = prepare_recipient(&provider, &buy, audit_id, issuer, NOW, NOW + 50)
-            .await
-            .unwrap();
-        let second = prepare_recipient(&provider, &buy, audit_id, issuer, NOW, NOW + 50)
-            .await
-            .unwrap();
+        let first = prepare_recipient(
+            &provider,
+            &buy,
+            runtime_session_binding,
+            audit_id,
+            issuer,
+            NOW,
+            NOW + 50,
+        )
+        .await
+        .unwrap();
+        let second = prepare_recipient(
+            &provider,
+            &buy,
+            runtime_session_binding,
+            audit_id,
+            issuer,
+            NOW,
+            NOW + 50,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(first.audit_request_id(), audit_id.digest());
@@ -1795,7 +1661,16 @@ mod tests {
         let provider = FakeDecryptProvider::with_prepare_response(issuer, NOW, wrong_response);
 
         assert_eq!(
-            prepare_recipient(&provider, &buy, audit_id, issuer, NOW, NOW + 50).await,
+            prepare_recipient(
+                &provider,
+                &buy,
+                session_binding(0x66),
+                audit_id,
+                issuer,
+                NOW,
+                NOW + 50,
+            )
+            .await,
             Err(RuntimeOpenError::DecryptResult)
         );
     }
@@ -1896,9 +1771,17 @@ mod tests {
         .unwrap();
         let prepare_provider =
             FakeDecryptProvider::with_prepare_response(issuer, NOW, prepare_response);
-        let prepared = prepare_recipient(&prepare_provider, &buy, audit_id, issuer, NOW, NOW + 50)
-            .await
-            .unwrap();
+        let prepared = prepare_recipient(
+            &prepare_provider,
+            &buy,
+            session_binding(0x66),
+            audit_id,
+            issuer,
+            NOW,
+            NOW + 50,
+        )
+        .await
+        .unwrap();
 
         let cancelled = FakeDecryptProvider::with_cancel_response(
             DecryptProviderResponseV1::new_cancelled_prepared_recipient(
@@ -1940,9 +1823,17 @@ mod tests {
         .unwrap();
         let prepare_provider =
             FakeDecryptProvider::with_prepare_response(issuer, NOW, prepare_response);
-        let prepared = prepare_recipient(&prepare_provider, &buy, audit_id, issuer, NOW, NOW + 50)
-            .await
-            .unwrap();
+        let prepared = prepare_recipient(
+            &prepare_provider,
+            &buy,
+            session_binding(0x66),
+            audit_id,
+            issuer,
+            NOW,
+            NOW + 50,
+        )
+        .await
+        .unwrap();
 
         let wrong = FakeDecryptProvider::with_cancel_response(
             DecryptProviderResponseV1::new_cancelled_prepared_recipient(

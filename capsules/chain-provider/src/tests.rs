@@ -417,6 +417,18 @@ fn canonical_block_json(number: &str, hash: &str, transactions: Vec<&str>) -> Va
     })
 }
 
+fn finalized_block_json(number: &str, hash: &str) -> Value {
+    finalized_block_json_at(number, hash, RIGHTS_EVIDENCE_NOW - 5)
+}
+
+fn finalized_block_json_at(number: &str, hash: &str, timestamp: u64) -> Value {
+    json!({
+        "number": number,
+        "hash": hash,
+        "timestamp": format!("0x{:x}", timestamp),
+    })
+}
+
 #[test]
 fn encode_has_access_by_content_id_call_uses_address_and_bytes16_abi() {
     let access_id = [0x41; 16];
@@ -1684,7 +1696,7 @@ fn protected_content_rights_evidence_returns_canonical_evidence_at_finalized_blo
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x27", "hash": block_hash }),
+            finalized_block_json("0x27", block_hash),
         ),
         (
             "eth_call",
@@ -1758,7 +1770,10 @@ fn protected_content_rights_evidence_captures_denial_without_caller_supplied_res
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2a", "hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
+            finalized_block_json(
+                "0x2a",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
         ),
         (
             "eth_call",
@@ -1803,7 +1818,10 @@ fn protected_content_rights_evidence_rejects_fewer_than_two_matching_sources() {
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2a", "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+            finalized_block_json(
+                "0x2a",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
         ),
         (
             "eth_call",
@@ -1874,7 +1892,10 @@ fn protected_content_rights_evidence_rejects_chain_and_finalized_block_mismatche
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2a", "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+            finalized_block_json(
+                "0x2a",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
         ),
         (
             "eth_call",
@@ -1930,7 +1951,10 @@ fn protected_content_rights_evidence_rejects_chain_and_finalized_block_mismatche
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2a", "hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
+            finalized_block_json(
+                "0x2a",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
         ),
         (
             "eth_call",
@@ -1949,7 +1973,10 @@ fn protected_content_rights_evidence_rejects_chain_and_finalized_block_mismatche
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2a", "hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }),
+            finalized_block_json(
+                "0x2a",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
         ),
         (
             "eth_call",
@@ -1986,7 +2013,7 @@ fn protected_content_rights_evidence_rejects_chain_and_finalized_block_mismatche
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2a", "hash": "0x1234" }),
+            finalized_block_json("0x2a", "0x1234"),
         ),
     ];
     let mut provider = provider_with_rights_rpc_and_policies(
@@ -2024,7 +2051,7 @@ fn protected_content_rights_evidence_rejects_when_eip1898_call_does_not_succeed_
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            RpcReply::Result(json!({ "number": "0x2a", "hash": finalized_hash })),
+            RpcReply::Result(finalized_block_json("0x2a", finalized_hash)),
         ),
         (
             "eth_call",
@@ -2043,7 +2070,7 @@ fn protected_content_rights_evidence_rejects_when_eip1898_call_does_not_succeed_
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2a", "hash": finalized_hash }),
+            finalized_block_json("0x2a", finalized_hash),
         ),
         (
             "eth_call",
@@ -2120,7 +2147,7 @@ fn resolve_protected_content_policy_returns_canonical_policy_and_evidence_accept
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x1e", "hash": block_hash }),
+            finalized_block_json("0x1e", block_hash),
         ),
         (
             "eth_call",
@@ -2462,7 +2489,7 @@ fn resolve_protected_content_mint_receipt_requires_two_finalized_agreeing_receip
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2b", "hash": finalized_hash }),
+            finalized_block_json("0x2b", finalized_hash),
         ),
     ];
     let mut provider = provider_with_creator_mint_rpc_and_market_sources(
@@ -2733,7 +2760,7 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
             (
                 "eth_getBlockByNumber",
                 json!(["finalized", false]),
-                json!({ "number": "0x2b", "hash": finalized_hash }),
+                finalized_block_json("0x2b", finalized_hash),
             ),
         ];
         let mut provider = provider_with_creator_mint_rpc_and_market_sources(
@@ -2784,7 +2811,7 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2b", "hash": finalized_hash }),
+            finalized_block_json("0x2b", finalized_hash),
         ),
     ];
     let conflicting_b = vec![
@@ -2818,7 +2845,7 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2b", "hash": finalized_hash }),
+            finalized_block_json("0x2b", finalized_hash),
         ),
     ];
     let mut conflicting_provider = provider_with_creator_mint_rpc_and_market_sources(
@@ -2887,7 +2914,7 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
             (
                 "eth_getBlockByNumber",
                 json!(["finalized", false]),
-                json!({ "number": "0x2b", "hash": finalized_hash }),
+                finalized_block_json("0x2b", finalized_hash),
             ),
         ];
         let mut provider = provider_with_creator_mint_rpc_and_market_sources(
@@ -2985,7 +3012,7 @@ fn resolve_protected_content_mint_receipt_rejects_invalid_or_ambiguous_receipts(
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2b", "hash": finalized_hash }),
+            finalized_block_json("0x2b", finalized_hash),
         ),
     ];
     let mut extra_topics_provider = provider_with_creator_mint_rpc_and_market_sources(
@@ -3020,7 +3047,7 @@ fn resolve_protected_content_verified_listing_returns_common_finalized_tuple() {
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2c", "hash": finalized_hash }),
+            finalized_block_json("0x2c", finalized_hash),
         ),
         (
             "eth_call",
@@ -3125,7 +3152,7 @@ fn resolve_protected_content_verified_listing_rejects_conflicting_sources() {
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2c", "hash": finalized_hash }),
+            finalized_block_json("0x2c", finalized_hash),
         ),
         (
             "eth_call",
@@ -3186,7 +3213,7 @@ fn resolve_protected_content_verified_listing_rejects_conflicting_sources() {
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2c", "hash": finalized_hash }),
+            finalized_block_json("0x2c", finalized_hash),
         ),
         (
             "eth_call",
@@ -3275,7 +3302,7 @@ fn resolve_protected_content_verified_listing_rejects_noncanonical_address_word(
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2c", "hash": finalized_hash }),
+            finalized_block_json("0x2c", finalized_hash),
         ),
         (
             "eth_call",
@@ -3327,7 +3354,7 @@ fn resolve_protected_content_purchase_returns_exact_network_target_value_and_dat
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2b", "hash": finalized_hash }),
+            finalized_block_json("0x2b", finalized_hash),
         ),
         (
             "eth_call",
@@ -3449,7 +3476,7 @@ fn resolve_protected_content_purchase_returns_exact_network_target_value_and_dat
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2b", "hash": finalized_hash }),
+            finalized_block_json("0x2b", finalized_hash),
         ),
         (
             "eth_call",
@@ -3538,7 +3565,7 @@ fn resolve_protected_content_purchase_returns_exact_network_target_value_and_dat
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2b", "hash": finalized_hash }),
+            finalized_block_json("0x2b", finalized_hash),
         ),
         (
             "eth_call",
@@ -3613,6 +3640,169 @@ fn resolve_protected_content_purchase_returns_exact_network_target_value_and_dat
         error_code(denied),
         "invalid_protected_content_purchase_request"
     );
+}
+
+#[test]
+fn resolve_protected_content_purchase_access_uses_view_policy_source_and_hides_topology() {
+    let access_id = content_access_id(0x51);
+    let wallet = "0x0000000000000000000000000000000000000007";
+    let expected_data =
+        encode_has_access_by_content_id_call("0x12345678", access_id.as_bytes(), wallet).unwrap();
+    let finalized_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let finalized_timestamp = format!("0x{:x}", RIGHTS_EVIDENCE_NOW - 5);
+    let sequence = vec![
+        ("eth_chainId", json!([]), json!("0x14")),
+        (
+            "eth_getBlockByNumber",
+            json!(["finalized", false]),
+            json!({
+                "number": "0x2c",
+                "hash": finalized_hash,
+                "timestamp": finalized_timestamp,
+            }),
+        ),
+        (
+            "eth_call",
+            json!([
+                {
+                    "to": "0x0000000000000000000000000000000000000001",
+                    "data": expected_data
+                },
+                {
+                    "blockHash": finalized_hash,
+                    "requireCanonical": true
+                }
+            ]),
+            evm_bool_word(true),
+        ),
+    ];
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "view",
+            vec![
+                spawn_rpc_sequence_asserting_server(sequence.clone()),
+                spawn_rpc_sequence_asserting_server(sequence),
+            ],
+        ),
+    );
+    let data = ok_data(
+        provider.handle(Request::ResolveProtectedContentPurchaseAccess {
+            request_id: "purchase-access:exact".to_string(),
+            network: "esc-local".to_string(),
+            wallet: wallet.to_string(),
+            content_access_id: format!("0x{}", encode_hex(access_id.as_bytes())),
+        }),
+    );
+    let rendered = serde_json::to_string(&data).unwrap();
+    assert_eq!(data["schema"], PROTECTED_CONTENT_PURCHASE_ACCESS_SCHEMA);
+    assert_eq!(data["request_id"], "purchase-access:exact");
+    assert_eq!(data["network"], "esc-local");
+    assert_eq!(data["chain_id"], 20);
+    assert_eq!(data["wallet"], wallet);
+    assert_eq!(
+        data["content_access_id"],
+        format!("0x{}", encode_hex(access_id.as_bytes()))
+    );
+    assert_eq!(data["has_access"], true);
+    assert_eq!(data["finalized_block_number"], 44);
+    assert_eq!(data["finalized_block_hash"], finalized_hash);
+    assert_eq!(data["finalized_block_timestamp"], RIGHTS_EVIDENCE_NOW - 5);
+    assert_eq!(data["observed_at"], RIGHTS_EVIDENCE_NOW);
+    assert!(!rendered.contains("http://127.0.0.1:9"));
+    assert!(!rendered.contains("\"contract\""));
+    assert!(!rendered.contains("\"selector\""));
+}
+
+#[test]
+fn resolve_protected_content_purchase_access_rejects_non_view_policy_source() {
+    let access_id = content_access_id(0x51);
+    let mut provider = provider_with_rights_rpc_and_policies(
+        "http://127.0.0.1:9".to_string(),
+        "0x12345678",
+        protected_content_policy_sources(
+            "download",
+            vec![
+                "https://rpc-a.example".to_string(),
+                "https://rpc-b.example".to_string(),
+            ],
+        ),
+    );
+    assert_eq!(
+        error_code(
+            provider.handle(Request::ResolveProtectedContentPurchaseAccess {
+                request_id: "purchase-access:missing-view".to_string(),
+                network: "esc-local".to_string(),
+                wallet: "0x0000000000000000000000000000000000000007".to_string(),
+                content_access_id: format!("0x{}", encode_hex(access_id.as_bytes())),
+            })
+        ),
+        "protected_content_purchase_access_not_configured"
+    );
+}
+
+#[test]
+fn resolve_protected_content_purchase_access_rejects_stale_or_future_finalized_observation() {
+    let access_id = content_access_id(0x51);
+    let wallet = "0x0000000000000000000000000000000000000007";
+    for finalized_timestamp in [
+        RIGHTS_EVIDENCE_NOW - super::PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FINALIZED_AGE_SECS - 1,
+        RIGHTS_EVIDENCE_NOW + super::PROTECTED_CONTENT_PURCHASE_ACCESS_MAX_FUTURE_SKEW_SECS + 1,
+    ] {
+        let expected_data =
+            encode_has_access_by_content_id_call("0x12345678", access_id.as_bytes(), wallet)
+                .unwrap();
+        let finalized_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sequence = vec![
+            ("eth_chainId", json!([]), json!("0x14")),
+            (
+                "eth_getBlockByNumber",
+                json!(["finalized", false]),
+                json!({
+                    "number": "0x2c",
+                    "hash": finalized_hash,
+                    "timestamp": format!("0x{:x}", finalized_timestamp),
+                }),
+            ),
+            (
+                "eth_call",
+                json!([
+                    {
+                        "to": "0x0000000000000000000000000000000000000001",
+                        "data": expected_data
+                    },
+                    {
+                        "blockHash": finalized_hash,
+                        "requireCanonical": true
+                    }
+                ]),
+                evm_bool_word(true),
+            ),
+        ];
+        let mut provider = provider_with_rights_rpc_and_policies(
+            "http://127.0.0.1:9".to_string(),
+            "0x12345678",
+            protected_content_policy_sources(
+                "view",
+                vec![
+                    spawn_rpc_sequence_asserting_server(sequence.clone()),
+                    spawn_rpc_sequence_asserting_server(sequence),
+                ],
+            ),
+        );
+        assert_eq!(
+            error_code(
+                provider.handle(Request::ResolveProtectedContentPurchaseAccess {
+                    request_id: "purchase-access:stale".to_string(),
+                    network: "esc-local".to_string(),
+                    wallet: wallet.to_string(),
+                    content_access_id: format!("0x{}", encode_hex(access_id.as_bytes())),
+                })
+            ),
+            "stale_protected_content_purchase_access_observation"
+        );
+    }
 }
 
 #[test]
@@ -4022,7 +4212,7 @@ fn resolve_protected_content_mint_receipt_rejects_huge_token_uri_length_without_
         (
             "eth_getBlockByNumber",
             json!(["finalized", false]),
-            json!({ "number": "0x2b", "hash": finalized_hash }),
+            finalized_block_json("0x2b", finalized_hash),
         ),
     ];
     let mut provider = provider_with_creator_mint_rpc_and_market_sources(

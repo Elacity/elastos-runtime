@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::Json as AxumJson;
 use base64::Engine;
 use ed25519_dalek::{Signer as _, Verifier as _};
+use elastos_protected_content_contracts::CanonicalContract;
 use elastos_runtime::auth::{
     ethereum_signed_message_hash, verify_siwe_challenge, AuthChallengeInput, AuthChallengeV1,
     AuthSessionGrantV1, PasskeyWebAuthnBinding, ProofBinding,
