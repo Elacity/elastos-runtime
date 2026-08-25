@@ -5746,7 +5746,7 @@ mod recovery_rule_lockstep_tests {
             let allowed = recovery_rule_is_ready(root_encrypted, recovery_configured);
             let mut recovery = PrincipalRootRecoveryStatusV1::unprotected(
                 "principal:test".to_string(),
-                "Users/self".to_string(),
+                "Users/test".to_string(),
             );
             recovery.root_encrypted = root_encrypted;
             recovery.recovery_configured = recovery_configured;
