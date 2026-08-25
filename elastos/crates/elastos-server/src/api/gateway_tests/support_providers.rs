@@ -69,7 +69,7 @@ fn mock_published_protected_content(
 }
 
 fn mock_protected_content_provider_signing_key() -> ed25519_dalek::SigningKey {
-    ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32])
+    elastos_identity::derive_did(&[0x5a; 32]).0
 }
 
 fn mock_protected_content_provider_signer_did() -> String {
@@ -102,33 +102,17 @@ fn mock_protected_content_manifest_digest(files: &[crate::content::ContentObject
     format!("sha256:{:x}", hasher.finalize())
 }
 
-fn seed_mock_published_protected_content(
+fn store_mock_published_protected_content(
     object_identity: &str,
     publisher_did: &str,
-    media_identity: &elastos_protected_content_provider_contracts::CencFmp4MediaIdentityV1,
-    protected_init: &[u8],
-    protected_segments: &[Vec<u8>],
+    mut files: std::collections::BTreeMap<String, Vec<u8>>,
     checked_at: u64,
 ) {
-    let descriptor = media_identity.canonical_bytes().unwrap();
-    let mut files = std::collections::BTreeMap::new();
-    let mut manifest_files = Vec::with_capacity(protected_segments.len() + 2);
-
-    let identity_path = "protected-content/v1/identity.bin";
-    files.insert(identity_path.to_string(), descriptor.clone());
-    manifest_files.push(mock_protected_content_file(identity_path, &descriptor));
-
-    let init_path = "protected-content/v1/init.mp4";
-    files.insert(init_path.to_string(), protected_init.to_vec());
-    manifest_files.push(mock_protected_content_file(init_path, protected_init));
-
-    for (index, segment) in protected_segments.iter().enumerate() {
-        let path = format!("protected-content/v1/segments/{index:08}.m4s");
-        files.insert(path.clone(), segment.clone());
-        manifest_files.push(mock_protected_content_file(&path, segment));
-    }
+    let mut manifest_files = files
+        .iter()
+        .map(|(path, bytes)| mock_protected_content_file(path, bytes))
+        .collect::<Vec<_>>();
     manifest_files.sort_by(|left, right| left.path.cmp(&right.path));
-
     let manifest = crate::content::ContentObjectManifest {
         schema: "elastos.content.object.manifest/v1".to_string(),
         kind: "protected-content".to_string(),
@@ -150,7 +134,7 @@ fn seed_mock_published_protected_content(
         object_did: Some(object_identity.to_string()),
         publisher_did: publisher_did.to_string(),
         provider: "content".to_string(),
-        policy: "replicate:3".to_string(),
+        policy: "protected-content-replication/v1".to_string(),
         status: "network_available".to_string(),
         replicas: 3,
         peer_selection: json!({}),
@@ -177,6 +161,30 @@ fn seed_mock_published_protected_content(
                 signer_did,
             },
         });
+}
+
+fn seed_mock_published_protected_content(
+    object_identity: &str,
+    publisher_did: &str,
+    media_identity: &elastos_protected_content_provider_contracts::CencFmp4MediaIdentityV1,
+    protected_init: &[u8],
+    protected_segments: &[Vec<u8>],
+    checked_at: u64,
+) {
+    let descriptor = media_identity.canonical_bytes().unwrap();
+    let mut files = std::collections::BTreeMap::new();
+
+    let identity_path = "protected-content/v1/identity.bin";
+    files.insert(identity_path.to_string(), descriptor.clone());
+
+    let init_path = "protected-content/v1/init.mp4";
+    files.insert(init_path.to_string(), protected_init.to_vec());
+
+    for (index, segment) in protected_segments.iter().enumerate() {
+        let path = format!("protected-content/v1/segments/{index:08}.m4s");
+        files.insert(path.clone(), segment.clone());
+    }
+    store_mock_published_protected_content(object_identity, publisher_did, files, checked_at);
 }
 
 fn mock_protected_content_chain_mode() -> &'static std::sync::Mutex<MockProtectedContentChainMode> {
@@ -504,6 +512,72 @@ impl Provider for MockChainProvider {
                     "block_number": 42
                 }
             })),
+            Some("resolve_protected_content_policy") => {
+                let encrypted_content_hex = required_test_str(request, "encrypted_content")?;
+                let encrypted_content_bytes =
+                    hex::decode(encrypted_content_hex.trim_start_matches("0x"))
+                        .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                let encrypted_content = elastos_protected_content_contracts::EncryptedContentIdentityV1::from_canonical_bytes(
+                    &encrypted_content_bytes,
+                )
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                let content_access_id_hex = required_test_str(request, "content_access_id")?;
+                let content_access_id_bytes =
+                    hex::decode(content_access_id_hex.trim_start_matches("0x"))
+                        .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                let content_access_id =
+                    elastos_protected_content_contracts::ContentAccessIdV1::new(
+                        content_access_id_bytes.try_into().map_err(|_| {
+                            ProviderError::Provider(
+                                "mock protected-content policy requires 16-byte content_access_id"
+                                    .to_string(),
+                            )
+                        })?,
+                    )
+                    .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                let action = match required_test_str(request, "action")? {
+                    "view" => elastos_protected_content_contracts::RightsActionV1::View,
+                    other => {
+                        return Ok(json!({
+                            "status": "error",
+                            "code": "invalid_request",
+                            "message": format!(
+                                "mock protected-content policy only supports action=view, got {other}"
+                            )
+                        }));
+                    }
+                };
+                let policy = elastos_protected_content_contracts::RightsPolicyBodyV1::new(
+                    encrypted_content,
+                    content_access_id,
+                    action,
+                    elastos_protected_content_contracts::RightsSubjectSourceV1::WalletAddress,
+                    MOCK_PROTECTED_CONTENT_CHAIN_ID,
+                    elastos_protected_content_contracts::EvmContractAddressV1::new(
+                        hex::decode(
+                            MOCK_PROTECTED_CONTENT_AUTHORITY_GATEWAY.trim_start_matches("0x"),
+                        )
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                    )
+                    .map_err(|error| ProviderError::Provider(error.to_string()))?,
+                    elastos_protected_content_contracts::EvmFunctionSelectorV1::new([
+                        0x54, 0xd4, 0x28, 0x21,
+                    ])
+                    .unwrap(),
+                    elastos_protected_content_contracts::EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+                    elastos_protected_content_contracts::RightsObservationFinalityV1::finalized(),
+                )
+                .map_err(|error| ProviderError::Provider(error.to_string()))?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": {
+                        "schema": "elastos.chain.protected-content-policy/v1",
+                        "policy_body": format!("0x{}", hex::encode(policy.canonical_bytes().unwrap())),
+                    }
+                }))
+            }
             Some("resolve_protected_content_creator_mint") => Ok(json!({
                 "status": "ok",
                 "data": {
@@ -1116,6 +1190,40 @@ impl Provider for MockContentProvider {
                 if request.get("object_kind").and_then(|value| value.as_str()) == Some("sealed") {
                     validate_mock_sealed_publish_request(request)?;
                 }
+                if request.get("object_kind").and_then(|value| value.as_str())
+                    == Some("protected-content")
+                {
+                    let object_identity = required_test_str(request, "object_did")?;
+                    let publisher_did = required_test_str(request, "publisher_did")?;
+                    let entries =
+                        request
+                            .get("files")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                ProviderError::Provider(
+                                    "protected-content publish requires files".to_string(),
+                                )
+                            })?;
+                    let mut files = std::collections::BTreeMap::new();
+                    for entry in entries {
+                        let path = required_test_str(entry, "path")?;
+                        let data = required_test_str(entry, "data")?;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                        if files.insert(path.to_string(), bytes).is_some() {
+                            return Err(ProviderError::Provider(
+                                "duplicate protected-content file".to_string(),
+                            ));
+                        }
+                    }
+                    store_mock_published_protected_content(
+                        object_identity,
+                        publisher_did,
+                        files,
+                        crate::auth::now_ts(),
+                    );
+                }
                 Ok(json!({
                     "status": "ok",
                     "data": {
@@ -1245,286 +1353,6 @@ fn validate_mock_sealed_publish_request(request: &serde_json::Value) -> Result<(
         ));
     }
     Ok(())
-}
-
-struct MockDrmProvider;
-struct MockRightsProvider;
-struct MockKeyProvider;
-struct MockDecryptProvider;
-
-#[async_trait::async_trait]
-impl Provider for MockDrmProvider {
-    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
-        Err(ProviderError::Provider(
-            "mock drm provider only supports raw requests".into(),
-        ))
-    }
-
-    fn schemes(&self) -> Vec<&'static str> {
-        vec!["drm"]
-    }
-
-    fn name(&self) -> &'static str {
-        "mock-drm-provider"
-    }
-
-    async fn send_raw(
-        &self,
-        request: &serde_json::Value,
-    ) -> Result<serde_json::Value, ProviderError> {
-        match request.get("op").and_then(|value| value.as_str()) {
-            Some("status") => Ok(json!({
-                "status": "ok",
-                "data": {
-                    "provider": "drm",
-                    "configured": true,
-                    "supported_operations": ["status", "open"],
-                    "blocked_authority": ["raw_cek", "chain_rpc", "wallet_rpc"],
-                    "contract": {
-                        "schema": "elastos.protected-content.drm-provider/v1",
-                        "fixture": true
-                    }
-                }
-            })),
-            Some("open") => {
-                let request = request
-                    .get("request")
-                    .ok_or_else(|| ProviderError::Provider("drm request is required".into()))?;
-                let object = request
-                    .get("object")
-                    .ok_or_else(|| ProviderError::Provider("sealed object is required".into()))?;
-                Ok(json!({
-                    "status": "ok",
-                    "data": {
-                        "schema": "elastos.drm.open.receipt/v1",
-                        "provider": "drm-provider",
-                        "status": "accepted",
-                        "payload_cid": object
-                            .get("payload_cid")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or(TEST_CIDV1),
-                        "principal_id": required_test_str(request, "principal_id")?,
-                        "session_id": required_test_str(request, "session_id")?,
-                        "action": required_test_str(request, "action")?,
-                        "fixture": true
-                    }
-                }))
-            }
-            _ => Ok(json!({
-                "status": "error",
-                "code": "unsupported",
-                "message": "unsupported mock drm op"
-            })),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Provider for MockRightsProvider {
-    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
-        Err(ProviderError::Provider(
-            "mock rights provider only supports raw requests".into(),
-        ))
-    }
-
-    fn schemes(&self) -> Vec<&'static str> {
-        vec!["rights"]
-    }
-
-    fn name(&self) -> &'static str {
-        "mock-rights-provider"
-    }
-
-    async fn send_raw(
-        &self,
-        request: &serde_json::Value,
-    ) -> Result<serde_json::Value, ProviderError> {
-        match request.get("op").and_then(|value| value.as_str()) {
-            Some("status") => Ok(json!({
-                "status": "ok",
-                "data": {
-                    "provider": "rights",
-                    "configured": true,
-                    "supported_operations": ["status", "has_access_by_content_id"],
-                    "blocked_authority": ["chain_rpc", "wallet_rpc", "raw_cek"],
-                    "contract": {
-                        "schema": "elastos.protected-content.rights-provider/v1",
-                        "fixture": true
-                    }
-                }
-            })),
-            Some("has_access_by_content_id") => {
-                let request = request
-                    .get("request")
-                    .ok_or_else(|| ProviderError::Provider("rights request is required".into()))?;
-                let content_id = required_test_str(request, "content_id")?;
-                let principal_id = required_test_str(request, "principal_id")?;
-                let session_id = required_test_str(request, "session_id")?;
-                let right = required_test_str(request, "right")?;
-                let allowed = right == "view" && !principal_id.contains("blocked");
-                Ok(json!({
-                    "status": "ok",
-                    "data": {
-                        "schema": "elastos.rights.decision.receipt/v1",
-                        "request_id": "rights:fixture",
-                        "content_id": content_id,
-                        "principal_id": principal_id,
-                        "session_id": session_id,
-                        "right": right,
-                        "provider": "rights-provider",
-                        "allowed": allowed,
-                        "issued_at": 1_800_000_000u64,
-                        "expires_at": 1_900_000_000u64
-                    }
-                }))
-            }
-            _ => Ok(json!({
-                "status": "error",
-                "code": "unsupported",
-                "message": "unsupported mock rights op"
-            })),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Provider for MockKeyProvider {
-    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
-        Err(ProviderError::Provider(
-            "mock key provider only supports raw requests".into(),
-        ))
-    }
-
-    fn schemes(&self) -> Vec<&'static str> {
-        vec!["key"]
-    }
-
-    fn name(&self) -> &'static str {
-        "mock-key-provider"
-    }
-
-    async fn send_raw(
-        &self,
-        request: &serde_json::Value,
-    ) -> Result<serde_json::Value, ProviderError> {
-        match request.get("op").and_then(|value| value.as_str()) {
-            Some("status") => Ok(json!({
-                "status": "ok",
-                "data": {
-                    "provider": "key",
-                    "configured": true,
-                    "supported_operations": ["status", "release"],
-                    "blocked_authority": ["raw_cek", "kms_node_credentials"],
-                    "contract": {
-                        "schema": "elastos.protected-content.key-provider/v1",
-                        "fixture": true
-                    }
-                }
-            })),
-            Some("release") => {
-                let request = request
-                    .get("request")
-                    .ok_or_else(|| ProviderError::Provider("key request is required".into()))?;
-                if request
-                    .get("rights_receipt")
-                    .and_then(|receipt| receipt.get("allowed"))
-                    .and_then(|value| value.as_bool())
-                    != Some(true)
-                {
-                    return Ok(json!({
-                        "status": "error",
-                        "code": "denied",
-                        "message": "rights receipt denied key release"
-                    }));
-                }
-                Ok(json!({
-                    "status": "ok",
-                    "data": {
-                        "schema": "elastos.release.receipt/v1",
-                        "request_id": required_test_str(request, "request_id")?,
-                        "object_cid": required_test_str(request, "object_cid")?,
-                        "principal_id": required_test_str(request, "principal_id")?,
-                        "session_id": required_test_str(request, "session_id")?,
-                        "action": required_test_str(request, "action")?,
-                        "provider": "key-provider",
-                        "status": "released",
-                        "issued_at": 1_800_000_000u64,
-                        "expires_at": request
-                            .get("expires_at")
-                            .and_then(|value| value.as_u64())
-                            .unwrap_or(1_900_000_000u64)
-                    }
-                }))
-            }
-            _ => Ok(json!({
-                "status": "error",
-                "code": "unsupported",
-                "message": "unsupported mock key op"
-            })),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Provider for MockDecryptProvider {
-    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
-        Err(ProviderError::Provider(
-            "mock decrypt provider only supports raw requests".into(),
-        ))
-    }
-
-    fn schemes(&self) -> Vec<&'static str> {
-        vec!["decrypt"]
-    }
-
-    fn name(&self) -> &'static str {
-        "mock-decrypt-provider"
-    }
-
-    async fn send_raw(
-        &self,
-        request: &serde_json::Value,
-    ) -> Result<serde_json::Value, ProviderError> {
-        match request.get("op").and_then(|value| value.as_str()) {
-            Some("status") => Ok(json!({
-                "status": "ok",
-                "data": {
-                    "provider": "decrypt",
-                    "configured": true,
-                    "supported_operations": ["status", "open_session"],
-                    "blocked_authority": ["raw_cek", "raw_plaintext", "filesystem"],
-                    "contract": {
-                        "schema": "elastos.protected-content.decrypt-provider/v1",
-                        "fixture": true
-                    }
-                }
-            })),
-            Some("open_session") => {
-                let request = request
-                    .get("request")
-                    .ok_or_else(|| ProviderError::Provider("decrypt request is required".into()))?;
-                Ok(json!({
-                    "status": "ok",
-                    "data": {
-                        "schema": "elastos.decrypt.session/v1",
-                        "session_id": "decrypt-session:fixture",
-                        "object_cid": required_test_str(request, "object_cid")?,
-                        "viewer_interface": required_test_str(request, "viewer_interface")?,
-                        "output": "viewer_capsule_session:fixture",
-                        "expires_at": request
-                            .get("expires_at")
-                            .and_then(|value| value.as_u64())
-                            .unwrap_or(1_900_000_000u64)
-                    }
-                }))
-            }
-            _ => Ok(json!({
-                "status": "error",
-                "code": "unsupported",
-                "message": "unsupported mock decrypt op"
-            })),
-        }
-    }
 }
 
 struct MockExternalObjectProvider {
@@ -4435,6 +4263,17 @@ impl Provider for MockWalletProvider {
                     "payload": payload,
                     "expires_at": expires_at,
                 }),
+                WalletProviderOperationV2::RequestProtectedContentRightsSignature {
+                    account_id,
+                    canonical_rights_request_hex,
+                    reason,
+                } => json!({
+                    "op": "request_protected_content_rights_signature",
+                    "principal_id": wallet_request.authority.principal_id,
+                    "account_id": account_id,
+                    "canonical_rights_request_hex": canonical_rights_request_hex,
+                    "reason": reason,
+                }),
                 WalletProviderOperationV2::AttachValidatedChainOutcome { outcome } => json!({
                     "op": "attach_validated_chain_outcome",
                     "principal_id": wallet_request.authority.principal_id,
@@ -4568,6 +4407,30 @@ impl RecordingWalletProvider {
             provider,
             requests: TokioMutex::default(),
         }
+    }
+
+    async fn clear_requests(&self) {
+        self.requests.lock().await.clear();
+    }
+
+    async fn recorded_v2_operation_kinds(&self) -> Vec<WalletOperationKind> {
+        let requests = self.requests.lock().await;
+        let mut actual = Vec::new();
+        for request in requests.iter() {
+            if request.get("op").and_then(Value::as_str) != Some(WALLET_BUS_OPERATION) {
+                continue;
+            }
+            let request_bytes = serde_json::to_vec(
+                request
+                    .get("request")
+                    .expect("Wallet Bus v2 request envelope"),
+            )
+            .unwrap();
+            let wallet_request =
+                WalletProviderRequestV2::decode_at(&request_bytes, crate::auth::now_ts()).unwrap();
+            actual.push(wallet_request.operation.kind());
+        }
+        actual
     }
 
     async fn assert_no_requests(&self) {
@@ -4802,15 +4665,23 @@ impl RecordingWalletProvider {
 
 impl MockWalletProvider {
     async fn seed_managed_evm_account_for_principal(&self, principal_id: &str) -> String {
-        let account_id = format!("wallet:eip155:8453:{MOCK_MANAGED_EVM_ADDRESS}");
+        self.seed_managed_evm_account_for_principal_with_index(principal_id, 1)
+            .await
+    }
+
+    async fn seed_managed_evm_account_for_principal_with_index(
+        &self,
+        principal_id: &str,
+        index: usize,
+    ) -> String {
+        let address = mock_managed_evm_address(index).unwrap();
+        let account_id = format!("wallet:eip155:8453:{address}");
         let account = json!({
             "account_id": account_id,
             "principal_id": principal_id,
-            "proof_binding_id": format!(
-                "proof:wallet:managed:eip155:8453:{MOCK_MANAGED_EVM_ADDRESS}"
-            ),
+            "proof_binding_id": format!("proof:wallet:managed:eip155:8453:{address}"),
             "chain_namespace": "eip155:8453",
-            "address": MOCK_MANAGED_EVM_ADDRESS,
+            "address": address,
             "proof_type": "managed_evm",
             "signing_available": true,
             "signing_status": "managed_key_available",
@@ -5719,6 +5590,68 @@ impl MockWalletProvider {
                         "requires_approval": true,
                         "signature": serde_json::Value::Null
                     }
+                }))
+            }
+            Some("request_protected_content_rights_signature") => {
+                let principal_id = required_test_str(request, "principal_id")?;
+                let account_id = required_test_str(request, "account_id")?;
+                let canonical_rights_request_hex =
+                    required_test_str(request, "canonical_rights_request_hex")?;
+                let account = {
+                    let accounts = self.accounts.lock().await;
+                    accounts
+                        .iter()
+                        .find(|account| {
+                            account.get("principal_id").and_then(Value::as_str)
+                                == Some(principal_id)
+                                && account.get("account_id").and_then(Value::as_str)
+                                    == Some(account_id)
+                                && account.get("revoked_at").is_none()
+                        })
+                        .cloned()
+                };
+                let Some(account) = account else {
+                    return Ok(json!({
+                        "status": "error",
+                        "code": "not_found",
+                        "message": "active linked account not found"
+                    }));
+                };
+                let rights_bytes = hex::decode(canonical_rights_request_hex)
+                    .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                let rights_request =
+                    elastos_protected_content_contracts::RightsRequestV1::from_canonical_bytes(
+                        &rights_bytes,
+                    )
+                    .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                let signer = required_test_str(&account, "address")?;
+                let signing_key = mock_managed_evm_key_for_address(signer)?;
+                let (signature, recovery_id) = signing_key
+                    .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
+                        &rights_bytes,
+                    ))
+                    .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                let mut signature_bytes = signature.to_bytes().to_vec();
+                signature_bytes.push(recovery_id.to_byte());
+                let signed = elastos_protected_content_contracts::WalletSignedRightsRequestV1::new(
+                    rights_request,
+                    signature_bytes,
+                )
+                .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                let result = elastos_wallet_contract::ProtectedContentRightsSignatureResultV1::new(
+                    account_id,
+                    signer,
+                    hex::encode(
+                        signed
+                            .canonical_bytes()
+                            .map_err(|err| ProviderError::Provider(err.to_string()))?,
+                    ),
+                )
+                .map_err(|err| ProviderError::Provider(err.to_string()))?;
+                Ok(json!({
+                    "status": "ok",
+                    "data": serde_json::to_value(result)
+                        .map_err(|err| ProviderError::Provider(err.to_string()))?
                 }))
             }
             Some("reject_approval") => {

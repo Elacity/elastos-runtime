@@ -99,6 +99,40 @@ pub enum RuntimeReleaseNonterminalReason {
     ProviderEffectUncertain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartedOperationResolutionMode {
+    InitialDispatch,
+    ExactResume,
+}
+
+#[derive(Debug)]
+struct StartedOperationCollection {
+    offer: Option<RuntimeReleaseReconcileOffer>,
+    replayable_rights_decisions: Vec<SignedNodeRightsDecisionV1>,
+}
+
+struct StartedOperationContext<'a, 'b> {
+    draft: &'a RuntimeReleaseOperationDraft,
+    signed_runtime_release_operation: &'a SignedRuntimeReleaseOperationV1,
+    authenticated: &'a AuthenticatedRuntimeReleaseOperationV1,
+    ordered_providers: &'a [&'b RuntimeSelectedProvider<'b>],
+    replayable_rights_decisions: &'a [SignedNodeRightsDecisionV1],
+    now_unix_seconds: u64,
+    mode: StartedOperationResolutionMode,
+}
+
+impl<'a, 'b> StartedOperationContext<'a, 'b> {
+    fn threshold(&self) -> Result<usize, RuntimeReleaseCoordinatorError> {
+        self.authenticated
+            .statement()
+            .custody_epoch()
+            .statement()
+            .node_set()
+            .map(|node_set| usize::from(node_set.threshold().required()))
+            .map_err(|_| RuntimeReleaseCoordinatorError::OperationAuthority)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum RuntimeReleaseReconcileOffer {
     RightsDenied {
@@ -214,12 +248,61 @@ impl<'a> RuntimeReleaseCoordinator<'a> {
         }
         let ordered_providers = self.selected_ordered_providers(&authenticated)?;
         self.journal.mark_provider_effect_started(&draft)?;
-        self.invoke_providers(
-            &draft,
-            &signed_runtime_release_operation,
-            &authenticated,
-            &ordered_providers,
-            now_unix_seconds,
+        self.resolve_started_operation(
+            draft.operation_hash()?,
+            StartedOperationContext {
+                draft: &draft,
+                signed_runtime_release_operation: &signed_runtime_release_operation,
+                authenticated: &authenticated,
+                ordered_providers: &ordered_providers,
+                replayable_rights_decisions: &[],
+                now_unix_seconds,
+                mode: StartedOperationResolutionMode::InitialDispatch,
+            },
+        )
+        .await
+    }
+
+    pub async fn resume_exact(
+        &self,
+        operation_hash: Digest32,
+        now_unix_seconds: u64,
+    ) -> Result<RuntimeReleaseCoordinatorOutcome, RuntimeReleaseCoordinatorError> {
+        let persisted = self
+            .journal
+            .load(operation_hash)
+            .map_err(|error| match error {
+                RuntimeReleaseJournalError::NotFound => {
+                    RuntimeReleaseCoordinatorError::Reconciliation
+                }
+                _ => RuntimeReleaseCoordinatorError::Journal,
+            })?;
+        if let Some(terminal) = persisted.terminal_result().cloned() {
+            return Ok(RuntimeReleaseCoordinatorOutcome::Terminal(terminal));
+        }
+        if !persisted.provider_effect_started() {
+            return Err(RuntimeReleaseCoordinatorError::Reconciliation);
+        }
+        let draft = persisted.draft().clone();
+        if draft.operation_hash()? != operation_hash {
+            return Err(RuntimeReleaseCoordinatorError::Reconciliation);
+        }
+        let signed_runtime_release_operation = draft.signed_runtime_release_operation().clone();
+        let authenticated = signed_runtime_release_operation
+            .verify(self.expected_runtime_issuer, now_unix_seconds)
+            .map_err(|_| RuntimeReleaseCoordinatorError::OperationAuthority)?;
+        let ordered_providers = self.selected_ordered_providers(&authenticated)?;
+        self.resolve_started_operation(
+            operation_hash,
+            StartedOperationContext {
+                draft: &draft,
+                signed_runtime_release_operation: &signed_runtime_release_operation,
+                authenticated: &authenticated,
+                ordered_providers: &ordered_providers,
+                replayable_rights_decisions: persisted.replayable_rights_decisions(),
+                now_unix_seconds,
+                mode: StartedOperationResolutionMode::ExactResume,
+            },
         )
         .await
     }
@@ -325,144 +408,258 @@ impl<'a> RuntimeReleaseCoordinator<'a> {
         Ok(selected)
     }
 
-    async fn invoke_providers(
+    async fn resolve_started_operation(
         &self,
-        draft: &RuntimeReleaseOperationDraft,
-        signed_runtime_release_operation: &SignedRuntimeReleaseOperationV1,
-        authenticated: &AuthenticatedRuntimeReleaseOperationV1,
-        ordered_providers: &[&RuntimeSelectedProvider<'_>],
-        now_unix_seconds: u64,
+        operation_hash: Digest32,
+        context: StartedOperationContext<'_, '_>,
     ) -> Result<RuntimeReleaseCoordinatorOutcome, RuntimeReleaseCoordinatorError> {
-        let node_set = authenticated
+        let collection = self.collect_rights_decisions(&context).await?;
+        let Some(offer) = collection.offer else {
+            let persisted_decisions = if collection.replayable_rights_decisions.is_empty() {
+                context.replayable_rights_decisions.to_vec()
+            } else {
+                self.journal
+                    .persist_replayable_rights_decisions(
+                        context.draft,
+                        &collection.replayable_rights_decisions,
+                    )
+                    .map_err(|_| RuntimeReleaseCoordinatorError::Journal)?
+                    .replayable_rights_decisions()
+                    .to_vec()
+            };
+            if persisted_decisions.len() < context.threshold()? {
+                return Ok(RuntimeReleaseCoordinatorOutcome::Nonterminal {
+                    operation_hash,
+                    reason: RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
+                });
+            }
+            let offer = self
+                .collect_contributions(&StartedOperationContext {
+                    replayable_rights_decisions: &persisted_decisions,
+                    ..context
+                })
+                .await?;
+            let Some(offer) = offer else {
+                return Ok(RuntimeReleaseCoordinatorOutcome::Nonterminal {
+                    operation_hash,
+                    reason: RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
+                });
+            };
+            return self.reconcile(operation_hash, offer, context.now_unix_seconds);
+        };
+        self.reconcile(operation_hash, offer, context.now_unix_seconds)
+    }
+
+    async fn collect_rights_decisions(
+        &self,
+        context: &StartedOperationContext<'_, '_>,
+    ) -> Result<StartedOperationCollection, RuntimeReleaseCoordinatorError> {
+        let node_set = context
+            .authenticated
             .statement()
             .custody_epoch()
             .statement()
             .node_set()
             .map_err(|_| RuntimeReleaseCoordinatorError::OperationAuthority)?;
-        let threshold = usize::from(node_set.threshold().required());
-        let mut decisions = Vec::with_capacity(ordered_providers.len());
-        for provider in ordered_providers {
+        let threshold = context.threshold()?;
+        let mut persisted_by_node = self.persisted_rights_decisions_by_node(context, &node_set)?;
+        if persisted_by_node.len() >= threshold {
+            return Ok(StartedOperationCollection {
+                offer: None,
+                replayable_rights_decisions: Vec::new(),
+            });
+        }
+        let mut newly_replayable_rights_decisions = Vec::new();
+        for provider in context.ordered_providers.iter().copied() {
+            if persisted_by_node.contains_key(&provider.node_public_key) {
+                continue;
+            }
             let request = RightsProviderRequestV1::new_evaluate(
                 provider.node_public_key,
-                signed_runtime_release_operation,
+                context.signed_runtime_release_operation,
             )
             .map_err(|_| RuntimeReleaseCoordinatorError::OperationAuthority)?;
             let response = match provider.rights.evaluate_rights(&request).await {
                 Ok(response) => response,
-                Err(_) => {
-                    return self.nonterminal(
-                        draft,
-                        RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
-                    );
-                }
+                Err(_) => match context.mode {
+                    StartedOperationResolutionMode::InitialDispatch => {
+                        return Ok(StartedOperationCollection {
+                            offer: None,
+                            replayable_rights_decisions: newly_replayable_rights_decisions,
+                        });
+                    }
+                    StartedOperationResolutionMode::ExactResume => continue,
+                },
             };
             if response
                 .validate_against_request_at(
                     &request,
                     self.expected_runtime_issuer,
-                    now_unix_seconds,
+                    context.now_unix_seconds,
                 )
                 .is_err()
             {
-                return self.nonterminal(
-                    draft,
-                    RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
-                );
+                return match context.mode {
+                    StartedOperationResolutionMode::InitialDispatch => {
+                        Ok(StartedOperationCollection {
+                            offer: None,
+                            replayable_rights_decisions: newly_replayable_rights_decisions,
+                        })
+                    }
+                    StartedOperationResolutionMode::ExactResume => {
+                        Err(RuntimeReleaseCoordinatorError::ProviderResult)
+                    }
+                };
             }
             let decision = match response.signed_node_rights_decision() {
                 Ok(decision) => decision,
                 Err(_) => {
-                    return self.nonterminal(
-                        draft,
-                        RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
-                    );
+                    return match context.mode {
+                        StartedOperationResolutionMode::InitialDispatch => {
+                            Ok(StartedOperationCollection {
+                                offer: None,
+                                replayable_rights_decisions: newly_replayable_rights_decisions,
+                            })
+                        }
+                        StartedOperationResolutionMode::ExactResume => {
+                            Err(RuntimeReleaseCoordinatorError::ProviderResult)
+                        }
+                    };
                 }
             };
-            let verified = authenticated
-                .verify_node_rights_decision(&decision, &node_set, now_unix_seconds)
+            let verified = context
+                .authenticated
+                .verify_node_rights_decision(&decision, &node_set, context.now_unix_seconds)
                 .map_err(|_| RuntimeReleaseCoordinatorError::ProviderResult)?;
-            if verified.decision() == RightsDecisionV1::Denied {
-                let terminal = RuntimeReleaseTerminalResult::RightsDenied {
-                    signed_node_rights_decision: Box::new(decision),
-                };
-                let persisted = self.journal.mark_terminal(draft, terminal)?;
-                return Ok(RuntimeReleaseCoordinatorOutcome::Terminal(
-                    persisted.into_terminal_result()?,
-                ));
+            if verified.node_public_key() != provider.node_public_key {
+                return Err(RuntimeReleaseCoordinatorError::ProviderResult);
             }
-            decisions.push((provider, decision));
-            if decisions.len() == threshold {
+            if verified.decision() == RightsDecisionV1::Denied {
+                return Ok(StartedOperationCollection {
+                    offer: Some(RuntimeReleaseReconcileOffer::RightsDenied {
+                        signed_node_rights_decision: Box::new(decision),
+                    }),
+                    replayable_rights_decisions: newly_replayable_rights_decisions,
+                });
+            }
+            if persisted_by_node
+                .insert(provider.node_public_key, decision.clone())
+                .is_some()
+            {
+                return Err(RuntimeReleaseCoordinatorError::ProviderResult);
+            }
+            newly_replayable_rights_decisions.push(decision);
+            if persisted_by_node.len() == threshold {
                 break;
             }
         }
+        Ok(StartedOperationCollection {
+            offer: None,
+            replayable_rights_decisions: newly_replayable_rights_decisions,
+        })
+    }
 
+    async fn collect_contributions(
+        &self,
+        context: &StartedOperationContext<'_, '_>,
+    ) -> Result<Option<RuntimeReleaseReconcileOffer>, RuntimeReleaseCoordinatorError> {
+        let node_set = context
+            .authenticated
+            .statement()
+            .custody_epoch()
+            .statement()
+            .node_set()
+            .map_err(|_| RuntimeReleaseCoordinatorError::OperationAuthority)?;
+        let threshold = context.threshold()?;
+        let persisted_by_node = self.persisted_rights_decisions_by_node(context, &node_set)?;
         let mut contributions = Vec::with_capacity(threshold);
-        for (provider, decision) in decisions {
+        for provider in context.ordered_providers.iter().copied() {
+            let Some(decision) = persisted_by_node.get(&provider.node_public_key) else {
+                continue;
+            };
             let request = CustodyProviderRequestV1::new_release_contribution(
-                signed_runtime_release_operation,
-                &decision,
+                context.signed_runtime_release_operation,
+                decision,
             )
             .map_err(|_| RuntimeReleaseCoordinatorError::OperationAuthority)?;
             let response = match provider.custody.release_contribution(&request).await {
                 Ok(response) => response,
-                Err(_) => {
-                    return self.nonterminal(
-                        draft,
-                        RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
-                    );
-                }
+                Err(_) => match context.mode {
+                    StartedOperationResolutionMode::InitialDispatch => return Ok(None),
+                    StartedOperationResolutionMode::ExactResume => continue,
+                },
             };
             if response
                 .validate_against_request_at(
                     &request,
                     self.expected_runtime_issuer,
                     provider.node_public_key,
-                    now_unix_seconds,
+                    context.now_unix_seconds,
                 )
                 .is_err()
             {
-                return self.nonterminal(
-                    draft,
-                    RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
-                );
+                return match context.mode {
+                    StartedOperationResolutionMode::InitialDispatch => Ok(None),
+                    StartedOperationResolutionMode::ExactResume => {
+                        Err(RuntimeReleaseCoordinatorError::ProviderResult)
+                    }
+                };
             }
             let contribution = response
                 .signed_node_contribution()
                 .map_err(|_| RuntimeReleaseCoordinatorError::ProviderResult)?;
             validate_contribution_identity(
-                authenticated,
+                context.authenticated,
                 &node_set,
                 &contribution,
                 provider.node_public_key,
-                now_unix_seconds,
+                context.now_unix_seconds,
             )?;
             contributions.push(contribution);
             if contributions.len() == threshold {
-                let terminal = RuntimeReleaseTerminalResult::ContributionsReady {
+                return Ok(Some(RuntimeReleaseReconcileOffer::ContributionsReady {
                     signed_node_contributions: contributions,
-                };
-                let persisted = self.journal.mark_terminal(draft, terminal)?;
-                return Ok(RuntimeReleaseCoordinatorOutcome::Terminal(
-                    persisted.into_terminal_result()?,
-                ));
+                }));
             }
         }
-
-        self.nonterminal(
-            draft,
-            RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
-        )
+        Ok(None)
     }
 
-    fn nonterminal(
+    fn persisted_rights_decisions_by_node(
         &self,
-        draft: &RuntimeReleaseOperationDraft,
-        reason: RuntimeReleaseNonterminalReason,
-    ) -> Result<RuntimeReleaseCoordinatorOutcome, RuntimeReleaseCoordinatorError> {
-        Ok(RuntimeReleaseCoordinatorOutcome::Nonterminal {
-            operation_hash: draft.operation_hash()?,
-            reason,
-        })
+        context: &StartedOperationContext<'_, '_>,
+        node_set: &NodeSetV1,
+    ) -> Result<HashMap<NodePublicKey, SignedNodeRightsDecisionV1>, RuntimeReleaseCoordinatorError>
+    {
+        if context.replayable_rights_decisions.len() > context.ordered_providers.len() {
+            return Err(RuntimeReleaseCoordinatorError::ProviderResult);
+        }
+        let selected_nodes = context
+            .ordered_providers
+            .iter()
+            .map(|provider| provider.node_public_key)
+            .collect::<BTreeSet<_>>();
+        let mut persisted_by_node =
+            HashMap::with_capacity(context.replayable_rights_decisions.len());
+        for decision in context.replayable_rights_decisions {
+            let verified = context
+                .authenticated
+                .verify_node_rights_decision(decision, node_set, context.now_unix_seconds)
+                .map_err(|_| RuntimeReleaseCoordinatorError::ProviderResult)?;
+            if verified.decision() != RightsDecisionV1::Allowed {
+                return Err(RuntimeReleaseCoordinatorError::ProviderResult);
+            }
+            if !selected_nodes.contains(&verified.node_public_key()) {
+                return Err(RuntimeReleaseCoordinatorError::ProviderResult);
+            }
+            if persisted_by_node
+                .insert(verified.node_public_key(), decision.clone())
+                .is_some()
+            {
+                return Err(RuntimeReleaseCoordinatorError::ProviderResult);
+            }
+        }
+        Ok(persisted_by_node)
     }
 }
 
@@ -717,6 +914,70 @@ mod tests {
             request: &CustodyProviderRequestV1,
         ) -> Result<CustodyProviderResponseV1, RuntimeProviderCallError> {
             self.requests.lock().unwrap().push(request.clone());
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                return Err(RuntimeProviderCallError::NoExactResult);
+            }
+            Ok(responses.remove(0)?)
+        }
+
+        async fn provision_node_share(
+            &self,
+            _request: &CustodyProviderRequestV1,
+        ) -> Result<CustodyProviderResponseV1, RuntimeProviderCallError> {
+            Err(RuntimeProviderCallError::NoExactResult)
+        }
+    }
+
+    struct InspectingCustodyProvider {
+        journal_root: PathBuf,
+        operation_hash: Digest32,
+        observed_replayable_rights_counts: Mutex<Vec<usize>>,
+        responses: Mutex<Vec<Result<CustodyProviderResponseV1, RuntimeProviderCallError>>>,
+        requests: Mutex<Vec<CustodyProviderRequestV1>>,
+    }
+
+    impl InspectingCustodyProvider {
+        fn new(
+            journal_root: PathBuf,
+            operation_hash: Digest32,
+            responses: Vec<Result<CustodyProviderResponseV1, RuntimeProviderCallError>>,
+        ) -> Self {
+            Self {
+                journal_root,
+                operation_hash,
+                observed_replayable_rights_counts: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn observed_replayable_rights_counts(&self) -> Vec<usize> {
+            self.observed_replayable_rights_counts
+                .lock()
+                .unwrap()
+                .clone()
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeCustodyProvider for InspectingCustodyProvider {
+        async fn release_contribution(
+            &self,
+            request: &CustodyProviderRequestV1,
+        ) -> Result<CustodyProviderResponseV1, RuntimeProviderCallError> {
+            self.requests.lock().unwrap().push(request.clone());
+            let persisted = RuntimeReleaseJournal::new(self.journal_root.clone())
+                .load(self.operation_hash)
+                .unwrap();
+            self.observed_replayable_rights_counts
+                .lock()
+                .unwrap()
+                .push(persisted.replayable_rights_decisions().len());
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 return Err(RuntimeProviderCallError::NoExactResult);
@@ -1418,6 +1679,340 @@ mod tests {
         assert_eq!(r2_replay.request_count(), 0);
         assert_eq!(c1_replay.request_count(), 0);
         assert_eq!(c2_replay.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_coordination_resume_exact_settles_uncertain_effect_without_new_operation() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_root(&temp);
+        let operation = signed_runtime_release_operation(0x42);
+        let (wallet_request, wallet_response) = wallet_request_response(&operation);
+        let r1 = FakeRightsProvider::new(vec![
+            Err(RuntimeProviderCallError::NoExactResult),
+            Err(RuntimeProviderCallError::NoExactResult),
+        ]);
+        let r2 = FakeRightsProvider::new(vec![
+            Err(RuntimeProviderCallError::NoExactResult),
+            Ok(
+                RightsProviderResponseV1::new_decision(&signed_node_rights_decision(
+                    &operation,
+                    2,
+                    RightsDecisionV1::Allowed,
+                ))
+                .unwrap(),
+            ),
+        ]);
+        let r3 = FakeRightsProvider::new(vec![
+            Ok(
+                RightsProviderResponseV1::new_decision(&signed_node_rights_decision(
+                    &operation,
+                    3,
+                    RightsDecisionV1::Allowed,
+                ))
+                .unwrap(),
+            ),
+            Ok(
+                RightsProviderResponseV1::new_decision(&signed_node_rights_decision(
+                    &operation,
+                    3,
+                    RightsDecisionV1::Allowed,
+                ))
+                .unwrap(),
+            ),
+        ]);
+        let c1 = FakeCustodyProvider::default();
+        let c2 = FakeCustodyProvider::new(vec![Ok(CustodyProviderResponseV1::new_contribution(
+            &signed_node_contribution(&operation, 2),
+        )
+        .unwrap())]);
+        let c3 = FakeCustodyProvider::new(vec![Ok(CustodyProviderResponseV1::new_contribution(
+            &signed_node_contribution(&operation, 3),
+        )
+        .unwrap())]);
+        let runtime = coordinator(
+            &root,
+            vec![
+                selected(&r1, &c1, 1),
+                selected(&r2, &c2, 2),
+                selected(&r3, &c3, 3),
+            ],
+        );
+
+        let first = runtime
+            .release(
+                &wallet_request,
+                &wallet_response,
+                operation.clone(),
+                NOW + 6,
+            )
+            .await
+            .unwrap();
+        let operation_hash = match first {
+            RuntimeReleaseCoordinatorOutcome::Nonterminal {
+                operation_hash,
+                reason: RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
+            } => operation_hash,
+            other => panic!("unexpected first outcome: {other:?}"),
+        };
+        let resumed = runtime.resume_exact(operation_hash, NOW + 6).await.unwrap();
+        match resumed {
+            RuntimeReleaseCoordinatorOutcome::Terminal(
+                RuntimeReleaseTerminalResult::ContributionsReady {
+                    signed_node_contributions,
+                },
+            ) => assert_eq!(signed_node_contributions.len(), 2),
+            other => panic!("unexpected resumed outcome: {other:?}"),
+        }
+        let persisted = RuntimeReleaseJournal::new(root)
+            .load(operation_hash)
+            .unwrap();
+        assert!(matches!(
+            persisted.terminal_result(),
+            Some(RuntimeReleaseTerminalResult::ContributionsReady { .. })
+        ));
+        assert_eq!(c1.request_count(), 0);
+        assert_eq!(c2.request_count(), 1);
+        assert_eq!(c3.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_coordination_persists_replayable_rights_before_contribution_dispatch() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_root(&temp);
+        let operation = signed_runtime_release_operation(0x42);
+        let (wallet_request, wallet_response) = wallet_request_response(&operation);
+        let draft = RuntimeReleaseOperationDraft::new(
+            wallet_request.clone(),
+            wallet_response.clone(),
+            operation.clone(),
+        )
+        .unwrap();
+        let operation_hash = draft.operation_hash().unwrap();
+        let r1 = FakeRightsProvider::new(vec![Ok(RightsProviderResponseV1::new_decision(
+            &signed_node_rights_decision(&operation, 1, RightsDecisionV1::Allowed),
+        )
+        .unwrap())]);
+        let r2 = FakeRightsProvider::new(vec![Ok(RightsProviderResponseV1::new_decision(
+            &signed_node_rights_decision(&operation, 2, RightsDecisionV1::Allowed),
+        )
+        .unwrap())]);
+        let c1 = InspectingCustodyProvider::new(
+            root.clone(),
+            operation_hash,
+            vec![Err(RuntimeProviderCallError::NoExactResult)],
+        );
+        let c2 = InspectingCustodyProvider::new(
+            root.clone(),
+            operation_hash,
+            vec![Err(RuntimeProviderCallError::NoExactResult)],
+        );
+        let runtime = coordinator(
+            &root,
+            vec![
+                RuntimeSelectedProvider::new(node_public_key(1), &r1, &c1),
+                RuntimeSelectedProvider::new(node_public_key(2), &r2, &c2),
+            ],
+        );
+
+        let first = runtime
+            .release(
+                &wallet_request,
+                &wallet_response,
+                operation.clone(),
+                NOW + 6,
+            )
+            .await
+            .unwrap();
+        let operation_hash = match first {
+            RuntimeReleaseCoordinatorOutcome::Nonterminal {
+                operation_hash,
+                reason: RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
+            } => operation_hash,
+            other => panic!("unexpected first outcome: {other:?}"),
+        };
+        let persisted = RuntimeReleaseJournal::new(root.clone())
+            .load(operation_hash)
+            .unwrap();
+        assert_eq!(persisted.replayable_rights_decisions().len(), 2);
+        let observed_counts = [
+            c1.observed_replayable_rights_counts(),
+            c2.observed_replayable_rights_counts(),
+        ]
+        .concat();
+        assert_eq!(observed_counts, vec![2]);
+        assert_eq!(c1.request_count() + c2.request_count(), 1);
+
+        let r1_resume = FakeRightsProvider::default();
+        let r2_resume = FakeRightsProvider::default();
+        let c1_resume = FakeCustodyProvider::new(vec![Ok(
+            CustodyProviderResponseV1::new_contribution(&signed_node_contribution(&operation, 1))
+                .unwrap(),
+        )]);
+        let c2_resume = FakeCustodyProvider::new(vec![Ok(
+            CustodyProviderResponseV1::new_contribution(&signed_node_contribution(&operation, 2))
+                .unwrap(),
+        )]);
+        let resumed_runtime = coordinator(
+            &root,
+            vec![
+                selected(&r1_resume, &c1_resume, 1),
+                selected(&r2_resume, &c2_resume, 2),
+            ],
+        );
+        let resumed = resumed_runtime
+            .resume_exact(operation_hash, NOW + 6)
+            .await
+            .unwrap();
+        match resumed {
+            RuntimeReleaseCoordinatorOutcome::Terminal(
+                RuntimeReleaseTerminalResult::ContributionsReady {
+                    signed_node_contributions,
+                },
+            ) => assert_eq!(signed_node_contributions.len(), 2),
+            other => panic!("unexpected resumed outcome: {other:?}"),
+        }
+        assert_eq!(r1_resume.request_count(), 0);
+        assert_eq!(r2_resume.request_count(), 0);
+        assert_eq!(c1_resume.request_count(), 1);
+        assert_eq!(c2_resume.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_coordination_resume_exact_reloads_same_unresolved_operation_hash() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_root(&temp);
+        let operation = signed_runtime_release_operation(0x42);
+        let (wallet_request, wallet_response) = wallet_request_response(&operation);
+        let r1 = FakeRightsProvider::new(vec![Err(RuntimeProviderCallError::NoExactResult)]);
+        let r2 = FakeRightsProvider::new(vec![Err(RuntimeProviderCallError::NoExactResult)]);
+        let c1 = FakeCustodyProvider::default();
+        let c2 = FakeCustodyProvider::default();
+        let runtime = coordinator(&root, vec![selected(&r1, &c1, 1), selected(&r2, &c2, 2)]);
+
+        let first = runtime
+            .release(
+                &wallet_request,
+                &wallet_response,
+                operation.clone(),
+                NOW + 6,
+            )
+            .await
+            .unwrap();
+        let operation_hash = match first {
+            RuntimeReleaseCoordinatorOutcome::Nonterminal {
+                operation_hash,
+                reason: RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
+            } => operation_hash,
+            other => panic!("unexpected first outcome: {other:?}"),
+        };
+
+        let r1_resume = FakeRightsProvider::new(vec![Ok(RightsProviderResponseV1::new_decision(
+            &signed_node_rights_decision(&operation, 1, RightsDecisionV1::Allowed),
+        )
+        .unwrap())]);
+        let r2_resume = FakeRightsProvider::new(vec![Ok(RightsProviderResponseV1::new_decision(
+            &signed_node_rights_decision(&operation, 2, RightsDecisionV1::Allowed),
+        )
+        .unwrap())]);
+        let c1_resume = FakeCustodyProvider::new(vec![Ok(
+            CustodyProviderResponseV1::new_contribution(&signed_node_contribution(&operation, 1))
+                .unwrap(),
+        )]);
+        let c2_resume = FakeCustodyProvider::new(vec![Ok(
+            CustodyProviderResponseV1::new_contribution(&signed_node_contribution(&operation, 2))
+                .unwrap(),
+        )]);
+        let resumed_runtime = coordinator(
+            &root,
+            vec![
+                selected(&r1_resume, &c1_resume, 1),
+                selected(&r2_resume, &c2_resume, 2),
+            ],
+        );
+        let resumed = resumed_runtime
+            .resume_exact(operation_hash, NOW + 6)
+            .await
+            .unwrap();
+        match resumed {
+            RuntimeReleaseCoordinatorOutcome::Terminal(
+                RuntimeReleaseTerminalResult::ContributionsReady {
+                    signed_node_contributions,
+                },
+            ) => assert_eq!(signed_node_contributions.len(), 2),
+            other => panic!("unexpected resumed outcome: {other:?}"),
+        }
+        assert_eq!(r1.request_count() + r2.request_count(), 1);
+        assert_eq!(r1_resume.request_count(), 1);
+        assert_eq!(r2_resume.request_count(), 1);
+        assert_eq!(c1_resume.request_count(), 1);
+        assert_eq!(c2_resume.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_coordination_resume_exact_rejects_mismatched_replay_and_keeps_obligation() {
+        let temp = tempdir().unwrap();
+        let root = owner_only_root(&temp);
+        let operation = signed_runtime_release_operation(0x42);
+        let other = signed_runtime_release_operation_for(0x43, 0x12, 7, 0x30);
+        let (wallet_request, wallet_response) = wallet_request_response(&operation);
+        let r1 = FakeRightsProvider::new(vec![Err(RuntimeProviderCallError::NoExactResult)]);
+        let r2 = FakeRightsProvider::new(vec![Err(RuntimeProviderCallError::NoExactResult)]);
+        let c1 = FakeCustodyProvider::default();
+        let c2 = FakeCustodyProvider::default();
+        let runtime = coordinator(&root, vec![selected(&r1, &c1, 1), selected(&r2, &c2, 2)]);
+
+        let first = runtime
+            .release(
+                &wallet_request,
+                &wallet_response,
+                operation.clone(),
+                NOW + 6,
+            )
+            .await
+            .unwrap();
+        let operation_hash = match first {
+            RuntimeReleaseCoordinatorOutcome::Nonterminal {
+                operation_hash,
+                reason: RuntimeReleaseNonterminalReason::ProviderEffectUncertain,
+            } => operation_hash,
+            other => panic!("unexpected first outcome: {other:?}"),
+        };
+
+        let r1_resume = FakeRightsProvider::new(vec![Ok(RightsProviderResponseV1::new_decision(
+            &signed_node_rights_decision(&operation, 1, RightsDecisionV1::Allowed),
+        )
+        .unwrap())]);
+        let r2_resume = FakeRightsProvider::new(vec![Ok(RightsProviderResponseV1::new_decision(
+            &signed_node_rights_decision(&operation, 2, RightsDecisionV1::Allowed),
+        )
+        .unwrap())]);
+        let c1_resume = FakeCustodyProvider::new(vec![Ok(
+            CustodyProviderResponseV1::new_contribution(&signed_node_contribution(&other, 1))
+                .unwrap(),
+        )]);
+        let c2_resume = FakeCustodyProvider::new(vec![Ok(
+            CustodyProviderResponseV1::new_contribution(&signed_node_contribution(&other, 2))
+                .unwrap(),
+        )]);
+        let resumed_runtime = coordinator(
+            &root,
+            vec![
+                selected(&r1_resume, &c1_resume, 1),
+                selected(&r2_resume, &c2_resume, 2),
+            ],
+        );
+        assert_eq!(
+            resumed_runtime.resume_exact(operation_hash, NOW + 6).await,
+            Err(RuntimeReleaseCoordinatorError::ProviderResult)
+        );
+        let persisted = RuntimeReleaseJournal::new(root)
+            .load(operation_hash)
+            .unwrap();
+        assert!(persisted.provider_effect_started());
+        assert!(persisted.terminal_result().is_none());
+        assert_eq!(r1_resume.request_count(), 1);
+        assert_eq!(r2_resume.request_count(), 1);
+        assert_eq!(c1_resume.request_count() + c2_resume.request_count(), 1);
     }
 
     #[tokio::test]
@@ -2414,7 +3009,6 @@ mod tests {
         recipient_public_key: RecipientPublicKeyBytesV1,
         recipient_identity: RecipientKeyIdentityV1,
         prepared_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
-        viewer_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
         clear_init: Vec<u8>,
         clear_segment: Vec<u8>,
         requests: Mutex<Vec<DecryptProviderRequestV1>>,
@@ -2432,7 +3026,6 @@ mod tests {
                     .recipient_identity()
                     .clone(),
                 prepared_handle: opaque_handle(0x41),
-                viewer_handle: opaque_handle(0x42),
                 clear_init: b"clear-fmp4-init".to_vec(),
                 clear_segment: b"clear-fmp4-segment".to_vec(),
                 requests: Mutex::new(Vec::new()),
@@ -2491,7 +3084,7 @@ mod tests {
             }
             DecryptProviderResponseV1::new_viewer_session_opened(
                 validated.audit_request_id(),
-                self.viewer_handle,
+                self.prepared_handle,
             )
             .map_err(|_| RuntimeProviderCallError::NoExactResult)
         }
@@ -2504,7 +3097,7 @@ mod tests {
             if validated
                 .viewer_session_handle()
                 .map_err(|_| RuntimeProviderCallError::NoExactResult)?
-                != &self.viewer_handle
+                != &self.prepared_handle
             {
                 return Err(RuntimeProviderCallError::NoExactResult);
             }
@@ -2520,7 +3113,7 @@ mod tests {
             };
             DecryptProviderResponseV1::new_viewer_media_part(
                 validated.audit_request_id(),
-                self.viewer_handle,
+                self.prepared_handle,
                 selector.clone(),
                 clear,
             )
@@ -2549,13 +3142,13 @@ mod tests {
             if validated
                 .viewer_session_handle()
                 .map_err(|_| RuntimeProviderCallError::NoExactResult)?
-                != &self.viewer_handle
+                != &self.prepared_handle
             {
                 return Err(RuntimeProviderCallError::NoExactResult);
             }
             DecryptProviderResponseV1::new_closed_viewer_session(
                 validated.audit_request_id(),
-                self.viewer_handle,
+                self.prepared_handle,
             )
             .map_err(|_| RuntimeProviderCallError::NoExactResult)
         }
@@ -2662,6 +3255,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            session.viewer_session_handle(),
+            prepared.prepared_recipient_handle()
+        );
         let init = read_viewer_media_part(
             &decrypt,
             &session,

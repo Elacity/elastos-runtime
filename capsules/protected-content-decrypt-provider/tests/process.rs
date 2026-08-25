@@ -297,6 +297,10 @@ fn process_prepare_open_read_close_replay_and_restart_absence_flow() {
         opened_a.status(),
         DecryptProviderResponseStatusV1::ViewerSessionOpened
     );
+    assert_eq!(
+        opened_a.viewer_session_handle().unwrap(),
+        prepare_a.prepared_recipient_handle().unwrap()
+    );
 
     let read_init_request = DecryptProviderRequestV1::new_read_viewer_media_part(
         open_audit,

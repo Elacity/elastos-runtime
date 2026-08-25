@@ -13,21 +13,23 @@ use nix::unistd::geteuid;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-const STORE_MAGIC: &[u8; 8] = b"epc-ro01";
-const STORE_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-release-journal/v1";
+const STORE_MAGIC: &[u8; 8] = b"epc-ro02";
+const STORE_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-release-journal/v2";
 const SLOT_DIGEST_DOMAIN: &[u8] = b"elastos/protected-content/runtime-release-journal/slot/v1";
 const STORE_LOCK_FILE: &str = "runtime-release-journal.lock";
 const STORE_DIGEST_BYTES: usize = 32;
-const STORE_HEADER_BYTES: usize = 8 + 32 + 32 + 32 + 32 + 1 + 4 + 4 + 4 + 4;
+const STORE_HEADER_BYTES: usize = 8 + 32 + 32 + 32 + 32 + 1 + 4 + 4 + 4 + 4 + 4;
 const MAX_WALLET_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WALLET_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_SIGNED_OPERATION_BYTES: usize = 256 * 1024;
 const MAX_TERMINAL_BYTES: usize = 256 * 1024;
+const MAX_REPLAYABLE_RIGHTS_BYTES: usize = 256 * 1024;
 const MAX_STORE_FILE_BYTES: usize = STORE_HEADER_BYTES
     + MAX_WALLET_REQUEST_BYTES
     + MAX_WALLET_RESPONSE_BYTES
     + MAX_SIGNED_OPERATION_BYTES
     + MAX_TERMINAL_BYTES
+    + MAX_REPLAYABLE_RIGHTS_BYTES
     + STORE_DIGEST_BYTES;
 const MAX_RUNTIME_RELEASE_RECORDS: usize = 4096;
 
@@ -297,6 +299,7 @@ impl RuntimeReleaseTerminalResult {
 pub struct PersistedRuntimeReleaseOperation {
     draft: RuntimeReleaseOperationDraft,
     terminal_result: Option<RuntimeReleaseTerminalResult>,
+    replayable_rights_decisions: Vec<SignedNodeRightsDecisionV1>,
     provider_effect_started: bool,
 }
 
@@ -307,6 +310,10 @@ impl PersistedRuntimeReleaseOperation {
 
     pub fn terminal_result(&self) -> Option<&RuntimeReleaseTerminalResult> {
         self.terminal_result.as_ref()
+    }
+
+    pub fn replayable_rights_decisions(&self) -> &[SignedNodeRightsDecisionV1] {
+        &self.replayable_rights_decisions
     }
 
     pub const fn provider_effect_started(&self) -> bool {
@@ -375,7 +382,7 @@ impl RuntimeReleaseJournal {
         self.ensure_root_dir()?;
         let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
         self.cleanup_stale_temps()?;
-        let entry = StoreEntry::from_draft(draft, None, false)?;
+        let entry = StoreEntry::from_draft(draft, None, false, Vec::new())?;
         self.write_or_replay(entry)
     }
 
@@ -396,6 +403,7 @@ impl RuntimeReleaseJournal {
             draft,
             existing.terminal_bytes.clone(),
             existing.effect_started,
+            existing.replayable_rights_bytes.clone(),
         )?;
         if existing != expected {
             return Err(RuntimeReleaseJournalError::Conflict);
@@ -403,10 +411,58 @@ impl RuntimeReleaseJournal {
         if existing.effect_started || existing.terminal_bytes.is_some() {
             return existing.into_persisted();
         }
-        let started = StoreEntry::from_draft(draft, None, true)?;
+        let started =
+            StoreEntry::from_draft(draft, None, true, existing.replayable_rights_bytes.clone())?;
         let bytes = encode_entry(&started)?;
         self.write_replace_entry(started.slot_hash, &bytes)?;
         started.into_persisted()
+    }
+
+    pub fn persist_replayable_rights_decisions(
+        &self,
+        draft: &RuntimeReleaseOperationDraft,
+        replayable_rights_decisions: &[SignedNodeRightsDecisionV1],
+    ) -> Result<PersistedRuntimeReleaseOperation, RuntimeReleaseJournalError> {
+        self.ensure_root_dir()?;
+        let _lock = ExclusiveFileLock::acquire(&self.lock_path)?;
+        self.cleanup_stale_temps()?;
+        let path = self.record_path(slot_hash_for(draft.operation_hash()?));
+        let existing = read_entry_from_path(
+            &path,
+            slot_hash_for(draft.operation_hash()?),
+            draft.operation_hash()?,
+        )?;
+        let expected = StoreEntry::from_draft(
+            draft,
+            existing.terminal_bytes.clone(),
+            existing.effect_started,
+            existing.replayable_rights_bytes.clone(),
+        )?;
+        if existing != expected {
+            return Err(RuntimeReleaseJournalError::Conflict);
+        }
+        if existing.terminal_bytes.is_some() {
+            return existing.into_persisted();
+        }
+        if !existing.effect_started {
+            return Err(RuntimeReleaseJournalError::Conflict);
+        }
+        let merged = merge_replayable_rights_decisions(
+            &decode_replayable_rights_decisions(&existing.replayable_rights_bytes)?,
+            replayable_rights_decisions,
+        )?;
+        let updated = StoreEntry::from_draft(
+            draft,
+            None,
+            true,
+            encode_replayable_rights_decisions(&merged)?,
+        )?;
+        if updated == existing {
+            return existing.into_persisted();
+        }
+        let bytes = encode_entry(&updated)?;
+        self.write_replace_entry(updated.slot_hash, &bytes)?;
+        updated.into_persisted()
     }
 
     pub fn load(
@@ -488,6 +544,7 @@ impl RuntimeReleaseJournal {
             draft,
             existing.terminal_bytes.clone(),
             existing.effect_started,
+            existing.replayable_rights_bytes.clone(),
         )?;
         if existing != expected {
             return Err(RuntimeReleaseJournalError::Conflict);
@@ -498,7 +555,8 @@ impl RuntimeReleaseJournal {
             }
             return existing.into_persisted();
         }
-        let terminal_entry = StoreEntry::from_draft(draft, Some(terminal_result.encode()?), true)?;
+        let terminal_entry =
+            StoreEntry::from_draft(draft, Some(terminal_result.encode()?), true, Vec::new())?;
         let bytes = encode_entry(&terminal_entry)?;
         self.write_replace_entry(terminal_entry.slot_hash, &bytes)?;
         terminal_entry.into_persisted()
@@ -708,6 +766,7 @@ struct StoreEntry {
     wallet_response_bytes: Vec<u8>,
     signed_operation_bytes: Vec<u8>,
     terminal_bytes: Option<Vec<u8>>,
+    replayable_rights_bytes: Vec<u8>,
     effect_started: bool,
 }
 
@@ -716,6 +775,7 @@ impl StoreEntry {
         draft: &RuntimeReleaseOperationDraft,
         terminal_bytes: Option<Vec<u8>>,
         effect_started: bool,
+        replayable_rights_bytes: Vec<u8>,
     ) -> Result<Self, RuntimeReleaseJournalError> {
         let operation_hash = draft.operation_hash()?;
         Ok(Self {
@@ -727,6 +787,7 @@ impl StoreEntry {
             wallet_response_bytes: draft.wallet_response_bytes().to_vec(),
             signed_operation_bytes: draft.signed_operation_bytes()?,
             terminal_bytes,
+            replayable_rights_bytes,
             effect_started,
         })
     }
@@ -760,9 +821,12 @@ impl StoreEntry {
             .as_deref()
             .map(RuntimeReleaseTerminalResult::decode)
             .transpose()?;
+        let replayable_rights_decisions =
+            decode_replayable_rights_decisions(&self.replayable_rights_bytes)?;
         Ok(PersistedRuntimeReleaseOperation {
             draft,
             terminal_result,
+            replayable_rights_decisions,
             provider_effect_started: self.effect_started,
         })
     }
@@ -775,6 +839,77 @@ fn push_blob(target: &mut Vec<u8>, bytes: Vec<u8>) -> Result<(), RuntimeReleaseJ
     target.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     target.extend_from_slice(&bytes);
     Ok(())
+}
+
+fn encode_replayable_rights_decisions(
+    replayable_rights_decisions: &[SignedNodeRightsDecisionV1],
+) -> Result<Vec<u8>, RuntimeReleaseJournalError> {
+    if replayable_rights_decisions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let count = u16::try_from(replayable_rights_decisions.len())
+        .map_err(|_| RuntimeReleaseJournalError::Unavailable)?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&count.to_be_bytes());
+    for decision in replayable_rights_decisions {
+        push_blob(&mut bytes, decision.canonical_bytes()?)?;
+    }
+    if bytes.len() > MAX_REPLAYABLE_RIGHTS_BYTES {
+        return Err(RuntimeReleaseJournalError::Unavailable);
+    }
+    Ok(bytes)
+}
+
+fn decode_replayable_rights_decisions(
+    bytes: &[u8],
+) -> Result<Vec<SignedNodeRightsDecisionV1>, RuntimeReleaseJournalError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if bytes.len() < 2 || bytes.len() > MAX_REPLAYABLE_RIGHTS_BYTES {
+        return Err(RuntimeReleaseJournalError::Corrupt);
+    }
+    let count = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    if count == 0 {
+        return Err(RuntimeReleaseJournalError::Corrupt);
+    }
+    let mut cursor = 2usize;
+    let mut decisions = Vec::with_capacity(count);
+    for _ in 0..count {
+        decisions.push(SignedNodeRightsDecisionV1::from_canonical_bytes(
+            take_blob(bytes, &mut cursor)?,
+        )?);
+    }
+    if cursor != bytes.len() {
+        return Err(RuntimeReleaseJournalError::Corrupt);
+    }
+    Ok(decisions)
+}
+
+fn merge_replayable_rights_decisions(
+    existing: &[SignedNodeRightsDecisionV1],
+    additional: &[SignedNodeRightsDecisionV1],
+) -> Result<Vec<SignedNodeRightsDecisionV1>, RuntimeReleaseJournalError> {
+    let mut merged = existing.to_vec();
+    for decision in additional {
+        let node_public_key = decision.statement().node_public_key();
+        if let Some(existing_decision) = merged.iter().find(|existing_decision| {
+            existing_decision.statement().node_public_key() == node_public_key
+        }) {
+            if existing_decision != decision {
+                return Err(RuntimeReleaseJournalError::Conflict);
+            }
+            continue;
+        }
+        merged.push(decision.clone());
+    }
+    merged.sort_by(|left, right| {
+        left.statement()
+            .node_public_key()
+            .as_bytes()
+            .cmp(right.statement().node_public_key().as_bytes())
+    });
+    Ok(merged)
 }
 
 fn take_blob<'a>(
@@ -812,6 +947,7 @@ fn encode_entry(entry: &StoreEntry) -> Result<Vec<u8>, RuntimeReleaseJournalErro
         || entry.wallet_response_bytes.len() > MAX_WALLET_RESPONSE_BYTES
         || entry.signed_operation_bytes.is_empty()
         || entry.signed_operation_bytes.len() > MAX_SIGNED_OPERATION_BYTES
+        || entry.replayable_rights_bytes.len() > MAX_REPLAYABLE_RIGHTS_BYTES
     {
         return Err(RuntimeReleaseJournalError::Unavailable);
     }
@@ -827,6 +963,8 @@ fn encode_entry(entry: &StoreEntry) -> Result<Vec<u8>, RuntimeReleaseJournalErro
         .map_err(|_| RuntimeReleaseJournalError::Unavailable)?;
     let terminal_len =
         u32::try_from(terminal_bytes.len()).map_err(|_| RuntimeReleaseJournalError::Unavailable)?;
+    let replayable_rights_len = u32::try_from(entry.replayable_rights_bytes.len())
+        .map_err(|_| RuntimeReleaseJournalError::Unavailable)?;
     let mut payload = Vec::with_capacity(
         STORE_HEADER_BYTES
             + entry.wallet_request_bytes.len()
@@ -844,10 +982,12 @@ fn encode_entry(entry: &StoreEntry) -> Result<Vec<u8>, RuntimeReleaseJournalErro
     payload.extend_from_slice(&wallet_response_len.to_be_bytes());
     payload.extend_from_slice(&operation_len.to_be_bytes());
     payload.extend_from_slice(&terminal_len.to_be_bytes());
+    payload.extend_from_slice(&replayable_rights_len.to_be_bytes());
     payload.extend_from_slice(&entry.wallet_request_bytes);
     payload.extend_from_slice(&entry.wallet_response_bytes);
     payload.extend_from_slice(&entry.signed_operation_bytes);
     payload.extend_from_slice(terminal_bytes);
+    payload.extend_from_slice(&entry.replayable_rights_bytes);
     if payload.len() + STORE_DIGEST_BYTES > MAX_STORE_FILE_BYTES {
         return Err(RuntimeReleaseJournalError::Unavailable);
     }
@@ -922,6 +1062,11 @@ fn decode_entry_for_slot(
             .try_into()
             .map_err(|_| RuntimeReleaseJournalError::Corrupt)?,
     ) as usize;
+    let replayable_rights_len = u32::from_be_bytes(
+        payload[153..157]
+            .try_into()
+            .map_err(|_| RuntimeReleaseJournalError::Corrupt)?,
+    ) as usize;
     if wallet_len == 0
         || wallet_len > MAX_WALLET_REQUEST_BYTES
         || wallet_response_len == 0
@@ -929,6 +1074,7 @@ fn decode_entry_for_slot(
         || operation_len == 0
         || operation_len > MAX_SIGNED_OPERATION_BYTES
         || terminal_len > MAX_TERMINAL_BYTES
+        || replayable_rights_len > MAX_REPLAYABLE_RIGHTS_BYTES
     {
         return Err(RuntimeReleaseJournalError::Corrupt);
     }
@@ -937,6 +1083,7 @@ fn decode_entry_for_slot(
         .and_then(|value| value.checked_add(wallet_response_len))
         .and_then(|value| value.checked_add(operation_len))
         .and_then(|value| value.checked_add(terminal_len))
+        .and_then(|value| value.checked_add(replayable_rights_len))
         .ok_or(RuntimeReleaseJournalError::Corrupt)?;
     if payload.len() != expected_len {
         return Err(RuntimeReleaseJournalError::Corrupt);
@@ -945,6 +1092,7 @@ fn decode_entry_for_slot(
     let wallet_response_start = wallet_start + wallet_len;
     let operation_start = wallet_response_start + wallet_response_len;
     let terminal_start = operation_start + operation_len;
+    let replayable_rights_start = terminal_start + terminal_len;
     Ok(StoreEntry {
         slot_hash,
         audit_request_id,
@@ -953,7 +1101,9 @@ fn decode_entry_for_slot(
         wallet_request_bytes: payload[wallet_start..wallet_response_start].to_vec(),
         wallet_response_bytes: payload[wallet_response_start..operation_start].to_vec(),
         signed_operation_bytes: payload[operation_start..terminal_start].to_vec(),
-        terminal_bytes: (terminal_len > 0).then(|| payload[terminal_start..].to_vec()),
+        terminal_bytes: (terminal_len > 0)
+            .then(|| payload[terminal_start..replayable_rights_start].to_vec()),
+        replayable_rights_bytes: payload[replayable_rights_start..].to_vec(),
         effect_started,
     })
 }

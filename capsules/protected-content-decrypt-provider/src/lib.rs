@@ -517,20 +517,9 @@ impl DecryptProvider {
                     }
                 };
                 wrap_transcript.extend_from_slice(decrypt_session_public.as_bytes());
-                let viewer_handle = match next_unique_handle(
-                    state.prepared_by_handle.keys(),
-                    state.viewer_by_handle.keys(),
-                    state.cancelled_prepared.keys(),
-                    state.closed_viewers.keys(),
-                ) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return typed_response(DecryptProviderResponseV1::new_failure(
-                            request.audit_request_id(),
-                            ProviderFailureCodeV1::BackendUnavailable,
-                        ));
-                    }
-                };
+                let viewer_handle = *request
+                    .prepared_recipient_handle()
+                    .expect("validated handle");
                 let response = match DecryptProviderResponseV1::new_viewer_session_opened(
                     request.audit_request_id(),
                     viewer_handle,
@@ -558,9 +547,6 @@ impl DecryptProvider {
                     wrap_transcript,
                     expires_at: operation.statement().expires_at(),
                 };
-                let prepared_handle = *request
-                    .prepared_recipient_handle()
-                    .expect("validated handle");
                 state.open_replays.insert(
                     audit_key,
                     OpenReplayEntry {
@@ -570,7 +556,7 @@ impl DecryptProvider {
                     },
                 );
                 state.viewer_by_handle.insert(viewer_handle, entry);
-                state.prepared_by_handle.remove(&prepared_handle);
+                state.prepared_by_handle.remove(&viewer_handle);
                 typed_ok(response)
             }
             DecryptProviderRequestOpV1::ReadViewerMediaPart => {
@@ -924,8 +910,8 @@ fn strip_runtime_invocation_envelope(
         "progress",
         "abi",
     ]
-        .into_iter()
-        .all(|key| envelope.contains_key(key))
+    .into_iter()
+    .all(|key| envelope.contains_key(key))
     {
         return Err(());
     }
@@ -1240,6 +1226,10 @@ mod tests {
             opened.status(),
             DecryptProviderResponseStatusV1::ViewerSessionOpened
         );
+        assert_eq!(
+            opened.viewer_session_handle().unwrap(),
+            prepared.prepared_recipient_handle().unwrap()
+        );
 
         let read_init = read_request(
             open_audit,
@@ -1409,6 +1399,10 @@ mod tests {
         let opened_a = typed_response(provider.handle_line_at(&open_line, NOW + 7));
         let opened_b = typed_response(provider.handle_line_at(&open_line, NOW + 8));
         assert_eq!(opened_a, opened_b);
+        assert_eq!(
+            opened_a.viewer_session_handle().unwrap(),
+            prepared_a.prepared_recipient_handle().unwrap()
+        );
 
         let conflicting_open = open_request(OpenRequestInputs {
             prepared_handle: [0x11; 32],

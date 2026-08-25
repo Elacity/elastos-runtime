@@ -38,10 +38,11 @@ pub use mint_journal::{
     RuntimeVerifiedContentAvailability,
 };
 pub use open::{
-    bind_buy, cancel_prepared_recipient, close_viewer_session, open_viewer_session,
-    prepare_recipient, read_viewer_media_part, reject_bearer_playback, RuntimeBuyReceipt,
-    RuntimeDecryptProvider, RuntimeOpenError, RuntimeOpenViewerSessionInput,
-    RuntimePreparedRecipient, RuntimeProtectedContentPurchaseIntent,
+    bind_buy, cancel_prepared_recipient, cancel_prepared_recipient_with_result_by_handle,
+    close_viewer_session, close_viewer_session_with_result, open_viewer_session, prepare_recipient,
+    read_viewer_media_part, reject_bearer_playback, RuntimeBuyReceipt, RuntimeDecryptProvider,
+    RuntimeOpenError, RuntimeOpenViewerSessionInput, RuntimePreparedRecipient,
+    RuntimePreparedRecipientCancelResult, RuntimeProtectedContentPurchaseIntent,
     RuntimePurchaseEffectAuthority, RuntimeVerifiedPurchaseEffect, RuntimeViewerMediaPart,
-    RuntimeViewerSession,
+    RuntimeViewerSession, RuntimeViewerSessionCloseResult,
 };

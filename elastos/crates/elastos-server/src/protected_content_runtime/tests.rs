@@ -5,6 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use base64::Engine as _;
@@ -26,7 +27,7 @@ use elastos_protected_content_runtime::{
     RuntimeOpenViewerSessionInput, RuntimeProtectedContentPurchaseIntent, RuntimeProviderCallError,
     RuntimePurchaseEffectAuthority, RuntimeReleaseCoordinator, RuntimeReleaseCoordinatorOutcome,
     RuntimeReleaseJournal, RuntimeReleaseTerminalResult, RuntimeRightsProvider,
-    RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect,
+    RuntimeSelectedProvider, RuntimeVerifiedPurchaseEffect, RuntimeViewerSession,
 };
 use elastos_runtime::provider::{
     bridge::ProviderConfig, CapsuleProvider, Provider, ProviderBridge, ProviderCarrierInvoker,
@@ -42,7 +43,7 @@ use k256::ecdsa::SigningKey as WalletSigningKey;
 use serde_json::{json, Value};
 use sha2::Digest as _;
 use sha3::Keccak256;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use x_wing::kem::{Decapsulator as _, KeyExport as _};
 use x_wing::TryKeyInit as _;
 
@@ -64,8 +65,8 @@ use super::{
     RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE,
     RUNTIME_CUSTODY_MINT_RECONCILIATION_REQUIRED_MESSAGE,
     RUNTIME_CUSTODY_MINT_TERMINAL_ABORT_MESSAGE, RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE,
-    RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE, RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE,
-    RUNTIME_PROVIDER_ID, RUNTIME_PURCHASE_SCHEMA_V1,
+    RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE, RUNTIME_PROVIDER_ID,
+    RUNTIME_PURCHASE_SCHEMA_V1,
 };
 use elastos_protected_content_contracts::{
     CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
@@ -98,7 +99,8 @@ use elastos_protected_content_provider_contracts::{
     ProtectProviderRequestV1, ProtectProviderResponseStatusV1, ProtectProviderResponseV1,
     ProtectionSessionNodeV1, ProviderFailureCodeV1, RightsProviderRequestV1,
     RightsProviderResponseV1, ValidatedClearFmp4MediaSessionLayoutV1,
-    ValidatedCustodyProviderRequestV1, ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
+    ValidatedCustodyProviderRequestV1, ValidatedDecryptProviderRequestV1,
+    ValidatedRightsProviderRequestV1, ViewerMediaPartSelectorV1,
     MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 
@@ -112,6 +114,10 @@ struct SequencedProvider {
     name: &'static str,
     requests: Mutex<Vec<Value>>,
     responses: Mutex<VecDeque<Result<Value, ProviderError>>>,
+}
+
+struct PrepareOnlyCleanupDecryptProvider {
+    requests: Mutex<Vec<Value>>,
 }
 
 struct ProcessChainEvidenceProvider {
@@ -445,6 +451,18 @@ impl SequencedProvider {
     }
 }
 
+impl PrepareOnlyCleanupDecryptProvider {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    async fn requests(&self) -> Vec<Value> {
+        self.requests.lock().await.clone()
+    }
+}
+
 impl ProcessChainEvidenceProvider {
     fn new(expected_request: RightsProviderRequestV1, has_access: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -456,6 +474,80 @@ impl ProcessChainEvidenceProvider {
 
     async fn requests(&self) -> Vec<Value> {
         self.requests.lock().await.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for PrepareOnlyCleanupDecryptProvider {
+    async fn handle(&self, _request: ResourceRequest) -> Result<ResourceResponse, ProviderError> {
+        Err(ProviderError::Provider(
+            "prepare-only cleanup decrypt provider is invoke-only".to_string(),
+        ))
+    }
+
+    fn schemes(&self) -> Vec<&'static str> {
+        vec!["decrypt"]
+    }
+
+    fn name(&self) -> &'static str {
+        "prepare-only-cleanup-decrypt-provider"
+    }
+
+    async fn send_raw(&self, request: &Value) -> Result<Value, ProviderError> {
+        self.requests.lock().await.push(request.clone());
+        let mut inner_request = request.clone();
+        inner_request
+            .as_object_mut()
+            .ok_or_else(|| ProviderError::Provider("invalid decrypt request".to_string()))?
+            .remove("_runtime_invocation");
+        let validated = ValidatedDecryptProviderRequestV1::decode_and_validate_at(
+            &serde_json::to_vec(&inner_request)
+                .map_err(|_| ProviderError::Provider("invalid decrypt request".to_string()))?,
+            derived_device_runtime_issuer(0x21),
+            crate::auth::now_ts(),
+        )
+        .map_err(|_| ProviderError::Provider("invalid decrypt request".to_string()))?;
+        match request.get("op").and_then(Value::as_str) {
+            Some("prepare_recipient") => Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_prepared_recipient(
+                        validated.audit_request_id(),
+                        opaque_handle(0x71),
+                        recipient_public_key(0x30),
+                        &recipient_identity(0x30),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+            Some("close_viewer_session") => Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_viewer_session_already_absent(
+                        validated.audit_request_id(),
+                        *validated.viewer_session_handle().map_err(|_| {
+                            ProviderError::Provider("missing viewer handle".to_string())
+                        })?,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+            Some("cancel_prepared_recipient") => Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_cancelled_prepared_recipient(
+                        validated.audit_request_id(),
+                        *validated.prepared_recipient_handle().map_err(|_| {
+                            ProviderError::Provider("missing prepared handle".to_string())
+                        })?,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+            _ => Err(ProviderError::Provider(
+                "unsupported decrypt operation".to_string(),
+            )),
+        }
     }
 }
 
@@ -1892,6 +1984,98 @@ fn persist_runtime_custody_purchase_for_mint(
     write_owner_only_bytes(
         &runtime_purchase_path(data_dir, principal_id, mint.draft().mint_id()),
         &serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    record
+}
+
+#[cfg(unix)]
+fn persist_runtime_custody_active_viewer_for_purchase(
+    data_dir: &Path,
+    mint: &PersistedRuntimeMint,
+    purchase: &RuntimeCustodyPurchaseRecord,
+    proof_binding_id: &str,
+    session_id: &str,
+    grant_id: &str,
+    handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    expires_at: u64,
+) -> RuntimeViewerSession {
+    let binding = super::derive_runtime_custody_session_binding(
+        &purchase.principal_id,
+        &purchase.profile_did,
+        proof_binding_id,
+        session_id,
+        grant_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap();
+    let session = RuntimeViewerSession::from_persisted_parts(
+        digest(0x91),
+        handle,
+        mint.draft().encrypted_content().clone(),
+        RightsActionV1::View,
+        expires_at,
+    )
+    .unwrap();
+    let record = super::RuntimeCustodyViewerRecord::from_active_session(
+        &purchase.principal_id,
+        &purchase.profile_did,
+        mint.draft().mint_id(),
+        &purchase.content_id,
+        binding,
+        &session,
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    super::persist_runtime_custody_viewer_record(
+        data_dir,
+        &purchase.principal_id,
+        mint.draft().mint_id(),
+        &record,
+    )
+    .unwrap();
+    session
+}
+
+#[cfg(unix)]
+fn persist_runtime_custody_open_pending_viewer_for_purchase(
+    data_dir: &Path,
+    mint: &PersistedRuntimeMint,
+    purchase: &RuntimeCustodyPurchaseRecord,
+    proof_binding_id: &str,
+    session_id: &str,
+    grant_id: &str,
+    handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+    expires_at: u64,
+) -> super::RuntimeCustodyViewerRecord {
+    let binding = super::derive_runtime_custody_session_binding(
+        &purchase.principal_id,
+        &purchase.profile_did,
+        proof_binding_id,
+        session_id,
+        grant_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap();
+    let record = super::RuntimeCustodyViewerRecord::from_open_pending(
+        super::RuntimeCustodyOpenPendingInput {
+            principal_id: &purchase.principal_id,
+            profile_did: &purchase.profile_did,
+            mint_id: mint.draft().mint_id(),
+            content_id: &purchase.content_id,
+            runtime_session_binding: binding,
+            audit_request_id: digest(0x91),
+            viewer_session_handle: handle,
+            expires_at,
+            now: crate::auth::now_ts(),
+        },
+    )
+    .unwrap();
+    super::persist_runtime_custody_viewer_record(
+        data_dir,
+        &purchase.principal_id,
+        mint.draft().mint_id(),
+        &record,
     )
     .unwrap();
     record
@@ -3699,6 +3883,127 @@ fn runtime_custody_composition_rejects_unsafe_or_symlinked_paths() {
         .expect("expected hard-link rejection")
         .to_string()
         .contains("hard-linked"));
+}
+
+#[cfg(unix)]
+#[test]
+fn write_owner_only_bytes_creates_owner_only_atomic_runtime_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let path = data_dir.join("protected-content/runtime-open/demo/viewers/state.json");
+    write_owner_only_bytes(&path, b"{\"state\":\"active\"}").unwrap();
+
+    assert_eq!(fs::read(&path).unwrap(), b"{\"state\":\"active\"}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(path.parent().unwrap().parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_owner_only_bytes_failed_replace_preserves_previous_runtime_storage_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let path = data_dir.join("protected-content/runtime-open/demo/viewers/state.json");
+    write_owner_only_bytes(&path, b"{\"state\":\"closed\"}").unwrap();
+
+    let parent = path.parent().unwrap();
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o500)).unwrap();
+    let error = write_owner_only_bytes(&path, b"{\"state\":\"active\"}")
+        .err()
+        .expect("expected atomic write failure");
+    assert!(
+        error.to_string().contains("Permission denied") || error.to_string().contains("storage")
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"{\"state\":\"closed\"}");
+    let entries = fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec!["state.json".to_string()]);
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_viewer_record_load_rejects_oversized_serialized_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let viewer_path = super::runtime_viewer_path(
+        &data_dir,
+        "person:local:oversized-viewer-record",
+        digest(0x61),
+    );
+    write_owner_only_bytes(&viewer_path, &vec![b'x'; (64 * 1024) + 1]).unwrap();
+
+    let error = super::load_runtime_custody_viewer_record(
+        &data_dir,
+        "person:local:oversized-viewer-record",
+        digest(0x61),
+    )
+    .err()
+    .expect("expected oversized viewer record rejection");
+    assert!(error
+        .to_string()
+        .contains("Runtime custody viewer session is unavailable"));
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_custody_viewer_record_persist_rejects_oversized_serialized_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let mut record = super::RuntimeCustodyViewerRecord::from_active_session(
+        "person:local:oversized-viewer-record",
+        "did:key:z6MkoD3Yk6TBGj1jiL1pDkV8JrjT4bQmQGq7nD5x7WQy3mYQ",
+        digest(0x62),
+        "content:1234",
+        RuntimeSessionBindingV1::new(digest(0x63)).unwrap(),
+        &RuntimeViewerSession::from_persisted_parts(
+            digest(0x64),
+            opaque_handle(0x65),
+            media_identity(0x66).encrypted_content().clone(),
+            RightsActionV1::View,
+            crate::auth::now_ts() + 60,
+        )
+        .unwrap(),
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    record.content_id = format!("content:{}", "a".repeat((64 * 1024) + 1));
+
+    let error = super::persist_runtime_custody_viewer_record(
+        &data_dir,
+        "person:local:oversized-viewer-record",
+        digest(0x62),
+        &record,
+    )
+    .err()
+    .expect("expected oversized viewer record rejection");
+    assert!(error
+        .to_string()
+        .contains("Runtime custody viewer session is unavailable"));
 }
 
 #[cfg(unix)]
@@ -7149,7 +7454,7 @@ impl Provider for LibraryReleaseWalletProvider {
 }
 
 #[cfg(unix)]
-fn write_device_key(data_dir: &Path, seed: u8) {
+pub(crate) fn write_device_key(data_dir: &Path, seed: u8) {
     let identity = data_dir.join("identity");
     fs::create_dir_all(&identity).unwrap();
     let path = identity.join("device.key");
@@ -7166,612 +7471,6 @@ fn derived_device_key_for_seed(seed: u8) -> (SigningKey, String) {
 fn derived_device_runtime_issuer(seed: u8) -> RuntimeOperationIssuerKeyV1 {
     let (key, _) = derived_device_key_for_seed(seed);
     RuntimeOperationIssuerKeyV1::new(key.verifying_key().to_bytes()).unwrap()
-}
-
-#[cfg(unix)]
-async fn write_library_object_bytes(
-    registry: &ProviderRegistry,
-    principal_id: &str,
-    uri: &str,
-    bytes: &[u8],
-) {
-    let response = registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "write",
-                "principal_id": principal_id,
-                "uri": uri,
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response["status"], "ok", "{response}");
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn runtime_custody_library_publish_protects_mints_and_records_identity_only_facts() {
-    let harness = publish_library_runtime_custody_harness().await;
-    let publish = harness.publish.clone();
-    assert_eq!(publish["status"], "ok", "{publish}");
-    let cid = publish["data"]["cid"].as_str().unwrap().to_string();
-    let content_id = publish["data"]["content_security"]["content_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let mint_id = publish["data"]["content_security"]["mint_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        publish["data"]["content_security"]["published_payload"],
-        "runtime_custody_encrypted"
-    );
-    assert_eq!(publish["data"]["object"]["published_cid"], cid);
-    assert_eq!(
-        publish["data"]["object"]["metadata"]["protected_content"]["content_id"],
-        content_id
-    );
-    assert!(!publish.to_string().contains("sealed"));
-    assert!(!publish.to_string().contains("cek"));
-
-    let status = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "status",
-                "principal_id": harness.creator.as_str(),
-                "uri": harness.uri.as_str(),
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(status["status"], "ok", "{status}");
-    assert_eq!(status["data"]["object"]["published_cid"], cid);
-    assert_eq!(
-        status["data"]["published"]["content_security"]["content_id"],
-        content_id
-    );
-    assert_eq!(
-        status["data"]["published"]["content_security"]["mint_id"],
-        mint_id
-    );
-    assert!(status["data"]["published"]["content_security"]
-        .get("sealed_object")
-        .is_none());
-
-    let share = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "share",
-                "principal_id": harness.creator.as_str(),
-                "uri": harness.uri.as_str(),
-                "recipients": ["did:key:zShare"],
-                "policy": "public",
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(share["status"], "error");
-    assert!(
-        share["message"]
-            .as_str()
-            .unwrap()
-            .contains("Runtime custody sharing is not available yet"),
-        "{share}"
-    );
-
-    harness.registry.unregister(PROTECT_PROVIDER_ID).await;
-    let replay = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "publish",
-                "principal_id": harness.creator.as_str(),
-                "uri": harness.uri.as_str(),
-                "protection": {
-                    "mode": "runtime_custody",
-                    "mime_type": MEDIA_MIME_TYPE_V1,
-                    "codecs": MEDIA_CODECS_V1,
-                    "wallet_account_id": "wallet-account-1",
-                    "copies": "0x1",
-                    "price": "0x5",
-                },
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(replay["status"], "ok", "{replay}");
-    assert_eq!(replay["data"]["cid"], cid);
-    assert_eq!(replay["data"]["content_security"]["content_id"], content_id);
-    assert_eq!(replay["data"]["content_security"]["mint_id"], mint_id);
-
-    let request_id = library_publish_request_id(&RuntimeCustodyLibraryPublishInput {
-        object_uri: harness.uri.clone(),
-        principal_id: harness.creator.clone(),
-        mime_type: MEDIA_MIME_TYPE_V1.to_string(),
-        codecs: MEDIA_CODECS_V1.to_string(),
-        wallet_account_id: "wallet-account-1".to_string(),
-        copies: "0x1".to_string(),
-        price: "0x5".to_string(),
-        clear_init_segment: harness.clear_init.clone(),
-        clear_segments: harness.clear_segments.clone(),
-        source_storage: "protected_principal_root".to_string(),
-    });
-    let journal = runtime_mint_journal(&harness.data_dir);
-    let intent = journal.load_intent(request_id).unwrap();
-    assert_eq!(intent.protect_state_label(), "completed");
-    assert_eq!(
-        hex::encode(intent.completed_mint_id().unwrap().as_bytes()),
-        mint_id
-    );
-
-    let mint_root = harness.data_dir.join("protected-content/runtime-mint");
-    assert!(mint_root.is_dir());
-    assert!(!any_file_contains(&mint_root, &harness.clear_init));
-    assert!(!any_file_contains(&mint_root, &harness.clear_segments[0]));
-    let records_root = elastos_common::localhost::rooted_localhost_fs_path(
-        &harness.data_dir,
-        &format!(
-            "{}/.AppData/LocalHost/.Runtime/Library/Published",
-            crate::auth::principal_localhost_root(&harness.creator)
-        )
-        .strip_prefix("localhost://")
-        .unwrap(),
-    )
-    .unwrap();
-    if records_root.exists() {
-        assert!(!any_file_contains(&records_root, &harness.clear_init));
-        assert!(!any_file_contains(
-            &records_root,
-            &harness.clear_segments[0]
-        ));
-    }
-}
-
-#[cfg(unix)]
-struct LibraryRuntimeCustodyHarness {
-    _temp: tempfile::TempDir,
-    _nodes_temp: Option<tempfile::TempDir>,
-    data_dir: PathBuf,
-    registry: Arc<ProviderRegistry>,
-    creator: String,
-    buyer: String,
-    uri: String,
-    publish: Value,
-    mint_id: String,
-    cid: String,
-    content_id: String,
-    clear_init: Vec<u8>,
-    clear_segments: Vec<Vec<u8>>,
-}
-
-#[cfg(unix)]
-async fn publish_library_runtime_custody_harness() -> LibraryRuntimeCustodyHarness {
-    let protect_binary = required_test_binary_path(TEST_PROTECT_PROVIDER_BIN_ENV);
-    let temp = tempfile::tempdir().unwrap();
-    let data_dir = temp.path().join("data");
-    owner_only_dir(&data_dir);
-    write_device_key(&data_dir, 0x21);
-    let now = crate::auth::now_ts();
-    let epoch = signed_custody_epoch();
-    let pool = signed_custody_pool_for_epoch(&epoch, (now.saturating_sub(60), now + 3_600));
-    let authorization =
-        signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), &epoch);
-    write_owner_only_custody_composition_config(
-        &data_dir,
-        &RuntimeCustodyCompositionConfigFile {
-            schema: CUSTODY_COMPOSITION_SCHEMA_V1.to_string(),
-            expected_policy_authority_base64: raw_b64_32(
-                SigningKey::from_bytes(&[0x71; 32])
-                    .verifying_key()
-                    .to_bytes(),
-            ),
-            expected_committee_authorization_identity_base64: canonical_b64(
-                &authorization.authorization_identity().unwrap(),
-            ),
-            signed_pool_base64: canonical_b64(&pool),
-            signed_epoch_base64: canonical_b64(&epoch),
-            signed_committee_authorization_base64: canonical_b64(&authorization),
-            routes: library_publish_test_routes(&epoch),
-        },
-    );
-
-    let registry = Arc::new(ProviderRegistry::new());
-    register_protect_provider(&registry, &protect_binary)
-        .await
-        .unwrap();
-    registry
-        .register_sub_provider(
-            CUSTODY_PROVIDER_ID,
-            Arc::new(LibraryMintCustodyProvider {
-                expected_issuer: derived_device_runtime_issuer(0x21),
-                nodes: epoch
-                    .statement()
-                    .nodes()
-                    .iter()
-                    .map(|node| node.node_public_key())
-                    .collect(),
-            }),
-        )
-        .await
-        .unwrap();
-    registry
-        .set_carrier_invoker(Arc::new(LoopbackCustodyCarrierInvoker {
-            registry: Arc::downgrade(&registry),
-        }))
-        .await;
-    registry
-        .register_sub_provider(CHAIN_PROVIDER_ID, Arc::new(LibraryMintChainPolicyProvider))
-        .await
-        .unwrap();
-    let (device_key, _) = derived_device_key_for_seed(0x21);
-    let content = ContentAvailabilityTestProvider::with_signing_key(
-        device_key,
-        ContentAvailabilityTestConfig {
-            checked_at: crate::auth::now_ts(),
-            ..ContentAvailabilityTestConfig::accepted()
-        },
-    );
-    registry
-        .register_sub_provider("content", content)
-        .await
-        .unwrap();
-    registry
-        .register_sub_provider(
-            "object",
-            Arc::new(crate::library::ObjectProvider::new(
-                data_dir.clone(),
-                Arc::downgrade(&registry),
-            )),
-        )
-        .await
-        .unwrap();
-
-    let creator = "person:local:runtime-custody-slice-d-creator";
-    let buyer = "person:local:runtime-custody-slice-d-buyer";
-    crate::auth::store_test_principal_root_protection(&data_dir, creator);
-    crate::auth::store_test_principal_root_protection(&data_dir, buyer);
-    let root = crate::auth::principal_localhost_root(creator);
-    let uri = format!("{root}/Documents/protected-clear-media");
-    let (clear_init, clear_segments) = clear_media_components(0x41);
-    write_library_object_bytes(&registry, creator, &format!("{uri}/init.mp4"), &clear_init).await;
-    for (index, segment) in clear_segments.iter().enumerate() {
-        write_library_object_bytes(
-            &registry,
-            creator,
-            &format!("{uri}/segments/{index:08}.m4s"),
-            segment,
-        )
-        .await;
-    }
-    let publish = registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "publish",
-                "principal_id": creator,
-                "uri": uri,
-                "protection": {
-                    "mode": "runtime_custody",
-                    "mime_type": MEDIA_MIME_TYPE_V1,
-                    "codecs": MEDIA_CODECS_V1,
-                },
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(publish["status"], "ok", "{publish}");
-    LibraryRuntimeCustodyHarness {
-        _temp: temp,
-        _nodes_temp: None,
-        data_dir,
-        registry,
-        creator: creator.to_string(),
-        buyer: buyer.to_string(),
-        uri,
-        publish: publish.clone(),
-        mint_id: publish["data"]["content_security"]["mint_id"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-        cid: publish["data"]["cid"].as_str().unwrap().to_string(),
-        content_id: publish["data"]["content_security"]["content_id"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-        clear_init,
-        clear_segments,
-    }
-}
-
-#[cfg(unix)]
-fn wallet_buy_bundle_for_mint(
-    mint: &PersistedRuntimeMint,
-    principal_id: &str,
-    now: u64,
-) -> (String, String, Value) {
-    wallet_buy_bundle_for_mint_with_profile(
-        mint,
-        principal_id,
-        now,
-        ProfileIdentityV1::from_public_key_bytes(
-            SigningKey::from_bytes(&[0x26; 32])
-                .verifying_key()
-                .to_bytes(),
-        )
-        .unwrap(),
-    )
-}
-
-#[cfg(unix)]
-fn wallet_buy_bundle_for_mint_with_profile(
-    mint: &PersistedRuntimeMint,
-    principal_id: &str,
-    now: u64,
-    profile: ProfileIdentityV1,
-) -> (String, String, Value) {
-    let binding = ProtectedContentBindingV1::new(
-        mint.draft().encrypted_content().clone(),
-        mint.draft().key_envelope().clone(),
-        mint.draft().policy().clone(),
-        profile,
-        wallet(7),
-        RuntimeSessionBindingV1::new(digest(0x66)).unwrap(),
-    )
-    .unwrap();
-    let request = RightsRequestV1::new(
-        binding,
-        RightsActionV1::View,
-        recipient_identity(0x30),
-        now.saturating_sub(5),
-        now + 180,
-        ReplayNonce16::new([0x55; 16]),
-    )
-    .unwrap();
-    let key = WalletSigningKey::from_slice(&[7; 32]).unwrap();
-    let (signature, recovery_id) = key
-        .sign_prehash_recoverable(&elastos_auth::ethereum_signed_message_hash(
-            &request.canonical_bytes().unwrap(),
-        ))
-        .unwrap();
-    let mut signature_bytes = signature.to_bytes().to_vec();
-    signature_bytes.push(recovery_id.to_byte());
-    let signed = WalletSignedRightsRequestV1::new(request.clone(), signature_bytes).unwrap();
-    let context = VerifiedWalletInvocationContext::new(
-        principal_id,
-        "runtime-session:alpha",
-        Some("proof:alpha".to_string()),
-        "grant:alpha",
-        "runtime",
-        "launch:alpha",
-    )
-    .unwrap();
-    let account_id = "wallet-account-alpha";
-    let approval_request_id = "wallet-request:11111111111111111111111111111111";
-    let wallet_request = WalletProviderRequestV2::new(
-        &context,
-        approval_request_id,
-        now,
-        now + 120,
-        WalletProviderOperationV2::RequestProtectedContentRightsSignature {
-            account_id: account_id.to_string(),
-            canonical_rights_request_hex: hex::encode(request.canonical_bytes().unwrap()),
-            reason: "Buy protected content".to_string(),
-        },
-    )
-    .unwrap();
-    let result = ProtectedContentRightsSignatureResultV1::new(
-        account_id,
-        wallet_address_hex(wallet(7)),
-        hex::encode(signed.canonical_bytes().unwrap()),
-    )
-    .unwrap();
-    let wallet_response = WalletProviderResponseV2::for_request(
-        &wallet_request,
-        WalletResultV2::Ok {
-            data: serde_json::to_value(result).unwrap(),
-        },
-    );
-    (
-        hex::encode(serde_json::to_vec(&wallet_request).unwrap()),
-        hex::encode(serde_json::to_vec(&wallet_response).unwrap()),
-        json!({
-            "account_id": account_id,
-            "address": wallet_address_hex(wallet(7)),
-            "approval_request_id": approval_request_id,
-            "chain_namespace": "eip155:20",
-            "network": "esc-mainnet",
-            "to": "0x2222222222222222222222222222222222222222",
-            "value": "0x1",
-            "data": "0x",
-            "wallet_binding": {
-                "kind": "managed_signed",
-                "signed_transaction_sha256": format!("sha256:{}", hex::encode([0xab; 32])),
-            },
-            "transaction_hash": format!("0x{}", hex::encode([0xaa; 32])),
-            "chain_observation": {
-                "schema": "elastos.chain.broadcast_receipt/v1",
-                "network": "esc-mainnet",
-            },
-            "confirmed_at": now,
-        }),
-    )
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn runtime_custody_library_buy_is_denied_before_purchase() {
-    let harness = publish_library_runtime_custody_harness().await;
-    let denied = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "buy",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(denied["status"], "error", "{denied}");
-    assert!(
-        denied["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE),
-        "{denied}"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn runtime_custody_library_buy_binds_wallet_chain_and_marks_listing_buyer_owned() {
-    let harness = publish_library_runtime_custody_harness().await;
-    let mint = runtime_mint_journal(&harness.data_dir)
-        .load(Digest32::new(
-            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
-        ))
-        .unwrap();
-    let now = crate::auth::now_ts();
-    let (wallet_request_hex, wallet_response_hex, purchase) =
-        wallet_buy_bundle_for_mint(&mint, &harness.buyer, now);
-    let buy = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "buy",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "wallet_request_hex": wallet_request_hex,
-                "wallet_response_hex": wallet_response_hex,
-                "purchase": purchase,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(buy["status"], "ok", "{buy}");
-    assert_eq!(buy["data"]["mint_id"], harness.mint_id);
-    assert_eq!(buy["data"]["content_id"], harness.content_id);
-    assert_eq!(buy["data"]["cid"], harness.cid);
-    assert_eq!(buy["data"]["availability"]["status"], "buyer_owned");
-    assert!(!buy.to_string().contains("sealed"));
-    assert!(!buy.to_string().contains("cek"));
-    assert!(!buy.to_string().contains("play_url"));
-
-    let listings = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "list_runtime_custody",
-                "principal_id": harness.buyer,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(listings["status"], "ok", "{listings}");
-    let listing = listings["data"]["listings"]
-        .as_array()
-        .and_then(|items| items.first())
-        .expect("published listing");
-    assert_eq!(listing["mint_id"], harness.mint_id);
-    assert_eq!(listing["publisher_principal_id"], harness.creator);
-    assert_eq!(listing["buyer_principal_id"], harness.buyer);
-    assert_eq!(listing["availability"]["status"], "buyer_owned");
-    assert!(!listings.to_string().contains("sealed"));
-    assert!(!listings
-        .to_string()
-        .contains(&hex::encode(&harness.clear_init)));
-
-    let stranger_listings = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "list_runtime_custody",
-                "principal_id": "person:local:runtime-custody-slice-d-stranger",
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(stranger_listings["status"], "ok", "{stranger_listings}");
-    assert!(
-        stranger_listings["data"]["listings"]
-            .as_array()
-            .map(Vec::is_empty)
-            .unwrap_or(false),
-        "{stranger_listings}"
-    );
-
-    let second_buy = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "buy",
-                "principal_id": "person:local:runtime-custody-slice-d-stranger",
-                "mint_id": harness.mint_id,
-                "wallet_request_hex": wallet_request_hex,
-                "wallet_response_hex": wallet_response_hex,
-                "purchase": purchase,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(second_buy["status"], "error", "{second_buy}");
-    assert!(
-        second_buy["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(RUNTIME_CUSTODY_PURCHASE_DENIED_MESSAGE),
-        "{second_buy}"
-    );
-
-    let purchases_root = harness.data_dir.join("protected-content/runtime-purchases");
-    if purchases_root.exists() {
-        assert!(!any_file_contains(&purchases_root, &harness.clear_init));
-        assert!(!any_file_contains(
-            &purchases_root,
-            &harness.clear_segments[0]
-        ));
-    }
-    let mint_root = harness.data_dir.join("protected-content/runtime-mint");
-    assert!(!any_file_contains(&mint_root, &harness.clear_init));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn runtime_custody_library_open_is_denied_before_purchase() {
-    let harness = publish_library_runtime_custody_harness().await;
-    let denied = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "open_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(denied["status"], "error", "{denied}");
-    assert!(
-        denied["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE),
-        "{denied}"
-    );
 }
 
 #[cfg(unix)]
@@ -7950,139 +7649,1648 @@ async fn runtime_custody_release_wallet_uses_fresh_binding_per_session() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn runtime_custody_library_open_after_purchase_fails_closed_without_profile() {
-    let harness = publish_library_runtime_custody_harness().await;
+async fn runtime_custody_viewer_open_replays_exact_active_session_without_provider_effects() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-replay";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
-        .load(Digest32::new(
-            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x21),
+        crate::auth::now_ts() + 60,
+    );
+    let open = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            proof_binding_id: Some(proof_binding_id),
+            session_id: Some("runtime-session:alpha".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        open["viewer_session_handle"].as_str().unwrap(),
+        hex::encode(session.viewer_session_handle())
+    );
+    assert_eq!(open["expires_at"].as_u64(), Some(session.expires_at()));
+    assert!(harness.content_provider.requests().await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_open_rejects_substituted_session_without_provider_effects() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-replay";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x21),
+        crate::auth::now_ts() + 60,
+    );
+    let err = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            proof_binding_id: Some(proof_binding_id),
+            session_id: Some("runtime-session:beta".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains(RUNTIME_CUSTODY_OPEN_DENIED_MESSAGE));
+    assert!(harness.content_provider.requests().await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_read_close_and_replay_settle_exactly() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-read-close";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x21),
+        crate::auth::now_ts() + 60,
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+    let read_request = DecryptProviderRequestV1::new_read_viewer_media_part(
+        RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+        *session.viewer_session_handle(),
+        ViewerMediaPartSelectorV1::init(),
+    )
+    .unwrap();
+    let read_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(
+            serde_json::to_value(
+                DecryptProviderResponseV1::new_viewer_media_part(
+                    RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+                    *session.viewer_session_handle(),
+                    ViewerMediaPartSelectorV1::init(),
+                    vec![0x10, 0x11, 0x12],
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+    );
+    registry
+        .register_sub_provider("decrypt", read_provider.clone())
+        .await
+        .unwrap();
+    let read = super::read_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(read["data"].as_str().unwrap())
+            .unwrap(),
+        vec![0x10, 0x11, 0x12]
+    );
+    assert_eq!(read_provider.requests().await.len(), 1);
+    assert_exact_runtime_decrypt_invocation(
+        &read_provider.requests().await[0],
+        "read_viewer_media_part",
+        &serde_json::to_value(&read_request).unwrap(),
+    );
+
+    registry.unregister_sub_provider("decrypt").await.unwrap();
+    let close_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(
+            serde_json::to_value(
+                DecryptProviderResponseV1::new_closed_viewer_session(
+                    RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+                    *session.viewer_session_handle(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+    );
+    registry
+        .register_sub_provider("decrypt", close_provider.clone())
+        .await
+        .unwrap();
+    let close = super::close_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(close["close_result"], "closed");
+    let record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::Closed
+    );
+    let closed_record_bytes = fs::read(super::runtime_viewer_path(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    ))
+    .unwrap();
+    registry.unregister_sub_provider("decrypt").await.unwrap();
+
+    let replay = super::close_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["close_result"], "already_absent");
+    let record_bytes = fs::read(super::runtime_viewer_path(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    ))
+    .unwrap();
+    assert_eq!(record_bytes, closed_record_bytes);
+    let replay_record: super::RuntimeCustodyViewerRecord =
+        serde_json::from_slice(&record_bytes).unwrap();
+    assert_eq!(
+        replay_record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::Closed
+    );
+    let record_json = String::from_utf8(record_bytes).unwrap();
+    assert!(!record_json.contains("proof:alpha"));
+    assert!(!record_json.contains("runtime-session:alpha"));
+    assert!(!record_json.contains("grant:alpha"));
+    assert!(!record_json.contains("http://"));
+    assert!(!record_json.contains("encrypted_content_base64"));
+    assert!(!record_json.contains("\"action\""));
+    assert!(!record_json.contains("\"clear_media_part\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_close_rejects_wrong_principal_without_provider_effects() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-close-owner";
+    let wrong_principal_id = "person:local:runtime-custody-viewer-close-other";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x29),
+        crate::auth::now_ts() + 60,
+    );
+    let record_path =
+        super::runtime_viewer_path(&harness.data_dir, principal_id, mint.draft().mint_id());
+    let before = fs::read(&record_path).unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(serde_json::json!({"schema":"unused"})),
+    );
+    registry
+        .register_sub_provider("decrypt", decrypt_provider.clone())
+        .await
+        .unwrap();
+
+    let error = super::close_runtime_custody_viewer(
+        &harness.data_dir,
+        registry,
+        wrong_principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+    )
+    .await
+    .err()
+    .expect("expected wrong-principal close rejection");
+    assert!(error
+        .to_string()
+        .contains("Runtime custody viewer session is unavailable"));
+    assert!(decrypt_provider.requests().await.is_empty());
+    assert_eq!(fs::read(&record_path).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_close_retains_cleanup_pending_until_exact_settlement() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-close-reconcile";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x21),
+        crate::auth::now_ts() + 60,
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+    let pending_provider = SequencedProvider::new(
+        "decrypt",
+        vec![Err(ProviderError::Provider("timeout".to_string()))],
+    );
+    registry
+        .register_sub_provider("decrypt", pending_provider.clone())
+        .await
+        .unwrap();
+    let err = super::close_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+    )
+    .await
+    .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE));
+    let pending = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        pending.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::CleanupPending
+    );
+
+    registry.unregister_sub_provider("decrypt").await.unwrap();
+    let absent_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(
+            serde_json::to_value(
+                DecryptProviderResponseV1::new_viewer_session_already_absent(
+                    RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+                    *session.viewer_session_handle(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+    );
+    registry
+        .register_sub_provider("decrypt", absent_provider)
+        .await
+        .unwrap();
+    let closed = super::close_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed["close_result"], "already_absent");
+    let settled = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        settled.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_open_pending_reconciliation_settles_no_dispatch_with_exact_close_and_cancel(
+) {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-pending-no-dispatch";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let record = persist_runtime_custody_open_pending_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x51),
+        crate::auth::now_ts() + 60,
+    );
+    let audit_request_id = RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap();
+    let close_request =
+        DecryptProviderRequestV1::new_close_viewer_session(audit_request_id, opaque_handle(0x51))
+            .unwrap();
+    let cancel_request = DecryptProviderRequestV1::new_cancel_prepared_recipient(
+        audit_request_id,
+        opaque_handle(0x51),
+    )
+    .unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt = SequencedProvider::new(
+        "decrypt",
+        vec![
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_viewer_session_already_absent(
+                        audit_request_id,
+                        opaque_handle(0x51),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_cancelled_prepared_recipient(
+                        audit_request_id,
+                        opaque_handle(0x51),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+        ],
+    );
+    registry
+        .register_sub_provider("decrypt", decrypt.clone())
+        .await
+        .unwrap();
+
+    let settled = super::settle_runtime_custody_viewer_cleanup(
+        &harness.data_dir,
+        registry,
+        principal_id,
+        mint.draft().mint_id(),
+        record,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        settled.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+    let requests = decrypt.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_exact_runtime_decrypt_invocation(
+        &requests[0],
+        "close_viewer_session",
+        &serde_json::to_value(&close_request).unwrap(),
+    );
+    assert_exact_runtime_decrypt_invocation(
+        &requests[1],
+        "cancel_prepared_recipient",
+        &serde_json::to_value(&cancel_request).unwrap(),
+    );
+    let persisted = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        persisted.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+    assert!(harness.content_provider.requests().await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_open_pending_reconciliation_settles_response_loss_with_exact_close_and_cancel(
+) {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-pending-response-loss";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let record = persist_runtime_custody_open_pending_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x52),
+        crate::auth::now_ts() + 60,
+    );
+    let audit_request_id = RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap();
+    let close_request =
+        DecryptProviderRequestV1::new_close_viewer_session(audit_request_id, opaque_handle(0x52))
+            .unwrap();
+    let cancel_request = DecryptProviderRequestV1::new_cancel_prepared_recipient(
+        audit_request_id,
+        opaque_handle(0x52),
+    )
+    .unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt = SequencedProvider::new(
+        "decrypt",
+        vec![
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_closed_viewer_session(
+                        audit_request_id,
+                        opaque_handle(0x52),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_prepared_recipient_already_absent(
+                        audit_request_id,
+                        opaque_handle(0x52),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+        ],
+    );
+    registry
+        .register_sub_provider("decrypt", decrypt.clone())
+        .await
+        .unwrap();
+
+    let settled = super::settle_runtime_custody_viewer_cleanup(
+        &harness.data_dir,
+        registry,
+        principal_id,
+        mint.draft().mint_id(),
+        record,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        settled.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::Closed
+    );
+    let requests = decrypt.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_exact_runtime_decrypt_invocation(
+        &requests[0],
+        "close_viewer_session",
+        &serde_json::to_value(&close_request).unwrap(),
+    );
+    assert_exact_runtime_decrypt_invocation(
+        &requests[1],
+        "cancel_prepared_recipient",
+        &serde_json::to_value(&cancel_request).unwrap(),
+    );
+    let persisted = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        persisted.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::Closed
+    );
+    assert!(harness.content_provider.requests().await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_open_pending_survives_active_write_failure_and_failed_cleanup() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-pending-write-failure";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let open_pending = persist_runtime_custody_open_pending_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x53),
+        crate::auth::now_ts() + 60,
+    );
+    let before = fs::read(super::runtime_viewer_path(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    ))
+    .unwrap();
+    let active = super::RuntimeCustodyViewerRecord::from_active_session(
+        principal_id,
+        &current_profile_did,
+        mint.draft().mint_id(),
+        &purchase.content_id,
+        super::derive_runtime_custody_session_binding(
+            principal_id,
+            &current_profile_did,
+            &proof_binding_id,
+            "runtime-session:alpha",
+            "grant:alpha",
+            mint.draft().mint_id(),
+        )
+        .unwrap(),
+        &RuntimeViewerSession::from_persisted_parts(
+            digest(0x91),
+            opaque_handle(0x53),
+            mint.draft().encrypted_content().clone(),
+            RightsActionV1::View,
+            crate::auth::now_ts() + 60,
+        )
+        .unwrap(),
+        crate::auth::now_ts(),
+    )
+    .unwrap();
+    let viewers_dir =
+        super::runtime_viewer_path(&harness.data_dir, principal_id, mint.draft().mint_id())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+    fs::set_permissions(&viewers_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let persist_error = super::persist_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+        &active,
+    )
+    .err()
+    .expect("expected active viewer persist failure");
+    let _ = persist_error;
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt = SequencedProvider::new(
+        "decrypt",
+        vec![Err(ProviderError::Provider("timeout".to_string()))],
+    );
+    registry
+        .register_sub_provider("decrypt", decrypt)
+        .await
+        .unwrap();
+    let cleanup_error = super::settle_runtime_custody_viewer_cleanup(
+        &harness.data_dir,
+        registry,
+        principal_id,
+        mint.draft().mint_id(),
+        open_pending,
+    )
+    .await
+    .err()
+    .expect("expected cleanup failure");
+    fs::set_permissions(&viewers_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(cleanup_error
+        .to_string()
+        .contains(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE));
+    assert_eq!(
+        fs::read(super::runtime_viewer_path(
+            &harness.data_dir,
+            principal_id,
+            mint.draft().mint_id(),
         ))
+        .unwrap(),
+        before
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_expiry_reconciles_exact_cleanup_before_read() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-expiry";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x21),
+        crate::auth::now_ts().saturating_sub(1),
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+    let close_request = DecryptProviderRequestV1::new_close_viewer_session(
+        RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+        *session.viewer_session_handle(),
+    )
+    .unwrap();
+    let close_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(
+            serde_json::to_value(
+                DecryptProviderResponseV1::new_viewer_session_already_absent(
+                    RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+                    *session.viewer_session_handle(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+    );
+    registry
+        .register_sub_provider("decrypt", close_provider.clone())
+        .await
+        .unwrap();
+    let err = super::read_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        principal_id,
+        &hex::encode(harness.mint_id.as_bytes()),
+        &hex::encode(session.viewer_session_handle()),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Runtime custody viewer session is unavailable"));
+    assert_eq!(close_provider.requests().await.len(), 1);
+    assert_exact_runtime_decrypt_invocation(
+        &close_provider.requests().await[0],
+        "close_viewer_session",
+        &serde_json::to_value(&close_request).unwrap(),
+    );
+    let record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+    assert!(harness.content_provider.requests().await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_restart_reconciliation_settles_old_active_record_before_replay() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-restart-reconcile";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x31),
+        crate::auth::now_ts() + 60,
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+    let close_request = DecryptProviderRequestV1::new_close_viewer_session(
+        RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+        *session.viewer_session_handle(),
+    )
+    .unwrap();
+    let close_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(
+            serde_json::to_value(
+                DecryptProviderResponseV1::new_viewer_session_already_absent(
+                    RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+                    *session.viewer_session_handle(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+    );
+    registry
+        .register_sub_provider("decrypt", close_provider.clone())
+        .await
+        .unwrap();
+
+    super::reconcile_runtime_custody_viewers_after_decrypt_registration(
+        &harness.data_dir,
+        registry.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(close_provider.requests().await.len(), 1);
+    assert_exact_runtime_decrypt_invocation(
+        &close_provider.requests().await[0],
+        "close_viewer_session",
+        &serde_json::to_value(&close_request).unwrap(),
+    );
+    let record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_restart_reconciliation_settles_open_pending_record() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-restart-open-pending";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    persist_runtime_custody_open_pending_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x33),
+        crate::auth::now_ts() + 60,
+    );
+    let audit_request_id = RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap();
+    let close_request =
+        DecryptProviderRequestV1::new_close_viewer_session(audit_request_id, opaque_handle(0x33))
+            .unwrap();
+    let cancel_request = DecryptProviderRequestV1::new_cancel_prepared_recipient(
+        audit_request_id,
+        opaque_handle(0x33),
+    )
+    .unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt = SequencedProvider::new(
+        "decrypt",
+        vec![
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_viewer_session_already_absent(
+                        audit_request_id,
+                        opaque_handle(0x33),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_cancelled_prepared_recipient(
+                        audit_request_id,
+                        opaque_handle(0x33),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+        ],
+    );
+    registry
+        .register_sub_provider("decrypt", decrypt.clone())
+        .await
+        .unwrap();
+
+    super::reconcile_runtime_custody_viewers_after_decrypt_registration(
+        &harness.data_dir,
+        registry,
+    )
+    .await
+    .unwrap();
+
+    let requests = decrypt.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_exact_runtime_decrypt_invocation(
+        &requests[0],
+        "close_viewer_session",
+        &serde_json::to_value(&close_request).unwrap(),
+    );
+    assert_exact_runtime_decrypt_invocation(
+        &requests[1],
+        "cancel_prepared_recipient",
+        &serde_json::to_value(&cancel_request).unwrap(),
+    );
+    let record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_restart_reconciliation_settles_cleanup_pending_record() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-restart-cleanup-pending";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x34),
+        crate::auth::now_ts() + 60,
+    );
+    let mut record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    record.mark_cleanup_pending(crate::auth::now_ts());
+    super::persist_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+        &record,
+    )
+    .unwrap();
+    let close_request = DecryptProviderRequestV1::new_close_viewer_session(
+        RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+        *session.viewer_session_handle(),
+    )
+    .unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let close_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(
+            serde_json::to_value(
+                DecryptProviderResponseV1::new_viewer_session_already_absent(
+                    RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+                    *session.viewer_session_handle(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+    );
+    registry
+        .register_sub_provider("decrypt", close_provider.clone())
+        .await
+        .unwrap();
+
+    super::reconcile_runtime_custody_viewers_after_decrypt_registration(
+        &harness.data_dir,
+        registry,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(close_provider.requests().await.len(), 1);
+    assert_exact_runtime_decrypt_invocation(
+        &close_provider.requests().await[0],
+        "close_viewer_session",
+        &serde_json::to_value(&close_request).unwrap(),
+    );
+    let settled = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        settled.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_expired_old_binding_allows_cleanup_before_fresh_open() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-expired-old-binding";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    let session = persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x35),
+        crate::auth::now_ts().saturating_sub(1),
+    );
+    let close_request = DecryptProviderRequestV1::new_close_viewer_session(
+        RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+        *session.viewer_session_handle(),
+    )
+    .unwrap();
+    let registry = Arc::new(ProviderRegistry::new());
+    let close_provider = RecordingProvider::new(
+        "decrypt",
+        ok_provider_response(
+            serde_json::to_value(
+                DecryptProviderResponseV1::new_viewer_session_already_absent(
+                    RuntimeReleaseAuditIdV1::new(session.audit_request_id()).unwrap(),
+                    *session.viewer_session_handle(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+    );
+    registry
+        .register_sub_provider("decrypt", close_provider.clone())
+        .await
+        .unwrap();
+
+    let error = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            proof_binding_id: Some(proof_binding_id),
+            session_id: Some("runtime-session:beta".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains(RUNTIME_CUSTODY_COMPOSITION_MISSING_MESSAGE));
+    assert_eq!(close_provider.requests().await.len(), 1);
+    assert_exact_runtime_decrypt_invocation(
+        &close_provider.requests().await[0],
+        "close_viewer_session",
+        &serde_json::to_value(&close_request).unwrap(),
+    );
+    let record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_reconciliation_ignores_terminal_histories_beyond_unresolved_limit()
+{
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let profile_did = derived_device_key_for_seed(0x41).1;
+    for index in 0..300usize {
+        let principal_id = format!("person:local:runtime-custody-viewer-terminal-{index}");
+        let purchase = persist_runtime_custody_purchase_for_mint(
+            &harness.data_dir,
+            &mint,
+            &principal_id,
+            &profile_did,
+            crate::auth::now_ts(),
+        );
+        let session = RuntimeViewerSession::from_persisted_parts(
+            Digest32::new([u8::try_from((index % 250) + 1).unwrap(); 32]),
+            [u8::try_from((index % 250) + 1).unwrap(); MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+            mint.draft().encrypted_content().clone(),
+            RightsActionV1::View,
+            crate::auth::now_ts() + 60,
+        )
+        .unwrap();
+        let mut record = super::RuntimeCustodyViewerRecord::from_active_session(
+            &principal_id,
+            &profile_did,
+            mint.draft().mint_id(),
+            &purchase.content_id,
+            RuntimeSessionBindingV1::new(Digest32::new(
+                [u8::try_from((index % 250) + 1).unwrap(); 32],
+            ))
+            .unwrap(),
+            &session,
+            crate::auth::now_ts(),
+        )
+        .unwrap();
+        record.mark_terminal(
+            elastos_protected_content_runtime::RuntimeViewerSessionCloseResult::Closed,
+            crate::auth::now_ts(),
+        );
+        super::persist_runtime_custody_viewer_record(
+            &harness.data_dir,
+            &principal_id,
+            mint.draft().mint_id(),
+            &record,
+        )
+        .unwrap();
+    }
+    let principal_id = "person:local:runtime-custody-viewer-unresolved";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &load_profile_did_for_test(&harness.data_dir, principal_id),
+        crate::auth::now_ts(),
+    );
+    persist_runtime_custody_open_pending_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x36),
+        crate::auth::now_ts() + 60,
+    );
+    let registry = Arc::new(ProviderRegistry::new());
+    let decrypt = SequencedProvider::new(
+        "decrypt",
+        vec![
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_viewer_session_already_absent(
+                        RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap(),
+                        opaque_handle(0x36),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+            Ok(ok_provider_response(
+                serde_json::to_value(
+                    DecryptProviderResponseV1::new_cancelled_prepared_recipient(
+                        RuntimeReleaseAuditIdV1::new(digest(0x91)).unwrap(),
+                        opaque_handle(0x36),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )),
+        ],
+    );
+    registry
+        .register_sub_provider("decrypt", decrypt)
+        .await
+        .unwrap();
+
+    super::reconcile_runtime_custody_viewers_after_decrypt_registration(
+        &harness.data_dir,
+        registry,
+    )
+    .await
+    .unwrap();
+
+    let record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_restart_reconciliation_rejects_invalid_active_record() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-viewer-restart-invalid";
+    let (proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let current_profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
+        .unwrap();
+    let purchase = persist_runtime_custody_purchase_for_mint(
+        &harness.data_dir,
+        &mint,
+        principal_id,
+        &current_profile_did,
+        crate::auth::now_ts(),
+    );
+    persist_runtime_custody_active_viewer_for_purchase(
+        &harness.data_dir,
+        &mint,
+        &purchase,
+        &proof_binding_id,
+        "runtime-session:alpha",
+        "grant:alpha",
+        opaque_handle(0x32),
+        crate::auth::now_ts() + 60,
+    );
+    let mut record = super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+    )
+    .unwrap()
+    .unwrap();
+    record.viewer_session_handle = hex::encode([0u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1]);
+    super::persist_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id(),
+        &record,
+    )
+    .unwrap();
+
+    let error = super::reconcile_runtime_custody_viewers_after_decrypt_registration(
+        &harness.data_dir,
+        Arc::new(ProviderRegistry::new()),
+    )
+    .await
+    .err()
+    .expect("expected invalid active record rejection");
+    assert!(error.to_string().contains("invalid"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_viewer_lifecycle_guard_serializes_same_key_and_leaves_other_keys_independent(
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("data");
+    owner_only_dir(&data_dir);
+    let first_entered = Arc::new(Notify::new());
+    let same_key_attempted = Arc::new(Notify::new());
+    let other_key_entered = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let same_key_acquired = Arc::new(AtomicBool::new(false));
+    let other_key_acquired = Arc::new(AtomicBool::new(false));
+
+    let first_entered_task = first_entered.clone();
+    let release_first_task = release_first.clone();
+    let first_data_dir = data_dir.clone();
+    let first = tokio::spawn(async move {
+        let _guard = super::acquire_runtime_custody_viewer_lifecycle_guard(
+            &first_data_dir,
+            "principal-a",
+            digest(0x41),
+        )
+        .await;
+        first_entered_task.notify_one();
+        release_first_task.notified().await;
+    });
+
+    first_entered.notified().await;
+
+    let same_key_flag = same_key_acquired.clone();
+    let same_key_attempted_task = same_key_attempted.clone();
+    let same_key_data_dir = data_dir.clone();
+    let same_key = tokio::spawn(async move {
+        same_key_attempted_task.notify_one();
+        let _guard = super::acquire_runtime_custody_viewer_lifecycle_guard(
+            &same_key_data_dir,
+            "principal-a",
+            digest(0x41),
+        )
+        .await;
+        same_key_flag.store(true, Ordering::SeqCst);
+    });
+
+    let other_key_flag = other_key_acquired.clone();
+    let other_key_entered_task = other_key_entered.clone();
+    let other_key_data_dir = data_dir.clone();
+    let other_key = tokio::spawn(async move {
+        let _guard = super::acquire_runtime_custody_viewer_lifecycle_guard(
+            &other_key_data_dir,
+            "principal-b",
+            digest(0x42),
+        )
+        .await;
+        other_key_flag.store(true, Ordering::SeqCst);
+        other_key_entered_task.notify_one();
+    });
+
+    same_key_attempted.notified().await;
+    other_key_entered.notified().await;
+    assert!(!same_key_acquired.load(Ordering::SeqCst));
+    assert!(other_key_acquired.load(Ordering::SeqCst));
+
+    release_first.notify_one();
+    first.await.unwrap();
+    same_key.await.unwrap();
+    other_key.await.unwrap();
+    assert!(same_key_acquired.load(Ordering::SeqCst));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_custody_library_open_after_purchase_fails_closed_without_profile() {
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-missing-profile";
+    let mint = runtime_mint_journal(&harness.data_dir)
+        .load(harness.mint_id)
         .unwrap();
     persist_runtime_custody_purchase_for_mint(
         &harness.data_dir,
         &mint,
-        &harness.buyer,
-        "did:key:zmissing-profile",
+        principal_id,
+        &derived_device_key_for_seed(0x27).1,
         crate::auth::now_ts(),
     );
-    let open = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "open_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "proof_binding_id": "proof:alpha",
-                "session_id": "runtime-session:alpha",
-                "grant_id": "grant:alpha",
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(open["status"], "error", "{open}");
+    let open = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            proof_binding_id: Some("proof:alpha".to_string()),
+            session_id: Some("runtime-session:alpha".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
     assert!(
-        open["message"]
-            .as_str()
-            .unwrap_or_default()
+        open.to_string()
             .contains(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
         "{open}"
     );
+    assert!(harness.content_provider.requests().await.is_empty());
+    assert!(super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id()
+    )
+    .unwrap()
+    .is_none());
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_library_open_after_purchase_rejects_mismatched_purchased_profile() {
-    let harness = publish_library_runtime_custody_harness().await;
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-profile-mismatch";
     let (proof_binding_id, _) =
-        install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
+    let other_principal = "person:local:runtime-custody-open-profile-other";
+    let (_other_proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, other_principal);
+    let other_profile_did = load_profile_did_for_test(&harness.data_dir, other_principal);
     let mint = runtime_mint_journal(&harness.data_dir)
-        .load(Digest32::new(
-            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
-        ))
+        .load(harness.mint_id)
         .unwrap();
     persist_runtime_custody_purchase_for_mint(
         &harness.data_dir,
         &mint,
-        &harness.buyer,
-        &derived_device_key_for_seed(0x27).1,
+        principal_id,
+        &other_profile_did,
         crate::auth::now_ts(),
     );
-    let open = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "open_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "proof_binding_id": proof_binding_id,
-                "session_id": "runtime-session:alpha",
-                "grant_id": "grant:alpha",
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(open["status"], "error", "{open}");
+    let open = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            proof_binding_id: Some(proof_binding_id),
+            session_id: Some("runtime-session:alpha".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
     assert!(
-        open["message"]
-            .as_str()
-            .unwrap_or_default()
+        open.to_string()
             .contains("Runtime custody chain evidence is invalid"),
         "{open}"
     );
+    assert!(harness.content_provider.requests().await.is_empty());
+    assert!(super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id()
+    )
+    .unwrap()
+    .is_none());
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_library_open_after_buy_fails_closed_without_decrypt() {
-    let harness = publish_library_runtime_custody_harness().await;
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-no-decrypt";
+    write_device_key(&harness.data_dir, 0x21);
+    let epoch = write_library_publish_test_composition(&harness.data_dir);
     let (proof_binding_id, _) =
-        install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
-        .load(Digest32::new(
-            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
-        ))
+        .load(harness.mint_id)
         .unwrap();
-    let now = crate::auth::now_ts();
-    let profile_did = load_profile_did_for_test(&harness.data_dir, &harness.buyer);
+    super::persist_runtime_open_envelope(
+        &harness.data_dir,
+        mint.draft().mint_id(),
+        &custody_envelope_for_media_with_epoch(0x41, &epoch),
+    )
+    .unwrap();
+    let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
     persist_runtime_custody_purchase_for_mint(
         &harness.data_dir,
         &mint,
-        &harness.buyer,
+        principal_id,
         &profile_did,
-        now,
+        crate::auth::now_ts(),
     );
-    let open = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "open_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "proof_binding_id": proof_binding_id,
-                "session_id": "runtime-session:alpha",
-                "grant_id": "grant:alpha",
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(open["status"], "error", "{open}");
+    let open = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            proof_binding_id: Some(proof_binding_id),
+            session_id: Some("runtime-session:alpha".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
     assert!(
-        open["message"]
-            .as_str()
-            .unwrap_or_default()
+        open.to_string()
             .contains(RUNTIME_CUSTODY_DECRYPT_UNAVAILABLE_MESSAGE),
         "{open}"
     );
-}
-
-#[cfg(unix)]
-fn derived_device_runtime_issuer_hex(seed: u8) -> String {
-    format!(
-        "0x{}",
-        hex::encode(derived_device_runtime_issuer(seed).as_bytes())
+    assert!(super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id()
     )
+    .unwrap()
+    .is_none());
 }
 
 #[cfg(unix)]
@@ -8139,16 +9347,23 @@ async fn register_test_decrypt_provider(registry: &Arc<ProviderRegistry>, issuer
 }
 
 #[cfg(unix)]
-async fn publish_library_runtime_custody_play_harness() -> LibraryRuntimeCustodyHarness {
+pub(crate) struct RuntimeCustodyProcessProviderFixture {
+    _nodes_temp: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+pub(crate) async fn register_runtime_custody_process_providers_for_test_registry(
+    data_dir: &Path,
+    registry: &Arc<ProviderRegistry>,
+) -> RuntimeCustodyProcessProviderFixture {
     let protect_binary = required_test_binary_path(TEST_PROTECT_PROVIDER_BIN_ENV);
     let custody_binary = required_test_binary_path(TEST_CUSTODY_PROVIDER_BIN_ENV);
-    let temp = tempfile::tempdir().unwrap();
     let nodes_temp = tempfile::tempdir().unwrap();
     let nodes_root = fs::canonicalize(nodes_temp.path()).unwrap();
-    let data_dir = temp.path().join("data");
-    owner_only_dir(&data_dir);
-    write_device_key(&data_dir, 0x21);
-    let runtime_issuer = derived_device_runtime_issuer(0x21);
+    owner_only_dir(data_dir);
+    let (runtime_device_key, _) = elastos_identity::load_or_create_did(data_dir).unwrap();
+    let runtime_issuer =
+        RuntimeOperationIssuerKeyV1::new(runtime_device_key.verifying_key().to_bytes()).unwrap();
     let node1 = provisioned_process_custody_node_for_issuer(
         &custody_binary,
         &nodes_root,
@@ -8237,7 +9452,7 @@ async fn publish_library_runtime_custody_play_harness() -> LibraryRuntimeCustody
     let authorization =
         signed_committee_authorization_for_epoch(pool.pool_identity().unwrap(), &epoch);
     write_owner_only_custody_composition_config(
-        &data_dir,
+        data_dir,
         &RuntimeCustodyCompositionConfigFile {
             schema: CUSTODY_COMPOSITION_SCHEMA_V1.to_string(),
             expected_policy_authority_base64: raw_b64_32(
@@ -8255,8 +9470,7 @@ async fn publish_library_runtime_custody_play_harness() -> LibraryRuntimeCustody
         },
     );
 
-    let registry = Arc::new(ProviderRegistry::new());
-    register_protect_provider(&registry, &protect_binary)
+    register_protect_provider(registry, &protect_binary)
         .await
         .unwrap();
     registry
@@ -8279,310 +9493,155 @@ async fn publish_library_runtime_custody_play_harness() -> LibraryRuntimeCustody
         .unwrap();
     registry
         .set_carrier_invoker(Arc::new(LoopbackCustodyCarrierInvoker {
-            registry: Arc::downgrade(&registry),
+            registry: Arc::downgrade(registry),
         }))
         .await;
-    registry
-        .register_sub_provider(CHAIN_PROVIDER_ID, Arc::new(LibraryMintChainPolicyProvider))
-        .await
-        .unwrap();
-    register_test_decrypt_provider(&registry, &derived_device_runtime_issuer_hex(0x21)).await;
-    registry
-        .register_sub_provider("wallet", Arc::new(LibraryReleaseWalletProvider))
-        .await
-        .unwrap();
-    let (device_key, _) = derived_device_key_for_seed(0x21);
-    let content = ContentAvailabilityTestProvider::with_signing_key(
-        device_key,
-        ContentAvailabilityTestConfig {
-            checked_at: crate::auth::now_ts(),
-            ..ContentAvailabilityTestConfig::accepted()
-        },
-    );
-    registry
-        .register_sub_provider("content", content)
-        .await
-        .unwrap();
-    registry
-        .register_sub_provider(
-            "object",
-            Arc::new(crate::library::ObjectProvider::new(
-                data_dir.clone(),
-                Arc::downgrade(&registry),
-            )),
-        )
-        .await
-        .unwrap();
-
-    let creator = "person:local:runtime-custody-slice-d-creator";
-    let buyer = "person:local:runtime-custody-slice-d-buyer";
-    crate::auth::store_test_principal_root_protection(&data_dir, creator);
-    crate::auth::store_test_principal_root_protection(&data_dir, buyer);
-    let root = crate::auth::principal_localhost_root(creator);
-    let uri = format!("{root}/Documents/protected-clear-media");
-    let (clear_init, clear_segments) = clear_media_components(0x41);
-    write_library_object_bytes(&registry, creator, &format!("{uri}/init.mp4"), &clear_init).await;
-    for (index, segment) in clear_segments.iter().enumerate() {
-        write_library_object_bytes(
-            &registry,
-            creator,
-            &format!("{uri}/segments/{index:08}.m4s"),
-            segment,
-        )
-        .await;
-    }
-    let publish = registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "publish",
-                "principal_id": creator,
-                "uri": uri,
-                "protection": {
-                    "mode": "runtime_custody",
-                    "mime_type": MEDIA_MIME_TYPE_V1,
-                    "codecs": MEDIA_CODECS_V1,
-                },
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(publish["status"], "ok", "{publish}");
-    LibraryRuntimeCustodyHarness {
-        _temp: temp,
-        _nodes_temp: Some(nodes_temp),
-        data_dir,
+    register_test_decrypt_provider(
         registry,
-        creator: creator.to_string(),
-        buyer: buyer.to_string(),
-        uri,
-        publish: publish.clone(),
-        mint_id: publish["data"]["content_security"]["mint_id"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-        cid: publish["data"]["cid"].as_str().unwrap().to_string(),
-        content_id: publish["data"]["content_security"]["content_id"]
-            .as_str()
-            .unwrap()
-            .to_string(),
-        clear_init,
-        clear_segments,
+        &format!("0x{}", hex::encode(runtime_issuer.as_bytes())),
+    )
+    .await;
+    RuntimeCustodyProcessProviderFixture {
+        _nodes_temp: nodes_temp,
     }
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_library_open_after_buy_fails_closed_without_launch_token() {
-    let harness = publish_library_runtime_custody_harness().await;
-    register_test_decrypt_provider(&harness.registry, &derived_device_runtime_issuer_hex(0x21))
-        .await;
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-no-launch-token";
+    write_device_key(&harness.data_dir, 0x21);
+    let epoch = write_library_publish_test_composition(&harness.data_dir);
+    let (_proof_binding_id, _) =
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
-        .load(Digest32::new(
-            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
-        ))
+        .load(harness.mint_id)
         .unwrap();
-    let profile_did = derived_device_key_for_seed(0x26).1;
+    super::persist_runtime_open_envelope(
+        &harness.data_dir,
+        mint.draft().mint_id(),
+        &custody_envelope_for_media_with_epoch(0x41, &epoch),
+    )
+    .unwrap();
+    let decrypt = PrepareOnlyCleanupDecryptProvider::new();
+    harness
+        .registry
+        .register_sub_provider("decrypt", decrypt.clone())
+        .await
+        .unwrap();
+    let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
     persist_runtime_custody_purchase_for_mint(
         &harness.data_dir,
         &mint,
-        &harness.buyer,
+        principal_id,
         &profile_did,
         crate::auth::now_ts(),
     );
-    let open = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "open_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(open["status"], "error", "{open}");
+    let open = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            proof_binding_id: None,
+            session_id: None,
+            grant_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
     assert!(
-        open["message"]
-            .as_str()
-            .unwrap_or_default()
+        open.to_string()
             .contains(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
         "{open}"
     );
+    assert!(decrypt.requests().await.is_empty());
+    assert!(super::load_runtime_custody_viewer_record(
+        &harness.data_dir,
+        principal_id,
+        mint.draft().mint_id()
+    )
+    .unwrap()
+    .is_none());
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_custody_library_open_after_buy_fails_closed_without_release_wallet() {
-    let harness = publish_library_runtime_custody_harness().await;
-    register_test_decrypt_provider(&harness.registry, &derived_device_runtime_issuer_hex(0x21))
-        .await;
+    let harness = runtime_custody_prebuy_availability_harness(
+        0x61,
+        ContentAvailabilityTestConfig::accepted(),
+    )
+    .await;
+    let principal_id = "person:local:runtime-custody-open-no-release-wallet";
+    write_device_key(&harness.data_dir, 0x21);
+    let epoch = write_library_publish_test_composition(&harness.data_dir);
     let (proof_binding_id, _) =
-        install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
+        install_profile_authority_keeping_device_key(&harness.data_dir, principal_id);
     let mint = runtime_mint_journal(&harness.data_dir)
-        .load(Digest32::new(
-            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
-        ))
+        .load(harness.mint_id)
         .unwrap();
-    let profile_did = load_profile_did_for_test(&harness.data_dir, &harness.buyer);
+    super::persist_runtime_open_envelope(
+        &harness.data_dir,
+        mint.draft().mint_id(),
+        &custody_envelope_for_media_with_epoch(0x41, &epoch),
+    )
+    .unwrap();
+    let decrypt = PrepareOnlyCleanupDecryptProvider::new();
+    harness
+        .registry
+        .register_sub_provider("decrypt", decrypt.clone())
+        .await
+        .unwrap();
+    let profile_did = load_profile_did_for_test(&harness.data_dir, principal_id);
     persist_runtime_custody_purchase_for_mint(
         &harness.data_dir,
         &mint,
-        &harness.buyer,
+        principal_id,
         &profile_did,
         crate::auth::now_ts(),
     );
-    let open = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "open_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "proof_binding_id": proof_binding_id,
-                "session_id": "runtime-session:alpha",
-                "grant_id": "grant:alpha",
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(open["status"], "error", "{open}");
+    let open = super::open_runtime_custody_viewer(
+        &harness.data_dir,
+        harness.registry.clone(),
+        super::RuntimeCustodyViewerOpenInput {
+            principal_id: principal_id.to_string(),
+            mint_id: hex::encode(harness.mint_id.as_bytes()),
+            proof_binding_id: Some(proof_binding_id),
+            session_id: Some("runtime-session:alpha".to_string()),
+            grant_id: Some("grant:alpha".to_string()),
+        },
+    )
+    .await
+    .unwrap_err();
     assert!(
-        open["message"]
-            .as_str()
-            .unwrap_or_default()
+        open.to_string()
             .contains(RUNTIME_CUSTODY_RELEASE_APPROVAL_UNAVAILABLE_MESSAGE),
         "{open}"
     );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn runtime_custody_library_open_after_buy_reads_clear_media_and_closes() {
-    let harness = publish_library_runtime_custody_play_harness().await;
-    let (proof_binding_id, _) =
-        install_profile_authority_keeping_device_key(&harness.data_dir, &harness.buyer);
-    let mint = runtime_mint_journal(&harness.data_dir)
-        .load(Digest32::new(
-            hex::decode(&harness.mint_id).unwrap().try_into().unwrap(),
-        ))
-        .unwrap();
-    let now = crate::auth::now_ts();
-    let profile_did = load_profile_did_for_test(&harness.data_dir, &harness.buyer);
-    let listing_path = super::runtime_listing_path(&harness.data_dir, mint.draft().mint_id());
-    let listing_before = fs::read(&listing_path).unwrap();
-    let purchase = persist_runtime_custody_purchase_for_mint(
+    let record = super::load_runtime_custody_viewer_record(
         &harness.data_dir,
-        &mint,
-        &harness.buyer,
-        &profile_did,
-        now,
-    );
-    let purchase_bytes = fs::read(super::runtime_purchase_path(
-        &harness.data_dir,
-        &harness.buyer,
+        principal_id,
         mint.draft().mint_id(),
-    ))
-    .unwrap();
-    let purchase_json = String::from_utf8(purchase_bytes).unwrap();
-    assert!(!purchase_json.contains("wallet_request_hex"));
-    assert!(!purchase_json.contains("wallet_response_hex"));
-    assert_eq!(purchase.profile_did, profile_did);
-    let open = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "open_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "proof_binding_id": proof_binding_id,
-                "session_id": "runtime-session:alpha",
-                "grant_id": "grant:alpha",
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(open["status"], "ok", "{open}");
+    )
+    .unwrap()
+    .expect("expected durable viewer cleanup record");
+    let requests = decrypt.requests().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["op"], "prepare_recipient");
+    assert_eq!(requests[1]["op"], "close_viewer_session");
+    assert_eq!(requests[2]["op"], "cancel_prepared_recipient");
     assert_eq!(
-        open["data"]["schema"],
-        "elastos.library.runtime-custody-viewer/v1"
+        requests[1]["viewer_session_handle"].as_str(),
+        requests[2]["prepared_recipient_handle"].as_str()
     );
-    let handle = open["data"]["viewer_session_handle"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let init = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "read_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "viewer_session_handle": handle,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(init["status"], "ok", "{init}");
-    assert_eq!(init["data"]["encoding"], "base64");
-    let init_bytes = base64::engine::general_purpose::STANDARD
-        .decode(init["data"]["data"].as_str().unwrap())
-        .unwrap();
-    assert_eq!(init_bytes, harness.clear_init);
-    let segment = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "read_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "viewer_session_handle": handle,
-                "segment_index": 0,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(segment["status"], "ok", "{segment}");
-    let segment_bytes = base64::engine::general_purpose::STANDARD
-        .decode(segment["data"]["data"].as_str().unwrap())
-        .unwrap();
-    assert_eq!(segment_bytes, harness.clear_segments[0]);
-    let closed = harness
-        .registry
-        .send_raw(
-            "object",
-            &json!({
-                "op": "close_viewer",
-                "principal_id": harness.buyer,
-                "mint_id": harness.mint_id,
-                "viewer_session_handle": handle,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(closed["status"], "ok", "{closed}");
-    assert!(!open.to_string().contains("cek"));
-    assert!(!open.to_string().contains("play_url"));
-    assert!(!init.to_string().contains(&hex::encode(&harness.clear_init)));
-    let mint_root = harness.data_dir.join("protected-content/runtime-mint");
-    assert!(!any_file_contains(&mint_root, &harness.clear_init));
-    assert!(!any_file_contains(&mint_root, &harness.clear_segments[0]));
-    let purchases_root = harness.data_dir.join("protected-content/runtime-purchases");
-    if purchases_root.exists() {
-        assert!(!any_file_contains(&purchases_root, &harness.clear_init));
-        assert!(!any_file_contains(
-            &purchases_root,
-            &harness.clear_segments[0]
-        ));
-    }
-    let listings_root = harness.data_dir.join("protected-content/runtime-listings");
-    if listings_root.exists() {
-        assert!(!any_file_contains(&listings_root, &harness.clear_init));
-    }
-    assert_eq!(fs::read(&listing_path).unwrap(), listing_before);
+    assert_eq!(
+        record.lifecycle_status,
+        super::RuntimeCustodyViewerLifecycleStatus::AlreadyAbsent
+    );
 }

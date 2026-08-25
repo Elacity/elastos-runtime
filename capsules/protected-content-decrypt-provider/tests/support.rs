@@ -5,16 +5,17 @@ use std::os::unix::fs::PermissionsExt;
 use ed25519_dalek::{Signer as _, SigningKey};
 use elastos_auth::ethereum_signed_message_hash;
 use elastos_protected_content_contracts::{
-    CanonicalContract, CustodyApprovedSuitesV1, CustodyCommitteeAuthorizationStatementV1,
-    CustodyEnvelopeV1, CustodyEpochIdentityV1, CustodyEpochIssuerKeyV1, CustodyEpochStatementV1,
-    CustodyNodeIdentityV1, CustodyNodeProvisioningRecordV1, CustodyPoolFailureDomainIdV1,
-    CustodyPoolIdentityV1, CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1,
-    CustodyPoolStatementV1, Digest32, EvmContractAddressV1, EvmFunctionSelectorV1,
-    EvmRightsMethodAbiV1, KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1,
-    NodePublicKey, ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1,
-    RecipientKeyIdentityV1, RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1,
-    RightsDecisionV1, RightsEvaluationEvidenceRequestV1, RightsObservationFinalityV1,
-    RightsPolicyBodyV1, RightsRequestV1, RightsSubjectSourceV1, RuntimeCustodyProvisioningIdV1,
+    CanonicalContract, ContentAccessIdV1, CustodyApprovedSuitesV1,
+    CustodyCommitteeAuthorizationStatementV1, CustodyEnvelopeV1, CustodyEpochIdentityV1,
+    CustodyEpochIssuerKeyV1, CustodyEpochStatementV1, CustodyNodeIdentityV1,
+    CustodyNodeProvisioningRecordV1, CustodyPoolFailureDomainIdV1, CustodyPoolIdentityV1,
+    CustodyPoolMemberStateV1, CustodyPoolMemberV1, CustodyPoolOperatorIdV1, CustodyPoolStatementV1,
+    Digest32, EvmContractAddressV1, EvmFunctionSelectorV1, EvmRightsMethodAbiV1,
+    KeyReleaseOutcomeV1, KeyReleaseRequestV1, NodeContributionRefV1, NodePublicKey,
+    ProtectedContentBindingV1, RecipientKeyAuthorizationStatementV1, RecipientKeyIdentityV1,
+    RecipientPublicKeyBytesV1, ReplayNonce16, RightsActionV1, RightsDecisionV1,
+    RightsEvaluationEvidenceRequestV1, RightsObservationFinalityV1, RightsPolicyBodyV1,
+    RightsRequestV1, RightsSubjectSourceV1, RuntimeCustodyProvisioningIdV1,
     RuntimeCustodyProvisioningStatementV1, RuntimeOperationIssuerKeyV1, RuntimeReleaseAuditIdV1,
     RuntimeReleaseOperationStatementV1, RuntimeSessionBindingV1, ShareCoordinateV1,
     SignedCustodyCommitteeAuthorizationV1, SignedCustodyEpochV1, SignedCustodyPoolV1,
@@ -235,15 +236,15 @@ pub fn media_identity(seed: u8) -> CencFmp4MediaIdentityV1 {
 
 pub fn policy_body() -> RightsPolicyBodyV1 {
     RightsPolicyBodyV1::new(
-        "content:alpha",
+        media_identity(0x10).encrypted_content().clone(),
+        ContentAccessIdV1::new([0x44; 16]).unwrap(),
         RightsActionV1::View,
-        "view",
         RightsSubjectSourceV1::WalletAddress,
         11155111,
         EvmContractAddressV1::new([0x11; 20]).unwrap(),
         EvmFunctionSelectorV1::new([0x12, 0x34, 0x56, 0x78]).unwrap(),
-        EvmRightsMethodAbiV1::HasAccessByContentIdStringAddressString,
-        RightsObservationFinalityV1::new(12),
+        EvmRightsMethodAbiV1::HasAccessByContentIdAddressBytes16,
+        RightsObservationFinalityV1::finalized(),
     )
     .unwrap()
 }

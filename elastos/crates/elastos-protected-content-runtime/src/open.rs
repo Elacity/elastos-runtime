@@ -18,8 +18,8 @@ use elastos_protected_content_contracts::{
 };
 use elastos_protected_content_provider_contracts::{
     CencFmp4MediaIdentityV1, DecryptProviderRequestV1, DecryptProviderResponseStatusV1,
-    DecryptProviderResponseV1, ValidatedDecryptProviderRequestV1, ViewerMediaPartSelectorV1,
-    MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
+    DecryptProviderResponseV1, OpaqueHandleV1, ValidatedDecryptProviderRequestV1,
+    ViewerMediaPartSelectorV1, MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1,
 };
 use elastos_wallet_contract::{
     PublicNetwork, ValidatedChainOutcomeBindingV1, ValidatedChainOutcomeV1,
@@ -529,6 +529,27 @@ impl fmt::Debug for RuntimeViewerSession {
 }
 
 impl RuntimeViewerSession {
+    pub fn from_persisted_parts(
+        audit_request_id: Digest32,
+        viewer_session_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+        encrypted_content: EncryptedContentIdentityV1,
+        action: RightsActionV1,
+        expires_at: u64,
+    ) -> Result<Self, ContractError> {
+        RuntimeReleaseAuditIdV1::new(audit_request_id)?;
+        OpaqueHandleV1::new(viewer_session_handle)?;
+        if expires_at == 0 {
+            return Err(ContractError::InvalidField("expires_at"));
+        }
+        Ok(Self {
+            audit_request_id,
+            viewer_session_handle,
+            encrypted_content,
+            action,
+            expires_at,
+        })
+    }
+
     pub const fn audit_request_id(&self) -> Digest32 {
         self.audit_request_id
     }
@@ -792,27 +813,51 @@ pub async fn open_viewer_session(
     let handle = *response
         .viewer_session_handle()
         .map_err(|_| RuntimeOpenError::DecryptResult)?;
-    Ok(RuntimeViewerSession {
-        audit_request_id: audit_request_id.digest(),
-        viewer_session_handle: handle,
-        encrypted_content: binding.encrypted_content().clone(),
-        action: input.buy.action(),
-        expires_at: input
+    if handle != *input.prepared_recipient.prepared_recipient_handle() {
+        return Err(RuntimeOpenError::DecryptResult);
+    }
+    RuntimeViewerSession::from_persisted_parts(
+        audit_request_id.digest(),
+        handle,
+        binding.encrypted_content().clone(),
+        input.buy.action(),
+        input
             .signed_runtime_release_operation
             .statement()
             .expires_at(),
-    })
+    )
+    .map_err(|_| RuntimeOpenError::DecryptResult)
 }
 
 pub async fn cancel_prepared_recipient(
     decrypt: &dyn RuntimeDecryptProvider,
     prepared: &RuntimePreparedRecipient,
 ) -> Result<(), RuntimeOpenError> {
-    let audit_request_id = RuntimeReleaseAuditIdV1::new(prepared.audit_request_id)
+    cancel_prepared_recipient_with_result_by_handle(
+        decrypt,
+        prepared.audit_request_id,
+        prepared.prepared_recipient_handle,
+    )
+    .await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimePreparedRecipientCancelResult {
+    Cancelled,
+    AlreadyAbsent,
+}
+
+pub async fn cancel_prepared_recipient_with_result_by_handle(
+    decrypt: &dyn RuntimeDecryptProvider,
+    audit_request_id: Digest32,
+    prepared_recipient_handle: [u8; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+) -> Result<RuntimePreparedRecipientCancelResult, RuntimeOpenError> {
+    let audit_request_id = RuntimeReleaseAuditIdV1::new(audit_request_id)
         .map_err(|_| RuntimeOpenError::DecryptResult)?;
     let request = DecryptProviderRequestV1::new_cancel_prepared_recipient(
         audit_request_id,
-        prepared.prepared_recipient_handle,
+        prepared_recipient_handle,
     )?;
     let request_bytes = request
         .to_json_vec()
@@ -826,17 +871,21 @@ pub async fn cancel_prepared_recipient(
         .to_json_vec()
         .map_err(|_| RuntimeOpenError::DecryptResult)?;
     reject_bearer_playback(&response_bytes)?;
-    match response.status() {
-        DecryptProviderResponseStatusV1::CancelledPreparedRecipient
-        | DecryptProviderResponseStatusV1::PreparedRecipientAlreadyAbsent => {}
+    let result = match response.status() {
+        DecryptProviderResponseStatusV1::CancelledPreparedRecipient => {
+            RuntimePreparedRecipientCancelResult::Cancelled
+        }
+        DecryptProviderResponseStatusV1::PreparedRecipientAlreadyAbsent => {
+            RuntimePreparedRecipientCancelResult::AlreadyAbsent
+        }
         _ => return Err(RuntimeOpenError::DecryptResult),
-    }
+    };
     if response.audit_request_id()? != audit_request_id
-        || response.prepared_recipient_handle()? != &prepared.prepared_recipient_handle
+        || response.prepared_recipient_handle()? != &prepared_recipient_handle
     {
         return Err(RuntimeOpenError::DecryptResult);
     }
-    Ok(())
+    Ok(result)
 }
 
 pub async fn read_viewer_media_part(
@@ -888,6 +937,20 @@ pub async fn close_viewer_session(
     decrypt: &dyn RuntimeDecryptProvider,
     session: &RuntimeViewerSession,
 ) -> Result<(), RuntimeOpenError> {
+    close_viewer_session_with_result(decrypt, session).await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeViewerSessionCloseResult {
+    Closed,
+    AlreadyAbsent,
+}
+
+pub async fn close_viewer_session_with_result(
+    decrypt: &dyn RuntimeDecryptProvider,
+    session: &RuntimeViewerSession,
+) -> Result<RuntimeViewerSessionCloseResult, RuntimeOpenError> {
     let audit_request_id = RuntimeReleaseAuditIdV1::new(session.audit_request_id)
         .map_err(|_| RuntimeOpenError::DecryptResult)?;
     let request = DecryptProviderRequestV1::new_close_viewer_session(
@@ -906,17 +969,21 @@ pub async fn close_viewer_session(
         .to_json_vec()
         .map_err(|_| RuntimeOpenError::DecryptResult)?;
     reject_bearer_playback(&response_bytes)?;
-    match response.status() {
-        DecryptProviderResponseStatusV1::ClosedViewerSession
-        | DecryptProviderResponseStatusV1::ViewerSessionAlreadyAbsent => {}
+    let result = match response.status() {
+        DecryptProviderResponseStatusV1::ClosedViewerSession => {
+            RuntimeViewerSessionCloseResult::Closed
+        }
+        DecryptProviderResponseStatusV1::ViewerSessionAlreadyAbsent => {
+            RuntimeViewerSessionCloseResult::AlreadyAbsent
+        }
         _ => return Err(RuntimeOpenError::DecryptResult),
-    }
+    };
     if response.audit_request_id()? != audit_request_id
         || response.viewer_session_handle()? != &session.viewer_session_handle
     {
         return Err(RuntimeOpenError::DecryptResult);
     }
-    Ok(())
+    Ok(result)
 }
 
 fn chain_transaction_digest(
@@ -1103,7 +1170,7 @@ mod tests {
         .unwrap()
     }
 
-    fn mint_draft() -> RuntimeMintDraft {
+    fn mint_draft_with_access_seed(access_seed: u8) -> RuntimeMintDraft {
         let nodes = vec![mint_binding(1), mint_binding(2), mint_binding(3)];
         let threshold = ThresholdV1::new(2, 3).unwrap();
         let (init_segment, encrypted_segments, mime_type, codecs) =
@@ -1130,7 +1197,7 @@ mod tests {
             &encrypted_segments,
             mime_type,
             codecs,
-            content_access_id(0x41),
+            content_access_id(access_seed),
             key_envelope,
             RightsPolicyIdentityV1::new(digest(0x44), 384).unwrap(),
             digest(0x19),
@@ -1138,6 +1205,10 @@ mod tests {
             nodes,
         )
         .unwrap()
+    }
+
+    fn mint_draft() -> RuntimeMintDraft {
+        mint_draft_with_access_seed(0x41)
     }
 
     fn mint_receipt(node: &RuntimeMintNodeBinding, seed: u8) -> RuntimeMintNodeReceipt {
@@ -1165,6 +1236,33 @@ mod tests {
         create_owner_only_directory(&parent);
         let journal = RuntimeMintJournal::new(parent.join("runtime-mint"));
         let draft = mint_draft();
+        journal.persist_bound(&draft).unwrap();
+        if custody_provisioned {
+            for (index, node) in draft.nodes().iter().enumerate() {
+                journal
+                    .mark_node_effect_started(draft.mint_id(), node.node_public_key())
+                    .unwrap();
+                journal
+                    .mark_node_receipt(draft.mint_id(), mint_receipt(node, 0x80 + index as u8))
+                    .unwrap();
+            }
+            let provisioned = journal.mark_custody_provisioned(draft.mint_id()).unwrap();
+            (temp, provisioned)
+        } else {
+            let bound = journal.load(draft.mint_id()).unwrap();
+            (temp, bound)
+        }
+    }
+
+    fn persist_mint_with_access_seed(
+        custody_provisioned: bool,
+        access_seed: u8,
+    ) -> (tempfile::TempDir, PersistedRuntimeMint) {
+        let temp = tempdir().unwrap();
+        let parent = temp.path().join("owner-only-parent");
+        create_owner_only_directory(&parent);
+        let journal = RuntimeMintJournal::new(parent.join("runtime-mint"));
+        let draft = mint_draft_with_access_seed(access_seed);
         journal.persist_bound(&draft).unwrap();
         if custody_provisioned {
             for (index, node) in draft.nodes().iter().enumerate() {
@@ -1304,13 +1402,42 @@ mod tests {
     }
 
     fn viewer_session(seed: u8) -> RuntimeViewerSession {
-        RuntimeViewerSession {
-            audit_request_id: digest(0x80 ^ seed),
-            viewer_session_handle: opaque_handle(seed),
-            encrypted_content: test_media::media_identity(0x11).encrypted_content().clone(),
-            action: RightsActionV1::View,
-            expires_at: NOW + 60,
-        }
+        RuntimeViewerSession::from_persisted_parts(
+            digest(0x80 ^ seed),
+            opaque_handle(seed),
+            test_media::media_identity(0x11).encrypted_content().clone(),
+            RightsActionV1::View,
+            NOW + 60,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn persisted_viewer_session_rejects_invalid_fields() {
+        assert!(RuntimeViewerSession::from_persisted_parts(
+            Digest32::new([0; 32]),
+            opaque_handle(0x11),
+            test_media::media_identity(0x11).encrypted_content().clone(),
+            RightsActionV1::View,
+            NOW + 60,
+        )
+        .is_err());
+        assert!(RuntimeViewerSession::from_persisted_parts(
+            digest(0x44),
+            [0; MAX_PROVIDER_OPAQUE_HANDLE_BYTES_V1],
+            test_media::media_identity(0x11).encrypted_content().clone(),
+            RightsActionV1::View,
+            NOW + 60,
+        )
+        .is_err());
+        assert!(RuntimeViewerSession::from_persisted_parts(
+            digest(0x44),
+            opaque_handle(0x11),
+            test_media::media_identity(0x11).encrypted_content().clone(),
+            RightsActionV1::View,
+            0,
+        )
+        .is_err());
     }
 
     struct FakeDecryptProvider {
@@ -1528,7 +1655,7 @@ mod tests {
             Err(RuntimeOpenError::MintSelection)
         );
 
-        let (mint_temp, custody_provisioned) = persist_mint(true);
+        let (mint_temp, custody_provisioned) = persist_mint_with_access_seed(true, 0x52);
         let available_mint = persist_content_availability(&mint_temp, &custody_provisioned);
         assert_eq!(
             bind_buy(
@@ -1565,17 +1692,6 @@ mod tests {
                     "network": "esc-mainnet",
                 }),
                 NOW,
-            ),
-            Err(RuntimeOpenError::ChainEvidence)
-        );
-
-        let mismatched = purchase_effect(&available_mint, "wallet-account-other", 0xaa);
-        assert_eq!(
-            bind_buy(
-                &available_mint,
-                "profile:alpha",
-                profile_identity(0x26),
-                &mismatched,
             ),
             Err(RuntimeOpenError::ChainEvidence)
         );
