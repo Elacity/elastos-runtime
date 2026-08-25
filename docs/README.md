@@ -88,6 +88,8 @@ Each top-level ledger has one job:
 - [Sites](SITES.md): local site roots and public exposure
 - [Scripts](../scripts/README.md): build, proof, release, and operator commands
 - [Debugging](../DEBUG.md): developer diagnostics
+- [Logging](../elastos/crates/elastos-logger/README.md): `elastos-logger`
+  levels, components, sinks, and the JSON insight stream
 - [Security](../SECURITY.md): reporting policy and verified security findings
 
 ## Versioning

@@ -18,7 +18,7 @@ run_check() {
   local pattern="$4"
 
   : >"$tmp"
-  CARGO_TERM_COLOR=never RUST_LOG=warn \
+  CARGO_TERM_COLOR=never ELASTOS_LOG=warn \
     printf "%b" "$input" | cargo run -p elastos-server -- ${command} >"$tmp" 2>&1
 
   if ! grep -q -E "$pattern" "$tmp"; then

@@ -115,6 +115,9 @@ capability, provider, and audit boundaries.
    locally; executable Component and microVM paths use the operator lane.
 8. `elastos` and `elastos serve` are separate lanes for one data home and must
    not own it concurrently.
+9. `--log-level <trace|debug|info|warn|error|critical>` is a global flag on
+   every command; it overrides the `ELASTOS_LOG` environment variable (default
+   `info`). See [DEBUG.md](../DEBUG.md#logging).
 
 ## Future: changing command ownership
 
