@@ -1710,8 +1710,6 @@ dependencies = [
  "toml",
  "tower",
  "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
  "url",
  "wasm-encoder 0.236.1",
  "wasmparser 0.236.1",

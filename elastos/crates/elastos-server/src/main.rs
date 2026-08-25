@@ -1131,30 +1131,18 @@ pub(crate) enum IdentityNicknameCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Conditional tracing writer — suppresses stderr output during interactive VM
+// Conditional log sink — suppresses stderr output during interactive VM
 // ---------------------------------------------------------------------------
 
-/// When true, tracing output is silently discarded (interactive TUI active).
+/// When true, log output is silently discarded (interactive TUI active).
 static SUPPRESS_LOGGING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn set_logging_suppressed(suppress: bool) -> bool {
     SUPPRESS_LOGGING.swap(suppress, Ordering::Relaxed)
 }
 
-struct ConditionalStderr;
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ConditionalStderr {
-    type Writer = ConditionalStderrWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        ConditionalStderrWriter {
-            suppress: SUPPRESS_LOGGING.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// `elastos-logger` sink honoring the same interactive-TUI suppression flag as
-/// [`ConditionalStderr`]: while a VM owns the terminal, records are dropped.
+/// `elastos-logger` stderr sink honoring the interactive-TUI suppression flag:
+/// while a VM owns the terminal, records are dropped.
 struct SuppressableStderrSink;
 
 impl elastos_logger::LogSink for SuppressableStderrSink {
@@ -1162,28 +1150,6 @@ impl elastos_logger::LogSink for SuppressableStderrSink {
         if !SUPPRESS_LOGGING.load(Ordering::Relaxed) {
             use std::io::Write;
             let _ = writeln!(std::io::stderr(), "{}", rec.format_line());
-        }
-    }
-}
-
-struct ConditionalStderrWriter {
-    suppress: bool,
-}
-
-impl std::io::Write for ConditionalStderrWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.suppress {
-            Ok(buf.len())
-        } else {
-            std::io::stderr().write(buf)
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.suppress {
-            Ok(())
-        } else {
-            std::io::stderr().flush()
         }
     }
 }
@@ -1232,15 +1198,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Install rustls crypto provider (ring)
     let _ = rustls::crypto::ring::default_provider().install_default();
-
-    // Initialize logging — uses ConditionalStderr so interactive VMs can suppress output.
-    tracing_subscriber::fmt()
-        .with_writer(ConditionalStderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("elastos=info".parse().expect("valid tracing directive")),
-        )
-        .init();
 
     let cli = Cli::parse();
 
