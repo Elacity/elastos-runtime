@@ -7,7 +7,6 @@
   "type": "data",
   "author": "Emma Britton",
   "entrypoint": "nonogram.gba",
-  "icon": "icons",
   "viewer": "gba-emulator",
   "permissions": {
     "storage": ["localhost://Users/self/.AppData/LocalHost/GBA/nonogram/*"]
