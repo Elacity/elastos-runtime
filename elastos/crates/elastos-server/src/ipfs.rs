@@ -10,7 +10,7 @@ use base64::Engine;
 use elastos_logger::log_info;
 use elastos_runtime::provider;
 
-const LOG_COMPONENT: &str = "ipfs";
+const LOG_COMPONENT: &str = "cmd.ipfs";
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IpfsStatus {

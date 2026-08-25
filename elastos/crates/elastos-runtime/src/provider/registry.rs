@@ -7,7 +7,7 @@
 //! All first-party providers (did, peer, ai) use the `elastos://` namespace
 //! exclusively: `elastos://did/*`, `elastos://peer/*`, `elastos://ai/*`.
 
-use elastos_logger::log_info;
+use elastos_logger::log_trace;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -533,7 +533,7 @@ impl ProviderRegistry {
     pub async fn register(&self, provider: Arc<dyn Provider>) {
         let mut providers = self.providers.write().await;
         for scheme in provider.schemes() {
-            log_info!(component: LOG_COMPONENT,
+            log_trace!(component: LOG_COMPONENT,
                 "Registered provider '{}' for scheme '{}'",
                 provider.name(),
                 scheme
@@ -546,7 +546,7 @@ impl ProviderRegistry {
     pub async fn unregister(&self, scheme: &str) {
         let mut providers = self.providers.write().await;
         if let Some(provider) = providers.remove(scheme) {
-            log_info!(component: LOG_COMPONENT,
+            log_trace!(component: LOG_COMPONENT,
                 "Unregistered provider '{}' for scheme '{}'",
                 provider.name(),
                 scheme
@@ -576,7 +576,7 @@ impl ProviderRegistry {
                 name
             )));
         }
-        log_info!(component: LOG_COMPONENT,
+        log_trace!(component: LOG_COMPONENT,
             "Registered sub-provider '{}' for elastos://{}/...",
             provider.name(),
             name
@@ -591,7 +591,7 @@ impl ProviderRegistry {
     pub async fn unregister_sub_provider(&self, name: &str) {
         let key = name.to_lowercase();
         if let Some(provider) = self.sub_providers.write().await.remove(&key) {
-            log_info!(component: LOG_COMPONENT,
+            log_trace!(component: LOG_COMPONENT,
                 "Unregistered sub-provider '{}' for elastos://{}/...",
                 provider.name(),
                 key

@@ -19,7 +19,7 @@ use crate::sources::{
     save_trusted_sources, TrustedSource,
 };
 
-const LOG_COMPONENT: &str = "update";
+const LOG_COMPONENT: &str = "cmd.update";
 
 /// Async callback for fetching content by CID from the trusted source.
 /// The caller decides whether any explicit transport override is allowed.

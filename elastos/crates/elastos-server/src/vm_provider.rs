@@ -16,7 +16,7 @@ use elastos_runtime::provider::{
     ResourceResponse,
 };
 
-const LOG_COMPONENT: &str = "vm";
+const LOG_COMPONENT: &str = "vm.provider";
 
 struct VmIo {
     reader: BufReader<Box<dyn Read + Send>>,

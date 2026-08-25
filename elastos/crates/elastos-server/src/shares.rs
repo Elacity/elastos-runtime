@@ -9,7 +9,7 @@ use elastos_runtime::signature;
 use sha2::Digest;
 use std::path::PathBuf;
 
-const LOG_COMPONENT: &str = "share";
+const LOG_COMPONENT: &str = "cmd.share";
 
 // --- Share catalog types ---
 

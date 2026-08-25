@@ -28,7 +28,7 @@ use std::time::Duration;
 use elastos_logger::{log_info, log_trace, log_warn};
 use tokio::task::JoinHandle;
 
-const LOG_COMPONENT: &str = "vz";
+const LOG_COMPONENT: &str = "vm.vz";
 
 /// **kernel-console line cap.**
 ///

@@ -30,7 +30,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-const LOG_COMPONENT: &str = "vz";
+const LOG_COMPONENT: &str = "vm.vz";
 
 const OPEN_REQUEST_ENV: &str = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 const VZ_TRANSPORT_AUTHORITY_SCHEMA: &str = "elastos.browser.vz-transport-authority/v1";

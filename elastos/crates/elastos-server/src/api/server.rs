@@ -36,7 +36,7 @@ use elastos_runtime::namespace::NamespaceStore;
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::SessionRegistry;
 
-const LOG_COMPONENT: &str = "gw";
+const LOG_COMPONENT: &str = "gateway.http";
 
 /// Middleware that sets Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers.
 /// Required for SharedArrayBuffer (used by threaded WASM like mgba-wasm).

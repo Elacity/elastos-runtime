@@ -24,7 +24,7 @@ use elastos_logger::{log_error, log_info, log_trace, log_warn};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::session::{SessionRegistry, SessionType};
 
-const LOG_COMPONENT: &str = "supervisor";
+const LOG_COMPONENT: &str = "vm.supervisor";
 
 /// TCP port used by VM provider capsules for raw JSON request/response over the
 /// Carrier-managed control network.

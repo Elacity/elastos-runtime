@@ -7,7 +7,7 @@ use elastos_logger::{log_trace, log_warn};
 
 use super::*;
 
-const LOG_COMPONENT: &str = "home";
+const LOG_COMPONENT: &str = "gateway.home";
 
 const HOME_EVENTS_SCHEMA: &str = "elastos.home.events/v1";
 const HOME_EVENTS_DEFAULT_WAIT_MS: u64 = 25_000;

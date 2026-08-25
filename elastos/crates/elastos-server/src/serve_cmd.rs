@@ -7,7 +7,7 @@ use elastos_logger::{fp, log_error, log_info, log_trace, log_warn};
 use elastos_runtime::{bootstrap, session};
 use sha2::Digest as _;
 
-const LOG_COMPONENT: &str = "serve";
+const LOG_COMPONENT: &str = "cmd.serve";
 
 pub async fn run_serve(
     addr: String,

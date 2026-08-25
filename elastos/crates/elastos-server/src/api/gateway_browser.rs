@@ -34,7 +34,7 @@ pub(in crate::api::gateway) use gateway_browser_transport::*;
 pub(in crate::api::gateway) use gateway_browser_validation::*;
 pub(in crate::api::gateway) use gateway_browser_wallet::*;
 
-const LOG_COMPONENT: &str = "browser";
+const LOG_COMPONENT: &str = "gateway.browser";
 
 const BROWSER_PROFILE_STORAGE: &str = "principal_owned_profile_disk";
 const BROWSER_PROFILE_STORAGE_POSTURE: &str = "principal_owned_reset_scoped_unprotected";

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use elastos_logger::log_warn;
 
-const LOG_COMPONENT: &str = "share";
+const LOG_COMPONENT: &str = "cmd.share";
 
 use elastos_server::content::{
     fetch_bytes_via_provider, parse_content_object_manifest, verify_content_object_file,

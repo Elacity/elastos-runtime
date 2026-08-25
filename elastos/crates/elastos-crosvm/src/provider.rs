@@ -17,7 +17,7 @@ use crate::network::NetworkConfig;
 use crate::rootfs::RootfsManager;
 use crate::vm::RunningVm;
 
-const LOG_COMPONENT: &str = "crosvm";
+const LOG_COMPONENT: &str = "vm.crosvm";
 
 /// crosvm compute provider for running MicroVM capsules
 pub struct CrosvmProvider {

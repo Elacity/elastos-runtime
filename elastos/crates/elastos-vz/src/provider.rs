@@ -32,7 +32,7 @@ use elastos_logger::log_info;
 use crate::config::{VmConfig, VmConfigLimits, VzConfig};
 
 #[cfg(target_os = "macos")]
-const LOG_COMPONENT: &str = "vz";
+const LOG_COMPONENT: &str = "vm.vz";
 
 use crate::network::NetworkConfig;
 use crate::vm::RunningVm;

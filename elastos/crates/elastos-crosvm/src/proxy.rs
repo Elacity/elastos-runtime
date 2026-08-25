@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
-const LOG_COMPONENT: &str = "crosvm";
+const LOG_COMPONENT: &str = "vm.crosvm";
 
 /// TCP proxy that forwards connections from host to VM
 pub struct TcpProxy {

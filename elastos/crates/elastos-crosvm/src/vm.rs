@@ -11,7 +11,7 @@ use tokio::process::{Child, Command};
 
 use crate::config::VmConfig;
 
-const LOG_COMPONENT: &str = "crosvm";
+const LOG_COMPONENT: &str = "vm.crosvm";
 
 /// A running crosvm VM instance
 pub struct RunningVm {

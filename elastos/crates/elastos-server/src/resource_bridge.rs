@@ -29,7 +29,7 @@ use elastos_runtime::auth::RuntimeAuditEventV1;
 use elastos_runtime::capability::{Action, CapabilityManager, CapabilityToken, ResourceId};
 use elastos_runtime::provider::ProviderRegistry;
 
-const LOG_COMPONENT: &str = "bridge";
+const LOG_COMPONENT: &str = "gateway.bridge";
 
 const CAPABILITY_APPROVAL_POLL_MS: u64 = 100;
 const CAPABILITY_APPROVAL_MAX_POLLS: usize = 300;

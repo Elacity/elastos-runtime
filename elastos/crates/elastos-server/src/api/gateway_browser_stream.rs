@@ -27,7 +27,7 @@ use tokio::net::{TcpStream, UnixListener, UnixStream};
 use elastos_logger::{log_info, log_trace, log_warn};
 
 #[cfg(unix)]
-const LOG_COMPONENT: &str = "browser";
+const LOG_COMPONENT: &str = "gateway.browser";
 
 const BROWSER_RUNTIME_STREAM_TMP_DIR: &str = "elastos-browser-streams";
 const BROWSER_ADAPTER_IPC_TMP_DIR: &str = "elastos-browser-adapter-ipc";

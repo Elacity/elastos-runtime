@@ -2,7 +2,7 @@ use super::*;
 
 use elastos_logger::log_warn;
 
-const LOG_COMPONENT: &str = "home";
+const LOG_COMPONENT: &str = "gateway.home";
 
 pub(super) async fn home_launch(
     State(state): State<GatewayState>,

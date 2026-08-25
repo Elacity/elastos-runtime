@@ -14,7 +14,7 @@ use elastos_logger::{log_info, log_trace, log_warn};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::signature::{hash_content, SignatureVerifier};
 
-const LOG_COMPONENT: &str = "runtime";
+const LOG_COMPONENT: &str = "gateway.capsule";
 
 /// Information about a running capsule (for API responses and lifecycle management)
 #[derive(Debug, Clone)]

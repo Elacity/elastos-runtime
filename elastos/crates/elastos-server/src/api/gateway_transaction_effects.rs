@@ -17,7 +17,7 @@ use super::*;
 
 use elastos_logger::log_warn;
 
-const LOG_COMPONENT: &str = "effects";
+const LOG_COMPONENT: &str = "gateway.effects";
 
 const TRANSACTION_EFFECT_STORE_SCHEMA: &str = "elastos.runtime.transaction-effect-store/v1";
 const TRANSACTION_EFFECT_SCHEMA: &str = "elastos.runtime.transaction-effect/v1";

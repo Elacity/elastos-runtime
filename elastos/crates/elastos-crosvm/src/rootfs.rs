@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use elastos_common::{ElastosError, Result};
 use elastos_logger::{log_info, log_trace};
 
-const LOG_COMPONENT: &str = "crosvm";
+const LOG_COMPONENT: &str = "vm.crosvm";
 
 /// Manages rootfs images and overlays
 pub struct RootfsManager {

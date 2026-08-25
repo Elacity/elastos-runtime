@@ -9,7 +9,7 @@ use elastos_server::sources::{
 };
 use sha2::{Digest, Sha256};
 
-const LOG_COMPONENT: &str = "chat";
+const LOG_COMPONENT: &str = "cmd.chat";
 
 const CHAT_TOPIC: &str = "#general";
 const PRESENCE_ATTACH_RETRY_BACKOFF: Duration = Duration::from_secs(12);

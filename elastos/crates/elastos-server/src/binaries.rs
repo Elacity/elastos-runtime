@@ -4,7 +4,7 @@ use elastos_logger::log_info;
 
 use crate::{setup, sources::default_data_dir};
 
-const LOG_COMPONENT: &str = "binaries";
+const LOG_COMPONENT: &str = "host.binaries";
 
 /// Find a provider binary from an operator override or installed runtime paths.
 pub fn find_installed_provider_binary(name: &str) -> Option<PathBuf> {

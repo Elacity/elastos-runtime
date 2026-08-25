@@ -18,7 +18,7 @@ use elastos_server::sources::{default_data_dir, local_session_owner};
 use elastos_server::{api, fetcher, ownership};
 use elastos_wallet_contract::WALLET_PROTOCOL_VERSION;
 
-const LOG_COMPONENT: &str = "infra";
+const LOG_COMPONENT: &str = "gateway.infra";
 
 pub(crate) struct ServerInfrastructure {
     pub(crate) audit_log: Arc<primitives::audit::AuditLog>,

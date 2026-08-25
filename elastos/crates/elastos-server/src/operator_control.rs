@@ -30,7 +30,7 @@ use crate::{
     },
 };
 
-const LOG_COMPONENT: &str = "operator";
+const LOG_COMPONENT: &str = "host.operator";
 
 pub const OPERATOR_ALPN: &[u8] = b"elastos/operator/1";
 pub const OPERATOR_ACTION_STATUS_READ: &str = "status.read";

@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context as _};
 use elastos_logger::log_critical;
 use serde::{Deserialize, Serialize};
 
-const LOG_COMPONENT: &str = "lock";
+const LOG_COMPONENT: &str = "host.lock";
 
 #[derive(Debug)]
 pub struct HostProcessGuard {

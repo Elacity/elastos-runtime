@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use elastos_logger::log_info;
 
-const LOG_COMPONENT: &str = "run";
+const LOG_COMPONENT: &str = "cmd.run";
 
 pub async fn run_capsule(
     path: Option<PathBuf>,

@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicI32;
 use elastos_common::{ElastosError, Result};
 use elastos_logger::{log_info, log_warn};
 
-const LOG_COMPONENT: &str = "crosvm";
+const LOG_COMPONENT: &str = "vm.crosvm";
 
 // ── Linux ioctl constants ──────────────────────────────────────────
 

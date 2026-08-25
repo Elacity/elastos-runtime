@@ -41,7 +41,7 @@ use super::gateway::{
 
 use elastos_logger::{fp, log_info};
 
-const LOG_COMPONENT: &str = "auth";
+const LOG_COMPONENT: &str = "gateway.auth";
 
 const AUTH_SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const RECOVERY_DESCRIPTOR_SCHEMA: &str = "elastos.principal.root-descriptor/v1";

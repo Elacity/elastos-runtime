@@ -16,7 +16,7 @@ use crate::{
 
 const ELASTOS_VERSION: &str = env!("ELASTOS_VERSION");
 
-const LOG_COMPONENT: &str = "gw";
+const LOG_COMPONENT: &str = "gateway.http";
 pub struct GatewayControlPlane {
     pub provider_registry: Arc<provider::ProviderRegistry>,
     pub host_helpers: Vec<api::server::HostHelperProcess>,

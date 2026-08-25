@@ -35,7 +35,7 @@ use objc2_virtualization::{VZVirtualMachine, VZVirtualMachineDelegate};
 
 use super::error::ns_error_to_string;
 
-const LOG_COMPONENT: &str = "vz";
+const LOG_COMPONENT: &str = "vm.vz";
 
 /// Terminal-state classification surfaced by the delegate and
 /// by `VzMachineHandle::stop`.
