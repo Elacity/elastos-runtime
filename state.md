@@ -1,25 +1,31 @@
 # State
 
-Last updated: 2026-07-31 UTC
+Last updated: 2026-08-25 UTC
 
-This file records public-safe current truth for the 0.5.0 baseline, the 0.6.0
-release candidate, and active feature branches. Historical
+This file records public-safe current truth for the 0.6 source line on `main`
+and the active 0.7 review branches. Historical
 local proof logs, private SSH aliases, tunnel ports, operator usernames, key
 paths, worktree paths, and target backup paths are intentionally not tracked in
 the public repository.
 
 ## Release Posture
 
-- `main` is the 0.5.0 baseline. Active feature branches must state whether they
-  are preserving 0.5.0 behavior or intentionally moving the product architecture.
-- `fix/elastos-shell-protocol-browser-wallet-consolidation` is the published
-  0.6.0 review line. It is based on `feat/elastos-shell-protocol`, which
-  descends from `upstream/0.6-dev`; it includes the reviewed ESP, Wallet,
-  Recovery, and Browser continuation and keeps the accepted implementation
-  history intact. It is not merged to `main`.
-- Carrier reconciliation, shell UI redesign, and extended AI UI work are not
-  included in 0.6.0. Carrier moves to 0.7; the UI work requires an independent
-  compatibility and product review before a later release.
+- `main` at `d358dedb` contains the 0.6 source line. Some product proof,
+  packaging, and target-device work remains open and must not be inferred from
+  the branch name or version alone.
+- `upstream/0.7-dev` currently points to the same `d358dedb` base.
+  `review/collaboration-candidate` at `5f1fb004` is the published proposed 0.7
+  collaboration foundation. It is not merged or released.
+- PR #23 at `5e546ef4` targets `feat/home-agent-harness-rebuild` at `25cef473`.
+  Commit `a86aec71` added the shared recovery predicate and regression test, and
+  `5e546ef4` corrected the entropy interaction. Four current CI jobs pass and
+  the experimental Windows job still fails on Unix-only `elastos-guest`
+  terminal code. Windows is not an accepted target for that slice, so the job
+  may be non-blocking only with the portability debt retained explicitly. The
+  complete Home URUX flow and manual UX remain merge gates.
+- PR #17 at `9f423796` remains open and parked. Its model-provider service
+  offers are not the free content-capsule catalog or a replacement for the
+  native content path.
 - The Runtime implements the WASM Component Model path through
   `elastos.component/v1` and the Runtime-mediated `elastos:bus@v1` authority
   contract. The conformance fixture and authoring template exercise it; all 18
@@ -58,9 +64,9 @@ the public repository.
 ## Capsule Execution Truth
 
 - [docs/CAPSULE_MODEL.md](docs/CAPSULE_MODEL.md#isolation-boundary)
-  defines the cross-branch isolated-execution contract. It is a 0.6
-  architecture requirement, not an additional product claim for the 0.5.0
-  `main` line.
+  defines the cross-branch isolated-execution contract. It is an architecture
+  requirement, not proof that every first-party product capsule has migrated
+  to that execution path.
 - The ESP branch proves a useful substrate slice: the Component runner and
   conformance fixture use no linked WASI, environment, filesystem preopen,
   FIFO, raw socket, or gateway authority, and every guest effect is linked
@@ -190,6 +196,40 @@ the public repository.
   keyboard/on-screen input, user-enabled audio, save/reload, source-installed-
   served artifact parity, and view cleanup. GBA remains outside the default
   profile and is installed only by explicit `demo` or `full` profiles.
+- `gba-ucity` already models a game as a `role=content`, `type=data` capsule
+  bound to `gba-emulator`. This is the intended shape for additional licensed
+  GBA content. A public Home Get catalog and network-backed install receipt do
+  not exist yet.
+
+## Content Catalog And Model Truth
+
+- The implemented Runtime catalog is an installed-capsule projection. It is not
+  a community network catalog and has no accepted Home Get mutation for
+  not-yet-installed content.
+- Current GGUF records in `components.json` are setup-only external components
+  fetched from raw Hugging Face URLs with checksums. They are transitional
+  operator provisioning, not the intended model-content identity or permission
+  for Home to expose those URLs.
+- The intended model is a signed GGUF content capsule identified by its complete
+  bundle CID and fetched through the content and availability provider path.
+  No Hugging Face gateway provider capsule or ElastOS-native community model
+  catalog is implemented yet.
+- `elastos.service.offer/v1` describes a running provider capability. It is not
+  required to identify, fetch, pin, or admit a game or GGUF content capsule.
+
+## Windows Truth
+
+- Native Windows is not an accepted Runtime target today. The current product
+  direction is a local Linux Runtime inside WSL2 with a small Windows launcher.
+  See [docs/WINDOWS.md](docs/WINDOWS.md).
+- The experimental Windows CI failure is useful evidence and must stay visible.
+  The first confirmed blocker is overly broad non-WASI Unix code in
+  `elastos-guest`, including termios, serial, PTY, and FIFO paths. It is the
+  first blocker, not the only one.
+- A future native Windows host must preserve the existing Runtime, Carrier,
+  provider, identity, and Browser contracts. Named pipes, ConPTY, Job Objects,
+  Windows ACLs, and any later WHPX or Hyper-V adapter belong behind those
+  contracts.
 
 ## System Truth
 
