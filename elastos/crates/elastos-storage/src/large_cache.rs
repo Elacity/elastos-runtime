@@ -7,8 +7,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use elastos_common::{ElastosError, Result};
+use elastos_logger::{log_info, log_warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+
+const LOG_COMPONENT: &str = "storage";
 
 /// Default cache size limit: 50GB
 const DEFAULT_CACHE_SIZE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
@@ -207,7 +210,7 @@ impl LargeFileCache {
         drop(index);
         self.save_index().await?;
 
-        tracing::info!("Cached rootfs {} ({} MB)", cid, size / (1024 * 1024));
+        log_info!(component: LOG_COMPONENT, "Cached rootfs {} ({} MB)", cid, size / (1024 * 1024));
 
         Ok(cache_path)
     }
@@ -243,9 +246,9 @@ impl LargeFileCache {
                 let path = self.config.cache_dir.join(&entry.path);
                 if path.exists() {
                     if let Err(e) = tokio::fs::remove_file(&path).await {
-                        tracing::warn!("Failed to remove evicted cache file: {}", e);
+                        log_warn!(component: LOG_COMPONENT, "Failed to remove evicted cache file: {}", e);
                     } else {
-                        tracing::info!("Evicted cached rootfs: {}", cid);
+                        log_info!(component: LOG_COMPONENT, "Evicted cached rootfs: {}", cid);
                     }
                 }
             }

@@ -22,13 +22,15 @@ use elastos_common::{
     ResourceLimits, SCHEMA_V1,
 };
 use elastos_compute::{CapsuleHandle, ComputeProvider};
+use elastos_logger::{log_error, log_info, log_warn};
 use elastos_vz::{VmConfig, VzConfig, VzProvider};
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
-use tracing_subscriber::{fmt, EnvFilter};
+
+const LOG_COMPONENT: &str = "vz";
 
 const OPEN_REQUEST_ENV: &str = "ELASTOS_BROWSER_VM_OPEN_REQUEST";
 const VZ_TRANSPORT_AUTHORITY_SCHEMA: &str = "elastos.browser.vz-transport-authority/v1";
@@ -79,20 +81,10 @@ const VZ_AUTHORITY_BOOT_ARG_PREFIXES: [&str; 4] = [
 
 #[tokio::main]
 async fn main() {
-    init_tracing();
     if let Err(error) = run().await {
-        eprintln!("{error}");
+        log_error!(component: LOG_COMPONENT, "{error}");
         process::exit(1);
     }
-}
-
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,vm_console=info"));
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
 }
 
 #[derive(Debug, Clone)]
@@ -688,9 +680,12 @@ fn trace_stage(stage: &str, detail: impl AsRef<str>) {
     if enabled {
         let detail = detail.as_ref();
         if detail.is_empty() {
-            eprintln!("browser-vz-engine-supervisor stage={stage}");
+            log_info!(component: LOG_COMPONENT, "browser-vz-engine-supervisor stage={stage}");
         } else {
-            eprintln!("browser-vz-engine-supervisor stage={stage} {detail}");
+            log_info!(
+                component: LOG_COMPONENT,
+                "browser-vz-engine-supervisor stage={stage} {detail}"
+            );
         }
     }
 }
@@ -3047,7 +3042,10 @@ fn spawn_control_proxy(
             match listener.accept() {
                 Ok((host_stream, _)) => {
                     if let Err(error) = host_stream.set_nonblocking(false) {
-                        eprintln!("Browser VM host control proxy client setup failed: {error}");
+                        log_warn!(
+                            component: LOG_COMPONENT,
+                            "Browser VM host control proxy client setup failed: {error}"
+                        );
                         continue;
                     }
                     let provider = Arc::clone(&provider);
@@ -3083,7 +3081,10 @@ fn spawn_control_proxy(
                                     File::from(fd),
                                     request_timeout,
                                 ) {
-                                    eprintln!("Browser VM host control proxy failed: {error}");
+                                    log_warn!(
+                                        component: LOG_COMPONENT,
+                                        "Browser VM host control proxy failed: {error}"
+                                    );
                                 }
                             }
                             Err(error) => {
@@ -3320,7 +3321,10 @@ fn spawn_egress_bridge(
                     let session_id = session_id;
                     let trace_egress = env_bool("ELASTOS_BROWSER_VM_TRACE_EGRESS", false);
                     if trace_egress {
-                        eprintln!("Browser VM host egress bridge accepted session {session_id}");
+                        log_info!(
+                            component: LOG_COMPONENT,
+                            "Browser VM host egress bridge accepted session {session_id}"
+                        );
                     }
                     let host_path = runtime_stream_path.clone();
                     workers.push(tokio::task::spawn_blocking(move || {
@@ -3335,14 +3339,16 @@ fn spawn_egress_bridge(
                                 DuplexStream::Unix(runtime_stream),
                             )?;
                             if trace_egress {
-                                eprintln!(
+                                log_info!(
+                                    component: LOG_COMPONENT,
                                     "Browser VM host egress bridge session {session_id} guest_to_runtime={guest_to_runtime} runtime_to_guest={runtime_to_guest}"
                                 );
                             }
                             Ok(())
                         })();
                         if let Err(error) = result {
-                            eprintln!(
+                            log_warn!(
+                                component: LOG_COMPONENT,
                                 "Browser VM host egress bridge session {session_id} failed: {error}"
                             );
                         }

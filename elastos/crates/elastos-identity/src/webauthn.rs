@@ -9,11 +9,14 @@ use std::time::{Duration, Instant};
 
 use aws_lc_rs::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use elastos_logger::log_warn;
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::store::{IdentityStore, StoredCredential};
+
+const LOG_COMPONENT: &str = "identity";
 
 /// Challenge expiry duration
 const CHALLENGE_EXPIRY: Duration = Duration::from_secs(300);
@@ -576,7 +579,8 @@ impl IdentityManager {
         // Clone detection: sign count should increase
         if stored.sign_count > 0 && sign_count <= stored.sign_count {
             if self.allow_clone {
-                tracing::warn!(
+                log_warn!(
+                    component: LOG_COMPONENT,
                     "Possible credential clone detected (dev mode, allowing): stored={}, received={}",
                     stored.sign_count,
                     sign_count

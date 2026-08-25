@@ -9,6 +9,9 @@ use tokio::fs;
 
 use crate::ContentId;
 use elastos_common::Result;
+use elastos_logger::{log_info, log_trace};
+
+const LOG_COMPONENT: &str = "storage";
 
 /// Content cache with LRU eviction
 pub struct ContentCache {
@@ -69,7 +72,7 @@ impl ContentCache {
         }
         *self.current_size.lock().unwrap() = total_size;
 
-        tracing::info!(
+        log_info!(component: LOG_COMPONENT,
             "Cache initialized: {} bytes in {} items",
             total_size,
             self.lru.lock().unwrap().len()
@@ -204,7 +207,7 @@ impl ContentCache {
                 let path = self.cache_dir.join(&name);
                 if path.exists() {
                     fs::remove_file(&path).await?;
-                    tracing::debug!("Evicted {} ({} bytes) from cache", name, size);
+                    log_trace!(component: LOG_COMPONENT, "Evicted {} ({} bytes) from cache", name, size);
                 }
 
                 let mut current = self.current_size.lock().unwrap();

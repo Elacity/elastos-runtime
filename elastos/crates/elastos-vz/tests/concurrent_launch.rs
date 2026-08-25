@@ -26,7 +26,7 @@
 //!    a real Apple Silicon Mac with a real kernel artefact.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use elastos_common::{
@@ -34,12 +34,8 @@ use elastos_common::{
 };
 use elastos_compute::ComputeProvider;
 
+use elastos_logger::{Level, LogSink, Logger, StderrSink, VecSink};
 use elastos_vz::{is_supported, VmConfig, VzConfig, VzProvider};
-
-use tracing::field::{Field, Visit};
-use tracing::Event;
-use tracing_subscriber::layer::{Context, Layer};
-use tracing_subscriber::prelude::*;
 
 fn microvm_manifest(name: &str) -> CapsuleManifest {
     CapsuleManifest {
@@ -370,10 +366,11 @@ async fn concurrent_load_with_real_kernel() {
 
 // ─── Boot-to-userspace validation ─────────────────────────────────────────────
 //
-// Captures the kernel-console `tracing` stream (target = "vm_console")
-// emitted by `src/ffi/console_forwarder.rs` and asserts that booting a
-// real Linux kernel + initramfs through the substrate produces
-// recognizable boot markers (e.g. "Linux version", "Run /init").
+// Captures the kernel-console log stream (lines prefixed with
+// `vm_console vm_id=...`) emitted by `src/ffi/console_forwarder.rs` and
+// asserts that booting a real Linux kernel + initramfs through the
+// substrate produces recognizable boot markers (e.g. "Linux version",
+// "Run /init").
 //
 // Discovery contract mirrors `concurrent_load_with_real_kernel`:
 //
@@ -384,73 +381,46 @@ async fn concurrent_load_with_real_kernel() {
 // The test cleanly skips (eprintln + return) on unsupported hosts or
 // when artefacts are missing — same skip pattern as the load test.
 
-/// Lines tagged with target = "vm_console" since process start. Shared
-/// across all tests in this binary; populated by `VmConsoleCaptureLayer`
-/// (installed exactly once via `init_vm_console_capture`).
-type LineBuffer = Arc<Mutex<Vec<String>>>;
-static VM_CONSOLE_LINES: OnceLock<LineBuffer> = OnceLock::new();
+/// Capturing sink installed as part of the process logger. Shared
+/// across all tests in this binary; installed exactly once via
+/// `init_vm_console_capture`.
+static VM_CONSOLE_SINK: OnceLock<Arc<VecSink>> = OnceLock::new();
 
-/// Install the capturing tracing subscriber on first call. Subsequent
-/// calls return the same shared buffer. Idempotent across tests in the
-/// same binary so the no-tracing-setup-needed contract of the other
+/// Install the capturing process logger on first call. Subsequent
+/// calls return the same shared sink. Idempotent across tests in the
+/// same binary so the no-logger-setup-needed contract of the other
 /// tests stays intact.
-fn init_vm_console_capture() -> LineBuffer {
-    VM_CONSOLE_LINES
+fn init_vm_console_capture() -> Arc<VecSink> {
+    VM_CONSOLE_SINK
         .get_or_init(|| {
-            let buf: LineBuffer = Arc::new(Mutex::new(Vec::new()));
-            let layer = VmConsoleCaptureLayer { lines: buf.clone() };
-            // `try_init` is non-panicking: if some other test already
-            // installed a global subscriber, we silently fall through
-            // (our buffer just stays empty, which the boot test will
-            // surface as a clear assertion failure).
-            let _ = tracing_subscriber::registry().with(layer).try_init();
-            buf
+            let sink = Arc::new(VecSink::default());
+            // `elastos_logger::init` is a no-op if something already
+            // installed the process logger; our sink would then stay
+            // empty, which the boot test will surface as a clear
+            // assertion failure. StderrSink keeps the stream visible
+            // under `--nocapture`, matching the old fmt subscriber.
+            elastos_logger::init(Logger::new(
+                Level::Trace,
+                "vz-test",
+                vec![
+                    sink.clone() as Arc<dyn LogSink>,
+                    Arc::new(StderrSink) as Arc<dyn LogSink>,
+                ],
+            ));
+            sink
         })
         .clone()
 }
 
-/// Minimal tracing `Layer` that collects the message body of every
-/// `vm_console`-targeted event into a shared `Vec<String>`. Drops all
-/// other targets unchanged (so the `concurrent_load_*` tests in this
-/// same file remain unaffected).
-struct VmConsoleCaptureLayer {
-    lines: LineBuffer,
-}
-
-impl<S> Layer<S> for VmConsoleCaptureLayer
-where
-    S: tracing::Subscriber,
-{
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        if event.metadata().target() != "vm_console" {
-            return;
-        }
-        let mut visitor = MessageVisitor(String::new());
-        event.record(&mut visitor);
-        if !visitor.0.is_empty() {
-            if let Ok(mut guard) = self.lines.lock() {
-                guard.push(visitor.0);
-            }
-        }
-    }
-}
-
-struct MessageVisitor(String);
-
-impl Visit for MessageVisitor {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.0.push_str(value);
-        }
-    }
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            // `tracing::info!(..., "{line}")` ends up as a Debug
-            // record on the message field at the layer boundary;
-            // the actual line string lives inside that Debug repr.
-            self.0.push_str(&format!("{value:?}"));
-        }
-    }
+/// Kernel-console lines captured so far. The forwarder prefixes every
+/// guest line with `vm_console vm_id=...: `, so filtering on that
+/// marker drops all other log traffic (keeping the `concurrent_load_*`
+/// tests in this same file unaffected).
+fn captured_console_lines(sink: &VecSink) -> Vec<String> {
+    sink.lines()
+        .into_iter()
+        .filter(|l| l.contains("vm_console vm_id="))
+        .collect()
 }
 
 fn discover_initrd() -> Option<PathBuf> {
@@ -478,18 +448,15 @@ fn discover_initrd() -> Option<PathBuf> {
     None
 }
 
-/// Returns true once the captured `vm_console` buffer contains any of
-/// the recognised Linux-boot markers.
-fn observed_boot_markers(buf: &LineBuffer) -> Option<&'static str> {
+/// Returns the matched marker once the captured `vm_console` buffer
+/// contains any of the recognised Linux-boot markers.
+fn observed_boot_markers(sink: &VecSink) -> Option<&'static str> {
     // These three are present in *every* arm64 Linux 5.x boot. We
     // accept any one of them as proof of "kernel reached
     // initialisation"; the union covers cases where one or another
     // is filtered by a `quiet` boot arg or a custom printk level.
     const MARKERS: &[&str] = &["Linux version", "Booting Linux", "Run /init"];
-    let lines = buf.lock().ok()?;
-    // clippy `manual_find` (RUSTSEC equivalent: idiomatic Iterator::find).
-    // The original explicit `for + return Some` was caught by `-D warnings` under
-    // clippy after formatting invalidated cached analysis.
+    let lines = captured_console_lines(sink);
     MARKERS
         .iter()
         .find(|&marker| lines.iter().any(|l| l.contains(marker)))
@@ -554,8 +521,8 @@ async fn single_vm_boots_to_userspace() {
         rootfs.display()
     );
 
-    let console_lines = init_vm_console_capture();
-    let baseline_len = console_lines.lock().unwrap().len();
+    let console_sink = init_vm_console_capture();
+    let baseline_len = captured_console_lines(&console_sink).len();
 
     let tmp = tempfile::tempdir().unwrap();
     let provider = std::sync::Arc::new(
@@ -619,7 +586,7 @@ async fn single_vm_boots_to_userspace() {
     // within 1–2 seconds of `start()` returning on M1/M2.
     let deadline = Instant::now() + Duration::from_secs(30);
     let found = loop {
-        if let Some(marker) = observed_boot_markers(&console_lines) {
+        if let Some(marker) = observed_boot_markers(&console_sink) {
             break Some(marker);
         }
         if Instant::now() >= deadline {
@@ -633,13 +600,10 @@ async fn single_vm_boots_to_userspace() {
     // `cargo test -- --nocapture` so a reader can confirm the VM
     // actually booted — even when the assertion passes — and so
     // failures include real evidence.
-    let captured: Vec<String> = console_lines
-        .lock()
-        .unwrap()
-        .iter()
+    let captured: Vec<String> = captured_console_lines(&console_sink)
+        .into_iter()
         .skip(baseline_len)
         .take(30)
-        .cloned()
         .collect();
     if !captured.is_empty() {
         eprintln!("=== first ≤30 kernel-console lines ===");
@@ -648,7 +612,7 @@ async fn single_vm_boots_to_userspace() {
         }
         eprintln!("=== end console capture ===");
     } else {
-        eprintln!("=== no kernel-console output captured (capture layer race or pipe stalled) ===");
+        eprintln!("=== no kernel-console output captured (capture sink race or pipe stalled) ===");
     }
 
     // Stop the VM. Best-effort: even if the kernel panicked we still

@@ -36,7 +36,7 @@ use super::vsock::build_vsock_device;
 /// Final product of the builder. Holds the Vz configuration
 /// **and** every Rust-side handle that needs to outlive the
 /// configuration (specifically the kernel-console read end, so
-/// the lifecycle module can forward bytes to `tracing`).
+/// the lifecycle module can forward bytes to the logger).
 #[derive(Debug)]
 pub(crate) struct BuiltMachine {
     /// Configuration ready for `VZVirtualMachine::initWithConfiguration:queue:`.

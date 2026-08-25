@@ -538,7 +538,7 @@ mod tests {
         assert!(report.budget_secs.is_none());
 
         // Non-Vz domain (e.g. NSPOSIXErrorDomain) must surface
-        // the original domain — operators tracing lower-level
+        // the original domain — operators tracking lower-level
         // OS errors need the domain to make sense of the code.
         let posix = VzError::from_ns_error_parts("NSPOSIXErrorDomain", 13, "Permission denied");
         let posix_report = posix.to_report();

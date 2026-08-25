@@ -9,6 +9,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::AtomicI32;
 
 use elastos_common::{ElastosError, Result};
+use elastos_logger::{log_info, log_warn};
+
+const LOG_COMPONENT: &str = "crosvm";
 
 // ── Linux ioctl constants ──────────────────────────────────────────
 
@@ -183,7 +186,8 @@ impl NetworkConfig {
             libc::close(fd);
         }
 
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "Guest-network TAP configured (ioctl): tap={} host={} guest={}",
             self.tap_name,
             self.host_ip,
@@ -210,7 +214,7 @@ impl NetworkConfig {
             unsafe {
                 libc::close(fd);
             }
-            tracing::info!("Guest-network TAP torn down: tap={}", self.tap_name);
+            log_info!(component: LOG_COMPONENT, "Guest-network TAP torn down: tap={}", self.tap_name);
         }
         Ok(())
     }
@@ -241,7 +245,8 @@ impl NetworkConfig {
         // Set owner to current user
         let uid = unsafe { libc::geteuid() } as libc::c_ulong;
         if unsafe { ioctl_raw(fd, TUNSETOWNER, uid as *mut _) } < 0 {
-            tracing::warn!(
+            log_warn!(
+                component: LOG_COMPONENT,
                 "TUNSETOWNER failed (non-fatal): {}",
                 std::io::Error::last_os_error()
             );

@@ -15,9 +15,9 @@ elastos-namespace = { path = "../elastos-namespace" }
 elastos-storage = { path = "../elastos-storage" }
 elastos-compute = { path = "../elastos-compute" }
 elastos-auth = { path = "../elastos-auth" }
+elastos-logger = { path = "../elastos-logger" }
 
 tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"

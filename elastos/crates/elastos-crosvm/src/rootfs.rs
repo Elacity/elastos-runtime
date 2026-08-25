@@ -3,6 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use elastos_common::{ElastosError, Result};
+use elastos_logger::{log_info, log_trace};
+
+const LOG_COMPONENT: &str = "crosvm";
 
 /// Manages rootfs images and overlays
 pub struct RootfsManager {
@@ -46,11 +49,12 @@ impl RootfsManager {
         let overlay_path = self.overlay_dir.join(format!("{}.ext4", vm_id));
 
         if overlay_path.exists() {
-            tracing::debug!("Using existing overlay: {}", overlay_path.display());
+            log_trace!(component: LOG_COMPONENT, "Using existing overlay: {}", overlay_path.display());
             return Ok(overlay_path);
         }
 
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "Creating rootfs overlay for VM '{}' from: {}",
             vm_id,
             base_rootfs.display()
@@ -102,7 +106,8 @@ impl RootfsManager {
         let disk_path = data_dir.join(format!("{}-data.ext4", capsule_name));
 
         if disk_path.exists() {
-            tracing::info!(
+            log_info!(
+                component: LOG_COMPONENT,
                 "Reusing existing data disk: {} ({}MB)",
                 disk_path.display(),
                 size_mb
@@ -110,7 +115,8 @@ impl RootfsManager {
             return Ok(disk_path);
         }
 
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "Creating data disk for '{}': {} ({}MB sparse)",
             capsule_name,
             disk_path.display(),

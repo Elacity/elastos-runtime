@@ -4,6 +4,7 @@
 //! must go through token validation here.
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use elastos_logger::{log_error, log_info, log_warn};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,6 +13,8 @@ use super::token::{Action, CapabilityToken, ResourceId, TokenConstraints, TokenI
 use crate::primitives::audit::AuditLog;
 use crate::primitives::metrics::MetricsManager;
 use crate::primitives::time::SecureTimestamp;
+
+const LOG_COMPONENT: &str = "runtime";
 
 /// Validation error types
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,11 +142,11 @@ impl CapabilityManager {
                     let mut key_bytes = [0u8; 32];
                     key_bytes.copy_from_slice(&bytes);
                     let key = SigningKey::from_bytes(&key_bytes);
-                    tracing::info!("Loaded existing capability signing key from {:?}", key_path);
+                    log_info!(component: LOG_COMPONENT, "Loaded existing capability signing key from {:?}", key_path);
                     key
                 }
                 Ok(bytes) => {
-                    tracing::warn!(
+                    log_warn!(component: LOG_COMPONENT,
                         "Signing key file {:?} has wrong length ({} bytes, expected 32). Generating new key.",
                         key_path,
                         bytes.len()
@@ -151,7 +154,7 @@ impl CapabilityManager {
                     Self::generate_and_persist_key(&key_path, &audit_log)
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    log_warn!(component: LOG_COMPONENT,
                         "Failed to read signing key from {:?}: {}. Generating new key.",
                         key_path,
                         e
@@ -162,7 +165,7 @@ impl CapabilityManager {
         } else {
             // No key file — generate and save
             if let Err(e) = std::fs::create_dir_all(data_dir) {
-                tracing::warn!("Failed to create data directory {:?}: {}", data_dir, e);
+                log_warn!(component: LOG_COMPONENT, "Failed to create data directory {:?}: {}", data_dir, e);
             }
             Self::generate_and_persist_key(&key_path, &audit_log)
         };
@@ -191,13 +194,13 @@ impl CapabilityManager {
                     let _ =
                         std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
                 }
-                tracing::info!(
+                log_info!(component: LOG_COMPONENT,
                     "Generated and saved new capability signing key to {:?}",
                     key_path
                 );
             }
             Err(e) => {
-                tracing::error!(
+                log_error!(component: LOG_COMPONENT,
                     "Failed to persist signing key to {:?}: {}. Tokens will not survive restart.",
                     key_path,
                     e
@@ -516,7 +519,7 @@ impl CapabilityManager {
         // Persist new key with restrictive permissions
         let key_path = data_dir.join("signing_key");
         if let Err(e) = std::fs::write(&key_path, new_key.to_bytes()) {
-            tracing::error!("Failed to persist rotated key: {}", e);
+            log_error!(component: LOG_COMPONENT, "Failed to persist rotated key: {}", e);
         } else {
             #[cfg(unix)]
             {

@@ -17,7 +17,7 @@
 //! logfile is a guaranteed disk-exhaustion footgun on long-running
 //! Mac sessions. Both attachments below use a `pipe(2)` pair instead;
 //! the read end stays owned by Rust so the lifecycle module can copy
-//! bytes into the `tracing` subscriber.
+//! bytes into the process logger.
 
 #![cfg(target_os = "macos")]
 
@@ -39,7 +39,7 @@ use objc2_virtualization::{
 ///
 /// * **Pipe-backed**: the Rust side keeps ownership of
 ///   [`host_read`] so the lifecycle module can read guest kernel
-///   output as raw bytes and forward them to a `tracing` target.
+///   output as raw bytes and forward them to the logger.
 ///   The Vz side keeps the write end of the pipe inside an
 ///   `NSFileHandle` (via [`serial_port_cfg`]) and writes guest
 ///   output there. Guest reads from `/dev/hvc0` always return EOF
@@ -68,7 +68,7 @@ pub(crate) struct KernelConsole {
 ///
 /// `interactive`:
 /// - `false`: pipe-backed, write-only. Output flows
-///   into the returned `host_read` for the in-process tracing
+///   into the returned `host_read` for the in-process log
 ///   forwarder.
 /// - `true`:  bidirectional stdio-backed. Output prints
 ///   on the operator's stdout; input reads from operator stdin.

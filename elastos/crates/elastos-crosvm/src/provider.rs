@@ -10,11 +10,14 @@ use elastos_common::{
     CapsuleId, CapsuleManifest, CapsuleStatus, CapsuleType, ElastosError, Result,
 };
 use elastos_compute::{CapsuleHandle, CapsuleInfo, ComputeProvider};
+use elastos_logger::{fp, log_info};
 
 use crate::config::{CrosvmConfig, VmConfig};
 use crate::network::NetworkConfig;
 use crate::rootfs::RootfsManager;
 use crate::vm::RunningVm;
+
+const LOG_COMPONENT: &str = "crosvm";
 
 /// crosvm compute provider for running MicroVM capsules
 pub struct CrosvmProvider {
@@ -124,7 +127,7 @@ impl ComputeProvider for CrosvmProvider {
 
         self.vms.write().await.insert(id.clone(), vm);
 
-        tracing::info!("Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
+        log_info!(component: LOG_COMPONENT, "Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
 
         Ok(CapsuleHandle {
             id,
@@ -207,10 +210,11 @@ impl CrosvmProvider {
 
         vm.config = vm.config.clone().with_session(token, api_addr);
 
-        tracing::info!(
-            "Configured session for VM {}: token={}..., api={}",
+        log_info!(
+            component: LOG_COMPONENT,
+            "Configured session for VM {}: token={}, api={}",
             capsule_id,
-            &token[..8.min(token.len())],
+            fp(token),
             api_addr
         );
 
@@ -231,7 +235,8 @@ impl CrosvmProvider {
 
         vm.config.network = Some(network.clone());
 
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "Configured guest-network TAP for VM {}: host={} guest={}",
             capsule_id,
             network.host_ip,

@@ -8,6 +8,7 @@ description = "ElastOS Apple Virtualization.framework Compute Provider for macOS
 [dependencies]
 elastos-common = { path = "../elastos-common" }
 elastos-compute = { path = "../elastos-compute" }
+elastos-logger = { path = "../elastos-logger" }
 
 tokio = { version = "1.0", features = ["full", "process"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -19,8 +20,6 @@ sha2 = "0.10"
 url = "2.5"
 uuid = { version = "1.0", features = ["v4"] }
 async-trait = "0.1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "1.0"
 libc = "0.2"
 

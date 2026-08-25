@@ -4,6 +4,7 @@
 //! - Capability tokens (for secure resource access)
 //! - Metrics (for rate limiting and monitoring)
 //! - Audit logging (for security and compliance)
+use elastos_logger::{log_error, log_info};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +17,8 @@ use elastos_compute::{CapsuleHandle, ComputeProvider};
 use crate::capability::CapabilityManager;
 use crate::primitives::audit::{AuditLog, StopReason, TrustLevel};
 use crate::primitives::metrics::MetricsManager;
+
+const LOG_COMPONENT: &str = "runtime";
 
 /// Unique identifier for a capsule instance
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -206,7 +209,7 @@ impl CapsuleManager {
             trust_level,
         );
 
-        tracing::info!(
+        log_info!(component: LOG_COMPONENT,
             "Launched capsule '{}' with ID: {}",
             manifest.name,
             capsule_id
@@ -254,7 +257,7 @@ impl CapsuleManager {
         // Emit audit event
         self.audit_log.capsule_stop(capsule_id.as_str(), reason);
 
-        tracing::info!("Stopped capsule: {}", capsule_id);
+        log_info!(component: LOG_COMPONENT, "Stopped capsule: {}", capsule_id);
 
         Ok(())
     }
@@ -319,7 +322,7 @@ impl CapsuleManager {
         let ids: Vec<CapsuleId> = self.list_running().await;
         for id in ids {
             if let Err(e) = self.stop(&id, reason.clone()).await {
-                tracing::error!("Failed to stop capsule {}: {}", id, e);
+                log_error!(component: LOG_COMPONENT, "Failed to stop capsule {}: {}", id, e);
             }
         }
     }

@@ -1,4 +1,5 @@
 //! Signature verification for capsules
+use elastos_logger::log_info;
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -9,6 +10,8 @@ use elastos_common::{CapsuleManifest, ElastosError, Result};
 
 /// Re-export for use by CLI
 pub use ed25519_dalek::SigningKey;
+
+const LOG_COMPONENT: &str = "runtime";
 
 /// Verifies capsule signatures
 pub struct SignatureVerifier {
@@ -64,7 +67,7 @@ impl SignatureVerifier {
             count += 1;
         }
 
-        tracing::info!("Loaded {} trusted keys from {:?}", count, path);
+        log_info!(component: LOG_COMPONENT, "Loaded {} trusted keys from {:?}", count, path);
         Ok(count)
     }
 

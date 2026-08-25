@@ -1541,7 +1541,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
  "uuid",
  "wasmtime",
 ]
@@ -1553,6 +1552,7 @@ dependencies = [
  "async-trait",
  "elastos-common",
  "elastos-compute",
+ "elastos-logger",
  "libc",
  "nix",
  "serde",
@@ -1560,7 +1560,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -1568,6 +1567,7 @@ dependencies = [
 name = "elastos-guest"
 version = "0.1.0"
 dependencies = [
+ "elastos-logger",
  "libc",
  "serde",
  "serde_json",
@@ -1585,6 +1585,7 @@ dependencies = [
  "bs58",
  "ciborium",
  "ed25519-dalek 2.2.0",
+ "elastos-logger",
  "hex",
  "hkdf",
  "p256",
@@ -1593,7 +1594,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "tracing",
  "uuid",
  "zeroize",
 ]
@@ -1616,6 +1616,7 @@ dependencies = [
  "cid",
  "ed25519-dalek 2.2.0",
  "elastos-common",
+ "elastos-logger",
  "hex",
  "multihash",
  "rand 0.8.7",
@@ -1624,7 +1625,6 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1639,6 +1639,7 @@ dependencies = [
  "elastos-auth",
  "elastos-common",
  "elastos-compute",
+ "elastos-logger",
  "elastos-namespace",
  "elastos-storage",
  "flate2",
@@ -1651,7 +1652,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
  "uuid",
 ]
 
@@ -1725,6 +1725,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "elastos-common",
+ "elastos-logger",
  "futures",
  "hex",
  "lru 0.18.2",
@@ -1736,7 +1737,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -1745,12 +1745,12 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum-server",
+ "elastos-logger",
  "rcgen",
  "tempfile",
  "time",
  "tokio",
  "tokio-rustls",
- "tracing",
 ]
 
 [[package]]
@@ -1764,6 +1764,7 @@ dependencies = [
  "dispatch2",
  "elastos-common",
  "elastos-compute",
+ "elastos-logger",
  "hmac",
  "libc",
  "objc2",
@@ -1776,8 +1777,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
- "tracing-subscriber",
  "url",
  "uuid",
 ]

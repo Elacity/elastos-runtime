@@ -4,11 +4,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use elastos_common::{CapsuleManifest, CapsuleStatus, ElastosError, Result};
+use elastos_logger::{log_info, log_warn};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use tokio::process::{Child, Command};
 
 use crate::config::VmConfig;
+
+const LOG_COMPONENT: &str = "crosvm";
 
 /// A running crosvm VM instance
 pub struct RunningVm {
@@ -83,7 +86,8 @@ impl RunningVm {
         }
 
         if let Some(ref network) = self.config.network {
-            tracing::info!(
+            log_info!(
+                component: LOG_COMPONENT,
                 "Setting up guest-network TAP for VM '{}': tap={} host={} guest={}",
                 self.manifest.name,
                 network.tap_name,
@@ -108,7 +112,8 @@ impl RunningVm {
         // Build crosvm run command
         let crosvm_args = self.config.to_crosvm_args();
 
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "Starting crosvm VM '{}': {} run --socket {} {}",
             self.manifest.name,
             crosvm_bin.display(),
@@ -144,7 +149,7 @@ impl RunningVm {
             ElastosError::Compute(format!("Failed to start crosvm: {}", e))
         })?;
 
-        // Forward VM serial output through tracing.
+        // Forward VM serial output through the logger.
         if !self.config.interactive_stdio {
             if let Some(stdout) = child.stdout.take() {
                 tokio::spawn(async move {
@@ -152,7 +157,7 @@ impl RunningVm {
                     let reader = tokio::io::BufReader::new(stdout);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        tracing::info!(target: "vm_console", "{}", line);
+                        log_info!(component: LOG_COMPONENT, "vm_console: {}", line);
                     }
                 });
             }
@@ -162,7 +167,7 @@ impl RunningVm {
                     let reader = tokio::io::BufReader::new(stderr);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        tracing::warn!(target: "vm_console", "{}", line);
+                        log_warn!(component: LOG_COMPONENT, "vm_console: {}", line);
                     }
                 });
             }
@@ -173,7 +178,8 @@ impl RunningVm {
         self.status = CapsuleStatus::Running;
         self.crosvm_bin = Some(crosvm_bin.to_path_buf());
 
-        tracing::info!(
+        log_info!(
+            component: LOG_COMPONENT,
             "crosvm VM '{}' started (pid: {:?})",
             self.manifest.name,
             self.pid,
@@ -198,7 +204,8 @@ impl RunningVm {
 
             match output {
                 Ok(o) if o.status.success() => {
-                    tracing::info!(
+                    log_info!(
+                        component: LOG_COMPONENT,
                         "crosvm VM '{}' stopped via control socket",
                         self.manifest.name
                     );
@@ -208,7 +215,7 @@ impl RunningVm {
                     if let Some(pid) = self.pid {
                         let nix_pid = Pid::from_raw(pid as i32);
                         if let Err(e) = signal::kill(nix_pid, Signal::SIGTERM) {
-                            tracing::warn!("Failed to send SIGTERM to VM: {}", e);
+                            log_warn!(component: LOG_COMPONENT, "Failed to send SIGTERM to VM: {}", e);
                         }
                     }
                 }
@@ -216,7 +223,7 @@ impl RunningVm {
         } else if let Some(pid) = self.pid {
             let nix_pid = Pid::from_raw(pid as i32);
             if let Err(e) = signal::kill(nix_pid, Signal::SIGTERM) {
-                tracing::warn!("Failed to send SIGTERM to VM: {}", e);
+                log_warn!(component: LOG_COMPONENT, "Failed to send SIGTERM to VM: {}", e);
             }
         }
 
@@ -224,17 +231,18 @@ impl RunningVm {
         if let Some(ref mut child) = self.process {
             match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await {
                 Ok(Ok(status)) => {
-                    tracing::info!(
+                    log_info!(
+                        component: LOG_COMPONENT,
                         "crosvm VM '{}' exited with status: {}",
                         self.manifest.name,
                         status
                     );
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!("Error waiting for VM to exit: {}", e);
+                    log_warn!(component: LOG_COMPONENT, "Error waiting for VM to exit: {}", e);
                 }
                 Err(_) => {
-                    tracing::warn!("VM did not exit within timeout, killing");
+                    log_warn!(component: LOG_COMPONENT, "VM did not exit within timeout, killing");
                     self.kill().await?;
                 }
             }
@@ -258,7 +266,7 @@ impl RunningVm {
         if let Some(pid) = self.pid {
             let nix_pid = Pid::from_raw(pid as i32);
             if let Err(e) = signal::kill(nix_pid, Signal::SIGKILL) {
-                tracing::warn!("Failed to send SIGKILL to VM: {}", e);
+                log_warn!(component: LOG_COMPONENT, "Failed to send SIGKILL to VM: {}", e);
             }
         }
 

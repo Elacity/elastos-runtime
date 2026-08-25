@@ -2,9 +2,12 @@
 //!
 //! The registry is the authority for session validation. All API requests
 //! must have their session token validated through this registry.
+use elastos_logger::{fp, log_info};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+const LOG_COMPONENT: &str = "runtime";
 
 use super::{Session, SessionType};
 use crate::primitives::audit::AuditLog;
@@ -231,10 +234,11 @@ impl SessionRegistry {
                     ),
                 });
 
-            tracing::info!(
-                session_id = %session.id,
-                token = %token[..8.min(token.len())],
-                "Cleaned up stale session"
+            log_info!(
+                component: LOG_COMPONENT,
+                "Cleaned up stale session: session_id={}, token={}",
+                session.id,
+                fp(token)
             );
         }
 

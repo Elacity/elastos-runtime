@@ -7,6 +7,7 @@
 //! All first-party providers (did, peer, ai) use the `elastos://` namespace
 //! exclusively: `elastos://did/*`, `elastos://peer/*`, `elastos://ai/*`.
 
+use elastos_logger::log_info;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,6 +15,8 @@ use tokio::sync::RwLock;
 
 use base64::Engine as _;
 use elastos_common::localhost::{parse_localhost_path, parse_localhost_uri};
+
+const LOG_COMPONENT: &str = "runtime";
 
 /// A route currently backed by the live Runtime provider registry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -530,7 +533,7 @@ impl ProviderRegistry {
     pub async fn register(&self, provider: Arc<dyn Provider>) {
         let mut providers = self.providers.write().await;
         for scheme in provider.schemes() {
-            tracing::info!(
+            log_info!(component: LOG_COMPONENT,
                 "Registered provider '{}' for scheme '{}'",
                 provider.name(),
                 scheme
@@ -543,7 +546,7 @@ impl ProviderRegistry {
     pub async fn unregister(&self, scheme: &str) {
         let mut providers = self.providers.write().await;
         if let Some(provider) = providers.remove(scheme) {
-            tracing::info!(
+            log_info!(component: LOG_COMPONENT,
                 "Unregistered provider '{}' for scheme '{}'",
                 provider.name(),
                 scheme
@@ -573,7 +576,7 @@ impl ProviderRegistry {
                 name
             )));
         }
-        tracing::info!(
+        log_info!(component: LOG_COMPONENT,
             "Registered sub-provider '{}' for elastos://{}/...",
             provider.name(),
             name
@@ -588,7 +591,7 @@ impl ProviderRegistry {
     pub async fn unregister_sub_provider(&self, name: &str) {
         let key = name.to_lowercase();
         if let Some(provider) = self.sub_providers.write().await.remove(&key) {
-            tracing::info!(
+            log_info!(component: LOG_COMPONENT,
                 "Unregistered sub-provider '{}' for elastos://{}/...",
                 provider.name(),
                 key

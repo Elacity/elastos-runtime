@@ -26,8 +26,14 @@ use elastos_common::{
     CapsuleId, CapsuleManifest, CapsuleStatus, CapsuleType, ElastosError, Result,
 };
 use elastos_compute::{CapsuleHandle, CapsuleInfo, ComputeProvider};
+#[cfg(target_os = "macos")]
+use elastos_logger::log_info;
 
 use crate::config::{VmConfig, VmConfigLimits, VzConfig};
+
+#[cfg(target_os = "macos")]
+const LOG_COMPONENT: &str = "vz";
+
 use crate::network::NetworkConfig;
 use crate::vm::RunningVm;
 // VZ_BACKEND_UNAVAILABLE_MESSAGE is referenced from the non-macOS branch
@@ -278,7 +284,7 @@ impl VzProvider {
 
             self.vms.write().await.insert(id.clone(), vm);
 
-            tracing::info!("Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
+            log_info!(component: LOG_COMPONENT, "Loaded MicroVM capsule '{}' with ID {}", manifest.name, id);
 
             Ok(CapsuleHandle {
                 id,

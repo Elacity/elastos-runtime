@@ -128,7 +128,7 @@ pub(crate) struct VzMachineHandle {
     /// `exec_sync` / `exec_async`.
     queue: Arc<VzDispatchQueue>,
 
-    /// Diagnostic identifier embedded in tracing events. Matches
+    /// Diagnostic identifier embedded in log events. Matches
     /// `VmConfig::vm_id`.
     vm_id: String,
 
