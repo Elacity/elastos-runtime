@@ -23,20 +23,17 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::{Arc, Mutex};
-
-use elastos_logger::{log_info, log_warn};
 use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{msg_send, AnyThread, DefinedClass};
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_virtualization::{VZVirtualMachine, VZVirtualMachineDelegate};
+use std::sync::{Arc, Mutex};
 
 use super::error::ns_error_to_string;
 
-const LOG_COMPONENT: &str = "vm.vz";
-
+use crate::logger;
 /// Terminal-state classification surfaced by the delegate and
 /// by `VzMachineHandle::stop`.
 ///
@@ -123,8 +120,7 @@ define_class!(
             _network_device: &objc2_virtualization::VZNetworkDevice,
             error: &NSError,
         ) {
-            log_warn!(
-                component: LOG_COMPONENT,
+            logger::warn!(
                 "vz-delegate vm_id={}: network attachment disconnected: {}",
                 self.ivars().vm_id,
                 ns_error_to_string(error)
@@ -154,8 +150,7 @@ impl ElastosVzDelegate {
     /// and become no-ops at the channel level.
     fn signal_exit(&self, exit: DelegateExit) {
         let ivars = self.ivars();
-        log_info!(
-            component: LOG_COMPONENT,
+        logger::info!(
             "vz-delegate vm_id={}: delegate observed terminal state: {:?}",
             ivars.vm_id,
             exit

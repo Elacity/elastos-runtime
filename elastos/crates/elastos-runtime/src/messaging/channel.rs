@@ -6,8 +6,6 @@
 //! - All messages are audited
 //! - Rate limits are enforced
 //! - Messages cannot be forged or spoofed
-
-use elastos_logger::{log_trace, log_warn};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -19,8 +17,7 @@ use crate::primitives::audit::AuditLog;
 use crate::primitives::metrics::MetricsManager;
 use crate::primitives::time::SecureTimestamp;
 
-const LOG_COMPONENT: &str = "runtime";
-
+use crate::logger;
 /// Maximum message size in bytes (1 MB)
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
@@ -187,7 +184,7 @@ impl MessageChannel {
         let mut inboxes = self.inboxes.write().await;
         inboxes.insert(capsule_id.to_string(), inbox);
 
-        log_trace!(component: LOG_COMPONENT, "Registered capsule {} for messaging", capsule_id);
+        logger::trace!("Registered capsule {} for messaging", capsule_id);
         rx
     }
 
@@ -195,7 +192,7 @@ impl MessageChannel {
     pub async fn unregister(&self, capsule_id: &str) {
         let mut inboxes = self.inboxes.write().await;
         inboxes.remove(capsule_id);
-        log_trace!(component: LOG_COMPONENT, "Unregistered capsule {} from messaging", capsule_id);
+        logger::trace!("Unregistered capsule {} from messaging", capsule_id);
     }
 
     /// Send a message from one capsule to another
@@ -217,7 +214,7 @@ impl MessageChannel {
 
         // Enforce rate limit
         if self.metrics.would_exceed_message_limit(&message.from) {
-            log_warn!(component: LOG_COMPONENT, "Capsule {} exceeded message rate limit", message.from);
+            logger::warn!("Capsule {} exceeded message rate limit", message.from);
             return Err(MessageError::RateLimitExceeded);
         }
 

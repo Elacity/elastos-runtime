@@ -4,14 +4,11 @@
 //! without requiring complex iptables rules.
 
 use std::net::SocketAddr;
-
-use elastos_logger::{log_info, log_trace, log_warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
-const LOG_COMPONENT: &str = "vm.crosvm";
-
+use crate::logger;
 /// TCP proxy that forwards connections from host to VM
 pub struct TcpProxy {
     host_port: u16,
@@ -40,8 +37,7 @@ impl TcpProxy {
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx.clone());
 
-        log_info!(
-            component: LOG_COMPONENT,
+        logger::info!(
             "TCP proxy started: 0.0.0.0:{} -> {}",
             self.host_port,
             self.vm_addr
@@ -55,21 +51,21 @@ impl TcpProxy {
                     result = listener.accept() => {
                         match result {
                             Ok((client_stream, client_addr)) => {
-                                log_trace!(component: LOG_COMPONENT, "New connection from {}", client_addr);
+                                logger::trace!("New connection from {}", client_addr);
                                 let vm_addr = vm_addr;
                                 tokio::spawn(async move {
                                     if let Err(e) = proxy_connection(client_stream, vm_addr).await {
-                                        log_trace!(component: LOG_COMPONENT, "Proxy connection error: {}", e);
+                                        logger::trace!("Proxy connection error: {}", e);
                                     }
                                 });
                             }
                             Err(e) => {
-                                log_warn!(component: LOG_COMPONENT, "Accept error: {}", e);
+                                logger::warn!("Accept error: {}", e);
                             }
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        log_info!(component: LOG_COMPONENT, "TCP proxy shutting down");
+                        logger::info!("TCP proxy shutting down");
                         break;
                     }
                 }
@@ -96,7 +92,7 @@ async fn proxy_connection(
     let mut vm_stream = match TcpStream::connect(vm_addr).await {
         Ok(s) => s,
         Err(e) => {
-            log_trace!(component: LOG_COMPONENT, "Failed to connect to VM at {}: {}", vm_addr, e);
+            logger::trace!("Failed to connect to VM at {}: {}", vm_addr, e);
             return Err(e);
         }
     };
@@ -135,12 +131,12 @@ async fn proxy_connection(
     tokio::select! {
         result = client_to_vm => {
             if let Err(e) = result {
-                log_trace!(component: LOG_COMPONENT, "Client to VM error: {}", e);
+                logger::trace!("Client to VM error: {}", e);
             }
         }
         result = vm_to_client => {
             if let Err(e) = result {
-                log_trace!(component: LOG_COMPONENT, "VM to client error: {}", e);
+                logger::trace!("VM to client error: {}", e);
             }
         }
     }

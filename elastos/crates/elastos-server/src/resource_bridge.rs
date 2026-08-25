@@ -16,8 +16,6 @@ use crate::provider_resource::{
     provider_operation_action, WALLET_STATUS_RESOURCE,
 };
 use anyhow::{Context, Result};
-use elastos_logger::{log_info, log_trace, log_warn};
-
 use elastos_common::localhost::{
     is_supported_resource_scheme, is_system_only_backend_resource, rooted_localhost_fs_path,
     rooted_localhost_uri,
@@ -29,8 +27,7 @@ use elastos_runtime::auth::RuntimeAuditEventV1;
 use elastos_runtime::capability::{Action, CapabilityManager, CapabilityToken, ResourceId};
 use elastos_runtime::provider::ProviderRegistry;
 
-const LOG_COMPONENT: &str = "gateway.bridge";
-
+use crate::logger::gateway_bridge as logger;
 const CAPABILITY_APPROVAL_POLL_MS: u64 = 100;
 const CAPABILITY_APPROVAL_MAX_POLLS: usize = 300;
 const MAX_RESOURCE_FRAME_BYTES: usize = 1_048_576;
@@ -79,12 +76,11 @@ pub async fn spawn_resource_bridge(
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
             Err(e) => {
-                log_warn!(component: LOG_COMPONENT, "Resource bridge accept failed: {}", e);
+                logger::warn!("Resource bridge accept failed: {}", e);
                 return;
             }
         };
-        log_info!(
-            component: LOG_COMPONENT,
+        logger::info!(
             "Resource microVM bridge: bidirectional connection accepted for {}",
             socket_display
         );
@@ -98,14 +94,13 @@ pub async fn spawn_resource_bridge(
                 Ok(0) => break, // EOF — guest shut down
                 Ok(_) => {}
                 Err(e) => {
-                    log_trace!(component: LOG_COMPONENT, "Resource bridge read error: {}", e);
+                    logger::trace!("Resource bridge read error: {}", e);
                     break;
                 }
             }
 
             if line.len() > MAX_RESOURCE_FRAME_BYTES {
-                log_warn!(
-                    component: LOG_COMPONENT,
+                logger::warn!(
                     "Resource bridge: oversized line ({} bytes), dropping",
                     line.len()
                 );
@@ -117,15 +112,14 @@ pub async fn spawn_resource_bridge(
 
             let response = match handle_request(&line, &ctx).await {
                 Ok(resp) => {
-                    log_trace!(
-                        component: LOG_COMPONENT,
+                    logger::trace!(
                         "[serial-bridge] handled request id={}",
                         resp.get("id").and_then(|value| value.as_u64()).unwrap_or(0)
                     );
                     resp
                 }
                 Err(e) => {
-                    log_warn!(component: LOG_COMPONENT, "[serial-bridge] error: {}", e);
+                    logger::warn!("[serial-bridge] error: {}", e);
                     serde_json::json!({
                         "id": 0,
                         "response": {"type": "error", "code": "bridge_error", "message": e.to_string()}
@@ -141,7 +135,7 @@ pub async fn spawn_resource_bridge(
                 break;
             }
         }
-        log_info!(component: LOG_COMPONENT, "Resource bridge closed for {}", socket_display);
+        logger::info!("Resource bridge closed for {}", socket_display);
     });
 
     Ok(())
@@ -315,7 +309,7 @@ fn emit_component_invoke_audit(
                 outcome: outcome.unwrap_or("pending"),
             },
         ) {
-            log_warn!(component: LOG_COMPONENT, "failed to persist component invoke audit: {err}");
+            logger::warn!("failed to persist component invoke audit: {err}");
         }
     }
 }
@@ -445,8 +439,7 @@ async fn authorize_and_dispatch_resource_invoke(
             }),
         ),
         Err(e) => {
-            log_warn!(
-                component: LOG_COMPONENT,
+            logger::warn!(
                 "Bridge resource_invoke failed for {}/{}: {}",
                 dispatch.scheme,
                 dispatch.operation,
@@ -860,8 +853,7 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                 let request_id = pending.id.to_string();
 
                 if pending.is_denied() {
-                    log_info!(
-                        component: LOG_COMPONENT,
+                    logger::info!(
                         "bridge: denied {} {} for capsule '{}' (capacity)",
                         action,
                         resource,
@@ -893,8 +885,7 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                                 elastos_runtime::capability::pending::RequestStatus::Denied {
                                     reason,
                                 } => {
-                                    log_info!(
-                                        component: LOG_COMPONENT,
+                                    logger::info!(
                                         "bridge: denied {} {} for capsule '{}': {}",
                                         action,
                                         resource,
@@ -927,8 +918,7 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
 
                     if let Some(token) = granted_token {
                         let token_b64 = encode_bridge_capability_token(&token);
-                        log_info!(
-                            component: LOG_COMPONENT,
+                        logger::info!(
                             "bridge: shell granted {} {} to capsule '{}'",
                             action,
                             resource,
@@ -939,8 +929,7 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                             "token": token_b64,
                         })
                     } else {
-                        log_warn!(
-                            component: LOG_COMPONENT,
+                        logger::warn!(
                             "bridge: capability request timed out {} {} for capsule '{}'",
                             action,
                             resource,
@@ -958,8 +947,7 @@ async fn handle_request(line: &str, ctx: &Option<BridgeContext>) -> Result<serde
                 // a capability context (e.g. gateway service-plane capsules).
                 // Capability requests are denied — infrastructure capsules should
                 // not need user-facing capabilities.
-                log_warn!(
-                    component: LOG_COMPONENT,
+                logger::warn!(
                     "bridge: infrastructure capsule requested capability {} {} (denied)",
                     resource,
                     action_str,
@@ -1114,8 +1102,7 @@ pub async fn handle_remote_request_with_audit_dir(
                 )?;
             }
 
-            log_trace!(
-                component: LOG_COMPONENT,
+            logger::trace!(
                 "[remote-resource-bridge] resource_invoke {}/{} token_present={}",
                 dispatch.scheme,
                 dispatch.operation,
@@ -1154,8 +1141,7 @@ pub async fn handle_remote_request_with_audit_dir(
             };
             let status = resp.status();
             let body: serde_json::Value = resp.json().await?;
-            log_trace!(
-                component: LOG_COMPONENT,
+            logger::trace!(
                 "[remote-resource-bridge] {}/{} -> {}",
                 dispatch.scheme,
                 dispatch.operation,

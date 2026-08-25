@@ -1,11 +1,7 @@
+use crate::{setup, sources::default_data_dir};
 use std::path::{Path, PathBuf};
 
-use elastos_logger::log_info;
-
-use crate::{setup, sources::default_data_dir};
-
-const LOG_COMPONENT: &str = "host.binaries";
-
+use crate::logger::host_binaries as logger;
 /// Find a provider binary from an operator override or installed runtime paths.
 pub fn find_installed_provider_binary(name: &str) -> Option<PathBuf> {
     let data_dir = default_data_dir();
@@ -77,8 +73,7 @@ pub fn verify_component_binary_with_data_dir(
     path: &Path,
 ) -> anyhow::Result<()> {
     let checksum = setup::verify_installed_component_binary(data_dir, name, path)?;
-    log_info!(
-        component: LOG_COMPONENT,
+    logger::info!(
         "{} binary verified against installed manifest ({})",
         name,
         checksum

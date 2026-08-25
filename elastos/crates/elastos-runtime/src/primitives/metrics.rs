@@ -7,15 +7,12 @@
 //!
 //! Phase 3: Track only, no enforcement
 //! Later: Add configurable limits and enforcement
-
-use elastos_logger::log_warn;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
-const LOG_COMPONENT: &str = "runtime";
-
+use crate::logger;
 /// Metrics for a single capsule
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapsuleMetrics {
@@ -170,35 +167,35 @@ impl MetricsManager {
 
     fn metrics_read(&self) -> RwLockReadGuard<'_, HashMap<String, CapsuleMetrics>> {
         self.metrics.read().unwrap_or_else(|poisoned| {
-            log_warn!(component: LOG_COMPONENT, "metrics registry lock poisoned; recovering read access");
+            logger::warn!("metrics registry lock poisoned; recovering read access");
             poisoned.into_inner()
         })
     }
 
     fn metrics_write(&self) -> RwLockWriteGuard<'_, HashMap<String, CapsuleMetrics>> {
         self.metrics.write().unwrap_or_else(|poisoned| {
-            log_warn!(component: LOG_COMPONENT, "metrics registry lock poisoned; recovering write access");
+            logger::warn!("metrics registry lock poisoned; recovering write access");
             poisoned.into_inner()
         })
     }
 
     fn limits_read(&self) -> RwLockReadGuard<'_, HashMap<String, ResourceLimits>> {
         self.limits.read().unwrap_or_else(|poisoned| {
-            log_warn!(component: LOG_COMPONENT, "metrics limits lock poisoned; recovering read access");
+            logger::warn!("metrics limits lock poisoned; recovering read access");
             poisoned.into_inner()
         })
     }
 
     fn limits_write(&self) -> RwLockWriteGuard<'_, HashMap<String, ResourceLimits>> {
         self.limits.write().unwrap_or_else(|poisoned| {
-            log_warn!(component: LOG_COMPONENT, "metrics limits lock poisoned; recovering write access");
+            logger::warn!("metrics limits lock poisoned; recovering write access");
             poisoned.into_inner()
         })
     }
 
     fn period_start_write(&self) -> RwLockWriteGuard<'_, Instant> {
         self.period_start.write().unwrap_or_else(|poisoned| {
-            log_warn!(component: LOG_COMPONENT, "metrics period lock poisoned; recovering write access");
+            logger::warn!("metrics period lock poisoned; recovering write access");
             poisoned.into_inner()
         })
     }

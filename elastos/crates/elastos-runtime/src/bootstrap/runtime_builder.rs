@@ -2,7 +2,6 @@
 //!
 //! The ElastosRuntime struct ties together all components and provides
 //! a clean interface for starting and stopping the runtime.
-use elastos_logger::{log_error, log_info, log_warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,8 +18,7 @@ use crate::primitives::time::SecureTimeSource;
 
 use super::shell::{ShellConfig, ShellManager};
 
-const LOG_COMPONENT: &str = "runtime";
-
+use crate::logger;
 const RUNTIME_VERSION: &str = match option_env!("ELASTOS_RELEASE_VERSION") {
     Some(version) => version,
     None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
@@ -127,11 +125,11 @@ impl RuntimeConfig {
                         return (base, false);
                     }
                     Err(e) => {
-                        log_warn!(component: LOG_COMPONENT, "Invalid config.toml, using defaults: {}", e);
+                        logger::warn!("Invalid config.toml, using defaults: {}", e);
                     }
                 },
                 Err(e) => {
-                    log_warn!(component: LOG_COMPONENT, "Could not read config.toml: {}", e);
+                    logger::warn!("Could not read config.toml: {}", e);
                 }
             }
             (base, false)
@@ -338,7 +336,7 @@ impl ElastosRuntime {
             return Err(StartError::AlreadyStarted);
         }
 
-        log_info!(component: LOG_COMPONENT, "Starting ElastOS Runtime v{}", self.config.version);
+        logger::info!("Starting ElastOS Runtime v{}", self.config.version);
 
         // Emit runtime start audit event
         self.audit_log.runtime_start(&self.config.version);
@@ -354,17 +352,17 @@ impl ElastosRuntime {
             .await
         {
             Ok(shell_id) => {
-                log_info!(component: LOG_COMPONENT, "Shell capsule started with ID: {}", shell_id);
+                logger::info!("Shell capsule started with ID: {}", shell_id);
             }
             Err(e) => {
-                log_error!(component: LOG_COMPONENT, "Failed to bootstrap shell: {}", e);
+                logger::error!("Failed to bootstrap shell: {}", e);
                 return Err(StartError::ShellBootstrap(e.to_string()));
             }
         }
 
         self.started = true;
 
-        log_info!(component: LOG_COMPONENT, "ElastOS Runtime started successfully");
+        logger::info!("ElastOS Runtime started successfully");
         Ok(())
     }
 
@@ -374,7 +372,7 @@ impl ElastosRuntime {
             return Err(StopError::NotStarted);
         }
 
-        log_info!(component: LOG_COMPONENT, "Stopping ElastOS Runtime...");
+        logger::info!("Stopping ElastOS Runtime...");
 
         // Stop the shell first
         if let Err(e) = self
@@ -382,7 +380,7 @@ impl ElastosRuntime {
             .stop(&self.capsule_manager, &self.message_channel)
             .await
         {
-            log_error!(component: LOG_COMPONENT, "Failed to stop shell: {}", e);
+            logger::error!("Failed to stop shell: {}", e);
         }
 
         // Stop all other capsules
@@ -392,12 +390,12 @@ impl ElastosRuntime {
 
         // Persist capability store
         if let Err(e) = self.capability_store.persist().await {
-            log_error!(component: LOG_COMPONENT, "Failed to persist capability store: {}", e);
+            logger::error!("Failed to persist capability store: {}", e);
         }
 
         // Persist time source
         if let Err(e) = self.time_source.persist() {
-            log_error!(component: LOG_COMPONENT, "Failed to persist time source: {}", e);
+            logger::error!("Failed to persist time source: {}", e);
         }
 
         // Emit runtime stop audit event
@@ -405,7 +403,7 @@ impl ElastosRuntime {
 
         self.started = false;
 
-        log_info!(component: LOG_COMPONENT, "ElastOS Runtime stopped");
+        logger::info!("ElastOS Runtime stopped");
         Ok(())
     }
 

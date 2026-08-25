@@ -7,19 +7,16 @@
 //! contract exposed by VM-backed providers. Callers still see provider/resource
 //! semantics, not host process or transport details.
 
+use elastos_runtime::provider::{
+    EntryType, Provider, ProviderError, ResourceAction, ResourceEntry, ResourceRequest,
+    ResourceResponse,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use elastos_logger::log_info;
-use elastos_runtime::provider::{
-    EntryType, Provider, ProviderError, ResourceAction, ResourceEntry, ResourceRequest,
-    ResourceResponse,
-};
-
-const LOG_COMPONENT: &str = "carrier";
-
+use crate::logger::carrier as logger;
 struct ChildIo {
     reader: BufReader<std::process::ChildStdout>,
     writer: std::process::ChildStdin,
@@ -118,11 +115,7 @@ impl CarrierServiceBridge {
                     init_resp
                 )));
             }
-            log_info!(
-                component: LOG_COMPONENT,
-                "carrier service '{}' initialized",
-                self.binary_path
-            );
+            logger::info!("carrier service '{}' initialized", self.binary_path);
         }
 
         let io = guard

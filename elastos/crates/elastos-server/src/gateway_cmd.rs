@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use elastos_logger::{log_info, log_warn};
 use elastos_runtime::provider;
 
 use crate::{
@@ -16,7 +15,7 @@ use crate::{
 
 const ELASTOS_VERSION: &str = env!("ELASTOS_VERSION");
 
-const LOG_COMPONENT: &str = "gateway.http";
+use crate::logger::gateway_http as logger;
 pub struct GatewayControlPlane {
     pub provider_registry: Arc<provider::ProviderRegistry>,
     pub host_helpers: Vec<api::server::HostHelperProcess>,
@@ -40,7 +39,7 @@ where
         return run_gateway_public(addr, cache_dir, publish, setup_control_plane).await;
     }
 
-    log_info!(component: LOG_COMPONENT, "ElastOS {} starting on {}", ELASTOS_VERSION, addr);
+    logger::info!("ElastOS {} starting on {}", ELASTOS_VERSION, addr);
 
     let data_dir = default_data_dir();
     let _host_guard = crate::host_lock::acquire_host_process_lock(&data_dir, "gateway", &addr)?;
@@ -82,8 +81,7 @@ where
     F: Fn() -> Fut + Copy + Send + Sync + 'static,
     Fut: Future<Output = anyhow::Result<GatewayControlPlane>> + Send,
 {
-    log_info!(
-        component: LOG_COMPONENT,
+    logger::info!(
         "ElastOS {} starting public gateway on {}",
         ELASTOS_VERSION,
         addr
@@ -118,7 +116,7 @@ where
     let run_result: anyhow::Result<()> = async {
         for external in ["ipfs-provider", "kubo"] {
             if registry.external.contains_key(external) {
-                log_info!(component: LOG_COMPONENT, "ensuring external '{}'", external);
+                logger::info!("ensuring external '{}'", external);
                 supervisor_require_ok(
                     &supervisor::Supervisor::new(data_dir.clone(), registry.clone()),
                     supervisor::SupervisorRequest::DownloadExternal {
@@ -150,10 +148,9 @@ where
         // a clear "infrastructure_capsule" denial rather than silently granting.
         let sup = Arc::new(sup_inner);
 
-        log_info!(
-        component: LOG_COMPONENT,
-        "Trust domain: infrastructure (service-plane capsules, no user shell approval)"
-    );
+        logger::info!(
+            "Trust domain: infrastructure (service-plane capsules, no user shell approval)"
+        );
 
         let (tunnel_capsules, tunnel_externals) =
             sup.resolve_launch_plan("tunnel-provider").await?;
@@ -173,7 +170,7 @@ where
         }
 
         for ext in &externals {
-            log_info!(component: LOG_COMPONENT, "ensuring external '{}'", ext);
+            logger::info!("ensuring external '{}'", ext);
             supervisor_require_ok(
                 &sup,
                 supervisor::SupervisorRequest::DownloadExternal {
@@ -185,7 +182,7 @@ where
         }
 
         for cap in &capsules {
-            log_info!(component: LOG_COMPONENT, "ensuring capsule '{}'", cap);
+            logger::info!("ensuring capsule '{}'", cap);
             supervisor_require_ok(
                 &sup,
                 supervisor::SupervisorRequest::EnsureCapsule { name: cap.clone() },
@@ -196,7 +193,7 @@ where
         let mut handles = Vec::<String>::new();
         let mut tunnel_host_ip: Option<String> = None;
         for cap in &capsules {
-            log_info!(component: LOG_COMPONENT, "launching infrastructure capsule '{}'", cap);
+            logger::info!("launching infrastructure capsule '{}'", cap);
             let resp = supervisor_require_ok(
                 &sup,
                 supervisor::SupervisorRequest::LaunchCapsule {
@@ -234,7 +231,7 @@ where
             format!("http://{}", effective_addr)
         };
 
-        log_info!(component: LOG_COMPONENT, "requesting public tunnel for {}", tunnel_target);
+        logger::info!("requesting public tunnel for {}", tunnel_target);
         let tunnel_resp = provider_send_raw_retry(
             &provider_registry,
             "tunnel",
@@ -245,7 +242,7 @@ where
             std::time::Duration::from_secs(30),
         )
         .await?;
-        log_info!(component: LOG_COMPONENT, "tunnel-provider start: {}", tunnel_resp);
+        logger::info!("tunnel-provider start: {}", tunnel_resp);
         let url =
             wait_for_public_tunnel_url(&provider_registry, std::time::Duration::from_secs(90))
                 .await?;
@@ -285,13 +282,13 @@ where
                     println!("Install:   curl -fsSL {} | bash", install_url);
                 }
                 Err(e) => {
-                    log_warn!(component: LOG_COMPONENT, "failed to publish {:?}: {}", publish_path, e);
+                    logger::warn!("failed to publish {:?}: {}", publish_path, e);
                     println!("Installer URL template: {}s/<cid>/install.sh", public_base);
                 }
             }
         }
 
-        log_info!(component: LOG_COMPONENT, "runtime gateway running; press Ctrl+C to stop");
+        logger::info!("runtime gateway running; press Ctrl+C to stop");
         tokio::signal::ctrl_c().await?;
 
         for handle in handles.iter().rev() {
@@ -444,7 +441,7 @@ async fn wait_for_public_tunnel_url(
 
         if let Some(log) = last_log.clone() {
             if last_log_seen.as_deref() != Some(log.as_str()) {
-                log_info!(component: LOG_COMPONENT, "tunnel: {}", log);
+                logger::info!("tunnel: {}", log);
                 last_log_seen = Some(log);
             }
         }
@@ -483,8 +480,7 @@ async fn publish_to_content_availability(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
     let data_b64 = base64::engine::general_purpose::STANDARD.encode(&content);
-    log_info!(
-        component: LOG_COMPONENT,
+    logger::info!(
         "publishing {} ({} bytes) through content availability...",
         filename,
         content.len()
@@ -507,7 +503,7 @@ async fn publish_to_content_availability(
         .and_then(|d| d.get("cid"))
         .and_then(|c| c.as_str())
         .ok_or_else(|| anyhow::anyhow!("no CID in content provider response: {}", resp))?;
-    log_info!(component: LOG_COMPONENT, "published {} as CID {}", filename, cid);
+    logger::info!("published {} as CID {}", filename, cid);
     Ok(cid.to_string())
 }
 

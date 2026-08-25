@@ -24,12 +24,9 @@
 
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
-
-use elastos_logger::{log_info, log_trace, log_warn};
 use tokio::task::JoinHandle;
 
-const LOG_COMPONENT: &str = "vm.vz";
-
+use crate::logger;
 /// **kernel-console line cap.**
 ///
 /// Maximum byte length of a single kernel-console line before
@@ -196,8 +193,7 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                 Ok(0) => {
                     // EOF — Vz closed the write end. Normal
                     // shutdown path.
-                    log_trace!(
-                        component: LOG_COMPONENT,
+                    logger::trace!(
                         "vm_console vm_id={vm_id}: kernel console EOF (vz closed write end)"
                     );
                     return;
@@ -207,15 +203,12 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                     // next newline, continue. No response
                     // channel back to the guest kernel — best
                     // we can do is log + drain.
-                    log_warn!(
-                        component: LOG_COMPONENT,
+                    logger::warn!(
                         "vm_console vm_id={vm_id}: kernel console line exceeded cap; \
                          dropping and resyncing: bytes={n} cap={KERNEL_CONSOLE_MAX_LINE_BYTES}"
                     );
                     if let Err(e) = drain_to_newline_sync(&mut reader) {
-                        log_warn!(
-                            component: LOG_COMPONENT,
-                            "vm_console vm_id={vm_id}: kernel console drain-after-overflow error: {e}"
+                        logger::warn!("vm_console vm_id={vm_id}: kernel console drain-after-overflow error: {e}"
                         );
                         return;
                     }
@@ -235,10 +228,7 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                     if line.is_empty() {
                         continue;
                     }
-                    log_info!(
-                        component: LOG_COMPONENT,
-                        "vm_console vm_id={vm_id}: {line}"
-                    );
+                    logger::info!("vm_console vm_id={vm_id}: {line}");
                 }
                 Err(e)
                     if matches!(
@@ -253,10 +243,7 @@ pub(crate) fn spawn_console_forwarder(host_read: std::fs::File, vm_id: String) -
                     continue;
                 }
                 Err(e) => {
-                    log_warn!(
-                        component: LOG_COMPONENT,
-                        "vm_console vm_id={vm_id}: kernel console read error: {e}"
-                    );
+                    logger::warn!("vm_console vm_id={vm_id}: kernel console read error: {e}");
                     return;
                 }
             }

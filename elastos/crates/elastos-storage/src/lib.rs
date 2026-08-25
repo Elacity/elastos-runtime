@@ -3,6 +3,7 @@
 mod cache;
 mod content_id;
 mod large_cache;
+pub(crate) mod logger;
 pub mod mutable;
 mod traits;
 

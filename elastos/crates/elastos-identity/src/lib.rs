@@ -7,6 +7,7 @@
 //! - **WebAuthn/Passkey** — local user authentication. Credentials encrypted
 //!   with device key via AES-256-GCM.
 
+pub(crate) mod logger;
 pub mod store;
 pub mod webauthn;
 

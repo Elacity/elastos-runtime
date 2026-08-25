@@ -10,6 +10,7 @@ mod gateway_entry;
 mod home_cmd;
 mod identity_cmd;
 mod init_cmd;
+mod logger;
 mod node_cmd;
 mod publish;
 mod release_cmd;

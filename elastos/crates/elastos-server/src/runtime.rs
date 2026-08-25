@@ -8,14 +8,11 @@ use tokio::sync::RwLock;
 use elastos_common::{CapsuleManifest, CapsuleType, ElastosError, Result};
 use elastos_compute::providers::{BridgeHostcall, ComponentProvider};
 use elastos_compute::{CapsuleHandle, ComputeProvider};
-use elastos_storage::StorageProvider;
-
-use elastos_logger::{log_info, log_trace, log_warn};
 use elastos_runtime::provider::ProviderRegistry;
 use elastos_runtime::signature::{hash_content, SignatureVerifier};
+use elastos_storage::StorageProvider;
 
-const LOG_COMPONENT: &str = "gateway.capsule";
-
+use crate::logger::gateway_capsule as logger;
 /// Information about a running capsule (for API responses and lifecycle management)
 #[derive(Debug, Clone)]
 pub struct RunningCapsuleInfo {
@@ -126,7 +123,7 @@ impl Runtime {
                     .map_err(|err| err.to_string())?;
                 serde_json::to_string(&response).map_err(|err| err.to_string())
             }));
-            log_info!(component: LOG_COMPONENT, "Component resource bridge configured");
+            logger::info!("Component resource bridge configured");
         }
 
         let mut guard = self.provider_registry.write().await;
@@ -198,13 +195,10 @@ impl Runtime {
         *self.signature_dev_mode.write().await = dev_mode;
 
         if dev_mode {
-            log_warn!(
-                component: LOG_COMPONENT,
-                "Capsule signature verification running in dev_mode=true; unsigned local capsules are allowed"
+            logger::warn!("Capsule signature verification running in dev_mode=true; unsigned local capsules are allowed"
             );
         } else {
-            log_info!(
-                component: LOG_COMPONENT,
+            logger::info!(
                 "Capsule signature verification enforced with {} trusted key(s)",
                 trusted_key_count
             );
@@ -255,8 +249,7 @@ impl Runtime {
             ));
         }
 
-        log_info!(
-            component: LOG_COMPONENT,
+        logger::info!(
             "Loading capsule '{}' ({:?})",
             manifest.name,
             manifest.capsule_type
@@ -346,8 +339,7 @@ impl Runtime {
 
         if manifest.signature.is_none() {
             if dev_mode {
-                log_warn!(
-                    component: LOG_COMPONENT,
+                logger::warn!(
                     "Unsigned capsule '{}' allowed because dev_mode=true",
                     manifest.name
                 );
@@ -382,7 +374,7 @@ impl Runtime {
             ));
         }
 
-        log_info!(component: LOG_COMPONENT, "Capsule signature verified successfully");
+        logger::info!("Capsule signature verified successfully");
         Ok(())
     }
 
@@ -412,7 +404,7 @@ impl Runtime {
     /// register capsules that weren't started through Runtime's run_* methods.
     pub async fn register_capsule(&self, info: RunningCapsuleInfo) {
         let mut capsules = self.running_capsules.write().await;
-        log_info!(component: LOG_COMPONENT, "Registered capsule '{}' with ID: {}", info.name, info.id);
+        logger::info!("Registered capsule '{}' with ID: {}", info.name, info.id);
         capsules.insert(info.id.clone(), info);
     }
 
@@ -420,7 +412,7 @@ impl Runtime {
     pub async fn unregister_capsule(&self, id: &str) {
         let mut capsules = self.running_capsules.write().await;
         if capsules.remove(id).is_some() {
-            log_info!(component: LOG_COMPONENT, "Unregistered capsule: {}", id);
+            logger::info!("Unregistered capsule: {}", id);
         }
     }
 
@@ -441,7 +433,7 @@ impl Runtime {
         let mut capsules = self.running_capsules.write().await;
         if let Some(info) = capsules.get_mut(id) {
             info.status = status.to_string();
-            log_trace!(component: LOG_COMPONENT, "Updated capsule {} status to: {}", id, status);
+            logger::trace!("Updated capsule {} status to: {}", id, status);
         }
     }
 
@@ -464,7 +456,7 @@ impl Runtime {
         if let Some(handle) = &info.handle {
             // Find the provider that supports this capsule type
             if let Some(provider) = self.get_provider_for_manifest(&handle.manifest) {
-                log_info!(component: LOG_COMPONENT, "Stopping capsule '{}' ({})", info.name, id);
+                logger::info!("Stopping capsule '{}' ({})", info.name, id);
                 provider.stop(handle).await?;
             }
         }

@@ -6,12 +6,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::cache::ContentCache;
+use crate::logger;
 use crate::{ContentId, StorageProvider};
 use elastos_common::{ElastosError, Result};
-use elastos_logger::{log_info, log_trace};
-
-const LOG_COMPONENT: &str = "storage";
-
 /// IPFS storage provider
 ///
 /// Stores and retrieves content from IPFS via the HTTP API.
@@ -120,7 +117,7 @@ impl StorageProvider for IpfsProvider {
         // Cache locally for faster retrieval
         self.cache.put(&cid, data).await?;
 
-        log_info!(component: LOG_COMPONENT, "Added content to IPFS: {}", cid);
+        logger::info!("Added content to IPFS: {}", cid);
 
         Ok(cid)
     }
@@ -130,11 +127,11 @@ impl StorageProvider for IpfsProvider {
 
         // Check cache first
         if let Some(data) = self.cache.get(id).await? {
-            log_trace!(component: LOG_COMPONENT, "Cache hit for {}", cid);
+            logger::trace!("Cache hit for {}", cid);
             return Ok(data);
         }
 
-        log_trace!(component: LOG_COMPONENT, "Cache miss for {}, fetching from IPFS", cid);
+        logger::trace!("Cache miss for {}, fetching from IPFS", cid);
 
         // Fetch from IPFS
         let url = if self.gateway_mode {
@@ -213,7 +210,7 @@ impl StorageProvider for IpfsProvider {
             // Unpinning may fail if not pinned, that's okay
             let _ = self.client.post(&url).send().await;
 
-            log_info!(component: LOG_COMPONENT, "Unpinned content from IPFS: {}", cid);
+            logger::info!("Unpinned content from IPFS: {}", cid);
         }
 
         Ok(())

@@ -4,14 +4,11 @@
 //! signed by that CA. The user trusts the CA once per device, then HTTPS
 //! works from any transport (localhost, LAN, Tailscale, Tor, Boson).
 
+mod logger;
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-
-use elastos_logger::{log_info, log_trace, log_warn};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
-
-const LOG_COMPONENT: &str = "tls";
 
 /// TLS file paths within the data directory
 pub struct TlsPaths {
@@ -48,7 +45,7 @@ pub async fn load_or_create_tls_config(
 
     // Detect current IPs for SANs
     let ips = detect_ips();
-    log_info!(component: LOG_COMPONENT,
+    logger::info!(
         "Detected IPs for TLS cert: {:?}",
         ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>()
     );
@@ -61,18 +58,18 @@ pub async fn load_or_create_tls_config(
     };
 
     if needs_regen {
-        log_info!(component: LOG_COMPONENT, "Generating TLS leaf certificate...");
+        logger::info!("Generating TLS leaf certificate...");
         generate_leaf_cert(&paths, &ca_cert_pem, &ca_key_pem, &ips)?;
         // Store IPs for change detection
         let mut ip_strs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
         ip_strs.sort();
         fs::write(paths.leaf_cert.with_extension("ips"), ip_strs.join(","))?;
-        log_info!(component: LOG_COMPONENT,
+        logger::info!(
             "TLS leaf certificate written to {}",
             paths.leaf_cert.display()
         );
     } else {
-        log_info!(component: LOG_COMPONENT, "Reusing existing TLS leaf certificate");
+        logger::info!("Reusing existing TLS leaf certificate");
     }
 
     // Build rustls config from PEM files
@@ -88,11 +85,11 @@ fn ensure_ca(paths: &TlsPaths) -> anyhow::Result<(String, String)> {
     if paths.ca_cert.exists() && paths.ca_key.exists() {
         let cert_pem = fs::read_to_string(&paths.ca_cert)?;
         let key_pem = fs::read_to_string(&paths.ca_key)?;
-        log_info!(component: LOG_COMPONENT, "Loaded existing CA from {}", paths.ca_cert.display());
+        logger::info!("Loaded existing CA from {}", paths.ca_cert.display());
         return Ok((cert_pem, key_pem));
     }
 
-    log_info!(component: LOG_COMPONENT, "Generating new ElastOS CA certificate...");
+    logger::info!("Generating new ElastOS CA certificate...");
 
     let mut params = CertificateParams::default();
     params
@@ -124,8 +121,8 @@ fn ensure_ca(paths: &TlsPaths) -> anyhow::Result<(String, String)> {
         fs::set_permissions(&paths.ca_key, fs::Permissions::from_mode(0o600))?;
     }
 
-    log_info!(component: LOG_COMPONENT, "CA certificate written to {}", paths.ca_cert.display());
-    log_info!(component: LOG_COMPONENT, "Trust this CA on your devices: elastos tls trust");
+    logger::info!("CA certificate written to {}", paths.ca_cert.display());
+    logger::info!("Trust this CA on your devices: elastos tls trust");
 
     Ok((cert_pem, key_pem))
 }
@@ -337,7 +334,7 @@ pub async fn start_tls_proxy(
     let listener = TcpListener::bind(format!("0.0.0.0:{}", listen_port)).await?;
     let target_addr: std::net::SocketAddr = format!("{}:{}", target_ip, target_port).parse()?;
 
-    log_info!(component: LOG_COMPONENT,
+    logger::info!(
         "TLS proxy started: https://0.0.0.0:{} -> {}:{}",
         listen_port,
         target_ip,
@@ -349,7 +346,7 @@ pub async fn start_tls_proxy(
             let (stream, peer) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    log_warn!(component: LOG_COMPONENT, "TLS proxy accept error: {}", e);
+                    logger::warn!("TLS proxy accept error: {}", e);
                     continue;
                 }
             };
@@ -359,7 +356,7 @@ pub async fn start_tls_proxy(
                 let tls_stream = match acceptor.accept(stream).await {
                     Ok(s) => s,
                     Err(e) => {
-                        log_trace!(component: LOG_COMPONENT, "TLS handshake failed from {}: {}", peer, e);
+                        logger::trace!("TLS handshake failed from {}: {}", peer, e);
                         return;
                     }
                 };
@@ -367,7 +364,7 @@ pub async fn start_tls_proxy(
                 let mut vm_stream = match TcpStream::connect(target_addr).await {
                     Ok(s) => s,
                     Err(e) => {
-                        log_trace!(component: LOG_COMPONENT, "Failed to connect to VM: {}", e);
+                        logger::trace!("Failed to connect to VM: {}", e);
                         return;
                     }
                 };
@@ -402,8 +399,8 @@ pub async fn start_tls_proxy(
                 };
 
                 tokio::select! {
-                    r = c2v => { if let Err(e) = r { log_trace!(component: LOG_COMPONENT, "c2v: {}", e); } }
-                    r = v2c => { if let Err(e) = r { log_trace!(component: LOG_COMPONENT, "v2c: {}", e); } }
+                    r = c2v => { if let Err(e) = r { logger::trace!("c2v: {}", e); } }
+                    r = v2c => { if let Err(e) = r { logger::trace!("v2c: {}", e); } }
                 }
             });
         }

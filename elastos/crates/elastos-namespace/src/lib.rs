@@ -5,6 +5,7 @@
 //! This crate is transport-agnostic — content fetching is injected via the
 //! `ContentFetcher` trait. Audit logging is injected via the `AuditSink` trait.
 
+pub(crate) mod logger;
 mod namespace;
 mod resolver;
 mod store;

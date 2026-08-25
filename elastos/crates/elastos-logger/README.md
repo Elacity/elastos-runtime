@@ -14,14 +14,27 @@ lines without persisting the secret.
 
 ## Usage
 
+Each crate declares its logger once in `src/logger.rs` and call sites import only that:
+
 ```rust
-use elastos_logger::{log_info, log_warn};
+// src/logger.rs — single-component crate:
+elastos_logger::component!("runtime");
 
-const LOG_COMPONENT: &str = "gateway.auth";
+// src/logger.rs — multi-surface binary (one module per surface):
+elastos_logger::component_mod!(pub(crate) gateway_auth, "gateway.auth");
 
-log_warn!(component: LOG_COMPONENT, "token rejected {}", elastos_logger::fp(&token));
-log_info!("plain call logs under the process-default component");
+// call sites: import your logger, then log — no component, no elastos_logger import.
+use crate::logger;                              // single-component crate
+use crate::logger::gateway_auth as logger;      // multi-surface crate
+
+logger::warn!("token rejected {}", elastos_logger::fp(&token));
+logger::info!("lazy: formats only when the level is enabled");
 ```
+
+The generated `trace!`/`info!`/`warn!`/`error!`/`critical!` macros stamp the component and
+the call site's `module_path!()` automatically. The underlying `log_*!` macros remain for
+the process-default component (e.g. `main.rs`) and `log_*!(component: <expr>, ...)` for
+dynamic components.
 
 The process global installs once (`init`); before that, records fall back to stderr at
 Info so early logging is never lost and never panics. Threshold resolution precedence

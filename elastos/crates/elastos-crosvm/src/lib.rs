@@ -22,6 +22,7 @@
 //! ```
 
 mod config;
+pub(crate) mod logger;
 #[cfg(target_os = "linux")]
 mod network;
 #[cfg(not(target_os = "linux"))]

@@ -9,19 +9,15 @@
 //! `elastos-guest` resource bridge.
 
 // Used by lib crate (tests, API handlers) but not directly by main.rs binary
-
-use elastos_logger::{log_error, log_trace, log_warn};
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-const LOG_COMPONENT: &str = "runtime";
-
-use crate::capsule::CapsuleId;
-
 use super::protocol::{RequestEnvelope, ResponseEnvelope, RuntimeRequest, RuntimeResponse};
 use super::RequestHandler;
+use crate::capsule::CapsuleId;
+use crate::logger;
 
 /// Maximum line length from a capsule (1 MB). Prevents OOM from malicious guests.
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -75,7 +71,7 @@ impl CapsuleIoBridge {
         }
 
         if line.len() > MAX_LINE_BYTES {
-            log_warn!(component: LOG_COMPONENT,
+            logger::warn!(
                 "Capsule {} sent oversized request ({} bytes, max {})",
                 self.capsule_id,
                 line.len(),
@@ -95,7 +91,7 @@ impl CapsuleIoBridge {
         let envelope: RequestEnvelope = match serde_json::from_str(line) {
             Ok(env) => env,
             Err(e) => {
-                log_warn!(component: LOG_COMPONENT,
+                logger::warn!(
                     "Failed to parse request from capsule {}: {}",
                     self.capsule_id,
                     e
@@ -119,7 +115,7 @@ impl CapsuleIoBridge {
         match serde_json::to_string(&response) {
             Ok(json) => Some(json),
             Err(e) => {
-                log_error!(component: LOG_COMPONENT,
+                logger::error!(
                     "Failed to serialize response for capsule {}: {}",
                     self.capsule_id,
                     e
@@ -147,7 +143,7 @@ impl CapsuleIoBridge {
             tokio::select! {
                 // Check for shutdown signal
                 _ = shutdown_rx.recv() => {
-                    log_trace!(component: LOG_COMPONENT, "I/O bridge for {} received shutdown signal", self.capsule_id);
+                    logger::trace!("I/O bridge for {} received shutdown signal", self.capsule_id);
                     break;
                 }
 
@@ -158,24 +154,21 @@ impl CapsuleIoBridge {
                             if let Some(response_json) = self.process_line(&line).await {
                                 // Write response back to capsule
                                 if let Err(e) = writer.write_all(response_json.as_bytes()).await {
-                                    log_error!(component: LOG_COMPONENT,
-                                        "Failed to write response to capsule {}: {}",
+                                    logger::error!("Failed to write response to capsule {}: {}",
                                         self.capsule_id,
                                         e
                                     );
                                     break;
                                 }
                                 if let Err(e) = writer.write_all(b"\n").await {
-                                    log_error!(component: LOG_COMPONENT,
-                                        "Failed to write newline to capsule {}: {}",
+                                    logger::error!("Failed to write newline to capsule {}: {}",
                                         self.capsule_id,
                                         e
                                     );
                                     break;
                                 }
                                 if let Err(e) = writer.flush().await {
-                                    log_error!(component: LOG_COMPONENT,
-                                        "Failed to flush response to capsule {}: {}",
+                                    logger::error!("Failed to flush response to capsule {}: {}",
                                         self.capsule_id,
                                         e
                                     );
@@ -185,12 +178,11 @@ impl CapsuleIoBridge {
                         }
                         Ok(None) => {
                             // EOF - capsule closed stdout
-                            log_trace!(component: LOG_COMPONENT, "Capsule {} closed stdout", self.capsule_id);
+                            logger::trace!("Capsule {} closed stdout", self.capsule_id);
                             break;
                         }
                         Err(e) => {
-                            log_error!(component: LOG_COMPONENT,
-                                "Error reading from capsule {}: {}",
+                            logger::error!("Error reading from capsule {}: {}",
                                 self.capsule_id,
                                 e
                             );
@@ -201,7 +193,7 @@ impl CapsuleIoBridge {
             }
         }
 
-        log_trace!(component: LOG_COMPONENT, "I/O bridge for {} exiting", self.capsule_id);
+        logger::trace!("I/O bridge for {} exiting", self.capsule_id);
     }
 
     /// Process multiple lines and return responses
@@ -225,7 +217,7 @@ impl CapsuleIoBridge {
                     }
                 }
                 Err(e) => {
-                    log_error!(component: LOG_COMPONENT, "Error reading from capsule {}: {}", self.capsule_id, e);
+                    logger::error!("Error reading from capsule {}: {}", self.capsule_id, e);
                     break;
                 }
             }

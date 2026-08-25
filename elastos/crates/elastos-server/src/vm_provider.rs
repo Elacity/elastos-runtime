@@ -10,14 +10,13 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use elastos_logger::{fp, log_info, log_trace, log_warn};
+use elastos_logger::fp;
 use elastos_runtime::provider::{
     EntryType, Provider, ProviderError, ResourceAction, ResourceEntry, ResourceRequest,
     ResourceResponse,
 };
 
-const LOG_COMPONENT: &str = "vm.provider";
-
+use crate::logger::vm_provider as logger;
 struct VmIo {
     reader: BufReader<Box<dyn Read + Send>>,
     writer: Box<dyn Write + Send>,
@@ -54,8 +53,7 @@ impl VmRawBridge {
         for attempt in 0..VM_PROVIDER_CONNECT_ATTEMPTS {
             match self.try_connect_once() {
                 Ok(io) => {
-                    log_info!(
-                        component: LOG_COMPONENT,
+                    logger::info!(
                         "tcp connect to guest {}:{} succeeded on attempt {} ({:.1}s)",
                         self.guest_host,
                         self.guest_port,
@@ -103,8 +101,7 @@ impl VmRawBridge {
                 ProviderError::Provider("guest provider address resolved empty".into())
             })?;
 
-        log_info!(
-            component: LOG_COMPONENT,
+        logger::info!(
             "using local TCP compatibility transport to guest {}:{}",
             self.guest_host,
             self.guest_port
@@ -237,8 +234,7 @@ impl VmRawBridge {
             .map_err(|_| ProviderError::Provider("vm bridge mutex poisoned".into()))?;
 
         if guard.is_some() {
-            log_trace!(
-                component: LOG_COMPONENT,
+            logger::trace!(
                 "reusing persistent connection to guest {}:{} for op={} payload={}",
                 self.guest_host,
                 self.guest_port,
@@ -256,8 +252,7 @@ impl VmRawBridge {
                 "op": "init",
                 "config": self.init_config.clone()
             });
-            log_trace!(
-                component: LOG_COMPONENT,
+            logger::trace!(
                 "sending init to guest {}:{} config={}",
                 self.guest_host,
                 self.guest_port,
@@ -271,8 +266,7 @@ impl VmRawBridge {
             ) {
                 Ok(resp) => resp,
                 Err(e) => {
-                    log_warn!(
-                        component: LOG_COMPONENT,
+                    logger::warn!(
                         "init exchange failed for guest {}:{} after {:.1}s: {}",
                         self.guest_host,
                         self.guest_port,
@@ -285,8 +279,7 @@ impl VmRawBridge {
                     )));
                 }
             };
-            log_trace!(
-                component: LOG_COMPONENT,
+            logger::trace!(
                 "init response from guest {}:{} in {:.1}s: {}",
                 self.guest_host,
                 self.guest_port,
@@ -336,8 +329,7 @@ impl VmRawBridge {
             .flush()
             .map_err(|e| ProviderError::Provider(format!("tcp flush failed: {e}")))?;
 
-        log_trace!(
-            component: LOG_COMPONENT,
+        logger::trace!(
             "tcp write complete ({} bytes), waiting for response...",
             payload.len() + 1
         );
@@ -407,7 +399,7 @@ impl VmRawBridge {
 
     fn wait_for_readable(io: &VmIo, timeout: Duration) -> Result<(), ProviderError> {
         if !io.reader.buffer().is_empty() {
-            log_trace!(component: LOG_COMPONENT, "provider reader has buffered data, skipping poll");
+            logger::trace!("provider reader has buffered data, skipping poll");
             return Ok(());
         }
 
@@ -427,15 +419,14 @@ impl VmRawBridge {
             )));
         }
         if rc == 0 {
-            log_warn!(component: LOG_COMPONENT, "provider poll timed out after {}ms (fd={})", timeout_ms, fd);
+            logger::warn!("provider poll timed out after {}ms (fd={})", timeout_ms, fd);
             return Err(ProviderError::Provider(format!(
                 "timed out waiting for provider VM response after {:?}",
                 timeout
             )));
         }
         if (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
-            log_warn!(
-                component: LOG_COMPONENT,
+            logger::warn!(
                 "provider poll unhealthy: rc={}, revents=0x{:x} (fd={})",
                 rc,
                 pollfd.revents,
@@ -446,8 +437,7 @@ impl VmRawBridge {
                 pollfd.revents
             )));
         }
-        log_trace!(
-            component: LOG_COMPONENT,
+        logger::trace!(
             "provider poll ready: rc={}, revents=0x{:x}",
             rc,
             pollfd.revents

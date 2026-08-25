@@ -21,6 +21,7 @@ pub mod capsule;
 pub mod handler;
 pub mod inspect;
 pub mod invoke;
+pub(crate) mod logger;
 pub mod messaging;
 pub mod primitives;
 pub mod provider;

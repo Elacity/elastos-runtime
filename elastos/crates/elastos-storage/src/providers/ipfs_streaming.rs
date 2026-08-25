@@ -8,12 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use elastos_common::{ElastosError, Result};
-use elastos_logger::{log_info, log_trace, log_warn};
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-const LOG_COMPONENT: &str = "storage";
-
+use crate::logger;
 // No default public IPFS gateways. Callers must explicitly provide gateways
 // via with_gateways() if they want gateway-based downloads. The default path
 // is local IPFS node only — fail closed if unavailable.
@@ -126,7 +124,7 @@ impl IpfsStreamingProvider {
             .map_err(|e| ElastosError::Storage(format!("Failed to read file metadata: {}", e)))?;
 
         let file_size = metadata.len();
-        log_info!(component: LOG_COMPONENT,
+        logger::info!(
             "Uploading {} ({} MB) to IPFS...",
             path.display(),
             file_size / (1024 * 1024)
@@ -198,7 +196,7 @@ impl IpfsStreamingProvider {
             .await
             .map_err(|e| ElastosError::Storage(format!("Failed to parse IPFS response: {}", e)))?;
 
-        log_info!(component: LOG_COMPONENT, "Uploaded to IPFS: {} -> {}", path.display(), result.hash);
+        logger::info!("Uploaded to IPFS: {} -> {}", path.display(), result.hash);
 
         Ok(result.hash)
     }
@@ -212,7 +210,7 @@ impl IpfsStreamingProvider {
     ) -> Result<()> {
         let url = format!("{}/api/v0/cat?arg={}", self.api_url, cid);
 
-        log_info!(component: LOG_COMPONENT, "Downloading from local IPFS node...");
+        logger::info!("Downloading from local IPFS node...");
 
         let response = self
             .client
@@ -247,20 +245,20 @@ impl IpfsStreamingProvider {
 
         // Try local IPFS node first
         if self.is_available().await {
-            log_trace!(component: LOG_COMPONENT, "Local IPFS node available, checking for CID...");
+            logger::trace!("Local IPFS node available, checking for CID...");
             match self
                 .try_download_from_local(cid, &temp_path, progress.clone())
                 .await
             {
                 Ok(()) => {
-                    log_info!(component: LOG_COMPONENT, "Downloaded from local IPFS node");
+                    logger::info!("Downloaded from local IPFS node");
                     tokio::fs::rename(&temp_path, dest).await.map_err(|e| {
                         ElastosError::Storage(format!("Failed to finalize download: {}", e))
                     })?;
                     return Ok(());
                 }
                 Err(e) => {
-                    log_trace!(component: LOG_COMPONENT, "Local IPFS node doesn't have content: {}", e);
+                    logger::trace!("Local IPFS node doesn't have content: {}", e);
                 }
             }
         }
@@ -275,26 +273,26 @@ impl IpfsStreamingProvider {
             ));
         }
 
-        log_info!(component: LOG_COMPONENT,
+        logger::info!(
             "Local IPFS unavailable, trying {} explicitly configured gateways",
             self.gateways.len()
         );
         let mut last_error = None;
         for gateway in &self.gateways {
-            log_info!(component: LOG_COMPONENT, "Trying gateway: {}", gateway);
+            logger::info!("Trying gateway: {}", gateway);
             match self
                 .try_download_from_gateway(gateway, cid, &temp_path, progress.clone())
                 .await
             {
                 Ok(()) => {
-                    log_info!(component: LOG_COMPONENT, "Downloaded from explicit gateway: {}", gateway);
+                    logger::info!("Downloaded from explicit gateway: {}", gateway);
                     tokio::fs::rename(&temp_path, dest).await.map_err(|e| {
                         ElastosError::Storage(format!("Failed to finalize download: {}", e))
                     })?;
                     return Ok(());
                 }
                 Err(e) => {
-                    log_warn!(component: LOG_COMPONENT, "Gateway {} failed: {}", gateway, e);
+                    logger::warn!("Gateway {} failed: {}", gateway, e);
                     last_error = Some(e);
                 }
             }
@@ -316,7 +314,7 @@ impl IpfsStreamingProvider {
     ) -> Result<()> {
         let url = format!("{}/ipfs/{}", gateway.trim_end_matches('/'), cid);
 
-        log_info!(component: LOG_COMPONENT, "Downloading from {}...", url);
+        logger::info!("Downloading from {}...", url);
 
         let response = self
             .client
@@ -384,7 +382,7 @@ impl IpfsStreamingProvider {
                 let total_str = content_length
                     .map(|t| format!("{} MB", t / (1024 * 1024)))
                     .unwrap_or_else(|| "unknown".to_string());
-                log_info!(component: LOG_COMPONENT,
+                logger::info!(
                     "Downloaded {} MB / {}",
                     bytes_written / (1024 * 1024),
                     total_str
@@ -397,7 +395,7 @@ impl IpfsStreamingProvider {
             .await
             .map_err(|e| ElastosError::Storage(format!("Failed to flush file: {}", e)))?;
 
-        log_info!(component: LOG_COMPONENT, "Download complete ({} MB)", bytes_written / (1024 * 1024));
+        logger::info!("Download complete ({} MB)", bytes_written / (1024 * 1024));
 
         Ok(())
     }

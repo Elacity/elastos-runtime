@@ -1,14 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
+use super::*;
 use anyhow::Context as _;
 use elastos_common::CapsuleRole;
-use elastos_logger::{log_trace, log_warn};
 
-use super::*;
-
-const LOG_COMPONENT: &str = "gateway.home";
-
+use crate::logger::gateway_home as logger;
 const HOME_EVENTS_SCHEMA: &str = "elastos.home.events/v1";
 const HOME_EVENTS_DEFAULT_WAIT_MS: u64 = 25_000;
 const HOME_EVENTS_MAX_WAIT_MS: u64 = 30_000;
@@ -1914,10 +1911,7 @@ pub(super) async fn services_summary(
     let data_dir = state.data_dir.clone();
     match tokio::task::spawn_blocking(move || {
         if let Err(err) = home_services_sync_access_decisions(&data_dir, &context) {
-            log_warn!(
-                component: LOG_COMPONENT,
-                "could not sync Services access decisions: {err}"
-            );
+            logger::warn!("could not sync Services access decisions: {err}");
         }
         let mut home_state = home_state(&data_dir);
         apply_services_peer_authority(&data_dir, &context, &mut home_state.services)?;
@@ -2095,8 +2089,7 @@ fn home_services_selection_state(
         Err(err) => return Err(err).with_context(|| format!("could not read {}", path.display())),
     };
     if raw.len() > HOME_SERVICES_STATE_MAX_BYTES {
-        log_warn!(
-            component: LOG_COMPONENT,
+        logger::warn!(
             "ignored oversized Home services state: path={} bytes={}",
             path.display(),
             raw.len()
@@ -2106,8 +2099,7 @@ fn home_services_selection_state(
     let mut state: HomeServicesSelectionState = match serde_json::from_slice(&raw) {
         Ok(state) => state,
         Err(err) => {
-            log_warn!(
-                component: LOG_COMPONENT,
+            logger::warn!(
                 "ignored invalid Home services state: path={} error={err}",
                 path.display()
             );
@@ -2122,8 +2114,7 @@ fn home_services_selection_state(
     if state.schema.trim().is_empty() {
         state.schema = HOME_SERVICES_STATE_SCHEMA.to_string();
     } else if state.schema != HOME_SERVICES_STATE_SCHEMA {
-        log_warn!(
-            component: LOG_COMPONENT,
+        logger::warn!(
             "ignored unsupported Home services state schema: path={} schema={}",
             path.display(),
             state.schema
@@ -2533,7 +2524,7 @@ fn home_services_sync_access_decisions(
         ) {
             Ok(merged) => changed |= merged,
             Err(err) => {
-                log_warn!(component: LOG_COMPONENT, "service access decision ignored: {err}")
+                logger::warn!("service access decision ignored: {err}")
             }
         }
     }
@@ -3850,9 +3841,7 @@ fn home_active_shell_summary(
     if needs_repair && !active.is_empty() {
         if let Some(context) = context {
             if let Err(err) = home_save_active_shell(data_dir, context, &active) {
-                log_warn!(
-                    component: LOG_COMPONENT,
-                    "failed to repair obsolete Home active shell state: active_shell={active} error={err}"
+                logger::warn!("failed to repair obsolete Home active shell state: active_shell={active} error={err}"
                 );
             }
         }
@@ -3961,8 +3950,7 @@ fn home_active_shell_state(
     let state: HomeActiveShellState = match serde_json::from_slice(&bytes) {
         Ok(state) => state,
         Err(err) => {
-            log_warn!(
-                component: LOG_COMPONENT,
+            logger::warn!(
                 "ignored invalid Home active shell state: path={} error={err}",
                 path.display()
             );
@@ -3973,8 +3961,7 @@ fn home_active_shell_state(
         || state.principal_id != principal_id
         || state.localhost_root != localhost_root
     {
-        log_warn!(
-            component: LOG_COMPONENT,
+        logger::warn!(
             "ignored mismatched Home active shell state: path={}",
             path.display()
         );
@@ -4277,8 +4264,7 @@ fn home_browser_state(
     let mut state: HomeBrowserStateSummary = match serde_json::from_slice(&bytes) {
         Ok(state) => state,
         Err(err) => {
-            log_warn!(
-                component: LOG_COMPONENT,
+            logger::warn!(
                 "ignored invalid Home browser state: path={} error={err}",
                 path.display()
             );
@@ -4286,8 +4272,7 @@ fn home_browser_state(
         }
     };
     if state.schema != HOME_BROWSER_STATE_SCHEMA {
-        log_warn!(
-            component: LOG_COMPONENT,
+        logger::warn!(
             "ignored unsupported Home browser state schema: path={} schema={}",
             path.display(),
             state.schema
@@ -4295,8 +4280,7 @@ fn home_browser_state(
         return Ok(default_home_browser_state(context));
     }
     if state.principal_id != principal_id {
-        log_warn!(
-            component: LOG_COMPONENT,
+        logger::warn!(
             "ignored Home browser state principal mismatch: path={} principal_id={}",
             path.display(),
             state.principal_id
@@ -4304,8 +4288,7 @@ fn home_browser_state(
         return Ok(default_home_browser_state(context));
     }
     if state.localhost_root != localhost_root {
-        log_warn!(
-            component: LOG_COMPONENT,
+        logger::warn!(
             "ignored Home browser state root mismatch: path={} localhost_root={}",
             path.display(),
             state.localhost_root
@@ -5380,7 +5363,7 @@ fn refresh_runtime_owned_contexts_after_profile_change(
         return;
     };
     if let Err(err) = service.register_runtime_owned_contexts(data_dir) {
-        log_trace!(component: LOG_COMPONENT, "refreshing collaboration contexts after a Profile change failed: {err}");
+        logger::trace!("refreshing collaboration contexts after a Profile change failed: {err}");
     }
 }
 

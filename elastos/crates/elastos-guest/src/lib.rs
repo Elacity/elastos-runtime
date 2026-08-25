@@ -26,6 +26,8 @@
 
 /// Runtime communication module (requires "serde" feature).
 #[cfg(feature = "serde")]
+#[cfg(not(target_os = "wasi"))]
+mod logger;
 pub mod runtime;
 
 /// Canonical Rust request shapes for the `elastos:bus@v1` contract.

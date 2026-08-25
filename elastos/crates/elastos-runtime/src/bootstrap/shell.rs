@@ -5,7 +5,6 @@
 //! - Can list/launch/stop other capsules
 //! - Can grant/revoke capabilities
 //! - Acts as the user's interface to the runtime
-use elastos_logger::log_info;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,8 +14,7 @@ use crate::handler::{CapsuleIoBridge, RequestHandler};
 use crate::messaging::MessageChannel;
 use crate::primitives::audit::TrustLevel;
 
-const LOG_COMPONENT: &str = "runtime";
-
+use crate::logger;
 /// Shell configuration
 #[derive(Debug, Clone)]
 pub struct ShellConfig {
@@ -111,7 +109,7 @@ impl ShellManager {
         } else {
             // No shell configured - create a virtual shell ID for API use
             let id = CapsuleId::new();
-            log_info!(component: LOG_COMPONENT,
+            logger::info!(
                 "No shell capsule configured, using virtual shell ID: {}",
                 id
             );
@@ -129,7 +127,7 @@ impl ShellManager {
 
         self.shell_id = Some(shell_id.clone());
 
-        log_info!(component: LOG_COMPONENT, "Shell capsule bootstrapped with ID: {}", shell_id);
+        logger::info!("Shell capsule bootstrapped with ID: {}", shell_id);
 
         Ok(shell_id)
     }
@@ -140,7 +138,7 @@ impl ShellManager {
         path: &std::path::Path,
         capsule_manager: &Arc<CapsuleManager>,
     ) -> Result<CapsuleId, ShellError> {
-        log_info!(component: LOG_COMPONENT, "Launching shell from local path: {}", path.display());
+        logger::info!("Launching shell from local path: {}", path.display());
 
         // Read manifest
         let manifest_path = path.join("capsule.json");
@@ -196,7 +194,7 @@ impl ShellManager {
                     .map_err(|e| ShellError::Stop(format!("Failed to stop shell: {}", e)))?;
             }
 
-            log_info!(component: LOG_COMPONENT, "Shell capsule stopped");
+            logger::info!("Shell capsule stopped");
         }
 
         Ok(())

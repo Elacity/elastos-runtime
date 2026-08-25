@@ -7,11 +7,8 @@ use std::io::{self, BufRead, Read, Write};
 use std::time::Duration;
 
 #[cfg(not(target_os = "wasi"))]
-use elastos_logger::log_warn;
-
 #[cfg(not(target_os = "wasi"))]
-const LOG_COMPONENT: &str = "guest";
-
+use crate::logger;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -204,12 +201,7 @@ impl RuntimeClient {
                         use std::os::fd::AsRawFd;
                         let fd = file.as_raw_fd();
                         if let Err(e) = Self::configure_serial_raw_fd(fd) {
-                            log_warn!(
-                                component: LOG_COMPONENT,
-                                "failed to configure raw serial mode on {}: {}",
-                                path,
-                                e
-                            );
+                            logger::warn!("failed to configure raw serial mode on {}: {}", path, e);
                         }
                         RuntimeBridgeChannel::Serial { file }
                     }

@@ -1,9 +1,4 @@
-use std::path::PathBuf;
-
-use elastos_logger::log_warn;
-
-const LOG_COMPONENT: &str = "cmd.share";
-
+use crate::logger::cmd_share as logger;
 use elastos_server::content::{
     fetch_bytes_via_provider, parse_content_object_manifest, verify_content_object_file,
     ContentObjectManifest, CONTENT_OBJECT_MANIFEST_PATH,
@@ -13,6 +8,7 @@ use elastos_server::shares::{
     load_share_catalog, parse_share_uri, publish_channel_head_via_provider, save_share_catalog,
     ChannelStatus, ShareChannel, ShareEntry, ShareMeta,
 };
+use std::path::PathBuf;
 
 pub async fn run_share(
     path: PathBuf,
@@ -142,7 +138,7 @@ pub async fn run_share(
 
     tokio::signal::ctrl_c().await?;
     if let Err(err) = tunnel.shutdown().await {
-        log_warn!(component: LOG_COMPONENT, "failed to stop public share cleanly: {}", err);
+        logger::warn!("failed to stop public share cleanly: {}", err);
     }
     Ok(())
 }

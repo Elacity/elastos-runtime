@@ -5,7 +5,6 @@
 //!
 //! Phase 3: Simple file-based logging
 //! Later: Tamper-evident storage, cryptographic chaining, audit capsule
-use elastos_logger::log_error;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -16,8 +15,7 @@ use std::sync::{Mutex, RwLock};
 use super::time::SecureTimestamp;
 use crate::capability::token::{Action, ResourceId, TokenId};
 
-const LOG_COMPONENT: &str = "runtime";
-
+use crate::logger;
 /// Audit event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -314,7 +312,7 @@ impl AuditLog {
         let json = match serde_json::to_string(&event) {
             Ok(j) => j,
             Err(e) => {
-                log_error!(component: LOG_COMPONENT, "Audit event serialization failed: {}", e);
+                logger::error!("Audit event serialization failed: {}", e);
                 return;
             }
         };
@@ -328,7 +326,7 @@ impl AuditLog {
         if let Some(writer) = &self.writer {
             if let Ok(mut w) = writer.lock() {
                 if let Err(e) = writeln!(w, "{}", json) {
-                    log_error!(component: LOG_COMPONENT, "Audit event write failed: {}", e);
+                    logger::error!("Audit event write failed: {}", e);
                 }
                 // Flush to ensure durability
                 let _ = w.flush();

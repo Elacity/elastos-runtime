@@ -56,6 +56,7 @@ mod config;
 mod error;
 #[cfg(target_os = "macos")]
 mod ffi;
+pub mod logger;
 #[cfg(target_os = "macos")]
 mod network;
 #[cfg(not(target_os = "macos"))]
