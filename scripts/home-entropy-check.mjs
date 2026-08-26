@@ -5310,13 +5310,25 @@ assert(
   "Inbox Inspector approval must require fresh same-principal passkey proof before approved provider dispatch",
   inboxInspectorApprovalBoundary,
 );
-assert(
-  inbox.includes('entry.kind !== "wallet_approval_request"') &&
-    inbox.includes("const unreadIdSet = new Set(unreadIds)") &&
-    inbox.includes("unread_count: unreadCount") &&
-    !inbox.includes("renderInbox(Object.assign({}, notifications, { unread_count: 0 }))"),
-  "Inbox auto-read must not locally mark wallet approval requests as read when clearing ordinary visible notifications",
-);
+{
+  const markVisibleReadBlock = inbox.slice(
+    inbox.indexOf("function markVisibleRead() {"),
+    inbox.indexOf("function formatInboxTime(", inbox.indexOf("function markVisibleRead() {")),
+  );
+  assert(
+    markVisibleReadBlock.includes('entry.kind !== "wallet_approval_request"') &&
+      markVisibleReadBlock.includes('entry.kind !== "contact_request"') &&
+      markVisibleReadBlock.includes("const unreadIds = state.entries") &&
+      markVisibleReadBlock.includes("const unreadIdSet = new Set(unreadIds)") &&
+      markVisibleReadBlock.includes("for (const entry of state.entries)") &&
+      markVisibleReadBlock.includes("if (unreadIdSet.has(entry.id))") &&
+      markVisibleReadBlock.includes("entry.read = true;") &&
+      markVisibleReadBlock.includes("renderInbox();") &&
+      !markVisibleReadBlock.includes("unread_count") &&
+      !markVisibleReadBlock.includes("Object.assign({}, notifications"),
+    "Inbox auto-read must derive eligible unread ids from current entries, mark only matching entries as read, rerender from current state, and avoid synthesizing notification unread_count",
+  );
+}
 assert(
   inbox.includes("capability-approve-request:") &&
     inbox.includes("capability-deny-request:") &&
