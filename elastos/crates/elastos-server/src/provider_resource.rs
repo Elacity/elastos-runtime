@@ -7,6 +7,7 @@
 use elastos_common::localhost::rooted_localhost_uri;
 use elastos_runtime::capability::Action;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub const WALLET_STATUS_RESOURCE: &str = "elastos://wallet/meta/status";
 
@@ -98,6 +99,7 @@ pub fn build_capability_resource(
             op,
             &["chat_completions", "status", "health", "list_models"],
         ),
+        "model" => model_resource(op, request),
         "object" => object_resource(op),
         "operator-drive-adapter" => simple_elastos_resource(
             "operator-drive-adapter",
@@ -176,6 +178,11 @@ pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
         },
         "wallet" => wallet_op_required_action(op),
         "ipfs" => ipfs_op_required_action(op),
+        "model" => match op {
+            "offers_list" | "runs_get" | "runs_events" => Some(Action::Read),
+            "runs_create" | "runs_cancel" => Some(Action::Execute),
+            _ => None,
+        },
         "object" => object_op_required_action(op),
         "operator-drive-adapter" => match op {
             "status" | "metadata_index" | "read_bytes" => Some(Action::Read),
@@ -548,6 +555,94 @@ fn decrypt_resource(op: &str) -> Result<String, String> {
     }
 }
 
+fn model_resource(op: &str, request: &Value) -> Result<String, String> {
+    ensure_supported_operation(
+        "model",
+        op,
+        &[
+            "offers_list",
+            "runs_create",
+            "runs_get",
+            "runs_events",
+            "runs_cancel",
+        ],
+    )?;
+    match op {
+        "offers_list" => Ok("elastos://model/offers".to_string()),
+        "runs_create" => {
+            let offer_hash = model_offer_id_hash(
+                request
+                    .get("offer_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "model provider request missing offer_id".to_string())?,
+            )?;
+            Ok(format!("elastos://model/offers/sha256/{offer_hash}/runs"))
+        }
+        "runs_get" => {
+            let run_digest = validated_model_run_digest(
+                request
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "model provider request missing run_id".to_string())?,
+            )?;
+            Ok(format!("elastos://model/runs/sha256/{run_digest}"))
+        }
+        "runs_events" => {
+            let run_digest = validated_model_run_digest(
+                request
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "model provider request missing run_id".to_string())?,
+            )?;
+            Ok(format!("elastos://model/runs/sha256/{run_digest}/events"))
+        }
+        "runs_cancel" => {
+            let run_digest = validated_model_run_digest(
+                request
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "model provider request missing run_id".to_string())?,
+            )?;
+            Ok(format!("elastos://model/runs/sha256/{run_digest}/cancel"))
+        }
+        _ => Err(format!("Unsupported model provider operation: {op}")),
+    }
+}
+
+fn validated_model_run_digest(run_id: &str) -> Result<&str, String> {
+    let digest = run_id
+        .strip_prefix("run:sha256:")
+        .ok_or_else(|| "model run_id must be a canonical run:sha256 identifier".to_string())?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("model run_id must be a canonical run:sha256 identifier".to_string());
+    }
+    if digest.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err("model run_id must be a canonical run:sha256 identifier".to_string());
+    }
+    validate_segment(digest, "model run_id hash")?;
+    Ok(digest)
+}
+
+fn model_offer_id_hash(offer_id: &str) -> Result<String, String> {
+    if offer_id.is_empty() || offer_id.trim() != offer_id {
+        return Err("model offer_id must be a trimmed non-empty string".to_string());
+    }
+    if offer_id.len() > 256 {
+        return Err("model offer_id exceeds 256 bytes".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(offer_id.as_bytes());
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +920,141 @@ mod tests {
         assert_eq!(
             provider_operation_action("browser-engine", "close_page"),
             Some(elastos_runtime::capability::Action::Delete)
+        );
+    }
+
+    #[test]
+    fn model_resources_and_actions_are_canonical() {
+        let list = serde_json::json!({});
+        let offer_a = "offer:flash-chat:pair-a";
+        let offer_b = "offer:h3-video:2x";
+        let run_id = "run:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            build_capability_resource("model", "offers_list", &list).unwrap(),
+            "elastos://model/offers"
+        );
+        assert_eq!(
+            build_capability_resource(
+                "model",
+                "runs_create",
+                &serde_json::json!({"offer_id": offer_a})
+            )
+            .unwrap(),
+            "elastos://model/offers/sha256/6a01612dd8b7e218fcc8d3f037c8672498658b6738262c1fae375cd1514ad77d/runs"
+        );
+        assert_eq!(
+            build_capability_resource(
+                "model",
+                "runs_create",
+                &serde_json::json!({"offer_id": offer_b})
+            )
+            .unwrap(),
+            "elastos://model/offers/sha256/7e635da8f42e2df0918f065be21057fecd516b45639357674d414b4cb8cd2fe7/runs"
+        );
+        assert_eq!(
+            build_capability_resource(
+                "model",
+                "runs_get",
+                &serde_json::json!({"run_id": run_id})
+            )
+            .unwrap(),
+            "elastos://model/runs/sha256/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            build_capability_resource(
+                "model",
+                "runs_events",
+                &serde_json::json!({"run_id": run_id})
+            )
+            .unwrap(),
+            "elastos://model/runs/sha256/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/events"
+        );
+        assert_eq!(
+            build_capability_resource(
+                "model",
+                "runs_cancel",
+                &serde_json::json!({"run_id": run_id})
+            )
+            .unwrap(),
+            "elastos://model/runs/sha256/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/cancel"
+        );
+        assert_eq!(
+            provider_operation_action("model", "offers_list"),
+            Some(elastos_runtime::capability::Action::Read)
+        );
+        assert_eq!(
+            provider_operation_action("model", "runs_create"),
+            Some(elastos_runtime::capability::Action::Execute)
+        );
+        assert_eq!(
+            provider_operation_action("model", "runs_get"),
+            Some(elastos_runtime::capability::Action::Read)
+        );
+        assert_eq!(
+            provider_operation_action("model", "runs_events"),
+            Some(elastos_runtime::capability::Action::Read)
+        );
+        assert_eq!(
+            provider_operation_action("model", "runs_cancel"),
+            Some(elastos_runtime::capability::Action::Execute)
+        );
+        assert!(build_capability_resource("model", "runs_create", &serde_json::json!({})).is_err());
+        assert!(build_capability_resource(
+            "model",
+            "runs_create",
+            &serde_json::json!({"offer_id": ""})
+        )
+        .is_err());
+        assert!(build_capability_resource(
+            "model",
+            "runs_create",
+            &serde_json::json!({"offer_id": " offer:flash-chat:pair-a "})
+        )
+        .is_err());
+        assert!(build_capability_resource(
+            "model",
+            "runs_create",
+            &serde_json::json!({"offer_id": "x".repeat(257)})
+        )
+        .is_err());
+        assert!(build_capability_resource("model", "runs_get", &serde_json::json!({})).is_err());
+        assert!(
+            build_capability_resource(
+                "model",
+                "runs_get",
+                &serde_json::json!({"run_id": "run:sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"})
+            )
+            .is_err()
+        );
+        assert!(build_capability_resource(
+            "model",
+            "runs_get",
+            &serde_json::json!({"run_id": "run:sha256:01234567"})
+        )
+        .is_err());
+        assert!(
+            build_capability_resource(
+                "model",
+                "runs_get",
+                &serde_json::json!({"run_id": "run:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF"})
+            )
+            .is_err()
+        );
+        assert!(
+            build_capability_resource(
+                "model",
+                "runs_get",
+                &serde_json::json!({"run_id": "run:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"})
+            )
+            .is_err()
+        );
+        assert!(
+            build_capability_resource(
+                "model",
+                "runs_get",
+                &serde_json::json!({"run_id": "run:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd/0"})
+            )
+            .is_err()
         );
     }
 
