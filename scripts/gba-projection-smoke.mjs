@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { BUTTON_BITS, gamepadMask } from "../capsules/gba-emulator/browser/gba-input.js";
@@ -14,6 +14,19 @@ const projection = await readFile(path.join(browserRoot, "index.html"), "utf8");
 const style = await readFile(path.join(browserRoot, "style.css"), "utf8");
 const manifest = JSON.parse(await readFile(path.join(root, "capsules/gba-emulator/capsule.json")));
 const ucityManifest = JSON.parse(await readFile(path.join(root, "capsules/gba-ucity/capsule.json")));
+const nonogramManifest = JSON.parse(
+  await readFile(path.join(root, "capsules/gba-nonogram/capsule.json")),
+);
+const nonogramRom = await readFile(path.join(root, "capsules/gba-nonogram/nonogram.gba"));
+const nonogramAttribution = await readFile(
+  path.join(root, "capsules/gba-nonogram/ATTRIBUTION.md"),
+  "utf8",
+);
+const nonogramLicense = await readFile(path.join(root, "capsules/gba-nonogram/LICENSE"), "utf8");
+const nonogramIconSvg = await readFile(
+  path.join(root, "capsules/gba-nonogram/icons/icon.svg"),
+  "utf8",
+);
 const mgbaJs = await readFile(path.join(browserRoot, "mgba.js"));
 const mgbaWasm = await readFile(path.join(browserRoot, "mgba.wasm"));
 const normalizer = await readFile(path.join(root, "scripts/normalize-gba-engine-imports.mjs"), "utf8");
@@ -25,6 +38,30 @@ function assert(condition, message) {
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function pngDimensions(bytes) {
+  assert(bytes.length >= 24, "PNG icon header was truncated");
+  assert(bytes.toString("hex", 0, 8) === "89504e470d0a1a0a", "icon is not a PNG");
+  assert(bytes.toString("ascii", 12, 16) === "IHDR", "PNG is missing IHDR");
+  return {
+    width: bytes.readUInt32BE(16),
+    height: bytes.readUInt32BE(20),
+  };
+}
+
+async function listFilesRecursive(dir) {
+  const entries = await readdir(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await listFilesRecursive(full)));
+    } else if (entry.isFile()) {
+      files.push(full);
+    }
+  }
+  return files;
 }
 
 const buttons = Array.from({ length: 16 }, () => ({ pressed: false }));
@@ -61,6 +98,53 @@ assert(
   projection.includes(`style.css?v=${gbaAssetVersion}`) &&
     projection.includes(`emulator.js?v=${gbaAssetVersion}`),
   "GBA projection assets do not share the current cache identity",
+);
+assert(
+  nonogramManifest.name === "gba-nonogram" &&
+    nonogramManifest.role === "content" &&
+    nonogramManifest.type === "data" &&
+    nonogramManifest.entrypoint === "nonogram.gba" &&
+    nonogramManifest.viewer === "gba-emulator" &&
+    nonogramManifest.icon === "icons",
+  "Nonogram capsule manifest lost its content/viewer/icon contract",
+);
+assert(
+  sha256(nonogramRom) === "e9947cf38f5b537f694ee3bd76dcc21dd6f4ed1b96bf33ae36940b9d20e1164b",
+  "Nonogram Advance ROM does not match the pinned v0.9.5 SRAM build",
+);
+assert(
+  nonogramAttribution.includes("official GitHub release `nonogram_advance_v0.9.5_sram.gba`") &&
+    nonogramAttribution.includes("**sha256:** `e9947cf38f5b537f694ee3bd76dcc21dd6f4ed1b96bf33ae36940b9d20e1164b`") &&
+    nonogramAttribution.includes(
+      "Capsule icon source `icons/icon.svg` and generated `icons/icon-{32,64,128,256}.png` are original Elacity marks for this capsule",
+    ),
+  "Nonogram attribution is missing the pinned ROM provenance or capsule icon note",
+);
+assert(
+  nonogramLicense.includes("Permission is hereby granted, free of charge, to any person obtaining a copy") &&
+    nonogramLicense.includes("THE SOFTWARE IS PROVIDED \"AS IS\""),
+  "Nonogram MIT license text is incomplete",
+);
+assert(
+  nonogramIconSvg.includes('aria-label="Nonogram Advance"') &&
+    nonogramIconSvg.includes('fill="#7dd3c7"'),
+  "Nonogram source icon art drifted from the donor SVG",
+);
+for (const size of [32, 64, 128, 256]) {
+  const icon = await readFile(path.join(root, "capsules/gba-nonogram/icons", `icon-${size}.png`));
+  const dims = pngDimensions(icon);
+  assert(
+    dims.width === size && dims.height === size,
+    `Nonogram icon-${size}.png does not match its declared size`,
+  );
+}
+const homeIconFiles = [
+  ...(await listFilesRecursive(path.join(root, "capsules/home/browser"))),
+  ...(await listFilesRecursive(path.join(root, "capsules/home-gui/browser"))),
+];
+assert(
+  homeIconFiles.every((file) => !file.includes("gba-nonogram")),
+  "Nonogram must not ship a central Home-owned icon mirror",
 );
 const imports = WebAssembly.Module.imports(new WebAssembly.Module(mgbaWasm));
 const allowedLocalMemfs = new Set([

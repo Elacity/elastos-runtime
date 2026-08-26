@@ -567,6 +567,7 @@ APP_CAPSULES=(
     wallet-walletconnect
     gba-emulator
     gba-ucity
+    gba-nonogram
     chat-room
 )
 
