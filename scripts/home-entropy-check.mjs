@@ -351,6 +351,7 @@ function assertUsersSelfReferencesAreApproved() {
     "capsules/browser-engine-adapter/src/tests.rs",
     "capsules/browser-engine-adapter/src/validation.rs",
     "capsules/gba-emulator/capsule.json",
+    "capsules/gba-nonogram/capsule.json",
     "capsules/gba-ucity/capsule.json",
     "elastos/crates/elastos-server/src/api/browser_capsules.rs",
     "elastos/crates/elastos-server/src/api/gateway_browser.rs",
@@ -3527,6 +3528,33 @@ assert(
     homeGuiCapsuleManifest.description === "Desktop Home view for ElastOS" &&
     homeCliManifest.role === "shell",
   "Home identity split must keep home as the host and expose plain Desktop and Terminal shell descriptions",
+);
+assert(
+  homeGuiCapsuleManifest.icon === "browser/icons" &&
+    fileExists("capsules/home-gui/browser/icons/icon-32.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-64.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-128.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-256.png"),
+  "Home GUI must own its capsule icon manifest and four top-level raster icon sizes",
+);
+const gbaNonogramManifest = JSON.parse(read("capsules/gba-nonogram/capsule.json"));
+assert(
+  gbaNonogramManifest.icon === "icons" &&
+    gbaNonogramManifest.role === "content" &&
+    gbaNonogramManifest.type === "data" &&
+    gbaNonogramManifest.viewer === "gba-emulator" &&
+    fileExists("capsules/gba-nonogram/icons/icon.svg") &&
+    fileExists("capsules/gba-nonogram/icons/icon-32.png") &&
+    fileExists("capsules/gba-nonogram/icons/icon-64.png") &&
+    fileExists("capsules/gba-nonogram/icons/icon-128.png") &&
+    fileExists("capsules/gba-nonogram/icons/icon-256.png") &&
+    listFilesRecursive(resolve(repoRootPath, "capsules/home/browser")).every(
+      (file) => !file.includes("gba-nonogram"),
+    ) &&
+    listFilesRecursive(resolve(repoRootPath, "capsules/home-gui/browser")).every(
+      (file) => !file.includes("gba-nonogram"),
+    ),
+  "GBA Nonogram must keep a schema-valid content manifest, capsule-owned icon assets, and no central Home mirror",
 );
 assertManifestMethod(coreCapsuleManifests, "browser", "elastos.browser.page", "page.open", {
   risk: "launch",
