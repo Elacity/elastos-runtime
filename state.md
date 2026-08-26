@@ -1,6 +1,6 @@
 # State
 
-Last updated: 2026-08-16 UTC
+Last updated: 2026-08-26 UTC
 
 This file records public-safe current truth for released 0.6.0, published review
 lines, and active unpublished work. Historical
@@ -11,21 +11,29 @@ the public repository.
 ## Release Posture
 
 - `main` at `d358dedb` is the released 0.6.0 line.
-- `origin/review/collaboration-candidate` at `b07160cf` is the published review
-  line for the collaboration and UI work described below. It is review evidence,
-  not released or deployed product truth.
-- The branch adds Runtime-backed People/Chat collaboration and selected shell UI
-  work. The source boundary is complete for review: Profile authority, Runtime
-  lifecycle, Carrier routing, People/Chat projections, and the strict
-  fixture-owned two-Runtime acceptance all pass. Normal localhost and public
-  seed installation remain separate product gates.
-- The first normal cross-Runtime Chat send on the installed candidate aborted
-  inside the old Iroh 0.96.1 `iroh-quinn` transport. The source candidate now
-  uses one coordinated Carrier generation: Iroh 1.0.2, iroh-gossip 0.101.0,
-  mDNS 0.4.0, and distributed-topic-tracker 0.3.5. Focused Carrier,
-  collaboration, and two-node source tests pass. Localhost artifact parity and
-  machine Browser open/connect/close/zero-residue proof now exist; public-seed
-  retesting and manual Browser visible video/input usability remain open.
+- `feat/0.7-uiux-candidate` is the current unpublished 0.7 UIUX source
+  candidate over `origin/upstream/0.7-dev`. Its reviewed UI implementation tip
+  is `03cb271d` (tree `123776843b769b37288668001fd07cc5fb4c499f`).
+- The candidate integrates the reviewed collaboration, Home/platform/app UIUX,
+  Wallet/connectors, GBA viewer/content, typed model-provider, standalone
+  Assistant, and legacy AI-path retirement work into one source line. The named
+  focused source gates are green; installation, localhost artifact proof,
+  public-seed proof, and human acceptance remain separate gates.
+- The broad `just verify` gate is not yet green on this host: it stops in the
+  existing `carrier-dependency-generation-check` when Cargo tries to resolve
+  crates from the network and DNS fails for `static.crates.io`. That is an
+  environment blocker, not a proved defect in this candidate diff.
+- Assistant uses only the typed Runtime model-provider boundary. It truthfully
+  reports no available models when the operator-owned model-provider config is
+  absent, and it does not expose backend selectors, credentials, or topology.
+- Protected-content runtime and product work remains on separate reviewed lines
+  and is intentionally inactive in this UIUX candidate.
+- Rejected donor behavior remains out of the candidate: central icon authority,
+  unsigned directory picker flows, embedded Agent Space and fake grants/tools,
+  direct backend or topology exposure, legacy `ai-provider` and
+  `llama-provider` product paths, hardcoded CI donor branches, Windows source
+  gates, and GBA engine/CSP/binary/storage regressions such as dead sidebar
+  CSS, worker-permission changes, or central icon mirrors.
 - The Runtime implements the WASM Component Model path through
   `elastos.component/v1` and the Runtime-mediated `elastos:bus@v1` authority
   contract. The conformance fixture and authoring template exercise it; all 18
@@ -234,6 +242,26 @@ the public repository.
   served artifact parity, and view cleanup. GBA remains outside the default
   profile and is installed only by explicit `demo` or `full` profiles.
 
+## Model And Assistant Truth
+
+- `model-provider` is the single active model execution path. Runtime registers
+  it as a verified native provider and authorizes only the typed
+  `offers_list`, `runs_create`, `runs_get`, `runs_events`, and `runs_cancel`
+  operations.
+- The operator-owned model-provider config lives under the Runtime data root at
+  `providers/model-provider/config.json`. Runtime validates the fixed path and
+  file security, passes only the raw top-level offers value through Init, and
+  keeps backend URLs, credentials, and adapter details below the provider
+  boundary.
+- Missing model-provider config is an honest zero-offer state: Runtime may
+  start/register the provider with no offers, writes no config file, and
+  Assistant shows that no model offers are available.
+- Assistant is a standalone first-party capsule. Chat, Build, and Studio use
+  only typed Runtime model resources and the protected Assistant workspace;
+  transcript copy goes only through the trusted Home Clipboard path.
+- Assistant source proof is source-only today. No install, localhost, or human
+  acceptance claim is recorded yet for this candidate's Assistant workflows.
+
 ## System Truth
 
 - System has no generic Storage or pseudo-WebSpace inventory section. Files,
@@ -435,16 +463,11 @@ the public repository.
   learn the rebound endpoint from one announcement. An import whose identity
   restore fails is reported incomplete and never claims a complete account
   recovery.
-- The collaboration path on `origin/review/collaboration-candidate` at
-  `b07160cf` is published for review but is not released or deployed product
-  truth. Its disposable, fixture-owned two-Runtime product journey passed on
-  exact source-built artifacts. The current candidate is installed on
-  normal localhost with source/installed artifact parity, HTTP 200, accepted
-  People/Chat/Inbox/Clipboard/restart evidence, and machine Browser
-  open/connect/close/zero-residue proof, but its one-Runtime product acceptance
-  is not complete because manual Browser visible video/input usability remains
-  open. The public seed has not been updated to this candidate and is not
-  matching product evidence.
+- Historical review evidence remains on `origin/review/collaboration-candidate`
+  at `b07160cf`: its disposable, fixture-owned two-Runtime product journey
+  passed on exact source-built artifacts. The current unpublished UIUX
+  candidate is a different source line and has not yet been installed or
+  accepted as matching localhost or public-seed product evidence.
 - Bilateral signed contact removal is implemented with the complete People
   states: a pair-scoped signed revocation delivered over the direct channel
   with durable retry, visible removed state on both sides, retained heads as

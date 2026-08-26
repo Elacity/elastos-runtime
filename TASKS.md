@@ -15,55 +15,29 @@ Do not add new product surface area until the `Now` section is materially tighte
 Read this section as strict priority order for this branch. Do not start a lower
 section if a higher section is incoherent, unverified, or too large to review.
 
-### Collaboration candidate closeout
+### 0.7 UIUX candidate closeout
 
-This is the only active closeout for `codex/post-0.6-consolidation`. It is based
-on released `main` at `d358dedb` and is a candidate for the next 0.7 development
-line. Do not resume work from superseded hardening, network-profile, or
-collaboration worktrees.
+This is the only active closeout for the unpublished
+`feat/0.7-uiux-candidate` line over released `main` at `d358dedb`. Keep
+protected-content and broader product-documentation work on their separate
+reviewed branches unless a user explicitly asks to integrate them.
 
-The source boundary is complete: a person is a signed Profile, a Runtime owns
-authority and collaboration state, Carrier transports authenticated endpoint
-traffic, and People, Chat, and Inbox use typed Runtime resources. The strict
-fixture-owned two-Runtime journey passes. This does not yet prove the installed
-product on localhost or the public seed.
+Open gates for this candidate, in order:
 
-The first normal cross-Runtime Chat send exposed a Runtime abort in the old
-Iroh 0.96.1 transport generation. The reviewed Iroh 1.0.2 source port is now
-part of this closeout. Its source tests pass; localhost now has installed
-artifact parity plus machine Browser open/connect/close/zero-residue proof, and
-the remaining installed localhost/manual Browser usability plus public-seed
-proof remain in steps 3 and 4 below.
-
-Finish these steps in order. Do not add product scope while they are open:
-
-1. [x] Review the complete branch, remove stale or competing truth, and rebuild
-   the 47 development commits into a small authority-bound review series with
-   the same final behavior.
-2. [x] Run the complete source gate on the reconstructed series, including the
-   explicit People and Chat capsule gates and the fixture-owned two-Runtime
-   acceptance.
-3. [ ] Install the exact reviewed commit on localhost and pass one-Runtime
-   acceptance: Profile creation and rename, opt-in discovery state, Inbox
-   request handling, Chat selection and settings, trusted Clipboard, restart,
-   and no unexpected writes from read-only summaries.
-   The current candidate is installed with artifact parity and HTTP 200.
-   Existing localhost evidence now covers People, Chat, Inbox, trusted
-   Clipboard, restart continuity, and a machine Browser open/connect/close path
-   with zero ownership/stream/reconciliation residue. Manual Browser visible
-   video/input usability on the installed localhost candidate is still open, so
-   this step remains open.
-4. [ ] Install that same commit on the public seed and pass the real two-Runtime
-   journey: overlapping bounded discovery, one request, Inbox-only acceptance,
-   direct messages both ways, rename, remove, re-add, shared-room continuity,
-   restart, narrow-window UI, and exact source/installed artifact parity.
-5. [ ] Review the installed evidence, update release truth, and publish only the
-   approved series to the named 0.7 development branch. Do not merge, tag, or
-   deploy as a release during this closeout.
-
-Mailbox delivery, user-created groups, silent blocking, wider discovery scale,
-the remaining Home redesign, and Browser setup are later work. They must not
-enter this candidate to satisfy the five gates above.
+1. [ ] Install the exact reviewed candidate on localhost and collect the
+   remaining product evidence that source tests cannot prove: manual Browser
+   visible video/input usability, Home shell acceptance, Assistant visible
+   Chat/Build/Studio behavior, and GBA theme/layout acceptance on the installed
+   artifacts.
+2. [ ] Install that same reviewed candidate on the public seed and rerun the
+   real two-Runtime collaboration journey with exact source/installed artifact
+   parity.
+3. [ ] Review the install evidence, update release truth, and publish only the
+   approved candidate series to the named 0.7 development branch. Do not merge,
+   tag, or deploy as a release during this closeout.
+4. [ ] Add the private operator-owned model-provider config on the Runtime line
+   only when real model offers are ready for install proof. Missing config is an
+   honest zero-offer Assistant state and is not itself a source defect.
 
 ## Later
 
@@ -124,129 +98,17 @@ enter this candidate to satisfy the five gates above.
   offline, and the People state machine reserves `blocked` beside the removed
   states. Unblock clears the flag locally with nothing to re-announce.
 
-#### Migrate the stranded UI work
+#### Deferred Sash UIUX work
 
-`feat/shell-ui-esp-on-protocol-extended-ai-work` and `feat/shell-ui-v1` hold
-substantial UI work that never reached `main`. The newer branch is 377 files and
-62,806 insertions, 35 commits behind `main`, and built against pre-0.6
-contracts. Merging is not viable. Migration is per surface, rewritten against
-current contracts, each piece verified on its own.
-
-The branch mixes four things and they must not travel together:
-
-1. a shared design system replicated into 17 capsules, which has landed as one
-   canonical source under `capsules/_shared/` with a stamping step and a drift
-   gate, adopted by Home, Home GUI, People, Inbox and Chat Room;
-2. a Home shell redesign, 207 files and 33,600 insertions across `home-gui` and
-   `home`, which is the largest single piece of value and is what remains;
-3. an agent harness, `agent-harness.js` and `agent-harness.css`, roughly 6,300
-   lines, which this file already excludes as extended AI work;
-4. pre-0.6 server behaviour, including `auth_gateway.rs`,
-   `elastos-identity/src/webauthn.rs`, `gateway_inbox.rs`, `gateway_models.rs`,
-   and `gateway_provider_proxy.rs`, which would regress released authority work.
-
-Only 1 and 2 migrate. Nothing from 3 or 4 comes across.
-
-Correcting a constraint this section used to carry: it said no migration commit
-may touch `elastos/crates`. That held while migration meant copying assets, and
-it stopped holding at the app icons. The branch keeps icons in a central table
-keyed by capsule name, which is the coupling the shell already had; letting each
-capsule own its icon needs a manifest field and a Runtime-resolved read model,
-so that slice touched `elastos/crates` by design. The rule that actually matters
-is the one above: nothing from 3 or 4, and no pre-0.6 server behaviour. A
-Runtime change a migrated surface genuinely requires is a rewrite against
-current contracts, which is what this section asks for.
-
-The Home shell redesign migrates in slices, not in one move. Five have landed
-— the restyle of the surfaces that already existed, the app menu bar,
-Spotlight, Stages with Exposé, and the keyboard layer with Quick Look — and
-the rest are listed below. What made slicing possible is that
-the redesign is additive: 71 of the current template's 73 classes survive it,
-so each surface can arrive with its own module, markup, styling and gate
-assertions, leaving `just verify` green in between.
-
-Three constraints shape every remaining slice. The agent harness does not come
-across, and it is woven through `shell-stages.js` (an Agent Space in the ring),
-`shell-windows.js` (a workspace snapshot hook) and `shell-surface.js`, so each
-needs excising rather than copying. `agent-tip.js` is misnamed on the branch —
-it is the shared cache-bust constant with an agent checklist attached, and
-should arrive as a shell asset-version module without it. And the branch
-predates `home-gui-authority.js` and the `home:shell-context` message, so
-neither may be dropped on the way past. The reconciliation test prerequisite
-is complete: `BrowserCallRecorder` appends each exact provider call before
-publishing its committed count through a watch notification, with 13
-consecutive exact-regression runs and eight consecutive complete 11-test
-module runs passing without a larger yield or time budget.
-
-- [ ] Migrate the status rails: Notification Centre, the Wallet rail, the Inbox
-  rail and the connector sheet. These hang off the menubar clock and the wallet
-  bar entry, and `shell-notifications.js` depends on both rails, so they travel
-  together. The Inbox rail is what the branch Inbox's `inbox:pending-count`
-  message talks to.
-- [ ] Migrate the Control Centre, without the branch's Nearby section. Settled:
-  Discovery belongs to People, so the shell neither writes it nor reads it. The
-  branch does both — it posts to a shell-owned `/api/apps/home/discovery`, and
-  it reads `summary.people.discovery`. Neither exists here, and the second is
-  the one worth being explicit about: discovery state is returned only from
-  `/api/apps/people/summary`, behind People's own launch token, and the Home
-  summary carries no discovery field at all. So a "read-only projection" is not
-  free — it would mean widening the shell's read model across the exact
-  authority boundary the Runtime enforces today, to give the shell standing
-  read access to a privacy-sensitive fact it has no authority over. The row
-  goes. What survives is everything the shell genuinely owns: theme, accent,
-  sounds, focus, dock behaviour, desktop icons.
-- [ ] Decide how a Home tells you that you are still discoverable. Dropping the
-  Nearby row leaves a real gap, and it is a privacy one: discovery is a
-  time-bounded broadcast, and someone who turns it on and closes People has no
-  ambient signal that it is still running. The cheap aligned answer is for
-  People to raise a notification, which reaches the shell through
-  `summary.notifications` — a bounded read model the shell already renders and
-  already has reason to. That keeps the fact People's to publish rather than
-  the shell's to inspect. Size this against the ten-minute expiry first.
-- [ ] Consider capsule-rendered panels in system chrome, as a surface kind of
-  their own. The idea: rather than the shell reading People's state, the
-  Control Centre gives People a rectangle and People renders its own discovery
-  control inside it, under its own launch token. The shell would then hold
-  placement and no authority at all — which is a stronger position than the
-  projection it replaces, and stronger than the precedent it resembles. Note
-  the precedent runs the other way: in viewer/content the passive party is the
-  data capsule and the viewer holds authority (`/apps/{viewer}/?capsule={name}`),
-  whereas here the passive party would be the shell. Two pieces already exist —
-  the host mints per-app launch tokens, and app frames are opaque-sandboxed
-  with cross-origin resource policy, so an iframe in a popover is no different
-  from one in a window. Three do not:
-  - a panel surface distinct from a window. Every app frame today is a window:
-    it lands in `shellState.windows`, the dock and the menubar. A panel must be
-    none of those, with its own mount and retire tied to the popover.
-  - a compact projection contract. People's entrypoint is a full page; a panel
-    needs a declared small view, which is work in People and a product call.
-  - an anti-spoofing rule. A capsule drawing inside system chrome can imitate
-    system UI. Panels need visible attribution to their app, and probably only
-    a user-pinned capsule gets a slot.
-  This is a feature, not a migration step, and it does not change the Discovery
-  decision above: either way the shell never reads discovery state. Shortcuts
-  that open People cost nothing and land with the Control Centre; the panel is
-  the richer version of the same answer if the ambient control turns out to be
-  worth a new surface kind.
-- [ ] Migrate the Home host redesign: `capsules/home/browser/shell-auth.js` and
-  `style.css`. The branch also deletes the clipboard host, protocol and client,
-  the wallet connector host, and the browser context module — all released
-  behaviour, none of which may go with it.
-- [ ] Add the desktop-object write path the redesign expects, or drop it. The
-  branch's `shell-core.js` posts to `/api/apps/home/desktop/objects`, which has
-  no route here; the summary carries `desktop_objects` for reading only.
-- [ ] Restyle People, Chat, and Inbox. Their behaviour slices have landed —
-  contact removal with the full People states, shared-room Profile
-  attribution, the terminal delivery state, the reachability signal, and the
-  People/Chat notifications — so the layouts now wait only on the product
-  surface review setting the target. The token work above is the foundation it
-  builds on, not a substitute for it.
-- [ ] Prove the migrated UI. These capsules are outside `just verify`, so each
-  migrated surface needs its named commands and the Chat UI needs its wasm
-  regenerated so the source-to-generated parity check stays green. The entropy
-  check now guards the token adoption itself: it asserts People, Inbox and Chat
-  Room name no colour of their own and load the vendored sheet, and both new
-  assertions were proven by reintroducing a literal and watching them fail.
+- [ ] Add a People-owned ambient indication while opt-in discovery is active,
+  without giving Home read access to People's private discovery state.
+- [ ] Define a typed, attributed capsule-rendered compact panel surface only if
+  the product needs app-owned controls inside system chrome. This is future
+  surface work, not a migration shortcut.
+- [ ] Add advanced Assistant workflows only after typed Runtime contracts and
+  accepted product scope exist for them: desktop attachment, knowledge/citation
+  and search flows, rich media preview/open, and advanced Studio
+  inputs/workflows.
 
 #### First run on a clean Home
 
@@ -533,23 +395,13 @@ and review items pass.
 - [ ] Keep unfinished surfaces out of the main live path unless they launch from Home and return cleanly.
 - [ ] Rehearse and simplify the Home/People/Spaces/System story so the front door feels useful without internal-runtime narration.
 - [ ] Extend `elastos.runtime.services/v1` beyond local configured-provider cards and conversation offers: remote Exit, storage, relay, model, and hosting offers must arrive as provider-backed `elastos.service.offer/v1` records through People/Carrier, and enabling one must create/select a principal-scoped provider grant instead of giving capsules direct People-state authority.
-  - [ ] Model Provider subtask: the current prototype is refactor evidence only,
-    not product truth or a compatibility path. Today `capsules/ai-provider`
-    routes caller-selected backend strings to local OpenAI-compatible HTTP,
-    Venice, or the Codex CLI; `capsules/llama-provider` owns a
-    `llama-server` child and loopback endpoint; `server_infra` starts native
-    installed provider binaries through `ProviderBridge` and passes the llama
-    URL into `ai-provider`; `provider_resource` derives
-    `elastos://ai/<backend>/<op>`; `list_backends` exposes `api_url` or command
-    paths; there is still no typed stream/cancel contract, remote service
-    offer, Carrier provider path, or principal-scoped backend secret; and the
-    `ai-provider` and `llama-provider` manifests still say `microvm` while the
-    active Runtime path spawns native provider binaries. Replace that with one
-    typed Runtime Model service: Runtime selects a granted provider instance,
-    provider adapters own URLs, keys, model processes, model discovery,
-    invoke/stream/cancel, limits, and usage receipts, local llama, remote
-    Spark/Jetson, OpenAI, Claude, and Venice all implement the same contract,
-    remote instances publish signed provider-backed model service offers and
+  - [ ] Model Provider subtask: the local typed model service now exists behind
+    the verified `model-provider` Runtime path and Assistant uses only typed
+    offers and runs. The remaining open work is the later remote
+    service-offer path: provider-backed model offers through People/Carrier,
+    principal-scoped provider grants, and the same typed invoke/stream/cancel
+    contract across local and remote providers without exposing backend URLs,
+    credentials, or topology to capsules.
     use Carrier only below Runtime routing, and capsules or agents receive no
     backend string, URL, port, API key, endpoint DID, or Carrier peer. Keep a
     full Runtime on Spark/Jetson as the first supported remote host and define
