@@ -10800,9 +10800,18 @@ assert(
   "Wallet must provide balances and built-in Bitcoin accounts without manual Bitcoin proof linking",
 );
 assert(
-  wallet.includes("wallet.js?v=wallet-20260726b") &&
+  walletJs.includes("homeClipboard.start();") &&
+    !walletJs.includes('window.top.postMessage({ type: "home:app-ready", homeToken: activeHomeToken }, homeParentOrigin);') &&
+    walletPreferencesForConnectorContinuity.includes('type: "home:open-target"'),
+  "Wallet must keep one canonical Home Clipboard/app-ready path and one exact Home connector-launch path.",
+);
+assert(
+  wallet.includes("wallet.js?v=wallet-20260819f") &&
     wallet.includes('id="wallet-send"') &&
     wallet.includes('id="wallet-receive"') &&
+    wallet.includes('id="wallet-account-card"') &&
+    wallet.includes('id="wallet-hero-pending"') &&
+    wallet.includes('id="wallet-signers"') &&
     wallet.includes("data-wallet-create-account") &&
     wallet.includes("data-wallet-import-recovery-key") &&
     (wallet.match(/data-wallet-create-account/g) || []).length === 2 &&
@@ -10817,7 +10826,9 @@ assert(
     walletJs.includes("openReceiveFlow") &&
     walletJs.includes("openSendFlow") &&
     walletJs.includes("balance_key") &&
-    walletJs.includes("wallet-detail-summary") &&
+    walletJs.includes("wallet-account-card") &&
+    walletJs.includes("wallet-hero-pending") &&
+    walletJs.includes("wallet-signers") &&
     walletJs.includes("fundedSendableAccounts"),
   "Wallet must expose Send/Receive plus canonical Accounts/Settings create-import surfaces with cache-busted assets",
 );
@@ -10859,11 +10870,11 @@ assert(
 assert(
   wallet.includes("wallet-settings-drawer") &&
     wallet.includes("wallet-settings-main") &&
-    wallet.includes("wallet-settings-side") &&
-    wallet.indexOf('class="wallet-settings-side"') <
-      wallet.indexOf('id="wallet-methods"') &&
-    !wallet.includes("<h2>Wallet settings</h2>") &&
-    !wallet.includes("<h3>Identity</h3>") &&
+    wallet.includes("<h2>Settings</h2>") &&
+    wallet.includes("<h3>Manage accounts</h3>") &&
+    wallet.includes("<h3>Display currency</h3>") &&
+    !wallet.includes("wallet-settings-side") &&
+    !wallet.includes("<h3>Appearance</h3>") &&
     !wallet.includes('id="wallet-theme"') &&
     !wallet.includes("data-wallet-theme") &&
     !walletJs.includes("applyStoredTheme") &&
@@ -10879,8 +10890,9 @@ assert(
 assert(
   !wallet.includes("wallet-brand") &&
     walletJs.includes("selectedAccountId") &&
-    walletJs.includes("wallet-detail-address") &&
-    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes("wallet-account-card-address") &&
+    walletJs.includes("wallet-account-card-copy") &&
+    walletJs.includes("wallet-copy-icon") &&
     walletJs.includes('account.proof_type === "siwe"') &&
     walletJs.includes("unavailable: Boolean(payload.unavailable)") &&
     !walletJs.includes("Balances update through approved Runtime providers.") &&
@@ -10900,13 +10912,12 @@ assert(
     walletJs.includes("balanceTargetsForAccounts") &&
     walletJs.includes("accountForAsset") &&
     walletJs.includes("account_ids") &&
-    walletJs.includes("accountActionsNode.hidden = accounts.length > 0") &&
-    walletJs.includes("onWalletActionClick") &&
+    walletJs.includes("openAccountMenu") &&
+    walletJs.includes("data-wallet-account-menu") &&
     !walletJs.includes("createAccountTile") &&
     !walletStyle.includes(".wallet-create-card") &&
     walletJs.includes("create_new: index === 0") &&
     walletJs.includes("Create an EVM account for supported networks.") &&
-    walletJs.includes("dataset.walletAccountMenu") &&
     walletJs.includes("/api/apps/wallet/wallet/default") &&
     walletJs.includes("openRenameAccount") &&
     walletJs.includes('method: "PUT"') &&
@@ -10956,37 +10967,33 @@ assert(
   "wallet-provider manifest must keep principal-sensitive operations off its public interface while retaining internal audit truth",
 );
 assert(
-  wallet.includes(
-    '<section id="wallet-account-detail" class="wallet-detail" aria-label="Default account"></section>',
-  ) &&
+  wallet.includes('id="wallet-account-card"') &&
+    wallet.includes('id="wallet-account-card-address"') &&
+    wallet.includes('id="wallet-account-card-copy"') &&
+    wallet.includes('id="wallet-hero-back"') &&
     wallet.indexOf('class="wallet-hero-balance"') <
       wallet.indexOf('id="wallet-delta"') &&
     wallet.indexOf('id="wallet-delta"') <
-      wallet.indexOf('id="wallet-account-detail"') &&
+      wallet.indexOf('id="wallet-account-card"') &&
     wallet.indexOf('id="wallet-total-balance"') <
       wallet.indexOf('class="wallet-action-row"') &&
     walletJs.includes("renderHeroAccount(allAccounts)") &&
     walletJs.includes("selectedOrDefaultAccount") &&
     walletJs.includes("defaultWalletAccount") &&
     walletJs.includes("latestDefault") &&
-    walletJs.includes("wallet-detail-inline") &&
+    walletJs.includes("has-account-card") &&
     walletJs.includes(
       'selectedAccountId = selectedAccountId === accountId ? "" : accountId',
     ) &&
-    walletJs.includes(
-      'getSelectedAccountId() === account.account_id ? "Show default wallet" : "Show in hero"',
-    ) &&
     walletJs.includes("clearAccountSelection") &&
     walletJs.includes("is-selected") &&
-    walletJs.includes("wallet-detail-qr") &&
+    walletJs.includes("accountCardCopyNode.replaceChildren") &&
+    walletJs.includes("openReceiveFlow") &&
     walletJs.includes("/api/wallet/qr") &&
     !walletJs.includes("visibleAccounts") &&
     !walletJs.includes("Selected account ·") &&
     !walletJs.includes("Hide details") &&
     !walletJs.includes("clearAccountFilter") &&
-    !walletJs.includes("accountDetailNode.scrollIntoView") &&
-    !walletJs.includes("wallet-detail-balance") &&
-    !walletJs.includes("wallet-detail-section") &&
     !walletJs.includes("No transactions yet") &&
     !walletJs.includes("closeOverlaySurfaces") &&
     !walletJs.includes("walletPageNode") &&
@@ -10994,55 +11001,39 @@ assert(
       walletStyle,
       ".wallet-hero-row {",
       "Wallet hero row style",
-    ).includes(
-      "grid-template-columns: minmax(240px, 1fr) minmax(160px, 0.6fr) minmax(190px, 220px)",
-    ) &&
+    ).includes("grid-template-columns: 1fr;") &&
     sourceBlock(walletStyle, ".wallet-delta {", "Wallet graph style").includes(
       "justify-self: center",
     ) &&
     sourceBlock(
       walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("justify-self: end") &&
+      "@container wallet-hero-front (min-width: 700px)",
+      "Wallet wide hero layout",
+    ).includes("grid-template-columns: minmax(0, 1fr) minmax(240px, 340px);") &&
     sourceBlock(
       walletStyle,
-      "@media (max-width: 780px)",
-      "Wallet mobile media",
-    ).includes(".wallet-detail {\n    justify-self: center;") &&
-    !sourceBlock(
+      "\n.wallet-account-card {",
+      "Wallet account card style",
+    ).includes("margin: 6px auto 0;") &&
+    sourceBlock(
       walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("min-height:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("border:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("background:") &&
-    !sourceBlock(
-      walletStyle,
-      ".wallet-detail {",
-      "Wallet detail style",
-    ).includes("position: fixed") &&
-    walletStyle.includes(".wallet-detail-inline") &&
-    walletStyle.includes("width: 156px;") &&
-    walletStyle.includes("width: 132px;") &&
+      "@container wallet-hero-front (min-width: 700px)",
+      "Wallet wide hero layout",
+    ).includes("justify-self: end") &&
+    walletStyle.includes(".wallet-hero-face-back .wallet-qr") &&
+    walletStyle.includes(".wallet-account-card-copy") &&
     walletStyle.includes(
       "grid-template-columns: repeat(auto-fill, minmax(200px, 1fr))",
     ) &&
-    walletStyle.includes("min-height: 118px") &&
+    !walletStyle.includes(".wallet-detail") &&
+    !walletStyle.includes(".wallet-detail-inline") &&
+    !walletStyle.includes(".wallet-detail-qr") &&
+    !walletStyle.includes(".wallet-detail-address") &&
+    !walletStyle.includes(".wallet-detail-summary") &&
     !walletStyle.includes(".wallet-address") &&
     !walletStyle.includes(".wallet-detail-close") &&
-    !walletStyle.includes(".wallet-detail-balance") &&
-    !walletStyle.includes(".wallet-detail-section") &&
     walletStyle.includes(".wallet-account.is-selected"),
-  "Wallet hero must keep balance/actions on the left, graph centered, QR/address on the right, center QR on mobile, and denser account cards without separate containers, side sheets, scroll jumps, transactions placeholders, or duplicate balances",
+  "Wallet hero must keep the reviewed front-face balance and branded account card, move QR/address into the receive face, and avoid stale detail-pane or placeholder chrome",
 );
 assert(
   gatewayApi.includes('WALLET_CAPSULE_ID => "Wallet"') &&
