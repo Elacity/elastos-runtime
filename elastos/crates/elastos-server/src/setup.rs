@@ -2358,6 +2358,45 @@ mod tests {
     }
 
     #[test]
+    fn assistant_capsule_is_packaged_with_a_capsule_owned_icon() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("capsules/assistant/capsule.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["schema"], "elastos.capsule/v1");
+        assert_eq!(manifest["name"], "assistant");
+        assert_eq!(manifest["icon"], "browser/icons");
+        assert_eq!(manifest["entrypoint"], "browser/index.html");
+
+        for file in ["icon-32.png", "icon-64.png", "icon-128.png", "icon-256.png"] {
+            assert!(
+                root.join("capsules/assistant/browser/icons")
+                    .join(file)
+                    .is_file(),
+                "missing Assistant icon asset {file}"
+            );
+        }
+
+        let components: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("components.json")).unwrap()).unwrap();
+        assert_eq!(
+            components["external"]["assistant"]["install_path"],
+            "capsules/assistant"
+        );
+        for profile in ["home", "demo", "agent-local-ai", "public-gateway", "full"] {
+            assert!(
+                components["profiles"][profile]["components"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == "assistant"),
+                "profile {profile} must include the Assistant capsule"
+            );
+        }
+    }
+
+    #[test]
     fn test_normalize_profile_name_preserves_home_profile() {
         assert_eq!(normalize_profile_name("home"), "home");
     }

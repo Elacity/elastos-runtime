@@ -843,6 +843,20 @@
         }
       }
     },
+    "assistant": {
+      "install_path": "capsules/assistant",
+      "description": "Assistant capsule for typed model access through Runtime authorization",
+      "platforms": {
+        "*": {
+          "cid": "",
+          "checksum": "",
+          "size": 0,
+          "release_path": "assistant.tar.gz",
+          "extract_path": "assistant",
+          "install_path": "capsules/assistant"
+        }
+      }
+    },
     "system": {
       "install_path": "capsules/system",
       "description": "Runtime-launched System capsule for identity, runtime, storage, and appearance state",
@@ -1321,7 +1335,8 @@
         "library",
         "marketplace",
         "archive-manager",
-        "inbox"
+        "inbox",
+        "assistant"
       ]
     },
     "demo": {
@@ -1365,7 +1380,8 @@
         "library",
         "marketplace",
         "archive-manager",
-        "inbox"
+        "inbox",
+        "assistant"
       ]
     },
     "operator": {
@@ -1426,6 +1442,7 @@
         "marketplace",
         "archive-manager",
         "inbox",
+        "assistant",
         "llama-server",
         "model-qwen3.5-0.8b"
       ]
@@ -1469,6 +1486,7 @@
         "marketplace",
         "archive-manager",
         "inbox",
+        "assistant",
         "cloudflared"
       ]
     },
@@ -1517,6 +1535,7 @@
         "marketplace",
         "archive-manager",
         "inbox",
+        "assistant",
         "crosvm",
         "vmlinux",
         "kubo",

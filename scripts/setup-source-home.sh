@@ -580,6 +580,7 @@ APP_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    assistant
     wallet
     wallet-metamask
     wallet-unisat

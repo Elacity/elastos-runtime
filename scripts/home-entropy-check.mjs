@@ -668,6 +668,9 @@ const activeUiFiles = [
   "capsules/home-cli/browser/index.html",
   "capsules/home-cli/browser/home-cli.js",
   "capsules/home-cli/browser/style.css",
+  "capsules/assistant/browser/index.html",
+  "capsules/assistant/browser/assistant.js",
+  "capsules/assistant/browser/style.css",
   "capsules/system/browser/index.html",
   "capsules/system/browser/system.js",
   "capsules/system/browser/esp-projections.mjs",
@@ -721,6 +724,7 @@ const activeUiFiles = [
 const activeHtmlFiles = [
   "capsules/home/browser/index.html",
   "capsules/home-cli/browser/index.html",
+  "capsules/assistant/browser/index.html",
   "capsules/system/browser/index.html",
   "capsules/wallet-metamask/browser/index.html",
   "capsules/wallet-unisat/browser/index.html",
@@ -833,6 +837,29 @@ for (const [token, value] of new Map([
     "Chat Room must load the vendored token sheet and theme runtime it maps onto",
   );
 }
+
+const assistantIndex = read("capsules/assistant/browser/index.html");
+const assistantScript = read("capsules/assistant/browser/assistant.js");
+const assistantStyle = read("capsules/assistant/browser/style.css");
+
+assert(
+  assistantIndex.includes('<script src="./assistant.js"></script>'),
+  "Assistant must boot through its capsule-owned browser shell",
+);
+assert(
+  !/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(assistantScript),
+  "Assistant must not add browser-owned persistence",
+);
+assert(
+  !/\bnavigator\.clipboard\b|\bexecCommand\b/.test(assistantScript),
+  "Assistant must not add direct clipboard fallbacks",
+);
+assert(
+  !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+  ),
+  "Assistant capsule source must not expose backend endpoints, topology, or credentials",
+);
 
 // Inbox took the shared token sheet, so pinning its own hex palette here
 // would pin a copy of someone else's decision. The stronger rule: every name

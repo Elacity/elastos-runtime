@@ -1678,6 +1678,7 @@ dependencies = [
  "elastos-compute",
  "elastos-crosvm",
  "elastos-identity",
+ "elastos-model-contract",
  "elastos-namespace",
  "elastos-runtime",
  "elastos-storage",

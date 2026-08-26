@@ -74,6 +74,7 @@ DEFAULT_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    assistant
 )
 CAPSULES=("${DEFAULT_CAPSULES[@]}")
 REQUIRED_SUPPORTED_CAPSULES=(
@@ -104,6 +105,7 @@ REQUIRED_SUPPORTED_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    assistant
 )
 SUPPORT_BINARY_ASSETS=(
     shell
