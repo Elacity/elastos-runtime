@@ -346,6 +346,23 @@ struct SystemBackgroundOverlayRequest {
     opacity: f64,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeAppearancePreferencesUpdate {
+    #[serde(default)]
+    theme: Option<String>,
+    #[serde(default)]
+    accent: Option<String>,
+    #[serde(default)]
+    accent_custom: Option<String>,
+    #[serde(default)]
+    dock_auto_hide: Option<bool>,
+    #[serde(default)]
+    sounds: Option<bool>,
+    #[serde(default)]
+    focus_mode: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SystemGuestRegistrationRequest {
@@ -499,8 +516,16 @@ struct SystemAccessSummary {
     guest_registration_enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct HomeAppearanceSummary {
+    schema: String,
+    revision: u64,
+    theme: String,
+    accent: String,
+    accent_custom: String,
+    dock_auto_hide: bool,
+    sounds: bool,
+    focus_mode: bool,
     #[serde(default)]
     background_image_url: Option<String>,
     background_overlay_enabled: bool,
