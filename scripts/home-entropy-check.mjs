@@ -2563,13 +2563,15 @@ assert(
   servicesCapsule.includes('"name": "services"') &&
     servicesCapsule.includes('"role": "app"') &&
     servicesIndex.includes("Services · ElastOS") &&
+    servicesIndex.includes('./elastos-theme.js') &&
+    servicesIndex.includes('./elastos-ui.css') &&
     servicesIndex.includes("This device") &&
     servicesIndex.includes("From People") &&
     servicesIndex.includes("Shared from this device") &&
     servicesIndex.includes("Available from People") &&
     servicesIndex.includes("mine-services") &&
     servicesIndex.includes("other-services") &&
-    servicesIndex.includes("services-20260626a") &&
+    servicesIndex.includes("services-20260819a") &&
     servicesIndex.includes("services-20260711i") &&
     servicesScript.includes("/api/apps/services/summary") &&
     servicesScript.includes("/api/apps/services/offers") &&
@@ -2602,6 +2604,11 @@ assert(
     servicesStyle.includes(".services-toolbar") &&
     servicesStyle.includes(".service-confirm") &&
     servicesStyle.includes(".pc2-btn-danger") &&
+    (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 4 &&
+    (servicesStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
+      (declaration) => declaration === "letter-spacing: 0;",
+    ) &&
+    !servicesStyle.includes("Narrow stopgap") &&
     !servicesIndex.includes("settings-sidebar-title") &&
     !servicesStyle.includes(".settings-sidebar-title") &&
     !servicesStyle.includes(".service-filter-banner") &&

@@ -34,6 +34,7 @@ TARGETS=(
   home/browser
   home-gui/browser
   system/browser
+  services/browser
   people/browser
   inbox/browser
   chat-room/browser
