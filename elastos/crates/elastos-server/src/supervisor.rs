@@ -1818,6 +1818,7 @@ mod tests {
             repository: None,
             size_mb: None,
             description: None,
+            provider_runtime: None,
             platforms,
         }
     }

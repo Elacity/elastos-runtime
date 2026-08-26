@@ -243,6 +243,13 @@
     "localhost-provider": {
       "install_path": "bin/localhost-provider",
       "description": "Host localhost provider binary required for runtime storage access",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "localhost://*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -270,6 +277,13 @@
     "did-provider": {
       "install_path": "bin/did-provider",
       "description": "Host DID provider binary required for managed chat identity",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://did/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -297,6 +311,13 @@
     "chain-provider": {
       "install_path": "bin/chain-provider",
       "description": "Host chain provider binary for typed production chain access",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://chain/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -324,6 +345,13 @@
     "net-provider": {
       "install_path": "bin/net-provider",
       "description": "Host Browser/Net provider binary for exit-mediated web connectivity",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://net/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -351,6 +379,13 @@
     "exit-provider": {
       "install_path": "bin/exit-provider",
       "description": "Host Browser Exit provider contract for Runtime-mediated network egress",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://exit/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -378,6 +413,13 @@
     "browser-engine-adapter": {
       "install_path": "bin/browser-engine-adapter",
       "description": "Host Browser Engine Adapter contract for Runtime-mediated browser rendering",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://browser-engine/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -492,6 +534,13 @@
     "wallet-provider": {
       "install_path": "bin/wallet-provider",
       "description": "Host wallet provider binary for proof challenges, linked-account metadata, and typed wallet authority",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://wallet/meta/status"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -519,6 +568,13 @@
     "object-provider": {
       "install_path": "bin/object-provider",
       "description": "Host object provider binary for principal-root Library object authority",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://object/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -546,6 +602,13 @@
     "content-block-graph-provider": {
       "install_path": "bin/content-block-graph-provider",
       "description": "Host block graph provider binary for Runtime-mediated arbitrary DAG repair",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://block-graph/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -653,6 +716,13 @@
     "webspace-provider": {
       "install_path": "bin/webspace-provider",
       "description": "Host WebSpace resolver binary for mounted localhost://WebSpaces/<moniker>/... handles",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "localhost://WebSpaces/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
@@ -854,6 +924,13 @@
     "ipfs-provider": {
       "install_path": "bin/ipfs-provider",
       "description": "Host IPFS bridge binary required for direct share/open and attest commands",
+      "provider_runtime": {
+        "role": "provider",
+        "substrate": "native",
+        "runtime_abi": "elastos.provider-stdio/v1",
+        "execution": "native-provider",
+        "provides": "elastos://ipfs/*"
+      },
       "platforms": {
         "linux-amd64": {
           "cid": "",
