@@ -42,6 +42,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use url::form_urlencoded;
 
+#[path = "gateway_assistant.rs"]
+mod gateway_assistant;
 #[path = "gateway_browser.rs"]
 mod gateway_browser;
 #[path = "gateway_capsule_catalog.rs"]
@@ -96,7 +98,9 @@ pub(crate) fn principal_root_protected_object_inventory(
     localhost_root: &str,
 ) -> Vec<crate::auth::PrincipalRootProtectedObjectDeclarationV1> {
     let mut inventory =
-        gateway_home_system::principal_root_protected_object_inventory(localhost_root);
+        gateway_assistant::principal_root_protected_object_inventory(localhost_root);
+    inventory
+        .extend(gateway_home_system::principal_root_protected_object_inventory(localhost_root));
     inventory.extend(
         gateway_transaction_effects::principal_root_protected_object_inventory(localhost_root),
     );
@@ -673,6 +677,14 @@ fn gateway_router_with_api_url(state: GatewayState, gateway_api_url: String) -> 
         )
         .route("/api/carrier/bootstrap", get(gateway_carrier_bootstrap))
         .route("/artifacts/*path", get(serve_artifact_file))
+        .route(
+            "/api/apps/assistant/workspace",
+            get(gateway_assistant::assistant_workspace_get)
+                .put(gateway_assistant::assistant_workspace_put)
+                .layer(DefaultBodyLimit::max(
+                    gateway_assistant::ASSISTANT_WORKSPACE_MAX_BYTES,
+                )),
+        )
         .route("/api/apps/system/summary", get(system_summary))
         .route(
             "/api/apps/system/appearance/background-image",

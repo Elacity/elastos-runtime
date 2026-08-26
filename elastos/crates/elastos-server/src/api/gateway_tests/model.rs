@@ -94,6 +94,92 @@ fn post_model(token: String, op: &str, body: Value) -> Request<Body> {
         .unwrap()
 }
 
+fn get_assistant_workspace(token: String) -> Request<Body> {
+    test_browser_request("localhost:61180", "null")
+        .method("GET")
+        .uri("/api/apps/assistant/workspace")
+        .header("x-elastos-home-token", token)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn put_assistant_workspace(token: String, body: Value) -> Request<Body> {
+    test_browser_request("localhost:61180", "null")
+        .method("PUT")
+        .uri("/api/apps/assistant/workspace")
+        .header("x-elastos-home-token", token)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn assistant_workspace_object(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+) -> (String, std::path::PathBuf) {
+    let localhost_root = crate::auth::principal_localhost_root(principal_id);
+    let object_uri = format!("{localhost_root}/.AppData/ElastOS/Assistant/workspace.json");
+    let object_path =
+        elastos_common::localhost::rooted_localhost_fs_path(data_dir, &object_uri).unwrap();
+    (object_uri, object_path)
+}
+
+fn sample_workspace_put(if_revision: u64) -> Value {
+    json!({
+        "schema": "elastos.assistant.workspace/v1",
+        "if_revision": if_revision,
+        "sessions": [
+            {
+                "id": "session-1",
+                "title": "First session",
+                "mode": "chat",
+                "messages": [
+                    { "role": "user", "content": "hello" },
+                    {
+                        "role": "assistant",
+                        "content": "hi",
+                        "run_id": format!("run:sha256:{}", "a".repeat(64))
+                    }
+                ]
+            },
+            {
+                "id": "session-2",
+                "title": "Build session",
+                "mode": "build",
+                "messages": []
+            }
+        ],
+        "draft": "Draft note",
+        "selected_offer_id": "offer:sample-model"
+    })
+}
+
+fn write_protected_workspace_fixture(
+    data_dir: &std::path::Path,
+    principal_id: &str,
+    body: &Value,
+) -> std::path::PathBuf {
+    let protection = crate::auth::store_test_principal_root_protection(data_dir, principal_id);
+    let (object_uri, object_path) = assistant_workspace_object(data_dir, principal_id);
+    crate::auth::write_protected_principal_root_object(
+        data_dir,
+        principal_id,
+        &protection.localhost_root,
+        &object_uri,
+        &object_path,
+        &serde_json::to_vec_pretty(body).unwrap(),
+    )
+    .unwrap();
+    object_path
+}
+
+async fn response_json(response: Response) -> Value {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 #[tokio::test]
 async fn non_assistant_capsule_cannot_invoke_model_provider() {
     let dir = tempfile::tempdir().unwrap();
@@ -433,4 +519,520 @@ async fn model_audit_failure_blocks_provider_invocation() {
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(provider.requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn assistant_workspace_absent_get_is_read_only_and_returns_revision_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = gateway_router(test_state(dir.path()));
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let (_, object_path) = assistant_workspace_object(dir.path(), &authority.principal_id);
+    assert!(!object_path.exists());
+
+    let response = app.oneshot(get_assistant_workspace(token)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "revision": 0,
+            "sessions": [],
+            "draft": ""
+        })
+    );
+    assert!(!object_path.exists());
+}
+
+#[tokio::test]
+async fn assistant_workspace_round_trip_and_restart_preserve_exact_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router(test_state(dir.path()));
+    let request = sample_workspace_put(0);
+
+    let stored = app
+        .clone()
+        .oneshot(put_assistant_workspace(token.clone(), request))
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), StatusCode::OK);
+    let stored_json = response_json(stored).await;
+    assert_eq!(stored_json["revision"], 1);
+
+    let restarted = gateway_router(test_state(dir.path()));
+    let loaded = restarted
+        .oneshot(get_assistant_workspace(token))
+        .await
+        .unwrap();
+    assert_eq!(loaded.status(), StatusCode::OK);
+    assert_eq!(response_json(loaded).await, stored_json);
+}
+
+#[tokio::test]
+async fn assistant_workspace_wrong_capsule_is_forbidden_and_other_principals_stay_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let assistant_token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router(test_state(dir.path()));
+
+    let written = app
+        .clone()
+        .oneshot(put_assistant_workspace(
+            assistant_token.clone(),
+            sample_workspace_put(0),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(written.status(), StatusCode::OK);
+
+    let forbidden = app
+        .clone()
+        .oneshot(get_assistant_workspace(authority.system_token.clone()))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let other = passkey_authority_with_name_role(
+        dir.path(),
+        Some("guest-user"),
+        crate::auth::RuntimePrincipalRole::Guest,
+    );
+    let other_token = app_token_for_authority(dir.path(), "assistant", &other);
+    let other_response = app
+        .oneshot(get_assistant_workspace(other_token))
+        .await
+        .unwrap();
+    assert_eq!(other_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(other_response).await,
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "revision": 0,
+            "sessions": [],
+            "draft": ""
+        })
+    );
+}
+
+#[tokio::test]
+async fn assistant_workspace_stale_and_future_revisions_fail_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router(test_state(dir.path()));
+
+    let initial = app
+        .clone()
+        .oneshot(put_assistant_workspace(
+            token.clone(),
+            sample_workspace_put(0),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(initial.status(), StatusCode::OK);
+
+    for revision in [0_u64, 2_u64] {
+        let stale = app
+            .clone()
+            .oneshot(put_assistant_workspace(
+                token.clone(),
+                sample_workspace_put(revision),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+    }
+
+    let loaded = app.oneshot(get_assistant_workspace(token)).await.unwrap();
+    assert_eq!(loaded.status(), StatusCode::OK);
+    let loaded_json = response_json(loaded).await;
+    assert_eq!(loaded_json["revision"], 1);
+    assert_eq!(loaded_json["draft"], "Draft note");
+}
+
+#[tokio::test]
+async fn assistant_workspace_invalid_requests_fail_closed_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router(test_state(dir.path()));
+    let (_, object_path) = assistant_workspace_object(dir.path(), &authority.principal_id);
+
+    let invalid_requests = vec![
+        json!({
+            "schema": "elastos.assistant.workspace/v2",
+            "if_revision": 0,
+            "sessions": [],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [
+                { "id": "session-1", "title": "", "mode": "chat", "messages": [] },
+                { "id": "session-1", "title": "", "mode": "chat", "messages": [] }
+            ],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [{ "id": "session-1", "title": "", "mode": "invalid", "messages": [] }],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [{
+                "id": "session-1",
+                "title": "",
+                "mode": "chat",
+                "messages": [{ "role": "invalid", "content": "hi" }]
+            }],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": (0..25).map(|index| json!({
+                "id": format!("session-{index}"),
+                "title": "",
+                "mode": "chat",
+                "messages": []
+            })).collect::<Vec<_>>(),
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [{
+                "id": "session-1",
+                "title": "",
+                "mode": "chat",
+                "messages": (0..65).map(|_| json!({ "role": "user", "content": "hi" })).collect::<Vec<_>>()
+            }],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [],
+            "draft": "",
+            "principal_id": "spoofed"
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [],
+            "draft": "",
+            "authority": "spoofed"
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [],
+            "draft": "",
+            "session_id": "spoofed"
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [{
+                "id": "s".repeat(129),
+                "title": "",
+                "mode": "chat",
+                "messages": []
+            }],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [{
+                "id": "session-1",
+                "title": "t".repeat(161),
+                "mode": "chat",
+                "messages": []
+            }],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [],
+            "draft": "",
+            "path": "spoofed"
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [],
+            "draft": "",
+            "storage_root": "spoofed"
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [{
+                "id": "session-1",
+                "title": "",
+                "mode": "chat",
+                "messages": [{
+                    "role": "assistant",
+                    "content": "hi",
+                    "run_id": "run:sha256:ABC123"
+                }]
+            }],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [{
+                "id": "session-1",
+                "title": "",
+                "mode": "build",
+                "messages": [{
+                    "role": "assistant",
+                    "content": "x".repeat(8193)
+                }]
+            }],
+            "draft": ""
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [],
+            "draft": "x".repeat(16_385)
+        }),
+        json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "if_revision": 0,
+            "sessions": [],
+            "draft": "",
+            "selected_offer_id": format!("offer:{}", "x".repeat(251))
+        }),
+    ];
+
+    for (index, request) in invalid_requests.into_iter().enumerate() {
+        let response = app
+            .clone()
+            .oneshot(put_assistant_workspace(token.clone(), request))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "invalid workspace request #{index} returned {}",
+            response.status()
+        );
+        assert!(!object_path.exists());
+    }
+
+    let oversized = app
+        .oneshot(put_assistant_workspace(
+            token,
+            json!({
+                "schema": "elastos.assistant.workspace/v1",
+                "if_revision": 0,
+                "sessions": [],
+                "draft": "x".repeat(300 * 1024)
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!object_path.exists());
+}
+
+#[tokio::test]
+async fn assistant_workspace_is_declared_for_recovery_and_written_as_ciphertext() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    let protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router(test_state(dir.path()));
+    let (object_uri, object_path) = assistant_workspace_object(dir.path(), &authority.principal_id);
+    assert!(!object_path.parent().unwrap().exists());
+
+    let response = app
+        .oneshot(put_assistant_workspace(token, sample_workspace_put(0)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let inventory = crate::api::auth_gateway::principal_root_protected_object_inventory(
+        dir.path(),
+        &protection.localhost_root,
+    );
+    assert!(inventory
+        .iter()
+        .map(crate::auth::PrincipalRootProtectedObjectDeclarationV1::uri)
+        .any(|uri| uri.ends_with("/.AppData/ElastOS/Assistant")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(object_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    let ciphertext = std::fs::read(&object_path).unwrap();
+    let raw_text = String::from_utf8_lossy(&ciphertext);
+    assert!(!raw_text.contains("Draft note"));
+    assert!(!raw_text.contains("elastos.assistant.workspace/v1"));
+
+    let decrypted = crate::auth::read_principal_root_object(
+        dir.path(),
+        &authority.principal_id,
+        &protection.localhost_root,
+        &object_uri,
+        &object_path,
+    )
+    .unwrap();
+    let workspace: Value = serde_json::from_slice(&decrypted).unwrap();
+    assert_eq!(workspace["revision"], 1);
+    assert_eq!(workspace["selected_offer_id"], "offer:sample-model");
+}
+
+#[tokio::test]
+async fn assistant_workspace_rejects_unknown_top_level_fields_in_stored_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    write_protected_workspace_fixture(
+        dir.path(),
+        &authority.principal_id,
+        &json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "revision": 1,
+            "sessions": [],
+            "draft": "",
+            "unexpected": true
+        }),
+    );
+    let app = gateway_router(test_state(dir.path()));
+
+    let response = app.oneshot(get_assistant_workspace(token)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn assistant_workspace_revision_overflow_fails_closed_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let object_path = write_protected_workspace_fixture(
+        dir.path(),
+        &authority.principal_id,
+        &json!({
+            "schema": "elastos.assistant.workspace/v1",
+            "revision": u64::MAX,
+            "sessions": [],
+            "draft": ""
+        }),
+    );
+    let before = std::fs::read(&object_path).unwrap();
+    let app = gateway_router(test_state(dir.path()));
+
+    let response = app
+        .oneshot(put_assistant_workspace(
+            token,
+            json!({
+                "schema": "elastos.assistant.workspace/v1",
+                "if_revision": u64::MAX,
+                "sessions": [],
+                "draft": ""
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read(&object_path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn assistant_workspace_existing_directory_at_workspace_path_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let (_, object_path) = assistant_workspace_object(dir.path(), &authority.principal_id);
+    std::fs::create_dir_all(&object_path).unwrap();
+    let app = gateway_router(test_state(dir.path()));
+
+    let response = app.oneshot(get_assistant_workspace(token)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn assistant_workspace_symlink_at_workspace_path_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let (_, object_path) = assistant_workspace_object(dir.path(), &authority.principal_id);
+    std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+    symlink(dir.path().join("other-workspace.json"), &object_path).unwrap();
+    let app = gateway_router(test_state(dir.path()));
+
+    let response = app.oneshot(get_assistant_workspace(token)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn assistant_workspace_concurrent_same_revision_allows_one_write_and_one_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = passkey_authority_with_name(dir.path(), Some("assistant-user"));
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    let token = app_token_for_authority(dir.path(), "assistant", &authority);
+    let app = gateway_router(test_state(dir.path()));
+
+    let (first, second) = tokio::join!(
+        app.clone().oneshot(put_assistant_workspace(
+            token.clone(),
+            sample_workspace_put(0),
+        )),
+        app.oneshot(put_assistant_workspace(
+            token.clone(),
+            sample_workspace_put(0)
+        )),
+    );
+    let statuses = [first.unwrap().status(), second.unwrap().status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::OK)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count(),
+        1
+    );
+
+    let loaded = gateway_router(test_state(dir.path()))
+        .oneshot(get_assistant_workspace(token))
+        .await
+        .unwrap();
+    let loaded_json = response_json(loaded).await;
+    assert_eq!(loaded_json["revision"], 1);
 }

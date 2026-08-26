@@ -64,12 +64,13 @@ async function runScenario({ fetchResult, fetchError = null, homeToken = "token-
   assert.equal(posts[0].message.type, "home:app-ready");
   assert.equal(posts[0].message.homeToken, "token-1");
   assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0][0], "/api/provider/model/offers_list");
   assert.equal(statusNode.textContent, "No model offers available.");
   assert.equal(statusNode.hidden, false);
 }
 
 {
-  const { statusNode } = await runScenario({
+  const { statusNode, fetchCalls } = await runScenario({
     fetchResult: {
       ok: false,
       async json() {
@@ -77,6 +78,8 @@ async function runScenario({ fetchResult, fetchError = null, homeToken = "token-
       },
     },
   });
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0][0], "/api/provider/model/offers_list");
   assert.equal(statusNode.textContent, "Model provider unavailable.");
   assert.equal(statusNode.hidden, false);
 }

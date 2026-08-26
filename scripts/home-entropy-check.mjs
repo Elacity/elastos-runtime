@@ -841,6 +841,10 @@ for (const [token, value] of new Map([
 const assistantIndex = read("capsules/assistant/browser/index.html");
 const assistantScript = read("capsules/assistant/browser/assistant.js");
 const assistantStyle = read("capsules/assistant/browser/style.css");
+const assistantGateway = read(
+  "elastos/crates/elastos-server/src/api/gateway_assistant.rs",
+);
+const gatewaySource = read("elastos/crates/elastos-server/src/api/gateway.rs");
 
 assert(
   assistantIndex.includes('<script src="./assistant.js"></script>'),
@@ -851,6 +855,12 @@ assert(
   "Assistant must not add browser-owned persistence",
 );
 assert(
+  !assistantScript.includes("/api/apps/assistant/workspace") &&
+    !assistantScript.includes("workspace.json") &&
+    !assistantScript.includes("session.agent"),
+  "Assistant shell must not start using the private workspace route, storage, or Home session.agent before the workspace slice is wired into the UI",
+);
+assert(
   !/\bnavigator\.clipboard\b|\bexecCommand\b/.test(assistantScript),
   "Assistant must not add direct clipboard fallbacks",
 );
@@ -859,6 +869,36 @@ assert(
     `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
   ),
   "Assistant capsule source must not expose backend endpoints, topology, or credentials",
+);
+assert(
+  (gatewaySource.match(/\/api\/apps\/assistant\/workspace/g) || []).length === 1,
+  "Assistant workspace must expose exactly one dedicated Runtime route",
+);
+assert(
+  (assistantGateway.match(/elastos\.assistant\.workspace\/v1/g) || []).length >= 1,
+  "Assistant workspace must use one bounded v1 schema",
+);
+assert(
+  (assistantGateway.match(
+    /const ASSISTANT_WORKSPACE_RELATIVE_ROOT: &str = "\.AppData\/ElastOS\/Assistant";/g,
+  ) || []).length === 1 &&
+    (assistantGateway.match(
+      /const ASSISTANT_WORKSPACE_FILE: &str = "workspace\.json";/g,
+    ) || []).length === 1 &&
+    (assistantGateway.match(/fn assistant_workspace_uri\(/g) || []).length === 1 &&
+    (assistantGateway.match(/\.AppData\/ElastOS\/Assistant\/workspace\.json/g) || []).length === 0,
+  "Assistant workspace must use exactly one protected principal-root file",
+);
+assert(
+  assistantGateway.includes("read_principal_root_object(") &&
+    assistantGateway.includes("write_protected_principal_root_object("),
+  "Assistant workspace must use the principal-root protected-object APIs",
+);
+assert(
+  !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
+    assistantGateway,
+  ),
+  "Assistant workspace route must not encode backend endpoints, topology, or credentials",
 );
 
 // Inbox took the shared token sheet, so pinning its own hex palette here
