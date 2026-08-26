@@ -248,6 +248,20 @@ const shellCore = await import(`../capsules/home-gui/browser/shell-core.js?v=${m
 const shellWindows = await import(`../capsules/home-gui/browser/shell-windows.js?v=${moduleVersion}`);
 const shellSurface = await import(`../capsules/home-gui/browser/shell-surface.js?v=${moduleVersion}`);
 
+const trashGlyph = new FakeElement(".taskbar-item-icon");
+shellCore.mountGlyph(trashGlyph, "trash");
+assert(
+  trashGlyph.dataset.tone === "raster" &&
+    trashGlyph.dataset.icon === "bin" &&
+    trashGlyph.innerHTML === "",
+  "trash glyph did not resolve to Home-owned raster bin art",
+  trashGlyph,
+);
+assert(
+  existsSync(new URL("../capsules/home-gui/browser/icons/bin/icon-64.png", import.meta.url)),
+  "trash bin icon asset is missing",
+);
+
 const summary = {
   authority: { signed_in: true },
   targets: [
