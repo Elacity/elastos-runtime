@@ -37,6 +37,8 @@ struct AssistantWorkspaceSession {
     title: String,
     mode: AssistantWorkspaceSessionMode,
     #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
     messages: Vec<AssistantWorkspaceMessage>,
 }
 

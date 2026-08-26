@@ -133,6 +133,7 @@ fn sample_workspace_put(if_revision: u64) -> Value {
                 "id": "session-1",
                 "title": "First session",
                 "mode": "chat",
+                "pinned": true,
                 "messages": [
                     { "role": "user", "content": "hello" },
                     {
@@ -146,6 +147,7 @@ fn sample_workspace_put(if_revision: u64) -> Value {
                 "id": "session-2",
                 "title": "Build session",
                 "mode": "build",
+                "pinned": false,
                 "messages": []
             }
         ],
@@ -570,6 +572,8 @@ async fn assistant_workspace_round_trip_and_restart_preserve_exact_workspace() {
         .unwrap();
     assert_eq!(loaded.status(), StatusCode::OK);
     assert_eq!(response_json(loaded).await, stored_json);
+    assert_eq!(stored_json["sessions"][0]["pinned"], true);
+    assert_eq!(stored_json["sessions"][1]["pinned"], false);
 }
 
 #[tokio::test]
@@ -903,6 +907,7 @@ async fn assistant_workspace_is_declared_for_recovery_and_written_as_ciphertext(
     let workspace: Value = serde_json::from_slice(&decrypted).unwrap();
     assert_eq!(workspace["revision"], 1);
     assert_eq!(workspace["selected_offer_id"], "offer:sample-model");
+    assert_eq!(workspace["sessions"][0]["pinned"], true);
 }
 
 #[tokio::test]
@@ -1035,4 +1040,5 @@ async fn assistant_workspace_concurrent_same_revision_allows_one_write_and_one_c
         .unwrap();
     let loaded_json = response_json(loaded).await;
     assert_eq!(loaded_json["revision"], 1);
+    assert_eq!(loaded_json["sessions"][0]["pinned"], true);
 }

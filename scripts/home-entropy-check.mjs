@@ -847,7 +847,7 @@ const assistantGateway = read(
 const gatewaySource = read("elastos/crates/elastos-server/src/api/gateway.rs");
 
 assert(
-  assistantIndex.includes('<script src="./assistant.js"></script>'),
+  assistantIndex.includes('<script type="module" src="./assistant.js"></script>'),
   "Assistant must boot through its capsule-owned browser shell",
 );
 assert(
@@ -855,14 +855,35 @@ assert(
   "Assistant must not add browser-owned persistence",
 );
 assert(
-  !assistantScript.includes("/api/apps/assistant/workspace") &&
+  assistantScript.includes("/api/apps/assistant/workspace") &&
     !assistantScript.includes("workspace.json") &&
     !assistantScript.includes("session.agent"),
-  "Assistant shell must not start using the private workspace route, storage, or Home session.agent before the workspace slice is wired into the UI",
+  "Assistant shell must use the dedicated Runtime workspace route without reaching for Home session.agent or raw path literals",
 );
 assert(
   !/\bnavigator\.clipboard\b|\bexecCommand\b/.test(assistantScript),
   "Assistant must not add direct clipboard fallbacks",
+);
+assert(
+  !/offer:flash-chat:pair-a|offer:h3-video:2x|mock-agent-provider|install catalog/i.test(
+    assistantScript,
+  ) &&
+    !/(["'](?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)["']\s*:|\b(?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)\s*:)/i.test(
+      assistantScript,
+    ),
+  "Assistant shell must not hardcode donor offer IDs or reintroduce mock, grant, install, or authority fields",
+);
+assert(
+  !/assistant-message-meta|typed text runs only|Build mode uses the same typed text runs/i.test(
+    assistantScript,
+  ),
+  "Assistant shell must not render run ids or visible contract wording",
+);
+assert(
+  !/localStorage|sessionStorage|indexedDB|navigator\.clipboard|execCommand/i.test(
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+  ),
+  "Assistant capsule source must not introduce browser-owned storage or direct clipboard authority",
 );
 assert(
   !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
