@@ -37,6 +37,7 @@ TARGETS=(
   chat-room/browser
   library/browser
   documents/browser
+  archive-manager/browser
 )
 
 MODE="${1:-sync}"

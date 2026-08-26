@@ -4851,7 +4851,10 @@ const libraryDesktopIcon = read("capsules/library/browser/icons/sidebar-folder-d
 const libraryMenuSmoke = read("scripts/library-menu-smoke.mjs");
 const libraryPerformanceSmoke = read("scripts/library-performance-smoke.mjs");
 const libraryLiveSmoke = read("scripts/library-live-smoke.sh");
+const archiveBehaviorSmoke = read("scripts/archive-product-behavior-smoke.mjs");
+const archiveLayoutSmoke = read("scripts/archive-product-layout-smoke.mjs");
 const namespacesDoc = read("docs/NAMESPACES.md");
+const justfile = read("justfile");
 const chatStyle = read("capsules/chat-room/browser/style.css");
 const gba = read("capsules/gba-emulator/browser/index.html");
 const gbaStyle = read("capsules/gba-emulator/browser/style.css");
@@ -5494,6 +5497,21 @@ assert(
     libraryApp.includes('menuAction("Compress Selected to ZIP"') &&
     libraryState.includes('"compress_archive"'),
   "Library Compress to ZIP must be provider-owned, capability-gated, cache-invalidating, and available for single objects and same-folder selections",
+);
+assert(
+  archiveManager.includes('<script src="./elastos-theme.js"></script>') &&
+    archiveManager.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    archiveManager.includes('window.top.postMessage({ type: "home:app-ready", homeToken }, homeParentOrigin);') &&
+    archiveManager.includes('type: "home:menu-manifest"') &&
+    archiveManager.includes('title: "File"') &&
+    archiveManager.includes('title: "Edit"') &&
+    archiveManager.includes('return event.origin === "null" && event.source === window.parent;') &&
+    !archiveManager.includes("event.origin !== homeParentOrigin || event.source !== window.top") &&
+    archiveBehaviorSmoke.includes("archive-product-behavior-smoke: OK") &&
+    archiveLayoutSmoke.includes("archive-product-layout-smoke: OK") &&
+    justfile.includes("node scripts/archive-product-behavior-smoke.mjs") &&
+    justfile.includes("node scripts/archive-product-layout-smoke.mjs"),
+  "Archive must use the shared UI tokens, the accepted Home top-out or trusted-parent-in boundary, and dedicated source or browser smokes wired into the normal UIUX gate",
 );
 assert(
     archiveManagerManifest.includes('"name": "archive-manager"') &&
