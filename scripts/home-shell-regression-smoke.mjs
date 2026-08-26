@@ -350,6 +350,19 @@ assert(
   "Home toolbar fullscreen control still writes visible label text into the menubar",
 );
 assert(
+  homeGuiScript.includes("const active = Boolean(fullscreenElement());") &&
+    homeGuiScript.includes("document.addEventListener(\"fullscreenchange\", syncFullscreenButton);") &&
+    homeGuiScript.includes("document.addEventListener(\"webkitfullscreenchange\", syncFullscreenButton);") &&
+    homeGuiScript.includes("await exit.call(document);") &&
+    homeGuiScript.includes("await request.call(root);"),
+  "Home Control Centre fullscreen action no longer follows the real browser Fullscreen API state",
+);
+assert(
+  !homeGuiScript.includes("toggleActiveFullscreenStage") &&
+    !homeGuiScript.includes("Window fullscreen stage (dedicated Space)"),
+  "Home Control Centre fullscreen action still routes through the app-window fullscreen Space path",
+);
+assert(
   canonicalWindowHeadMarkup.test(homeGuiTemplate),
   "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
 );

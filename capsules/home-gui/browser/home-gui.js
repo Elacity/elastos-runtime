@@ -102,7 +102,6 @@ import { bindExpose, closeExpose, toggleExpose } from "./shell-expose.js?v=home-
 import {
   bindSpaceEdgePeek,
   bindSpacePager,
-  toggleActiveFullscreenStage,
 } from "./shell-stages.js?v=home-20260813a";
 import { setUiSoundsEnabled } from "./shell-sounds.js?v=home-20260813a";
 import {
@@ -863,6 +862,7 @@ function fullscreenApi() {
 /* About ElastOS: window-chrome close, verified runtime version, and an
    honest update path (System About owns check/install — no fake badges). */
 let aboutOverlayBound = false;
+let homeGuiFullscreenControlBound = false;
 
 function aboutOverlayNode() {
   return document.querySelector("#about-overlay");
@@ -1008,10 +1008,7 @@ function syncFullscreenButton() {
   if (!toolbarFullscreenButton) {
     return;
   }
-  // Window fullscreen stage (dedicated Space) — not the browser Fullscreen API.
-  const id = shellState.activeWindowId;
-  const entry = id ? shellState.windows.get(id) : null;
-  const active = entry?.fullscreenStage === true;
+  const active = Boolean(fullscreenElement());
   const text = active ? "Exit Fullscreen" : "Enter Fullscreen";
   const label = toolbarFullscreenButton.querySelector(".control-centre-row-label");
   if (label) {
@@ -1021,10 +1018,23 @@ function syncFullscreenButton() {
   toolbarFullscreenButton.title = text;
 }
 
-function toggleHomeGuiFullscreen() {
+async function toggleHomeGuiFullscreen() {
   hideControlCentre({ restoreFocus: false });
-  toggleActiveFullscreenStage();
-  syncFullscreenButton();
+  const { root, request, exit } = fullscreenApi();
+  try {
+    if (fullscreenElement()) {
+      if (typeof exit === "function") {
+        await exit.call(document);
+      }
+    } else if (typeof request === "function") {
+      await request.call(root);
+    }
+  } catch {
+    // Browser Fullscreen API owns state. Fail closed and resync from the
+    // actual document fullscreen state so the control stays retryable.
+  } finally {
+    syncFullscreenButton();
+  }
 }
 
 function trackPointerDown(event) {
@@ -1050,11 +1060,16 @@ function trackPointerMove(event) {
 }
 
 function bindHomeGuiFullscreenControl() {
-  if (!toolbarFullscreenButton) {
+  if (!toolbarFullscreenButton || homeGuiFullscreenControlBound) {
     return;
   }
+  homeGuiFullscreenControlBound = true;
   toolbarFullscreenButton.hidden = false;
-  toolbarFullscreenButton.addEventListener("click", toggleHomeGuiFullscreen);
+  document.addEventListener("fullscreenchange", syncFullscreenButton);
+  document.addEventListener("webkitfullscreenchange", syncFullscreenButton);
+  toolbarFullscreenButton.addEventListener("click", () => {
+    void toggleHomeGuiFullscreen();
+  });
   syncFullscreenButton();
 }
 
