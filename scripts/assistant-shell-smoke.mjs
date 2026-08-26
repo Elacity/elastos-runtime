@@ -4,9 +4,17 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const textEncoder = new TextEncoder();
-const source = readFileSync(
+const homeClipboardClientUrl = new URL(
+  "../capsules/home/browser/home-clipboard-client.js",
+  import.meta.url,
+).href;
+const originalSource = readFileSync(
   new URL("../capsules/assistant/browser/assistant.js", import.meta.url),
   "utf8",
+);
+const source = originalSource.replace(
+  '"/apps/home/home-clipboard-client.js?v=home-20260726a"',
+  JSON.stringify(homeClipboardClientUrl),
 );
 const assistantModule = await import(
   `data:text/javascript,${encodeURIComponent(source)}`,
@@ -199,12 +207,26 @@ function createFetchFixture({
 
 async function buildApp(options = {}) {
   const posts = [];
+  const clipboardWrites = [];
   const fetch = createFetchFixture(options);
   const timers = new Map();
   const timerOrder = [];
   let timerId = 0;
   let uuidCounter = 0;
   let nowMs = 0;
+  const clipboard = {
+    config: null,
+    startCount: 0,
+    async onWrite(text, writeOptions) {
+      if (typeof options.onClipboardWrite === "function") {
+        return options.onClipboardWrite(text, writeOptions);
+      }
+      if (options.clipboardError) {
+        throw options.clipboardError;
+      }
+      return true;
+    },
+  };
   const app = assistantModule.createAssistantApp({
     homeToken: "token-1",
     homeOrigin: "null",
@@ -232,6 +254,27 @@ async function buildApp(options = {}) {
         posts.push({ message, origin });
       },
     },
+    homeClipboardClientFactory(config) {
+      clipboard.config = config;
+      return {
+        start() {
+          clipboard.startCount += 1;
+          if (config.targetWindow && typeof config.targetWindow.postMessage === "function") {
+            config.targetWindow.postMessage(
+              {
+                type: "home:app-ready",
+                homeToken: config.homeToken,
+              },
+              config.homeOrigin,
+            );
+          }
+        },
+        async writeText(text, writeOptions) {
+          clipboardWrites.push({ text, writeOptions });
+          return clipboard.onWrite(text, writeOptions);
+        },
+      };
+    },
   });
   await app.initialize();
   async function flushAsync(turns = 8) {
@@ -256,6 +299,8 @@ async function buildApp(options = {}) {
   }
   return {
     app,
+    clipboard,
+    clipboardWrites,
     posts,
     fetch,
     flushAsync,
@@ -280,6 +325,57 @@ async function buildApp(options = {}) {
 {
   const { app } = await buildApp({ unavailable: true });
   assert.equal(app.snapshot().statusMessage, "Model provider unavailable.");
+}
+
+{
+  const { app, clipboard, clipboardWrites } = await buildApp({
+    workspace: {
+      schema: "elastos.assistant.workspace/v1",
+      revision: 1,
+      sessions: [
+        {
+          id: "session-1",
+          title: "Saved chat",
+          mode: "chat",
+          pinned: false,
+          messages: [
+            { role: "user", content: "Outline the next patch." },
+            {
+              role: "assistant",
+              content: "Start with the smallest safe edit.",
+              run_id:
+                "run:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            },
+            { role: "system", content: "hidden system detail" },
+          ],
+        },
+      ],
+      draft: "",
+      selected_offer_id: "offer:text-1",
+    },
+  });
+  assert.equal(clipboard.config.targetId, "assistant");
+  assert.equal(await app.copyTranscript(), true);
+  assert.equal(clipboardWrites.length, 1);
+  assert.deepEqual(clipboardWrites[0].writeOptions, {
+    purpose: "transcript.markdown",
+  });
+  assert.equal(
+    clipboardWrites[0].text,
+    [
+      "# Assistant transcript",
+      "",
+      "## User",
+      "",
+      "Outline the next patch.",
+      "",
+      "## Assistant",
+      "",
+      "Start with the smallest safe edit.",
+    ].join("\n"),
+  );
+  assert.equal(/run:sha256:|offer:text-1|revision|hidden system detail/.test(clipboardWrites[0].text), false);
+  assert.equal(app.snapshot().copyStatusMessage, "Transcript copied.");
 }
 
 {
@@ -363,6 +459,67 @@ async function buildApp(options = {}) {
   assert.match(createBody.request_id, /^uuid-/);
   const messages = app.snapshot().currentSession.messages;
   assert.equal(messages.at(-1).content, "Hello world");
+}
+
+{
+  const unavailableError = new Error("not ready");
+  unavailableError.code = "unavailable";
+  const { app, clipboardWrites } = await buildApp({
+    workspace: {
+      schema: "elastos.assistant.workspace/v1",
+      revision: 1,
+      sessions: [
+        {
+          id: "session-1",
+          title: "Saved chat",
+          mode: "chat",
+          pinned: false,
+          messages: [{ role: "user", content: "Retry later." }],
+        },
+      ],
+      draft: "",
+      selected_offer_id: "offer:text-1",
+    },
+    clipboardError: unavailableError,
+  });
+  assert.equal(await app.copyTranscript(), false);
+  assert.equal(clipboardWrites.length, 1);
+  assert.equal(app.snapshot().copyStatusMessage, "Clipboard unavailable.");
+}
+
+{
+  const hugeMessage = "🙂".repeat(2048);
+  const { app, clipboardWrites } = await buildApp({
+    workspace: {
+      schema: "elastos.assistant.workspace/v1",
+      revision: 1,
+      sessions: [
+        {
+          id: "session-1",
+          title: "Saved chat",
+          mode: "chat",
+          pinned: false,
+          messages: Array.from({ length: 16 }, (_, index) => ({
+            role: index % 2 === 0 ? "user" : "assistant",
+            content: hugeMessage,
+          })),
+        },
+      ],
+      draft: "",
+      selected_offer_id: "offer:text-1",
+    },
+  });
+  assert.equal(await app.copyTranscript(), true);
+  assert.equal(clipboardWrites.length, 1);
+  assert.equal(
+    textEncoder.encode(clipboardWrites[0].text).length <= 65_536,
+    true,
+  );
+  assert.match(
+    clipboardWrites[0].text,
+    /> Note: Transcript truncated to fit the trusted Home Clipboard limit\.$/,
+  );
+  assert.equal(clipboardWrites[0].text.includes("\ufffd"), false);
 }
 
 {
@@ -464,6 +621,15 @@ async function buildApp(options = {}) {
   assert.equal(app.snapshot().statusMessage, "Model provider unavailable.");
   assert.equal(app.snapshot().activeRun?.terminal, false);
   assert.equal(pendingTimerCount(), 0);
+}
+
+{
+  const { app, clipboardWrites } = await buildApp();
+  app.setDraft("Do not copy partial output.");
+  await app.sendDraft();
+  assert.equal(app.snapshot().copyDisabled, true);
+  assert.equal(await app.copyTranscript(), false);
+  assert.equal(clipboardWrites.length, 0);
 }
 
 {
@@ -600,6 +766,22 @@ async function buildApp(options = {}) {
       postMessage(message, origin) {
         posts.push({ message, origin });
       },
+    },
+    homeClipboardClientFactory(config) {
+      return {
+        start() {
+          config.targetWindow?.postMessage(
+            {
+              type: "home:app-ready",
+              homeToken: config.homeToken,
+            },
+            config.homeOrigin,
+          );
+        },
+        async writeText() {
+          return true;
+        },
+      };
     },
     fetchFn(url, init = {}) {
       if (url === "/api/provider/model/offers_list") {
@@ -829,9 +1011,15 @@ async function buildApp(options = {}) {
   );
 }
 
-assert(!/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(source));
-assert(!/navigator\.clipboard|execCommand/.test(source));
+assert(!/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(originalSource));
+assert(!/navigator\.clipboard|execCommand/.test(originalSource));
+assert(originalSource.includes('"/apps/home/home-clipboard-client.js?v=home-20260726a"'));
+assert(!/home:clipboard-request|home:clipboard-ready|home:clipboard-result|home:clipboard-cancel/.test(originalSource));
 assert(
-  !/(["'](?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)["']\s*:|\b(?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)\s*:)/i.test(source),
+  !/(["'](?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)["']\s*:|\b(?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)\s*:)/i.test(originalSource),
 );
-assert(!/typed text runs only|Build mode uses the same typed text runs/i.test(source));
+assert(!/typed text runs only|Build mode uses the same typed text runs/i.test(originalSource));
+assert(!/run:sha256:|offer:text-|workspace revision/i.test(readFileSync(
+  new URL("../capsules/assistant/browser/index.html", import.meta.url),
+  "utf8",
+)));

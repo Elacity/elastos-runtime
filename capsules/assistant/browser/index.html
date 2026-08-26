@@ -74,10 +74,45 @@
             </button>
           </div>
 
-          <label class="assistant-offer-picker">
-            <span>Model</span>
-            <select id="assistant-offer-select" aria-label="Model offer"></select>
-          </label>
+          <div class="assistant-main-tools">
+            <label class="assistant-offer-picker">
+              <span>Model</span>
+              <select id="assistant-offer-select" aria-label="Model offer"></select>
+            </label>
+            <div class="assistant-copy-tools">
+              <button
+                id="assistant-copy-transcript"
+                type="button"
+                class="assistant-icon-button"
+                aria-label="Copy transcript"
+                title="Copy this conversation as Markdown."
+              >
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  width="16"
+                  height="16"
+                >
+                  <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+                  <path
+                    d="M10.5 3.5v-.8A1.7 1.7 0 0 0 8.8 1H3.7A1.7 1.7 0 0 0 2 2.7v5.1a1.7 1.7 0 0 0 1.7 1.7h.8"
+                  />
+                </svg>
+                <span class="assistant-visually-hidden">Copy transcript</span>
+              </button>
+              <span
+                id="assistant-copy-status"
+                class="assistant-copy-status"
+                role="status"
+                aria-live="polite"
+              ></span>
+            </div>
+          </div>
         </header>
 
         <section id="assistant-empty-state" class="assistant-empty-state" aria-live="polite">

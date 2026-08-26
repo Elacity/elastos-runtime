@@ -1,6 +1,12 @@
+import {
+  createHomeClipboardClient,
+  MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES,
+} from "/apps/home/home-clipboard-client.js?v=home-20260726a";
+
 const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 const MODEL_TEXT_OUTPUT_SCHEMA = "elastos.model.output.text/v1";
 const ASSISTANT_WORKSPACE_SCHEMA = "elastos.assistant.workspace/v1";
+const ASSISTANT_CLIPBOARD_PURPOSE = "transcript.markdown";
 const MODE_CHAT = "chat";
 const MODE_BUILD = "build";
 const MAX_SESSION_ID_BYTES = 128;
@@ -154,6 +160,62 @@ function createSessionRecord({ id, mode, title = "", pinned = false } = {}) {
   };
 }
 
+function transcriptMessages(session) {
+  return Array.isArray(session?.messages)
+    ? session.messages.filter((message) => {
+        const role = message?.role;
+        return (
+          (role === "user" || role === "assistant") &&
+          String(message?.content ?? "").trim().length > 0
+        );
+      })
+    : [];
+}
+
+function transcriptMarkdown(session) {
+  const messages = transcriptMessages(session);
+  if (!messages.length) {
+    return "";
+  }
+  const markdown = [
+    "# Assistant transcript",
+    "",
+    ...messages.flatMap((message) => [
+      `## ${message.role === "assistant" ? "Assistant" : "User"}`,
+      "",
+      String(message.content ?? ""),
+      "",
+    ]),
+  ].join("\n").trimEnd();
+  if (TEXT_ENCODER.encode(markdown).length <= MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES) {
+    return markdown;
+  }
+  const note = "\n\n> Note: Transcript truncated to fit the trusted Home Clipboard limit.";
+  const maxBytes = Math.max(
+    0,
+    MAX_HOME_CLIPBOARD_TEXT_UTF8_BYTES - TEXT_ENCODER.encode(note).length,
+  );
+  const trimmed = boundedText(markdown, maxBytes).trimEnd();
+  return `${trimmed}${note}`;
+}
+
+function readClipboardStatus(error) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  if (code === "unavailable") {
+    return "Clipboard unavailable.";
+  }
+  if (code === "cancelled") {
+    return "Transcript copy cancelled.";
+  }
+  if (code === "denied") {
+    return "Transcript copy denied.";
+  }
+  if (code === "timeout") {
+    return "Clipboard request timed out.";
+  }
+  return "Transcript copy failed.";
+}
+
 function sortSessions(sessions) {
   return [...sessions].sort((left, right) => {
     if (Boolean(left.pinned) !== Boolean(right.pinned)) {
@@ -207,6 +269,8 @@ function initialState(homeToken) {
     renameValue: "",
     workspaceRevision: 0,
     activeRun: null,
+    clipboardStatusMessage: "",
+    copyingTranscript: false,
     pollTimer: 0,
     saveTimer: 0,
     saving: false,
@@ -225,24 +289,25 @@ export function createAssistantApp({
   setTimeoutFn = globalThis.setTimeout?.bind(globalThis),
   clearTimeoutFn = globalThis.clearTimeout?.bind(globalThis),
   targetWindow = globalThis.window?.top,
+  sourceWindow = globalThis.window,
+  homeClipboardClientFactory = createHomeClipboardClient,
   onStateChange = () => {},
 } = {}) {
   const state = initialState(homeToken);
-
-  function postAppReady() {
-    if (targetWindow && typeof targetWindow.postMessage === "function") {
-      targetWindow.postMessage(
-        {
-          type: "home:app-ready",
-          homeToken,
-        },
-        homeOrigin,
-      );
-    }
-  }
+  const homeClipboard = homeClipboardClientFactory({
+    targetId: "assistant",
+    homeOrigin,
+    homeToken,
+    targetWindow,
+    sourceWindow,
+    cryptoRef,
+    setTimeoutFn,
+    clearTimeoutFn,
+  });
 
   function snapshot() {
     const currentSession = findSession(state.sessions, state.activeSessionId);
+    const canCopyTranscript = transcriptMessages(currentSession).length > 0;
     const needle = state.searchQuery.trim().toLowerCase();
     const filteredSessions = sortSessions(state.sessions).filter((session) => {
       if (!needle) {
@@ -261,6 +326,20 @@ export function createAssistantApp({
       filteredSessions,
       offersReady: state.offers.filter((offer) => offer.id && offer.operation),
       starters: (currentSession?.mode || MODE_CHAT) === MODE_BUILD ? BUILD_STARTERS : CHAT_STARTERS,
+      copyStatusMessage: state.clipboardStatusMessage,
+      copyDisabled:
+        !homeToken ||
+        !canCopyTranscript ||
+        Boolean(state.activeRun && !state.activeRun.terminal) ||
+        state.copyingTranscript,
+      copyTitle:
+        state.copyingTranscript
+          ? "Copying transcript..."
+          : state.activeRun && !state.activeRun.terminal
+            ? "Finish the current run before copying."
+            : canCopyTranscript
+              ? "Copy this conversation as Markdown."
+              : "Nothing to copy yet.",
       sendDisabled:
         !homeToken ||
         state.offersLoading ||
@@ -282,6 +361,11 @@ export function createAssistantApp({
 
   function setStatus(message) {
     state.statusMessage = message;
+    notify();
+  }
+
+  function setClipboardStatus(message) {
+    state.clipboardStatusMessage = message;
     notify();
   }
 
@@ -911,9 +995,39 @@ export function createAssistantApp({
 
   async function initialize() {
     if (homeToken) {
-      postAppReady();
+      homeClipboard.start();
     }
     await Promise.all([loadOffers(), loadWorkspace()]);
+  }
+
+  async function copyTranscript() {
+    const session = findSession(state.sessions, state.activeSessionId);
+    if (!session || (state.activeRun && !state.activeRun.terminal)) {
+      notify();
+      return false;
+    }
+    const markdown = transcriptMarkdown(session);
+    if (!markdown) {
+      setClipboardStatus("Nothing to copy yet.");
+      return false;
+    }
+    state.copyingTranscript = true;
+    state.clipboardStatusMessage = "";
+    notify();
+    try {
+      await homeClipboard.writeText(markdown, {
+        purpose: ASSISTANT_CLIPBOARD_PURPOSE,
+      });
+      state.copyingTranscript = false;
+      state.clipboardStatusMessage = "Transcript copied.";
+      notify();
+      return true;
+    } catch (error) {
+      state.copyingTranscript = false;
+      state.clipboardStatusMessage = readClipboardStatus(error);
+      notify();
+      return false;
+    }
   }
 
   return {
@@ -931,6 +1045,7 @@ export function createAssistantApp({
     setDraft,
     setSelectedOfferId,
     setSessionMode,
+    copyTranscript,
     sendDraft,
     stopRun,
     updateRenameValue(value) {
@@ -1056,6 +1171,8 @@ export function mountAssistantApp(root, app) {
   const searchNode = root.querySelector("#assistant-session-search");
   const draftNode = root.querySelector("#assistant-composer-input");
   const offerNode = root.querySelector("#assistant-offer-select");
+  const copyNode = root.querySelector("#assistant-copy-transcript");
+  const copyStatusNode = root.querySelector("#assistant-copy-status");
   const metaNode = root.querySelector("#assistant-composer-meta");
   const sendNode = root.querySelector("#assistant-send");
   const stopNode = root.querySelector("#assistant-stop");
@@ -1096,6 +1213,9 @@ export function mountAssistantApp(root, app) {
       String((view.currentSession?.mode || MODE_CHAT) === MODE_BUILD),
     );
     offerNode.innerHTML = "";
+    copyNode.disabled = view.copyDisabled;
+    copyNode.title = view.copyTitle;
+    copyStatusNode.textContent = view.copyStatusMessage || "";
     if (!view.offersReady.length) {
       const option = document.createElement("option");
       option.value = "";
@@ -1174,6 +1294,11 @@ export function mountAssistantApp(root, app) {
 
   stopNode.addEventListener("click", async () => {
     await app.stopRun();
+    rerender();
+  });
+
+  copyNode.addEventListener("click", async () => {
+    await app.copyTranscript();
     rerender();
   });
 

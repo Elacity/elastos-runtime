@@ -56,6 +56,8 @@ textarea {
 
 .assistant-rail-head,
 .assistant-main-head,
+.assistant-main-tools,
+.assistant-copy-tools,
 .assistant-composer-actions,
 .assistant-session-row,
 .assistant-session-meta,
@@ -291,8 +293,53 @@ textarea {
   gap: 10px;
 }
 
+.assistant-main-tools {
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .assistant-offer-picker select {
   min-width: min(320px, 62vw);
+}
+
+.assistant-copy-tools {
+  gap: 8px;
+  min-width: min(100%, 18rem);
+}
+
+.assistant-copy-status {
+  color: rgba(243, 245, 251, 0.65);
+  font-size: 0.85rem;
+  flex: 0 1 14rem;
+  min-height: 1lh;
+  min-width: 10rem;
+  max-width: min(40vw, 18rem);
+  text-align: right;
+}
+
+#assistant-copy-transcript {
+  width: 2.5rem;
+  height: 2.5rem;
+  padding: 0;
+  flex: 0 0 2.5rem;
+  justify-content: center;
+}
+
+.assistant-icon-button svg {
+  display: block;
+}
+
+.assistant-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .assistant-empty-state,
@@ -426,6 +473,19 @@ textarea {
     justify-content: space-between;
   }
 
+  .assistant-main-tools,
+  .assistant-copy-tools {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .assistant-copy-status {
+    flex: 1 1 12rem;
+    min-width: 0;
+    max-width: none;
+    text-align: left;
+  }
+
   .assistant-offer-picker select {
     min-width: 0;
     width: 100%;
@@ -457,6 +517,7 @@ textarea {
   .assistant-brand-copy p,
   .assistant-search-label,
   .assistant-offer-picker span,
+  .assistant-copy-status,
   .assistant-composer-label,
   .assistant-session-count,
   .assistant-composer-meta,

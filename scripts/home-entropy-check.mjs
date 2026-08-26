@@ -861,6 +861,13 @@ assert(
   "Assistant shell must use the dedicated Runtime workspace route without reaching for Home session.agent or raw path literals",
 );
 assert(
+  assistantScript.includes('/apps/home/home-clipboard-client.js?v=home-20260726a') &&
+    !/home:clipboard-request|home:clipboard-ready|home:clipboard-result|home:clipboard-cancel/.test(
+      assistantScript,
+    ),
+  "Assistant must use the trusted Home Clipboard client without reimplementing the Clipboard protocol",
+);
+assert(
   !/\bnavigator\.clipboard\b|\bexecCommand\b/.test(assistantScript),
   "Assistant must not add direct clipboard fallbacks",
 );
@@ -2315,6 +2322,8 @@ assert(
     homeClipboardProtocol.includes('"browser.text"') &&
     homeClipboardProtocol.includes('"wallet.address"') &&
     homeClipboardProtocol.includes('"wallet.recovery-key"') &&
+    homeClipboardProtocol.includes("assistant: Object.freeze({") &&
+    homeClipboardProtocol.includes('"transcript.markdown"') &&
     homeClipboardProtocol.includes('"resource.identifier"') &&
     homeClipboardProtocol.includes('"resource.uri"') &&
     homeClipboardProtocol.includes(
