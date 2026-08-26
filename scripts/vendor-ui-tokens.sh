@@ -39,6 +39,10 @@ TARGETS=(
   marketplace/browser
   documents/browser
   archive-manager/browser
+  wallet/browser
+  wallet-metamask/browser
+  wallet-unisat/browser
+  wallet-walletconnect/browser
 )
 
 MODE="${1:-sync}"
