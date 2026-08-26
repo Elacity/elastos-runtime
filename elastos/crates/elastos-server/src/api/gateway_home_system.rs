@@ -1874,7 +1874,7 @@ pub(super) async fn people_profile_update(
             Ok(recovery) => recovery,
             Err(err) => return home_error_response(err),
         };
-        if !recovery.root_encrypted || !recovery.recovery_configured {
+        if !crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery) {
             return (
                 StatusCode::CONFLICT,
                 Json(PeopleProfileProtectionRequiredResponse {
@@ -3697,6 +3697,7 @@ fn standard_home_identity_summary() -> HomeIdentitySummary {
     HomeIdentitySummary {
         device_did: None,
         profile_readiness: None,
+        recovery_readiness: None,
         profile_setup_display_name: None,
         profile: None,
     }
@@ -3705,6 +3706,26 @@ fn standard_home_identity_summary() -> HomeIdentitySummary {
 pub(in crate::api) struct ProfileReadinessProjection {
     pub readiness: ProfileReadinessSummary,
     profile: Option<crate::collaboration_profile_authority::VerifiedCollaborationProfileDocument>,
+}
+
+pub(super) fn recovery_readiness_for_context(
+    data_dir: &std::path::Path,
+    context: &HomeLaunchTokenContext,
+) -> RecoveryReadinessSummary {
+    match crate::api::auth_gateway::principal_root_recovery_status_for_verified_principal(
+        data_dir,
+        &home_browser_principal_id(context),
+        &home_browser_localhost_root(context),
+    ) {
+        Ok(recovery) => {
+            if crate::api::auth_gateway::principal_root_recovery_is_ready(&recovery) {
+                RecoveryReadinessSummary::ready()
+            } else {
+                RecoveryReadinessSummary::setup_required()
+            }
+        }
+        Err(_) => RecoveryReadinessSummary::unavailable(),
+    }
 }
 
 pub(in crate::api) fn profile_readiness_for_principal(

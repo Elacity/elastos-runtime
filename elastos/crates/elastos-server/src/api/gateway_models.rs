@@ -36,6 +36,8 @@ struct HomeIdentitySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile_readiness: Option<ProfileReadinessSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_readiness: Option<RecoveryReadinessSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     profile_setup_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<HomeProfileSummary>,
@@ -49,6 +51,37 @@ pub struct ProfileReadinessSummary {
 
 impl ProfileReadinessSummary {
     const SCHEMA: &'static str = "elastos.profile.readiness/v1";
+
+    fn ready() -> Self {
+        Self {
+            schema: Self::SCHEMA,
+            status: "ready",
+        }
+    }
+
+    fn setup_required() -> Self {
+        Self {
+            schema: Self::SCHEMA,
+            status: "setup_required",
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            schema: Self::SCHEMA,
+            status: "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecoveryReadinessSummary {
+    schema: &'static str,
+    status: &'static str,
+}
+
+impl RecoveryReadinessSummary {
+    const SCHEMA: &'static str = "elastos.recovery.readiness/v1";
 
     fn ready() -> Self {
         Self {

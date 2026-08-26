@@ -2171,6 +2171,160 @@ async fn test_people_profile_creation_requires_completed_system_recovery_without
     assert_eq!(payload["identity"]["profile"]["display_name"], "Anders");
 }
 
+fn assert_recovery_readiness_projection(payload: &Value, status: &str, path: &str) {
+    assert_eq!(
+        payload["identity"]["recovery_readiness"],
+        json!({
+            "schema": "elastos.recovery.readiness/v1",
+            "status": status,
+        }),
+        "{path}"
+    );
+}
+
+#[tokio::test]
+async fn test_recovery_readiness_and_first_profile_gate_share_one_recovery_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let before_summary = file_snapshot(dir.path());
+
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_readiness_projection(&payload, "setup_required", path);
+    }
+    assert_eq!(file_snapshot(dir.path()), before_summary);
+
+    let (status, payload) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        authority.people_token.as_str(),
+        "null",
+        json!({ "display_name": "Anders" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        payload,
+        json!({
+            "schema": "elastos.people.profile-protection-required/v1",
+            "status": "recovery_required",
+            "action_target": "system",
+            "message": "Open System, choose Security, and download Recovery. Then retry creating your Profile."
+        })
+    );
+
+    crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+
+    let before_ready_summary = file_snapshot(dir.path());
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_readiness_projection(&payload, "ready", path);
+    }
+    assert_eq!(file_snapshot(dir.path()), before_ready_summary);
+
+    let (status, payload) = home_test_post_json(
+        &app,
+        "/api/apps/people/profile",
+        authority.people_token.as_str(),
+        "null",
+        json!({ "display_name": "Anders" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["profile"]["display_name"], "Anders");
+    assert_eq!(payload["profile_readiness"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn test_recovery_readiness_projects_unavailable_and_first_profile_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = elastos_identity::load_or_create_did(dir.path()).unwrap();
+    let app = gateway_router(wallet_test_state(dir.path()).await);
+    let authority = passkey_authority_with_name(dir.path(), Some("anders"));
+    let mut protection =
+        crate::auth::store_test_principal_root_protection(dir.path(), &authority.principal_id);
+    protection.protectors.clear();
+    let mut auth_state = crate::auth::load_auth_state(dir.path()).unwrap();
+    auth_state.principal_root_protections.clear();
+    auth_state.principal_root_protections.push(protection);
+    crate::auth::save_auth_state(dir.path(), &auth_state).unwrap();
+    let before = file_snapshot(dir.path());
+
+    for (path, token, origin) in [
+        (
+            "/api/apps/home/summary",
+            authority.home_token.as_str(),
+            "http://localhost:61180",
+        ),
+        (
+            "/api/apps/people/summary",
+            authority.people_token.as_str(),
+            "null",
+        ),
+    ] {
+        let (status, payload) = home_test_get_json(&app, path, token, origin).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_recovery_readiness_projection(&payload, "unavailable", path);
+    }
+    assert_eq!(file_snapshot(dir.path()), before);
+
+    let response = app
+        .clone()
+        .oneshot(
+            test_browser_request("localhost:61180", "null")
+                .method("POST")
+                .uri("/api/apps/people/profile")
+                .header("x-elastos-home-token", authority.people_token.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"display_name":"Anders"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    assert_eq!(file_snapshot(dir.path()), before);
+    assert!(
+        crate::collaboration_profile_authority::load_profile_authority(
+            dir.path(),
+            &authority.principal_id,
+            &crate::auth::principal_localhost_root(&authority.principal_id),
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
 #[tokio::test]
 async fn test_people_invite_create_route_is_absent_and_read_only() {
     let dir = tempfile::tempdir().unwrap();
