@@ -4883,8 +4883,10 @@ const gbaJs = read("capsules/gba-emulator/browser/emulator.js");
 const gbaInputJs = read("capsules/gba-emulator/browser/gba-input.js");
 const walletMetamask = read("capsules/wallet-metamask/browser/index.html");
 const walletMetamaskJs = read("capsules/wallet-metamask/browser/wallet-metamask.js");
+const walletMetamaskStyle = read("capsules/wallet-metamask/browser/style.css");
 const walletUnisat = read("capsules/wallet-unisat/browser/index.html");
 const walletUnisatJs = read("capsules/wallet-unisat/browser/wallet-unisat.js");
+const walletUnisatStyle = read("capsules/wallet-unisat/browser/style.css");
 const walletConnectorTransactionSmoke = read(
   "scripts/wallet-connector-transaction-smoke.mjs",
 );
@@ -5028,6 +5030,7 @@ const walletWalletconnect = read("capsules/wallet-walletconnect/browser/index.ht
 const walletWalletconnectJs = read(
   "capsules/wallet-walletconnect/browser/wallet-walletconnect.js",
 );
+const walletWalletconnectStyle = read("capsules/wallet-walletconnect/browser/style.css");
 const homeSmoke = read("scripts/home-camofox-smoke.mjs");
 const systemSmoke = read("scripts/system-camofox-smoke.mjs");
 const homeVirtualAuthSmoke = read(
@@ -10685,7 +10688,13 @@ assert(
   walletMetamask.includes('id="wallet-connect"') &&
     walletMetamask.includes('id="wallet-state"') &&
     walletMetamask.includes('id="wallet-accounts"') &&
-    walletMetamask.includes('id="wallet-requests"'),
+    walletMetamask.includes('id="wallet-requests"') &&
+    walletMetamask.includes('<script src="./elastos-theme.js"></script>') &&
+    walletMetamask.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletMetamaskStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletMetamaskStyle.includes("linear-gradient(") &&
+    !walletMetamaskStyle.includes("radial-gradient(") &&
+    walletMetamaskStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
   "MetaMask must live in a dedicated connector capsule with connected-account visibility",
 );
 assert(
@@ -10768,7 +10777,13 @@ assert(
   walletUnisat.includes('id="wallet-connect"') &&
     walletUnisat.includes('id="wallet-state"') &&
     walletUnisat.includes('id="wallet-accounts"') &&
-    walletUnisat.includes('id="wallet-requests"'),
+    walletUnisat.includes('id="wallet-requests"') &&
+    walletUnisat.includes('<script src="./elastos-theme.js"></script>') &&
+    walletUnisat.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletUnisatStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletUnisatStyle.includes("linear-gradient(") &&
+    !walletUnisatStyle.includes("radial-gradient(") &&
+    walletUnisatStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
   "UniSat must live in a dedicated connector capsule with connected-account visibility",
 );
 assert(
@@ -11088,6 +11103,19 @@ assert(
   !walletMetamask.includes("WalletConnect") &&
     !walletMetamaskJs.includes("walletconnect"),
   "WalletConnect must not be visible until a pinned connector exists",
+);
+assert(
+  walletWalletconnect.includes('id="wallet-connect"') &&
+    walletWalletconnect.includes('id="wallet-state"') &&
+    walletWalletconnect.includes('id="wallet-accounts"') &&
+    walletWalletconnect.includes('id="wallet-requests"') &&
+    walletWalletconnect.includes('<script src="./elastos-theme.js"></script>') &&
+    walletWalletconnect.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    [...walletWalletconnectStyle.matchAll(/letter-spacing:\s*([^;]+);/g)].every(([, value]) => value.trim() === "0") &&
+    !walletWalletconnectStyle.includes("linear-gradient(") &&
+    !walletWalletconnectStyle.includes("radial-gradient(") &&
+    walletWalletconnectStyle.includes('font-family: var(--el-font, "Inter", sans-serif);'),
+  "WalletConnect connector UI must use the same shared-token surface without adding a second authority path",
 );
 assert(
   !system.includes("<dt>Wallet requests</dt>") &&
