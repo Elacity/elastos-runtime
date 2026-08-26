@@ -898,15 +898,14 @@ for (const [token, value] of new Map([
 
 const libraryStyle = read("capsules/library/browser/library.css");
 for (const [token, value] of new Map([
-  ["--bg", "#f6f7f9"],
-  ["--sidebar-bg", "#f0f1f4"],
-  ["--panel", "#ffffff"],
-  ["--panel-soft", "#f3f4f6"],
-  ["--line", "rgba(60, 60, 67, 0.14)"],
-  ["--ink", "#1d1d1f"],
-  ["--muted", "#6b6b6b"],
-  ["--brand", "#f6921a"],
-  ["--accent", "#007aff"],
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "var(--el-surface-raised)"],
+  ["--panel-soft", "var(--el-inset)"],
+  ["--line", "var(--el-hairline)"],
+  ["--ink", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
 ])) {
   assertToken(libraryStyle, "capsules/library/browser/library.css", token, value);
 }
@@ -5882,7 +5881,8 @@ assert(
     libraryRender.includes("This space is empty") &&
     libraryRender.includes("Add files or folders to this space.") &&
     libraryRender.includes('${visible} item${visible === 1 ? "" : "s"}') &&
-    libraryRender.includes('elements.currentTitle.textContent || "Library"') &&
+    libraryRender.includes('const currentCrumb = elements.breadcrumbs.querySelector(".crumb-current");') &&
+    libraryRender.includes('elements.footerRight.textContent = currentCrumb?.textContent || "Library";') &&
     !libraryRender.includes("No connected spaces") &&
     libraryActions.includes("This Space is read-only.") &&
     !libraryActions.includes("Mounted WebSpaces are read-only resolver handles."),
@@ -6859,8 +6859,10 @@ assert(
   "Library toolbar must stack on narrow screens",
 );
 assert(
-  libraryCss.includes("padding: 4px;") && libraryCss.includes("border-radius: 14px;"),
-  "Library mobile panels must use compact Home-aligned spacing",
+  libraryCss.includes("@media (max-width: 720px)") &&
+    libraryCss.includes(".shell {\n        gap: 0;") &&
+    libraryCss.includes("padding: 0;"),
+  "Library narrow layouts must keep the donor full-bleed shell without clipped mobile padding wrappers",
 );
 assert(
   chatStyle.includes("grid-template-columns: 220px minmax(0, 1fr);") &&

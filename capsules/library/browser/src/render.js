@@ -199,8 +199,9 @@ export function createLibraryRenderer({
     const visible = visibleObjects().length;
     const selected = selectedObjects().length;
     const prefix = selected ? `${selected} selected · ` : "";
+    const currentCrumb = elements.breadcrumbs.querySelector(".crumb-current");
     elements.footerLeft.textContent = `${prefix}${visible} item${visible === 1 ? "" : "s"}`;
-    elements.footerRight.textContent = elements.currentTitle.textContent || "Library";
+    elements.footerRight.textContent = currentCrumb?.textContent || "Library";
   }
 
   function scheduleContentRender() {

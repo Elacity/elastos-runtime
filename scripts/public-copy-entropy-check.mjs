@@ -210,7 +210,8 @@ assert(
     && libraryRender.includes('title: "No matching items"')
     && libraryRender.includes('title: "This space is empty"')
     && libraryRender.includes('${visible} item${visible === 1 ? "" : "s"}')
-    && libraryRender.includes('elements.currentTitle.textContent || "Library"')
+    && libraryRender.includes('const currentCrumb = elements.breadcrumbs.querySelector(".crumb-current");')
+    && libraryRender.includes('elements.footerRight.textContent = currentCrumb?.textContent || "Library";')
     && !libraryRender.includes("shortUri(state.currentUri)")
     && !libraryRender.includes("Localhost is your signed local object space"),
   "Library restored implementation nouns in ordinary actions",
