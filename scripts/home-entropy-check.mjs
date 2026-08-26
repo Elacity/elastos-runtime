@@ -3535,6 +3535,14 @@ assert(
     homeCliManifest.role === "shell",
   "Home identity split must keep home as the host and expose plain Desktop and Terminal shell descriptions",
 );
+assert(
+  homeGuiCapsuleManifest.icon === "browser/icons" &&
+    fileExists("capsules/home-gui/browser/icons/icon-32.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-64.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-128.png") &&
+    fileExists("capsules/home-gui/browser/icons/icon-256.png"),
+  "Home GUI must own its capsule icon manifest and four top-level raster icon sizes",
+);
 assertManifestMethod(coreCapsuleManifests, "browser", "elastos.browser.page", "page.open", {
   risk: "launch",
   approval: "runtime_policy",
