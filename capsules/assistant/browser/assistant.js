@@ -7,7 +7,6 @@ const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
 const MODEL_IMAGE_INPUT_SCHEMA = "elastos.model.input.image/v1";
 const MODEL_VIDEO_INPUT_SCHEMA = "elastos.model.input.video/v1";
 const MODEL_TEXT_OUTPUT_SCHEMA = "elastos.model.output.text/v1";
-const MODEL_OBJECT_OUTPUT_SCHEMA = "elastos.model.output.object/v1";
 const MODEL_CONTENT_OUTPUT_SCHEMA = "elastos.model.output.content/v1";
 const ASSISTANT_WORKSPACE_SCHEMA = "elastos.assistant.workspace/v1";
 const ASSISTANT_CLIPBOARD_PURPOSE = "transcript.markdown";
@@ -224,12 +223,6 @@ function parseStudioOutput(output) {
     !Object.prototype.hasOwnProperty.call(output, "uri")
   ) {
     return null;
-  }
-  if (
-    output.schema === MODEL_OBJECT_OUTPUT_SCHEMA &&
-    validStudioUri(output.uri, "elastos://object/")
-  ) {
-    return { schema: output.schema, uri: output.uri };
   }
   if (
     output.schema === MODEL_CONTENT_OUTPUT_SCHEMA &&
