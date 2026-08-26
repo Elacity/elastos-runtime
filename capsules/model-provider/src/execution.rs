@@ -300,11 +300,11 @@ mod tests {
     use crate::adapters::serialize_local_text_backend_state;
     use crate::config::{AdapterConfig, ConfiguredOffer, OfferPolicy};
     use crate::contract::{
-        model_input_hash, RunEvent, RuntimeAccessBinding, RuntimeCreateBinding,
-        RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA, RUN_EVENT_SCHEMA,
+        model_input_hash, RunEvent, RuntimeAccessBinding, RuntimeCreateBinding, RUN_EVENT_SCHEMA,
         RUN_OUTPUT_TEXT_SCHEMA,
     };
     use crate::journal::{deterministic_run_id, RunJournal, StoredRun};
+    use elastos_model_contract::{RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA};
     use serde_json::{json, Value};
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};

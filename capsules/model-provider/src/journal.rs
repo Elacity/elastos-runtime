@@ -8,9 +8,11 @@ use crate::config::{
 use crate::contract::{
     hex_hash, model_input_hash, validate_bounded_trimmed, validate_input_hash, validate_run_id,
     OfferSummary, ProviderFault, RunError, RunEvent, RunStatus, RunTerminalOutcome, RunView,
-    RuntimeCreateBinding, MAX_EVENT_SEQUENCE, MAX_RUNTIME_BINDING_ID_BYTES,
-    MAX_RUNTIME_OPERATION_BYTES, MODEL_POLICY_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA,
-    RUN_EVENT_SCHEMA, RUN_OUTPUT_CONTENT_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
+    RuntimeCreateBinding, MAX_EVENT_SEQUENCE, MODEL_POLICY_SCHEMA, RUN_EVENT_SCHEMA,
+    RUN_OUTPUT_CONTENT_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
+};
+use elastos_model_contract::{
+    MAX_RUNTIME_BINDING_ID_BYTES, MAX_RUNTIME_OPERATION_BYTES, RUNTIME_CREATE_BINDING_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1093,8 +1095,9 @@ mod tests {
     use crate::config::{OfferPolicy, MAX_EVENT_BYTES_LIMIT};
     use crate::contract::{
         model_input_hash, OfferSummary, RunError, RunEvent, RunStatus, RuntimeCreateBinding,
-        RUNTIME_CREATE_BINDING_SCHEMA, RUN_EVENT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
+        RUN_EVENT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
     };
+    use elastos_model_contract::RUNTIME_CREATE_BINDING_SCHEMA;
     fn temp_root(label: &str) -> PathBuf {
         crate::test_support::temp_root_path("model-provider-journal", label)
     }

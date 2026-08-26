@@ -2233,7 +2233,7 @@ fn bound_detail(detail: String) -> String {
 mod tests {
     use super::*;
     use crate::config::{OfferPolicy, MAX_POLL_INTERVAL_MS};
-    use crate::contract::RUNTIME_CREATE_BINDING_SCHEMA;
+    use elastos_model_contract::RUNTIME_CREATE_BINDING_SCHEMA;
     use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc as std_mpsc;

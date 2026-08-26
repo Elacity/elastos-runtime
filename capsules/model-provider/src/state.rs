@@ -1170,9 +1170,9 @@ mod tests {
         MAX_RUN_EVENT_COUNT_LIMIT,
     };
     use crate::contract::{
-        model_input_hash, RuntimeCreateBinding, RUNTIME_ACCESS_BINDING_SCHEMA,
-        RUNTIME_CREATE_BINDING_SCHEMA, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
+        model_input_hash, RuntimeCreateBinding, RUN_OUTPUT_OBJECT_SCHEMA, RUN_OUTPUT_TEXT_SCHEMA,
     };
+    use elastos_model_contract::{RUNTIME_ACCESS_BINDING_SCHEMA, RUNTIME_CREATE_BINDING_SCHEMA};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]

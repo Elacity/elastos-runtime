@@ -130,6 +130,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elastos-model-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -531,6 +540,7 @@ name = "model-provider"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "elastos-model-contract",
  "reqwest",
  "serde",
  "serde_json",

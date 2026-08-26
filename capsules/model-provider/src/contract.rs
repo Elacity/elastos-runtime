@@ -1,13 +1,14 @@
 use crate::config::BridgeProviderConfig;
 use anyhow::Result;
+pub use elastos_model_contract::{
+    model_input_hash, validate_input_hash, validate_run_id, RuntimeAccessBinding,
+    RuntimeCreateBinding,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 pub const PROVIDER_ID: &str = "model-provider";
 pub const PROVIDER_PROTOCOL_VERSION: &str = "elastos.model-provider/v1";
-pub const RUNTIME_CREATE_BINDING_SCHEMA: &str = "elastos.model.runtime-binding/v1";
-pub const RUNTIME_ACCESS_BINDING_SCHEMA: &str = "elastos.model.runtime-access-binding/v1";
 pub const OFFERS_LIST_SCHEMA: &str = "elastos.model.offers-list/v1";
 pub const RUN_SCHEMA: &str = "elastos.model.run/v1";
 pub const RUN_EVENTS_SCHEMA: &str = "elastos.model.run-events/v1";
@@ -16,10 +17,6 @@ pub const MODEL_POLICY_SCHEMA: &str = "elastos.model.policy/v1";
 pub const RUN_OUTPUT_TEXT_SCHEMA: &str = "elastos.model.output.text/v1";
 pub const RUN_OUTPUT_OBJECT_SCHEMA: &str = "elastos.model.output.object/v1";
 pub const RUN_OUTPUT_CONTENT_SCHEMA: &str = "elastos.model.output.content/v1";
-pub const MAX_RUNTIME_BINDING_ID_BYTES: usize = 256;
-pub const MAX_RUNTIME_OPERATION_BYTES: usize = 128;
-pub const MAX_RUNTIME_INPUT_HASH_BYTES: usize = 71;
-pub const MAX_RUN_ID_BYTES: usize = 75;
 pub const MAX_EVENT_SEQUENCE: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug)]
@@ -109,84 +106,6 @@ pub struct RunsCancelRequest {
     pub op: String,
     pub run_id: String,
     pub runtime_binding: RuntimeAccessBinding,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeCreateBinding {
-    pub schema: String,
-    pub principal_id: String,
-    pub session_id: String,
-    pub capsule_id: String,
-    pub grant_id: String,
-    pub request_id: String,
-    pub offer_id: String,
-    pub operation: String,
-    pub input_hash: String,
-}
-
-impl RuntimeCreateBinding {
-    pub fn validate(&self, offer_id: &str, operation: &str, input: &Value) -> Result<()> {
-        if self.schema != RUNTIME_CREATE_BINDING_SCHEMA {
-            anyhow::bail!("runtime binding schema must be {RUNTIME_CREATE_BINDING_SCHEMA}");
-        }
-        validate_bounded_trimmed(
-            &self.principal_id,
-            "principal_id",
-            MAX_RUNTIME_BINDING_ID_BYTES,
-        )?;
-        validate_bounded_trimmed(&self.session_id, "session_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.capsule_id, "capsule_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.grant_id, "grant_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.request_id, "request_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.offer_id, "offer_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.operation, "operation", MAX_RUNTIME_OPERATION_BYTES)?;
-        validate_input_hash(&self.input_hash)?;
-        if self.offer_id != offer_id {
-            anyhow::bail!("runtime binding offer_id does not match request");
-        }
-        if self.operation != operation {
-            anyhow::bail!("runtime binding operation does not match request");
-        }
-        if self.input_hash != model_input_hash(input)? {
-            anyhow::bail!("runtime binding input_hash does not match request input");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeAccessBinding {
-    pub schema: String,
-    pub principal_id: String,
-    pub session_id: String,
-    pub capsule_id: String,
-    pub grant_id: String,
-    pub request_id: String,
-    pub run_id: String,
-}
-
-impl RuntimeAccessBinding {
-    pub fn validate(&self, run_id: &str) -> Result<()> {
-        if self.schema != RUNTIME_ACCESS_BINDING_SCHEMA {
-            anyhow::bail!("runtime access binding schema must be {RUNTIME_ACCESS_BINDING_SCHEMA}");
-        }
-        validate_bounded_trimmed(
-            &self.principal_id,
-            "principal_id",
-            MAX_RUNTIME_BINDING_ID_BYTES,
-        )?;
-        validate_bounded_trimmed(&self.session_id, "session_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.capsule_id, "capsule_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.grant_id, "grant_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.request_id, "request_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_run_id(&self.run_id)?;
-        if self.run_id != run_id {
-            anyhow::bail!("runtime access binding run_id does not match request");
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -420,13 +339,6 @@ pub fn error_response(code: &str, message: &str) -> Value {
     })
 }
 
-pub fn model_input_hash(input: &Value) -> Result<String> {
-    let canonical = serde_json::to_vec(input)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&canonical);
-    Ok(format!("sha256:{}", hex_hash(&hasher.finalize())))
-}
-
 pub fn validate_trimmed(value: &str, label: &str) -> Result<()> {
     if value.trim().is_empty() || value.trim() != value {
         anyhow::bail!("{label} must be a trimmed non-empty string");
@@ -438,32 +350,6 @@ pub fn validate_bounded_trimmed(value: &str, label: &str, max_bytes: usize) -> R
     validate_trimmed(value, label)?;
     if value.len() > max_bytes {
         anyhow::bail!("{label} exceeds {max_bytes} bytes");
-    }
-    Ok(())
-}
-
-pub fn validate_input_hash(value: &str) -> Result<()> {
-    validate_bounded_trimmed(value, "input_hash", MAX_RUNTIME_INPUT_HASH_BYTES)?;
-    if value.len() != MAX_RUNTIME_INPUT_HASH_BYTES
-        || !value.starts_with("sha256:")
-        || !value["sha256:".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        anyhow::bail!("input_hash must be a canonical sha256 digest");
-    }
-    Ok(())
-}
-
-pub fn validate_run_id(value: &str) -> Result<()> {
-    validate_bounded_trimmed(value, "run_id", MAX_RUN_ID_BYTES)?;
-    if value.len() != MAX_RUN_ID_BYTES
-        || !value.starts_with("run:sha256:")
-        || !value["run:sha256:".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        anyhow::bail!("run_id must be a canonical model run identifier");
     }
     Ok(())
 }

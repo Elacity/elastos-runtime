@@ -1,7 +1,6 @@
-use crate::contract::{
-    model_input_hash, validate_trimmed, OfferPolicySummary, OfferSummary, MODEL_POLICY_SCHEMA,
-};
+use crate::contract::{validate_trimmed, OfferPolicySummary, OfferSummary, MODEL_POLICY_SCHEMA};
 use anyhow::Result;
+use elastos_model_contract::model_input_hash;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -299,10 +298,10 @@ impl ConfiguredOffer {
                 "poll_interval_ms": poll_interval_ms,
             }),
         };
-        model_input_hash(&json!({
+        Ok(model_input_hash(&json!({
             "adapter": adapter,
             "offer": self.summary(),
-        }))
+        }))?)
     }
 
     fn validate_canonical_modalities(&self) -> Result<()> {
