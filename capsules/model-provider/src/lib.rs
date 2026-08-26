@@ -1,8 +1,11 @@
-pub mod config;
-pub mod contract;
-pub mod adapters;
-pub mod journal;
-pub mod execution;
-pub mod state;
+mod adapters;
+mod config;
+mod contract;
+mod execution;
+mod journal;
+mod process;
+mod state;
 #[cfg(test)]
-pub mod test_support;
+mod test_support;
+
+pub use process::run_main;
