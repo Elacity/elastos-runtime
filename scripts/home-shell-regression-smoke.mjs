@@ -247,6 +247,8 @@ async function withCapturedFrameRevealTimers(run) {
 }
 
 const shellCore = await import(`../capsules/home-gui/browser/shell-core.js?v=${moduleVersion}`);
+const shellChrome = await import(`../capsules/home-gui/browser/shell-chrome.js?v=${moduleVersion}`);
+const shellControlCentre = await import(`../capsules/home-gui/browser/shell-control-centre.js?v=${moduleVersion}`);
 const shellWindows = await import(`../capsules/home-gui/browser/shell-windows.js?v=${moduleVersion}`);
 const shellSurface = await import(`../capsules/home-gui/browser/shell-surface.js?v=${moduleVersion}`);
 const shellWalletRail = await import(`../capsules/home-gui/browser/shell-wallet-rail.js?v=${moduleVersion}`);
@@ -403,6 +405,14 @@ const homeGuiScript = readFileSync(
   new URL("../capsules/home-gui/browser/home-gui.js", import.meta.url),
   "utf8",
 );
+const shellChromeScript = readFileSync(
+  new URL("../capsules/home-gui/browser/shell-chrome.js", import.meta.url),
+  "utf8",
+);
+const shellControlCentreScript = readFileSync(
+  new URL("../capsules/home-gui/browser/shell-control-centre.js", import.meta.url),
+  "utf8",
+);
 const openHomeGuiTargetBlock = sourceBlock(
   homeGuiScript,
   "export function openHomeGuiTarget(target, options = {}) {",
@@ -480,6 +490,40 @@ assert(
     taskbarCloseIndex,
   },
 );
+assert(
+  homeGuiTemplate.includes('id="control-centre-quick-open"') &&
+    homeGuiTemplate.includes('id="control-centre-spotlight"') &&
+    homeGuiTemplate.includes('id="control-centre-inbox-detail"') &&
+    homeGuiTemplate.includes('id="control-centre-quick-wallet"'),
+  "Home GUI template is missing the mobile quick-open controls",
+);
+assert(
+  shellChromeScript.includes("export function summaryDisplayName(summary)") &&
+    shellChromeScript.includes("summary?.identity?.profile?.display_name") &&
+    shellChromeScript.includes("summary?.identity?.profile?.handle") &&
+    !shellChromeScript.includes("profile_setup_display_name"),
+  "Home GUI display-name helper must prefer signed Profile names without setup fallbacks",
+);
+assert(
+  shellControlCentreScript.includes('import { summaryDisplayName } from "./shell-chrome.js') &&
+    shellControlCentreScript.includes("whoamiDetail.textContent = summaryDisplayName(summary);") &&
+    shellControlCentreScript.includes('quickSpotlightRow?.addEventListener("click"') &&
+    shellControlCentreScript.includes("showSpotlight();") &&
+    shellControlCentreScript.includes('quickInboxRow?.addEventListener("click"') &&
+    shellControlCentreScript.includes("showInboxRail();") &&
+    shellControlCentreScript.includes('quickWalletRow?.addEventListener("click"') &&
+    shellControlCentreScript.includes("showWalletRail();"),
+  "Home Control Centre quick-open rows must use the existing Spotlight, Inbox, and Wallet openers",
+);
+assert(
+  homeGuiStyle.includes(".control-centre-quick-open {\n  display: none;\n}") &&
+    homeGuiStyle.includes(".control-centre-row-label {\n  flex: 0 0 auto;\n  white-space: nowrap;\n}") &&
+    homeGuiStyle.includes(".control-centre-row-detail {\n  min-width: 0;\n  color: var(--muted);\n") &&
+    homeGuiStyle.includes("@media (max-width: 640px)") &&
+    homeGuiStyle.includes(".control-centre-quick-open {\n    display: block;\n  }"),
+  "Home mobile Control Centre is missing the donor quick-open layout and truncation rules",
+);
+
 {
   const previousSummary = shellCore.shellState.currentSummary;
   const launcherSurface = elementForSelector("#launcher");
@@ -520,6 +564,95 @@ assert(
       taskbarClasses: [...taskbar.classList.values],
     },
   );
+}
+
+{
+  const identitySummary = {
+    authority: { signed_in: true },
+    identity: {
+      profile: {
+        display_name: "Verified Profile Name",
+        handle: "verified-profile-handle",
+      },
+      handle: "outer-handle-must-not-render",
+      profile_setup_display_name: "Setup Suggestion",
+      principal_id: "principal:should-not-render",
+    },
+    notifications: {
+      attention_count: 3,
+      entries: [
+        { kind: "wallet_approval_request", action_ref: { action_id: "wallet-approve-request:1" } },
+        { kind: "generic", action_ref: { action_id: "generic:1" } },
+      ],
+    },
+    targets: [
+      { target: "wallet", title: "Wallet", route: "/apps/wallet/" },
+      { target: "inbox", title: "Inbox", route: "/apps/inbox/" },
+    ],
+  };
+  const signedHandleFallbackSummary = {
+    authority: { signed_in: true },
+    identity: {
+      profile: {
+        display_name: "   ",
+        handle: "profile-handle-fallback",
+      },
+      handle: "outer-fallback-must-not-render",
+      profile_setup_display_name: "Setup-only name",
+      principal_id: "principal:fallback",
+    },
+    notifications: { entries: [] },
+    targets: [],
+  };
+  shellControlCentre.bindControlCentre();
+  shellCore.shellState.currentSummary = identitySummary;
+  assert(
+    shellChrome.summaryDisplayName(identitySummary) === "Verified Profile Name" &&
+      shellChrome.summaryDisplayName(signedHandleFallbackSummary) === "profile-handle-fallback",
+    "Home shared display-name helper did not prefer signed Profile display_name then profile.handle",
+    {
+      identity: shellChrome.summaryDisplayName(identitySummary),
+      fallback: shellChrome.summaryDisplayName(signedHandleFallbackSummary),
+    },
+  );
+  shellControlCentre.syncControlCentre(identitySummary);
+  assert(
+    elementForSelector("#control-centre-whoami-detail").textContent === "Verified Profile Name" &&
+      elementForSelector("#control-centre-inbox").hidden === false &&
+      elementForSelector("#control-centre-inbox").disabled === false &&
+      elementForSelector("#control-centre-inbox-detail").textContent === "3 pending" &&
+      elementForSelector("#control-centre-quick-wallet").hidden === false &&
+      elementForSelector("#control-centre-quick-wallet-detail").textContent === "1 pending",
+    "Home Control Centre did not project the shared signed identity and bounded quick-open counts",
+    {
+      whoami: elementForSelector("#control-centre-whoami-detail").textContent,
+      inboxHidden: elementForSelector("#control-centre-inbox").hidden,
+      inboxDisabled: elementForSelector("#control-centre-inbox").disabled,
+      inboxDetail: elementForSelector("#control-centre-inbox-detail").textContent,
+      walletHidden: elementForSelector("#control-centre-quick-wallet").hidden,
+      walletDetail: elementForSelector("#control-centre-quick-wallet-detail").textContent,
+    },
+  );
+  shellCore.shellState.currentSummary = signedHandleFallbackSummary;
+  shellControlCentre.syncControlCentre(signedHandleFallbackSummary);
+  assert(
+    elementForSelector("#control-centre-inbox").hidden === true &&
+      elementForSelector("#control-centre-inbox").disabled === true &&
+      elementForSelector("#control-centre-inbox-detail").textContent === "Unavailable" &&
+      elementForSelector("#control-centre-quick-wallet").hidden === true &&
+      elementForSelector("#control-centre-whoami-detail").textContent === "profile-handle-fallback" &&
+      elementForSelector("#control-centre-whoami-detail").textContent !== "Setup-only name" &&
+      elementForSelector("#control-centre-whoami-detail").textContent !== "principal:fallback",
+    "Home Control Centre did not hide unavailable quick-open rows or keep setup/principal values out of the signed identity label",
+    {
+      whoami: elementForSelector("#control-centre-whoami-detail").textContent,
+      inboxHidden: elementForSelector("#control-centre-inbox").hidden,
+      inboxDisabled: elementForSelector("#control-centre-inbox").disabled,
+      inboxDetail: elementForSelector("#control-centre-inbox-detail").textContent,
+      walletHidden: elementForSelector("#control-centre-quick-wallet").hidden,
+    },
+  );
+  shellCore.shellState.currentSummary = summary;
 }
 
 assert(

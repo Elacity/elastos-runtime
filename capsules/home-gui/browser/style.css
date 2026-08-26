@@ -803,6 +803,10 @@ img {
   margin-top: 2px;
 }
 
+.control-centre-quick-open {
+  display: none;
+}
+
 .control-centre-label {
   padding: 0.2rem 0.85rem 0.15rem;
   color: var(--muted);
@@ -1052,9 +1056,19 @@ img {
   display: none;
 }
 
+.control-centre-row-label {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .control-centre-row-detail {
+  min-width: 0;
   color: var(--muted);
   font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
 }
 
 .control-centre-row-static {
@@ -5215,6 +5229,10 @@ body.dragging-target {
   .toolbar-active-title,
   .toolbar-menubar {
     display: none;
+  }
+
+  .control-centre-quick-open {
+    display: block;
   }
 
   .launcher-popover {

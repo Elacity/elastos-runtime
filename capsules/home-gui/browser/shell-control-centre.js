@@ -14,6 +14,7 @@ import {
   setDesktopIconsVisible,
   setFocusModeEnabled,
   shellState,
+  targetById,
 } from "./shell-core.js?v=home-20260813a";
 import { uiSoundsEnabled, setUiSoundsEnabled, playUiSound } from "./shell-sounds.js?v=home-20260813a";
 import {
@@ -22,8 +23,10 @@ import {
 } from "./shell-surface.js?v=home-20260813a";
 import { showWalletRail, walletRailAvailable } from "./shell-wallet-rail.js?v=home-20260813a";
 import { showInboxRail } from "./shell-inbox-rail.js?v=home-20260813a";
+import { showSpotlight } from "./shell-spotlight.js?v=home-20260813a";
 import { openTarget } from "./shell-windows.js?v=home-20260813a";
 import { openExpose } from "./shell-expose.js?v=home-20260813a";
+import { summaryDisplayName } from "./shell-chrome.js?v=home-20260813a";
 
 /* Control Centre: the quick layer for controls that already have canonical
    stores — theme, sounds, focus, accent, dock, desktop icons — plus Nearby
@@ -53,6 +56,11 @@ let whoamiDetail = null;
 let walletRow = null;
 let thisDeviceRow = null;
 let systemRow = null;
+let quickSpotlightRow = null;
+let quickInboxRow = null;
+let quickInboxDetail = null;
+let quickWalletRow = null;
+let quickWalletDetail = null;
 let outsideDismissBound = false;
 let registered = false;
 let discoveryTick = 0;
@@ -82,6 +90,11 @@ export function bindControlCentre() {
   walletRow = document.querySelector("#control-centre-wallet");
   thisDeviceRow = document.querySelector("#control-centre-this-device");
   systemRow = document.querySelector("#control-centre-system");
+  quickSpotlightRow = document.querySelector("#control-centre-spotlight");
+  quickInboxRow = document.querySelector("#control-centre-inbox");
+  quickInboxDetail = document.querySelector("#control-centre-inbox-detail");
+  quickWalletRow = document.querySelector("#control-centre-quick-wallet");
+  quickWalletDetail = document.querySelector("#control-centre-quick-wallet-detail");
   if (!panel || !button) {
     return;
   }
@@ -213,6 +226,24 @@ export function bindControlCentre() {
     openExpose();
   });
 
+  quickSpotlightRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    showSpotlight();
+  });
+
+  quickInboxRow?.addEventListener("click", () => {
+    hideControlCentre({ restoreFocus: false });
+    showInboxRail();
+  });
+
+  quickWalletRow?.addEventListener("click", () => {
+    if (!walletRailAvailable()) {
+      return;
+    }
+    hideControlCentre({ restoreFocus: false });
+    showWalletRail();
+  });
+
   walletRow?.addEventListener("click", () => {
     if (!walletRailAvailable()) {
       return;
@@ -300,6 +331,7 @@ export function syncControlCentre(summary) {
   syncDesktopIconsSwitch();
   syncWhoami(summary);
   syncWalletRow();
+  syncQuickOpen(summary);
 }
 
 function publishAccent(value) {
@@ -542,12 +574,7 @@ function syncWhoami(summary) {
   if (!whoamiDetail) {
     return;
   }
-  const name =
-    summary?.identity?.profile_card?.display_name ||
-    summary?.identity?.handle ||
-    summary?.authority?.principal_id ||
-    "Signed in";
-  whoamiDetail.textContent = String(name);
+  whoamiDetail.textContent = summaryDisplayName(summary);
 }
 
 function syncWalletRow() {
@@ -557,6 +584,39 @@ function syncWalletRow() {
   // Toolbar Wallet is the primary door — keep CC Wallet hidden when the rail
   // is available (Jobs: quiet money).
   walletRow.hidden = true;
+}
+
+function syncQuickOpen(summary) {
+  const inboxTarget = targetById(summary, "inbox");
+  if (quickInboxRow) {
+    quickInboxRow.hidden = !inboxTarget;
+    quickInboxRow.disabled = !inboxTarget;
+  }
+  if (quickInboxDetail) {
+    if (!inboxTarget) {
+      quickInboxDetail.textContent = "Unavailable";
+    } else {
+      const notifications = summary?.notifications || {};
+      const entries = Array.isArray(notifications.entries) ? notifications.entries : [];
+      const semanticCount =
+        Number(notifications.attention_count || 0) || Number(notifications.unread_count || 0);
+      const badgeCount = Math.max(0, semanticCount || entries.length);
+      quickInboxDetail.textContent =
+        badgeCount > 0 ? `${formatBadgeCount(badgeCount)} pending` : "Open";
+    }
+  }
+
+  const walletTarget = targetById(summary, "wallet");
+  if (quickWalletRow) {
+    quickWalletRow.hidden = !walletTarget;
+  }
+  if (quickWalletDetail) {
+    const count = pendingApprovalEntries(summary).filter(
+      (entry) => entry?.kind === "wallet_approval_request",
+    ).length;
+    quickWalletDetail.textContent =
+      count > 0 ? `${formatBadgeCount(count)} pending` : "Open";
+  }
 }
 
 function bindOutsideDismiss() {

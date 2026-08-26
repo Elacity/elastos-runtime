@@ -22,8 +22,12 @@ import {
 
 let avatarResolveSeq = 0;
 
-function summaryDisplayName(summary) {
-  const handle = summary?.identity?.handle;
+export function summaryDisplayName(summary) {
+  const profileName = summary?.identity?.profile?.display_name;
+  if (typeof profileName === "string" && profileName.trim()) {
+    return profileName.trim();
+  }
+  const handle = summary?.identity?.profile?.handle;
   if (typeof handle === "string" && handle.trim()) {
     return handle.trim();
   }
