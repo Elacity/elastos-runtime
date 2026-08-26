@@ -139,7 +139,17 @@ assert(
     && marketplaceJs.includes("function publicTitle(capsule)")
     && marketplaceJs.includes('role === "provider" ? "service"')
     && marketplaceJs.includes('if (role === "provider") return `${title} service for apps on this Home.`;')
-    && marketplaceJs.includes("technicalDependencies"),
+    && marketplaceJs.includes("sourceSummary")
+    && marketplaceJs.includes("Available actions")
+    && !marketplaceJs.includes("technicalDependencies")
+    && !marketplaceJs.includes("Repository:")
+    && !marketplaceJs.includes("install_path")
+    && !marketplaceJs.includes("installPath")
+    && !marketplaceJs.includes("release_path")
+    && !marketplaceJs.includes("releasePath")
+    && !marketplaceJs.includes("source_path")
+    && !marketplaceJs.includes("sourcePath")
+    && !marketplaceJs.includes("Requires:"),
   "Marketplace restored internal empty or error copy",
 );
 

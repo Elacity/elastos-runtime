@@ -4666,6 +4666,8 @@ assert(
   "Marketplace must read the canonical catalog and interface registry",
 );
 const marketplaceUi = read("capsules/marketplace/browser/marketplace.js");
+const marketplaceBehaviorSmoke = read("scripts/marketplace-product-behavior-smoke.mjs");
+const marketplaceLayoutSmoke = read("scripts/marketplace-product-layout-smoke.mjs");
 assert(
   marketplaceUi.includes("const installed = capsule.installed === true;") &&
     marketplaceUi.includes('type: "home:open-target"') &&
@@ -4680,17 +4682,21 @@ assert(
     marketplaceUi.includes("function executableActions(") &&
     marketplaceUi.includes("binding?.executable !== true") &&
     marketplaceUi.includes("function relationshipSection(") &&
-    !marketplaceUi.includes('name.includes("wallet")') &&
-    !marketplaceUi.includes('name.includes("provider")') &&
-    !marketplaceUi.includes('name.includes("gba")') &&
+    marketplaceUi.includes("function isValidCapsuleIconVariant(capsuleName, entry)") &&
+    marketplaceUi.includes('route.startsWith(`/apps/${capsuleName}/`)') &&
+    !marketplaceUi.includes("FIRST_PARTY_ICON_IDS") &&
+    !marketplaceUi.includes("OWN_ICON_CAPSULES") &&
+    !marketplaceUi.includes("resolveFirstPartyIconId") &&
     !marketplaceUi.includes("function isStaffPick(") &&
     !marketplaceUi.includes("function isPopular("),
-  "Marketplace must project canonical roles, relationships, and executable bindings without name-based guesses",
+  "Marketplace must project canonical roles, relationships, executable bindings, and declared icon routes without name-based guesses",
 );
 assert(
   marketplaceUi.includes('size: capsule.cid ? "Verified app" : "Local app"') &&
-    marketplaceUi.includes('storage: capsule.cid ? "SmartWeb" : "Local"') &&
-    marketplaceUi.includes("App identity:") &&
+    marketplaceUi.includes('sourceSummary: capsule.cid ? "SmartWeb" : "Local"') &&
+    marketplaceUi.includes("Trust:") &&
+    marketplaceUi.includes("Status:") &&
+    marketplaceUi.includes("Available actions") &&
     !marketplaceUi.includes("CID-backed") &&
     !marketplaceUi.includes("Content ID") &&
     !marketplaceUi.includes("Signed package") &&
@@ -4699,7 +4705,22 @@ assert(
     !marketplaceUi.includes("signed CID manifests") &&
     !marketplaceUi.includes("capsule catalog route missing") &&
     !marketplaceUi.includes("`CID:"),
-  "Marketplace must describe app trust in user-facing language instead of raw CID/package jargon",
+  "Marketplace must describe app trust and status in user-facing language instead of raw CID/package jargon",
+);
+assert(
+  marketplaceUi.includes("function announceHomeChrome()") &&
+    marketplaceUi.includes("lastHomeMenuManifestSignature") &&
+    marketplaceUi.includes('if (event.origin !== "null" || event.source !== window.parent) {') &&
+    !marketplaceUi.includes("window.location.origin") &&
+    !marketplaceUi.includes("onerror="),
+  "Marketplace must keep the exact Home menu boundary and bind icon fallback without inline event attributes",
+);
+assert(
+  marketplaceBehaviorSmoke.includes("marketplace-product-behavior-smoke: OK") &&
+    marketplaceLayoutSmoke.includes("marketplace-product-layout-smoke: OK") &&
+    read("justfile").includes("node scripts/marketplace-product-behavior-smoke.mjs") &&
+    read("justfile").includes("node scripts/marketplace-product-layout-smoke.mjs"),
+  "Marketplace UIUX must stay wired into the focused source and browser gates",
 );
 assert(
   read("elastos/crates/elastos-server/src/api/gateway_marketplace.rs").includes(
