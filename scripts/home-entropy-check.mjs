@@ -5417,7 +5417,8 @@ assert(
   "Object provider must be the only provider capsule authority metadata for every routed operation",
 );
 assert(
-  serverInfra.includes('find_installed_provider_binary("object-provider")') &&
+  serverInfra.includes('resolve_verified_native_provider_binary("object-provider")') &&
+    !serverInfra.includes('find_installed_provider_binary("object-provider")') &&
     !serverInfra.includes(
       `find_installed_provider_binary("${retiredObjectProviderMarkers.oldBinary}")`,
     ) &&

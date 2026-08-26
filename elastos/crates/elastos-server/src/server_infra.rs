@@ -11,6 +11,7 @@ use elastos_runtime::{capability, content, namespace, primitives, provider, sess
 use elastos_server::api::browser_engine_protocol::{
     BROWSER_ENGINE_PROTOCOL_VERSION, BROWSER_ENGINE_PROVIDER_ID,
 };
+use elastos_server::binaries;
 use elastos_server::content::ContentProvider;
 use elastos_server::documents::DocumentsProvider;
 use elastos_server::sources::{default_data_dir, local_session_owner};
@@ -302,10 +303,8 @@ async fn setup_server_infrastructure_impl(
         Ok(())
     };
 
-    if let Some(path) = crate::find_installed_provider_binary("did-provider") {
-        if let Err(e) = verify_provider_binary("did-provider", &path) {
-            tracing::warn!("Skipping did-provider due to verification failure: {}", e);
-        } else {
+    match binaries::resolve_verified_native_provider_binary("did-provider") {
+        Ok(Some(path)) => {
             let did_config = provider::BridgeProviderConfig {
                 base_path: data_dir.to_string_lossy().to_string(),
                 allowed_paths: file_backed_prefixes(),
@@ -329,18 +328,19 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn did-provider: {}", e),
             }
         }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping did-provider due to verification failure: {}", e),
     }
 
     if spawn_host_providers {
-        let binary_path =
-            crate::find_installed_provider_binary("localhost-provider").ok_or_else(|| {
+        let binary_path = binaries::resolve_verified_native_provider_binary("localhost-provider")?
+            .ok_or_else(|| {
                 anyhow::anyhow!(
                     "localhost-provider not installed.\n  \
                  Run:\n  \
                    elastos setup --with localhost-provider"
                 )
             })?;
-        verify_provider_binary("localhost-provider", &binary_path)?;
 
         let provider_bytes = std::fs::read(&binary_path)?;
         provider_cid = format!(
@@ -522,13 +522,8 @@ async fn setup_server_infrastructure_impl(
         }
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("content-block-graph-provider") {
-        if let Err(e) = verify_provider_binary("content-block-graph-provider", &path) {
-            tracing::warn!(
-                "Skipping content-block-graph-provider due to verification failure: {}",
-                e
-            );
-        } else {
+    match binaries::resolve_verified_native_provider_binary("content-block-graph-provider") {
+        Ok(Some(path)) => {
             let block_graph_config = provider::BridgeProviderConfig {
                 base_path: data_dir.to_string_lossy().to_string(),
                 extra: serde_json::json!({
@@ -558,20 +553,19 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn content-block-graph-provider: {}", e),
             }
         }
-    } else {
-        tracing::warn!(
-            "content-block-graph-provider binary is not installed; arbitrary DAG repair will fail closed"
-        );
+        Ok(None) => {
+            tracing::warn!(
+                "content-block-graph-provider binary is not installed; arbitrary DAG repair will fail closed"
+            );
+        }
+        Err(e) => tracing::warn!(
+            "Skipping content-block-graph-provider due to verification failure: {}",
+            e
+        ),
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("object-provider") {
-        if let Err(e) = verify_provider_binary("object-provider", &path) {
-            tracing::warn!(
-                "Skipping {} due to verification failure: {}",
-                "object-provider",
-                e
-            );
-        } else {
+    match binaries::resolve_verified_native_provider_binary("object-provider") {
+        Ok(Some(path)) => {
             let object_config = provider::BridgeProviderConfig {
                 base_path: data_dir.to_string_lossy().to_string(),
                 allowed_paths: file_backed_prefixes(),
@@ -596,19 +590,19 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn object-provider: {}", e),
             }
         }
-    } else {
-        tracing::warn!(
-            "object-provider binary is not installed; Library object operations will fail closed"
-        );
+        Ok(None) => {
+            tracing::warn!(
+                "object-provider binary is not installed; Library object operations will fail closed"
+            );
+        }
+        Err(e) => tracing::warn!(
+            "Skipping object-provider due to verification failure: {}",
+            e
+        ),
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("webspace-provider") {
-        if let Err(e) = verify_provider_binary("webspace-provider", &path) {
-            tracing::warn!(
-                "Skipping webspace-provider due to verification failure: {}",
-                e
-            );
-        } else {
+    match binaries::resolve_verified_native_provider_binary("webspace-provider") {
+        Ok(Some(path)) => {
             let webspace_config = provider::BridgeProviderConfig {
                 base_path: data_dir.to_string_lossy().to_string(),
                 read_only: false,
@@ -625,10 +619,15 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn webspace-provider: {}", e),
             }
         }
-    } else {
-        tracing::warn!(
-            "webspace-provider binary is not installed; WebSpace roots will fail closed"
-        );
+        Ok(None) => {
+            tracing::warn!(
+                "webspace-provider binary is not installed; WebSpace roots will fail closed"
+            );
+        }
+        Err(e) => tracing::warn!(
+            "Skipping webspace-provider due to verification failure: {}",
+            e
+        ),
     }
 
     if let Some(path) = crate::find_installed_provider_binary("operator-drive-adapter") {
@@ -660,75 +659,69 @@ async fn setup_server_infrastructure_impl(
         }
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("ipfs-provider") {
-        if let Err(e) = verify_provider_binary("ipfs-provider", &path) {
-            tracing::warn!("Skipping ipfs-provider due to verification failure: {}", e);
-        } else {
-            match provider::ProviderBridge::spawn(&path, Default::default()).await {
-                Ok(bridge) => {
-                    let bridge = Arc::new(bridge);
-                    let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::clone(&bridge), "ipfs"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("ipfs", ipfs_provider)
-                        .await
-                    {
-                        tracing::warn!("Failed to register elastos://ipfs sub-provider: {}", e);
-                    }
-                    tracing::info!("ipfs-provider capsule from {}", path.display());
+    match binaries::resolve_verified_native_provider_binary("ipfs-provider") {
+        Ok(Some(path)) => match provider::ProviderBridge::spawn(&path, Default::default()).await {
+            Ok(bridge) => {
+                let bridge = Arc::new(bridge);
+                let ipfs_provider: Arc<dyn provider::Provider> = Arc::new(
+                    provider::CapsuleProvider::with_scheme(Arc::clone(&bridge), "ipfs"),
+                );
+                if let Err(e) = provider_registry
+                    .register_sub_provider("ipfs", ipfs_provider)
+                    .await
+                {
+                    tracing::warn!("Failed to register elastos://ipfs sub-provider: {}", e);
                 }
-                Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
+                tracing::info!("ipfs-provider capsule from {}", path.display());
             }
+            Err(e) => tracing::warn!("ipfs-provider unavailable: {}", e),
+        },
+        Ok(None) => {
+            tracing::warn!(
+                "ipfs-provider binary is not installed; elastos://content publish/fetch will fail closed"
+            );
         }
-    } else {
-        tracing::warn!(
-            "ipfs-provider binary is not installed; elastos://content publish/fetch will fail closed"
-        );
+        Err(e) => tracing::warn!("Skipping ipfs-provider due to verification failure: {}", e),
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("chain-provider") {
-        if let Err(e) = verify_provider_binary("chain-provider", &path) {
-            tracing::warn!("Skipping chain-provider due to verification failure: {}", e);
-        } else {
-            match provider::ProviderBridge::spawn(&path, Default::default()).await {
-                Ok(bridge) => {
-                    let chain_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "chain"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("chain", chain_provider)
-                        .await
-                    {
-                        tracing::warn!("Failed to register elastos://chain sub-provider: {}", e);
-                    }
-                    tracing::info!("chain-provider capsule from {}", path.display());
+    match binaries::resolve_verified_native_provider_binary("chain-provider") {
+        Ok(Some(path)) => match provider::ProviderBridge::spawn(&path, Default::default()).await {
+            Ok(bridge) => {
+                let chain_provider: Arc<dyn provider::Provider> = Arc::new(
+                    provider::CapsuleProvider::with_scheme(Arc::new(bridge), "chain"),
+                );
+                if let Err(e) = provider_registry
+                    .register_sub_provider("chain", chain_provider)
+                    .await
+                {
+                    tracing::warn!("Failed to register elastos://chain sub-provider: {}", e);
                 }
-                Err(e) => tracing::warn!("Failed to spawn chain-provider: {}", e),
+                tracing::info!("chain-provider capsule from {}", path.display());
             }
-        }
+            Err(e) => tracing::warn!("Failed to spawn chain-provider: {}", e),
+        },
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping chain-provider due to verification failure: {}", e),
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("net-provider") {
-        if let Err(e) = verify_provider_binary("net-provider", &path) {
-            tracing::warn!("Skipping net-provider due to verification failure: {}", e);
-        } else {
-            match provider::ProviderBridge::spawn(&path, Default::default()).await {
-                Ok(bridge) => {
-                    let net_provider: Arc<dyn provider::Provider> = Arc::new(
-                        provider::CapsuleProvider::with_scheme(Arc::new(bridge), "net"),
-                    );
-                    if let Err(e) = provider_registry
-                        .register_sub_provider("net", net_provider)
-                        .await
-                    {
-                        tracing::warn!("Failed to register elastos://net sub-provider: {}", e);
-                    }
-                    tracing::info!("net-provider capsule from {}", path.display());
+    match binaries::resolve_verified_native_provider_binary("net-provider") {
+        Ok(Some(path)) => match provider::ProviderBridge::spawn(&path, Default::default()).await {
+            Ok(bridge) => {
+                let net_provider: Arc<dyn provider::Provider> = Arc::new(
+                    provider::CapsuleProvider::with_scheme(Arc::new(bridge), "net"),
+                );
+                if let Err(e) = provider_registry
+                    .register_sub_provider("net", net_provider)
+                    .await
+                {
+                    tracing::warn!("Failed to register elastos://net sub-provider: {}", e);
                 }
-                Err(e) => tracing::warn!("Failed to spawn net-provider: {}", e),
+                tracing::info!("net-provider capsule from {}", path.display());
             }
-        }
+            Err(e) => tracing::warn!("Failed to spawn net-provider: {}", e),
+        },
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping net-provider due to verification failure: {}", e),
     }
 
     if let Some(local_exit_config) = browser_local_exit_config_from_env(&data_dir) {
@@ -757,10 +750,8 @@ async fn setup_server_infrastructure_impl(
         }
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("exit-provider") {
-        if let Err(e) = verify_provider_binary("exit-provider", &path) {
-            tracing::warn!("Skipping exit-provider due to verification failure: {}", e);
-        } else {
+    match binaries::resolve_verified_native_provider_binary("exit-provider") {
+        Ok(Some(path)) => {
             let exit_config = provider::BridgeProviderConfig {
                 extra: exit_provider_config_from_env(&data_dir).unwrap_or(serde_json::Value::Null),
                 ..Default::default()
@@ -781,15 +772,12 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn exit-provider: {}", e),
             }
         }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping exit-provider due to verification failure: {}", e),
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("browser-engine-adapter") {
-        if let Err(e) = verify_provider_binary("browser-engine-adapter", &path) {
-            tracing::warn!(
-                "Skipping browser-engine-adapter due to verification failure: {}",
-                e
-            );
-        } else {
+    match binaries::resolve_verified_native_provider_binary("browser-engine-adapter") {
+        Ok(Some(path)) => {
             let browser_engine_config = provider::BridgeProviderConfig {
                 extra: browser_engine_adapter_config_from_env(&data_dir)
                     .unwrap_or(serde_json::Value::Null),
@@ -816,15 +804,15 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn browser-engine-adapter: {}", e),
             }
         }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            "Skipping browser-engine-adapter due to verification failure: {}",
+            e
+        ),
     }
 
-    if let Some(path) = crate::find_installed_provider_binary("wallet-provider") {
-        if let Err(e) = verify_provider_binary("wallet-provider", &path) {
-            tracing::warn!(
-                "Skipping wallet-provider due to verification failure: {}",
-                e
-            );
-        } else {
+    match binaries::resolve_verified_native_provider_binary("wallet-provider") {
+        Ok(Some(path)) => {
             let wallet_config = provider::BridgeProviderConfig {
                 base_path: data_dir.to_string_lossy().to_string(),
                 allowed_paths: file_backed_prefixes(),
@@ -853,6 +841,11 @@ async fn setup_server_infrastructure_impl(
                 Err(e) => tracing::warn!("Failed to spawn wallet-provider: {}", e),
             }
         }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            "Skipping wallet-provider due to verification failure: {}",
+            e
+        ),
     }
 
     if let Some(path) = crate::find_installed_provider_binary("drm-provider") {

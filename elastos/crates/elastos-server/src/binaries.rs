@@ -249,6 +249,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_verified_native_provider_binary_rejects_malformed_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        std::fs::write(data_dir.join("components.json"), b"{not-json").unwrap();
+
+        let error = resolve_verified_native_provider_binary_with_data_dir(data_dir, "did-provider")
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid"));
+        assert!(error.to_string().contains("components.json"));
+    }
+
+    #[test]
     fn resolve_verified_native_provider_binary_rejects_noncanonical_install_path() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path();
