@@ -10533,9 +10533,14 @@ assert(
   "Browser capsule must use the high-level Browser open route without faking EIP-1193 wallet injection, external host browsing, iframe host browsing, or diagnostic frame fallbacks into arbitrary web pages",
 );
 assert(
-  browserStyle.includes(".browser-stage") &&
+  browser.includes('<script src="./elastos-theme.js"></script>') &&
+    browser.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    browserStyle.includes(".browser-stage") &&
     browserStyle.includes("@media (max-width: 640px)") &&
-    browserStyle.includes("--accent: #d46f24") &&
+    browserStyle.includes("--accent: var(--el-accent)") &&
+    browserStyle.includes("overflow: hidden") &&
+    browserStyle.includes("height: 100%") &&
+    browserStyle.includes("min-height: 0") &&
     !browserStyle.includes(".browser-hero") &&
     !browserStyle.includes(".browser-card"),
   "Browser capsule must have a compact responsive ElastOS-aligned host-adapter UI without proof/debug cards",

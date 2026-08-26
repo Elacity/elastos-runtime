@@ -30,6 +30,7 @@ PICKER_JS_HEADER="/* GENERATED from ${SOURCE_PICKER_JS} — do not edit. Run \`j
 # storage, so it is safe in an opaque capsule; only the host installs a
 # persistence adapter, in its own non-vendored file.
 TARGETS=(
+  browser/browser
   home/browser
   home-gui/browser
   people/browser
