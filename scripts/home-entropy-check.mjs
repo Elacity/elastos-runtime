@@ -880,21 +880,45 @@ const systemJs = read("capsules/system/browser/system.js");
 const systemEspProjections = read("capsules/system/browser/esp-projections.mjs");
 const walletApiSource = read("capsules/wallet/browser/wallet-api.js");
 for (const [token, value] of new Map([
-  ["--color-settings-bg", "#ffffff"],
-  ["--color-settings-sidebar", "#f9f9f9"],
-  ["--color-settings-card", "#ffffff"],
-  ["--color-bg-tertiary", "#f3f4f6"],
-  ["--color-text-primary", "#1f2937"],
-  ["--color-text-secondary", "#4b5563"],
-  ["--color-text-muted", "#6b7280"],
-  ["--color-border", "#e5e7eb"],
-  ["--color-border-light", "#d1d5db"],
-  ["--color-input-bg", "#ffffff"],
-  ["--color-input-border", "#d1d5db"],
-  ["--color-input-text", "#1f2937"],
+  ["--color-settings-bg", "var(--el-bg)"],
+  ["--color-settings-card", "var(--el-surface-raised)"],
+  ["--color-bg-tertiary", "var(--el-inset)"],
+  ["--color-text-primary", "var(--el-text)"],
+  ["--color-text-secondary", "var(--el-muted)"],
+  ["--color-text-muted", "var(--el-soft)"],
+  ["--color-border", "var(--el-hairline)"],
+  ["--color-border-light", "var(--el-hairline-strong)"],
+  ["--color-input-bg", "var(--el-inset)"],
+  ["--color-input-border", "var(--el-hairline)"],
+  ["--color-input-text", "var(--el-text)"],
+  ["--color-success", "var(--el-ok)"],
+  ["--color-error", "var(--el-danger)"],
 ])) {
   assertToken(systemSettingsStyle, "capsules/system/browser/style.css", token, value);
 }
+assert(
+  system.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    system.includes('<script src="./elastos-theme.js"></script>') &&
+    system.includes('<script src="./elastos-accent-picker.js"></script>'),
+  "System must load the shared token sheet, theme runtime, and accent picker",
+);
+assert(
+  systemJs.includes('"/api/apps/system/summary"') &&
+    systemJs.includes('"/api/apps/system/appearance/preferences"') &&
+    systemJs.includes("createHomeClipboardClient") &&
+    systemJs.includes('targetId: "system"') &&
+    systemJs.includes('purpose: "identity.did"') &&
+    !systemJs.includes('"home:ui-preference"') &&
+    !systemJs.includes("localStorage") &&
+    !systemJs.includes("sessionStorage") &&
+    !systemJs.includes("navigator.clipboard") &&
+    !systemJs.includes("execCommand") &&
+    !systemJs.includes("account-picture") &&
+    !systemJs.includes("avatar") &&
+    !system.includes("account-picture") &&
+    !system.includes("avatar"),
+  "System appearance and DID copy must stay Runtime-owned and avoid browser storage, Home write fallbacks, or avatar surfaces",
+);
 
 const libraryStyle = read("capsules/library/browser/library.css");
 for (const [token, value] of new Map([
@@ -5068,7 +5092,7 @@ const walletconnectConfigSmoke = read(
   "scripts/walletconnect-connector-config-smoke.sh",
 );
 const walletProviderDoc = read("docs/WALLET_PROVIDER.md");
-const systemAssetVersion = "system-20260712a";
+const systemAssetVersion = "system-20260819f";
 const shellAuth = read("capsules/home/browser/shell-auth.js");
 const protectedHomeStateSmoke = read("scripts/protected-home-state-smoke.sh");
 const auditChainBoundary = {
@@ -11345,9 +11369,15 @@ assert(
   systemStyle.includes(".pc2-section-title") &&
     systemStyle.includes("font-size: 11px;") &&
     systemStyle.includes("text-transform: uppercase;") &&
-    systemStyle.includes("background: #f9f9f9;") &&
-    systemStyle.includes("border: 1px solid #d0d0d0;"),
-  "System Settings must keep PC2 compact section/card styling",
+    systemStyle.includes(".settings-content h1") &&
+    (systemStyle.match(/letter-spacing:\s*[^;]+;/g) || []).length === 5 &&
+    (systemStyle.match(/letter-spacing:\s*[^;]+;/g) || []).every(
+      (declaration) => declaration === "letter-spacing: 0;",
+    ) &&
+    systemStyle.includes(".pc2-card-row") &&
+    systemStyle.includes("background: var(--color-settings-card);") &&
+    systemStyle.includes("border: 1px solid var(--color-border);"),
+  "System Settings must keep PC2 compact section/card styling with exact zero letter spacing throughout System",
 );
 assert(
   !system.includes('data-settings="storage"') &&

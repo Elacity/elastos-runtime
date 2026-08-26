@@ -101,6 +101,7 @@ const canonicalClientImports = Object.freeze({
     "targetId: CONNECTOR_ID",
   "capsules/library/browser/src/app.js": 'targetId: "library"',
   "capsules/documents/browser/index.html": 'targetId: "documents"',
+  "capsules/system/browser/system.js": 'targetId: "system"',
   "capsules/chat-room/browser/index.html": 'targetId: "chat-room"',
 });
 for (const [path, targetBinding] of Object.entries(canonicalClientImports)) {
@@ -160,6 +161,11 @@ assert(
   "Chat invite copies must use the canonical trusted Home Clipboard path",
 );
 assert(
+  protocolSource.includes('"identity.did"') &&
+    hostSource.includes('"system:identity.did:write"'),
+  "System device DID copies must use the canonical bounded identifier Clipboard policy",
+);
+assert(
   protocolSource.includes(
     "Object.hasOwn(HOME_CLIPBOARD_TARGET_PURPOSE_POLICY, targetId)",
   ) &&
@@ -208,6 +214,7 @@ process.stdout.write(
     canonical_protocol: canonicalProtocol,
     library_identifier_purpose: "resource.identifier",
     library_uri_purpose: "resource.uri",
+    system_identifier_purpose: "identity.did",
     migrated_capsules: Object.keys(canonicalClientImports),
     direct_capsule_clipboard_access: 0,
     iframe_clipboard_permissions: 0,

@@ -33,6 +33,7 @@ TARGETS=(
   browser/browser
   home/browser
   home-gui/browser
+  system/browser
   people/browser
   inbox/browser
   chat-room/browser
