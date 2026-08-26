@@ -2355,6 +2355,29 @@ mod tests {
                 Some(runtime.provides.as_str())
             );
         }
+
+        for profile in ["agent-local-ai", "full"] {
+            assert!(
+                components
+                    .profiles
+                    .get(profile)
+                    .unwrap()
+                    .components
+                    .iter()
+                    .any(|value| value == "model-provider"),
+                "profile {profile} must install model-provider"
+            );
+        }
+        assert!(
+            !components
+                .profiles
+                .get("public-gateway")
+                .unwrap()
+                .components
+                .iter()
+                .any(|value| value == "model-provider"),
+            "public-gateway must not install model-provider"
+        );
     }
 
     #[test]

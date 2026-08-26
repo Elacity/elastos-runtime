@@ -785,32 +785,14 @@ fn command_spec(cmd: &CommandRequest) -> Result<CommandSpec, String> {
     Ok(spec)
 }
 
-/// Build capsule-specific config. This keeps provider wiring deterministic:
-/// - llama-provider uses a fixed guest port
-/// - ai-provider points local backend at host-forwarded llama endpoint
-/// - target app capsule receives the CLI payload
+/// Build capsule-specific config. Target app capsules receive the CLI payload.
 fn config_for_capsule(
-    cmd: &CommandRequest,
+    _cmd: &CommandRequest,
     spec: &CommandSpec,
-    capsule: &str,
+    _capsule: &str,
     is_target: bool,
 ) -> serde_json::Value {
     let mut config = serde_json::Map::new();
-
-    if let CommandRequest::Agent { backend, .. } = cmd {
-        if backend == "local" {
-            if capsule == "llama-provider" {
-                config.insert("extra".into(), serde_json::json!({ "port": 11434 }));
-            } else if capsule == "ai-provider" {
-                config.insert(
-                    "extra".into(),
-                    serde_json::json!({
-                        "local_url": "http://172.16.0.1:11434/v1/chat/completions"
-                    }),
-                );
-            }
-        }
-    }
 
     if is_target {
         if spec.interactive_target {
@@ -1584,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn config_for_capsule_agent_local_wiring() {
+    fn config_for_capsule_agent_local_keeps_non_target_config_empty() {
         let cmd = CommandRequest::Agent {
             nick: Some("bot".into()),
             channel: "#general".into(),
@@ -1594,14 +1576,8 @@ mod tests {
         };
         let spec = command_spec(&cmd).unwrap();
 
-        let llama_cfg = config_for_capsule(&cmd, &spec, "llama-provider", false);
-        assert_eq!(llama_cfg["extra"]["port"], 11434);
-
-        let ai_cfg = config_for_capsule(&cmd, &spec, "ai-provider", false);
-        assert_eq!(
-            ai_cfg["extra"]["local_url"],
-            "http://172.16.0.1:11434/v1/chat/completions"
-        );
+        let cfg = config_for_capsule(&cmd, &spec, "assistant", false);
+        assert_eq!(cfg, serde_json::json!({}));
     }
 
     #[test]

@@ -601,6 +601,8 @@ RETIRED_SOURCE_HOME_CAPSULES=(
 
 RETIRED_SOURCE_HOME_PROVIDER_BINARIES=(
     gba-engine-provider
+    ai-provider
+    llama-provider
 )
 
 collaboration_startup_config_destination() {

@@ -1162,7 +1162,6 @@ const appSurfaceCapsuleManifests = Object.fromEntries(
 );
 const providerCapsuleManifests = Object.fromEntries(
   [
-    "ai-provider",
     "availability-provider",
     "browser-engine-adapter",
     "chain-provider",
@@ -1173,7 +1172,7 @@ const providerCapsuleManifests = Object.fromEntries(
     "exit-provider",
     "ipfs-provider",
     "key-provider",
-    "llama-provider",
+    "model-provider",
     "net-provider",
     "object-provider",
     "operator-drive-adapter",
@@ -1187,6 +1186,14 @@ const firstPartyCapsuleManifests = {
   ...appSurfaceCapsuleManifests,
   ...providerCapsuleManifests,
 };
+assert(
+  !fileExists("capsules/ai-provider/capsule.json"),
+  "legacy ai-provider manifest must be absent",
+);
+assert(
+  !fileExists("capsules/llama-provider/capsule.json"),
+  "legacy llama-provider manifest must be absent",
+);
 const coreCapsuleManifests = {
   home: homeCapsuleManifest,
   "home-gui": homeGuiCapsuleManifest,

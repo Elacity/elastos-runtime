@@ -184,24 +184,6 @@
         "aarch64-linux"
       ]
     },
-    "ai-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
-    "llama-provider": {
-      "cid": "",
-      "sha256": "",
-      "size": 0,
-      "platforms": [
-        "x86_64-linux",
-        "aarch64-linux"
-      ]
-    },
     "tunnel-provider": {
       "cid": "",
       "sha256": "",
@@ -1443,6 +1425,7 @@
         "archive-manager",
         "inbox",
         "assistant",
+        "model-provider",
         "llama-server",
         "model-qwen3.5-0.8b"
       ]
@@ -1536,6 +1519,7 @@
         "archive-manager",
         "inbox",
         "assistant",
+        "model-provider",
         "crosvm",
         "vmlinux",
         "kubo",

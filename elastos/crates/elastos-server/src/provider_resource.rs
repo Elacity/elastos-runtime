@@ -29,17 +29,6 @@ pub fn build_capability_resource(
 
     match scheme {
         "localhost" => localhost_resource(op, request),
-        "ai" => {
-            ensure_supported_operation("ai", op, &["chat_completions", "list_backends", "ping"])?;
-            let backend = request.get("backend").and_then(|value| value.as_str());
-            match backend {
-                Some(backend) => {
-                    validate_segment(backend, "backend name")?;
-                    Ok(format!("elastos://ai/{backend}/{op}"))
-                }
-                None => Ok(format!("elastos://ai/meta/{op}")),
-            }
-        }
         "availability" => simple_elastos_resource("availability", op, &["ensure", "status"]),
         "block-graph" => simple_elastos_resource(
             "block-graph",
@@ -94,11 +83,6 @@ pub fn build_capability_resource(
         "wallet" => wallet_resource(op),
         "did" => did_resource(op),
         "ipfs" => ipfs_resource(op),
-        "llama" => simple_elastos_resource(
-            "llama",
-            op,
-            &["chat_completions", "status", "health", "list_models"],
-        ),
         "model" => model_resource(op, request),
         "object" => object_resource(op),
         "operator-drive-adapter" => simple_elastos_resource(
@@ -142,7 +126,7 @@ pub fn provider_operation_action(scheme: &str, op: &str) -> Option<Action> {
 
     match scheme {
         "localhost" | "webspace" => localhost_op_required_action(op),
-        "ai" | "llama" | "did" => execute_op_required_action(op),
+        "did" => execute_op_required_action(op),
         "availability" => match op {
             "status" => Some(Action::Read),
             "ensure" => Some(Action::Write),
@@ -648,31 +632,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ai_resource_with_backend() {
-        let request = serde_json::json!({"backend": "local", "op": "chat_completions"});
-        assert_eq!(
-            build_capability_resource("ai", "chat_completions", &request).unwrap(),
-            "elastos://ai/local/chat_completions"
-        );
-    }
-
-    #[test]
-    fn ai_resource_without_backend() {
-        let request = serde_json::json!({"op": "list_backends"});
-        assert_eq!(
-            build_capability_resource("ai", "list_backends", &request).unwrap(),
-            "elastos://ai/meta/list_backends"
-        );
-    }
-
-    #[test]
-    fn ai_resource_invalid_backend_fails_closed() {
-        let request = serde_json::json!({"backend": "bad/name", "op": "chat_completions"});
-        let err = build_capability_resource("ai", "chat_completions", &request).unwrap_err();
-        assert!(err.contains("Invalid backend name"));
-    }
-
-    #[test]
     fn localhost_resource_accepts_full_uri_and_bare_rooted_path() {
         let full = serde_json::json!({"path": "localhost://MyWebSite/Documents/demo.md"});
         assert_eq!(
@@ -742,11 +701,6 @@ mod tests {
                 "elastos://block-graph/export_graph",
             ),
             ("ipfs", "cat", "elastos://ipfs/cat"),
-            (
-                "llama",
-                "chat_completions",
-                "elastos://llama/chat_completions",
-            ),
             ("object", "read", "elastos://object/read"),
             (
                 "operator-drive-adapter",
@@ -771,7 +725,6 @@ mod tests {
             ("availability", "raw_replication_socket"),
             ("block-graph", "raw_car"),
             ("ipfs", "raw_kubo_rpc"),
-            ("llama", "raw_model_socket"),
             ("object", "raw_storage_path"),
             ("operator-drive-adapter", "resolver_credentials"),
             ("tunnel", "raw_cloudflared_admin"),
@@ -786,7 +739,6 @@ mod tests {
     #[test]
     fn first_party_provider_authority_operations_have_action_mapping() {
         let manifests = [
-            ("ai", "../../../capsules/ai-provider/capsule.json"),
             (
                 "availability",
                 "../../../capsules/availability-provider/capsule.json",
@@ -802,7 +754,6 @@ mod tests {
             ("exit", "../../../capsules/exit-provider/capsule.json"),
             ("ipfs", "../../../capsules/ipfs-provider/capsule.json"),
             ("key", "../../../capsules/key-provider/capsule.json"),
-            ("llama", "../../../capsules/llama-provider/capsule.json"),
             ("net", "../../../capsules/net-provider/capsule.json"),
             ("object", "../../../capsules/object-provider/capsule.json"),
             (
