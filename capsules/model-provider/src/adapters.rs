@@ -2415,13 +2415,27 @@ mod tests {
         }
     }
 
+    fn openai_binding() -> RuntimeCreateBinding {
+        RuntimeCreateBinding {
+            schema: RUNTIME_CREATE_BINDING_SCHEMA.to_string(),
+            principal_id: "principal-1".to_string(),
+            session_id: "session-1".to_string(),
+            capsule_id: "assistant".to_string(),
+            grant_id: "grant-1".to_string(),
+            request_id: "request-1".to_string(),
+            offer_id: "offer-1".to_string(),
+            operation: "text.generate".to_string(),
+            input_hash: "hash-1".to_string(),
+        }
+    }
+
     fn openai_offer(api_url: &str) -> ConfiguredOffer {
         ConfiguredOffer {
             id: "offer-1".to_string(),
             title: "Offer".to_string(),
-            operation: "image.generate".to_string(),
-            input_modalities: vec!["application/json".to_string()],
-            output_modalities: vec!["application/json".to_string()],
+            operation: "text.generate".to_string(),
+            input_modalities: vec!["text/plain".to_string()],
+            output_modalities: vec!["text/plain".to_string()],
             policy: OfferPolicy {
                 concurrency_limit: 1,
                 input_bytes_limit: 4096,
@@ -2506,7 +2520,7 @@ mod tests {
         let executor = LiveAdapterExecutor::new(runtime.handle.clone(), update_tx);
         let offer = openai_offer(&format!("{}/chat", server.base_url));
         let input = text_input("hello");
-        let run_binding = binding();
+        let run_binding = openai_binding();
         let run_id = deterministic_run_id(&run_binding);
         let registry_guard = executor.workers.lock().unwrap();
         let (started_tx, started_rx) = std_mpsc::channel();
@@ -3195,7 +3209,7 @@ mod tests {
             Some("secret"),
             "gpt-test",
             &openai_offer,
-            &binding(),
+            &openai_binding(),
             &text_input("hello"),
         )
         .unwrap();

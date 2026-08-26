@@ -165,7 +165,7 @@ impl AdapterConfig {
     }
 
     pub fn stream_output(&self) -> bool {
-        false
+        matches!(self, Self::OpenAiCompatibleText { .. })
     }
 }
 
@@ -254,28 +254,13 @@ impl ConfiguredOffer {
         validate_bounded_trimmed(&self.id, "offer id", MAX_OFFER_ID_BYTES)?;
         validate_bounded_trimmed(&self.title, "offer title", MAX_OFFER_TITLE_BYTES)?;
         validate_bounded_trimmed(&self.operation, "offer operation", MAX_OPERATION_BYTES)?;
-        if self.input_modalities.is_empty()
-            || self.input_modalities.len() > MAX_MODALITIES_PER_OFFER
-        {
-            anyhow::bail!(
-                "offer input_modalities must contain 1..={} values",
-                MAX_MODALITIES_PER_OFFER
-            );
-        }
-        if self.output_modalities.is_empty()
-            || self.output_modalities.len() > MAX_MODALITIES_PER_OFFER
-        {
-            anyhow::bail!(
-                "offer output_modalities must contain 1..={} values",
-                MAX_MODALITIES_PER_OFFER
-            );
-        }
         for modality in &self.input_modalities {
             validate_bounded_trimmed(modality, "offer input modality", MAX_MODALITY_BYTES)?;
         }
         for modality in &self.output_modalities {
             validate_bounded_trimmed(modality, "offer output modality", MAX_MODALITY_BYTES)?;
         }
+        self.validate_canonical_modalities()?;
         self.policy.validate()?;
         self.adapter.validate()?;
         Ok(())
@@ -318,6 +303,44 @@ impl ConfiguredOffer {
             "adapter": adapter,
             "offer": self.summary(),
         }))
+    }
+
+    fn validate_canonical_modalities(&self) -> Result<()> {
+        match &self.adapter {
+            AdapterConfig::OpenAiCompatibleText { .. } => {
+                if self.operation != "text.generate" {
+                    anyhow::bail!("openai compatible text offers require operation text.generate");
+                }
+                validate_exact_modalities(
+                    &self.input_modalities,
+                    &["text/plain"],
+                    "openai compatible text input_modalities",
+                )?;
+                validate_exact_modalities(
+                    &self.output_modalities,
+                    &["text/plain"],
+                    "openai compatible text output_modalities",
+                )?;
+            }
+            AdapterConfig::HttpJobArtifact { .. } => {
+                if !matches!(self.operation.as_str(), "image.generate" | "video.generate") {
+                    anyhow::bail!(
+                        "http job artifact offers require operation image.generate or video.generate"
+                    );
+                }
+                validate_exact_modalities(
+                    &self.input_modalities,
+                    &["application/json"],
+                    "http job artifact input_modalities",
+                )?;
+                validate_exact_modalities(
+                    &self.output_modalities,
+                    &["application/json"],
+                    "http job artifact output_modalities",
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -364,6 +387,18 @@ fn default_true() -> bool {
     true
 }
 
+fn validate_exact_modalities(actual: &[String], expected: &[&str], label: &str) -> Result<()> {
+    if actual.len() != expected.len() {
+        anyhow::bail!("{label} must be exactly {:?}", expected);
+    }
+    for (actual, expected) in actual.iter().zip(expected.iter()) {
+        if actual != expected {
+            anyhow::bail!("{label} must be exactly {:?}", expected);
+        }
+    }
+    Ok(())
+}
+
 fn validate_bounded_trimmed(value: &str, label: &str, max_bytes: usize) -> Result<()> {
     validate_trimmed(value, label)?;
     if value.len() > max_bytes {
@@ -399,6 +434,22 @@ mod tests {
                 model: "gpt-test".to_string(),
             },
             enabled: true,
+        }
+    }
+
+    fn artifact_offer(operation: &str) -> ConfiguredOffer {
+        ConfiguredOffer {
+            operation: operation.to_string(),
+            input_modalities: vec!["application/json".to_string()],
+            output_modalities: vec!["application/json".to_string()],
+            adapter: AdapterConfig::HttpJobArtifact {
+                create_url: "https://jobs.example.test/create".to_string(),
+                status_url: "https://jobs.example.test/status".to_string(),
+                cancel_url: Some("https://jobs.example.test/cancel".to_string()),
+                bearer_token: Some("token-a".to_string()),
+                poll_interval_ms: 1_000,
+            },
+            ..base_offer()
         }
     }
 
@@ -494,16 +545,7 @@ mod tests {
         }
         assert_eq!(openai_hash, openai_key.execution_binding_hash().unwrap());
 
-        let http_job = ConfiguredOffer {
-            adapter: AdapterConfig::HttpJobArtifact {
-                create_url: "https://jobs.example.test/create".to_string(),
-                status_url: "https://jobs.example.test/status".to_string(),
-                cancel_url: Some("https://jobs.example.test/cancel".to_string()),
-                bearer_token: Some("token-a".to_string()),
-                poll_interval_ms: 1_000,
-            },
-            ..base_offer()
-        };
+        let http_job = artifact_offer("image.generate");
         let http_job_hash = http_job.execution_binding_hash().unwrap();
 
         let mut http_job_create = http_job.clone();
@@ -564,6 +606,59 @@ mod tests {
         let mut policy_change = openai;
         policy_change.policy.retention_secs = 61;
         assert_ne!(openai_hash, policy_change.execution_binding_hash().unwrap());
+    }
+
+    #[test]
+    fn configured_offer_requires_canonical_modalities_and_adapter_pairs() {
+        base_offer().validate().unwrap();
+        artifact_offer("image.generate").validate().unwrap();
+        artifact_offer("video.generate").validate().unwrap();
+
+        let mut legacy_text = base_offer();
+        legacy_text.input_modalities = vec!["text".to_string()];
+        assert!(legacy_text.validate().is_err());
+
+        let mut extra_text_modality = base_offer();
+        extra_text_modality.input_modalities =
+            vec!["text/plain".to_string(), "application/json".to_string()];
+        assert!(extra_text_modality.validate().is_err());
+
+        let mut wrong_text_operation = base_offer();
+        wrong_text_operation.operation = "image.generate".to_string();
+        assert!(wrong_text_operation.validate().is_err());
+
+        let wrong_artifact_operation = artifact_offer("text.generate");
+        assert!(wrong_artifact_operation.validate().is_err());
+
+        let mut swapped_artifact_modalities = artifact_offer("image.generate");
+        swapped_artifact_modalities.input_modalities = vec!["text/plain".to_string()];
+        assert!(swapped_artifact_modalities.validate().is_err());
+
+        let mut mismatched_adapter = base_offer();
+        mismatched_adapter.adapter = AdapterConfig::HttpJobArtifact {
+            create_url: "https://jobs.example.test/create".to_string(),
+            status_url: "https://jobs.example.test/status".to_string(),
+            cancel_url: Some("https://jobs.example.test/cancel".to_string()),
+            bearer_token: Some("token-a".to_string()),
+            poll_interval_ms: 1_000,
+        };
+        assert!(mismatched_adapter.validate().is_err());
+    }
+
+    #[test]
+    fn offer_summary_redacts_adapter_secrets_and_reports_streaming_truthfully() {
+        let openai_summary = base_offer().summary();
+        assert!(openai_summary.stream_output);
+        let openai_json = serde_json::to_string(&openai_summary).unwrap();
+        assert!(!openai_json.contains("example.test"));
+        assert!(!openai_json.contains("secret-a"));
+        assert!(!openai_json.contains("token-a"));
+
+        let artifact_summary = artifact_offer("video.generate").summary();
+        assert!(!artifact_summary.stream_output);
+        let artifact_json = serde_json::to_string(&artifact_summary).unwrap();
+        assert!(!artifact_json.contains("jobs.example.test"));
+        assert!(!artifact_json.contains("token-a"));
     }
 
     #[test]
