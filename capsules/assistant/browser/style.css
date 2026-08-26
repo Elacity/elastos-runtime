@@ -372,6 +372,45 @@ textarea {
   line-height: 1.5;
 }
 
+.assistant-studio-panel[hidden] {
+  display: none;
+}
+
+.assistant-studio-panel {
+  align-self: start;
+  max-width: 680px;
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.assistant-studio-progress {
+  margin: 0;
+  color: rgba(243, 245, 251, 0.78);
+  line-height: 1.45;
+}
+
+.assistant-studio-result {
+  display: grid;
+  gap: 6px;
+}
+
+.assistant-studio-result-label {
+  color: rgba(243, 245, 251, 0.65);
+  font-size: 0.85rem;
+}
+
+.assistant-studio-result-uri {
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #eaf0ff;
+}
+
 .assistant-starters {
   display: flex;
   flex-wrap: wrap;
@@ -525,7 +564,8 @@ textarea {
   .assistant-session-preview,
   .assistant-message-role,
   .assistant-message-meta,
-  .assistant-empty-copy {
+  .assistant-empty-copy,
+  .assistant-studio-result-label {
     color: rgba(25, 32, 45, 0.64);
   }
 
@@ -538,7 +578,9 @@ textarea {
   .assistant-session-card,
   .assistant-icon-button,
   .assistant-mode-switch,
-  .assistant-starter {
+  .assistant-starter,
+  .assistant-studio-panel,
+  .assistant-studio-result-uri {
     background: rgba(255, 255, 255, 0.8);
     border-color: rgba(34, 47, 78, 0.12);
   }

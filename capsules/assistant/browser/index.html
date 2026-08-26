@@ -19,7 +19,7 @@
           />
           <div class="assistant-brand-copy">
             <h1 id="assistant-title">Assistant</h1>
-            <p>Typed model sessions</p>
+            <p>Chat, Build, and Studio</p>
           </div>
         </div>
 
@@ -72,6 +72,15 @@
             >
               Build
             </button>
+            <button
+              id="assistant-mode-studio"
+              type="button"
+              class="assistant-segment"
+              data-mode="studio"
+              role="tab"
+            >
+              Studio
+            </button>
           </div>
 
           <div class="assistant-main-tools">
@@ -121,6 +130,23 @@
             Choose a starter prompt or write your own.
           </p>
           <div id="assistant-starters" class="assistant-starters"></div>
+        </section>
+
+        <section
+          id="assistant-studio-panel"
+          class="assistant-studio-panel"
+          aria-live="polite"
+          hidden
+        >
+          <p id="assistant-studio-title" class="assistant-empty-title">Start a studio run</p>
+          <p id="assistant-studio-copy" class="assistant-empty-copy">
+            Choose an offer and write a prompt.
+          </p>
+          <p id="assistant-studio-progress" class="assistant-studio-progress" hidden></p>
+          <div id="assistant-studio-result" class="assistant-studio-result" hidden>
+            <span class="assistant-studio-result-label">Result URI</span>
+            <code id="assistant-studio-result-uri" class="assistant-studio-result-uri"></code>
+          </div>
         </section>
 
         <section

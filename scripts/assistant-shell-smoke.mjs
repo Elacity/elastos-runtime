@@ -25,8 +25,18 @@ function offer(id, title, operation = "text.generate") {
     id,
     title,
     operation,
-    input_modalities: ["text"],
-    output_modalities: ["text"],
+    input_modalities: ["text/plain"],
+    output_modalities: ["text/plain"],
+  };
+}
+
+function studioOffer(id, title, operation = "image.generate") {
+  return {
+    id,
+    title,
+    operation,
+    input_modalities: ["application/json"],
+    output_modalities: ["application/json"],
   };
 }
 
@@ -1011,9 +1021,545 @@ async function buildApp(options = {}) {
   );
 }
 
+{
+  const { app } = await buildApp({
+    offers: [
+      {
+        id: "offer:legacy-text",
+        title: "Legacy text",
+        operation: "text.generate",
+        input_modalities: ["text"],
+        output_modalities: ["text"],
+      },
+    ],
+  });
+  assert.equal(app.snapshot().offersReady.length, 0);
+  assert.equal(app.snapshot().statusMessage, "No model offers available.");
+}
+
+{
+  const { app } = await buildApp({
+    workspace: {
+      schema: "elastos.assistant.workspace/v1",
+      revision: 1,
+      sessions: [
+        {
+          id: "session-1",
+          title: "Saved chat",
+          mode: "chat",
+          pinned: false,
+          messages: [{ role: "user", content: "Visible chat history." }],
+        },
+      ],
+      draft: "",
+      selected_offer_id: "offer:text-1",
+    },
+  });
+  app.setSessionMode("studio");
+  const view = app.snapshot();
+  assert.equal(view.currentMode, "studio");
+  assert.equal(view.copyHidden, true);
+  assert.equal(view.copyDisabled, true);
+  assert.equal(view.studioUnavailable, true);
+}
+
+{
+  const { app, fetch } = await buildApp({
+    offers: [offer("offer:text-1", "Fast text"), studioOffer("offer:vision-1", "Vision", "image.generate")],
+    createResponse: {
+      status: "error",
+      code: "provider_unavailable",
+      message: "Model provider unavailable.",
+    },
+    workspace: {
+      schema: "elastos.assistant.workspace/v1",
+      revision: 7,
+      sessions: [
+        {
+          id: "session-1",
+          title: "Saved chat",
+          mode: "chat",
+          pinned: false,
+          messages: [],
+        },
+      ],
+      draft: "Saved draft",
+      selected_offer_id: "offer:text-1",
+    },
+  });
+  const before = app.snapshot();
+  app.setSessionMode("studio");
+  app.setDraft("Poster prompt");
+  const sent = await app.sendDraft();
+  const after = app.snapshot();
+  assert.equal(sent, false);
+  assert.equal(after.draft, "Poster prompt");
+  assert.equal(after.workspaceRevision, before.workspaceRevision);
+  assert.equal(after.workspaceVersion, before.workspaceVersion);
+  assert.equal(fetch.savedBodies.length, 0);
+  assert.equal(
+    fetch.fetchCalls.filter(([url]) => url === "/api/provider/model/runs_create").length,
+    1,
+  );
+}
+
+{
+  const runId =
+    "run:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  const { app, fetch } = await buildApp({
+    offers: [studioOffer("offer:vision-1", "Vision", "image.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-1",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Design a quiet poster.");
+  assert.equal(await app.sendDraft(), true);
+  const createCall = fetch.fetchCalls.find(
+    ([url]) => url === "/api/provider/model/runs_create",
+  );
+  assert.ok(createCall);
+  assert.deepEqual(JSON.parse(createCall[1].body).input, {
+    schema: "elastos.model.input.image/v1",
+    prompt: "Design a quiet poster.",
+  });
+}
+
+{
+  const runId =
+    "run:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+  const { app, fetch } = await buildApp({
+    offers: [studioOffer("offer:motion-1", "Motion", "video.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:motion-1",
+        operation: "video.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Generate a short teaser.");
+  assert.equal(await app.sendDraft(), true);
+  const createCall = fetch.fetchCalls.find(
+    ([url]) => url === "/api/provider/model/runs_create",
+  );
+  assert.ok(createCall);
+  assert.deepEqual(JSON.parse(createCall[1].body).input, {
+    schema: "elastos.model.input.video/v1",
+    prompt: "Generate a short teaser.",
+  });
+}
+
+{
+  const runId =
+    "run:sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  const { app, flushAsync, flushTimers } = await buildApp({
+    offers: [studioOffer("offer:vision-2", "Vision", "image.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-2",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+    eventPages: [
+      {
+        status: "ok",
+        data: {
+          schema: "elastos.model.run-events/v1",
+          run_id: runId,
+          next_cursor: 1,
+          has_more: false,
+          events: [
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 1,
+              kind: "progress",
+              terminal: false,
+              data: { phase: "rendering", completed: 1, total: 4 },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Create cover art.");
+  await app.sendDraft();
+  await flushAsync();
+  await flushTimers();
+  assert.deepEqual(app.snapshot().studioProgress, {
+    phase: "rendering",
+    completed: 1,
+    total: 4,
+  });
+}
+
+{
+  const runId =
+    "run:sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+  const { app, flushAsync, flushTimers } = await buildApp({
+    offers: [studioOffer("offer:motion-2", "Motion", "video.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:motion-2",
+        operation: "video.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+    eventPages: [
+      {
+        status: "ok",
+        data: {
+          schema: "elastos.model.run-events/v1",
+          run_id: runId,
+          next_cursor: 2,
+          has_more: true,
+          events: [
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 1,
+              kind: "progress",
+              terminal: false,
+              data: { phase: "rendering", completed: 2, total: 5 },
+            },
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 2,
+              kind: "output",
+              terminal: true,
+              data: {
+                schema: "elastos.model.output.content/v1",
+                uri: "elastos://content/result-1",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Create a trailer.");
+  await app.sendDraft();
+  await flushAsync();
+  await flushTimers();
+  const view = app.snapshot();
+  assert.equal(view.statusMessage, "");
+  assert.equal(view.currentSession.messages.length, 0);
+  assert.deepEqual(view.studioResult, {
+    mediaLabel: "Video",
+    schema: "elastos.model.output.content/v1",
+    uri: "elastos://content/result-1",
+  });
+}
+
+{
+  const runId =
+    "run:sha256:abababababababababababababababababababababababababababababababab";
+  const longUri = `elastos://object/${"a".repeat(4096)}`;
+  const { app, flushAsync, flushTimers } = await buildApp({
+    offers: [studioOffer("offer:vision-3", "Vision", "image.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-3",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+    eventPages: [
+      {
+        status: "ok",
+        data: {
+          schema: "elastos.model.run-events/v1",
+          run_id: runId,
+          next_cursor: 1,
+          has_more: false,
+          events: [
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 1,
+              kind: "output",
+              terminal: true,
+              data: {
+                schema: "elastos.model.output.object/v1",
+                uri: longUri,
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Reject overlong result.");
+  await app.sendDraft();
+  await flushAsync();
+  await flushTimers();
+  assert.equal(app.snapshot().statusMessage, "Model provider unavailable.");
+  assert.equal(app.snapshot().studioResult, null);
+}
+
+{
+  const runId =
+    "run:sha256:bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+  const { app, fetch } = await buildApp({
+    offers: [studioOffer("offer:vision-4", "Vision", "image.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-4",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+    cancelResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-4",
+        operation: "image.generate",
+        status: "cancelled",
+        sequence_cursor: 1,
+        terminal: {
+          status: "cancelled",
+          error: {
+            class: "cancelled",
+            code: "cancelled",
+            message: "Model run cancelled.",
+          },
+        },
+      },
+    },
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Cancel the studio run.");
+  await app.sendDraft();
+  assert.equal(await app.stopRun(), true);
+  assert.equal(
+    fetch.fetchCalls.filter(([url]) => url === "/api/provider/model/runs_cancel").length,
+    1,
+  );
+  assert.equal(app.snapshot().statusMessage, "Model run cancelled.");
+}
+
+{
+  const runId =
+    "run:sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+  const { app } = await buildApp({
+    offers: [
+      offer("offer:text-1", "Fast text"),
+      studioOffer("offer:vision-lock", "Vision", "image.generate"),
+    ],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-lock",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Keep the surface locked.");
+  assert.equal(await app.sendDraft(), true);
+  assert.equal(app.snapshot().modeSwitchDisabled, true);
+  assert.equal(app.setSessionMode("chat"), false);
+  assert.equal(app.snapshot().currentMode, "studio");
+}
+
+{
+  const runId =
+    "run:sha256:edededededededededededededededededededededededededededededededed";
+  const { app, flushAsync, flushTimers } = await buildApp({
+    offers: [
+      offer("offer:text-1", "Fast text"),
+      studioOffer("offer:vision-sticky", "Vision", "image.generate"),
+    ],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-sticky",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+    eventPages: [
+      {
+        status: "ok",
+        data: {
+          schema: "elastos.model.run-events/v1",
+          run_id: runId,
+          next_cursor: 1,
+          has_more: false,
+          events: [
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 1,
+              kind: "output",
+              terminal: true,
+              data: {
+                schema: "elastos.model.output.object/v1",
+                uri: "elastos://object/studio-result-1",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Keep the result visible.");
+  await app.sendDraft();
+  await flushAsync();
+  await flushTimers();
+  assert.equal(app.snapshot().studioResult?.uri, "elastos://object/studio-result-1");
+  assert.equal(app.setSessionMode("chat"), true);
+  assert.equal(app.snapshot().studioResult?.uri, "elastos://object/studio-result-1");
+  assert.equal(app.setSessionMode("studio"), true);
+  assert.equal(app.snapshot().studioResult?.uri, "elastos://object/studio-result-1");
+}
+
+{
+  const runId =
+    "run:sha256:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+  const { app, flushAsync, flushTimers } = await buildApp({
+    offers: [studioOffer("offer:vision-prefix", "Vision", "image.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-prefix",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+    eventPages: [
+      {
+        status: "ok",
+        data: {
+          schema: "elastos.model.run-events/v1",
+          run_id: runId,
+          next_cursor: 1,
+          has_more: false,
+          events: [
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 1,
+              kind: "output",
+              terminal: true,
+              data: {
+                schema: "elastos.model.output.object/v1",
+                uri: "elastos://object/",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Reject prefix only.");
+  await app.sendDraft();
+  await flushAsync();
+  await flushTimers();
+  assert.equal(app.snapshot().statusMessage, "Model provider unavailable.");
+  assert.equal(app.snapshot().studioResult, null);
+}
+
+{
+  const runId =
+    "run:sha256:f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0";
+  const { app, flushAsync, flushTimers } = await buildApp({
+    offers: [studioOffer("offer:vision-extra", "Vision", "image.generate")],
+    createResponse: {
+      status: "ok",
+      data: {
+        schema: "elastos.model.run/v1",
+        run_id: runId,
+        offer_id: "offer:vision-extra",
+        operation: "image.generate",
+        status: "running",
+        sequence_cursor: 0,
+      },
+    },
+    eventPages: [
+      {
+        status: "ok",
+        data: {
+          schema: "elastos.model.run-events/v1",
+          run_id: runId,
+          next_cursor: 1,
+          has_more: false,
+          events: [
+            {
+              schema: "elastos.model.run-event/v1",
+              sequence: 1,
+              kind: "output",
+              terminal: true,
+              data: {
+                schema: "elastos.model.output.content/v1",
+                uri: "elastos://content/studio-result-2",
+                extra: "nope",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  app.setSessionMode("studio");
+  app.setDraft("Reject extra fields.");
+  await app.sendDraft();
+  await flushAsync();
+  await flushTimers();
+  assert.equal(app.snapshot().statusMessage, "Model provider unavailable.");
+  assert.equal(app.snapshot().studioResult, null);
+}
+
 assert(!/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(originalSource));
 assert(!/navigator\.clipboard|execCommand/.test(originalSource));
 assert(originalSource.includes('"/apps/home/home-clipboard-client.js?v=home-20260726a"'));
+assert(originalSource.includes("copyNode.hidden = view.copyHidden;"));
+assert(originalSource.includes("chatNode.disabled = view.modeSwitchDisabled;"));
+assert(originalSource.includes("buildNode.disabled = view.modeSwitchDisabled;"));
+assert(originalSource.includes("studioNode.disabled = view.modeSwitchDisabled;"));
 assert(!/home:clipboard-request|home:clipboard-ready|home:clipboard-result|home:clipboard-cancel/.test(originalSource));
 assert(
   !/(["'](?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)["']\s*:|\b(?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)\s*:)/i.test(originalSource),

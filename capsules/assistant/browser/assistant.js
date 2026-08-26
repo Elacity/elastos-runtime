@@ -4,15 +4,21 @@ import {
 } from "/apps/home/home-clipboard-client.js?v=home-20260726a";
 
 const MODEL_TEXT_INPUT_SCHEMA = "elastos.model.input.text/v1";
+const MODEL_IMAGE_INPUT_SCHEMA = "elastos.model.input.image/v1";
+const MODEL_VIDEO_INPUT_SCHEMA = "elastos.model.input.video/v1";
 const MODEL_TEXT_OUTPUT_SCHEMA = "elastos.model.output.text/v1";
+const MODEL_OBJECT_OUTPUT_SCHEMA = "elastos.model.output.object/v1";
+const MODEL_CONTENT_OUTPUT_SCHEMA = "elastos.model.output.content/v1";
 const ASSISTANT_WORKSPACE_SCHEMA = "elastos.assistant.workspace/v1";
 const ASSISTANT_CLIPBOARD_PURPOSE = "transcript.markdown";
 const MODE_CHAT = "chat";
 const MODE_BUILD = "build";
+const MODE_STUDIO = "studio";
 const MAX_SESSION_ID_BYTES = 128;
 const MAX_SESSION_TITLE_BYTES = 160;
 const MAX_MESSAGE_CONTENT_BYTES = 8 * 1024;
 const MAX_DRAFT_BYTES = 16 * 1024;
+const MAX_STUDIO_RESULT_URI_BYTES = 4 * 1024;
 const MAX_SESSIONS = 24;
 const MAX_MESSAGES_PER_SESSION = 64;
 const POLL_DELAY_MS = 400;
@@ -34,6 +40,12 @@ const BUILD_STARTERS = Object.freeze([
   "Draft a focused implementation checklist.",
 ]);
 
+const STUDIO_STARTERS = Object.freeze([
+  "Design a launch image with a calm night scene.",
+  "Generate a short product teaser with clean motion.",
+  "Make a bold poster-style concept for this idea.",
+]);
+
 function boundedText(value, maxBytes) {
   const text = String(value ?? "");
   if (TEXT_ENCODER.encode(text).length <= maxBytes) {
@@ -53,7 +65,10 @@ function boundedText(value, maxBytes) {
 }
 
 function defaultSessionTitle(mode) {
-  return mode === MODE_BUILD ? "New build" : "New chat";
+  if (mode === MODE_BUILD) {
+    return "New build";
+  }
+  return "New chat";
 }
 
 function titleFromPrompt(prompt, mode) {
@@ -74,7 +89,10 @@ function sessionPreview(session) {
       return content;
     }
   }
-  return session?.mode === MODE_BUILD ? "Build session" : "Chat session";
+  if (session?.mode === MODE_BUILD) {
+    return "Build session";
+  }
+  return "Chat session";
 }
 
 function normalizeWorkspace(workspace) {
@@ -123,9 +141,35 @@ function eligibleTextOffers(payload) {
     typeof offer.operation === "string" &&
     Array.isArray(offer.input_modalities) &&
     Array.isArray(offer.output_modalities) &&
-    offer.input_modalities.includes("text") &&
-    offer.output_modalities.includes("text"),
+    offer.input_modalities.includes("text/plain") &&
+    offer.output_modalities.includes("text/plain"),
   );
+}
+
+function eligibleStudioOffers(payload) {
+  const offers = Array.isArray(payload?.offers)
+    ? payload.offers
+    : Array.isArray(payload?.data?.offers)
+      ? payload.data.offers
+      : [];
+  return offers
+    .filter((offer) => {
+      const operation = typeof offer?.operation === "string" ? offer.operation : "";
+      return (
+        offer &&
+        typeof offer.id === "string" &&
+        typeof offer.title === "string" &&
+        (operation === "image.generate" || operation === "video.generate") &&
+        Array.isArray(offer.input_modalities) &&
+        Array.isArray(offer.output_modalities) &&
+        offer.output_modalities.includes("application/json") &&
+        offer.input_modalities.includes("application/json")
+      );
+    })
+    .map((offer) => ({
+      ...offer,
+      mediaLabel: offer.operation === "video.generate" ? "Video" : "Image",
+    }));
 }
 
 function readStatusMessage(payload, fallback) {
@@ -147,6 +191,73 @@ function parseRunEventsPage(payload) {
 function parseCursorValue(value) {
   const cursor = Number(value);
   return Number.isInteger(cursor) && cursor >= 0 ? cursor : null;
+}
+
+function studioInputSchema(operation) {
+  if (operation === "image.generate") {
+    return MODEL_IMAGE_INPUT_SCHEMA;
+  }
+  if (operation === "video.generate") {
+    return MODEL_VIDEO_INPUT_SCHEMA;
+  }
+  return "";
+}
+
+function validStudioUri(uri, prefix) {
+  return (
+    typeof uri === "string" &&
+    uri.length > prefix.length &&
+    uri === uri.trim() &&
+    uri.startsWith(prefix) &&
+    TEXT_ENCODER.encode(uri).length <= MAX_STUDIO_RESULT_URI_BYTES &&
+    !/[\u0000-\u001f\u007f]/u.test(uri)
+  );
+}
+
+function parseStudioOutput(output) {
+  if (
+    !output ||
+    typeof output !== "object" ||
+    Array.isArray(output) ||
+    Object.keys(output).length !== 2 ||
+    !Object.prototype.hasOwnProperty.call(output, "schema") ||
+    !Object.prototype.hasOwnProperty.call(output, "uri")
+  ) {
+    return null;
+  }
+  if (
+    output.schema === MODEL_OBJECT_OUTPUT_SCHEMA &&
+    validStudioUri(output.uri, "elastos://object/")
+  ) {
+    return { schema: output.schema, uri: output.uri };
+  }
+  if (
+    output.schema === MODEL_CONTENT_OUTPUT_SCHEMA &&
+    validStudioUri(output.uri, "elastos://content/")
+  ) {
+    return { schema: output.schema, uri: output.uri };
+  }
+  return null;
+}
+
+function parseStudioProgress(data) {
+  const phase =
+    typeof data?.phase === "string" && data.phase.trim() === data.phase
+      ? data.phase
+      : "";
+  const completed = Number(data?.completed);
+  const total = Number(data?.total);
+  if (
+    !phase ||
+    !Number.isInteger(completed) ||
+    !Number.isInteger(total) ||
+    completed < 0 ||
+    total < 0 ||
+    completed > total
+  ) {
+    return null;
+  }
+  return { phase, completed, total };
 }
 
 function createSessionRecord({ id, mode, title = "", pinned = false } = {}) {
@@ -252,17 +363,21 @@ function serializeWorkspace(state) {
 function initialState(homeToken) {
   return {
     homeToken,
+    activeMode: MODE_CHAT,
     offersLoading: true,
     workspaceLoading: true,
     offersError: "",
     workspaceError: "",
     statusMessage: "Loading model offers...",
     conflictMessage: "",
-    offers: [],
+    textOffers: [],
+    studioOffers: [],
     sessions: [],
     draft: "",
+    studioDraft: "",
     searchQuery: "",
     selectedOfferId: null,
+    selectedStudioOfferId: null,
     activeSessionId: "",
     deletingSessionId: "",
     renamingSessionId: "",
@@ -271,6 +386,8 @@ function initialState(homeToken) {
     activeRun: null,
     clipboardStatusMessage: "",
     copyingTranscript: false,
+    studioProgress: null,
+    studioResult: null,
     pollTimer: 0,
     saveTimer: 0,
     saving: false,
@@ -307,6 +424,12 @@ export function createAssistantApp({
 
   function snapshot() {
     const currentSession = findSession(state.sessions, state.activeSessionId);
+    const currentMode = state.activeMode;
+    const offersReady = currentMode === MODE_STUDIO ? state.studioOffers : state.textOffers;
+    const selectedOfferId =
+      currentMode === MODE_STUDIO ? state.selectedStudioOfferId : state.selectedOfferId;
+    const draft = currentMode === MODE_STUDIO ? state.studioDraft : state.draft;
+    const modeSwitchDisabled = Boolean(state.activeRun && !state.activeRun.terminal);
     const canCopyTranscript = transcriptMessages(currentSession).length > 0;
     const needle = state.searchQuery.trim().toLowerCase();
     const filteredSessions = sortSessions(state.sessions).filter((session) => {
@@ -322,12 +445,24 @@ export function createAssistantApp({
     });
     return {
       ...state,
+      currentMode,
+      modeSwitchDisabled,
       currentSession,
       filteredSessions,
-      offersReady: state.offers.filter((offer) => offer.id && offer.operation),
-      starters: (currentSession?.mode || MODE_CHAT) === MODE_BUILD ? BUILD_STARTERS : CHAT_STARTERS,
+      offersReady: offersReady.filter((offer) => offer.id && offer.operation),
+      selectedOfferId,
+      draft,
+      studioUnavailable: currentMode === MODE_STUDIO && offersReady.length === 0,
+      starters:
+        currentMode === MODE_STUDIO
+          ? STUDIO_STARTERS
+          : currentMode === MODE_BUILD
+            ? BUILD_STARTERS
+            : CHAT_STARTERS,
       copyStatusMessage: state.clipboardStatusMessage,
+      copyHidden: currentMode === MODE_STUDIO,
       copyDisabled:
+        currentMode === MODE_STUDIO ||
         !homeToken ||
         !canCopyTranscript ||
         Boolean(state.activeRun && !state.activeRun.terminal) ||
@@ -335,6 +470,8 @@ export function createAssistantApp({
       copyTitle:
         state.copyingTranscript
           ? "Copying transcript..."
+          : currentMode === MODE_STUDIO
+            ? "Transcript copy is unavailable in Studio."
           : state.activeRun && !state.activeRun.terminal
             ? "Finish the current run before copying."
             : canCopyTranscript
@@ -344,8 +481,8 @@ export function createAssistantApp({
         !homeToken ||
         state.offersLoading ||
         state.workspaceLoading ||
-        !state.selectedOfferId ||
-        !state.draft.trim() ||
+        !selectedOfferId ||
+        !draft.trim() ||
         Boolean(state.activeRun && !state.activeRun.terminal),
     };
   }
@@ -425,18 +562,34 @@ export function createAssistantApp({
       notify();
       return;
     }
-    state.offers = eligibleTextOffers(payload);
+    state.textOffers = eligibleTextOffers(payload);
+    state.studioOffers = eligibleStudioOffers(payload);
     state.offersLoading = false;
-    if (!state.offers.length) {
+    if (!state.textOffers.length && !state.studioOffers.length) {
       state.selectedOfferId = null;
+      state.selectedStudioOfferId = null;
       state.statusMessage = "No model offers available.";
       notify();
       return;
     }
-    if (!state.selectedOfferId || !state.offers.some((offer) => offer.id === state.selectedOfferId)) {
-      state.selectedOfferId = state.offers[0].id;
+    if (
+      !state.selectedOfferId ||
+      !state.textOffers.some((offer) => offer.id === state.selectedOfferId)
+    ) {
+      state.selectedOfferId = state.textOffers[0]?.id ?? null;
     }
-    if (!state.workspaceLoading && state.offers.length) {
+    if (
+      !state.selectedStudioOfferId ||
+      !state.studioOffers.some((offer) => offer.id === state.selectedStudioOfferId)
+    ) {
+      state.selectedStudioOfferId = state.studioOffers[0]?.id ?? null;
+    }
+    if (
+      !state.workspaceLoading &&
+      (state.textOffers.length || state.studioOffers.length) &&
+      (state.statusMessage === "Loading model offers..." ||
+        state.statusMessage === "No model offers available.")
+    ) {
       state.statusMessage = "";
     }
     notify();
@@ -464,11 +617,11 @@ export function createAssistantApp({
     state.sessions = workspace.sessions;
     state.draft = workspace.draft;
     state.selectedOfferId = workspace.selected_offer_id;
-    state.workspaceVersion = 0;
-    state.savedWorkspaceVersion = 0;
-    state.saveQueued = false;
-    state.workspaceLoading = false;
-    state.workspaceError = "";
+      state.workspaceVersion = 0;
+      state.savedWorkspaceVersion = 0;
+      state.saveQueued = false;
+      state.workspaceLoading = false;
+      state.workspaceError = "";
     state.conflictMessage = setNotice
       ? "Workspace changed elsewhere. Reloaded the latest saved state."
       : "";
@@ -482,10 +635,22 @@ export function createAssistantApp({
     } else if (!findSession(state.sessions, state.activeSessionId)) {
       state.activeSessionId = state.sessions[0].id;
     }
-    if (state.offers.length && (!state.selectedOfferId || !state.offers.some((offer) => offer.id === state.selectedOfferId))) {
-      state.selectedOfferId = state.offers[0].id;
+    const activeSession = findSession(state.sessions, state.activeSessionId);
+    state.activeMode = activeSession?.mode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
+    if (
+      state.textOffers.length &&
+      (!state.selectedOfferId ||
+        !state.textOffers.some((offer) => offer.id === state.selectedOfferId))
+    ) {
+      state.selectedOfferId = state.textOffers[0].id;
     }
-    if (!state.offersLoading && !state.offersError && state.offers.length) {
+    if (
+      !state.offersLoading &&
+      !state.offersError &&
+      (state.textOffers.length || state.studioOffers.length) &&
+      (state.statusMessage === "Loading model offers..." ||
+        state.statusMessage === "Assistant workspace unavailable.")
+    ) {
       state.statusMessage = "";
     }
     notify();
@@ -594,14 +759,25 @@ export function createAssistantApp({
   }
 
   function setSessionMode(mode) {
-    const session = ensureActiveSession(mode);
-    session.mode = mode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
+    if (state.activeRun && !state.activeRun.terminal) {
+      notify();
+      return false;
+    }
+    state.activeMode =
+      mode === MODE_STUDIO ? MODE_STUDIO : mode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
+    if (state.activeMode === MODE_STUDIO) {
+      notify();
+      return true;
+    }
+    const session = ensureActiveSession(state.activeMode);
+    session.mode = state.activeMode === MODE_BUILD ? MODE_BUILD : MODE_CHAT;
     if (session.messages.length === 0) {
       session.title = defaultSessionTitle(session.mode);
     }
     replaceSession(session);
     markWorkspaceDirty();
     notify();
+    return true;
   }
 
   function createSession(mode = resolveCurrentSessionMode(), { persist = true } = {}) {
@@ -615,6 +791,7 @@ export function createAssistantApp({
     });
     state.sessions = [session, ...state.sessions];
     state.activeSessionId = session.id;
+    state.activeMode = session.mode;
     state.deletingSessionId = "";
     state.renamingSessionId = "";
     state.renameValue = "";
@@ -626,10 +803,12 @@ export function createAssistantApp({
   }
 
   function selectSession(sessionId) {
-    if (!findSession(state.sessions, sessionId)) {
+    const session = findSession(state.sessions, sessionId);
+    if (!session) {
       return;
     }
     state.activeSessionId = sessionId;
+    state.activeMode = session.mode;
     state.deletingSessionId = "";
     state.renamingSessionId = "";
     state.renameValue = "";
@@ -712,19 +891,36 @@ export function createAssistantApp({
   }
 
   function setDraft(text) {
+    if (state.activeMode === MODE_STUDIO) {
+      state.studioDraft = boundedText(text, MAX_MESSAGE_CONTENT_BYTES);
+      state.studioResult = null;
+      notify();
+      return;
+    }
     state.draft = boundedText(text, MAX_DRAFT_BYTES);
     markWorkspaceDirty();
     notify();
   }
 
   function setSelectedOfferId(nextOfferId) {
+    if (state.activeMode === MODE_STUDIO) {
+      state.selectedStudioOfferId = nextOfferId || null;
+      state.studioResult = null;
+      notify();
+      return;
+    }
     state.selectedOfferId = nextOfferId || null;
     markWorkspaceDirty();
     notify();
   }
 
   function selectedOffer() {
-    return state.offers.find((offer) => offer.id === state.selectedOfferId) || null;
+    if (state.activeMode === MODE_STUDIO) {
+      return (
+        state.studioOffers.find((offer) => offer.id === state.selectedStudioOfferId) || null
+      );
+    }
+    return state.textOffers.find((offer) => offer.id === state.selectedOfferId) || null;
   }
 
   function clearPollTimer() {
@@ -743,8 +939,25 @@ export function createAssistantApp({
     run.status = terminal.status;
     run.output = terminal.output ?? null;
     run.error = terminal.error ?? null;
+    if (run.mode === MODE_STUDIO) {
+      state.studioProgress = null;
+    }
     if (terminal.status === "completed") {
-      if (terminal.output?.schema === MODEL_TEXT_OUTPUT_SCHEMA) {
+      if (run.mode === MODE_STUDIO) {
+        const output = parseStudioOutput(terminal.output);
+        if (!output) {
+          state.studioResult = null;
+          state.statusMessage = "Model provider unavailable.";
+          notify();
+          return true;
+        }
+        state.studioResult = {
+          mediaLabel: run.mediaLabel,
+          schema: output.schema,
+          uri: output.uri,
+        };
+        state.statusMessage = "";
+      } else if (terminal.output?.schema === MODEL_TEXT_OUTPUT_SCHEMA) {
         updateStreamingMessage(run.sessionId, runId, terminal.output.text || "");
         state.statusMessage = "";
       } else {
@@ -757,7 +970,9 @@ export function createAssistantApp({
     } else if (terminal.status === "settlement_unknown") {
       state.statusMessage = terminal.error?.message || "Model run settlement unknown.";
     }
-    markWorkspaceDirty();
+    if (run.mode !== MODE_STUDIO) {
+      markWorkspaceDirty();
+    }
     notify();
     return true;
   }
@@ -787,11 +1002,18 @@ export function createAssistantApp({
       if (!event || typeof event !== "object") {
         continue;
       }
-      if (event.kind === "text_delta") {
+      if (run.mode !== MODE_STUDIO && event.kind === "text_delta") {
         nextText = boundedText(
           nextText + String(event.data?.text ?? ""),
           MAX_MESSAGE_CONTENT_BYTES,
         );
+      } else if (run.mode === MODE_STUDIO && event.kind === "progress") {
+        const progress = parseStudioProgress(event.data);
+        if (!progress) {
+          stopPollingUnavailable(run, "Model provider unavailable.");
+          return false;
+        }
+        state.studioProgress = progress;
       } else if (event.kind === "output") {
         terminal = {
           status: "completed",
@@ -818,7 +1040,7 @@ export function createAssistantApp({
         };
       }
     }
-    if (nextText !== run.outputText) {
+    if (run.mode !== MODE_STUDIO && nextText !== run.outputText) {
       run.outputText = nextText;
       updateStreamingMessage(run.sessionId, run.runId, nextText);
       markWorkspaceDirty();
@@ -913,31 +1135,47 @@ export function createAssistantApp({
   }
 
   async function sendDraft() {
-    const prompt = boundedText(state.draft.trim(), MAX_MESSAGE_CONTENT_BYTES);
+    const promptSource =
+      state.activeMode === MODE_STUDIO ? state.studioDraft : state.draft;
+    const prompt = boundedText(promptSource.trim(), MAX_MESSAGE_CONTENT_BYTES);
     const offer = selectedOffer();
     if (!prompt || !offer || state.offersLoading || state.workspaceLoading) {
       notify();
       return false;
     }
-    const session = ensureActiveSession(resolveCurrentSessionMode());
-    if (session.messages.length >= MAX_MESSAGES_PER_SESSION) {
+    const isStudio = state.activeMode === MODE_STUDIO;
+    const session = isStudio ? null : ensureActiveSession(resolveCurrentSessionMode());
+    if (session && session.messages.length >= MAX_MESSAGES_PER_SESSION) {
       setStatus("Assistant session is full.");
       return false;
     }
-    appendUserMessage(session, prompt);
-    state.draft = "";
+    if (session) {
+      appendUserMessage(session, prompt);
+      state.draft = "";
+    } else {
+      state.studioProgress = null;
+      state.studioResult = null;
+    }
+    const inputSchema = isStudio ? studioInputSchema(offer.operation) : MODEL_TEXT_INPUT_SCHEMA;
+    if (!inputSchema) {
+      state.statusMessage = "Model provider unavailable.";
+      notify();
+      return false;
+    }
     const { response, payload } = await requestJson("/api/provider/model/runs_create", {
       offer_id: offer.id,
       operation: offer.operation,
       request_id: cryptoRef.randomUUID(),
       input: {
-        schema: MODEL_TEXT_INPUT_SCHEMA,
+        schema: inputSchema,
         prompt,
       },
     });
     if (!response.ok || payload?.status === "error") {
       state.statusMessage = readStatusMessage(payload, "Model provider unavailable.");
-      markWorkspaceDirty();
+      if (session) {
+        markWorkspaceDirty();
+      }
       notify();
       return false;
     }
@@ -948,9 +1186,14 @@ export function createAssistantApp({
       notify();
       return false;
     }
+    if (isStudio) {
+      state.studioDraft = "";
+    }
     state.activeRun = {
       runId,
-      sessionId: session.id,
+      sessionId: session?.id || "",
+      mode: isStudio ? MODE_STUDIO : session.mode,
+      mediaLabel: offer.mediaLabel || "",
       afterSequence: parseCursorValue(runView.sequence_cursor) ?? 0,
       outputText: "",
       terminal: false,
@@ -958,11 +1201,14 @@ export function createAssistantApp({
       status: runView.status || "running",
       output: null,
       error: null,
+      progress: null,
       pollErrorCount: 0,
       pollDeadlineAt: nowFn() + MAX_POLL_ERROR_WINDOW_MS,
     };
-    updateStreamingMessage(session.id, runId, "");
-    markWorkspaceDirty();
+    if (session) {
+      updateStreamingMessage(session.id, runId, "");
+      markWorkspaceDirty();
+    }
     notify();
     if (!applyRunView(runView)) {
       void pollRun(state.activeRun);
@@ -1119,6 +1365,9 @@ function renderSessionList(view) {
 }
 
 function renderMessages(view) {
+  if (view.currentMode === MODE_STUDIO) {
+    return "";
+  }
   const session = view.currentSession;
   if (!session || !session.messages.length) {
     return "";
@@ -1166,6 +1415,12 @@ export function mountAssistantApp(root, app) {
   const emptyTitleNode = root.querySelector("#assistant-empty-title");
   const emptyCopyNode = root.querySelector("#assistant-empty-copy");
   const startersNode = root.querySelector("#assistant-starters");
+  const studioPanelNode = root.querySelector("#assistant-studio-panel");
+  const studioTitleNode = root.querySelector("#assistant-studio-title");
+  const studioCopyNode = root.querySelector("#assistant-studio-copy");
+  const studioProgressNode = root.querySelector("#assistant-studio-progress");
+  const studioResultNode = root.querySelector("#assistant-studio-result");
+  const studioResultUriNode = root.querySelector("#assistant-studio-result-uri");
   const statusNode = root.querySelector("#assistant-status");
   const conflictNode = root.querySelector("#assistant-conflict");
   const searchNode = root.querySelector("#assistant-session-search");
@@ -1179,54 +1434,87 @@ export function mountAssistantApp(root, app) {
   const newSessionNode = root.querySelector("#assistant-new-session");
   const chatNode = root.querySelector("#assistant-mode-chat");
   const buildNode = root.querySelector("#assistant-mode-build");
+  const studioNode = root.querySelector("#assistant-mode-studio");
 
   function render(view) {
+    const studioActive = view.currentMode === MODE_STUDIO;
+    const runningStudio = studioActive && view.activeRun && !view.activeRun.terminal;
     statusNode.hidden = !view.statusMessage;
     statusNode.textContent = view.statusMessage || "";
     conflictNode.hidden = !view.conflictMessage;
     conflictNode.textContent = view.conflictMessage || "";
     sessionListNode.innerHTML = renderSessionList(view);
     messageListNode.innerHTML = renderMessages(view);
-    emptyStateNode.hidden = Boolean(view.currentSession?.messages?.length);
+    messageListNode.hidden = studioActive;
+    emptyStateNode.hidden = studioActive || Boolean(view.currentSession?.messages?.length);
+    studioPanelNode.hidden = !studioActive;
     emptyTitleNode.textContent =
-      view.currentSession?.mode === MODE_BUILD ? "Start a build session" : "Start a chat session";
+      view.currentMode === MODE_BUILD ? "Start a build session" : "Start a chat session";
     emptyCopyNode.textContent =
-      view.currentSession?.mode === MODE_BUILD
+      view.currentMode === MODE_BUILD
         ? "Choose a starter prompt or write the next step."
         : "Choose a starter prompt or write your own.";
+    studioTitleNode.textContent = runningStudio
+      ? `Generating ${String(view.activeRun?.mediaLabel || "media").toLowerCase()}`
+      : view.studioResult
+        ? `${view.studioResult.mediaLabel} ready`
+        : "Start a studio run";
+    studioCopyNode.textContent = view.studioUnavailable
+      ? "No image or video offers available."
+      : view.studioResult
+        ? "Your latest Studio result is ready."
+        : "Choose an offer and write a prompt.";
+    studioProgressNode.hidden = !view.studioProgress;
+    studioProgressNode.textContent = view.studioProgress
+      ? `${view.studioProgress.phase} ${view.studioProgress.completed}/${view.studioProgress.total}`
+      : "";
+    studioResultNode.hidden = !view.studioResult;
+    studioResultUriNode.textContent = view.studioResult?.uri || "";
     startersNode.innerHTML = renderStarters(view);
     searchNode.value = view.searchQuery;
     draftNode.value = view.draft;
     metaNode.textContent = view.saving
       ? "Saving..."
-      : view.activeRun && !view.activeRun.terminal
-        ? "Running..."
+      : runningStudio && view.studioProgress
+        ? `${view.studioProgress.phase} ${view.studioProgress.completed}/${view.studioProgress.total}`
+        : view.activeRun && !view.activeRun.terminal
+          ? "Running..."
         : "Ready";
+    draftNode.placeholder = studioActive ? "Describe the image or video" : "Ask Assistant";
+    sendNode.textContent = studioActive ? "Generate" : "Send";
     sendNode.disabled = view.sendDisabled;
     stopNode.hidden = !(view.activeRun && !view.activeRun.terminal);
     chatNode.setAttribute(
       "aria-selected",
-      String((view.currentSession?.mode || MODE_CHAT) === MODE_CHAT),
+      String(view.currentMode === MODE_CHAT),
     );
+    chatNode.disabled = view.modeSwitchDisabled;
     buildNode.setAttribute(
       "aria-selected",
-      String((view.currentSession?.mode || MODE_CHAT) === MODE_BUILD),
+      String(view.currentMode === MODE_BUILD),
     );
+    buildNode.disabled = view.modeSwitchDisabled;
+    studioNode.setAttribute("aria-selected", String(view.currentMode === MODE_STUDIO));
+    studioNode.disabled = view.modeSwitchDisabled;
     offerNode.innerHTML = "";
+    copyNode.hidden = view.copyHidden;
     copyNode.disabled = view.copyDisabled;
     copyNode.title = view.copyTitle;
     copyStatusNode.textContent = view.copyStatusMessage || "";
+    copyStatusNode.hidden = view.copyHidden;
     if (!view.offersReady.length) {
       const option = document.createElement("option");
       option.value = "";
-      option.textContent = "No text offers";
+      option.textContent = studioActive ? "No image or video offers" : "No text offers";
       offerNode.append(option);
       offerNode.disabled = true;
     } else {
       for (const offer of view.offersReady) {
         const option = document.createElement("option");
         option.value = offer.id;
-        option.textContent = offer.title;
+        option.textContent = studioActive
+          ? `${offer.title} - ${offer.mediaLabel}`
+          : offer.title;
         option.selected = offer.id === view.selectedOfferId;
         offerNode.append(option);
       }
@@ -1309,6 +1597,11 @@ export function mountAssistantApp(root, app) {
 
   buildNode.addEventListener("click", () => {
     app.setSessionMode(MODE_BUILD);
+    rerender();
+  });
+
+  studioNode.addEventListener("click", () => {
+    app.setSessionMode(MODE_STUDIO);
     rerender();
   });
 
