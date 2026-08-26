@@ -1539,7 +1539,6 @@ dependencies = [
  "elastos-guest",
  "serde_json",
  "tokio",
- "tracing",
  "uuid",
  "wasmtime",
 ]
@@ -1551,13 +1550,13 @@ dependencies = [
  "async-trait",
  "elastos-common",
  "elastos-compute",
+ "elastos-logger",
  "libc",
  "nix",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -1565,6 +1564,7 @@ dependencies = [
 name = "elastos-guest"
 version = "0.1.0"
 dependencies = [
+ "elastos-logger",
  "libc",
  "serde",
  "serde_json",
@@ -1581,6 +1581,7 @@ dependencies = [
  "bs58",
  "ciborium",
  "ed25519-dalek 2.2.0",
+ "elastos-logger",
  "hex",
  "hkdf",
  "p256",
@@ -1588,9 +1589,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "elastos-logger"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
 ]
 
 [[package]]
@@ -1602,6 +1612,7 @@ dependencies = [
  "cid",
  "ed25519-dalek 2.2.0",
  "elastos-common",
+ "elastos-logger",
  "hex",
  "multihash",
  "serde",
@@ -1609,7 +1620,6 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1624,6 +1634,7 @@ dependencies = [
  "elastos-auth",
  "elastos-common",
  "elastos-compute",
+ "elastos-logger",
  "elastos-namespace",
  "elastos-storage",
  "flate2",
@@ -1636,7 +1647,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
  "uuid",
 ]
 
@@ -1663,6 +1673,7 @@ dependencies = [
  "elastos-compute",
  "elastos-crosvm",
  "elastos-identity",
+ "elastos-logger",
  "elastos-namespace",
  "elastos-runtime",
  "elastos-storage",
@@ -1693,8 +1704,6 @@ dependencies = [
  "tokio",
  "toml",
  "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
  "url",
  "wasmparser 0.236.1",
  "zip",
@@ -1707,6 +1716,7 @@ dependencies = [
  "async-trait",
  "dirs",
  "elastos-common",
+ "elastos-logger",
  "futures",
  "hex",
  "lru 0.18.2",
@@ -1717,7 +1727,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -1726,11 +1735,11 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum-server",
+ "elastos-logger",
  "rcgen",
  "time",
  "tokio",
  "tokio-rustls",
- "tracing",
 ]
 
 [[package]]
