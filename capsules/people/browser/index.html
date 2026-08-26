@@ -47,6 +47,10 @@
                 <button id="profile-submit" type="submit">Create Profile</button>
               </form>
             </section>
+            <div class="people-section-head">
+              <h3 id="people-list-title">Contacts</h3>
+              <span id="people-count" class="people-section-count" aria-live="polite">0 contacts</span>
+            </div>
             <div id="people-list" class="people-list"></div>
           </section>
 
@@ -67,14 +71,18 @@
               </div>
             </section>
             <div class="discovery-grid">
-              <section aria-labelledby="discovery-visible-title">
-                <h3 id="discovery-visible-title">Visible people</h3>
-                <p>People who chose to be visible.</p>
+              <section class="people-list-section" aria-labelledby="discovery-visible-title">
+                <div class="people-section-head">
+                  <h3 id="discovery-visible-title">Visible people</h3>
+                  <span id="discovery-visible-count" class="people-section-count" aria-live="polite">0 visible</span>
+                </div>
                 <div id="discovery-list" class="people-list"></div>
               </section>
-              <section aria-labelledby="discovery-requests-title">
-                <h3 id="discovery-requests-title">Requests</h3>
-                <p>People who want to connect.</p>
+              <section class="people-list-section" aria-labelledby="discovery-requests-title">
+                <div class="people-section-head">
+                  <h3 id="discovery-requests-title">Requests</h3>
+                  <span id="discovery-requests-count" class="people-section-count" aria-live="polite">0 requests</span>
+                </div>
                 <div id="discovery-requests-list" class="people-list"></div>
               </section>
             </div>

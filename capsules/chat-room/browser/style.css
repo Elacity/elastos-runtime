@@ -874,6 +874,10 @@ button.secondary {
   background: var(--el-inset);
 }
 
+.composer-field[data-multiline="true"] {
+  border-radius: 1.25rem;
+}
+
 .composer-field .composer-emoji-toggle {
   width: 2.1rem;
   height: 2.1rem;
@@ -968,6 +972,15 @@ body[data-room-access-mode="shell"][data-room-session-active="false"] .roster-he
 @media (max-width: 760px) {
   .chat-shell {
     grid-template-columns: 72px minmax(0, 1fr);
+  }
+
+  body[data-room-compact-rail="hidden"] .chat-shell {
+    grid-template-columns: minmax(0, 1fr);
+    background: var(--bg);
+  }
+
+  body[data-room-compact-rail="hidden"] .chat-sidebar {
+    display: none;
   }
 
   .chat-sidebar {

@@ -20,6 +20,7 @@ export function createLibraryDialog({
   onBeforeClose,
 }) {
   let pendingDialogResolve = null;
+  const propertyCopyResetTimers = new WeakMap();
 
   function showProperties(object) {
     const identity = smartWebIdentity(object);
@@ -148,7 +149,7 @@ export function createLibraryDialog({
         html: `
           <span class="props-copy-value">
             <code class="props-copy-text">${escapeHtml(text)}</code>
-            <button class="props-copy-btn" type="button" data-prop-copy="${escapeHtml(text)}" data-copy-label="${escapeHtml(label)}" data-copy-purpose="${escapeHtml(purpose)}" title="Copy ${escapeHtml(label)}">
+            <button class="props-copy-btn el-copy-btn" type="button" data-prop-copy="${escapeHtml(text)}" data-copy-label="${escapeHtml(label)}" data-copy-purpose="${escapeHtml(purpose)}" title="Copy ${escapeHtml(label)}">
               ${copyIconSvg()}
             </button>
           </span>
@@ -179,7 +180,38 @@ export function createLibraryDialog({
   }
 
   function copyIconSvg() {
-    return '<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+    return [
+      '<svg class="el-copy-icon" aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
+      '<svg class="el-copy-check" aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" hidden><path d="M3.25 8.25l3 3 6.5-6.5"></path></svg>',
+    ].join("");
+  }
+
+  function setPropertyCopyFeedback(button, label, copied) {
+    const pendingReset = propertyCopyResetTimers.get(button);
+    if (pendingReset) {
+      clearTimeout(pendingReset);
+      propertyCopyResetTimers.delete(button);
+    }
+    const copyIcon = button.querySelector(".el-copy-icon");
+    const checkIcon = button.querySelector(".el-copy-check");
+    if (!copied) {
+      button.classList.remove("copied");
+      delete button.dataset.copied;
+      button.removeAttribute("aria-label");
+      if (copyIcon) copyIcon.hidden = false;
+      if (checkIcon) checkIcon.hidden = true;
+      return;
+    }
+    button.classList.add("copied");
+    button.dataset.copied = "true";
+    button.setAttribute("aria-label", `Copied ${label}`);
+    if (copyIcon) copyIcon.hidden = true;
+    if (checkIcon) checkIcon.hidden = false;
+    const timer = setTimeout(() => {
+      propertyCopyResetTimers.delete(button);
+      setPropertyCopyFeedback(button, label, false);
+    }, 1400);
+    propertyCopyResetTimers.set(button, timer);
   }
 
   function propertiesVisibilitySummary(object = {}, identity = {}, remoteAccess = {}) {
@@ -876,14 +908,11 @@ export function createLibraryDialog({
         if (value && copyText) {
           copyText(value, label, purpose)
             .then(() => {
-              propertyCopy.classList.add("copied");
-              propertyCopy.setAttribute("aria-label", `Copied ${label}`);
-              setTimeout(() => {
-                propertyCopy.classList.remove("copied");
-                propertyCopy.removeAttribute("aria-label");
-              }, 1200);
+              setPropertyCopyFeedback(propertyCopy, label, true);
             })
-            .catch(() => {});
+            .catch(() => {
+              setPropertyCopyFeedback(propertyCopy, label, false);
+            });
         }
         return;
       }
