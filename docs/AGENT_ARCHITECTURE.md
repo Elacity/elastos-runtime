@@ -353,9 +353,8 @@ The repository already establishes several parts of this model:
   distinct from the local principal, passkey, and device DID.
 - The `people` App is the current Profile and contacts surface; Profile
   authority remains Runtime-owned rather than becoming a Profile capsule.
-- Capability and audit policy already applies to `elastos://ai/*` resources.
-- The installed provider set includes `ai-provider` and `llama-provider` for
-  Runtime-mediated model access.
+- Capability and audit policy already applies to typed model-provider
+  resources.
 - The old terminal `chat` and `agent` source capsules are retired. Product Chat
   is the `chat-room` App; no general Agent Host is currently in the install set.
 - The architecture already separates mutable capsule state from immutable

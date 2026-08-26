@@ -1,0 +1,16 @@
+[package]
+name = "model-provider"
+version = "0.1.0"
+edition = "2021"
+description = "ElastOS model provider - typed local model service"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+elastos-model-contract = { path = "../../elastos/crates/elastos-model-contract" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+url = "2.5"

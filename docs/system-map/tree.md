@@ -121,12 +121,12 @@ Primary implementation areas are the Runtime capability and provider registry,
 private-network product is implemented. See the
 [private network contract](../PRIVATE_NETWORK.md) and current `state.md`.
 
-## AI path
+## Model path
 
-The component catalog includes `ai-provider` and `llama-provider` behind Runtime
-AI policy. Exact profile membership and dependency closure come from
-`components.json`. The retired terminal `chat` and `agent` source capsules are
-not the product architecture. Product Chat is `chat-room`.
+The component catalog includes `model-provider` behind Runtime authorization.
+Exact profile membership and dependency closure come from `components.json`. The
+retired terminal `chat` and `agent` source capsules are not the product
+architecture. Product Chat is `chat-room`.
 
 A general Agent Host with durable task sessions and governed tools is target
 architecture, not a shipped claim. See

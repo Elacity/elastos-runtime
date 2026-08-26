@@ -202,6 +202,7 @@ test("client accepts the closed first-party write purposes", async () => {
     ["library", "resource.uri", "object:private/document-1"],
     ["library", "resource.identifier", "bafy-library-content"],
     ["documents", "resource.uri", "elastos://bafy-document"],
+    ["assistant", "transcript.markdown", "# Assistant transcript\n\n## User\n\nHello"],
   ];
   for (const [targetId, purpose, text] of cases) {
     const f = fixture(targetId);

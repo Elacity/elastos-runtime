@@ -669,6 +669,9 @@ const activeUiFiles = [
   "capsules/home-cli/browser/index.html",
   "capsules/home-cli/browser/home-cli.js",
   "capsules/home-cli/browser/style.css",
+  "capsules/assistant/browser/index.html",
+  "capsules/assistant/browser/assistant.js",
+  "capsules/assistant/browser/style.css",
   "capsules/system/browser/index.html",
   "capsules/system/browser/system.js",
   "capsules/system/browser/esp-projections.mjs",
@@ -722,6 +725,7 @@ const activeUiFiles = [
 const activeHtmlFiles = [
   "capsules/home/browser/index.html",
   "capsules/home-cli/browser/index.html",
+  "capsules/assistant/browser/index.html",
   "capsules/system/browser/index.html",
   "capsules/wallet-metamask/browser/index.html",
   "capsules/wallet-unisat/browser/index.html",
@@ -828,6 +832,97 @@ for (const [token, value] of new Map([
     "Chat Room must load the vendored token sheet and theme runtime it maps onto",
   );
 }
+
+const assistantIndex = read("capsules/assistant/browser/index.html");
+const assistantScript = read("capsules/assistant/browser/assistant.js");
+const assistantStyle = read("capsules/assistant/browser/style.css");
+const assistantGateway = read(
+  "elastos/crates/elastos-server/src/api/gateway_assistant.rs",
+);
+const gatewaySource = read("elastos/crates/elastos-server/src/api/gateway.rs");
+
+assert(
+  assistantIndex.includes('<script type="module" src="./assistant.js"></script>'),
+  "Assistant must boot through its capsule-owned browser shell",
+);
+assert(
+  !/\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b/.test(assistantScript),
+  "Assistant must not add browser-owned persistence",
+);
+assert(
+  assistantScript.includes("/api/apps/assistant/workspace") &&
+    !assistantScript.includes("workspace.json") &&
+    !assistantScript.includes("session.agent"),
+  "Assistant shell must use the dedicated Runtime workspace route without reaching for Home session.agent or raw path literals",
+);
+assert(
+  assistantScript.includes('/apps/home/home-clipboard-client.js?v=home-20260726a') &&
+    !/home:clipboard-request|home:clipboard-ready|home:clipboard-result|home:clipboard-cancel/.test(
+      assistantScript,
+    ),
+  "Assistant must use the trusted Home Clipboard client without reimplementing the Clipboard protocol",
+);
+assert(
+  !/\bnavigator\.clipboard\b|\bexecCommand\b/.test(assistantScript),
+  "Assistant must not add direct clipboard fallbacks",
+);
+assert(
+  !/offer:flash-chat:pair-a|offer:h3-video:2x|mock-agent-provider|install catalog/i.test(
+    assistantScript,
+  ) &&
+    !/(["'](?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)["']\s*:|\b(?:runtime_binding|principal_id|session_id|grant_id|backend_url|api_key|bearer)\s*:)/i.test(
+      assistantScript,
+    ),
+  "Assistant shell must not hardcode donor offer IDs or reintroduce mock, grant, install, or authority fields",
+);
+assert(
+  !/assistant-message-meta|typed text runs only|Build mode uses the same typed text runs/i.test(
+    assistantScript,
+  ),
+  "Assistant shell must not render run ids or visible contract wording",
+);
+assert(
+  !/localStorage|sessionStorage|indexedDB|navigator\.clipboard|execCommand/i.test(
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+  ),
+  "Assistant capsule source must not introduce browser-owned storage or direct clipboard authority",
+);
+assert(
+  !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
+    `${assistantIndex}\n${assistantScript}\n${assistantStyle}`,
+  ),
+  "Assistant capsule source must not expose backend endpoints, topology, or credentials",
+);
+assert(
+  (gatewaySource.match(/\/api\/apps\/assistant\/workspace/g) || []).length === 1,
+  "Assistant workspace must expose exactly one dedicated Runtime route",
+);
+assert(
+  (assistantGateway.match(/elastos\.assistant\.workspace\/v1/g) || []).length >= 1,
+  "Assistant workspace must use one bounded v1 schema",
+);
+assert(
+  (assistantGateway.match(
+    /const ASSISTANT_WORKSPACE_RELATIVE_ROOT: &str = "\.AppData\/ElastOS\/Assistant";/g,
+  ) || []).length === 1 &&
+    (assistantGateway.match(
+      /const ASSISTANT_WORKSPACE_FILE: &str = "workspace\.json";/g,
+    ) || []).length === 1 &&
+    (assistantGateway.match(/fn assistant_workspace_uri\(/g) || []).length === 1 &&
+    (assistantGateway.match(/\.AppData\/ElastOS\/Assistant\/workspace\.json/g) || []).length === 0,
+  "Assistant workspace must use exactly one protected principal-root file",
+);
+assert(
+  assistantGateway.includes("read_principal_root_object(") &&
+    assistantGateway.includes("write_protected_principal_root_object("),
+  "Assistant workspace must use the principal-root protected-object APIs",
+);
+assert(
+  !/https?:\/\/|ws:\/\/|wss:\/\/|127\.0\.0\.1|carrier_route|connect_ticket|backend_url|api_key|bearer/i.test(
+    assistantGateway,
+  ),
+  "Assistant workspace route must not encode backend endpoints, topology, or credentials",
+);
 
 // Inbox took the shared token sheet, so pinning its own hex palette here
 // would pin a copy of someone else's decision. The stronger rule: every name
@@ -1092,7 +1187,6 @@ const appSurfaceCapsuleManifests = Object.fromEntries(
 );
 const providerCapsuleManifests = Object.fromEntries(
   [
-    "ai-provider",
     "availability-provider",
     "browser-engine-adapter",
     "chain-provider",
@@ -1103,7 +1197,7 @@ const providerCapsuleManifests = Object.fromEntries(
     "exit-provider",
     "ipfs-provider",
     "key-provider",
-    "llama-provider",
+    "model-provider",
     "net-provider",
     "object-provider",
     "operator-drive-adapter",
@@ -1117,6 +1211,14 @@ const firstPartyCapsuleManifests = {
   ...appSurfaceCapsuleManifests,
   ...providerCapsuleManifests,
 };
+assert(
+  !fileExists("capsules/ai-provider/capsule.json"),
+  "legacy ai-provider manifest must be absent",
+);
+assert(
+  !fileExists("capsules/llama-provider/capsule.json"),
+  "legacy llama-provider manifest must be absent",
+);
 const coreCapsuleManifests = {
   home: homeCapsuleManifest,
   "home-gui": homeGuiCapsuleManifest,
@@ -2279,6 +2381,8 @@ assert(
     homeClipboardProtocol.includes('"browser.text"') &&
     homeClipboardProtocol.includes('"wallet.address"') &&
     homeClipboardProtocol.includes('"wallet.recovery-key"') &&
+    homeClipboardProtocol.includes("assistant: Object.freeze({") &&
+    homeClipboardProtocol.includes('"transcript.markdown"') &&
     homeClipboardProtocol.includes('"resource.identifier"') &&
     homeClipboardProtocol.includes('"resource.uri"') &&
     homeClipboardProtocol.includes(
@@ -5549,7 +5653,8 @@ assert(
   "Object provider must be the only provider capsule authority metadata for every routed operation",
 );
 assert(
-  serverInfra.includes('find_installed_provider_binary("object-provider")') &&
+  serverInfra.includes('resolve_verified_native_provider_binary("object-provider")') &&
+    !serverInfra.includes('find_installed_provider_binary("object-provider")') &&
     !serverInfra.includes(
       `find_installed_provider_binary("${retiredObjectProviderMarkers.oldBinary}")`,
     ) &&

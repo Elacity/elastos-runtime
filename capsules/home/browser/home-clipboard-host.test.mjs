@@ -211,6 +211,7 @@ test("closed target and purpose policy accepts only approved writes", async () =
     ["library", "resource.uri", "object:private/document-1"],
     ["library", "resource.identifier", "bafy-library-content"],
     ["documents", "resource.uri", "elastos://bafy-document"],
+    ["assistant", "transcript.markdown", "# Assistant transcript\n\n## User\n\nHello"],
   ];
   for (const [targetId, purpose, text] of cases) {
     const writes = [];
@@ -229,6 +230,47 @@ test("closed target and purpose policy accepts only approved writes", async () =
   }
 });
 
+test("Assistant transcript prompt is explicit and does not render conversation text", async () => {
+  function node() {
+    const listeners = new Map();
+    return {
+      hidden: true,
+      textContent: "",
+      addEventListener(type, listener) {
+        listeners.set(type, listener);
+      },
+      click() {
+        listeners.get("click")?.();
+      },
+      setAttribute() {},
+      focus() {},
+    };
+  }
+  const root = node();
+  const title = node();
+  const copy = node();
+  const allowButton = node();
+  const transcript = "# Assistant transcript\n\n## User\n\nprivate text";
+  const prompt = createHomeClipboardPrompt({
+    root,
+    title,
+    copy,
+    allowButton,
+    cancelButton: node(),
+  });
+  const decision = prompt.request({
+    requestId: "assistant:1",
+    targetId: "assistant",
+    operation: "write",
+    purpose: "transcript.markdown",
+    text: transcript,
+  });
+  assert.match(title.textContent, /Assistant transcript/);
+  assert.match(copy.textContent, /Markdown/);
+  assert.equal(`${title.textContent}${copy.textContent}`.includes(transcript), false);
+  allowButton.click();
+  assert.equal(await decision, true);
+});
 test("Recovery Key prompt classifies secret material without receiving its payload", async () => {
   function node() {
     const listeners = new Map();

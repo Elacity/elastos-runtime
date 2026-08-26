@@ -1,0 +1,82 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "model-provider",
+  "version": "0.1.0",
+  "description": "Model service provider for typed offers and durable runs behind Runtime authorization",
+  "author": "elastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://model/*",
+  "authority": {
+    "reason": "Runtime mediates authorization while the provider owns backend selection, credentials, offer configuration, and durable run lifecycle/state.",
+    "capabilities": [
+      {
+        "resource": "elastos://model/*",
+        "actions": ["read", "execute"],
+        "operations": ["offers_list", "runs_create", "runs_get", "runs_events", "runs_cancel"]
+      }
+    ],
+    "audit_events": ["model.offers_list", "model.run.create", "model.run.read", "model.run.events", "model.run.cancel"]
+  },
+  "interfaces": [
+    {
+      "id": "elastos.provider.model",
+      "version": "0.1.0",
+      "description": "Runtime provider affordance descriptors projected from model-provider authority metadata; descriptors are not grants.",
+      "methods": [
+        {
+          "id": "offers_list",
+          "description": "List typed model offers through the model-provider Runtime provider boundary.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "offers_list"
+        },
+        {
+          "id": "runs_create",
+          "description": "Create a typed model run through the model-provider Runtime provider boundary.",
+          "risk": "privileged",
+          "approval": "runtime_policy",
+          "audit": "full",
+          "resource": "elastos://model/*",
+          "operation": "runs_create"
+        },
+        {
+          "id": "runs_get",
+          "description": "Read typed model run state through the model-provider Runtime provider boundary.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "runs_get"
+        },
+        {
+          "id": "runs_events",
+          "description": "Read typed model run events through the model-provider Runtime provider boundary.",
+          "risk": "read",
+          "approval": "runtime_policy",
+          "audit": "summary",
+          "resource": "elastos://model/*",
+          "operation": "runs_events"
+        },
+        {
+          "id": "runs_cancel",
+          "description": "Cancel a typed model run through the model-provider Runtime provider boundary.",
+          "risk": "privileged",
+          "approval": "runtime_policy",
+          "audit": "full",
+          "resource": "elastos://model/*",
+          "operation": "runs_cancel"
+        }
+      ]
+    }
+  ],
+  "capabilities": [],
+  "resources": {
+    "memory_mb": 256,
+    "gpu": false
+  },
+  "permissions": {}
+}

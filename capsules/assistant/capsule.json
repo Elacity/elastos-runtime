@@ -1,0 +1,21 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "assistant",
+  "version": "0.1.0",
+  "description": "Assistant capsule for typed model access through Runtime authorization.",
+  "author": "elastos",
+  "role": "app",
+  "type": "wasm",
+  "runtime_abi": "elastos.runtime-projection/v1",
+  "bus_contract": "elastos.runtime-projection/v1",
+  "execution": "web-projection",
+  "projections": ["web", "facts", "affordances", "gates"],
+  "entrypoint": "browser/index.html",
+  "icon": "browser/icons",
+  "interfaces": [
+    {
+      "name": "assistant",
+      "description": "Minimal Assistant shell for typed model offer discovery through Runtime authorization."
+    }
+  ]
+}

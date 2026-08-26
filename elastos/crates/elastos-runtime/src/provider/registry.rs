@@ -4,8 +4,8 @@
 //! Supports hierarchical `elastos://` sub-dispatch: `elastos://peer/alice`
 //! routes to the `peer` sub-provider with path `alice`.
 //!
-//! All first-party providers (did, peer, ai) use the `elastos://` namespace
-//! exclusively: `elastos://did/*`, `elastos://peer/*`, `elastos://ai/*`.
+//! All first-party providers (did, peer, model) use the `elastos://` namespace
+//! exclusively: `elastos://did/*`, `elastos://peer/*`, `elastos://model/*`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -475,8 +475,7 @@ pub trait Provider: Send + Sync {
 const RESERVED_SUB_NAMES: &[&str] = &[
     "peer",
     "did",
-    "ai",
-    "llama",
+    "model",
     "ipfs",
     "content",
     "tunnel",
@@ -2366,6 +2365,7 @@ mod tests {
 
         for name in [
             "chain",
+            "model",
             "wallet",
             "drm",
             "rights",

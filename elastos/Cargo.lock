@@ -1599,6 +1599,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "elastos-model-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "elastos-namespace"
 version = "0.6.0"
 dependencies = [
@@ -1669,6 +1678,7 @@ dependencies = [
  "elastos-compute",
  "elastos-crosvm",
  "elastos-identity",
+ "elastos-model-contract",
  "elastos-namespace",
  "elastos-runtime",
  "elastos-storage",

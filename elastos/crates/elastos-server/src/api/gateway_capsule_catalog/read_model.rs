@@ -305,7 +305,6 @@ fn capsule_category(role: &CapsuleRole) -> &'static str {
 
 fn capsule_title(name: &str) -> String {
     let service_title = match name {
-        "ai-provider" => Some("AI"),
         "availability-provider" => Some("Content Availability"),
         "browser-engine-adapter" => Some("Browser Engine"),
         "chain-provider" => Some("Chains"),
@@ -316,7 +315,6 @@ fn capsule_title(name: &str) -> String {
         "exit-provider" => Some("Browser Exit"),
         "ipfs-provider" => Some("Content Storage"),
         "key-provider" => Some("Key Access"),
-        "llama-provider" => Some("Local AI"),
         "net-provider" => Some("Network"),
         "object-provider" => Some("Storage"),
         "operator-drive-adapter" => Some("Drive"),

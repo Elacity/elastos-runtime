@@ -524,29 +524,48 @@ configure_rust_toolchain_env "$CARGO_BIN"
 export PATH="$(dirname "$CARGO_BIN"):$(dirname "$NODE_BIN"):${PATH}"
 require_supported_rust "$(command -v rustc)"
 
-provider_names() {
-    printf '%s\n' \
-        did-provider \
-        net-provider \
-        exit-provider \
-        browser-engine-adapter \
-        browser-local-exit \
-        wallet-provider \
-        chain-provider
+provider_runtime_names() {
+    COMPONENTS_SRC="${ROOT}/components.json" python3 - <<'PY'
+import json
+import os
+import pathlib
+
+manifest = json.loads(pathlib.Path(os.environ["COMPONENTS_SRC"]).read_text())
+for name, component in manifest.get("external", {}).items():
+    runtime = component.get("provider_runtime")
+    if not isinstance(runtime, dict):
+        continue
+    if runtime.get("role") != "provider":
+        raise SystemExit(f"{name} provider_runtime.role must be provider")
+    if runtime.get("substrate") != "native":
+        raise SystemExit(f"{name} provider_runtime.substrate must be native")
+    if runtime.get("runtime_abi") != "elastos.provider-stdio/v1":
+        raise SystemExit(f"{name} provider_runtime.runtime_abi must be elastos.provider-stdio/v1")
+    if runtime.get("execution") != "native-provider":
+        raise SystemExit(f"{name} provider_runtime.execution must be native-provider")
+    provides = runtime.get("provides")
+    if not isinstance(provides, str) or not provides:
+        raise SystemExit(f"{name} provider_runtime.provides must be a non-empty string")
+    print(name)
+PY
+}
+
+source_home_helper_binary_names() {
+    printf '%s\n' "browser-local-exit"
     if [[ "$(uname -s)" == "Linux" ]]; then
         printf '%s\n' \
             browser-engine-supervisor \
             browser-native-proxy-engine \
             browser-stream-bridge
     fi
-    printf '%s\n' \
-        webspace-provider \
-        object-provider \
-        content-block-graph-provider \
-        ipfs-provider
 }
 
-PROVIDER_NAMES_JSON="$(provider_names | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
+source_home_binary_names() {
+    provider_runtime_names
+    source_home_helper_binary_names
+}
+
+SOURCE_HOME_BINARY_NAMES_JSON="$(source_home_binary_names | python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))')"
 
 APP_CAPSULES=(
     home-cli
@@ -561,6 +580,7 @@ APP_CAPSULES=(
     marketplace
     archive-manager
     inbox
+    assistant
     wallet
     wallet-metamask
     wallet-unisat
@@ -582,6 +602,8 @@ RETIRED_SOURCE_HOME_CAPSULES=(
 
 RETIRED_SOURCE_HOME_PROVIDER_BINARIES=(
     gba-engine-provider
+    ai-provider
+    llama-provider
 )
 
 collaboration_startup_config_destination() {
@@ -1578,7 +1600,7 @@ stamp_source_home_components_manifest() {
     COMPONENTS_DEST="${DATA_DIR}/components.json" \
     DATA_DIR="${DATA_DIR}" \
     SETUP_PLATFORM="${PLATFORM}" \
-    PROVIDER_NAMES_JSON="${PROVIDER_NAMES_JSON}" \
+    SOURCE_HOME_BINARY_NAMES_JSON="${SOURCE_HOME_BINARY_NAMES_JSON}" \
     APP_CAPSULES_JSON="${APP_CAPSULES_JSON}" \
     python3 - <<'PY'
 import hashlib
@@ -1594,8 +1616,7 @@ platform = os.environ["SETUP_PLATFORM"]
 manifest = json.loads(components_src.read_text())
 host_components = [
     "shell",
-    "localhost-provider",
-    *json.loads(os.environ["PROVIDER_NAMES_JSON"]),
+    *json.loads(os.environ["SOURCE_HOME_BINARY_NAMES_JSON"]),
 ]
 source_home_components = list(
     dict.fromkeys([*host_components, *json.loads(os.environ["APP_CAPSULES_JSON"])])
@@ -1636,7 +1657,7 @@ stamp_source_home_capsule_artifacts_manifest() {
         if [[ -f "${ROOT}/capsules/${capsule}/capsule.json" ]]; then
             args+=(--capsule "$capsule")
         fi
-    done < <(provider_names)
+    done < <(provider_runtime_names)
     python3 "${ROOT}/scripts/stamp-source-home-capsule-metadata.py" \
         --components "${DATA_DIR}/components.json" \
         --data-dir "${DATA_DIR}" \
@@ -1701,15 +1722,27 @@ if [[ "$PLATFORM" == "darwin-arm64" ]]; then
 fi
 build_browser_vm_guest_helpers
 
+source_home_binary_manifest_path() {
+    local name="$1"
+    local candidate
+    for candidate in \
+        "${ROOT}/capsules/${name}/Cargo.toml" \
+        "${ROOT}/elastos/capsules/${name}/Cargo.toml" \
+        "${ROOT}/elastos/tools/${name}/Cargo.toml"
+    do
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo "source-home binary manifest not found for ${name}" >&2
+    exit 1
+}
+
 echo "[setup-source-home] build native provider binaries"
 "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/shell/Cargo.toml" --release
-"$CARGO_BIN" build --manifest-path "${ROOT}/elastos/capsules/localhost-provider/Cargo.toml" --release
-provider_names | while IFS= read -r provider; do
-    if [[ -f "${ROOT}/capsules/${provider}/Cargo.toml" ]]; then
-        "$CARGO_BIN" build --manifest-path "${ROOT}/capsules/${provider}/Cargo.toml" --release
-    else
-        "$CARGO_BIN" build --manifest-path "${ROOT}/elastos/tools/${provider}/Cargo.toml" --release
-    fi
+source_home_binary_names | while IFS= read -r provider; do
+    "$CARGO_BIN" build --manifest-path "$(source_home_binary_manifest_path "${provider}")" --release
 done
 
 echo "[setup-source-home] build Home CLI native renderer"
@@ -1740,14 +1773,9 @@ done
 echo "[setup-source-home] install native providers and stamp manifest"
 mkdir -p "${DATA_DIR}/bin"
 install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release shell)" "${DATA_DIR}/bin/shell"
-install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/Cargo.toml" release localhost-provider)" "${DATA_DIR}/bin/localhost-provider"
 install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/home-cli/Cargo.toml" release home-cli)" "${DATA_DIR}/bin/home-cli"
-provider_names | while IFS= read -r provider; do
-    if [[ -f "${ROOT}/capsules/${provider}/Cargo.toml" ]]; then
-        install -m 755 "$(cargo_built_binary_path "${ROOT}/capsules/${provider}/Cargo.toml" release "${provider}")" "${DATA_DIR}/bin/${provider}"
-    else
-        install -m 755 "$(cargo_built_binary_path "${ROOT}/elastos/tools/${provider}/Cargo.toml" release "${provider}")" "${DATA_DIR}/bin/${provider}"
-    fi
+source_home_binary_names | while IFS= read -r provider; do
+    install -m 755 "$(cargo_built_binary_path "$(source_home_binary_manifest_path "${provider}")" release "${provider}")" "${DATA_DIR}/bin/${provider}"
 done
 stamp_source_home_components_manifest
 

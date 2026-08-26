@@ -3153,28 +3153,8 @@ fn resolve_elastos_handle(parts: &[&str]) -> Result<WebSpaceHandle, String> {
             "did handles do not support traversal beyond localhost://WebSpaces/Elastos/did/<did> yet"
                 .to_string(),
         ),
-        ["ai"] => Ok(folder_handle(
-            "Elastos",
-            "localhost://WebSpaces/Elastos/ai".to_string(),
-            Some("elastos://ai/".to_string()),
-            "AI-scoped dynamic space inside the broader Elastos WebSpace.",
-            Some("Append a backend or model path segment.".to_string()),
-        )),
-        ["ai", backend] if !backend.is_empty() => {
-            Ok(folder_handle(
-                "Elastos",
-                format!("localhost://WebSpaces/Elastos/ai/{}", backend),
-                Some(format!("elastos://ai/{}", backend)),
-                "Typed AI handle resolved through the Elastos WebSpace.",
-                Some("Inspect _meta.json for the current typed handle view. Deeper AI traversal is not implemented yet.".to_string()),
-            ))
-        }
-        ["ai", ..] => Err(
-            "ai handles do not support traversal beyond localhost://WebSpaces/Elastos/ai/<backend> yet"
-                .to_string(),
-        ),
         [child, ..] => Err(format!(
-            "unknown Elastos WebSpace child: {} (known typed children: content, peer, did, ai)",
+            "unknown Elastos WebSpace child: {} (known typed children: content, peer, did)",
             child
         )),
     }
@@ -3714,7 +3694,7 @@ fn list_for(state: &ProviderState, resolved: &ResolvedPath) -> Result<Vec<DirEnt
 
             match handle.handle_uri.as_str() {
                 "localhost://WebSpaces/Elastos" => {
-                    for child in ["content", "peer", "did", "ai"] {
+                    for child in ["content", "peer", "did"] {
                         entries.push(dir_entry_from_handle(
                             child,
                             resolve_elastos_handle(&[child])?,
@@ -4177,14 +4157,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_deeper_ai_traversal() {
-        let state = state();
-        let err = resolve_path(&state, "localhost://WebSpaces/Elastos/ai/openai/gpt-5.4")
-            .expect_err("deeper ai traversal should fail");
-        assert!(err.contains("ai handles do not support traversal"));
-    }
-
-    #[test]
     fn init_payload_advertises_supported_and_unsupported_ops() {
         let payload = init_payload(&state());
         let supported = payload["supported_ops"]
@@ -4237,7 +4209,6 @@ mod tests {
         assert!(names.contains(&"content".to_string()));
         assert!(names.contains(&"peer".to_string()));
         assert!(names.contains(&"did".to_string()));
-        assert!(names.contains(&"ai".to_string()));
         let content = entries
             .iter()
             .find(|entry| entry.name == "content")
@@ -4745,10 +4716,7 @@ mod tests {
         assert_eq!(cloud["live_adapter"], true);
         assert_eq!(cloud["adapter_state"], "connected");
         assert_eq!(cloud["adapter"]["provider"], "cloud-drive-provider");
-        assert_eq!(
-            cloud["adapter"]["health"]["status"],
-            "connected_unverified"
-        );
+        assert_eq!(cloud["adapter"]["health"]["status"], "connected_unverified");
         assert_eq!(
             cloud["adapter"]["endpoint_uri"],
             "https://redacted@example.test/drive"
