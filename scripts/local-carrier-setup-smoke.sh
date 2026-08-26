@@ -493,13 +493,8 @@ grep -q "ElastOS Home" "${STATUS_OUT}" || {
 HOME_OUT="${TEST_ROOT}/home.txt"
 (
     cd "${ELASTOS_ROOT}"
-    if [[ -t 0 && -t 1 ]]; then
-        printf 'q\n' | XDG_DATA_HOME="${XDG_DATA_HOME}" \
-        "${ELASTOS_BIN}" >"${HOME_OUT}"
-    else
-        printf 'q\n' | XDG_DATA_HOME="${XDG_DATA_HOME}" \
-        script -qec "${ELASTOS_BIN}" "${HOME_OUT}" >/dev/null
-    fi
+    printf 'q\n' | XDG_DATA_HOME="${XDG_DATA_HOME}" \
+    "${ELASTOS_BIN}" >"${HOME_OUT}"
 )
 grep -q "Home CLI /" "${HOME_OUT}" || {
     echo "expected home output missing from ${HOME_OUT}" >&2

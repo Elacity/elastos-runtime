@@ -11658,6 +11658,11 @@ assert(
   !tasks.includes("- [x]"),
   "TASKS.md must contain open work only; completed work belongs in elastos/CHANGELOG.md",
 );
+assert(
+  read("scripts/local-carrier-setup-smoke.sh").includes("printf 'q\\n' | XDG_DATA_HOME=\"${XDG_DATA_HOME}\" \\\n    \"${ELASTOS_BIN}\" >\"${HOME_OUT}\"") &&
+    !read("scripts/local-carrier-setup-smoke.sh").includes("script -qec"),
+  "Local carrier setup smoke must exercise the direct Home CLI contract, not a PTY wrapper path",
+);
 const productionStorageTaskLines =
   tasks.match(/^- \[ \] BLOCKER - production multi-peer availability\/storage markets .+$/gm) ??
   [];
