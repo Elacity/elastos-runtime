@@ -36,6 +36,7 @@ TARGETS=(
   inbox/browser
   chat-room/browser
   library/browser
+  documents/browser
 )
 
 MODE="${1:-sync}"

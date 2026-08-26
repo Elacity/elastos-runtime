@@ -760,37 +760,31 @@ for (const file of activeHtmlFiles) {
   assertStaticControlsAreNamed(file);
 }
 
-// Documents still owns its palette. Chat Room took the shared token sheet, so
-// it is checked below by the stronger rule instead: names must resolve to
-// shared tokens, and the file must name no colour of its own.
-const lightTokenFiles = [
-  "capsules/documents/browser/index.html",
-];
-
-const lightTokens = new Map([
-  ["--bg", "#edf1fb"],
-  ["--bg-strong", "#e3e9fb"],
-  ["--panel", "rgba(255, 255, 255, 0.9)"],
-  ["--panel-strong", "#ffffff"],
-  ["--panel-soft", "#eef2ff"],
-  ["--line", "rgba(83, 103, 164, 0.14)"],
-  ["--line-strong", "rgba(83, 103, 164, 0.22)"],
-  ["--ink", "#1d2438"],
-  ["--muted", "#66708a"],
-  ["--brand", "#f6921a"],
-  ["--brand-soft", "#fff1dc"],
-  ["--accent", "#5f76d8"],
-  ["--accent-soft", "#e8edff"],
-  ["--accent-deep", "#3c53a7"],
-  ["--danger", "#b14c5a"],
-]);
-
-for (const file of lightTokenFiles) {
-  const source = read(file);
-  for (const [token, value] of lightTokens) {
-    assertToken(source, file, token, value);
-  }
+// Documents now uses the shared token sheet. Check the stronger rule: it must
+// map onto canonical shared tokens and must not re-declare its own palette.
+const documentsStyle = read("capsules/documents/browser/index.html");
+for (const [token, value] of new Map([
+  ["--bg", "var(--el-bg)"],
+  ["--panel", "color-mix(in srgb, var(--el-surface) 94%, transparent)"],
+  ["--panel-strong", "color-mix(in srgb, var(--el-surface-raised) 96%, transparent)"],
+  ["--panel-soft", "color-mix(in srgb, var(--el-surface-raised) 84%, var(--el-accent-faint))"],
+  ["--line", "var(--el-hairline)"],
+  ["--line-strong", "var(--el-hairline-strong)"],
+  ["--text", "var(--el-text)"],
+  ["--muted", "var(--el-muted)"],
+  ["--brand", "var(--el-brand)"],
+  ["--accent", "var(--el-accent)"],
+  ["--accent-soft", "var(--el-accent-soft)"],
+  ["--accent-deep", "var(--el-accent-strong)"],
+  ["--danger", "var(--el-danger)"],
+])) {
+  assertToken(documentsStyle, "capsules/documents/browser/index.html", token, value);
 }
+assert(
+  documentsStyle.includes('<link rel="stylesheet" href="./elastos-ui.css">') &&
+    documentsStyle.includes('<script src="./elastos-theme.js"></script>'),
+  "Documents must load the vendored shared token sheet and theme runtime",
+);
 
 const chatRoomStyle = read("capsules/chat-room/browser/style.css");
 for (const [token, value] of new Map([
