@@ -74,9 +74,12 @@ verify:
 product-ui-source:
     node scripts/home-shell-regression-smoke.mjs
     node scripts/people-discovery-smoke.mjs
+    node scripts/inbox-product-behavior-smoke.mjs
+    node scripts/chat-room-product-behavior-smoke.mjs
 
 product-ui-browser:
     node scripts/people-product-layout-smoke.mjs
+    node scripts/inbox-product-layout-smoke.mjs
     node scripts/chat-room-configured-layout-smoke.mjs
 
 product-ui-virtual-auth:
