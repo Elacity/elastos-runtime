@@ -275,6 +275,55 @@
   </div>
 </aside>
 
+<section
+  id="setup-sheet"
+  class="setup-sheet"
+  role="dialog"
+  aria-modal="true"
+  aria-labelledby="setup-sheet-title"
+  tabindex="-1"
+  aria-hidden="true"
+  inert
+  hidden
+>
+  <div class="setup-sheet-card">
+    <button
+      id="setup-sheet-close"
+      class="wallet-rail-head-btn wallet-rail-icon-btn wallet-rail-close"
+      type="button"
+      aria-label="Close setup"
+    >
+      <img src="/apps/home-gui/close.svg" alt="" draggable="false" />
+    </button>
+    <h2 id="setup-sheet-title" class="setup-sheet-title">Welcome to Home</h2>
+    <p id="setup-sheet-lead" class="setup-sheet-lead">
+      Save a Recovery Kit, then create your Profile.
+    </p>
+    <ol class="setup-sheet-steps">
+      <li id="setup-sheet-step-recovery" class="setup-sheet-step">
+        <span class="setup-sheet-step-index" aria-hidden="true">1</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Recovery Kit</h3>
+          <p id="setup-sheet-recovery-body" class="setup-sheet-step-body">Required first. Download a kit in System → Security so this Home can create your Profile.</p>
+        </div>
+        <button id="setup-sheet-recovery" class="el-button el-button-primary" type="button">
+          Save kit
+        </button>
+      </li>
+      <li id="setup-sheet-step-profile" class="setup-sheet-step">
+        <span class="setup-sheet-step-index" aria-hidden="true">2</span>
+        <div class="setup-sheet-step-copy">
+          <h3 class="setup-sheet-step-title">Create your Profile</h3>
+          <p id="setup-sheet-profile-body" class="setup-sheet-step-body">The name people see. Chat stays closed until this exists.</p>
+        </div>
+        <button id="setup-sheet-profile" class="el-button" type="button">
+          Create Profile
+        </button>
+      </li>
+    </ol>
+  </div>
+</section>
+
 <main class="desktop-workspace" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div id="window-snap-preview" class="window-snap-preview" aria-hidden="true" hidden></div>
   <section id="desktop" class="desktop" aria-live="polite">

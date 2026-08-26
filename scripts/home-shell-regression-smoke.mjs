@@ -302,6 +302,10 @@ const homeGuiScript = readFileSync(
   new URL("../capsules/home-gui/browser/home-gui.js", import.meta.url),
   "utf8",
 );
+const homeSetupSheetScript = readFileSync(
+  new URL("../capsules/home-gui/browser/shell-setup-sheet.js", import.meta.url),
+  "utf8",
+);
 const homeGuiStyle = readFileSync(
   new URL("../capsules/home-gui/browser/style.css", import.meta.url),
   "utf8",
@@ -361,6 +365,69 @@ assert(
   !homeGuiScript.includes("toggleActiveFullscreenStage") &&
     !homeGuiScript.includes("Window fullscreen stage (dedicated Space)"),
   "Home Control Centre fullscreen action still routes through the app-window fullscreen Space path",
+);
+assert(
+  homeGuiScript.includes("bindSetupSheet();") &&
+    homeGuiScript.includes("syncSetupSheet(previous, summary);") &&
+    homeGuiScript.includes("holdHomeSetupAct,") &&
+    homeGuiScript.includes('"#setup-sheet"'),
+  "Home shell must wire the setup sheet through the existing shell summary and window-hook boundaries",
+);
+assert(
+  homeGuiTemplate.includes('id="setup-sheet"') &&
+    homeGuiTemplate.includes("Save a Recovery Kit, then create your Profile.") &&
+    homeGuiTemplate.includes('id="setup-sheet-recovery"') &&
+    homeGuiTemplate.includes('id="setup-sheet-profile"') &&
+    homeGuiTemplate.indexOf('id="setup-sheet-step-recovery"') <
+      homeGuiTemplate.indexOf('id="setup-sheet-step-profile"'),
+  "Home setup sheet must keep the Recovery-first order and the bounded setup actions",
+);
+assert(
+  homeSetupSheetScript.includes('const PROFILE_READINESS_SCHEMA = "elastos.profile.readiness/v1";') &&
+    homeSetupSheetScript.includes('const RECOVERY_READINESS_SCHEMA = "elastos.recovery.readiness/v1";') &&
+    homeSetupSheetScript.includes('openTarget("system", { query: { settings: "security" } });') &&
+    homeSetupSheetScript.includes('openTarget("people");') &&
+    homeSetupSheetScript.includes('const SETUP_HOLD_TARGETS = new Set(["chat-room"]);') &&
+    homeSetupSheetScript.includes('return status !== "ready" && status !== "signed_out";') &&
+    !homeSetupSheetScript.includes("principal_id") &&
+    !homeSetupSheetScript.includes("credential_id") &&
+    !homeSetupSheetScript.includes("localStorage") &&
+    !homeSetupSheetScript.includes("indexedDB") &&
+    !homeSetupSheetScript.includes("sessionStorage") &&
+    !homeSetupSheetScript.includes("createInitialProfile") &&
+    !homeSetupSheetScript.includes("skip") &&
+    !homeSetupSheetScript.includes("fallback"),
+  "Home setup must use typed Runtime readiness only, hold Chat only, and open System or People without local fallback state",
+);
+assert(
+  homeSetupSheetScript.includes('recoveryButton.textContent = unavailable') &&
+    homeSetupSheetScript.includes('? "Open System"') &&
+    homeSetupSheetScript.includes('profileButton.disabled = unavailable || profileReady || !recoveryReady || !targetById(summary, "people");') &&
+    homeSetupSheetScript.includes('const next = unavailable || homeRecoveryStatus(shellState.currentSummary) !== "ready"') &&
+    homeSetupSheetScript.includes('? recoveryButton') &&
+    homeSetupSheetScript.includes(': profileButton;'),
+  "Unavailable setup state must route only to System and must not enable Profile",
+);
+assert(
+  homeSetupSheetScript.includes('rememberChromeNotification({') &&
+    homeSetupSheetScript.includes('kind: "home_setup"') &&
+    homeSetupSheetScript.includes('sheet.setAttribute("aria-hidden", "false");') &&
+    homeSetupSheetScript.includes('sheet.setAttribute("aria-hidden", "true");') &&
+    homeSetupSheetScript.includes('sheet.setAttribute("aria-modal", "false");') &&
+    homeSetupSheetScript.includes('sheet.setAttribute("aria-modal", "true");') &&
+    homeSetupSheetScript.includes('if (event.key === "Escape")') &&
+    homeSetupSheetScript.includes('window.addEventListener("pointermove", onSetupCardPointerMove);') &&
+    homeSetupSheetScript.includes('window.addEventListener("pointerup", onSetupCardPointerUp);'),
+  "Home setup must keep the session reminder, accessibility state, Escape close, and yielded drag behavior wired through Home chrome",
+);
+assert(
+  homeGuiStyle.includes(".setup-sheet {") &&
+    homeGuiStyle.includes("width: min(92vw, 420px);") &&
+    homeGuiStyle.includes("width: min(92vw, 360px);") &&
+    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce)") &&
+    homeGuiStyle.includes(".setup-sheet-step .el-button") &&
+    homeGuiStyle.includes(".setup-sheet-step-body"),
+  "Home setup layout must stay bounded on narrow widths and keep reduced-motion behavior",
 );
 assert(
   canonicalWindowHeadMarkup.test(homeGuiTemplate),

@@ -88,6 +88,11 @@ import {
   recordNotifications,
 } from "./shell-notifications.js?v=home-20260813a";
 import {
+  bindSetupSheet,
+  holdHomeSetupAct,
+  syncSetupSheet,
+} from "./shell-setup-sheet.js?v=home-20260813a";
+import {
   bindMenubar,
   closeMenus,
   setMenuManifest,
@@ -145,6 +150,7 @@ bindIdentityMenu();
 bindShellSurfaceDom();
 bindSpotlight();
 bindNotificationCenter();
+bindSetupSheet();
 bindQuickLook();
 bindExpose();
 bindSpacePager();
@@ -176,6 +182,7 @@ const HOME_GUI_HOST_SELECTORS = Object.freeze([
   "#control-centre",
   "#wallet-rail",
   "#inbox-rail",
+  "#setup-sheet",
   "#connector-sheet",
   "#spotlight",
   "#window-switcher",
@@ -193,6 +200,7 @@ export const homeGuiWindowHooks = Object.freeze({
   renderDesktop,
   renderTaskbar,
   updateTaskbarState,
+  holdHomeSetupAct,
 });
 
 const homeGuiHostActions = {
@@ -210,6 +218,7 @@ configureWindowHooks({
   renderTaskbar,
   syncMenubar,
   updateTaskbarState,
+  holdHomeSetupAct,
   // Host-mediated launches: GUI never fetch-launches; shell-windows and the
   // wallet rail call this hook after bindHomeGuiInteractions binds it.
   launchTarget: (...args) => homeGuiHostActions.launchTarget?.(...args),
@@ -769,6 +778,7 @@ export function syncHomeGuiChrome(previous, summary) {
   syncWalletRailAvailability(summary);
   maybeShowWalletApprovalToast(previous, summary);
   recordNotifications(summary);
+  syncSetupSheet(previous, summary);
   syncControlCentre(summary);
 }
 
