@@ -4,6 +4,7 @@ import {
   toolbarIdentityAvatar,
   toolbarIdentityAvatarImage,
   toolbarIdentityMonogram,
+  toolbarSignOutButton,
   toolbarSystem,
   toolbarIdentityMenu,
   toolbarIdentityMenuName,
@@ -82,13 +83,16 @@ export function syncIdentity(summary) {
   if (!toolbarIdentityMenuName) {
     return;
   }
-  const signedIn = Boolean(summary?.authority?.signed_in);
+  const signedIn = summary?.authority?.signed_in === true;
   if (!signedIn) {
     clearIdentitySurface();
     return;
   }
   const name = summaryDisplayName(summary);
   toolbarIdentityMenuName.textContent = name;
+  if (toolbarSignOutButton) {
+    toolbarSignOutButton.hidden = false;
+  }
   const seed =
     typeof summary?.identity?.principal_id === "string"
       ? summary.identity.principal_id
@@ -102,6 +106,9 @@ export function clearIdentitySurface() {
   }
   closeIdentityMenu({ restoreFocus: false });
   toolbarIdentityMenuName.textContent = "";
+  if (toolbarSignOutButton) {
+    toolbarSignOutButton.hidden = true;
+  }
   avatarResolveSeq += 1;
   clearAvatarPhoto();
   if (toolbarIdentityMonogram) {

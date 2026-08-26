@@ -8,12 +8,16 @@ const indexHtml = fs.readFileSync(
   new URL("capsules/home-gui/browser/index.html", root),
   "utf8",
 );
+const templateHtml = fs.readFileSync(
+  new URL("capsules/home-gui/browser/home-gui-template.html", root),
+  "utf8",
+);
 const shellSource = fs.readFileSync(
   new URL("capsules/home-gui/browser/home-gui-shell.js", root),
   "utf8",
 );
-const styleSource = fs.readFileSync(
-  new URL("capsules/home-gui/browser/style.css", root),
+const chromeSource = fs.readFileSync(
+  new URL("capsules/home-gui/browser/shell-chrome.js", root),
   "utf8",
 );
 const {
@@ -32,14 +36,24 @@ assert.doesNotMatch(
   "Home GUI must start without projected authority",
 );
 assert.match(
-  styleSource,
-  /\.sign-out-btn\s*\{[^}]*display:\s*none;/s,
-  "Home GUI must hide sign-out before a trusted summary",
+  templateHtml,
+  /id="identity-menu-sign-out"[^>]*\shidden(?:\s|>)/,
+  "Home GUI must hide sign-out in markup before trusted state arrives",
 );
 assert.match(
-  styleSource,
-  /body\[data-home-authority="signed"\]\s+\.sign-out-btn\s*\{[^}]*display:\s*flex;/s,
-  "Home GUI must show sign-out only for projected signed authority",
+  chromeSource,
+  /const signedIn = summary\?\.authority\?\.signed_in === true;/,
+  "Home chrome must use exact signed truth for sign-out visibility",
+);
+assert.match(
+  chromeSource,
+  /if \(toolbarSignOutButton\) \{\s*toolbarSignOutButton\.hidden = false;\s*\}/s,
+  "Home chrome must show sign-out only after exact signed identity sync",
+);
+assert.match(
+  chromeSource,
+  /if \(toolbarSignOutButton\) \{\s*toolbarSignOutButton\.hidden = true;\s*\}/s,
+  "Home chrome must hide sign-out when identity clears",
 );
 
 const body = { dataset: {} };
@@ -102,4 +116,4 @@ assert.doesNotMatch(
   "isolated Home GUI must not revoke Runtime sessions directly",
 );
 
-console.log("[home-gui-sign-out] PASS checks=15");
+console.log("[home-gui-sign-out] PASS checks=17");
