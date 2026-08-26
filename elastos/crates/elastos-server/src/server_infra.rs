@@ -1,3 +1,9 @@
+use anyhow::Context as _;
+use serde::Deserialize;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Read as _};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -51,7 +57,144 @@ const BROWSER_ENGINE_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_PROVIDER_ID: &str = "model-provider";
 const MODEL_PROVIDER_PROTOCOL_VERSION: &str = "elastos.model-provider/v1";
 const MODEL_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const MODEL_PROVIDER_CONFIG_FILE_NAME: &str = "config.json";
+const MODEL_PROVIDER_CONFIG_MAX_BYTES: usize = 256 * 1024;
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelProviderOperatorConfigFile {
+    offers: Vec<serde_json::Value>,
+}
+
+fn model_provider_root_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("providers").join(MODEL_PROVIDER_ID)
+}
+
+fn model_provider_config_path(data_dir: &Path) -> PathBuf {
+    model_provider_root_dir(data_dir).join(MODEL_PROVIDER_CONFIG_FILE_NAME)
+}
+
+fn model_provider_journal_dir(data_dir: &Path) -> PathBuf {
+    model_provider_root_dir(data_dir).join("journal")
+}
+
+fn model_provider_bridge_config(data_dir: &Path) -> anyhow::Result<provider::BridgeProviderConfig> {
+    let offers = load_model_provider_operator_offers(data_dir)?;
+    Ok(provider::BridgeProviderConfig {
+        base_path: data_dir.to_string_lossy().into_owned(),
+        extra: serde_json::json!({
+            "provider_id": MODEL_PROVIDER_ID,
+            "journal_dir": model_provider_journal_dir(data_dir).to_string_lossy().into_owned(),
+            "offers": offers,
+        }),
+        ..Default::default()
+    })
+}
+
+fn load_model_provider_operator_offers(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    let config_path = model_provider_config_path(data_dir);
+    let metadata = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to inspect model-provider operator config {}",
+                    config_path.display()
+                )
+            })
+        }
+    };
+    let config_root = model_provider_root_dir(data_dir);
+    validate_model_provider_private_directory(
+        &data_dir.join("providers"),
+        "model-provider config parent",
+    )?;
+    validate_model_provider_private_directory(&config_root, "model-provider config root")?;
+    let bytes = read_model_provider_private_file(
+        &config_path,
+        &metadata,
+        MODEL_PROVIDER_CONFIG_MAX_BYTES,
+        "model-provider operator config",
+    )?;
+    let raw = String::from_utf8(bytes)
+        .context("model-provider operator config must be valid UTF-8 JSON")?;
+    let config: ModelProviderOperatorConfigFile = serde_json::from_str(&raw)
+        .context("model-provider operator config must contain only the top-level offers key")?;
+    Ok(config.offers)
+}
+
+fn validate_model_provider_private_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("{label} must be a real directory");
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != unsafe { libc::geteuid() } || mode != 0o700 {
+            anyhow::bail!("{label} must be owned by the current user with mode 0700");
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_provider_private_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    label: &str,
+) -> anyhow::Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("{label} must be a regular non-symlink file");
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != unsafe { libc::geteuid() } || mode != 0o600 {
+            anyhow::bail!("{label} must be owned by the current user with mode 0600");
+        }
+    }
+    let _ = path;
+    Ok(())
+}
+
+fn read_model_provider_private_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    validate_model_provider_private_file(path, metadata, label)?;
+    let metadata_len = usize::try_from(metadata.len())
+        .context("model-provider operator config length does not fit memory bounds")?;
+    if metadata_len > max_bytes {
+        anyhow::bail!("{label} exceeds its byte limit");
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {label} {}", path.display()))?;
+    validate_model_provider_private_file(path, &opened_metadata, label)?;
+    let mut bytes = Vec::with_capacity(metadata_len);
+    let read_limit = u64::try_from(max_bytes)?
+        .checked_add(1)
+        .context("model-provider operator config read bound overflow")?;
+    file.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!("{label} exceeds its byte limit");
+    }
+    Ok(bytes)
+}
 
 async fn request_browser_engine_provider_status(
     bridge: &provider::ProviderBridge,
@@ -710,12 +853,8 @@ async fn setup_server_infrastructure_impl(
     }
 
     match binaries::resolve_verified_native_provider_binary("model-provider") {
-        Ok(Some(path)) => {
-            let model_config = provider::BridgeProviderConfig {
-                base_path: data_dir.to_string_lossy().to_string(),
-                ..Default::default()
-            };
-            match provider::ProviderBridge::spawn(&path, model_config).await {
+        Ok(Some(path)) => match model_provider_bridge_config(&data_dir) {
+            Ok(model_config) => match provider::ProviderBridge::spawn(&path, model_config).await {
                 Ok(bridge) => {
                     let bridge = Arc::new(bridge);
                     match start_model_provider(
@@ -725,13 +864,20 @@ async fn setup_server_infrastructure_impl(
                     )
                     .await
                     {
-                        Ok(()) => tracing::info!("model-provider capsule from {}", path.display()),
-                        Err(e) => tracing::warn!("Failed to start model-provider: {}", e),
+                        Ok(()) => {
+                            tracing::info!("model-provider capsule from {}", path.display())
+                        }
+                        Err(_) => {
+                            tracing::warn!("Skipping model-provider because startup failed")
+                        }
                     }
                 }
-                Err(e) => tracing::warn!("Failed to spawn model-provider: {}", e),
+                Err(_) => tracing::warn!("Skipping model-provider because startup failed"),
+            },
+            Err(_) => {
+                tracing::warn!("Skipping model-provider due to invalid private operator config")
             }
-        }
+        },
         Ok(None) => {}
         Err(e) => tracing::warn!("Skipping model-provider due to verification failure: {}", e),
     }
@@ -1578,6 +1724,7 @@ fn provider_config_from_env_or_file(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1630,6 +1777,42 @@ mod tests {
                 "protocol_version": protocol_version,
             }
         })
+    }
+
+    fn setup_model_provider_operator_root(tempdir: &TempDir) -> PathBuf {
+        let root = model_provider_root_dir(tempdir.path());
+        fs::create_dir_all(&root).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(
+                tempdir.path().join("providers"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root
+    }
+
+    fn write_model_provider_operator_config(tempdir: &TempDir, raw: &str) -> PathBuf {
+        let root = setup_model_provider_operator_root(tempdir);
+        let path = root.join(MODEL_PROVIDER_CONFIG_FILE_NAME);
+        fs::write(&path, raw).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn assert_pid_absent(pid: libc::pid_t) {
+        let result = unsafe { libc::kill(pid, 0) };
+        let err = std::io::Error::last_os_error();
+        assert_eq!(result, -1, "pid {pid} should be absent");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ESRCH),
+            "pid {pid} should be reaped"
+        );
     }
 
     #[tokio::test]
@@ -2011,6 +2194,272 @@ mod tests {
         assert_eq!(requests[0]["op"], "status");
         assert_eq!(requests[1]["op"], "shutdown");
         first_provider.abort();
+    }
+
+    #[test]
+    fn model_provider_bridge_config_uses_empty_offers_when_config_is_absent() {
+        let tempdir = TempDir::new().unwrap();
+
+        let config = model_provider_bridge_config(tempdir.path()).unwrap();
+
+        assert_eq!(config.base_path, tempdir.path().to_string_lossy());
+        assert_eq!(config.extra["provider_id"], MODEL_PROVIDER_ID);
+        assert_eq!(
+            config.extra["journal_dir"],
+            model_provider_journal_dir(tempdir.path())
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(config.extra["offers"], serde_json::json!([]));
+        assert!(!model_provider_config_path(tempdir.path()).exists());
+    }
+
+    #[test]
+    fn model_provider_bridge_config_passes_raw_operator_offers_without_nested_validation() {
+        let tempdir = TempDir::new().unwrap();
+        let raw = serde_json::json!({
+            "offers": [
+                {
+                    "id": "offer:flash-chat:pair-a",
+                    "title": "Flash chat",
+                    "operation": "text.generate",
+                    "input_modalities": ["text/plain"],
+                    "output_modalities": ["text/plain"],
+                    "policy": {
+                        "concurrency_limit": 1,
+                        "input_bytes_limit": 1024,
+                        "inline_output_bytes_limit": 2048,
+                        "event_bytes_limit": 4096,
+                        "runtime_ms_limit": 1000,
+                        "retention_secs": 60,
+                        "cancel_settlement_timeout_ms": 1000
+                    },
+                    "adapter": {
+                        "kind": "open_ai_compatible_text",
+                        "api_url": "https://example.invalid/v1/chat/completions",
+                        "api_key": "Bearer super-secret",
+                        "model": "pair-a"
+                    }
+                },
+                {
+                    "id": "offer:nested-invalid",
+                    "title": "Broken nested config",
+                    "operation": "text.generate",
+                    "input_modalities": ["text/plain"],
+                    "output_modalities": ["text/plain"],
+                    "policy": {
+                        "concurrency_limit": 1,
+                        "input_bytes_limit": 1024,
+                        "inline_output_bytes_limit": 2048,
+                        "event_bytes_limit": 4096,
+                        "runtime_ms_limit": 1000,
+                        "retention_secs": 60,
+                        "cancel_settlement_timeout_ms": 1000
+                    },
+                    "adapter": {
+                        "kind": "open_ai_compatible_text"
+                    }
+                }
+            ]
+        });
+        write_model_provider_operator_config(&tempdir, &raw.to_string());
+
+        let config = model_provider_bridge_config(tempdir.path()).unwrap();
+
+        assert_eq!(config.extra["offers"], raw["offers"]);
+    }
+
+    #[test]
+    fn model_provider_bridge_config_rejects_invalid_top_level_shape_without_echoing_secrets() {
+        let tempdir = TempDir::new().unwrap();
+        let cases = [
+            r#"{"offers":[],"extra":"nope"}"#,
+            r#"{"offers":[],"offers":[]}"#,
+            r#"{"offers":{"id":"not-an-array"}}"#,
+            r#"["not-an-object"]"#,
+        ];
+        for raw in cases {
+            write_model_provider_operator_config(&tempdir, raw);
+            let error = model_provider_bridge_config(tempdir.path()).unwrap_err();
+            assert!(!error.to_string().contains("super-secret"));
+            fs::remove_file(model_provider_config_path(tempdir.path())).unwrap();
+        }
+        write_model_provider_operator_config(
+            &tempdir,
+            r#"{"offers":[],"authorization":"Bearer super-secret"}"#,
+        );
+        let error = model_provider_bridge_config(tempdir.path()).unwrap_err();
+        assert!(!error.to_string().contains("Bearer super-secret"));
+    }
+
+    #[test]
+    fn model_provider_bridge_config_has_no_env_fallback_and_is_read_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "ELASTOS_MODEL_PROVIDER_CONFIG",
+            "ELASTOS_MODEL_PROVIDER_CONFIG_PATH",
+        ]);
+        std::env::set_var(
+            "ELASTOS_MODEL_PROVIDER_CONFIG",
+            r#"{"offers":[{"id":"offer:env"}]}"#,
+        );
+        std::env::set_var("ELASTOS_MODEL_PROVIDER_CONFIG_PATH", "/tmp/not-used.json");
+        let tempdir = TempDir::new().unwrap();
+
+        let config = model_provider_bridge_config(tempdir.path()).unwrap();
+
+        assert_eq!(config.extra["offers"], serde_json::json!([]));
+        assert!(!model_provider_config_path(tempdir.path()).exists());
+    }
+
+    #[test]
+    fn model_provider_bridge_config_repeated_reads_leave_operator_config_unchanged() {
+        let tempdir = TempDir::new().unwrap();
+        let path = write_model_provider_operator_config(&tempdir, r#"{"offers":[]}"#);
+        let original_bytes = fs::read(&path).unwrap();
+        let original_metadata = fs::metadata(&path).unwrap();
+
+        let first = model_provider_bridge_config(tempdir.path()).unwrap();
+        let second = model_provider_bridge_config(tempdir.path()).unwrap();
+
+        assert_eq!(first.extra["offers"], serde_json::json!([]));
+        assert_eq!(second.extra["offers"], serde_json::json!([]));
+        assert_eq!(fs::read(&path).unwrap(), original_bytes);
+        let final_metadata = fs::metadata(&path).unwrap();
+        assert_eq!(final_metadata.len(), original_metadata.len());
+        #[cfg(unix)]
+        assert_eq!(
+            final_metadata.permissions().mode() & 0o777,
+            original_metadata.permissions().mode() & 0o777
+        );
+    }
+
+    #[test]
+    fn model_provider_bridge_config_rejects_oversized_operator_config() {
+        let tempdir = TempDir::new().unwrap();
+        let oversized = format!(
+            "{{\"offers\":[],\"padding\":\"{}\"}}",
+            "x".repeat(MODEL_PROVIDER_CONFIG_MAX_BYTES)
+        );
+        write_model_provider_operator_config(&tempdir, &oversized);
+
+        let error = model_provider_bridge_config(tempdir.path()).unwrap_err();
+
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_provider_bridge_config_rejects_insecure_or_nonregular_operator_config() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = TempDir::new().unwrap();
+        let path = write_model_provider_operator_config(&tempdir, r#"{"offers":[]}"#);
+
+        fs::set_permissions(
+            tempdir.path().join("providers"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(model_provider_bridge_config(tempdir.path()).is_err());
+        fs::set_permissions(
+            tempdir.path().join("providers"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        fs::set_permissions(
+            model_provider_root_dir(tempdir.path()),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(model_provider_bridge_config(tempdir.path()).is_err());
+        fs::set_permissions(
+            model_provider_root_dir(tempdir.path()),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(model_provider_bridge_config(tempdir.path()).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        symlink(tempdir.path().join("missing.json"), &path).unwrap();
+        assert!(model_provider_bridge_config(tempdir.path()).is_err());
+    }
+
+    #[test]
+    fn setup_source_home_does_not_seed_model_provider_operator_config() {
+        let script = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .join("scripts")
+                .join("setup-source-home.sh"),
+        )
+        .unwrap();
+
+        assert!(!script.contains("providers/model-provider/config.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nested_model_provider_config_reaches_spawn_and_provider_exits_without_registration() {
+        let tempdir = TempDir::new().unwrap();
+        write_model_provider_operator_config(
+            &tempdir,
+            &serde_json::json!({
+                "offers": [{
+                    "id": "offer:nested-invalid",
+                    "title": "Broken",
+                    "operation": "text.generate",
+                    "input_modalities": ["text/plain"],
+                    "output_modalities": ["text/plain"],
+                    "policy": {
+                        "concurrency_limit": 1,
+                        "input_bytes_limit": 1024,
+                        "inline_output_bytes_limit": 2048,
+                        "event_bytes_limit": 4096,
+                        "runtime_ms_limit": 1000,
+                        "retention_secs": 60,
+                        "cancel_settlement_timeout_ms": 1000
+                    },
+                    "adapter": {
+                        "kind": "open_ai_compatible_text"
+                    }
+                }]
+            })
+            .to_string(),
+        );
+        let script_path = tempdir.path().join("fake-model-provider.sh");
+        let pid_path = tempdir.path().join("fake-model-provider.pid");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' $$ > '{}'\nIFS= read -r _line || exit 0\nprintf '{{\"status\":\"error\",\"code\":\"invalid_config\",\"message\":\"invalid configuration\"}}\\n'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = match provider::ProviderBridge::spawn(
+            &script_path,
+            model_provider_bridge_config(tempdir.path()).unwrap(),
+        )
+        .await
+        {
+            Ok(_) => panic!("nested invalid config should not initialize a provider bridge"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("invalid configuration"));
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        assert_pid_absent(pid);
     }
 
     struct EnvGuard {
