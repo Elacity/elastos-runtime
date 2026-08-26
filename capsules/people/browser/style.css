@@ -195,7 +195,7 @@ button:disabled {
   color: var(--el-text);
   font-size: 34px;
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   line-height: 1.15;
 }
 
@@ -252,7 +252,7 @@ button:disabled {
   color: var(--el-text);
   font-size: 22px;
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
 }
 
 .people-section h3 {
@@ -260,12 +260,14 @@ button:disabled {
   color: var(--el-muted);
   font-size: 13px;
   font-weight: 600;
+  letter-spacing: 0;
 }
 
 .people-section p {
   margin-top: 4px;
   color: var(--el-muted);
   font-size: 13px;
+  letter-spacing: 0;
   line-height: 1.45;
 }
 
@@ -305,6 +307,33 @@ button:disabled {
   border-color: var(--el-hairline-strong);
   outline: 2px solid var(--el-accent-faint);
   outline-offset: 1px;
+}
+
+.people-section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.people-list-section {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.people-section-count {
+  flex: 0 0 auto;
+  align-self: center;
+  border: 1px solid var(--el-hairline);
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: var(--el-surface-raised);
+  color: var(--el-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  white-space: nowrap;
 }
 
 .people-list {
@@ -381,12 +410,25 @@ button:disabled {
   margin: 0;
   color: var(--el-text);
   font-size: 15px;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 
-.person-copy p {
+.person-details {
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
+  overflow-wrap: anywhere;
+}
+
+.person-details span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--el-hairline);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: var(--el-inset);
 }
 
 .person-actions,
@@ -464,13 +506,15 @@ button:disabled {
     padding: 16px 14px 24px;
   }
 
+  .people-section-head,
+  .discovery-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
   .profile-form,
   .discovery-grid {
     grid-template-columns: 1fr;
-  }
-
-  .discovery-header {
-    flex-direction: column;
   }
 
   .discovery-actions {
