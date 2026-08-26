@@ -476,6 +476,7 @@ const RESERVED_SUB_NAMES: &[&str] = &[
     "peer",
     "did",
     "ai",
+    "model",
     "llama",
     "ipfs",
     "content",
@@ -2366,6 +2367,7 @@ mod tests {
 
         for name in [
             "chain",
+            "model",
             "wallet",
             "drm",
             "rights",

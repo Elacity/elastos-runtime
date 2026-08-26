@@ -48,6 +48,9 @@ const CONTENT_REPAIR_SCHEDULER_DEFAULT_LIMIT: u64 = 10;
 const CONTENT_REPAIR_SCHEDULER_DEFAULT_MAX_ATTEMPTS: u64 = 3;
 const CONTENT_REPAIR_SCHEDULER_DEFAULT_FAILURE_BUDGET: u64 = 5;
 const BROWSER_ENGINE_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const MODEL_PROVIDER_ID: &str = "model-provider";
+const MODEL_PROVIDER_PROTOCOL_VERSION: &str = "elastos.model-provider/v1";
+const MODEL_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const WALLET_PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn request_browser_engine_provider_status(
@@ -165,6 +168,44 @@ async fn start_wallet_provider_v2(
     Ok(())
 }
 
+async fn request_model_provider_status(
+    bridge: &provider::ProviderBridge,
+    status_timeout: Duration,
+) -> anyhow::Result<serde_json::Value> {
+    tokio::time::timeout(
+        status_timeout,
+        bridge.send_raw(&serde_json::json!({"op": "status"})),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("model-provider status request timed out"))?
+    .map_err(|err| anyhow::anyhow!("model-provider status request failed: {err}"))
+}
+
+async fn start_model_provider(
+    registry: &provider::ProviderRegistry,
+    bridge: Arc<provider::ProviderBridge>,
+    status_timeout: Duration,
+) -> anyhow::Result<()> {
+    let startup = async {
+        let status = request_model_provider_status(&bridge, status_timeout).await?;
+        require_model_provider_status(&status)?;
+        let model_provider: Arc<dyn provider::Provider> = Arc::new(
+            provider::CapsuleProvider::with_scheme(bridge.clone(), "model"),
+        );
+        register_model_provider(registry, model_provider).await
+    }
+    .await;
+    if let Err(startup_error) = startup {
+        if let Err(shutdown_error) = bridge.shutdown().await {
+            return Err(anyhow::anyhow!(
+                "{startup_error}; model-provider shutdown/reap also failed: {shutdown_error}"
+            ));
+        }
+        return Err(startup_error);
+    }
+    Ok(())
+}
+
 fn require_wallet_provider_v2_status(status: &serde_json::Value) -> anyhow::Result<()> {
     if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
         anyhow::bail!("wallet-provider status request did not succeed");
@@ -186,6 +227,27 @@ fn require_wallet_provider_v2_status(status: &serde_json::Value) -> anyhow::Resu
     Ok(())
 }
 
+fn require_model_provider_status(status: &serde_json::Value) -> anyhow::Result<()> {
+    if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        anyhow::bail!("model-provider status request did not succeed");
+    }
+    let data = status
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("model-provider status is missing data"))?;
+    if data.get("provider").and_then(serde_json::Value::as_str) != Some(MODEL_PROVIDER_ID) {
+        anyhow::bail!("model-provider status has an unsupported provider identity");
+    }
+    if data
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(MODEL_PROVIDER_PROTOCOL_VERSION)
+    {
+        anyhow::bail!("model-provider status has an unsupported protocol version");
+    }
+    Ok(())
+}
+
 async fn register_wallet_provider_v2(
     registry: &provider::ProviderRegistry,
     wallet_provider: Arc<dyn provider::Provider>,
@@ -194,6 +256,23 @@ async fn register_wallet_provider_v2(
         .register_sub_provider("wallet", wallet_provider)
         .await
         .map_err(|err| anyhow::anyhow!("failed to register Wallet provider v2: {err}"))
+}
+
+async fn register_model_provider(
+    registry: &provider::ProviderRegistry,
+    model_provider: Arc<dyn provider::Provider>,
+) -> anyhow::Result<()> {
+    if registry
+        .registration_for_uri("elastos://model/offers")
+        .await
+        .is_some()
+    {
+        anyhow::bail!("failed to register model provider: route already registered");
+    }
+    registry
+        .register_sub_provider("model", model_provider)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to register model provider: {err}"))
 }
 
 pub(crate) async fn setup_server_infrastructure() -> anyhow::Result<ServerInfrastructure> {
@@ -628,6 +707,33 @@ async fn setup_server_infrastructure_impl(
             "Skipping webspace-provider due to verification failure: {}",
             e
         ),
+    }
+
+    match binaries::resolve_verified_native_provider_binary("model-provider") {
+        Ok(Some(path)) => {
+            let model_config = provider::BridgeProviderConfig {
+                base_path: data_dir.to_string_lossy().to_string(),
+                ..Default::default()
+            };
+            match provider::ProviderBridge::spawn(&path, model_config).await {
+                Ok(bridge) => {
+                    let bridge = Arc::new(bridge);
+                    match start_model_provider(
+                        &provider_registry,
+                        bridge,
+                        MODEL_PROVIDER_STATUS_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(()) => tracing::info!("model-provider capsule from {}", path.display()),
+                        Err(e) => tracing::warn!("Failed to start model-provider: {}", e),
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to spawn model-provider: {}", e),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Skipping model-provider due to verification failure: {}", e),
     }
 
     if let Some(path) = crate::find_installed_provider_binary("operator-drive-adapter") {
@@ -1769,6 +1875,142 @@ mod tests {
         let requests = provider.await.unwrap();
         assert_eq!(requests[0]["op"], "status");
         assert_eq!(requests[1]["op"], "shutdown");
+    }
+
+    #[tokio::test]
+    async fn model_provider_startup_registers_only_exact_identity_and_version() {
+        let registry = provider::ProviderRegistry::new();
+        let (bridge, provider) = test_provider_bridge(
+            provider_status(MODEL_PROVIDER_ID, MODEL_PROVIDER_PROTOCOL_VERSION),
+            Duration::ZERO,
+        );
+        start_model_provider(&registry, bridge, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let registration = registry
+            .registration_for_uri("elastos://model/offers")
+            .await
+            .unwrap();
+        assert_eq!(registration.route, "model");
+        assert_eq!(registration.provider, "capsule-provider");
+        provider.abort();
+    }
+
+    #[tokio::test]
+    async fn model_provider_startup_reaps_identity_or_version_mismatch() {
+        for status in [
+            provider_status(MODEL_PROVIDER_ID, "1.0"),
+            provider_status(MODEL_PROVIDER_ID, "2.0"),
+            provider_status("other-provider", MODEL_PROVIDER_PROTOCOL_VERSION),
+        ] {
+            let registry = provider::ProviderRegistry::new();
+            let (bridge, provider) = test_provider_bridge(status, Duration::ZERO);
+            let error = start_model_provider(&registry, bridge, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(error.to_string().contains("unsupported"));
+            assert!(registry
+                .registration_for_uri("elastos://model/offers")
+                .await
+                .is_none());
+            let requests = provider.await.unwrap();
+            assert_eq!(requests[0]["op"], "status");
+            assert_eq!(requests[1]["op"], "shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn model_provider_startup_reaps_failed_or_malformed_status() {
+        for status in [
+            serde_json::json!({"status": "error"}),
+            serde_json::json!({"status": "ok", "data": []}),
+            serde_json::json!({
+                "status": "ok",
+                "data": {
+                    "provider": MODEL_PROVIDER_ID,
+                }
+            }),
+        ] {
+            let registry = provider::ProviderRegistry::new();
+            let (bridge, provider) = test_provider_bridge(status, Duration::ZERO);
+            start_model_provider(&registry, bridge, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(registry
+                .registration_for_uri("elastos://model/offers")
+                .await
+                .is_none());
+            let requests = provider.await.unwrap();
+            assert_eq!(requests[0]["op"], "status");
+            assert_eq!(requests[1]["op"], "shutdown");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_provider_status_probe_completes_within_its_bound() {
+        let (bridge, provider) = test_provider_bridge(
+            provider_status(MODEL_PROVIDER_ID, MODEL_PROVIDER_PROTOCOL_VERSION),
+            Duration::from_millis(20),
+        );
+        let started = tokio::time::Instant::now();
+        let error = request_model_provider_status(&bridge, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(started.elapsed(), Duration::from_millis(5));
+        provider.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_provider_startup_reaps_provider_that_does_not_answer_in_time() {
+        let registry = provider::ProviderRegistry::new();
+        let (bridge, provider) = test_provider_bridge(
+            provider_status(MODEL_PROVIDER_ID, MODEL_PROVIDER_PROTOCOL_VERSION),
+            Duration::from_millis(20),
+        );
+        let error = start_model_provider(&registry, bridge, Duration::from_millis(5))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(registry
+            .registration_for_uri("elastos://model/offers")
+            .await
+            .is_none());
+        let requests = provider.await.unwrap();
+        assert_eq!(requests[0]["op"], "status");
+        assert_eq!(requests[1]["op"], "shutdown");
+    }
+
+    #[tokio::test]
+    async fn model_provider_startup_reaps_provider_when_registration_fails() {
+        let registry = provider::ProviderRegistry::new();
+        let (first_bridge, first_provider) = test_provider_bridge(
+            provider_status(MODEL_PROVIDER_ID, MODEL_PROVIDER_PROTOCOL_VERSION),
+            Duration::ZERO,
+        );
+        start_model_provider(&registry, first_bridge, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let (second_bridge, second_provider) = test_provider_bridge(
+            provider_status(MODEL_PROVIDER_ID, MODEL_PROVIDER_PROTOCOL_VERSION),
+            Duration::ZERO,
+        );
+        let error = start_model_provider(&registry, second_bridge, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed to register"));
+
+        let requests = second_provider.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["op"], "status");
+        assert_eq!(requests[1]["op"], "shutdown");
+        first_provider.abort();
     }
 
     struct EnvGuard {

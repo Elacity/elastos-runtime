@@ -2296,6 +2296,10 @@ mod tests {
                 "localhost-provider".to_string(),
                 "localhost://*".to_string(),
             ),
+            (
+                "model-provider".to_string(),
+                "elastos://model/*".to_string(),
+            ),
             ("net-provider".to_string(), "elastos://net/*".to_string()),
             (
                 "object-provider".to_string(),
