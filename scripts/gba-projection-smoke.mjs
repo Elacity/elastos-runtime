@@ -30,7 +30,7 @@ const nonogramIconSvg = await readFile(
 const mgbaJs = await readFile(path.join(browserRoot, "mgba.js"));
 const mgbaWasm = await readFile(path.join(browserRoot, "mgba.wasm"));
 const normalizer = await readFile(path.join(root, "scripts/normalize-gba-engine-imports.mjs"), "utf8");
-const gbaAssetVersion = "gba-20260724a";
+const gbaAssetVersion = "gba-20260826a";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -96,8 +96,24 @@ assert(
 );
 assert(
   projection.includes(`style.css?v=${gbaAssetVersion}`) &&
-    projection.includes(`emulator.js?v=${gbaAssetVersion}`),
+    projection.includes(`emulator.js?v=${gbaAssetVersion}`) &&
+    projection.includes('<script src="./elastos-theme.js"></script>') &&
+    projection.includes('<link rel="stylesheet" href="./elastos-ui.css">'),
   "GBA projection assets do not share the current cache identity",
+);
+assert(
+  style.includes("--bg: var(--el-surface-canvas);") &&
+    style.includes("--panel: color-mix(in srgb, var(--el-surface-raised) 88%, transparent);") &&
+    style.includes("font-family: var(--el-font);"),
+  "GBA viewer did not adopt the shared UI token layer",
+);
+assert(
+  !style.includes("sidebar-collapsed") &&
+    !style.includes("utility-toggle") &&
+    !style.includes("ui-preference") &&
+    !projection.includes("utility-toggle") &&
+    !emulator.includes("elastosTheme"),
+  "GBA viewer imported incomplete donor sidebar or theme-control logic",
 );
 assert(
   nonogramManifest.name === "gba-nonogram" &&

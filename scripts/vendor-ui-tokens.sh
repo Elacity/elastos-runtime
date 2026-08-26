@@ -46,6 +46,7 @@ TARGETS=(
   wallet-metamask/browser
   wallet-unisat/browser
   wallet-walletconnect/browser
+  gba-emulator/browser
 )
 
 MODE="${1:-sync}"
