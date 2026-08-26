@@ -595,9 +595,11 @@ fn reject_untrusted_binding_fields(input: &Value) -> Result<(), ProviderFault> {
 
 fn assert_run_owner(binding: &RuntimeAccessBinding, run: &StoredRun) -> Result<(), ProviderFault> {
     binding
-        .validate()
+        .validate(&run.run_id)
         .map_err(|_| ProviderFault::invalid_request("invalid runtime access binding"))?;
-    if !run.runtime_binding.matches_stable_run_access_scope(binding) {
+    if run.runtime_binding.principal_id != binding.principal_id
+        || run.runtime_binding.capsule_id != binding.capsule_id
+    {
         return Err(ProviderFault::unauthorized_run_access());
     }
     Ok(())
@@ -1024,7 +1026,7 @@ fn validate_run_lookup_request(
 ) -> Result<(), ProviderFault> {
     validate_run_id(run_id).map_err(|_| ProviderFault::invalid_request("invalid run_id"))?;
     binding
-        .validate()
+        .validate(run_id)
         .map_err(|_| ProviderFault::invalid_request("invalid runtime access binding"))?;
     if let Some(after_sequence) = after_sequence {
         if after_sequence > MAX_EVENT_SEQUENCE {
@@ -1277,6 +1279,7 @@ mod tests {
     }
 
     fn access_binding(binding: &RuntimeCreateBinding) -> RuntimeAccessBinding {
+        let run_id = deterministic_run_id(binding);
         RuntimeAccessBinding {
             schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
             principal_id: binding.principal_id.clone(),
@@ -1284,8 +1287,7 @@ mod tests {
             capsule_id: binding.capsule_id.clone(),
             grant_id: binding.grant_id.clone(),
             request_id: binding.request_id.clone(),
-            offer_id: binding.offer_id.clone(),
-            operation: binding.operation.clone(),
+            run_id,
         }
     }
 
@@ -3272,7 +3274,7 @@ mod tests {
     }
 
     #[test]
-    fn access_binding_requires_exact_principal_capsule_offer_and_operation() {
+    fn access_binding_requires_exact_principal_capsule_and_run_id() {
         let root = temp_root("access-scope");
         let adapters = FakeAdapters::default();
         let mut state = init_state(&root, vec![offer("local-text")], adapters);
@@ -3302,16 +3304,6 @@ mod tests {
                 wrong.capsule_id = "other-capsule".to_string();
                 wrong
             },
-            {
-                let mut wrong = access_binding(&binding);
-                wrong.offer_id = "other-offer".to_string();
-                wrong
-            },
-            {
-                let mut wrong = access_binding(&binding);
-                wrong.operation = "image.generate".to_string();
-                wrong
-            },
         ] {
             let error = state
                 .handle_runs_get(RunsGetRequest {
@@ -3322,6 +3314,90 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code(), "run_not_found");
         }
+
+        let mut wrong = access_binding(&binding);
+        wrong.run_id = deterministic_run_id(&create_binding(
+            "request:other-run",
+            &binding.offer_id,
+            &serde_json::json!({
+                "schema": "elastos.model.input.text/v1",
+                "prompt": "other"
+            }),
+        ));
+        let error = state
+            .handle_runs_get(RunsGetRequest {
+                op: "runs_get".to_string(),
+                run_id,
+                runtime_binding: wrong,
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_request");
+    }
+
+    #[test]
+    fn rotated_session_grant_and_request_can_access_same_exact_run() {
+        let root = temp_root("rotated-access");
+        let input = serde_json::json!({
+            "schema": "elastos.model.input.text/v1",
+            "prompt": "hello"
+        });
+        let binding = create_binding("request:stable-access", "local-text", &input);
+        let run_id = deterministic_run_id(&binding);
+        let mut state = init_state(&root, vec![offer("local-text")], FakeAdapters::default());
+        let run = StoredRun::new_prepared(
+            run_id.clone(),
+            binding.clone(),
+            offer("local-text").summary(),
+            offer("local-text").execution_binding_hash().unwrap(),
+            now_ms(),
+        );
+        state.journal.store_run(&run).unwrap();
+
+        let response = state
+            .handle_runs_get(RunsGetRequest {
+                op: "runs_get".to_string(),
+                run_id: run_id.clone(),
+                runtime_binding: rotate_access_invocation(
+                    &binding,
+                    "session:rotated",
+                    "grant:rotated",
+                    "request:fresh-access",
+                ),
+            })
+            .unwrap();
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["data"]["run_id"], run_id);
+        let stored = state.journal.load_run(&run.run_id).unwrap();
+        assert_eq!(stored.runtime_binding.session_id, binding.session_id);
+        assert_eq!(stored.runtime_binding.grant_id, binding.grant_id);
+    }
+
+    #[test]
+    fn access_binding_rejects_legacy_offer_and_operation_fields() {
+        let run_id = "run:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let error = serde_json::from_value::<RunsGetRequest>(serde_json::json!({
+            "op": "runs_get",
+            "run_id": run_id,
+            "runtime_binding": {
+                "schema": RUNTIME_ACCESS_BINDING_SCHEMA,
+                "principal_id": "person:local:test",
+                "session_id": "session:test",
+                "capsule_id": "assistant",
+                "grant_id": "grant:test",
+                "request_id": "request:test",
+                "run_id": run_id,
+                "offer_id": "local-text",
+                "operation": "text.generate"
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("unknown field `offer_id`")
+                || error.contains("unknown field `operation`")
+        );
     }
 
     #[test]

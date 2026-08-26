@@ -656,6 +656,7 @@ mod tests {
     }
 
     fn access_binding(binding: &RuntimeCreateBinding) -> RuntimeAccessBinding {
+        let run_id = deterministic_run_id(binding);
         RuntimeAccessBinding {
             schema: RUNTIME_ACCESS_BINDING_SCHEMA.to_string(),
             principal_id: binding.principal_id.clone(),
@@ -663,8 +664,7 @@ mod tests {
             capsule_id: binding.capsule_id.clone(),
             grant_id: binding.grant_id.clone(),
             request_id: binding.request_id.clone(),
-            offer_id: binding.offer_id.clone(),
-            operation: binding.operation.clone(),
+            run_id,
         }
     }
 

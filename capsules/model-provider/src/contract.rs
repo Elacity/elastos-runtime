@@ -153,13 +153,6 @@ impl RuntimeCreateBinding {
         }
         Ok(())
     }
-
-    pub fn matches_stable_run_access_scope(&self, access: &RuntimeAccessBinding) -> bool {
-        self.principal_id == access.principal_id
-            && self.capsule_id == access.capsule_id
-            && self.offer_id == access.offer_id
-            && self.operation == access.operation
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -171,12 +164,11 @@ pub struct RuntimeAccessBinding {
     pub capsule_id: String,
     pub grant_id: String,
     pub request_id: String,
-    pub offer_id: String,
-    pub operation: String,
+    pub run_id: String,
 }
 
 impl RuntimeAccessBinding {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, run_id: &str) -> Result<()> {
         if self.schema != RUNTIME_ACCESS_BINDING_SCHEMA {
             anyhow::bail!("runtime access binding schema must be {RUNTIME_ACCESS_BINDING_SCHEMA}");
         }
@@ -189,8 +181,10 @@ impl RuntimeAccessBinding {
         validate_bounded_trimmed(&self.capsule_id, "capsule_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
         validate_bounded_trimmed(&self.grant_id, "grant_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
         validate_bounded_trimmed(&self.request_id, "request_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.offer_id, "offer_id", MAX_RUNTIME_BINDING_ID_BYTES)?;
-        validate_bounded_trimmed(&self.operation, "operation", MAX_RUNTIME_OPERATION_BYTES)?;
+        validate_run_id(&self.run_id)?;
+        if self.run_id != run_id {
+            anyhow::bail!("runtime access binding run_id does not match request");
+        }
         Ok(())
     }
 }
