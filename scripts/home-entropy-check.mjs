@@ -1732,15 +1732,56 @@ assert(
   "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
 );
 assert(
-  /<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>\s*<div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">\s*<div class="launcher-header">[\s\S]*?<p class="launcher-browse-label">Apps<\/p>[\s\S]*?<button\s+id="launcher-view-toggle"[\s\S]*?<\/button>\s*<\/div>\s*<div class="launcher-scroll hide-scrollbar">[\s\S]*?<h1 class="launcher-heading visually-hidden">Apps<\/h1>[\s\S]*?<div id="launcher-grid" class="launcher-sections"><\/div>[\s\S]*?<\/div>\s*<\/div>\s*<\/aside>/.test(
-    homeGuiTemplateHtml,
-  ) &&
-    !homeGuiTemplateHtml.includes('id="close-launcher"') &&
-    !homeGuiTemplateHtml.includes('placeholder="Search Home"') &&
+  (homeGuiTemplateHtml.match(/id="launcher"/g) || []).length === 1 &&
+    (() => {
+      const taskbarOpenIndex = homeGuiTemplateHtml.indexOf('<footer class="taskbar"');
+      const launcherOpenIndex = homeGuiTemplateHtml.indexOf('<aside id="launcher"');
+      const launcherCloseIndex = homeGuiTemplateHtml.indexOf("</aside>", launcherOpenIndex);
+      const taskbarPrimaryIndex = homeGuiTemplateHtml.indexOf('<div class="taskbar-primary">', launcherCloseIndex);
+      const taskbarCloseIndex = homeGuiTemplateHtml.indexOf("</footer>", taskbarPrimaryIndex);
+      const launcherMarkup =
+        launcherOpenIndex >= 0 && launcherCloseIndex > launcherOpenIndex
+          ? homeGuiTemplateHtml.slice(launcherOpenIndex, launcherCloseIndex)
+          : "";
+      return taskbarOpenIndex >= 0 &&
+        launcherOpenIndex > taskbarOpenIndex &&
+        launcherCloseIndex > launcherOpenIndex &&
+        taskbarPrimaryIndex > launcherCloseIndex &&
+        taskbarCloseIndex > taskbarPrimaryIndex &&
+        launcherMarkup.includes('class="launcher-popover" role="dialog" aria-label="Home launcher"') &&
+        !launcherMarkup.includes('aria-modal="true"') &&
+        !launcherMarkup.includes('id="close-launcher"') &&
+        !launcherMarkup.includes('placeholder="Search Home"');
+    })() &&
     fileExists("capsules/home-gui/browser/icons/apps-launcher/dark-dock/icon-64.png") &&
     fileExists("capsules/home-gui/browser/icons/apps-launcher/light-dock/icon-64.png") &&
     fileExists("capsules/home-gui/browser/icons/apps-launcher/icon-64.png"),
-  "Home launcher must keep one complete launcher generation with its raster icon set",
+  "Home launcher must keep exactly one Shelf-nested non-modal launcher surface with its raster icon set",
+);
+assert(
+  shellSurface.includes('taskbar?.classList.toggle("is-launcher-face", isVisible);') &&
+    shellSurface.includes('launcherToggleButton.setAttribute("aria-expanded", isVisible ? "true" : "false");') &&
+    shellSurface.includes('trapTabWithin(launcher.querySelector(".launcher-popover"), event);') &&
+    !shellSurface.includes("pendingRunningDockIds") &&
+    !shellSurface.includes("dockFlyRevealTargetId") &&
+    !shellSurface.includes("shelfMorphApi") &&
+    !shellSurface.includes("flyLauncherCardToDock") &&
+    !shellSurface.includes("is-receiving-fly"),
+  "Home launcher must use one simple Shelf-face state and keep the existing keyboard trap without donor morph choreography",
+);
+assert(
+  homeGuiStyle.includes("body.dock-autohide .taskbar.is-launcher-face,") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {") &&
+    homeGuiStyle.includes(".taskbar .launcher[hidden] {") &&
+    homeGuiStyle.includes(".launcher {\n  position: static;") &&
+    !homeGuiStyle.includes(".launcher {\n  position: fixed;") &&
+    homeGuiStyle.includes("@media (prefers-reduced-motion: reduce) {\n  .launcher,") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face {\n    width: calc(100vw - 20px);") &&
+    homeGuiStyle.includes(".launcher-popover {\n    height: min(48vh, 380px);") &&
+    homeGuiStyle.includes(".taskbar.is-launcher-face .launcher {\n    max-height: min(48vh, 380px);") &&
+    !homeGuiStyle.includes("launcher-fly-icon") &&
+    !homeGuiStyle.includes("data-launcher-morphing"),
+  "Home launcher styles must keep one material Shelf face, narrow bounds, reduced motion, and matched narrow launcher heights",
 );
 assert(
   /people:\s*WINDOW_CHROME_UNIFIED_SIDEBAR/.test(homeGuiCore) &&

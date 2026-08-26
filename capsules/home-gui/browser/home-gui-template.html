@@ -340,6 +340,37 @@
 
 <footer class="taskbar" aria-label="Home taskbar" data-home-gui-hidden-by-host="hidden" inert hidden>
   <div class="taskbar-inner">
+    <aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
+      <div class="launcher-popover" role="dialog" aria-label="Home launcher">
+        <div class="launcher-header">
+          <div class="launcher-search-wrap" hidden>
+            <input
+              id="launcher-search"
+              class="launcher-search-field"
+              type="search"
+              autocomplete="off"
+              placeholder="Search"
+              spellcheck="false"
+              tabindex="-1"
+              aria-hidden="true"
+            />
+          </div>
+          <p class="launcher-browse-label">Apps</p>
+          <button
+            id="launcher-view-toggle"
+            class="launcher-header-btn"
+            type="button"
+            aria-label="Switch to list view"
+            aria-pressed="false"
+          ></button>
+        </div>
+        <div class="launcher-scroll hide-scrollbar">
+          <h1 class="launcher-heading visually-hidden">Apps</h1>
+          <div id="launcher-grid" class="launcher-sections"></div>
+          <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
+        </div>
+      </div>
+    </aside>
     <div class="taskbar-primary">
       <button
         id="launcher-toggle"
@@ -355,38 +386,6 @@
     </div>
   </div>
 </footer>
-
-<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>
-  <div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">
-    <div class="launcher-header">
-      <div class="launcher-search-wrap" hidden>
-        <input
-          id="launcher-search"
-          class="launcher-search-field"
-          type="search"
-          autocomplete="off"
-          placeholder="Search"
-          spellcheck="false"
-          tabindex="-1"
-          aria-hidden="true"
-        />
-      </div>
-      <p class="launcher-browse-label">Apps</p>
-      <button
-        id="launcher-view-toggle"
-        class="launcher-header-btn"
-        type="button"
-        aria-label="Switch to list view"
-        aria-pressed="false"
-      ></button>
-    </div>
-    <div class="launcher-scroll hide-scrollbar">
-      <h1 class="launcher-heading visually-hidden">Apps</h1>
-      <div id="launcher-grid" class="launcher-sections"></div>
-      <p id="launcher-empty-state" class="launcher-empty" hidden>No matching items</p>
-    </div>
-  </div>
-</aside>
 
 <div id="desktop-context-menu" class="context-menu" role="menu" aria-label="Home actions" inert hidden></div>
 

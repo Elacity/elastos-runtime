@@ -276,6 +276,7 @@ const summary = {
 
 shellCore.initializeShellLayout(summary);
 document.body.dataset.homeShell = "desktop";
+shellCore.shellState.currentSummary = summary;
 
 const layout = shellCore.shellState.shellLayoutState.desktop;
 assert(layout.wallet, "wallet desktop position missing", layout);
@@ -400,8 +401,77 @@ const launcherLightDockIcon = new URL(
 );
 const canonicalWindowHeadMarkup =
   /<div class="window-head">\s*<div class="window-traffic-lights">\s*<button class="window-action-btn" data-action="close"[\s\S]*?<button class="window-action-btn" data-action="minimize"[\s\S]*?<button class="window-action-btn" data-action="maximize"[\s\S]*?<\/div>\s*<div class="window-head-draggable">[\s\S]*?<\/div>\s*<div class="window-head-balance" aria-hidden="true"><\/div>\s*<\/div>/;
-const canonicalLauncherMarkup =
-  /<aside id="launcher" class="launcher" aria-hidden="true" data-open="false" data-view="grid" inert hidden>\s*<div class="launcher-popover" role="dialog" aria-modal="true" aria-label="Home launcher">\s*<div class="launcher-header">[\s\S]*?<p class="launcher-browse-label">Apps<\/p>[\s\S]*?<button\s+id="launcher-view-toggle"[\s\S]*?<\/button>\s*<\/div>\s*<div class="launcher-scroll hide-scrollbar">[\s\S]*?<h1 class="launcher-heading visually-hidden">Apps<\/h1>[\s\S]*?<div id="launcher-grid" class="launcher-sections"><\/div>[\s\S]*?<\/div>\s*<\/div>\s*<\/aside>/;
+const taskbarOpenIndex = homeGuiTemplate.indexOf('<footer class="taskbar"');
+const launcherOpenIndex = homeGuiTemplate.indexOf('<aside id="launcher"');
+const launcherCloseIndex = homeGuiTemplate.indexOf("</aside>", launcherOpenIndex);
+const taskbarPrimaryIndex = homeGuiTemplate.indexOf('<div class="taskbar-primary">', launcherCloseIndex);
+const taskbarCloseIndex = homeGuiTemplate.indexOf("</footer>", taskbarPrimaryIndex);
+const launcherMarkup = launcherOpenIndex >= 0 && launcherCloseIndex > launcherOpenIndex
+  ? homeGuiTemplate.slice(launcherOpenIndex, launcherCloseIndex)
+  : "";
+
+assert(
+  (homeGuiTemplate.match(/id="launcher"/g) || []).length === 1 &&
+    taskbarOpenIndex >= 0 &&
+    launcherOpenIndex > taskbarOpenIndex &&
+    launcherCloseIndex > launcherOpenIndex &&
+    taskbarPrimaryIndex > launcherCloseIndex &&
+    taskbarCloseIndex > taskbarPrimaryIndex &&
+    launcherMarkup.includes('class="launcher-popover" role="dialog" aria-label="Home launcher"') &&
+    !launcherMarkup.includes('aria-modal="true"') &&
+    !launcherMarkup.includes('id="close-launcher"') &&
+    !launcherMarkup.includes('placeholder="Search Home"'),
+  "Home must keep exactly one non-modal launcher surface nested inside the Shelf",
+  {
+    taskbarOpenIndex,
+    launcherOpenIndex,
+    launcherCloseIndex,
+    taskbarPrimaryIndex,
+    taskbarCloseIndex,
+  },
+);
+
+{
+  const previousSummary = shellCore.shellState.currentSummary;
+  const launcherSurface = elementForSelector("#launcher");
+  const taskbar = elementForSelector(".taskbar");
+  shellCore.shellState.currentSummary = summary;
+  elementForSelector("#launcher-search").value = "";
+  shellSurface.showLauncher();
+  assert(
+    launcherSurface.hidden === false &&
+      launcherSurface.dataset.open === "true" &&
+      taskbar.classList.contains("is-launcher-face"),
+    "showLauncher did not open the Shelf face with one launcher presentation state",
+    {
+      launcherHidden: launcherSurface.hidden,
+      launcherOpen: launcherSurface.dataset.open,
+      taskbarClasses: [...taskbar.classList.values],
+    },
+  );
+  shellSurface.setDockAutoHide(true);
+  assert(
+    document.body.classList.contains("dock-autohide") &&
+      taskbar.classList.contains("is-launcher-face"),
+    "open launcher did not preserve the Shelf face while dock auto-hide is enabled",
+    {
+      bodyClasses: [...document.body.classList.values],
+      taskbarClasses: [...taskbar.classList.values],
+    },
+  );
+  shellSurface.hideLauncher();
+  shellSurface.setDockAutoHide(false);
+  shellCore.shellState.currentSummary = previousSummary;
+  assert(
+    launcherSurface.dataset.open === "false" &&
+      taskbar.classList.contains("is-launcher-face") === false,
+    "hideLauncher did not clear the Shelf face presentation state",
+    {
+      launcherOpen: launcherSurface.dataset.open,
+      taskbarClasses: [...taskbar.classList.values],
+    },
+  );
+}
 
 assert(
   peopleStyle.includes("padding: var(--window-chrome-safe-top, 52px) 12px 16px;"),
@@ -510,10 +580,12 @@ assert(
   "Home window template must keep one traffic-light group in close/minimize/maximize order before the draggable title and balance shim",
 );
 assert(
-  canonicalLauncherMarkup.test(homeGuiTemplate) &&
-    !homeGuiTemplate.includes('id="close-launcher"') &&
-    !homeGuiTemplate.includes('placeholder="Search Home"'),
-  "Home launcher template must keep one complete canonical launcher generation",
+  (homeGuiTemplate.match(/id="launcher"/g) || []).length === 1 &&
+    launcherMarkup.includes('class="launcher-popover" role="dialog" aria-label="Home launcher"') &&
+    !launcherMarkup.includes('aria-modal="true"') &&
+    !launcherMarkup.includes('id="close-launcher"') &&
+    !launcherMarkup.includes('placeholder="Search Home"'),
+  "Home launcher template must keep one Shelf face without modal overlay claims",
 );
 assert(
   existsSync(launcherDarkDockIcon) && existsSync(launcherLightDockIcon),
